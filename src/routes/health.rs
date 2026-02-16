@@ -3,7 +3,6 @@ use axum::Json;
 use serde::Serialize;
 
 use crate::config::{RUNNER_API_PORT, RUNNER_VITE_PORT};
-use crate::process::port::{is_port_in_use, is_runner_responding};
 use crate::state::SharedState;
 
 #[derive(Serialize)]
@@ -13,7 +12,18 @@ pub struct HealthResponse {
     pub ports: PortsHealth,
     pub watchdog: WatchdogHealth,
     pub build: BuildHealth,
+    pub ai: AiHealth,
+    pub code_activity: CodeActivityHealth,
+    pub expo: ExpoHealth,
     pub supervisor: SupervisorInfo,
+}
+
+#[derive(Serialize)]
+pub struct ExpoHealth {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub port: u16,
+    pub configured: bool,
 }
 
 #[derive(Serialize)]
@@ -55,6 +65,22 @@ pub struct BuildHealth {
 }
 
 #[derive(Serialize)]
+pub struct AiHealth {
+    pub ai_running: bool,
+    pub ai_provider: String,
+    pub ai_model: String,
+    pub auto_debug_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct CodeActivityHealth {
+    pub code_being_edited: bool,
+    pub external_claude_session: bool,
+    pub pending_debug: bool,
+    pub pending_debug_reason: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct SupervisorInfo {
     pub version: String,
     pub dev_mode: bool,
@@ -62,13 +88,23 @@ pub struct SupervisorInfo {
 }
 
 pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
+    Json(build_health_response(&state).await)
+}
+
+pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let runner = state.runner.read().await;
     let watchdog = state.watchdog.read().await;
     let build = state.build.read().await;
+    let ai = state.ai.read().await;
+    let ca = state.code_activity.read().await;
+    let expo = state.expo.read().await;
 
-    let api_responding = is_runner_responding(RUNNER_API_PORT).await;
-    let api_in_use = is_port_in_use(RUNNER_API_PORT);
-    let vite_in_use = is_port_in_use(RUNNER_VITE_PORT);
+    // Read from background health cache instead of live port checks (~100µs vs ~3s)
+    let cached = state.cached_health.read().await;
+    let api_responding = cached.runner_responding;
+    let api_in_use = cached.runner_port_open;
+    let vite_in_use = cached.vite_port_open;
+    drop(cached);
 
     let overall_status = if runner.running && api_responding {
         "healthy"
@@ -80,7 +116,7 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
         "stopped"
     };
 
-    let response = HealthResponse {
+    HealthResponse {
         status: overall_status.to_string(),
         runner: RunnerHealth {
             running: runner.running,
@@ -120,12 +156,28 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
         },
+        ai: AiHealth {
+            ai_running: ai.running,
+            ai_provider: ai.provider.clone(),
+            ai_model: ai.model.clone(),
+            auto_debug_enabled: ai.auto_debug_enabled,
+        },
+        code_activity: CodeActivityHealth {
+            code_being_edited: ca.code_being_edited,
+            external_claude_session: ca.external_claude_session,
+            pending_debug: ca.pending_debug,
+            pending_debug_reason: ca.pending_debug_reason.clone(),
+        },
+        expo: ExpoHealth {
+            running: expo.running,
+            pid: expo.pid,
+            port: expo.port,
+            configured: state.config.expo_dir.is_some(),
+        },
         supervisor: SupervisorInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             dev_mode: state.config.dev_mode,
             project_dir: state.config.project_dir.display().to_string(),
         },
-    };
-
-    Json(response)
+    }
 }

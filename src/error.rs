@@ -25,6 +25,15 @@ pub enum SupervisorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Workflow loop is already running")]
+    WorkflowLoopAlreadyRunning,
+
+    #[error("Workflow loop is not running")]
+    WorkflowLoopNotRunning,
+
+    #[error("Runner API error: {0}")]
+    RunnerApi(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -35,6 +44,9 @@ impl IntoResponse for SupervisorError {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
+            SupervisorError::WorkflowLoopAlreadyRunning => StatusCode::CONFLICT,
+            SupervisorError::WorkflowLoopNotRunning => StatusCode::CONFLICT,
+            SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,

@@ -59,14 +59,23 @@ pub async fn control_watchdog(
     State(state): State<SharedState>,
     Json(body): Json<WatchdogRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let mut wd = state.watchdog.write().await;
-    wd.enabled = body.enabled;
+    let response = {
+        let mut wd = state.watchdog.write().await;
+        wd.enabled = body.enabled;
 
-    if body.reset_attempts {
-        wd.restart_attempts = 0;
-        wd.disabled_reason = None;
-        wd.crash_history.clear();
-    }
+        if body.reset_attempts {
+            wd.restart_attempts = 0;
+            wd.disabled_reason = None;
+            wd.crash_history.clear();
+        }
+
+        serde_json::json!({
+            "watchdog": {
+                "enabled": wd.enabled,
+                "restart_attempts": wd.restart_attempts,
+            }
+        })
+    };
 
     state
         .logs
@@ -85,12 +94,9 @@ pub async fn control_watchdog(
         )
         .await;
 
-    Ok(Json(serde_json::json!({
-        "watchdog": {
-            "enabled": wd.enabled,
-            "restart_attempts": wd.restart_attempts,
-        }
-    })))
+    state.notify_health_change();
+
+    Ok(Json(response))
 }
 
 /// Self-restart the supervisor process with the same CLI args.

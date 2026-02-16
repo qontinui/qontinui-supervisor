@@ -42,6 +42,8 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
         build.last_build_at = Some(chrono::Utc::now());
     }
 
+    state.notify_health_change();
+
     state
         .logs
         .emit(LogSource::Build, LogLevel::Info, "Starting cargo build...")
@@ -62,6 +64,8 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
             build.last_build_error = Some(e.to_string());
         }
     }
+
+    state.notify_health_change();
 
     result
 }
@@ -199,9 +203,17 @@ pub fn spawn_build_error_monitor(state: SharedState) -> tokio::task::JoinHandle<
                             .any(|p| p.is_match(&entry.message));
                         if is_error {
                             warn!("Build error detected in runner output: {}", entry.message);
-                            let mut build = state.build.write().await;
-                            build.build_error_detected = true;
-                            build.last_build_error = Some(entry.message.clone());
+                            {
+                                let mut build = state.build.write().await;
+                                build.build_error_detected = true;
+                                build.last_build_error = Some(entry.message.clone());
+                            }
+                            state.notify_health_change();
+                            crate::ai_debug::schedule_debug(
+                                &state,
+                                "Build error detected in runner output",
+                            )
+                            .await;
                             break;
                         }
                     }

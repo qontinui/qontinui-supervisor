@@ -30,9 +30,9 @@ pub fn is_port_in_use(port: u16) -> bool {
     }
 }
 
-/// Check if the runner HTTP API is responding at the given port.
-pub async fn is_runner_responding(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", port);
+/// Check if an HTTP health endpoint is responding at the given port and path.
+pub async fn check_http_health(port: u16, path: &str) -> bool {
+    let url = format!("http://127.0.0.1:{}{}", port, path);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build();
@@ -46,6 +46,11 @@ pub async fn is_runner_responding(port: u16) -> bool {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
+}
+
+/// Check if the runner HTTP API is responding at the given port.
+pub async fn is_runner_responding(port: u16) -> bool {
+    check_http_health(port, "/health").await
 }
 
 /// Wait for a port to become available (something starts listening).

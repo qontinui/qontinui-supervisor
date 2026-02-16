@@ -11,6 +11,8 @@ pub fn build_router(state: SharedState) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        // Dashboard
+        .route("/", get(crate::routes::dashboard::index))
         // Health
         .route("/health", get(crate::routes::health::health))
         // Runner lifecycle
@@ -33,6 +35,87 @@ pub fn build_router(state: SharedState) -> Router {
             "/supervisor/restart",
             post(crate::routes::runner::supervisor_restart),
         )
+        // AI debug
+        .route("/ai/debug", post(crate::routes::ai::debug))
+        .route("/ai/auto-debug", post(crate::routes::ai::auto_debug))
+        .route("/ai/status", get(crate::routes::ai::status))
+        .route("/ai/stop", post(crate::routes::ai::stop))
+        .route("/ai/provider", get(crate::routes::ai::get_provider))
+        .route("/ai/provider", post(crate::routes::ai::set_provider))
+        .route("/ai/models", get(crate::routes::ai::models))
+        .route("/ai/output/stream", get(crate::routes::ai::output_stream))
+        // Claude backward-compat aliases
+        .route("/claude/debug", post(crate::routes::ai::debug))
+        .route("/claude/status", get(crate::routes::ai::status))
+        .route("/claude/stop", post(crate::routes::ai::stop))
+        // Dev-start orchestration
+        .route(
+            "/dev-start/backend",
+            post(crate::routes::dev_start::backend),
+        )
+        .route(
+            "/dev-start/backend/stop",
+            post(crate::routes::dev_start::backend_stop),
+        )
+        .route(
+            "/dev-start/frontend",
+            post(crate::routes::dev_start::frontend),
+        )
+        .route(
+            "/dev-start/frontend/stop",
+            post(crate::routes::dev_start::frontend_stop),
+        )
+        .route("/dev-start/docker", post(crate::routes::dev_start::docker))
+        .route(
+            "/dev-start/docker/stop",
+            post(crate::routes::dev_start::docker_stop),
+        )
+        .route("/dev-start/all", post(crate::routes::dev_start::all))
+        .route("/dev-start/stop", post(crate::routes::dev_start::stop))
+        .route("/dev-start/clean", post(crate::routes::dev_start::clean))
+        .route("/dev-start/fresh", post(crate::routes::dev_start::fresh))
+        .route(
+            "/dev-start/migrate",
+            post(crate::routes::dev_start::migrate),
+        )
+        .route("/dev-start/status", get(crate::routes::dev_start::status))
+        // UI Bridge proxy (forwards to runner at port 9876)
+        .route(
+            "/ui-bridge/{*path}",
+            get(crate::routes::ui_bridge::proxy).post(crate::routes::ui_bridge::proxy),
+        )
+        // WebSocket
+        .route("/ws", get(crate::routes::ws::ws_handler))
+        // Workflow loop
+        .route(
+            "/workflow-loop/start",
+            post(crate::routes::workflow_loop::start),
+        )
+        .route(
+            "/workflow-loop/stop",
+            post(crate::routes::workflow_loop::stop),
+        )
+        .route(
+            "/workflow-loop/status",
+            get(crate::routes::workflow_loop::status),
+        )
+        .route(
+            "/workflow-loop/history",
+            get(crate::routes::workflow_loop::history),
+        )
+        .route(
+            "/workflow-loop/stream",
+            get(crate::routes::workflow_loop::stream),
+        )
+        .route(
+            "/workflow-loop/signal-restart",
+            post(crate::routes::workflow_loop::signal_restart),
+        )
+        // Expo
+        .route("/expo/start", post(crate::routes::expo::start))
+        .route("/expo/stop", post(crate::routes::expo::stop))
+        .route("/expo/status", get(crate::routes::expo::status))
+        .route("/expo/logs/stream", get(crate::routes::expo::logs_stream))
         .layer(cors)
         .with_state(state)
 }

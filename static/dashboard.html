@@ -1,0 +1,1891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qontinui Supervisor (v2)</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a0d;
+    --surface: #111115;
+    --surface-2: #1a1a20;
+    --border: #2a2a32;
+    --primary: #4A90D9;
+    --success: #4DB89D;
+    --warning: #E5A84B;
+    --error: #D94A4A;
+    --text: #E8E8EC;
+    --text-secondary: #9898A0;
+    --font-ui: system-ui, -apple-system, sans-serif;
+    --font-code: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    --radius: 8px;
+  }
+
+  body {
+    font-family: var(--font-ui);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* Status bar */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .status-bar .left { display: flex; align-items: center; gap: 12px; }
+  .status-bar .right { display: flex; align-items: center; gap: 16px; color: var(--text-secondary); }
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .status-dot.healthy { background: var(--success); box-shadow: 0 0 6px var(--success); }
+  .status-dot.degraded { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+  .status-dot.stopped { background: var(--error); }
+  .status-dot.building { background: var(--warning); animation: pulse 1.5s infinite; }
+  .connection-indicator { font-size: 11px; }
+  .connection-indicator.connected { color: var(--success); }
+  .connection-indicator.disconnected { color: var(--error); }
+  .shortcuts-hint { font-size: 10px; color: var(--text-secondary); font-family: var(--font-code); }
+
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* Grid layout */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    padding: 16px 20px;
+  }
+  .grid .full-width { grid-column: 1 / -1; }
+  .grid .two-col { grid-column: span 2; }
+
+  @media (max-width: 1100px) {
+    .grid { grid-template-columns: repeat(2, 1fr); }
+    .grid .two-col { grid-column: span 2; }
+  }
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; }
+    .grid .two-col { grid-column: 1; }
+    .grid .full-width { grid-column: 1; }
+    .status-bar { flex-direction: column; gap: 8px; align-items: flex-start; }
+    .status-bar .right { flex-wrap: wrap; gap: 8px; }
+  }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .card-body { font-size: 13px; }
+  .card-body .row {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+  }
+  .card-body .label { color: var(--text-secondary); }
+  .card-body .value { font-family: var(--font-code); font-size: 12px; }
+
+  /* Buttons */
+  .btn-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .btn {
+    padding: 5px 12px;
+    font-size: 12px;
+    font-family: var(--font-ui);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: var(--border); }
+  .btn:active { transform: scale(0.97); }
+  .btn.primary { border-color: var(--primary); color: var(--primary); }
+  .btn.primary:hover { background: rgba(74, 144, 217, 0.15); }
+  .btn.danger { border-color: var(--error); color: var(--error); }
+  .btn.danger:hover { background: rgba(217, 74, 74, 0.15); }
+  .btn.success { border-color: var(--success); color: var(--success); }
+  .btn.success:hover { background: rgba(77, 184, 157, 0.15); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.loading { opacity: 0.6; pointer-events: none; }
+
+  /* Toggle */
+  .toggle {
+    position: relative;
+    display: inline-block;
+    width: 36px; height: 20px;
+    cursor: pointer;
+  }
+  .toggle input { display: none; }
+  .toggle .slider {
+    position: absolute; inset: 0;
+    background: var(--border);
+    border-radius: 10px;
+    transition: 0.2s;
+  }
+  .toggle .slider::before {
+    content: '';
+    position: absolute;
+    width: 16px; height: 16px;
+    left: 2px; bottom: 2px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  .toggle input:checked + .slider { background: var(--primary); }
+  .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+  /* Port list */
+  .port-list { list-style: none; }
+  .port-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+    font-size: 12px;
+    font-family: var(--font-code);
+  }
+  .port-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .port-dot.up { background: var(--success); }
+  .port-dot.down { background: var(--border); }
+
+  /* Log viewer */
+  .log-viewer {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-family: var(--font-code);
+    font-size: 12px;
+    height: 260px;
+    overflow-y: auto;
+    padding: 8px;
+    outline: none;
+  }
+  .log-viewer:focus { border-color: var(--primary); }
+  .log-viewer .entry { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+  .log-viewer .entry .ts { color: var(--text-secondary); margin-right: 6px; }
+  .log-viewer .entry .src { margin-right: 6px; font-weight: 600; }
+  .log-viewer .entry .src.runner { color: var(--primary); }
+  .log-viewer .entry .src.supervisor { color: #b39ddb; }
+  .log-viewer .entry .src.build { color: var(--warning); }
+  .log-viewer .entry .src.watchdog { color: #ff8a65; }
+  .log-viewer .entry .src.expo { color: #4dd0e1; }
+  .log-viewer .entry .src.workflowloop { color: #66bb6a; }
+  .log-viewer .entry.warn .msg { color: var(--warning); }
+  .log-viewer .entry.error .msg { color: var(--error); }
+  .log-viewer .entry.info .msg { color: var(--text); }
+  .log-viewer .entry.debug .msg { color: var(--text-secondary); }
+
+  /* Log search */
+  .search-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+  }
+  #logSearch {
+    width: 200px;
+    padding: 4px 24px 4px 8px;
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    font-family: var(--font-ui);
+  }
+  #logSearch:focus { outline: 1px solid var(--primary); }
+  #logSearch::placeholder { color: var(--text-secondary); }
+  .search-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+    display: none;
+  }
+  .search-clear:hover { color: var(--text); }
+  #searchCount { font-size: 11px; color: var(--text-secondary); font-family: var(--font-code); white-space: nowrap; }
+  mark { background: #ffe066; color: #1a1a2e; padding: 0 2px; border-radius: 2px; }
+
+  /* Notification toggle */
+  .notify-toggle {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: all 0.15s;
+  }
+  .notify-toggle:hover { border-color: var(--text-secondary); }
+  .notify-toggle.active { color: var(--warning); border-color: var(--warning); }
+
+  /* AI output */
+  .ai-output {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-family: var(--font-code);
+    font-size: 12px;
+    height: 180px;
+    overflow-y: auto;
+    padding: 8px;
+    color: var(--text-secondary);
+  }
+  .ai-output .line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+
+  /* Toolbar */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .toolbar select {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-family: var(--font-ui);
+  }
+  .toolbar select:focus { outline: 1px solid var(--primary); }
+  .toolbar .spacer { flex: 1; }
+
+  /* Select styling */
+  select {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-family: var(--font-ui);
+  }
+
+  /* Workflow Loop panel */
+  .wl-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 700px) {
+    .wl-panel { grid-template-columns: 1fr; }
+  }
+  .wl-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .wl-add-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  .wl-add-row select { flex: 1; min-width: 0; }
+  .wl-queue {
+    list-style: none;
+    min-height: 48px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 6px;
+    margin-bottom: 10px;
+  }
+  .wl-queue.has-items { border-style: solid; }
+  .wl-queue-empty {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 12px;
+    padding: 12px;
+  }
+  .wl-queue-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 4px;
+    font-size: 12px;
+    cursor: grab;
+  }
+  .wl-queue-item:last-child { margin-bottom: 0; }
+  .wl-queue-item:active { cursor: grabbing; }
+  .wl-queue-item.dragging { opacity: 0.4; }
+  .wl-queue-item.drag-over { border-color: var(--primary); background: rgba(74, 144, 217, 0.08); }
+  .wl-queue-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .wl-queue-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wl-queue-steps { color: var(--text-secondary); font-size: 11px; flex-shrink: 0; }
+  .wl-queue-remove {
+    background: none; border: none; color: var(--text-secondary); cursor: pointer;
+    font-size: 14px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+  }
+  .wl-queue-remove:hover { color: var(--error); }
+  .wl-config-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 12px;
+  }
+  .wl-config-row .label { color: var(--text-secondary); }
+  .wl-config-row select, .wl-config-row input[type=number] {
+    width: 140px;
+    padding: 3px 6px;
+    font-size: 12px;
+  }
+  .wl-config-row input[type=number] {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 60px;
+    text-align: center;
+  }
+  .wl-status-phase {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font-code);
+  }
+  .wl-status-phase.idle { background: var(--surface-2); color: var(--text-secondary); }
+  .wl-status-phase.running_workflow { background: rgba(74, 144, 217, 0.2); color: var(--primary); }
+  .wl-status-phase.evaluating_exit { background: rgba(229, 168, 75, 0.2); color: var(--warning); }
+  .wl-status-phase.between_iterations { background: rgba(179, 157, 219, 0.2); color: #b39ddb; }
+  .wl-status-phase.waiting_for_runner { background: rgba(229, 168, 75, 0.2); color: var(--warning); }
+  .wl-status-phase.complete { background: rgba(77, 184, 157, 0.2); color: var(--success); }
+  .wl-status-phase.stopped { background: var(--surface-2); color: var(--text-secondary); }
+  .wl-status-phase.error { background: rgba(217, 74, 74, 0.2); color: var(--error); }
+  .wl-history {
+    max-height: 140px;
+    overflow-y: auto;
+    font-family: var(--font-code);
+    font-size: 11px;
+    margin-top: 6px;
+  }
+  .wl-history-item {
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .wl-history-item:last-child { border-bottom: none; }
+  .wl-history-iter { color: var(--primary); font-weight: 600; flex-shrink: 0; }
+  .wl-history-reason { color: var(--text-secondary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wl-history-exit { flex-shrink: 0; }
+  .wl-history-exit.yes { color: var(--success); }
+  .wl-history-exit.no { color: var(--warning); }
+  .wl-progress {
+    height: 4px;
+    background: var(--surface-2);
+    border-radius: 2px;
+    margin: 8px 0;
+    overflow: hidden;
+  }
+  .wl-progress-bar {
+    height: 100%;
+    background: var(--primary);
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+  .wl-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--primary);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    margin-left: 6px;
+  }
+
+  /* Toast notifications */
+  .toast-container {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+  }
+  .toast {
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: var(--font-ui);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    pointer-events: auto;
+    animation: toastIn 0.25s ease-out;
+    max-width: 360px;
+  }
+  .toast.success { border-color: var(--success); }
+  .toast.error { border-color: var(--error); color: var(--error); }
+  .toast.info { border-color: var(--primary); }
+  .toast.removing { animation: toastOut 0.2s ease-in forwards; }
+
+  @keyframes toastIn { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes toastOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(40px); } }
+</style>
+</head>
+<body>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- Status Bar -->
+<div class="status-bar">
+  <div class="left">
+    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span>
+    <span style="color:var(--text-secondary)">Supervisor <span id="supervisorVersion">v?.?.?</span></span>
+  </div>
+  <div class="right">
+    <button class="notify-toggle" id="notifyToggle" onclick="toggleNotifications()" title="Browser notifications"></button>
+    <span class="shortcuts-hint">r:restart s:stop l:logs p:pause /:search</span>
+    <span class="connection-indicator" id="wsIndicator">WS: --</span>
+    <span class="connection-indicator" id="sseIndicator">SSE: --</span>
+    <span id="clock"></span>
+  </div>
+</div>
+
+<!-- Main Grid -->
+<div class="grid">
+
+  <!-- Runner Card -->
+  <div class="card">
+    <div class="card-header">Runner</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Status</span><span class="value" id="runnerStatus">--</span></div>
+      <div class="row"><span class="label">PID</span><span class="value" id="runnerPid">--</span></div>
+      <div class="row"><span class="label">Mode</span><span class="value" id="runnerMode">--</span></div>
+      <div class="row"><span class="label">API</span><span class="value" id="runnerApi">--</span></div>
+      <div class="row"><span class="label">Uptime</span><span class="value" id="runnerUptime">--</span></div>
+      <div class="btn-group">
+        <button class="btn danger" onclick="postAction('/runner/stop')">Stop</button>
+        <button class="btn primary" onclick="postAction('/runner/restart',{rebuild:false})">Restart</button>
+        <button class="btn" onclick="postAction('/runner/restart',{rebuild:true})">Rebuild</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ports Card -->
+  <div class="card">
+    <div class="card-header">Ports</div>
+    <div class="card-body">
+      <ul class="port-list" id="portList">
+        <li><span class="port-dot down"></span>Loading...</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Watchdog Card -->
+  <div class="card">
+    <div class="card-header">Watchdog</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Enabled</span><span class="value" id="watchdogEnabled">--</span></div>
+      <div class="row"><span class="label">Attempts</span><span class="value" id="watchdogAttempts">--</span></div>
+      <div class="row"><span class="label">Crashes</span><span class="value" id="watchdogCrashes">--</span></div>
+      <div class="btn-group">
+        <button class="btn primary" id="watchdogToggle" onclick="toggleWatchdog()">Toggle</button>
+        <button class="btn" onclick="postAction('/runner/watchdog',{reset_attempts:true})">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Build Card -->
+  <div class="card">
+    <div class="card-header">Build</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Status</span><span class="value" id="buildStatus">--</span></div>
+      <div class="row"><span class="label">Error</span><span class="value" id="buildError">--</span></div>
+      <div class="row"><span class="label">Last Build</span><span class="value" id="buildLast">--</span></div>
+    </div>
+  </div>
+
+  <!-- AI Debug Card -->
+  <div class="card">
+    <div class="card-header">AI Debug</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Provider</span>
+        <select id="aiProvider" onchange="setAiProvider()"></select>
+      </div>
+      <div class="row"><span class="label">Running</span><span class="value" id="aiRunning">--</span></div>
+      <div class="row">
+        <span class="label">Auto-debug</span>
+        <label class="toggle">
+          <input type="checkbox" id="autoDebugToggle" onchange="toggleAutoDebug()">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="btn-group">
+        <button class="btn primary" onclick="postAction('/ai/debug',{})">Debug</button>
+        <button class="btn danger" onclick="postAction('/ai/stop')">Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Code Activity Card -->
+  <div class="card">
+    <div class="card-header">Code Activity</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Editing</span><span class="value" id="codeEditing">--</span></div>
+      <div class="row"><span class="label">Ext Claude</span><span class="value" id="codeExtClaude">--</span></div>
+      <div class="row"><span class="label">Pending Debug</span><span class="value" id="codePending">--</span></div>
+    </div>
+  </div>
+
+  <!-- Dev-Start Controls -->
+  <div class="card two-col">
+    <div class="card-header">Dev-Start Controls</div>
+    <div class="card-body">
+      <div class="btn-group">
+        <button class="btn success" onclick="postAction('/dev-start/backend')">Backend</button>
+        <button class="btn success" onclick="postAction('/dev-start/frontend')">Frontend</button>
+        <button class="btn success" onclick="postAction('/dev-start/docker')">Docker</button>
+        <button class="btn success" onclick="postAction('/dev-start/all')">All</button>
+        <button class="btn danger" onclick="postAction('/dev-start/stop')">Stop All</button>
+        <button class="btn" onclick="postAction('/dev-start/clean')">Clean</button>
+        <button class="btn" onclick="postAction('/dev-start/fresh')">Fresh</button>
+        <button class="btn" onclick="postAction('/dev-start/migrate')">Migrate</button>
+      </div>
+      <div class="btn-group" style="margin-top:6px;">
+        <button class="btn danger" onclick="postAction('/dev-start/backend/stop')">Stop Backend</button>
+        <button class="btn danger" onclick="postAction('/dev-start/frontend/stop')">Stop Frontend</button>
+        <button class="btn danger" onclick="postAction('/dev-start/docker/stop')">Stop Docker</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Expo Card -->
+  <div class="card">
+    <div class="card-header">Expo</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Status</span><span class="value" id="expoStatus">--</span></div>
+      <div class="row"><span class="label">PID</span><span class="value" id="expoPid">--</span></div>
+      <div class="row"><span class="label">Port</span><span class="value" id="expoPort">--</span></div>
+      <div class="row"><span class="label">Configured</span><span class="value" id="expoConfigured">--</span></div>
+      <div class="btn-group">
+        <button class="btn success" id="expoStartBtn" onclick="postAction('/expo/start')">Start</button>
+        <button class="btn danger" id="expoStopBtn" onclick="postAction('/expo/stop')">Stop</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- UI Bridge Card -->
+  <div class="card">
+    <div class="card-header">UI Bridge</div>
+    <div class="card-body">
+      <div class="row"><span class="label">Status</span><span class="value" id="uibStatus">--</span></div>
+      <div class="row"><span class="label">Elements</span><span class="value" id="uibElements">--</span></div>
+      <div class="row"><span class="label">Components</span><span class="value" id="uibComponents">--</span></div>
+      <div class="row"><span class="label">Updated</span><span class="value" id="uibLastUpdate">--</span></div>
+      <div class="btn-group">
+        <button class="btn primary" onclick="refreshUiBridge()">Refresh</button>
+        <button class="btn" onclick="window.open('/ui-bridge/control/snapshot','_blank')">View JSON</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Workflow Loop -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Workflow Loop<span class="wl-badge" id="wlQueueBadge" style="display:none">0</span></span>
+      <span class="wl-status-phase idle" id="wlPhaseTag">idle</span>
+    </div>
+    <div class="card-body">
+      <div class="wl-panel">
+        <!-- Left: Queue & Config -->
+        <div>
+          <div class="wl-section-title">Add Workflow</div>
+          <div class="wl-add-row">
+            <select id="wlWorkflowSelect"><option value="">Loading workflows...</option></select>
+            <button class="btn primary" onclick="wlAddToQueue()">+ Add</button>
+            <button class="btn" onclick="wlRefreshWorkflows()" title="Refresh workflow list">&#x21bb;</button>
+          </div>
+
+          <div class="wl-section-title">Queue</div>
+          <ul class="wl-queue" id="wlQueue">
+            <li class="wl-queue-empty">No workflows queued</li>
+          </ul>
+
+          <div class="wl-section-title" style="margin-top:10px">Configuration</div>
+          <div class="wl-config-row">
+            <span class="label">Exit Strategy</span>
+            <select id="wlExitStrategy">
+              <option value="fixed_iterations">Fixed Iterations</option>
+              <option value="reflection">Reflection (0 fixes = exit)</option>
+              <option value="workflow_verification">Verification (pass on 1st = exit)</option>
+            </select>
+          </div>
+          <div class="wl-config-row">
+            <span class="label">Between Iterations</span>
+            <select id="wlBetween">
+              <option value="restart_on_signal">Restart on Signal (rebuild)</option>
+              <option value="restart_on_signal_no_rebuild">Restart on Signal (no rebuild)</option>
+              <option value="restart_runner">Always Restart (rebuild)</option>
+              <option value="restart_runner_no_rebuild">Always Restart (no rebuild)</option>
+              <option value="wait_healthy">Wait for Healthy</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+          <div class="wl-config-row">
+            <span class="label">Max Iterations</span>
+            <input type="number" id="wlMaxIter" value="5" min="1" max="50">
+          </div>
+
+          <div class="btn-group" style="margin-top:12px">
+            <button class="btn success" id="wlStartBtn" onclick="wlStart()">Run Loop</button>
+            <button class="btn danger" id="wlStopBtn" onclick="wlStop()" disabled>Stop</button>
+            <button class="btn" id="wlClearBtn" onclick="wlClearQueue()">Clear</button>
+          </div>
+        </div>
+
+        <!-- Right: Status & History -->
+        <div>
+          <div class="wl-section-title">Status</div>
+          <div class="row"><span class="label">Phase</span><span class="value" id="wlPhase">idle</span></div>
+          <div class="row"><span class="label">Iteration</span><span class="value" id="wlIteration">--</span></div>
+          <div class="row"><span class="label">Started</span><span class="value" id="wlStarted">--</span></div>
+          <div class="row"><span class="label">Error</span><span class="value" id="wlError" style="color:var(--text-secondary)">none</span></div>
+          <div class="wl-progress" id="wlProgress" style="display:none">
+            <div class="wl-progress-bar" id="wlProgressBar" style="width:0%"></div>
+          </div>
+
+          <div class="wl-section-title" style="margin-top:12px">Iteration History</div>
+          <div class="wl-history" id="wlHistory">
+            <div style="color:var(--text-secondary);font-size:12px;padding:8px 0;text-align:center">No iterations yet</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log Viewer -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span>Log Viewer</span>
+    </div>
+    <div class="toolbar">
+      <label>Source:</label>
+      <select id="logSourceFilter" onchange="filterLogs()">
+        <option value="all">All</option>
+        <option value="runner">Runner</option>
+        <option value="supervisor">Supervisor</option>
+        <option value="build">Build</option>
+        <option value="watchdog">Watchdog</option>
+        <option value="expo">Expo</option>
+        <option value="workflowloop">Workflow Loop</option>
+      </select>
+      <label>Level:</label>
+      <select id="logLevelFilter" onchange="filterLogs()">
+        <option value="all">All</option>
+        <option value="info">Info</option>
+        <option value="warn">Warn</option>
+        <option value="error">Error</option>
+      </select>
+      <div class="search-wrapper">
+        <input id="logSearch" type="text" placeholder="Search logs...">
+        <button class="search-clear" id="searchClear" onclick="clearSearch()">&times;</button>
+      </div>
+      <span id="searchCount"></span>
+      <span class="spacer"></span>
+      <button class="btn" id="logPauseBtn" onclick="toggleLogPause()">Pause</button>
+      <button class="btn" onclick="clearLogs()">Clear</button>
+    </div>
+    <div class="log-viewer" id="logViewer" tabindex="0"></div>
+  </div>
+
+  <!-- AI Output -->
+  <div class="card full-width">
+    <div class="card-header">AI Output</div>
+    <div class="ai-output" id="aiOutput">
+      <div class="line" style="color:var(--text-secondary)">No AI output yet.</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // --- State ---
+  const MAX_LOG_ENTRIES = 1000;
+  let logEntries = [];
+  let logPaused = false;
+  let lastHealth = null;
+  let watchdogEnabled = false;
+  let sseConnected = false;
+  let aiSseConnected = false;
+  let wsConnected = false;
+  let modelsLoaded = false;
+  let aiModels = [];
+  let uptimeTimer = null;
+  let searchDebounceTimer = null;
+  let currentSearchTerm = '';
+
+  // --- Reconnect control (prevents zombie sockets) ---
+  let serverShuttingDown = false;
+  let wsReconnectDelay = 3000;   // exponential backoff: 3s → 6s → 12s → 30s max
+  let sseReconnectDelay = 3000;
+  let aiSseReconnectDelay = 3000;
+  const MAX_RECONNECT_DELAY = 30000;
+
+  function nextDelay(current) {
+    return Math.min(current * 2, MAX_RECONNECT_DELAY);
+  }
+
+  function closeAllConnections() {
+    if (logSSE) { logSSE.close(); logSSE = null; }
+    if (aiSSE) { aiSSE.close(); aiSSE = null; }
+    if (ws) { ws.close(); ws = null; }
+    if (wlLoopSSE) { wlLoopSSE.close(); wlLoopSSE = null; }
+    sseConnected = false;
+    aiSseConnected = false;
+    wsConnected = false;
+    updateConnectionIndicators();
+  }
+
+  // --- Browser Notifications ---
+  let notificationsEnabled = localStorage.getItem('notificationsEnabled') === 'true';
+  let lastNotifyState = {};
+
+  function updateNotifyToggle() {
+    var btn = document.getElementById('notifyToggle');
+    if (!('Notification' in window)) {
+      btn.textContent = '\uD83D\uDD15';
+      btn.title = 'Notifications not supported';
+      return;
+    }
+    if (notificationsEnabled && Notification.permission === 'granted') {
+      btn.textContent = '\uD83D\uDD14 On';
+      btn.className = 'notify-toggle active';
+    } else if (Notification.permission === 'denied') {
+      btn.textContent = '\uD83D\uDD15 Blocked';
+      btn.className = 'notify-toggle';
+    } else {
+      btn.textContent = '\uD83D\uDD15 Off';
+      btn.className = 'notify-toggle';
+    }
+  }
+
+  window.toggleNotifications = function() {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') {
+      Notification.requestPermission().then(function() {
+        if (Notification.permission === 'granted') {
+          notificationsEnabled = true;
+          localStorage.setItem('notificationsEnabled', 'true');
+        }
+        updateNotifyToggle();
+      });
+      return;
+    }
+    notificationsEnabled = !notificationsEnabled;
+    localStorage.setItem('notificationsEnabled', String(notificationsEnabled));
+    updateNotifyToggle();
+  };
+
+  function sendBrowserNotification(title, body) {
+    if (!notificationsEnabled) return;
+    if (document.hasFocus()) return; // hasFocus() is false when another window is focused
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body: body });
+    }
+  }
+
+  function checkStateTransitions(health) {
+    var prev = lastNotifyState;
+    if (prev.runner_running === true && !health.runner.running) {
+      sendBrowserNotification('Supervisor', 'Runner stopped');
+    }
+    if (prev.runner_running === false && health.runner.running) {
+      sendBrowserNotification('Supervisor', 'Runner started');
+    }
+    if (!prev.build_error && health.build.error_detected && health.build.last_error) {
+      sendBrowserNotification('Supervisor', 'Build error: ' + health.build.last_error.substring(0, 80));
+    }
+    if (!prev.ai_running && health.ai.ai_running) {
+      sendBrowserNotification('Supervisor', 'AI debug session started');
+    }
+    if (prev.ai_running === true && !health.ai.ai_running) {
+      sendBrowserNotification('Supervisor', 'AI debug session completed');
+    }
+    lastNotifyState = {
+      runner_running: health.runner.running,
+      build_error: health.build.error_detected,
+      ai_running: health.ai.ai_running
+    };
+  }
+
+  updateNotifyToggle();
+
+  // --- Toast Notifications ---
+  function showToast(message, type) {
+    type = type || 'success';
+    const container = document.getElementById('toastContainer');
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + type;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(function() {
+      toast.classList.add('removing');
+      setTimeout(function() { toast.remove(); }, 200);
+    }, 3000);
+  }
+
+  // --- Clock ---
+  function updateClock() {
+    var now = new Date();
+    document.getElementById('clock').textContent = now.toLocaleTimeString();
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+
+  // --- Uptime ---
+  function formatUptime(seconds) {
+    if (seconds < 0) return '--';
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = Math.floor(seconds % 60);
+    if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+    if (m > 0) return m + 'm ' + s + 's';
+    return s + 's';
+  }
+
+  function updateUptime() {
+    var el = document.getElementById('runnerUptime');
+    if (!lastHealth || !lastHealth.runner.running || !lastHealth.runner.started_at) {
+      el.textContent = '--';
+      return;
+    }
+    var started = new Date(lastHealth.runner.started_at).getTime();
+    var now = Date.now();
+    var secs = (now - started) / 1000;
+    el.textContent = formatUptime(secs);
+  }
+
+  uptimeTimer = setInterval(updateUptime, 1000);
+
+  // --- API Helpers ---
+  var BASE = '';
+
+  async function fetchJSON(url) {
+    var resp = await fetch(BASE + url);
+    return resp.json();
+  }
+
+  async function postAction(url, body) {
+    var btn = (typeof event !== 'undefined' && event) ? event.target : null;
+    if (btn && btn.classList) btn.classList.add('loading');
+    // Immediate feedback — extract action name from URL
+    var action = url.split('/').pop().replace(/-/g, ' ');
+    showToast('Running: ' + action + '...', 'info');
+    try {
+      var opts = { method: 'POST', headers: {'Content-Type': 'application/json'} };
+      if (body !== undefined) opts.body = JSON.stringify(body);
+      var resp = await fetch(BASE + url, opts);
+      var data = await resp.json().catch(function() { return {}; });
+      if (data.status === 'error' || data.status === 'timeout') {
+        showToast(data.stderr || data.message || 'Action failed', 'error');
+      } else {
+        showToast(data.message || action + ' completed', 'success');
+      }
+      setTimeout(function() { pollHealth(); pollDevStartStatus(); }, 500);
+    } catch(e) {
+      showToast('Request failed: ' + e.message, 'error');
+      setTimeout(function() { pollHealth(); }, 500);
+    } finally {
+      if (btn && btn.classList) {
+        setTimeout(function() { btn.classList.remove('loading'); }, 500);
+      }
+    }
+  }
+
+  // Make postAction globally accessible
+  window.postAction = postAction;
+
+  // --- Health (fetched on demand, pushed via WS) ---
+  async function pollHealth() {
+    try {
+      var h = await fetchJSON('/health');
+      lastHealth = h;
+      updateHealthUI(h);
+      updateUibFromHealth(h);
+    } catch(e) {
+      document.getElementById('statusDot').className = 'status-dot stopped';
+      document.getElementById('statusText').textContent = 'Disconnected';
+    }
+  }
+
+  function updateHealthUI(h) {
+    // Check for state transitions (browser notifications)
+    checkStateTransitions(h);
+
+    // Status bar
+    var dot = document.getElementById('statusDot');
+    var txt = document.getElementById('statusText');
+    dot.className = 'status-dot ' + h.status;
+    txt.textContent = h.status.charAt(0).toUpperCase() + h.status.slice(1);
+
+    document.getElementById('supervisorVersion').textContent = 'v' + h.supervisor.version;
+
+    // Runner
+    document.getElementById('runnerStatus').textContent = h.runner.running ? 'Running' : 'Stopped';
+    document.getElementById('runnerStatus').style.color = h.runner.running ? 'var(--success)' : 'var(--error)';
+    document.getElementById('runnerPid').textContent = h.runner.pid || '--';
+    document.getElementById('runnerMode').textContent = h.runner.mode;
+    document.getElementById('runnerApi').textContent = h.runner.api_responding ? 'Responding' : 'Not responding';
+    document.getElementById('runnerApi').style.color = h.runner.api_responding ? 'var(--success)' : 'var(--text-secondary)';
+
+    // Watchdog
+    watchdogEnabled = h.watchdog.enabled;
+    document.getElementById('watchdogEnabled').textContent = h.watchdog.enabled ? 'Yes' : 'No';
+    document.getElementById('watchdogEnabled').style.color = h.watchdog.enabled ? 'var(--success)' : 'var(--text-secondary)';
+    document.getElementById('watchdogAttempts').textContent = h.watchdog.restart_attempts + '/3';
+    document.getElementById('watchdogCrashes').textContent = h.watchdog.crash_count;
+
+    // Build
+    if (h.build.in_progress) {
+      document.getElementById('buildStatus').textContent = 'Building...';
+      document.getElementById('buildStatus').style.color = 'var(--warning)';
+    } else if (h.build.error_detected) {
+      document.getElementById('buildStatus').textContent = 'Error';
+      document.getElementById('buildStatus').style.color = 'var(--error)';
+    } else {
+      document.getElementById('buildStatus').textContent = 'OK';
+      document.getElementById('buildStatus').style.color = 'var(--success)';
+    }
+    document.getElementById('buildError').textContent = h.build.last_error ? h.build.last_error.substring(0, 60) + '...' : 'None';
+    document.getElementById('buildLast').textContent = h.build.last_build_at ? formatTime(h.build.last_build_at) : '--';
+
+    // AI
+    document.getElementById('aiRunning').textContent = h.ai.ai_running ? 'Yes' : 'No';
+    document.getElementById('aiRunning').style.color = h.ai.ai_running ? 'var(--warning)' : 'var(--text-secondary)';
+    document.getElementById('autoDebugToggle').checked = h.ai.auto_debug_enabled;
+
+    // Select the current provider/model combo
+    if (modelsLoaded) {
+      var combo = h.ai.ai_provider + '/' + h.ai.ai_model;
+      var sel = document.getElementById('aiProvider');
+      if (sel.value !== combo) sel.value = combo;
+    }
+
+    // Code activity
+    document.getElementById('codeEditing').textContent = h.code_activity.code_being_edited ? 'Yes' : 'No';
+    document.getElementById('codeExtClaude').textContent = h.code_activity.external_claude_session ? 'Yes' : 'No';
+    document.getElementById('codePending').textContent = h.code_activity.pending_debug ? 'Yes' : 'No';
+
+    // Expo
+    document.getElementById('expoStatus').textContent = h.expo.running ? 'Running' : 'Stopped';
+    document.getElementById('expoStatus').style.color = h.expo.running ? 'var(--success)' : 'var(--text-secondary)';
+    document.getElementById('expoPid').textContent = h.expo.pid || '--';
+    document.getElementById('expoPort').textContent = h.expo.port;
+    document.getElementById('expoConfigured').textContent = h.expo.configured ? 'Yes' : 'No';
+    document.getElementById('expoStartBtn').disabled = !h.expo.configured || h.expo.running;
+    document.getElementById('expoStopBtn').disabled = !h.expo.running;
+
+    // Update uptime immediately
+    updateUptime();
+  }
+
+  function formatTime(iso) {
+    if (!iso) return '--';
+    var d = new Date(iso);
+    return d.toLocaleTimeString();
+  }
+
+  // No periodic polling — health comes via WS push or after actions
+
+  // --- Dev-Start Status Polling (ports) ---
+  async function pollDevStartStatus() {
+    try {
+      var data = await fetchJSON('/dev-start/status');
+      updatePortsUI(data);
+    } catch(e) { /* ignore */ }
+  }
+
+  function updatePortsUI(data) {
+    var list = document.getElementById('portList');
+    if (!data.services) return;
+
+    var html = '';
+    for (var i = 0; i < data.services.length; i++) {
+      var svc = data.services[i];
+      var up = svc.available;
+      var dotClass = up ? 'up' : 'down';
+      html += '<li><span class="port-dot ' + dotClass + '"></span>' +
+              svc.port + ' ' + svc.name + '</li>';
+    }
+
+    list.innerHTML = html;
+  }
+
+  // No periodic polling — fetched after actions
+
+  // --- AI Models ---
+  async function loadModels() {
+    try {
+      var data = await fetchJSON('/ai/models');
+      aiModels = data.models || [];
+      var sel = document.getElementById('aiProvider');
+      sel.innerHTML = '';
+      for (var i = 0; i < aiModels.length; i++) {
+        var m = aiModels[i];
+        var opt = document.createElement('option');
+        opt.value = m.provider + '/' + m.key;
+        opt.textContent = m.display_name;
+        sel.appendChild(opt);
+      }
+      modelsLoaded = true;
+    } catch(e) { /* ignore */ }
+  }
+  loadModels();
+
+  window.setAiProvider = function() {
+    var sel = document.getElementById('aiProvider');
+    var parts = sel.value.split('/');
+    postAction('/ai/provider', { provider: parts[0], model: parts[1] });
+  };
+
+  window.toggleAutoDebug = function() {
+    var checked = document.getElementById('autoDebugToggle').checked;
+    postAction('/ai/auto-debug', { enabled: checked });
+  };
+
+  window.toggleWatchdog = function() {
+    postAction('/runner/watchdog', { enabled: !watchdogEnabled });
+  };
+
+  // --- Keyboard Shortcuts ---
+  document.addEventListener('keydown', function(e) {
+    var tag = e.target.tagName;
+
+    // Escape clears search when in search input, otherwise blurs
+    if (e.key === 'Escape') {
+      if (e.target.id === 'logSearch' && e.target.value) {
+        window.clearSearch();
+      } else {
+        document.activeElement.blur();
+      }
+      return;
+    }
+
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+    if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      document.getElementById('logSearch').focus();
+    } else if (e.key === 'r' && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      postAction('/runner/restart', {rebuild: false});
+    } else if (e.key === 's' && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      postAction('/runner/stop');
+    } else if (e.key === 'l' && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      document.getElementById('logViewer').focus();
+    } else if (e.key === 'p' && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      window.toggleLogPause();
+    }
+  });
+
+  // --- SSE Log Stream ---
+  var logSSE = null;
+
+  function connectLogSSE() {
+    if (serverShuttingDown) return;
+    if (logSSE) logSSE.close();
+    logSSE = new EventSource(BASE + '/logs/stream');
+
+    logSSE.addEventListener('log', function(e) {
+      try {
+        var entry = JSON.parse(e.data);
+        addLogEntry(entry);
+      } catch(err) { /* ignore */ }
+    });
+
+    logSSE.onopen = function() {
+      sseConnected = true;
+      sseReconnectDelay = 3000; // reset backoff on success
+      updateConnectionIndicators();
+    };
+
+    logSSE.onerror = function() {
+      sseConnected = false;
+      updateConnectionIndicators();
+      logSSE.close();
+      if (!serverShuttingDown) {
+        setTimeout(connectLogSSE, sseReconnectDelay);
+        sseReconnectDelay = nextDelay(sseReconnectDelay);
+      }
+    };
+  }
+
+  function addLogEntry(entry) {
+    logEntries.push(entry);
+    if (logEntries.length > MAX_LOG_ENTRIES) {
+      logEntries.shift();
+    }
+    if (!logPaused) renderLogs();
+  }
+
+  function renderLogs() {
+    var viewer = document.getElementById('logViewer');
+    var srcFilter = document.getElementById('logSourceFilter').value;
+    var lvlFilter = document.getElementById('logLevelFilter').value;
+    var search = currentSearchTerm.toLowerCase();
+
+    var filtered = logEntries.filter(function(e) {
+      if (srcFilter !== 'all' && e.source !== srcFilter) return false;
+      if (lvlFilter !== 'all' && e.level !== lvlFilter) return false;
+      if (search && e.message && e.message.toLowerCase().indexOf(search) === -1) return false;
+      return true;
+    });
+
+    // Update search count
+    var countEl = document.getElementById('searchCount');
+    if (search) {
+      countEl.textContent = filtered.length + ' match' + (filtered.length !== 1 ? 'es' : '');
+    } else {
+      countEl.textContent = '';
+    }
+
+    // Only render last 200 visible
+    var visible = filtered.slice(-200);
+
+    var html = '';
+    for (var i = 0; i < visible.length; i++) {
+      var e = visible[i];
+      var ts = formatLogTime(e.timestamp);
+      var lvl = e.level || 'info';
+      var msgHtml = escapeHtml(e.message);
+      if (search) {
+        msgHtml = highlightSearch(msgHtml, search);
+      }
+      html += '<div class="entry ' + lvl + '">' +
+              '<span class="ts">' + ts + '</span>' +
+              '<span class="src ' + e.source + '">[' + e.source + ']</span>' +
+              '<span class="msg">' + msgHtml + '</span>' +
+              '</div>';
+    }
+
+    var wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 30;
+    viewer.innerHTML = html;
+    if (wasAtBottom) {
+      viewer.scrollTop = viewer.scrollHeight;
+    }
+  }
+
+  function highlightSearch(html, term) {
+    // Case-insensitive highlight on already-escaped HTML
+    var lower = html.toLowerCase();
+    var result = '';
+    var pos = 0;
+    while (pos < html.length) {
+      var idx = lower.indexOf(term, pos);
+      if (idx === -1) {
+        result += html.substring(pos);
+        break;
+      }
+      result += html.substring(pos, idx);
+      result += '<mark>' + html.substring(idx, idx + term.length) + '</mark>';
+      pos = idx + term.length;
+    }
+    return result;
+  }
+
+  function formatLogTime(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  window.filterLogs = function() { renderLogs(); };
+
+  window.toggleLogPause = function() {
+    logPaused = !logPaused;
+    document.getElementById('logPauseBtn').textContent = logPaused ? 'Resume' : 'Pause';
+    if (!logPaused) renderLogs();
+  };
+
+  window.clearLogs = function() {
+    logEntries = [];
+    document.getElementById('logViewer').innerHTML = '';
+    document.getElementById('searchCount').textContent = '';
+  };
+
+  window.clearSearch = function() {
+    var input = document.getElementById('logSearch');
+    input.value = '';
+    currentSearchTerm = '';
+    document.getElementById('searchClear').style.display = 'none';
+    renderLogs();
+    input.blur();
+  };
+
+  // Search input with debounce
+  document.getElementById('logSearch').addEventListener('input', function() {
+    var val = this.value;
+    document.getElementById('searchClear').style.display = val ? 'block' : 'none';
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(function() {
+      currentSearchTerm = val;
+      renderLogs();
+    }, 200);
+  });
+
+  connectLogSSE();
+
+  // --- UI Bridge Status ---
+  // NOTE: Snapshot requests are expensive — they force layout recalculation
+  // for every registered element in the runner's webview (200-500 elements).
+  // Do NOT auto-poll. Use manual refresh or the lightweight health-based status.
+  var uibPolling = false;
+
+  function setUibState(status, statusColor, elements, components) {
+    document.getElementById('uibStatus').textContent = status;
+    document.getElementById('uibStatus').style.color = statusColor;
+    document.getElementById('uibElements').textContent = elements;
+    document.getElementById('uibComponents').textContent = components;
+  }
+
+  // Lightweight status: derive from health data (no snapshot call)
+  function updateUibFromHealth(h) {
+    if (!h || !h.runner || !h.runner.api_responding) {
+      setUibState('Runner offline', 'var(--text-secondary)', '--', '--');
+    } else {
+      // Runner API is up — UI Bridge is available but we don't know element count
+      // without an expensive snapshot call. Show "Available" instead of "--".
+      var st = document.getElementById('uibStatus');
+      if (st.textContent === '--' || st.textContent === 'Runner offline') {
+        setUibState('Available', 'var(--primary)', '-', '-');
+      }
+    }
+  }
+
+  // Full snapshot fetch (manual only — expensive!)
+  async function pollUiBridge() {
+    if (uibPolling) return;
+    uibPolling = true;
+
+    if (!lastHealth || !lastHealth.runner.api_responding) {
+      setUibState('Runner offline', 'var(--text-secondary)', '--', '--');
+      uibPolling = false;
+      return;
+    }
+
+    try {
+      var controller = new AbortController();
+      var fetchTimer = setTimeout(function() { controller.abort(); }, 4000);
+      var resp = await fetch(BASE + '/ui-bridge/control/snapshot', { signal: controller.signal });
+      clearTimeout(fetchTimer);
+      if (resp.status === 502 || resp.status === 504) {
+        setUibState('IPC timeout', 'var(--warning)', '--', '--');
+        document.getElementById('uibLastUpdate').textContent = new Date().toLocaleTimeString();
+        uibPolling = false;
+        return;
+      }
+      if (!resp.ok) {
+        setUibState('Error (' + resp.status + ')', 'var(--error)', '--', '--');
+        document.getElementById('uibLastUpdate').textContent = new Date().toLocaleTimeString();
+        uibPolling = false;
+        return;
+      }
+      var data = await resp.json();
+      var snapshot = data.data || data;
+      var elements = (snapshot.elements && Array.isArray(snapshot.elements)) ? snapshot.elements.length : 0;
+      var components = (snapshot.components && Array.isArray(snapshot.components) && snapshot.components.length > 0)
+        ? snapshot.components.length : 0;
+      if (components === 0 && snapshot.elements && Array.isArray(snapshot.elements)) {
+        var seen = {};
+        for (var i = 0; i < snapshot.elements.length; i++) {
+          var t = snapshot.elements[i].type || '';
+          if (t && !seen[t]) { seen[t] = true; components++; }
+        }
+      }
+      setUibState('Connected', 'var(--success)', elements, components);
+      document.getElementById('uibLastUpdate').textContent = new Date().toLocaleTimeString();
+    } catch(e) {
+      if (e.name === 'AbortError') {
+        setUibState('Timeout', 'var(--warning)', '--', '--');
+      } else {
+        setUibState('Error', 'var(--error)', '--', '--');
+      }
+      document.getElementById('uibLastUpdate').textContent = new Date().toLocaleTimeString();
+    } finally {
+      uibPolling = false;
+    }
+  }
+
+  window.refreshUiBridge = function() {
+    var btn = event ? event.target : null;
+    if (btn) btn.classList.add('loading');
+    pollUiBridge().finally(function() {
+      if (btn) setTimeout(function() { btn.classList.remove('loading'); }, 300);
+    });
+  };
+
+  // --- SSE AI Output Stream ---
+  var aiSSE = null;
+
+  function connectAiSSE() {
+    if (serverShuttingDown) return;
+    if (aiSSE) aiSSE.close();
+    aiSSE = new EventSource(BASE + '/ai/output/stream');
+
+    aiSSE.addEventListener('ai_output', function(e) {
+      try {
+        var entries = JSON.parse(e.data);
+        if (Array.isArray(entries) && entries.length > 0) {
+          appendAiOutput(entries);
+        }
+      } catch(err) { /* ignore */ }
+    });
+
+    aiSSE.onopen = function() {
+      aiSseConnected = true;
+      aiSseReconnectDelay = 3000; // reset backoff on success
+      updateConnectionIndicators();
+    };
+
+    aiSSE.onerror = function() {
+      aiSseConnected = false;
+      updateConnectionIndicators();
+      aiSSE.close();
+      if (!serverShuttingDown) {
+        setTimeout(connectAiSSE, aiSseReconnectDelay);
+        aiSseReconnectDelay = nextDelay(aiSseReconnectDelay);
+      }
+    };
+  }
+
+  function appendAiOutput(entries) {
+    var container = document.getElementById('aiOutput');
+    // Clear placeholder
+    if (container.querySelector('.line[style]')) {
+      container.innerHTML = '';
+    }
+
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      var div = document.createElement('div');
+      div.className = 'line';
+      div.textContent = entry.line;
+      if (entry.stream === 'stderr') {
+        div.style.color = 'var(--error)';
+      }
+      container.appendChild(div);
+    }
+
+    // Keep max 500 lines
+    while (container.children.length > 500) {
+      container.removeChild(container.firstChild);
+    }
+
+    container.scrollTop = container.scrollHeight;
+  }
+
+  connectAiSSE();
+
+  // --- WebSocket Health Connection ---
+  var ws = null;
+  var wsReconnectTimer = null;
+
+  function connectWS() {
+    if (serverShuttingDown) return;
+    if (ws) { ws.close(); ws = null; }
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var url = protocol + '//' + location.host + '/ws';
+
+    try {
+      ws = new WebSocket(url);
+    } catch(e) {
+      return;
+    }
+
+    ws.onopen = function() {
+      wsConnected = true;
+      wsReconnectDelay = 3000; // reset backoff on success
+      updateConnectionIndicators();
+      // Fetch current state on connect
+      pollHealth();
+      pollDevStartStatus();
+    };
+
+    ws.onmessage = function(e) {
+      try {
+        var msg = JSON.parse(e.data);
+        // Server shutdown notification — stop all reconnections
+        if (msg.type === 'shutdown') {
+          serverShuttingDown = true;
+          closeAllConnections();
+          document.getElementById('statusDot').className = 'status-dot stopped';
+          document.getElementById('statusText').textContent = 'Server shutting down';
+          showToast('Server is shutting down', 'info');
+          return;
+        }
+        lastHealth = msg;
+        updateHealthUI(msg);
+      } catch(err) { /* ignore */ }
+    };
+
+    ws.onclose = function() {
+      wsConnected = false;
+      ws = null;
+      updateConnectionIndicators();
+      if (!serverShuttingDown) {
+        if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = setTimeout(connectWS, wsReconnectDelay);
+        wsReconnectDelay = nextDelay(wsReconnectDelay);
+      }
+    };
+
+    ws.onerror = function() {
+      // onclose will fire after this
+    };
+  }
+
+  connectWS();
+
+  // --- Connection Indicators ---
+  function updateConnectionIndicators() {
+    // WS indicator
+    var wsEl = document.getElementById('wsIndicator');
+    if (wsConnected) {
+      wsEl.textContent = 'WS: Yes';
+      wsEl.className = 'connection-indicator connected';
+    } else {
+      wsEl.textContent = 'WS: No';
+      wsEl.className = 'connection-indicator disconnected';
+    }
+
+    // SSE indicator
+    var sseEl = document.getElementById('sseIndicator');
+    if (sseConnected && aiSseConnected) {
+      sseEl.textContent = 'SSE: Yes';
+      sseEl.className = 'connection-indicator connected';
+    } else if (sseConnected || aiSseConnected) {
+      sseEl.textContent = 'SSE: Partial';
+      sseEl.className = 'connection-indicator connected';
+    } else {
+      sseEl.textContent = 'SSE: No';
+      sseEl.className = 'connection-indicator disconnected';
+    }
+  }
+
+  // --- Workflow Loop ---
+  var wlWorkflows = [];
+  var wlQueueItems = JSON.parse(localStorage.getItem('wl-queue') || '[]');
+  var wlLoopSSE = null;
+  var wlLastStatus = null;
+  var wlStatusPollTimer = null;
+
+  function wlRenderQueue() {
+    var ul = document.getElementById('wlQueue');
+    var badge = document.getElementById('wlQueueBadge');
+    if (wlQueueItems.length === 0) {
+      ul.innerHTML = '<li class="wl-queue-empty">No workflows queued</li>';
+      ul.className = 'wl-queue';
+      badge.style.display = 'none';
+      return;
+    }
+    ul.className = 'wl-queue has-items';
+    badge.style.display = 'inline-flex';
+    badge.textContent = wlQueueItems.length;
+    var html = '';
+    for (var i = 0; i < wlQueueItems.length; i++) {
+      var item = wlQueueItems[i];
+      var steps = item.steps || '?';
+      html += '<li class="wl-queue-item" draggable="true" data-idx="' + i + '"' +
+              ' ondragstart="wlDragStart(event)" ondragover="wlDragOver(event)"' +
+              ' ondragenter="wlDragEnter(event)" ondragleave="wlDragLeave(event)"' +
+              ' ondrop="wlDrop(event)" ondragend="wlDragEnd(event)">' +
+              '<span class="wl-queue-num">' + (i + 1) + '</span>' +
+              '<span class="wl-queue-name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span>' +
+              '<span class="wl-queue-steps">' + steps + ' steps</span>' +
+              '<button class="wl-queue-remove" onclick="wlRemoveFromQueue(' + i + ')">&times;</button>' +
+              '</li>';
+    }
+    ul.innerHTML = html;
+  }
+
+  function wlSaveQueue() {
+    localStorage.setItem('wl-queue', JSON.stringify(wlQueueItems));
+  }
+
+  window.wlAddToQueue = function() {
+    var sel = document.getElementById('wlWorkflowSelect');
+    var id = sel.value;
+    if (!id) return;
+    var wf = wlWorkflows.find(function(w) { return w.id === id; });
+    if (!wf) return;
+    // Don't add duplicates
+    if (wlQueueItems.some(function(q) { return q.id === id; })) {
+      showToast('Workflow already in queue', 'error');
+      return;
+    }
+    var stepCount = 0;
+    if (wf.steps && Array.isArray(wf.steps)) stepCount = wf.steps.length;
+    wlQueueItems.push({ id: wf.id, name: wf.name || wf.id, steps: stepCount });
+    wlSaveQueue();
+    wlRenderQueue();
+  };
+
+  window.wlRemoveFromQueue = function(idx) {
+    wlQueueItems.splice(idx, 1);
+    wlSaveQueue();
+    wlRenderQueue();
+  };
+
+  window.wlClearQueue = function() {
+    wlQueueItems = [];
+    wlSaveQueue();
+    wlRenderQueue();
+  };
+
+  // Drag and drop
+  var wlDragIdx = null;
+  window.wlDragStart = function(e) {
+    wlDragIdx = parseInt(e.currentTarget.dataset.idx);
+    e.currentTarget.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  window.wlDragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+  window.wlDragEnter = function(e) {
+    e.preventDefault();
+    e.currentTarget.classList.add('drag-over');
+  };
+  window.wlDragLeave = function(e) { e.currentTarget.classList.remove('drag-over'); };
+  window.wlDragEnd = function(e) { e.currentTarget.classList.remove('dragging'); };
+  window.wlDrop = function(e) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('drag-over');
+    var toIdx = parseInt(e.currentTarget.dataset.idx);
+    if (wlDragIdx === null || wlDragIdx === toIdx) return;
+    var item = wlQueueItems.splice(wlDragIdx, 1)[0];
+    wlQueueItems.splice(toIdx, 0, item);
+    wlDragIdx = null;
+    wlSaveQueue();
+    wlRenderQueue();
+  };
+
+  async function wlFetchWorkflows() {
+    var sel = document.getElementById('wlWorkflowSelect');
+    try {
+      // Fetch from runner API through proxy or direct
+      var resp = await fetch('http://127.0.0.1:9876/unified-workflows');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      var data = await resp.json();
+      var list = data.data || data;
+      if (!Array.isArray(list)) list = [];
+      wlWorkflows = list;
+      sel.innerHTML = '<option value="">Select a workflow...</option>';
+      for (var i = 0; i < list.length; i++) {
+        var wf = list[i];
+        var opt = document.createElement('option');
+        opt.value = wf.id;
+        var stepCount = (wf.steps && Array.isArray(wf.steps)) ? wf.steps.length : 0;
+        opt.textContent = (wf.name || wf.id) + ' (' + stepCount + ' steps)';
+        sel.appendChild(opt);
+      }
+      // Update queue items with fresh step counts
+      for (var q = 0; q < wlQueueItems.length; q++) {
+        var match = list.find(function(w) { return w.id === wlQueueItems[q].id; });
+        if (match) {
+          wlQueueItems[q].name = match.name || match.id;
+          wlQueueItems[q].steps = (match.steps && Array.isArray(match.steps)) ? match.steps.length : 0;
+        }
+      }
+      wlSaveQueue();
+      wlRenderQueue();
+    } catch(e) {
+      sel.innerHTML = '<option value="">Runner not available</option>';
+    }
+  }
+
+  window.wlRefreshWorkflows = function() {
+    wlFetchWorkflows();
+    showToast('Refreshed workflow list', 'success');
+  };
+
+  window.wlStart = async function() {
+    if (wlQueueItems.length === 0) {
+      showToast('Add at least one workflow to the queue', 'error');
+      return;
+    }
+    // For now, the loop runs the first workflow in the queue
+    // (The API supports single workflow_id; future: sequential queue execution)
+    var workflowId = wlQueueItems[0].id;
+    var exitSel = document.getElementById('wlExitStrategy').value;
+    var betweenSel = document.getElementById('wlBetween').value;
+    var maxIter = parseInt(document.getElementById('wlMaxIter').value) || 5;
+
+    var exitStrategy;
+    if (exitSel === 'reflection') {
+      exitStrategy = { type: 'reflection', reflection_workflow_id: null };
+    } else if (exitSel === 'workflow_verification') {
+      exitStrategy = { type: 'workflow_verification' };
+    } else {
+      exitStrategy = { type: 'fixed_iterations' };
+    }
+
+    var between;
+    if (betweenSel === 'restart_on_signal') {
+      between = { type: 'restart_on_signal', rebuild: true };
+    } else if (betweenSel === 'restart_on_signal_no_rebuild') {
+      between = { type: 'restart_on_signal', rebuild: false };
+    } else if (betweenSel === 'restart_runner') {
+      between = { type: 'restart_runner', rebuild: true };
+    } else if (betweenSel === 'restart_runner_no_rebuild') {
+      between = { type: 'restart_runner', rebuild: false };
+    } else if (betweenSel === 'wait_healthy') {
+      between = { type: 'wait_healthy' };
+    } else {
+      between = { type: 'none' };
+    }
+
+    var body = {
+      workflow_id: workflowId,
+      max_iterations: maxIter,
+      exit_strategy: exitStrategy,
+      between_iterations: between
+    };
+
+    document.getElementById('wlStartBtn').classList.add('loading');
+    try {
+      var resp = await fetch(BASE + '/workflow-loop/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      var data = await resp.json();
+      if (resp.ok) {
+        showToast('Workflow loop started', 'success');
+        wlConnectSSE();
+        wlStartStatusPoll();
+      } else {
+        showToast(data.error || 'Failed to start', 'error');
+      }
+    } catch(e) {
+      showToast('Request failed: ' + e.message, 'error');
+    } finally {
+      document.getElementById('wlStartBtn').classList.remove('loading');
+    }
+  };
+
+  window.wlStop = async function() {
+    try {
+      var resp = await fetch(BASE + '/workflow-loop/stop', { method: 'POST' });
+      var data = await resp.json();
+      if (resp.ok) {
+        showToast('Stop requested', 'success');
+      } else {
+        showToast(data.error || 'Failed to stop', 'error');
+      }
+    } catch(e) {
+      showToast('Request failed: ' + e.message, 'error');
+    }
+  };
+
+  function wlUpdateStatusUI(s) {
+    wlLastStatus = s;
+    var running = s.running;
+
+    // Phase tag
+    var phaseTag = document.getElementById('wlPhaseTag');
+    var phaseText = (s.phase || 'idle').replace(/_/g, ' ');
+    phaseTag.textContent = phaseText;
+    phaseTag.className = 'wl-status-phase ' + (s.phase || 'idle');
+
+    // Status rows
+    document.getElementById('wlPhase').textContent = phaseText;
+    document.getElementById('wlPhase').style.color = running ? 'var(--primary)' : 'var(--text-secondary)';
+
+    var maxIter = (s.config && s.config.max_iterations) || '--';
+    document.getElementById('wlIteration').textContent = s.current_iteration + ' / ' + maxIter;
+
+    document.getElementById('wlStarted').textContent = s.started_at ? formatTime(s.started_at) : '--';
+
+    var errEl = document.getElementById('wlError');
+    if (s.error) {
+      errEl.textContent = s.error;
+      errEl.style.color = 'var(--error)';
+    } else {
+      errEl.textContent = 'none';
+      errEl.style.color = 'var(--text-secondary)';
+    }
+
+    // Progress bar
+    var progWrap = document.getElementById('wlProgress');
+    var progBar = document.getElementById('wlProgressBar');
+    if (running && maxIter > 0) {
+      progWrap.style.display = 'block';
+      var pct = Math.min(100, Math.round((s.current_iteration / maxIter) * 100));
+      progBar.style.width = pct + '%';
+    } else if (s.phase === 'complete') {
+      progWrap.style.display = 'block';
+      progBar.style.width = '100%';
+      progBar.style.background = 'var(--success)';
+    } else {
+      progWrap.style.display = 'none';
+      progBar.style.background = 'var(--primary)';
+    }
+
+    // Buttons
+    document.getElementById('wlStartBtn').disabled = running;
+    document.getElementById('wlStopBtn').disabled = !running;
+    document.getElementById('wlClearBtn').disabled = running;
+  }
+
+  function wlUpdateHistory(iterations) {
+    var el = document.getElementById('wlHistory');
+    if (!iterations || iterations.length === 0) {
+      el.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:8px 0;text-align:center">No iterations yet</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < iterations.length; i++) {
+      var iter = iterations[i];
+      var exit = iter.exit_check || {};
+      var exitClass = exit.should_exit ? 'yes' : 'no';
+      var exitLabel = exit.should_exit ? 'EXIT' : 'CONTINUE';
+      html += '<div class="wl-history-item">' +
+              '<span class="wl-history-iter">#' + iter.iteration + '</span>' +
+              '<span class="wl-history-reason" title="' + escapeHtml(exit.reason || '') + '">' + escapeHtml(exit.reason || '--') + '</span>' +
+              '<span class="wl-history-exit ' + exitClass + '">' + exitLabel + '</span>' +
+              '</div>';
+    }
+    el.innerHTML = html;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function wlConnectSSE() {
+    if (wlLoopSSE) wlLoopSSE.close();
+    wlLoopSSE = new EventSource(BASE + '/workflow-loop/stream');
+    wlLoopSSE.addEventListener('status', function(e) {
+      try {
+        var s = JSON.parse(e.data);
+        wlUpdateStatusUI(s);
+      } catch(err) { /* ignore */ }
+    });
+    wlLoopSSE.onerror = function() {
+      wlLoopSSE.close();
+      wlLoopSSE = null;
+    };
+  }
+
+  function wlStartStatusPoll() {
+    if (wlStatusPollTimer) clearInterval(wlStatusPollTimer);
+    wlPollStatus();
+    wlStatusPollTimer = setInterval(wlPollStatus, 3000);
+  }
+
+  async function wlPollStatus() {
+    try {
+      var s = await fetchJSON('/workflow-loop/status');
+      wlUpdateStatusUI(s);
+      // If running, also fetch history
+      if (s.running || s.phase === 'complete' || s.phase === 'error' || s.phase === 'stopped') {
+        var h = await fetchJSON('/workflow-loop/history');
+        wlUpdateHistory(h.iterations || []);
+      }
+      // Stop polling if no longer running and not in a terminal state we haven't seen
+      if (!s.running && wlLastStatus && !wlLastStatus.running) {
+        // Keep polling at slower rate for catch-up
+      }
+    } catch(e) { /* ignore */ }
+  }
+
+  // Initialize
+  wlRenderQueue();
+  // Fetch workflows once runner is available (delay slightly)
+  setTimeout(wlFetchWorkflows, 2000);
+  // Start status polling
+  wlStartStatusPoll();
+  // Connect SSE
+  wlConnectSSE();
+
+  // Auto-scroll detection for log viewer
+  var logViewer = document.getElementById('logViewer');
+  logViewer.addEventListener('scroll', function() {
+    var atBottom = logViewer.scrollHeight - logViewer.scrollTop - logViewer.clientHeight < 30;
+    if (logPaused && atBottom) {
+      logPaused = false;
+      document.getElementById('logPauseBtn').textContent = 'Pause';
+      renderLogs();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>

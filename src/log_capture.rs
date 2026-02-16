@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
@@ -24,6 +24,8 @@ pub enum LogSource {
     Supervisor,
     Build,
     Watchdog,
+    Expo,
+    WorkflowLoop,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +40,12 @@ pub enum LogLevel {
 pub struct LogState {
     buffer: Arc<RwLock<VecDeque<LogEntry>>>,
     sender: broadcast::Sender<LogEntry>,
+}
+
+impl Default for LogState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LogState {
@@ -165,6 +173,63 @@ pub fn spawn_stderr_reader(
                 }
                 Err(e) => {
                     warn!("Error reading runner stderr: {}", e);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Spawn a reader for any async source, with configurable LogSource and classification behavior.
+/// If `classify` is true, the log level is inferred from the line content.
+/// If `classify` is false, all lines are tagged as Error (useful for stderr).
+pub fn spawn_reader_with_source(
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    logs: &LogState,
+    source: LogSource,
+    classify: bool,
+) -> tokio::task::JoinHandle<()> {
+    let sender = logs.sender.clone();
+    let buffer = logs.buffer.clone();
+    let source_name = format!("{:?}", source).to_lowercase();
+
+    tokio::spawn(async move {
+        let buf_reader = BufReader::new(reader);
+        let mut lines = buf_reader.lines();
+
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let level = if classify {
+                        classify_log_level(&line)
+                    } else if line.contains("WARN") || line.contains("warn") {
+                        LogLevel::Warn
+                    } else {
+                        LogLevel::Error
+                    };
+                    let entry = LogEntry {
+                        timestamp: Utc::now(),
+                        source: source.clone(),
+                        level,
+                        message: line,
+                    };
+
+                    {
+                        let mut buf = buffer.write().await;
+                        if buf.len() >= LOG_BUFFER_SIZE {
+                            buf.pop_front();
+                        }
+                        buf.push_back(entry.clone());
+                    }
+
+                    let _ = sender.send(entry);
+                }
+                Ok(None) => {
+                    debug!("{} stream closed", source_name);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Error reading {} stream: {}", source_name, e);
                     break;
                 }
             }

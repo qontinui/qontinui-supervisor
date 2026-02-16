@@ -74,6 +74,9 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
         )
         .await;
 
+    state.notify_health_change();
+    state.health_cache_notify.notify_one();
+
     // Spawn a task to monitor the process exit
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -160,19 +163,22 @@ async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, Su
 
 /// Monitor the runner process for exit. Updates state when process terminates.
 async fn monitor_process_exit(state: SharedState) {
-    let exit_status = {
+    // Take the child out of state so we can await without holding the lock.
+    let child = {
         let mut runner = state.runner.write().await;
-        if let Some(ref mut child) = runner.process {
-            match child.wait().await {
-                Ok(status) => Some(status),
-                Err(e) => {
-                    error!("Error waiting for runner process: {}", e);
-                    None
-                }
+        runner.process.take()
+    };
+
+    let exit_status = if let Some(mut child) = child {
+        match child.wait().await {
+            Ok(status) => Some(status),
+            Err(e) => {
+                error!("Error waiting for runner process: {}", e);
+                None
             }
-        } else {
-            None
         }
+    } else {
+        None
     };
 
     // Update state
@@ -182,6 +188,8 @@ async fn monitor_process_exit(state: SharedState) {
         runner.process = None;
         runner.pid = None;
     }
+
+    state.notify_health_change();
 
     if let Some(status) = exit_status {
         let msg = if status.success() {
@@ -220,29 +228,31 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         .emit(LogSource::Supervisor, LogLevel::Info, "Stopping runner...")
         .await;
 
-    // 1. Try to kill the child process gracefully
-    let _had_process = {
+    // 1. Try to kill the child process gracefully (take child out to avoid holding lock across await)
+    let child = {
         let mut runner = state.runner.write().await;
-        if let Some(ref mut child) = runner.process {
-            info!("Killing runner child process");
-            let _ = child.kill().await;
+        runner.process.take()
+    };
 
-            // Wait briefly for process to exit
-            let wait_result = tokio::time::timeout(
-                Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
-                child.wait(),
-            )
-            .await;
+    let _had_process = if let Some(mut child) = child {
+        info!("Killing runner child process");
+        let _ = child.kill().await;
 
-            match wait_result {
-                Ok(Ok(_)) => info!("Runner process exited gracefully"),
-                Ok(Err(e)) => warn!("Error waiting for runner: {}", e),
-                Err(_) => warn!("Runner did not exit within timeout"),
-            }
-            true
-        } else {
-            false
+        // Wait briefly for process to exit
+        let wait_result = tokio::time::timeout(
+            Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
+            child.wait(),
+        )
+        .await;
+
+        match wait_result {
+            Ok(Ok(_)) => info!("Runner process exited gracefully"),
+            Ok(Err(e)) => warn!("Error waiting for runner: {}", e),
+            Err(_) => warn!("Runner did not exit within timeout"),
         }
+        true
+    } else {
+        false
     };
 
     // 2. Comprehensive kill (taskkill + port cleanup)
@@ -277,6 +287,9 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         .emit(LogSource::Supervisor, LogLevel::Info, "Runner stopped")
         .await;
     info!("Runner stopped");
+
+    state.notify_health_change();
+    state.health_cache_notify.notify_one();
 
     Ok(())
 }

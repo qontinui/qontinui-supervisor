@@ -5,7 +5,6 @@ use tracing::{error, info, warn};
 use crate::config::*;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::start_runner;
-use crate::process::port::{is_port_in_use, is_runner_responding};
 use crate::state::SharedState;
 
 /// Spawn the watchdog background task.
@@ -26,19 +25,13 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 continue;
             }
 
-            let runner_running = {
+            let (runner_running, stop_requested, restart_requested) = {
                 let runner = state.runner.read().await;
-                runner.running
-            };
-
-            let stop_requested = {
-                let runner = state.runner.read().await;
-                runner.stop_requested
-            };
-
-            let restart_requested = {
-                let runner = state.runner.read().await;
-                runner.restart_requested
+                (
+                    runner.running,
+                    runner.stop_requested,
+                    runner.restart_requested,
+                )
             };
 
             // Don't interfere with manual operations
@@ -54,13 +47,16 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 }
             }
 
-            // Check runner health
+            // Check runner health (reads from cache — instant, no port check)
             let is_healthy = check_runner_health(&state).await;
 
             if is_healthy {
                 // Runner is healthy — reset attempts if we had any
-                let mut wd = state.watchdog.write().await;
-                if wd.restart_attempts > 0 {
+                let needs_reset = {
+                    let wd = state.watchdog.read().await;
+                    wd.restart_attempts > 0
+                };
+                if needs_reset {
                     info!("Watchdog: runner recovered, resetting attempt counter");
                     state
                         .logs
@@ -70,6 +66,7 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                             "Runner recovered, resetting restart attempts",
                         )
                         .await;
+                    let mut wd = state.watchdog.write().await;
                     wd.restart_attempts = 0;
                 }
                 continue;
@@ -100,16 +97,34 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                     .await;
             }
 
-            // Record crash and check limits
-            {
+            // Record crash and check limits — collect decisions under lock, act outside
+            let action = {
                 let mut wd = state.watchdog.write().await;
                 wd.record_crash();
 
-                // Check crash loop
                 if wd.is_crash_loop(
                     WATCHDOG_CRASH_LOOP_THRESHOLD,
                     WATCHDOG_CRASH_LOOP_WINDOW_SECS,
                 ) {
+                    wd.enabled = false;
+                    wd.disabled_reason = Some("Crash loop detected".to_string());
+                    WatchdogAction::CrashLoop
+                } else if wd.is_in_cooldown(WATCHDOG_COOLDOWN_SECS) {
+                    WatchdogAction::InCooldown
+                } else if wd.restart_attempts >= WATCHDOG_MAX_RESTART_ATTEMPTS {
+                    wd.enabled = false;
+                    wd.disabled_reason = Some("Max restart attempts reached".to_string());
+                    WatchdogAction::MaxAttempts
+                } else {
+                    wd.restart_attempts += 1;
+                    wd.last_restart_at = Some(chrono::Utc::now());
+                    WatchdogAction::Restart(wd.restart_attempts)
+                }
+            };
+            // Lock is dropped here
+
+            match action {
+                WatchdogAction::CrashLoop => {
                     let msg = format!(
                         "Crash loop detected ({} crashes in {}s window). Disabling watchdog.",
                         WATCHDOG_CRASH_LOOP_THRESHOLD, WATCHDOG_CRASH_LOOP_WINDOW_SECS
@@ -119,19 +134,19 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                         .logs
                         .emit(LogSource::Watchdog, LogLevel::Error, &msg)
                         .await;
-                    wd.enabled = false;
-                    wd.disabled_reason = Some("Crash loop detected".to_string());
+                    state.notify_health_change();
+                    crate::ai_debug::schedule_debug(
+                        &state,
+                        "Runner crash loop detected — watchdog disabled",
+                    )
+                    .await;
                     continue;
                 }
-
-                // Check cooldown
-                if wd.is_in_cooldown(WATCHDOG_COOLDOWN_SECS) {
+                WatchdogAction::InCooldown => {
                     info!("Watchdog: still in cooldown period, skipping restart");
                     continue;
                 }
-
-                // Check max attempts
-                if wd.restart_attempts >= WATCHDOG_MAX_RESTART_ATTEMPTS {
+                WatchdogAction::MaxAttempts => {
                     let msg = format!(
                         "Max restart attempts ({}) reached. Disabling watchdog.",
                         WATCHDOG_MAX_RESTART_ATTEMPTS
@@ -141,26 +156,26 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                         .logs
                         .emit(LogSource::Watchdog, LogLevel::Error, &msg)
                         .await;
-                    wd.enabled = false;
-                    wd.disabled_reason = Some("Max restart attempts reached".to_string());
+                    state.notify_health_change();
+                    crate::ai_debug::schedule_debug(
+                        &state,
+                        "Runner max restart attempts reached — watchdog disabled",
+                    )
+                    .await;
                     continue;
                 }
-
-                wd.restart_attempts += 1;
-                wd.last_restart_at = Some(chrono::Utc::now());
+                WatchdogAction::Restart(attempt) => {
+                    let msg = format!(
+                        "Watchdog: restart attempt {}/{}",
+                        attempt, WATCHDOG_MAX_RESTART_ATTEMPTS
+                    );
+                    info!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Watchdog, LogLevel::Info, &msg)
+                        .await;
+                }
             }
-
-            // Attempt restart
-            let attempt = state.watchdog.read().await.restart_attempts;
-            let msg = format!(
-                "Watchdog: restart attempt {}/{}",
-                attempt, WATCHDOG_MAX_RESTART_ATTEMPTS
-            );
-            info!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Watchdog, LogLevel::Info, &msg)
-                .await;
 
             // Stop first if runner state thinks it's running
             if runner_running {
@@ -181,6 +196,7 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                             "Runner restarted successfully",
                         )
                         .await;
+                    state.notify_health_change();
                 }
                 Err(e) => {
                     error!("Watchdog: failed to restart runner: {}", e);
@@ -192,21 +208,27 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                             format!("Failed to restart runner: {}", e),
                         )
                         .await;
+                    state.notify_health_change();
                 }
             }
         }
     })
 }
 
-/// Check if the runner is healthy based on port availability.
+/// Internal enum for watchdog decision flow (avoids holding lock across awaits).
+enum WatchdogAction {
+    CrashLoop,
+    InCooldown,
+    MaxAttempts,
+    Restart(u32),
+}
+
+/// Check if the runner is healthy using the cached health data.
 async fn check_runner_health(state: &SharedState) -> bool {
+    let cached = state.cached_health.read().await;
     if state.config.dev_mode {
-        // Dev mode: both Vite and API ports should be responsive
-        let vite_up = is_port_in_use(RUNNER_VITE_PORT);
-        let api_up = is_runner_responding(RUNNER_API_PORT).await;
-        vite_up && api_up
+        cached.vite_port_open && cached.runner_responding
     } else {
-        // Exe mode: only API port
-        is_runner_responding(RUNNER_API_PORT).await
+        cached.runner_responding
     }
 }
