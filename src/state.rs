@@ -82,9 +82,7 @@ impl WatchdogState {
 
     pub fn is_crash_loop(&self, threshold: usize, window_secs: i64) -> bool {
         let cutoff = Utc::now() - chrono::Duration::seconds(window_secs);
-        let recent = self.crash_history.iter()
-            .filter(|t| **t > cutoff)
-            .count();
+        let recent = self.crash_history.iter().filter(|t| **t > cutoff).count();
         recent >= threshold
     }
 

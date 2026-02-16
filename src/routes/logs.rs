@@ -1,3 +1,4 @@
+use crate::state::SharedState;
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -6,7 +7,6 @@ use serde::Deserialize;
 use std::convert::Infallible;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use crate::state::SharedState;
 
 #[derive(Deserialize)]
 pub struct HistoryQuery {
@@ -68,7 +68,10 @@ pub async fn log_file(
         "frontend-err" => state.config.dev_logs_dir.join("frontend.err.log"),
         "runner-general" => state.config.dev_logs_dir.join("runner-general.jsonl"),
         "runner-actions" => state.config.dev_logs_dir.join("runner-actions.jsonl"),
-        "runner-image" => state.config.dev_logs_dir.join("runner-image-recognition.jsonl"),
+        "runner-image" => state
+            .config
+            .dev_logs_dir
+            .join("runner-image-recognition.jsonl"),
         "runner-playwright" => state.config.dev_logs_dir.join("runner-playwright.jsonl"),
         "ai-output" => state.config.dev_logs_dir.join("ai-output.jsonl"),
         _ => return Err(axum::http::StatusCode::NOT_FOUND),
@@ -110,9 +113,7 @@ pub struct LogFileQuery {
 }
 
 /// GET /logs/files — list available log files with metadata.
-pub async fn log_files(
-    State(state): State<SharedState>,
-) -> Json<serde_json::Value> {
+pub async fn log_files(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let log_types = vec![
         ("runner-tauri", "runner-tauri.log"),
         ("backend", "backend.log"),
@@ -169,7 +170,8 @@ async fn read_runner_log(path: &std::path::Path) -> String {
             if bytes.len() >= 2 && (bytes[0] == 0xFF && bytes[1] == 0xFE) {
                 // UTF-16LE with BOM — decode
                 decode_utf16le(&bytes[2..])
-            } else if bytes.len() > 1 && bytes.iter().step_by(2).any(|&b| b != 0)
+            } else if bytes.len() > 1
+                && bytes.iter().step_by(2).any(|&b| b != 0)
                 && bytes.iter().skip(1).step_by(2).any(|&b| b == 0)
             {
                 // Looks like UTF-16LE without BOM (null bytes in alternating positions)

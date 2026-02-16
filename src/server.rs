@@ -15,15 +15,24 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/health", get(crate::routes::health::health))
         // Runner lifecycle
         .route("/runner/stop", post(crate::routes::runner::stop_runner))
-        .route("/runner/restart", post(crate::routes::runner::restart_runner))
-        .route("/runner/watchdog", post(crate::routes::runner::control_watchdog))
+        .route(
+            "/runner/restart",
+            post(crate::routes::runner::restart_runner),
+        )
+        .route(
+            "/runner/watchdog",
+            post(crate::routes::runner::control_watchdog),
+        )
         // Logs
         .route("/logs/history", get(crate::routes::logs::log_history))
         .route("/logs/stream", get(crate::routes::logs::log_stream))
         .route("/logs/file/{type}", get(crate::routes::logs::log_file))
         .route("/logs/files", get(crate::routes::logs::log_files))
         // Supervisor self-restart
-        .route("/supervisor/restart", post(crate::routes::runner::supervisor_restart))
+        .route(
+            "/supervisor/restart",
+            post(crate::routes::runner::supervisor_restart),
+        )
         .layer(cors)
         .with_state(state)
 }

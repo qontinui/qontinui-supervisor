@@ -70,7 +70,9 @@ pub const LOG_BUFFER_SIZE: usize = 500;
 impl SupervisorConfig {
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
-        let dev_logs_dir = args.project_dir.parent()
+        let dev_logs_dir = args
+            .project_dir
+            .parent()
             .unwrap_or(&args.project_dir)
             .parent()
             .unwrap_or(&args.project_dir)
@@ -92,12 +94,16 @@ impl SupervisorConfig {
 
     /// Path to the runner executable (for exe mode)
     pub fn runner_exe_path(&self) -> PathBuf {
-        self.project_dir.join("target").join("debug").join("qontinui-runner.exe")
+        self.project_dir
+            .join("target")
+            .join("debug")
+            .join("qontinui-runner.exe")
     }
 
     /// Path to the runner npm project root (parent of src-tauri)
     pub fn runner_npm_dir(&self) -> PathBuf {
-        self.project_dir.parent()
+        self.project_dir
+            .parent()
             .unwrap_or(&self.project_dir)
             .to_path_buf()
     }

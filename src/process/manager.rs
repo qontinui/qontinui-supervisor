@@ -27,11 +27,17 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
         }
     }
 
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        format!("Starting runner in {} mode", if state.config.dev_mode { "dev" } else { "exe" }),
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "Starting runner in {} mode",
+                if state.config.dev_mode { "dev" } else { "exe" }
+            ),
+        )
+        .await;
 
     let mut child = if state.config.dev_mode {
         start_dev_mode(state).await?
@@ -59,11 +65,14 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
         runner.pid = pid;
     }
 
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        format!("Runner process started (PID: {:?})", pid),
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Runner process started (PID: {:?})", pid),
+        )
+        .await;
 
     // Spawn a task to monitor the process exit
     let state_clone = state.clone();
@@ -113,9 +122,10 @@ async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, Su
     let exe_path = state.config.runner_exe_path();
 
     if !exe_path.exists() {
-        return Err(SupervisorError::Process(
-            format!("Runner exe not found at {:?}. Run a build first.", exe_path)
-        ));
+        return Err(SupervisorError::Process(format!(
+            "Runner exe not found at {:?}. Run a build first.",
+            exe_path
+        )));
     }
 
     info!("Starting in exe mode from {:?}", exe_path);
@@ -180,14 +190,20 @@ async fn monitor_process_exit(state: SharedState) {
             format!("Runner process exited with status: {}", status)
         };
 
-        state.logs.emit(LogSource::Supervisor, LogLevel::Info, &msg).await;
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Info, &msg)
+            .await;
         info!("{}", msg);
     } else {
-        state.logs.emit(
-            LogSource::Supervisor,
-            LogLevel::Warn,
-            "Runner process terminated unexpectedly",
-        ).await;
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Warn,
+                "Runner process terminated unexpectedly",
+            )
+            .await;
         warn!("Runner process terminated unexpectedly");
     }
 }
@@ -199,7 +215,10 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         runner.stop_requested = true;
     }
 
-    state.logs.emit(LogSource::Supervisor, LogLevel::Info, "Stopping runner...").await;
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Info, "Stopping runner...")
+        .await;
 
     // 1. Try to kill the child process gracefully
     let _had_process = {
@@ -212,7 +231,8 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
             let wait_result = tokio::time::timeout(
                 Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
                 child.wait(),
-            ).await;
+            )
+            .await;
 
             match wait_result {
                 Ok(Ok(_)) => info!("Runner process exited gracefully"),
@@ -252,7 +272,10 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         runner.stop_requested = false;
     }
 
-    state.logs.emit(LogSource::Supervisor, LogLevel::Info, "Runner stopped").await;
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Info, "Runner stopped")
+        .await;
     info!("Runner stopped");
 
     Ok(())

@@ -38,11 +38,14 @@ pub async fn restart_runner(
 ) -> Result<impl IntoResponse, SupervisorError> {
     let rebuild = body.rebuild;
 
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        format!("Restart requested (rebuild: {})", rebuild),
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Restart requested (rebuild: {})", rebuild),
+        )
+        .await;
 
     manager::restart_runner(&state, rebuild).await?;
 
@@ -65,15 +68,22 @@ pub async fn control_watchdog(
         wd.crash_history.clear();
     }
 
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        format!(
-            "Watchdog {} {}",
-            if body.enabled { "enabled" } else { "disabled" },
-            if body.reset_attempts { "(attempts reset)" } else { "" }
-        ),
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "Watchdog {} {}",
+                if body.enabled { "enabled" } else { "disabled" },
+                if body.reset_attempts {
+                    "(attempts reset)"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .await;
 
     Ok(Json(serde_json::json!({
         "watchdog": {
@@ -87,11 +97,14 @@ pub async fn control_watchdog(
 pub async fn supervisor_restart(
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, SupervisorError> {
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        "Supervisor self-restart requested",
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            "Supervisor self-restart requested",
+        )
+        .await;
 
     let args = state.config.cli_args.clone();
     let exe = args.first().cloned().unwrap_or_else(|| {
@@ -142,11 +155,9 @@ pub async fn supervisor_restart(
 
             Ok(response)
         }
-        Err(e) => {
-            Err(SupervisorError::Process(format!(
-                "Failed to spawn replacement supervisor: {}",
-                e
-            )))
-        }
+        Err(e) => Err(SupervisorError::Process(format!(
+            "Failed to spawn replacement supervisor: {}",
+            e
+        ))),
     }
 }

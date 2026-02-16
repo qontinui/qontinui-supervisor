@@ -80,10 +80,7 @@ impl LogState {
 }
 
 /// Spawn a background task that reads lines from runner stdout and emits log entries.
-pub fn spawn_stdout_reader(
-    stdout: ChildStdout,
-    logs: &LogState,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
 

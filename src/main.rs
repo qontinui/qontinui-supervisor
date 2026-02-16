@@ -27,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = CliArgs::parse();
-    info!("Starting qontinui-supervisor v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting qontinui-supervisor v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("Project dir: {:?}", args.project_dir);
     info!("Dev mode: {}", args.dev_mode);
     info!("Watchdog: {}", args.watchdog);
@@ -46,11 +49,14 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(SupervisorState::new(config));
 
     // Log startup
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        format!("Supervisor starting on port {}", port),
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Supervisor starting on port {}", port),
+        )
+        .await;
 
     // Spawn watchdog background task
     let _watchdog_handle = watchdog::spawn_watchdog(state.clone());
@@ -60,11 +66,14 @@ async fn main() -> anyhow::Result<()> {
         let state_clone = state.clone();
         tokio::spawn(async move {
             info!("Auto-starting runner...");
-            state_clone.logs.emit(
-                LogSource::Supervisor,
-                LogLevel::Info,
-                "Auto-starting runner",
-            ).await;
+            state_clone
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    "Auto-starting runner",
+                )
+                .await;
 
             match process::manager::start_runner(&state_clone).await {
                 Ok(()) => {
@@ -74,11 +83,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     error!("Failed to auto-start runner: {}", e);
-                    state_clone.logs.emit(
-                        LogSource::Supervisor,
-                        LogLevel::Error,
-                        format!("Failed to auto-start runner: {}", e),
-                    ).await;
+                    state_clone
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Error,
+                            format!("Failed to auto-start runner: {}", e),
+                        )
+                        .await;
                 }
             }
         });
@@ -115,9 +127,12 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
 
     ctrl_c.await;
     info!("Received shutdown signal");
-    state.logs.emit(
-        LogSource::Supervisor,
-        LogLevel::Info,
-        "Shutdown signal received",
-    ).await;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            "Shutdown signal received",
+        )
+        .await;
 }

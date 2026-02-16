@@ -28,7 +28,10 @@ pub async fn taskkill_by_name(name: &str, force: bool) -> anyhow::Result<bool> {
 pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     // Find PIDs using the port via netstat
     let output = Command::new("cmd")
-        .args(["/C", &format!("netstat -ano | findstr :{} | findstr LISTENING", port)])
+        .args([
+            "/C",
+            &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -70,10 +73,13 @@ pub async fn cleanup_orphaned_build_processes() {
     for proc_name in &["cargo.exe", "rustc.exe"] {
         // Use WMIC to find processes - more reliable than tasklist parsing
         let output = Command::new("cmd")
-            .args(["/C", &format!(
-                "wmic process where \"name='{}'\" get ProcessId /format:list",
-                proc_name
-            )])
+            .args([
+                "/C",
+                &format!(
+                    "wmic process where \"name='{}'\" get ProcessId /format:list",
+                    proc_name
+                ),
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()

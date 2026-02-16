@@ -62,11 +62,14 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 let mut wd = state.watchdog.write().await;
                 if wd.restart_attempts > 0 {
                     info!("Watchdog: runner recovered, resetting attempt counter");
-                    state.logs.emit(
-                        LogSource::Watchdog,
-                        LogLevel::Info,
-                        "Runner recovered, resetting restart attempts",
-                    ).await;
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Watchdog,
+                            LogLevel::Info,
+                            "Runner recovered, resetting restart attempts",
+                        )
+                        .await;
                     wd.restart_attempts = 0;
                 }
                 continue;
@@ -76,19 +79,25 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
             if runner_running {
                 // Process is marked running but not responding — crashed
                 warn!("Watchdog: runner process not responding");
-                state.logs.emit(
-                    LogSource::Watchdog,
-                    LogLevel::Warn,
-                    "Runner process not responding, attempting recovery",
-                ).await;
+                state
+                    .logs
+                    .emit(
+                        LogSource::Watchdog,
+                        LogLevel::Warn,
+                        "Runner process not responding, attempting recovery",
+                    )
+                    .await;
             } else {
                 // Process has already exited
                 info!("Watchdog: runner process has exited");
-                state.logs.emit(
-                    LogSource::Watchdog,
-                    LogLevel::Info,
-                    "Runner process has exited, attempting restart",
-                ).await;
+                state
+                    .logs
+                    .emit(
+                        LogSource::Watchdog,
+                        LogLevel::Info,
+                        "Runner process has exited, attempting restart",
+                    )
+                    .await;
             }
 
             // Record crash and check limits
@@ -97,13 +106,19 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 wd.record_crash();
 
                 // Check crash loop
-                if wd.is_crash_loop(WATCHDOG_CRASH_LOOP_THRESHOLD, WATCHDOG_CRASH_LOOP_WINDOW_SECS) {
+                if wd.is_crash_loop(
+                    WATCHDOG_CRASH_LOOP_THRESHOLD,
+                    WATCHDOG_CRASH_LOOP_WINDOW_SECS,
+                ) {
                     let msg = format!(
                         "Crash loop detected ({} crashes in {}s window). Disabling watchdog.",
                         WATCHDOG_CRASH_LOOP_THRESHOLD, WATCHDOG_CRASH_LOOP_WINDOW_SECS
                     );
                     error!("{}", msg);
-                    state.logs.emit(LogSource::Watchdog, LogLevel::Error, &msg).await;
+                    state
+                        .logs
+                        .emit(LogSource::Watchdog, LogLevel::Error, &msg)
+                        .await;
                     wd.enabled = false;
                     wd.disabled_reason = Some("Crash loop detected".to_string());
                     continue;
@@ -122,7 +137,10 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                         WATCHDOG_MAX_RESTART_ATTEMPTS
                     );
                     error!("{}", msg);
-                    state.logs.emit(LogSource::Watchdog, LogLevel::Error, &msg).await;
+                    state
+                        .logs
+                        .emit(LogSource::Watchdog, LogLevel::Error, &msg)
+                        .await;
                     wd.enabled = false;
                     wd.disabled_reason = Some("Max restart attempts reached".to_string());
                     continue;
@@ -134,9 +152,15 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
 
             // Attempt restart
             let attempt = state.watchdog.read().await.restart_attempts;
-            let msg = format!("Watchdog: restart attempt {}/{}", attempt, WATCHDOG_MAX_RESTART_ATTEMPTS);
+            let msg = format!(
+                "Watchdog: restart attempt {}/{}",
+                attempt, WATCHDOG_MAX_RESTART_ATTEMPTS
+            );
             info!("{}", msg);
-            state.logs.emit(LogSource::Watchdog, LogLevel::Info, &msg).await;
+            state
+                .logs
+                .emit(LogSource::Watchdog, LogLevel::Info, &msg)
+                .await;
 
             // Stop first if runner state thinks it's running
             if runner_running {
@@ -149,19 +173,25 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
             match start_runner(&state).await {
                 Ok(()) => {
                     info!("Watchdog: runner restarted successfully");
-                    state.logs.emit(
-                        LogSource::Watchdog,
-                        LogLevel::Info,
-                        "Runner restarted successfully",
-                    ).await;
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Watchdog,
+                            LogLevel::Info,
+                            "Runner restarted successfully",
+                        )
+                        .await;
                 }
                 Err(e) => {
                     error!("Watchdog: failed to restart runner: {}", e);
-                    state.logs.emit(
-                        LogSource::Watchdog,
-                        LogLevel::Error,
-                        format!("Failed to restart runner: {}", e),
-                    ).await;
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Watchdog,
+                            LogLevel::Error,
+                            format!("Failed to restart runner: {}", e),
+                        )
+                        .await;
                 }
             }
         }

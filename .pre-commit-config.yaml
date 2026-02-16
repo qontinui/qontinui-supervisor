@@ -1,0 +1,45 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: validate-line-endings
+        name: Validate no CRLF left (text files)
+        entry: bash -c 'if git grep -I $'"'"'\r'"'"'$ -- "$(git rev-parse --show-toplevel)" >/dev/null; then echo "CRLF line endings detected. Convert to LF." >&2; exit 1; fi'
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: block-claude-attribution
+        name: Block Claude Attribution
+        entry: .pre-commit-hooks/block-claude-attribution.sh
+        language: script
+        stages: [commit-msg]
+
+ci:
+  autofix_prs: true
+  autofix_commit_msg: "chore: pre-commit auto fixes"

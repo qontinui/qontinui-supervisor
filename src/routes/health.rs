@@ -87,7 +87,11 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
             pid: runner.pid,
             started_at: runner.started_at.map(|t| t.to_rfc3339()),
             api_responding,
-            mode: if state.config.dev_mode { "dev".to_string() } else { "exe".to_string() },
+            mode: if state.config.dev_mode {
+                "dev".to_string()
+            } else {
+                "exe".to_string()
+            },
         },
         ports: PortsHealth {
             api_port: PortStatus {

@@ -42,7 +42,10 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
         build.last_build_at = Some(chrono::Utc::now());
     }
 
-    state.logs.emit(LogSource::Build, LogLevel::Info, "Starting cargo build...").await;
+    state
+        .logs
+        .emit(LogSource::Build, LogLevel::Info, "Starting cargo build...")
+        .await;
     info!("Starting cargo build in {:?}", state.config.project_dir);
 
     // Cleanup orphaned build processes first
@@ -101,7 +104,11 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&line));
-                let level = if is_error { LogLevel::Error } else { LogLevel::Info };
+                let level = if is_error {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Info
+                };
 
                 state_clone.logs.emit(LogSource::Build, level, &line).await;
 
@@ -117,15 +124,16 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
     };
 
     // Wait with timeout
-    let wait_result = tokio::time::timeout(
-        Duration::from_secs(BUILD_TIMEOUT_SECS),
-        child.wait(),
-    ).await;
+    let wait_result =
+        tokio::time::timeout(Duration::from_secs(BUILD_TIMEOUT_SECS), child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            return Err(SupervisorError::Process(format!("Build process error: {}", e)));
+            return Err(SupervisorError::Process(format!(
+                "Build process error: {}",
+                e
+            )));
         }
         Err(_) => {
             warn!("Build timed out after {}s, killing", BUILD_TIMEOUT_SECS);
@@ -145,7 +153,14 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
     };
 
     if status.success() {
-        state.logs.emit(LogSource::Build, LogLevel::Info, "Build completed successfully").await;
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                "Build completed successfully",
+            )
+            .await;
         info!("Build completed successfully");
         Ok(())
     } else {
@@ -155,7 +170,10 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
             format!("Build failed:\n{}", error_lines.join("\n"))
         };
         error!("{}", error_summary);
-        state.logs.emit(LogSource::Build, LogLevel::Error, &error_summary).await;
+        state
+            .logs
+            .emit(LogSource::Build, LogLevel::Error, &error_summary)
+            .await;
         Err(SupervisorError::BuildFailed(error_summary))
     }
 }
@@ -176,7 +194,9 @@ pub fn spawn_build_error_monitor(state: SharedState) -> tokio::task::JoinHandle<
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(entry)) => {
                     if entry.source == crate::log_capture::LogSource::Runner {
-                        let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&entry.message));
+                        let is_error = BUILD_ERROR_PATTERNS
+                            .iter()
+                            .any(|p| p.is_match(&entry.message));
                         if is_error {
                             warn!("Build error detected in runner output: {}", entry.message);
                             let mut build = state.build.write().await;
