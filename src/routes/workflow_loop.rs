@@ -17,6 +17,28 @@ pub async fn start(
     State(state): State<SharedState>,
     Json(config): Json<WorkflowLoopConfig>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    // Validate config: pipeline mode vs simple mode
+    if let Some(phases) = &config.phases {
+        // Pipeline mode: need either build or execute_workflow_id
+        if phases.build.is_none() && phases.execute_workflow_id.is_none() {
+            return Err(SupervisorError::Validation(
+                "Pipeline mode requires either a build phase or execute_workflow_id".to_string(),
+            ));
+        }
+    } else {
+        // Simple mode: workflow_id and exit_strategy required
+        if config.workflow_id.is_none() {
+            return Err(SupervisorError::Validation(
+                "workflow_id is required in simple mode (when phases is absent)".to_string(),
+            ));
+        }
+        if config.exit_strategy.is_none() {
+            return Err(SupervisorError::Validation(
+                "exit_strategy is required in simple mode (when phases is absent)".to_string(),
+            ));
+        }
+    }
+
     // Guard: not already running
     {
         let wl = state.workflow_loop.read().await;
@@ -27,6 +49,22 @@ pub async fn start(
 
     // Create stop channel
     let (stop_tx, stop_rx) = watch::channel(false);
+
+    let mode = if config.phases.is_some() {
+        "pipeline"
+    } else {
+        "simple"
+    };
+    let display_id = config
+        .workflow_id
+        .clone()
+        .or_else(|| {
+            config
+                .phases
+                .as_ref()
+                .and_then(|p| p.execute_workflow_id.clone())
+        })
+        .unwrap_or_else(|| "(generated)".to_string());
 
     // Initialize state
     {
@@ -47,8 +85,8 @@ pub async fn start(
             LogSource::WorkflowLoop,
             LogLevel::Info,
             format!(
-                "Workflow loop started: workflow_id={}, max_iterations={}",
-                config.workflow_id, config.max_iterations
+                "Workflow loop started: mode={}, workflow={}, max_iterations={}",
+                mode, display_id, config.max_iterations
             ),
         )
         .await;
@@ -61,7 +99,8 @@ pub async fn start(
 
     Ok(Json(serde_json::json!({
         "status": "started",
-        "workflow_id": config.workflow_id,
+        "mode": mode,
+        "workflow_id": display_id,
         "max_iterations": config.max_iterations,
     })))
 }

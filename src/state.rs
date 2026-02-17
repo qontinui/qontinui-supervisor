@@ -1,4 +1,5 @@
 use crate::config::{SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
+use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::CachedPortHealth;
 use crate::log_capture::LogState;
 use crate::workflow_loop::WorkflowLoopState;
@@ -7,7 +8,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::process::Child;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, watch, Notify, RwLock};
 
 pub type SharedState = Arc<SupervisorState>;
 
@@ -20,6 +21,8 @@ pub struct SupervisorState {
     pub code_activity: RwLock<CodeActivityState>,
     pub expo: RwLock<ExpoState>,
     pub workflow_loop: RwLock<WorkflowLoopState>,
+    pub diagnostics: RwLock<DiagnosticsState>,
+    pub evaluation: RwLock<EvaluationState>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
@@ -107,6 +110,8 @@ impl SupervisorState {
             code_activity: RwLock::new(CodeActivityState::new()),
             expo: RwLock::new(ExpoState::new(expo_port)),
             workflow_loop: RwLock::new(WorkflowLoopState::new()),
+            diagnostics: RwLock::new(DiagnosticsState::new()),
+            evaluation: RwLock::new(EvaluationState::new()),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
@@ -241,5 +246,35 @@ impl ExpoState {
             started_at: None,
             port,
         }
+    }
+}
+
+pub struct EvaluationState {
+    pub running: bool,
+    pub current_run_id: Option<String>,
+    pub continuous_mode: bool,
+    pub continuous_interval_secs: u64,
+    pub current_prompt_index: usize,
+    pub total_prompts: usize,
+    pub stop_tx: Option<watch::Sender<bool>>,
+}
+
+impl EvaluationState {
+    pub fn new() -> Self {
+        Self {
+            running: false,
+            current_run_id: None,
+            continuous_mode: false,
+            continuous_interval_secs: 3600,
+            current_prompt_index: 0,
+            total_prompts: 0,
+            stop_tx: None,
+        }
+    }
+}
+
+impl Default for EvaluationState {
+    fn default() -> Self {
+        Self::new()
     }
 }

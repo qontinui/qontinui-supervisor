@@ -128,7 +128,9 @@ Orchestrates repeated workflow execution with configurable exit strategies and b
 | GET | `/workflow-loop/stream` | SSE stream of phase/iteration changes |
 | POST | `/workflow-loop/signal-restart` | Signal that runner restart is needed between iterations |
 
-**Start body (`WorkflowLoopConfig`):**
+**Two modes:** Simple mode (single workflow repeated) or Pipeline mode (build/execute/reflect/fix cycle).
+
+**Simple mode start body:**
 ```json
 {
   "workflow_id": "<unified-workflow-id>",
@@ -138,18 +140,60 @@ Orchestrates repeated workflow execution with configurable exit strategies and b
 }
 ```
 
-**Exit strategies:**
+**Pipeline mode start body:**
+```json
+{
+  "max_iterations": 5,
+  "between_iterations": { "type": "restart_runner", "rebuild": true },
+  "phases": {
+    "build": {
+      "description": "Create a workflow that tests the login flow...",
+      "context": "Optional additional context",
+      "context_ids": ["optional-context-id"]
+    },
+    "execute_workflow_id": "fallback-workflow-id-if-no-build",
+    "reflect": { "reflection_workflow_id": null },
+    "implement_fixes": {
+      "provider": "claude",
+      "model": "opus",
+      "timeout_secs": 600,
+      "additional_context": "Focus on runner code"
+    }
+  }
+}
+```
+
+**Pipeline phases per iteration:**
+1. **Build** (conditional) — Generate workflow from description via runner's `/unified-workflows/generate-async`. Runs on iteration 1 and when previous iteration's fixes were workflow-structural.
+2. **Execute** — Run the workflow (generated or specified by `execute_workflow_id`).
+3. **Reflect** — Trigger reflection, wait for completion, count fixes. Exit if 0 fixes found.
+4. **Implement Fixes** (optional) — Spawn Claude Code (`claude --print`) to apply reflection findings. Checks if fixes are structural (triggers rebuild next iteration).
+
+**Pipeline config fields:**
+- `phases.build` — Optional. Requires `description`. If absent, `execute_workflow_id` is required.
+- `phases.execute_workflow_id` — Fallback workflow ID when build phase is absent.
+- `phases.reflect` — Always enabled in pipeline mode. Optional `reflection_workflow_id`.
+- `phases.implement_fixes` — Optional. When present, spawns Claude to apply fixes. Defaults: provider/model from supervisor's AI config, timeout 600s.
+
+**Rebuild trigger fix types:** `workflow_step_rewrite`, `instruction_clarification`, `context_addition` — these cause the build phase to re-run next iteration.
+
+**Exit strategies (simple mode only):**
 - `reflection` — Triggers reflection after each iteration; exits when 0 new fixes found
 - `workflow_verification` — Exits when inner verification loop passes on first iteration
 - `fixed_iterations` — Always runs `max_iterations` times
 
-**Between-iteration actions:**
+**Between-iteration actions (both modes):**
 - `restart_on_signal` — Only restart runner if the workflow called `/workflow-loop/signal-restart` during execution; skip restart otherwise. Use this for workflows that may or may not modify runner code (e.g., Clean and Push across multiple repos).
 - `restart_runner` — Always stop/rebuild/start runner, wait for healthy API
 - `wait_healthy` — Wait for runner API to respond (no restart)
 - `none` — Proceed immediately to next iteration
 
-**Loop phases** (reported in status/stream): `idle`, `running_workflow`, `evaluating_exit`, `between_iterations`, `waiting_for_runner`, `complete`, `stopped`, `error`
+**Loop phases** (reported in status/stream): `idle`, `building_workflow`, `running_workflow`, `reflecting`, `implementing_fixes`, `evaluating_exit`, `between_iterations`, `waiting_for_runner`, `complete`, `stopped`, `error`
+
+**Pipeline diagnostic events:**
+- `pipeline_phase_started` / `pipeline_phase_completed` — Per-phase timing with iteration and phase name
+- `fixes_implemented` — Fix count and duration when Claude applies fixes
+- `rebuild_triggered` — When structural fixes trigger workflow regeneration
 
 ### UI Bridge Proxy
 

@@ -3,6 +3,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::config::*;
+use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::start_runner;
 use crate::state::SharedState;
@@ -177,6 +178,17 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 }
             }
 
+            let restart_start = std::time::Instant::now();
+
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartStarted {
+                    source: RestartSource::Watchdog,
+                    rebuild: false,
+                });
+
             // Stop first if runner state thinks it's running
             if runner_running {
                 if let Err(e) = crate::process::manager::stop_runner(&state).await {
@@ -196,6 +208,16 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                             "Runner restarted successfully",
                         )
                         .await;
+                    state
+                        .diagnostics
+                        .write()
+                        .await
+                        .emit(DiagnosticEventKind::RestartCompleted {
+                            source: RestartSource::Watchdog,
+                            rebuild: false,
+                            duration_secs: restart_start.elapsed().as_secs_f64(),
+                            build_duration_secs: None,
+                        });
                     state.notify_health_change();
                 }
                 Err(e) => {
@@ -208,6 +230,14 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                             format!("Failed to restart runner: {}", e),
                         )
                         .await;
+                    state
+                        .diagnostics
+                        .write()
+                        .await
+                        .emit(DiagnosticEventKind::RestartFailed {
+                            source: RestartSource::Watchdog,
+                            error: e.to_string(),
+                        });
                     state.notify_health_change();
                 }
             }

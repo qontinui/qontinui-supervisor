@@ -7,6 +7,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use crate::config::{BUILD_MONITOR_WINDOW_SECS, BUILD_TIMEOUT_SECS};
+use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::windows::cleanup_orphaned_build_processes;
@@ -50,10 +51,18 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
         .await;
     info!("Starting cargo build in {:?}", state.config.project_dir);
 
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::BuildStarted);
+
     // Cleanup orphaned build processes first
     cleanup_orphaned_build_processes().await;
 
+    let build_start = std::time::Instant::now();
     let result = run_build_inner(state).await;
+    let duration_secs = build_start.elapsed().as_secs_f64();
 
     // Mark build complete
     {
@@ -64,6 +73,16 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
             build.last_build_error = Some(e.to_string());
         }
     }
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::BuildCompleted {
+            duration_secs,
+            success: result.is_ok(),
+            error: result.as_ref().err().map(|e| e.to_string()),
+        });
 
     state.notify_health_change();
 

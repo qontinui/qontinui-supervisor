@@ -4,6 +4,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use crate::config::{GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_API_PORT, RUNNER_VITE_PORT};
+use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
@@ -295,7 +296,22 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
 }
 
 /// Stop runner, optionally rebuild, then start.
-pub async fn restart_runner(state: &SharedState, rebuild: bool) -> Result<(), SupervisorError> {
+pub async fn restart_runner(
+    state: &SharedState,
+    rebuild: bool,
+    source: RestartSource,
+) -> Result<(), SupervisorError> {
+    let restart_start = std::time::Instant::now();
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::RestartStarted {
+            source: source.clone(),
+            rebuild,
+        });
+
     {
         let mut runner = state.runner.write().await;
         runner.restart_requested = true;
@@ -306,22 +322,67 @@ pub async fn restart_runner(state: &SharedState, rebuild: bool) -> Result<(), Su
         let runner = state.runner.read().await;
         if runner.running {
             drop(runner);
-            stop_runner(state).await?;
+            if let Err(e) = stop_runner(state).await {
+                state
+                    .diagnostics
+                    .write()
+                    .await
+                    .emit(DiagnosticEventKind::RestartFailed {
+                        source,
+                        error: e.to_string(),
+                    });
+                return Err(e);
+            }
         }
     }
 
     // Rebuild if requested
-    if rebuild {
-        crate::build_monitor::run_cargo_build(state).await?;
-    }
+    let build_duration = if rebuild {
+        let build_start = std::time::Instant::now();
+        if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartFailed {
+                    source,
+                    error: e.to_string(),
+                });
+            return Err(e);
+        }
+        Some(build_start.elapsed().as_secs_f64())
+    } else {
+        None
+    };
 
     // Start
-    start_runner(state).await?;
+    if let Err(e) = start_runner(state).await {
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::RestartFailed {
+                source,
+                error: e.to_string(),
+            });
+        return Err(e);
+    }
 
     {
         let mut runner = state.runner.write().await;
         runner.restart_requested = false;
     }
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::RestartCompleted {
+            source,
+            rebuild,
+            duration_secs: restart_start.elapsed().as_secs_f64(),
+            build_duration_secs: build_duration,
+        });
 
     Ok(())
 }

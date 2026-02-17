@@ -3,3 +3,5 @@ Cargo.lock
 *.exe
 *.pdb
 .env
+/dist
+/frontend/node_modules

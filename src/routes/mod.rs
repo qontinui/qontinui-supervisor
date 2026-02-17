@@ -1,10 +1,13 @@
 pub mod ai;
 pub mod dashboard;
 pub mod dev_start;
+pub mod diagnostics;
+pub mod evaluation;
 pub mod expo;
 pub mod health;
 pub mod logs;
 pub mod runner;
 pub mod ui_bridge;
+pub mod velocity;
 pub mod workflow_loop;
 pub mod ws;

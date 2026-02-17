@@ -1,16 +1,30 @@
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 use crate::state::SharedState;
 
 pub fn build_router(state: SharedState) -> Router {
+    // Resolve dev_logs directory for velocity routes
+    let dev_logs_dir = state
+        .config
+        .project_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&state.config.project_dir)
+        .join(".dev-logs");
+    let _ = std::fs::create_dir_all(&dev_logs_dir);
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    // Clone state for eval routes (eval_routes needs SharedState; main_routes consumes it)
+    let eval_state = state.clone();
+
+    // Build main stateful routes, then apply state to get Router<()>
+    let main_routes = Router::new()
         // Dashboard
         .route("/", get(crate::routes::dashboard::index))
         // Health
@@ -111,11 +125,32 @@ pub fn build_router(state: SharedState) -> Router {
             "/workflow-loop/signal-restart",
             post(crate::routes::workflow_loop::signal_restart),
         )
+        // Diagnostics
+        .route(
+            "/diagnostics",
+            get(crate::routes::diagnostics::get_diagnostics),
+        )
+        .route(
+            "/diagnostics/clear",
+            post(crate::routes::diagnostics::clear_diagnostics),
+        )
         // Expo
         .route("/expo/start", post(crate::routes::expo::start))
         .route("/expo/stop", post(crate::routes::expo::stop))
         .route("/expo/status", get(crate::routes::expo::status))
         .route("/expo/logs/stream", get(crate::routes::expo::logs_stream))
+        .with_state(state);
+
+    // Merge stateless routers (velocity/eval have their own state, SPA has none)
+    main_routes
+        .merge(crate::routes::velocity::velocity_routes(
+            dev_logs_dir.clone(),
+        ))
+        .merge(crate::routes::evaluation::eval_routes(
+            dev_logs_dir,
+            eval_state,
+        ))
+        .merge(crate::routes::dashboard::spa_routes())
+        .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(state)
 }

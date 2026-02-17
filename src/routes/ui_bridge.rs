@@ -15,7 +15,7 @@ use crate::config::RUNNER_API_PORT;
 use crate::state::SharedState;
 
 /// Default timeout for UI Bridge proxy requests (seconds).
-const PROXY_TIMEOUT_SECS: u64 = 5;
+const PROXY_TIMEOUT_SECS: u64 = 15;
 
 /// Proxy handler for all UI Bridge requests.
 ///

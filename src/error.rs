@@ -34,6 +34,9 @@ pub enum SupervisorError {
     #[error("Runner API error: {0}")]
     RunnerApi(String),
 
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -51,6 +54,7 @@ impl IntoResponse for SupervisorError {
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
             SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

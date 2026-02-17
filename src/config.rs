@@ -92,6 +92,7 @@ pub const WORKFLOW_LOOP_POLL_INTERVAL_SECS: u64 = 5;
 pub const WORKFLOW_LOOP_MAX_ITERATIONS_DEFAULT: u32 = 5;
 pub const WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS: u64 = 120;
 pub const WORKFLOW_LOOP_RUNNER_HEALTH_POLL_SECS: u64 = 2;
+pub const WORKFLOW_LOOP_FIX_TIMEOUT_SECS: u64 = 600;
 
 // AI model definitions: (provider, key, model_id, display_name)
 pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[

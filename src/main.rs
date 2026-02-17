@@ -2,7 +2,9 @@ mod ai_debug;
 mod build_monitor;
 mod code_activity;
 mod config;
+mod diagnostics;
 mod error;
+mod evaluation;
 mod expo;
 mod health_cache;
 mod log_capture;
@@ -11,12 +13,16 @@ mod routes;
 mod server;
 mod settings;
 mod state;
+mod velocity;
+mod velocity_layer;
 mod watchdog;
 mod workflow_loop;
 
 use clap::Parser;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use config::{CliArgs, SupervisorConfig};
 use log_capture::{LogLevel, LogSource};
@@ -24,15 +30,32 @@ use state::SupervisorState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "qontinui_supervisor=info,tower_http=info".into()),
-        )
-        .init();
-
+    // Parse args early so we can resolve dev_logs path for velocity layer
     let args = CliArgs::parse();
+
+    // Resolve dev_logs directory (sibling to project dir's grandparent)
+    let dev_logs_dir = args
+        .project_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&args.project_dir)
+        .join(".dev-logs");
+    let _ = std::fs::create_dir_all(&dev_logs_dir);
+
+    // Clear previous velocity JSONL on startup
+    velocity_layer::clear_velocity_jsonl(&dev_logs_dir);
+
+    // Initialize tracing with velocity layer for HTTP span capture
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "qontinui_supervisor=info,tower_http=info".into());
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    let velocity = velocity_layer::VelocityLayer::new(dev_logs_dir);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(velocity)
+        .init();
     info!(
         "Starting qontinui-supervisor v{}",
         env!("CARGO_PKG_VERSION")

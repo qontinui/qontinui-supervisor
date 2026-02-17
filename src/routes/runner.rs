@@ -3,6 +3,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
@@ -47,7 +48,7 @@ pub async fn restart_runner(
         )
         .await;
 
-    manager::restart_runner(&state, rebuild).await?;
+    manager::restart_runner(&state, rebuild, RestartSource::Manual).await?;
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
