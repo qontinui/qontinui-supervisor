@@ -9,7 +9,129 @@ use crate::config::RUNNER_API_PORT;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::state::SharedState;
 
-/// Generate a workflow via the runner API and return (task_run_id, workflow_id, workflow_json).
+/// After the meta-workflow completes, find the generated output workflow.
+/// The runner saves the generated workflow as a separate entity with a non-meta category.
+/// We list all workflows and find the most recently created one that isn't the meta-workflow.
+async fn find_generated_workflow(
+    http_client: &reqwest::Client,
+    runner_url: &str,
+    meta_workflow_id: &str,
+) -> anyhow::Result<(String, String)> {
+    // First, get the meta-workflow's created_at timestamp as a lower bound
+    let meta_resp = http_client
+        .get(format!(
+            "{}/unified-workflows/{}",
+            runner_url, meta_workflow_id
+        ))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !meta_resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to fetch meta-workflow {}: {}",
+            meta_workflow_id,
+            meta_resp.status()
+        );
+    }
+
+    let meta_body: serde_json::Value = meta_resp.json().await?;
+    let meta_created = meta_body["data"]["created_at"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // List all workflows and find the generated one:
+    // - Not the meta-workflow itself
+    // - Category != "meta"
+    // - Created after the meta-workflow
+    // - Most recently created
+    let list_resp = http_client
+        .get(format!("{}/unified-workflows", runner_url))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !list_resp.status().is_success() {
+        anyhow::bail!("Failed to list workflows: {}", list_resp.status());
+    }
+
+    let list_body: serde_json::Value = list_resp.json().await?;
+    let workflows = list_body["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("No data array in workflows response"))?;
+
+    // Find the generated workflow: non-meta, created after the meta-workflow
+    let mut best: Option<&serde_json::Value> = None;
+    for wf in workflows {
+        let id = wf["id"].as_str().unwrap_or("");
+        let category = wf["category"].as_str().unwrap_or("");
+        let created = wf["created_at"].as_str().unwrap_or("");
+
+        // Skip the meta-workflow itself
+        if id == meta_workflow_id {
+            continue;
+        }
+        // Skip meta-category workflows
+        if category == "meta" {
+            continue;
+        }
+        // Must be created after the meta-workflow started
+        if !meta_created.is_empty() && created < meta_created.as_str() {
+            continue;
+        }
+        // Pick the most recently created
+        match best {
+            None => best = Some(wf),
+            Some(prev) => {
+                let prev_created = prev["created_at"].as_str().unwrap_or("");
+                if created > prev_created {
+                    best = Some(wf);
+                }
+            }
+        }
+    }
+
+    let generated_wf = best.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No generated workflow found after meta-workflow {}",
+            meta_workflow_id
+        )
+    })?;
+
+    let generated_id = generated_wf["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Generated workflow has no id"))?
+        .to_string();
+
+    info!(
+        "Found generated workflow {} (meta was {})",
+        generated_id, meta_workflow_id
+    );
+
+    // Fetch the full workflow JSON for scoring
+    let wf_resp = http_client
+        .get(format!("{}/unified-workflows/{}", runner_url, generated_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !wf_resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to fetch generated workflow {}: {}",
+            generated_id,
+            wf_resp.status()
+        );
+    }
+
+    let wf_body: serde_json::Value = wf_resp.json().await?;
+    let wf_data = &wf_body["data"];
+    let workflow_json = serde_json::to_string_pretty(wf_data)?;
+
+    Ok((generated_id, workflow_json))
+}
+
+/// Generate a workflow via the runner API and return (task_run_id, generated_workflow_id, workflow_json).
 async fn generate_workflow_for_eval(
     http_client: &reqwest::Client,
     prompt: &str,
@@ -40,14 +162,14 @@ async fn generate_workflow_for_eval(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("No task_run_id in generate-async response"))?
         .to_string();
-    let workflow_id = data["meta_workflow_id"]
+    let meta_workflow_id = data["meta_workflow_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("No meta_workflow_id in generate-async response"))?
         .to_string();
 
     info!(
-        "Started generation task_run_id={}, workflow_id={}",
-        task_run_id, workflow_id
+        "Started generation task_run_id={}, meta_workflow_id={}",
+        task_run_id, meta_workflow_id
     );
 
     // Poll until complete (up to 10 minutes)
@@ -79,30 +201,14 @@ async fn generate_workflow_for_eval(
                         anyhow::bail!("Workflow generation was stopped");
                     }
 
-                    // Fetch the generated workflow JSON
-                    // The meta-workflow wraps the generation — the actual generated workflow
-                    // is the one we need to score. Fetch it from unified-workflows endpoint.
-                    let wf_resp = http_client
-                        .get(format!("{}/unified-workflows/{}", runner_url, workflow_id))
-                        .timeout(std::time::Duration::from_secs(10))
-                        .send()
-                        .await?;
+                    // The meta-workflow wraps the generation pipeline. The actual
+                    // generated output workflow is a separate entity. We need to find
+                    // the most recently created non-meta workflow produced by this run.
+                    let generated =
+                        find_generated_workflow(http_client, &runner_url, &meta_workflow_id)
+                            .await?;
 
-                    if !wf_resp.status().is_success() {
-                        anyhow::bail!(
-                            "Failed to fetch workflow {}: {}",
-                            workflow_id,
-                            wf_resp.status()
-                        );
-                    }
-
-                    // Response is {"success": true, "data": {...workflow...}}
-                    let wf_body: serde_json::Value = wf_resp.json().await?;
-                    let wf_data = &wf_body["data"];
-
-                    // The workflow JSON for scoring is the data object
-                    let workflow_json = serde_json::to_string_pretty(wf_data)?;
-                    return Ok((task_run_id, workflow_id, workflow_json));
+                    return Ok((task_run_id, generated.0, generated.1));
                 }
             }
             Ok(resp) => {

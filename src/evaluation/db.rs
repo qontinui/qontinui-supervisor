@@ -22,6 +22,7 @@ impl EvalDb {
         };
         db.init_schema()?;
         db.seed_defaults()?;
+        db.cleanup_stale_runs()?;
         Ok(db)
     }
 
@@ -169,6 +170,22 @@ impl EvalDb {
 
         tracing::info!("Seeded {} default test prompts", seeds.len());
         Ok(())
+    }
+
+    /// Mark any runs left in "running" status as "interrupted".
+    /// Called on startup to clean up stale state from previous supervisor instances.
+    pub fn cleanup_stale_runs(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let count = conn.execute(
+            "UPDATE eval_runs SET status='interrupted', completed_at=?1
+             WHERE status='running'",
+            params![now],
+        )?;
+        if count > 0 {
+            tracing::info!("Marked {} stale eval runs as interrupted", count);
+        }
+        Ok(count)
     }
 
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {

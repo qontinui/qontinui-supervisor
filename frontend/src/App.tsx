@@ -6,6 +6,7 @@ import VelocityCompare from './pages/VelocityCompare';
 import VelocityTrace from './pages/VelocityTrace';
 import Evaluation from './pages/Evaluation';
 import EvalRunDetail from './pages/EvalRunDetail';
+import VelocityTest from './pages/VelocityTest';
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
           <li><NavLink to="/velocity/compare" className={({ isActive }) => isActive ? 'active' : ''}>Compare</NavLink></li>
           <li><NavLink to="/velocity/trace" className={({ isActive }) => isActive ? 'active' : ''}>Trace</NavLink></li>
           <li><NavLink to="/evaluation" className={({ isActive }) => isActive ? 'active' : ''}>Evaluation</NavLink></li>
+          <li><NavLink to="/velocity-tests" className={({ isActive }) => isActive ? 'active' : ''}>Velocity Tests</NavLink></li>
         </ul>
       </aside>
       <main className="main-content">
@@ -30,6 +32,7 @@ export default function App() {
           <Route path="/velocity/trace" element={<VelocityTrace />} />
           <Route path="/evaluation" element={<Evaluation />} />
           <Route path="/evaluation/run/:id" element={<EvalRunDetail />} />
+          <Route path="/velocity-tests" element={<VelocityTest />} />
         </Routes>
       </main>
     </div>

@@ -183,6 +183,91 @@ export interface MessageResponse {
   message: string;
 }
 
+// Velocity Test types
+export interface VtStatus {
+  running: boolean;
+  current_run_id: string | null;
+  current_test_index: number;
+  total_tests: number;
+}
+
+export interface VtRun {
+  id: string;
+  started_at: string;
+  completed_at: string | null;
+  overall_score: number | null;
+  status: string;
+  tests_total: number;
+  tests_completed: number;
+}
+
+export interface VtResult {
+  id: number;
+  run_id: string;
+  test_name: string;
+  page_url: string;
+  load_time_ms: number | null;
+  console_errors: number;
+  element_found: boolean;
+  score: number | null;
+  error: string | null;
+  tested_at: string;
+  // Diagnostic fields
+  api_response_time_ms: number | null;
+  api_status_code: number | null;
+  ttfb_ms: number | null;
+  dom_interactive_ms: number | null;
+  dom_complete_ms: number | null;
+  fcp_ms: number | null;
+  long_task_count: number;
+  long_task_total_ms: number;
+  resource_count: number;
+  total_transfer_size_bytes: number;
+  slowest_resource_ms: number;
+  bottleneck: string | null;
+  diagnostics_json: string | null;
+}
+
+export interface VtDiagnostics {
+  navigation?: {
+    ttfbMs: number;
+    domInteractiveMs: number;
+    domCompleteMs: number;
+    loadEventMs: number;
+    redirectMs: number;
+    dnsMs: number;
+    tcpMs: number;
+  };
+  resources?: Array<{
+    name: string;
+    initiatorType: string;
+    startTime: number;
+    duration: number;
+    transferSize: number;
+    ttfbMs: number;
+    downloadMs: number;
+  }>;
+  paint?: Array<{
+    name: string;
+    startTime: number;
+  }>;
+  longTasks?: Array<{
+    duration: number;
+    startTime?: number;
+    [key: string]: unknown;
+  }>;
+}
+
+export interface VtRunWithResults extends VtRun {
+  results: VtResult[];
+}
+
+export interface VtTrendPoint {
+  run_id: string;
+  started_at: string;
+  overall_score: number | null;
+}
+
 export const api = {
   // Velocity
   ingest: () => fetchJson<IngestResult>('/velocity/ingest', { method: 'POST' }),
@@ -222,6 +307,14 @@ export const api = {
     body: JSON.stringify(prompt),
   }),
   evalTestSuiteDelete: (id: string) => fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: 'DELETE' }),
+
+  // Velocity Tests
+  vtStatus: () => fetchJson<VtStatus>('/velocity-tests/status'),
+  vtStart: () => fetchJson<MessageResponse>('/velocity-tests/start', { method: 'POST' }),
+  vtStop: () => fetchJson<MessageResponse>('/velocity-tests/stop', { method: 'POST' }),
+  vtRuns: () => fetchJson<VtRun[]>('/velocity-tests/runs'),
+  vtRun: (id: string) => fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
+  vtTrend: (limit?: number) => fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
 
   // Supervisor
   health: () => fetchJson<HealthResponse>('/health'),

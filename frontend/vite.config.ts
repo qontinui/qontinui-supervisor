@@ -35,6 +35,7 @@ export default defineConfig({
       '/ui-bridge': 'http://localhost:9875',
       '/expo': 'http://localhost:9875',
       '/eval': 'http://localhost:9875',
+      '/velocity-tests': 'http://localhost:9875',
       '/ws': { target: 'ws://localhost:9875', ws: true },
     },
   },

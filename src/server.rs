@@ -20,8 +20,9 @@ pub fn build_router(state: SharedState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Clone state for eval routes (eval_routes needs SharedState; main_routes consumes it)
+    // Clone state for stateless routes (they need SharedState; main_routes consumes it)
     let eval_state = state.clone();
+    let vt_state = state.clone();
 
     // Build main stateful routes, then apply state to get Router<()>
     let main_routes = Router::new()
@@ -147,8 +148,12 @@ pub fn build_router(state: SharedState) -> Router {
             dev_logs_dir.clone(),
         ))
         .merge(crate::routes::evaluation::eval_routes(
-            dev_logs_dir,
+            dev_logs_dir.clone(),
             eval_state,
+        ))
+        .merge(crate::routes::velocity_tests::velocity_test_routes(
+            dev_logs_dir,
+            vt_state,
         ))
         .merge(crate::routes::dashboard::spa_routes())
         .layer(TraceLayer::new_for_http())

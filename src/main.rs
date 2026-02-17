@@ -15,6 +15,7 @@ mod settings;
 mod state;
 mod velocity;
 mod velocity_layer;
+mod velocity_tests;
 mod watchdog;
 mod workflow_loop;
 
@@ -179,16 +180,11 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Supervisor listening on http://0.0.0.0:{}", port);
 
-    // Serve with graceful shutdown + forced 5s timeout to prevent zombie sockets
+    // Serve with graceful shutdown (no global timeout — eval benchmarks can run for hours)
     let serve_future =
         axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(state.clone()));
 
-    match tokio::time::timeout(std::time::Duration::from_secs(300), serve_future).await {
-        Ok(result) => result?,
-        Err(_) => {
-            warn!("Server shutdown timed out, forcing exit");
-        }
-    }
+    serve_future.await?;
 
     info!("Supervisor shutting down");
 

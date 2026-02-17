@@ -23,6 +23,7 @@ pub struct SupervisorState {
     pub workflow_loop: RwLock<WorkflowLoopState>,
     pub diagnostics: RwLock<DiagnosticsState>,
     pub evaluation: RwLock<EvaluationState>,
+    pub velocity_tests: RwLock<VelocityTestState>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
@@ -112,6 +113,7 @@ impl SupervisorState {
             workflow_loop: RwLock::new(WorkflowLoopState::new()),
             diagnostics: RwLock::new(DiagnosticsState::new()),
             evaluation: RwLock::new(EvaluationState::new()),
+            velocity_tests: RwLock::new(VelocityTestState::new()),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
@@ -274,6 +276,32 @@ impl EvaluationState {
 }
 
 impl Default for EvaluationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct VelocityTestState {
+    pub running: bool,
+    pub current_run_id: Option<String>,
+    pub current_test_index: usize,
+    pub total_tests: usize,
+    pub stop_tx: Option<watch::Sender<bool>>,
+}
+
+impl VelocityTestState {
+    pub fn new() -> Self {
+        Self {
+            running: false,
+            current_run_id: None,
+            current_test_index: 0,
+            total_tests: 0,
+            stop_tx: None,
+        }
+    }
+}
+
+impl Default for VelocityTestState {
     fn default() -> Self {
         Self::new()
     }

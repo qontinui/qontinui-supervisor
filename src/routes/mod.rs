@@ -9,5 +9,6 @@ pub mod logs;
 pub mod runner;
 pub mod ui_bridge;
 pub mod velocity;
+pub mod velocity_tests;
 pub mod workflow_loop;
 pub mod ws;
