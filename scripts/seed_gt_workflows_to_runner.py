@@ -49,10 +49,10 @@ def api_delete(url):
 
 
 def make_check(check_id, name, check_type, tool, command, working_dir):
-    """Create a check step dict."""
+    """Create a command step with check_type set (unified command type)."""
     return {
         "id": check_id,
-        "type": "check",
+        "type": "command",
         "name": name,
         "phase": "verification",
         "check_type": check_type,
@@ -61,16 +61,6 @@ def make_check(check_id, name, check_type, tool, command, working_dir):
         "working_directory": working_dir,
     }
 
-
-def make_gate(check_ids):
-    """Create a gate step that requires all checks."""
-    return {
-        "id": "step-gate",
-        "type": "gate",
-        "name": "All checks pass",
-        "phase": "verification",
-        "required_steps": check_ids,
-    }
 
 
 def make_agentic():
@@ -97,9 +87,9 @@ def add_gt(name, description, checks):
         "name": name,
         "description": description,
         "category": "ground_truth",
-        "tags": ["ground_truth", "check_group", "reference"],
+        "tags": ["ground_truth", "command", "reference"],
         "setup_steps": [],
-        "verification_steps": [*checks, make_gate([c["id"] for c in checks])],
+        "verification_steps": checks,
         "agentic_steps": [make_agentic()],
         "completion_steps": [],
         "max_iterations": 5,

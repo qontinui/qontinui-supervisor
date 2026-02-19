@@ -2,8 +2,8 @@
 Seed UI Bridge ground truth workflows and eval prompts.
 
 These GT workflows demonstrate deterministic UI test sequences using the
-UI Bridge control API. Each workflow navigates to a page, interacts with
-elements, and asserts expected state via API request steps.
+UI Bridge step type. Each workflow navigates to a page, interacts with
+elements, and asserts expected state via first-class ui_bridge steps.
 
 Prerequisites:
   - Web frontend running at http://localhost:3001
@@ -18,7 +18,6 @@ import urllib.request
 
 RUNNER = "http://localhost:9876"
 SUPERVISOR = "http://localhost:9875"
-UI_BRIDGE = "http://localhost:3001/api/ui-bridge"
 
 
 # ============================================================================
@@ -90,26 +89,20 @@ def upsert_prompt(prompt_data):
 # ============================================================================
 
 def navigate_step(step_id, name, url, phase="setup"):
-    """Create a page navigation step using UI Bridge control API."""
+    """Create a page navigation step using the ui_bridge step type."""
     return {
         "id": step_id,
-        "type": "api_request",
+        "type": "ui_bridge",
         "name": name,
         "phase": phase,
-        "method": "POST",
-        "url": f"{UI_BRIDGE}/control/page/navigate",
-        "body": json.dumps({"url": url}),
-        "content_type": "application/json",
-        "assertions": [
-            {"type": "status_code", "expected": "200"},
-            {"type": "json_path", "json_path": "$.data.success", "expected": "true"},
-        ],
+        "ui_bridge_action": "navigate",
+        "ui_bridge_url": url,
     }
 
 
 def ai_assert_step(step_id, name, target, assert_type="visible", expected=None,
                    phase="verification", retry_count=5, retry_delay_ms=3000):
-    """Create an AI assertion step using natural language element matching.
+    """Create an AI assertion step using the ui_bridge step type.
 
     target: natural language description of element (e.g., "Settings", "Runner Name input")
     assert_type: one of visible, hidden, enabled, disabled, checked, unchecked, focused,
@@ -119,23 +112,17 @@ def ai_assert_step(step_id, name, target, assert_type="visible", expected=None,
     retry_count/retry_delay_ms: after page navigation, the SSE connection
     reconnects after a few seconds. Retries allow the step to wait.
     """
-    body = {"target": target, "type": assert_type}
-    if expected is not None:
-        body["expected"] = expected
     step = {
         "id": step_id,
-        "type": "api_request",
+        "type": "ui_bridge",
         "name": name,
         "phase": phase,
-        "method": "POST",
-        "url": f"{UI_BRIDGE}/ai/assert",
-        "body": json.dumps(body),
-        "content_type": "application/json",
-        "assertions": [
-            {"type": "status_code", "expected": "200"},
-            {"type": "json_path", "json_path": "$.data.passed", "expected": "true"},
-        ],
+        "ui_bridge_action": "assert",
+        "ui_bridge_target": target,
+        "ui_bridge_assert_type": assert_type,
     }
+    if expected is not None:
+        step["ui_bridge_expected"] = expected
     if retry_count > 0:
         step["retry_count"] = retry_count
         step["retry_delay_ms"] = retry_delay_ms
@@ -144,40 +131,23 @@ def ai_assert_step(step_id, name, target, assert_type="visible", expected=None,
 
 def ai_execute_step(step_id, name, instruction, phase="verification",
                     retry_count=3, retry_delay_ms=2000):
-    """Create an AI execute step using natural language instruction.
+    """Create an AI execute step using the ui_bridge step type.
 
     instruction: simple NL instruction like "click Settings" or "type 'hello' in search"
-    Keep instructions short — the NL parser works best with simple patterns.
+    Keep instructions short -- the NL parser works best with simple patterns.
     """
     step = {
         "id": step_id,
-        "type": "api_request",
+        "type": "ui_bridge",
         "name": name,
         "phase": phase,
-        "method": "POST",
-        "url": f"{UI_BRIDGE}/ai/execute",
-        "body": json.dumps({"instruction": instruction}),
-        "content_type": "application/json",
-        "assertions": [
-            {"type": "status_code", "expected": "200"},
-            {"type": "json_path", "json_path": "$.data.success", "expected": "true"},
-        ],
+        "ui_bridge_action": "execute",
+        "ui_bridge_instruction": instruction,
     }
     if retry_count > 0:
         step["retry_count"] = retry_count
         step["retry_delay_ms"] = retry_delay_ms
     return step
-
-
-def make_gate(required_step_ids):
-    """Create a gate step that requires all specified steps to pass."""
-    return {
-        "id": "step-gate",
-        "type": "gate",
-        "name": "All UI Bridge checks pass",
-        "phase": "verification",
-        "required_steps": required_step_ids,
-    }
 
 
 def make_agentic():
@@ -207,16 +177,13 @@ EVAL_PROMPTS = []
 def add_gt(workflow_id, name, description, prompt_text, setup_steps,
            verification_steps, complexity="simple"):
     """Add a ground truth workflow and its eval prompt."""
-    verification_ids = [s["id"] for s in verification_steps if s["type"] != "gate"]
-    all_verification = [*verification_steps, make_gate(verification_ids)]
-
     workflow = {
         "name": name,
         "description": description,
         "category": "ground_truth",
         "tags": ["ground_truth", "ui_bridge", "test"],
         "setup_steps": setup_steps,
-        "verification_steps": all_verification,
+        "verification_steps": verification_steps,
         "agentic_steps": [make_agentic()],
         "completion_steps": [],
         "max_iterations": 3,
@@ -229,7 +196,7 @@ def add_gt(workflow_id, name, description, prompt_text, setup_steps,
         "category": "ui_bridge",
         "complexity": complexity,
         "expected_phases": None,
-        "expected_step_types": ["api_request"],
+        "expected_step_types": ["ui_bridge"],
         "tags": ["ui_bridge", "ground_truth"],
         "ground_truth_json": json.dumps(workflow),
         "enabled": True,
@@ -238,7 +205,7 @@ def add_gt(workflow_id, name, description, prompt_text, setup_steps,
     })
 
 
-# ── 1. Navigate to Settings page and verify ─────────────────────────────────
+# -- 1. Navigate to Settings page and verify ------------------------------------
 add_gt(
     "gt-ui-bridge-nav-settings",
     "GT: UI Bridge - Navigate to Settings",
@@ -271,7 +238,7 @@ add_gt(
     ],
 )
 
-# ── 2. Navigate to Discoveries page and verify tabs ─────────────────────────
+# -- 2. Navigate to Discoveries page and verify tabs ----------------------------
 add_gt(
     "gt-ui-bridge-nav-discoveries",
     "GT: UI Bridge - Navigate to Discoveries",
@@ -309,7 +276,7 @@ add_gt(
     ],
 )
 
-# ── 3. Navigate to Agentic Settings and verify ──────────────────────────────
+# -- 3. Navigate to Agentic Settings and verify --------------------------------
 add_gt(
     "gt-ui-bridge-nav-agentic-settings",
     "GT: UI Bridge - Navigate to Agentic Settings",
@@ -342,7 +309,7 @@ add_gt(
     ],
 )
 
-# ── 4. Navigate to Automation Builder (no project) ──────────────────────────
+# -- 4. Navigate to Automation Builder (no project) ----------------------------
 add_gt(
     "gt-ui-bridge-nav-builder",
     "GT: UI Bridge - Navigate to Automation Builder",
@@ -371,7 +338,7 @@ add_gt(
     ],
 )
 
-# ── 5. Discoveries tab switching ─────────────────────────────────────────────
+# -- 5. Discoveries tab switching -----------------------------------------------
 add_gt(
     "gt-ui-bridge-discoveries-tabs",
     "GT: UI Bridge - Switch Discoveries tabs",
@@ -405,7 +372,7 @@ add_gt(
     complexity="medium",
 )
 
-# ── 6. Settings runner name input field ──────────────────────────────────────
+# -- 6. Settings runner name input field ----------------------------------------
 add_gt(
     "gt-ui-bridge-settings-runner-name",
     "GT: UI Bridge - Verify Settings form fields",
@@ -439,7 +406,7 @@ add_gt(
     ],
 )
 
-# ── 7. Agentic Settings config validation ───────────────────────────────────
+# -- 7. Agentic Settings config validation -------------------------------------
 add_gt(
     "gt-ui-bridge-agentic-config-fields",
     "GT: UI Bridge - Verify Agentic Settings configuration",
@@ -494,7 +461,7 @@ if __name__ == "__main__":
     print("Seeding UI Bridge ground truth workflows")
     print("=" * 60)
 
-    # ── Step 1: Seed GT workflows to runner ──────────────────────────────────
+    # -- Step 1: Seed GT workflows to runner ------------------------------------
     print("\n--- Seeding workflows to runner (port 9876) ---")
 
     # Find and delete existing UI Bridge GT workflows
@@ -514,7 +481,7 @@ if __name__ == "__main__":
                 print(f"  {status} delete {w['name']}")
     elif "error" in (existing or {}):
         print(f"  WARNING: Could not fetch existing workflows: {existing['error']}")
-        print("  (Runner may not be running — skipping workflow seeding)")
+        print("  (Runner may not be running -- skipping workflow seeding)")
 
     # Insert new GT workflows
     print(f"\nInserting {len(GT_WORKFLOWS)} UI Bridge GT workflows...")
@@ -530,7 +497,7 @@ if __name__ == "__main__":
 
     print(f"\nWorkflows: {wf_success}/{len(GT_WORKFLOWS)} inserted")
 
-    # ── Step 2: Seed eval prompts to supervisor ──────────────────────────────
+    # -- Step 2: Seed eval prompts to supervisor --------------------------------
     print("\n--- Seeding eval prompts to supervisor (port 9875) ---")
 
     prompt_success = 0
@@ -547,7 +514,7 @@ if __name__ == "__main__":
     print(f"\nEval prompts: {prompt_success}/{len(EVAL_PROMPTS)} added/updated"
           f"{f', {prompt_fail} failed' if prompt_fail else ''}")
 
-    # ── Summary ──────────────────────────────────────────────────────────────
+    # -- Summary ----------------------------------------------------------------
     print("\n" + "=" * 60)
     print(f"Done: {wf_success} workflows, {prompt_success} eval prompts")
     print("=" * 60)
