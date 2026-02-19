@@ -394,6 +394,38 @@
     width: 60px;
     text-align: center;
   }
+  .wl-textarea {
+    width: 100%;
+    min-height: 60px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: var(--font-ui);
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    resize: vertical;
+  }
+  .wl-textarea:focus { outline: 1px solid var(--primary); }
+  .wl-textarea::placeholder { color: var(--text-secondary); }
+  .wl-config-row input[type=text] {
+    width: 140px;
+    padding: 3px 6px;
+    font-size: 12px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .wl-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .wl-checkbox-row input[type=checkbox] { margin: 0; }
   .wl-status-phase {
     display: inline-block;
     padding: 2px 8px;
@@ -705,28 +737,74 @@
       <div class="wl-panel">
         <!-- Left: Queue & Config -->
         <div>
-          <div class="wl-section-title">Add Workflow</div>
-          <div class="wl-add-row">
-            <select id="wlWorkflowSelect"><option value="">Loading workflows...</option></select>
-            <button class="btn primary" onclick="wlAddToQueue()">+ Add</button>
-            <button class="btn" onclick="wlRefreshWorkflows()" title="Refresh workflow list">&#x21bb;</button>
+          <div class="wl-section-title">Mode</div>
+          <div class="wl-config-row">
+            <label><input type="radio" name="wlMode" value="simple" checked onchange="wlModeChange()"> Simple</label>
+            <label style="margin-left:12px"><input type="radio" name="wlMode" value="pipeline" onchange="wlModeChange()"> Pipeline</label>
           </div>
 
-          <div class="wl-section-title">Queue</div>
-          <ul class="wl-queue" id="wlQueue">
-            <li class="wl-queue-empty">No workflows queued</li>
-          </ul>
+          <div id="wlSimpleConfig">
+            <div class="wl-section-title" style="margin-top:10px">Add Workflow</div>
+            <div class="wl-add-row">
+              <select id="wlWorkflowSelect"><option value="">Loading workflows...</option></select>
+              <button class="btn primary" onclick="wlAddToQueue()">+ Add</button>
+              <button class="btn" onclick="wlRefreshWorkflows()" title="Refresh workflow list">&#x21bb;</button>
+            </div>
 
-          <div class="wl-section-title" style="margin-top:10px">Configuration</div>
-          <div class="wl-config-row">
-            <span class="label">Exit Strategy</span>
-            <select id="wlExitStrategy">
-              <option value="fixed_iterations">Fixed Iterations</option>
-              <option value="reflection">Reflection (0 fixes = exit)</option>
-              <option value="workflow_verification">Verification (pass on 1st = exit)</option>
-            </select>
+            <div class="wl-section-title">Queue</div>
+            <ul class="wl-queue" id="wlQueue">
+              <li class="wl-queue-empty">No workflows queued</li>
+            </ul>
+
+            <div class="wl-section-title" style="margin-top:10px">Configuration</div>
+            <div class="wl-config-row">
+              <span class="label">Exit Strategy</span>
+              <select id="wlExitStrategy">
+                <option value="fixed_iterations">Fixed Iterations</option>
+                <option value="reflection">Reflection (0 fixes = exit)</option>
+                <option value="workflow_verification">Verification (pass on 1st = exit)</option>
+              </select>
+            </div>
           </div>
-          <div class="wl-config-row">
+
+          <div id="wlPipelineConfig" style="display:none">
+            <div class="wl-section-title" style="margin-top:10px">Pipeline Configuration</div>
+
+            <div style="margin-bottom:8px">
+              <div class="wl-config-row"><span class="label">Build Description</span></div>
+              <textarea id="wlPipelineBuildDesc" class="wl-textarea" placeholder="Describe the workflow to generate..." rows="3"></textarea>
+            </div>
+
+            <div style="margin-bottom:8px">
+              <div class="wl-config-row"><span class="label">Build Context (optional)</span></div>
+              <textarea id="wlPipelineBuildContext" class="wl-textarea" placeholder="Additional context for the builder..." rows="2"></textarea>
+            </div>
+
+            <div class="wl-config-row">
+              <span class="label">Execute Workflow (fallback)</span>
+              <select id="wlPipelineExecId" style="width:160px">
+                <option value="">None (use build)</option>
+              </select>
+            </div>
+
+            <div class="wl-checkbox-row" style="margin-top:6px">
+              <input type="checkbox" id="wlPipelineEnableFixes" onchange="wlToggleFixConfig()">
+              <span>Enable Fix Implementation</span>
+            </div>
+
+            <div id="wlFixConfig" style="display:none;margin-top:6px">
+              <div style="margin-bottom:8px">
+                <div class="wl-config-row"><span class="label">Fix Additional Context (optional)</span></div>
+                <textarea id="wlPipelineFixContext" class="wl-textarea" placeholder="Extra instructions for the fix agent..." rows="2"></textarea>
+              </div>
+              <div class="wl-config-row">
+                <span class="label">Fix Timeout (seconds)</span>
+                <input type="number" id="wlPipelineFixTimeout" value="600" min="60" max="3600">
+              </div>
+            </div>
+          </div>
+
+          <div class="wl-config-row" style="margin-top:10px">
             <span class="label">Between Iterations</span>
             <select id="wlBetween">
               <option value="restart_on_signal">Restart on Signal (rebuild)</option>
@@ -753,6 +831,7 @@
         <div>
           <div class="wl-section-title">Status</div>
           <div class="row"><span class="label">Phase</span><span class="value" id="wlPhase">idle</span></div>
+          <div class="row" id="wlPipelinePhaseRow" style="display:none"><span class="label">Pipeline Phase</span><span class="value wl-status-phase" id="wlPipelinePhaseTag" style="font-size:11px">--</span></div>
           <div class="row"><span class="label">Iteration</span><span class="value" id="wlIteration">--</span></div>
           <div class="row"><span class="label">Started</span><span class="value" id="wlStarted">--</span></div>
           <div class="row"><span class="label">Error</span><span class="value" id="wlError" style="color:var(--text-secondary)">none</span></div>
@@ -1711,6 +1790,8 @@
       if (!Array.isArray(list)) list = [];
       wlWorkflows = list;
       sel.innerHTML = '<option value="">Select a workflow...</option>';
+      var pipelineExecSel = document.getElementById('wlPipelineExecId');
+      pipelineExecSel.innerHTML = '<option value="">None (use build)</option>';
       for (var i = 0; i < list.length; i++) {
         var wf = list[i];
         var opt = document.createElement('option');
@@ -1718,6 +1799,11 @@
         var stepCount = (wf.steps && Array.isArray(wf.steps)) ? wf.steps.length : 0;
         opt.textContent = (wf.name || wf.id) + ' (' + stepCount + ' steps)';
         sel.appendChild(opt);
+        // Also add to pipeline exec dropdown
+        var popt = document.createElement('option');
+        popt.value = wf.id;
+        popt.textContent = (wf.name || wf.id) + ' (' + stepCount + ' steps)';
+        pipelineExecSel.appendChild(popt);
       }
       // Update queue items with fresh step counts
       for (var q = 0; q < wlQueueItems.length; q++) {
@@ -1734,31 +1820,34 @@
     }
   }
 
+  window.wlModeChange = function() {
+    var mode = document.querySelector('input[name="wlMode"]:checked').value;
+    localStorage.setItem('wl-mode', mode);
+    document.getElementById('wlSimpleConfig').style.display = mode === 'simple' ? '' : 'none';
+    document.getElementById('wlPipelineConfig').style.display = mode === 'pipeline' ? '' : 'none';
+    // Pre-populate sensible defaults when switching to pipeline
+    if (mode === 'pipeline') {
+      var betweenSel = document.getElementById('wlBetween');
+      if (betweenSel.value === 'restart_on_signal' || betweenSel.value === 'restart_on_signal_no_rebuild') {
+        betweenSel.value = 'restart_runner';
+      }
+    }
+  };
+
+  window.wlToggleFixConfig = function() {
+    var checked = document.getElementById('wlPipelineEnableFixes').checked;
+    document.getElementById('wlFixConfig').style.display = checked ? '' : 'none';
+  };
+
   window.wlRefreshWorkflows = function() {
     wlFetchWorkflows();
     showToast('Refreshed workflow list', 'success');
   };
 
   window.wlStart = async function() {
-    if (wlQueueItems.length === 0) {
-      showToast('Add at least one workflow to the queue', 'error');
-      return;
-    }
-    // For now, the loop runs the first workflow in the queue
-    // (The API supports single workflow_id; future: sequential queue execution)
-    var workflowId = wlQueueItems[0].id;
-    var exitSel = document.getElementById('wlExitStrategy').value;
+    var mode = document.querySelector('input[name="wlMode"]:checked').value;
     var betweenSel = document.getElementById('wlBetween').value;
     var maxIter = parseInt(document.getElementById('wlMaxIter').value) || 5;
-
-    var exitStrategy;
-    if (exitSel === 'reflection') {
-      exitStrategy = { type: 'reflection', reflection_workflow_id: null };
-    } else if (exitSel === 'workflow_verification') {
-      exitStrategy = { type: 'workflow_verification' };
-    } else {
-      exitStrategy = { type: 'fixed_iterations' };
-    }
 
     var between;
     if (betweenSel === 'restart_on_signal') {
@@ -1775,12 +1864,67 @@
       between = { type: 'none' };
     }
 
-    var body = {
-      workflow_id: workflowId,
-      max_iterations: maxIter,
-      exit_strategy: exitStrategy,
-      between_iterations: between
-    };
+    var body;
+
+    if (mode === 'pipeline') {
+      var desc = document.getElementById('wlPipelineBuildDesc').value.trim();
+      var ctx = document.getElementById('wlPipelineBuildContext').value.trim();
+      var execId = document.getElementById('wlPipelineExecId').value;
+      var enableFixes = document.getElementById('wlPipelineEnableFixes').checked;
+
+      if (!desc && !execId) {
+        showToast('Pipeline needs a build description or execute workflow ID', 'error');
+        return;
+      }
+
+      var phases = {
+        reflect: { reflection_workflow_id: null }
+      };
+      if (desc) {
+        phases.build = { description: desc };
+        if (ctx) phases.build.context = ctx;
+      }
+      if (execId) {
+        phases.execute_workflow_id = execId;
+      }
+      if (enableFixes) {
+        phases.implement_fixes = {};
+        var fixCtx = document.getElementById('wlPipelineFixContext').value.trim();
+        if (fixCtx) phases.implement_fixes.additional_context = fixCtx;
+        var fixTimeout = parseInt(document.getElementById('wlPipelineFixTimeout').value);
+        if (fixTimeout && fixTimeout !== 600) phases.implement_fixes.timeout_secs = fixTimeout;
+      }
+
+      body = {
+        max_iterations: maxIter,
+        between_iterations: between,
+        phases: phases
+      };
+    } else {
+      // Simple mode
+      if (wlQueueItems.length === 0) {
+        showToast('Add at least one workflow to the queue', 'error');
+        return;
+      }
+      var workflowId = wlQueueItems[0].id;
+      var exitSel = document.getElementById('wlExitStrategy').value;
+
+      var exitStrategy;
+      if (exitSel === 'reflection') {
+        exitStrategy = { type: 'reflection', reflection_workflow_id: null };
+      } else if (exitSel === 'workflow_verification') {
+        exitStrategy = { type: 'workflow_verification' };
+      } else {
+        exitStrategy = { type: 'fixed_iterations' };
+      }
+
+      body = {
+        workflow_id: workflowId,
+        max_iterations: maxIter,
+        exit_strategy: exitStrategy,
+        between_iterations: between
+      };
+    }
 
     document.getElementById('wlStartBtn').classList.add('loading');
     try {
@@ -1831,6 +1975,20 @@
     // Status rows
     document.getElementById('wlPhase').textContent = phaseText;
     document.getElementById('wlPhase').style.color = running ? 'var(--primary)' : 'var(--text-secondary)';
+
+    // Pipeline phase row — show when phase is a pipeline-specific phase
+    var pipelinePhases = ['building_workflow', 'reflecting', 'implementing_fixes'];
+    var isPipelinePhase = pipelinePhases.indexOf(s.phase) !== -1;
+    var isPipelineMode = isPipelinePhase || (s.config && s.config.phases);
+    var pipelineRow = document.getElementById('wlPipelinePhaseRow');
+    var pipelineTag = document.getElementById('wlPipelinePhaseTag');
+    if (isPipelineMode && running) {
+      pipelineRow.style.display = '';
+      pipelineTag.textContent = phaseText;
+      pipelineTag.className = 'value wl-status-phase ' + (s.phase || 'idle');
+    } else {
+      pipelineRow.style.display = 'none';
+    }
 
     var maxIter = (s.config && s.config.max_iterations) || '--';
     document.getElementById('wlIteration').textContent = s.current_iteration + ' / ' + maxIter;
@@ -1937,6 +2095,15 @@
 
   // Initialize
   wlRenderQueue();
+  // Restore saved mode from localStorage
+  var savedMode = localStorage.getItem('wl-mode');
+  if (savedMode === 'pipeline') {
+    var radios = document.querySelectorAll('input[name="wlMode"]');
+    for (var i = 0; i < radios.length; i++) {
+      radios[i].checked = radios[i].value === 'pipeline';
+    }
+    wlModeChange();
+  }
   // Fetch workflows once runner is available (delay slightly)
   setTimeout(wlFetchWorkflows, 2000);
   // Start status polling

@@ -98,6 +98,7 @@ export interface TestPrompt {
   expected_phases: string[] | null;
   expected_step_types: string[] | null;
   tags: string[] | null;
+  ground_truth_json: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -109,6 +110,7 @@ export interface EvalRunSummary {
   status: string;
   prompts_total: number;
   prompts_completed: number;
+  // Combined averages
   avg_overall_score: number | null;
   avg_structural: number | null;
   avg_command_accuracy: number | null;
@@ -116,6 +118,25 @@ export interface EvalRunSummary {
   avg_step_completeness: number | null;
   avg_prompt_quality: number | null;
   avg_determinism: number | null;
+  // Ground-truth prompt averages
+  gt_avg_overall: number | null;
+  gt_avg_structural: number | null;
+  gt_avg_command_accuracy: number | null;
+  gt_avg_phase_flow: number | null;
+  gt_avg_step_completeness: number | null;
+  gt_avg_prompt_quality: number | null;
+  gt_avg_determinism: number | null;
+  gt_count: number | null;
+  // Generic prompt averages
+  gen_avg_overall: number | null;
+  gen_avg_structural: number | null;
+  gen_avg_command_accuracy: number | null;
+  gen_avg_phase_flow: number | null;
+  gen_avg_step_completeness: number | null;
+  gen_avg_prompt_quality: number | null;
+  gen_avg_determinism: number | null;
+  gen_count: number | null;
+
   error: string | null;
   started_at: string;
   completed_at: string | null;
@@ -181,6 +202,59 @@ export interface CompareReport {
 export interface MessageResponse {
   ok: boolean;
   message: string;
+}
+
+// Workflow Loop types
+export interface WorkflowLoopStatus {
+  running: boolean;
+  config: WorkflowLoopConfig | null;
+  current_iteration: number;
+  phase: string;
+  started_at: string | null;
+  error: string | null;
+  iteration_count: number;
+  restart_signaled: boolean;
+}
+
+export interface WorkflowLoopConfig {
+  workflow_id?: string;
+  max_iterations: number;
+  exit_strategy?: { type: string; reflection_workflow_id?: string | null };
+  between_iterations: { type: string; rebuild?: boolean };
+  phases?: PipelinePhases;
+}
+
+export interface PipelinePhases {
+  build?: { description: string; context?: string };
+  execute_workflow_id?: string;
+  reflect: { reflection_workflow_id: string | null };
+  implement_fixes?: {
+    additional_context?: string;
+    timeout_secs?: number;
+  };
+}
+
+export interface IterationResult {
+  iteration: number;
+  started_at: string;
+  completed_at: string | null;
+  task_run_id: string | null;
+  exit_check: { should_exit: boolean; reason: string } | null;
+  generated_workflow_id?: string;
+  reflection_task_run_id?: string;
+  fix_count?: number;
+  fixes_implemented?: boolean;
+  rebuild_triggered?: boolean;
+}
+
+export interface WorkflowLoopHistory {
+  iterations: IterationResult[];
+}
+
+export interface UnifiedWorkflow {
+  id: string;
+  name: string;
+  steps?: unknown[];
 }
 
 // Velocity Test types
@@ -256,6 +330,12 @@ export interface VtDiagnostics {
     startTime?: number;
     [key: string]: unknown;
   }>;
+  scriptAttribution?: Array<{
+    sourceURL: string;
+    sourceFunctionName: string;
+    duration: number;
+    invoker: string;
+  }>;
 }
 
 export interface VtRunWithResults extends VtRun {
@@ -266,6 +346,43 @@ export interface VtTrendPoint {
   run_id: string;
   started_at: string;
   overall_score: number | null;
+}
+
+// Velocity Improvement types
+export interface VelocityImprovementStatus {
+  running: boolean;
+  phase: string;
+  current_iteration: number;
+  max_iterations: number;
+  target_score: number;
+  started_at: string | null;
+  error: string | null;
+}
+
+export interface VelocityImprovementIteration {
+  iteration: number;
+  started_at: string;
+  completed_at: string | null;
+  run_id: string | null;
+  overall_score: number | null;
+  per_page_scores: Array<{ name: string; score: number; bottleneck: string }>;
+  fix_applied: boolean;
+  fix_summary: string | null;
+  exit_reason: string | null;
+}
+
+export interface VelocityImprovementHistory {
+  iterations: VelocityImprovementIteration[];
+}
+
+// Runner Monitor types
+export interface RunnerTaskRun {
+  id: string;
+  status: string;
+  prompt?: string;
+  workflow_id?: string;
+  started_at?: string;
+  [key: string]: unknown;
 }
 
 export const api = {
@@ -307,6 +424,12 @@ export const api = {
     body: JSON.stringify(prompt),
   }),
   evalTestSuiteDelete: (id: string) => fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: 'DELETE' }),
+  evalSetGroundTruth: (promptId: string, workflowId: string) => fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workflow_id: workflowId }),
+  }),
+  evalClearGroundTruth: (promptId: string) => fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, { method: 'DELETE' }),
 
   // Velocity Tests
   vtStatus: () => fetchJson<VtStatus>('/velocity-tests/status'),
@@ -316,6 +439,27 @@ export const api = {
   vtRun: (id: string) => fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
   vtTrend: (limit?: number) => fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
 
+  // Workflow Loop
+  wlStatus: () => fetchJson<WorkflowLoopStatus>('/workflow-loop/status'),
+  wlHistory: () => fetchJson<WorkflowLoopHistory>('/workflow-loop/history'),
+  wlStart: (config: Record<string, unknown>) => fetchJson<unknown>('/workflow-loop/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  }),
+  wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
+  wlWorkflows: () => fetch('http://127.0.0.1:9876/unified-workflows').then(r => r.json()).then((d: { data?: UnifiedWorkflow[] }) => (d.data || d) as UnifiedWorkflow[]),
+
+  // Velocity Improvement
+  viStatus: () => fetchJson<VelocityImprovementStatus>('/velocity-improvement/status'),
+  viStart: (config: Record<string, unknown>) => fetchJson<MessageResponse>('/velocity-improvement/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  }),
+  viStop: () => fetchJson<MessageResponse>('/velocity-improvement/stop', { method: 'POST' }),
+  viHistory: () => fetchJson<VelocityImprovementHistory>('/velocity-improvement/history'),
+
   // Supervisor
   health: () => fetchJson<HealthResponse>('/health'),
   runnerRestart: (rebuild: boolean) => fetchJson<unknown>('/runner/restart', {
@@ -324,4 +468,20 @@ export const api = {
     body: JSON.stringify({ rebuild }),
   }),
   devStartStatus: () => fetchJson<Record<string, unknown>>('/dev-start/status'),
+  devStartAction: (action: string) => fetchJson<unknown>(`/dev-start/${action}`, { method: 'POST' }),
+  runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
+
+  // Runner Monitor (proxied to runner at port 9876)
+  runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
+  runnerTaskRunsRunning: () => fetchJson<RunnerTaskRun[]>('/runner-api/task-runs/running'),
+  runnerWorkflowState: (id: string) => fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`),
+  runnerTaskOutput: (id: string, tailChars = 15000) =>
+    fetch(`/runner-api/task-runs/${encodeURIComponent(id)}/output?tail_chars=${tailChars}`)
+      .then(r => { if (!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.text(); }),
+  runnerStopTask: (id: string) => fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+
+  // Expo
+  expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
+  expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
+  expoStatus: () => fetchJson<Record<string, unknown>>('/expo/status'),
 };

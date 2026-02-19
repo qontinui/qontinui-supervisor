@@ -2,6 +2,7 @@ use crate::config::{SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::CachedPortHealth;
 use crate::log_capture::LogState;
+use crate::velocity_improvement::VelocityImprovementState;
 use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -24,6 +25,7 @@ pub struct SupervisorState {
     pub diagnostics: RwLock<DiagnosticsState>,
     pub evaluation: RwLock<EvaluationState>,
     pub velocity_tests: RwLock<VelocityTestState>,
+    pub velocity_improvement: RwLock<VelocityImprovementState>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
@@ -114,6 +116,7 @@ impl SupervisorState {
             diagnostics: RwLock::new(DiagnosticsState::new()),
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
+            velocity_improvement: RwLock::new(VelocityImprovementState::new()),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,

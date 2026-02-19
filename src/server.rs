@@ -23,6 +23,7 @@ pub fn build_router(state: SharedState) -> Router {
     // Clone state for stateless routes (they need SharedState; main_routes consumes it)
     let eval_state = state.clone();
     let vt_state = state.clone();
+    let vi_state = state.clone();
 
     // Build main stateful routes, then apply state to get Router<()>
     let main_routes = Router::new()
@@ -99,6 +100,11 @@ pub fn build_router(state: SharedState) -> Router {
             "/ui-bridge/{*path}",
             get(crate::routes::ui_bridge::proxy).post(crate::routes::ui_bridge::proxy),
         )
+        // Runner API proxy (forwards to runner at port 9876)
+        .route(
+            "/runner-api/{*path}",
+            get(crate::routes::runner_monitor::proxy).post(crate::routes::runner_monitor::proxy),
+        )
         // WebSocket
         .route("/ws", get(crate::routes::ws::ws_handler))
         // Workflow loop
@@ -152,9 +158,15 @@ pub fn build_router(state: SharedState) -> Router {
             eval_state,
         ))
         .merge(crate::routes::velocity_tests::velocity_test_routes(
-            dev_logs_dir,
+            dev_logs_dir.clone(),
             vt_state,
         ))
+        .merge(
+            crate::routes::velocity_improvement::velocity_improvement_routes(
+                dev_logs_dir,
+                vi_state,
+            ),
+        )
         .merge(crate::routes::dashboard::spa_routes())
         .layer(TraceLayer::new_for_http())
         .layer(cors)

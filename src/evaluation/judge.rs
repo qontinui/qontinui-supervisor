@@ -5,8 +5,74 @@ use super::{ScoreResponse, TestPrompt};
 use crate::ai_debug::resolve_model_id;
 use crate::state::SharedState;
 
+/// System prompt for the scoring judge — keeps Claude focused on JSON output.
+const JUDGE_SYSTEM_PROMPT: &str = "You are an automated workflow quality evaluator. \
+Your ONLY job is to read the scoring rubric and respond with EXACTLY the JSON object requested. \
+Do NOT describe the task, do NOT explain the rubric, do NOT add any text before or after the JSON. \
+Respond with ONLY the JSON object.";
+
 /// Build the scoring prompt for the LLM judge.
+/// When ground truth is available, uses diff-based comparison.
+/// Otherwise, uses generic quality rubric.
 pub fn build_scoring_prompt(test_prompt: &TestPrompt, workflow_json: &str) -> String {
+    if let Some(ref ground_truth) = test_prompt.ground_truth_json {
+        build_ground_truth_prompt(test_prompt, workflow_json, ground_truth)
+    } else {
+        build_generic_prompt(test_prompt, workflow_json)
+    }
+}
+
+/// Diff-based scoring: compare generated workflow against known-good reference.
+fn build_ground_truth_prompt(
+    test_prompt: &TestPrompt,
+    workflow_json: &str,
+    ground_truth: &str,
+) -> String {
+    format!(
+        r#"You are an expert workflow quality evaluator. Compare the generated workflow against the known-correct reference workflow and score how closely it matches.
+
+## Original Prompt
+{prompt}
+
+## Reference Workflow (Ground Truth)
+```json
+{ground_truth}
+```
+
+## Generated Workflow (To Score)
+```json
+{workflow_json}
+```
+
+## Scoring Rubric — Compare Against Reference
+Score each dimension 1-5:
+
+1. structural_correctness — Does the generated workflow have the same phase structure (setup/verification/agentic/completion), same number of steps per phase, and valid required fields matching the reference? IGNORE differences in runtime configuration fields like max_iterations, max_sweep_iterations, enable_sweep, health_check_enabled, log_watch_enabled, auto_include_contexts — these are user preferences, not structural correctness.
+   5 = identical structure, 4 = minor field differences, 3 = same phases but different step count, 2 = missing a phase, 1 = completely wrong structure
+
+2. command_accuracy — Do the step types match the reference? Are the parameters (URLs, commands, methods, assertions) the same or functionally equivalent?
+   5 = identical step types and parameters, 4 = same types with minor param differences, 3 = mostly correct types but wrong params, 2 = wrong step types used, 1 = unrelated steps
+
+3. phase_flow_logic — Are steps in the same phases as the reference? Is the execution order correct? Are verification steps properly gated?
+   5 = identical ordering, 4 = same logic with minor reordering, 3 = right intent but steps in wrong phases, 2 = significant phase misplacement, 1 = illogical flow
+
+4. step_completeness — Does the generated workflow include all steps from the reference without adding unnecessary extras?
+   5 = exact step match, 4 = all reference steps present with 1 extra, 3 = missing 1 reference step or 2+ extras, 2 = missing multiple steps, 1 = most steps missing
+
+5. prompt_quality — Are the step names, descriptions, and prompt contents as clear and specific as the reference?
+   5 = equally clear, 4 = slightly less specific, 3 = vague but functional, 2 = unclear, 1 = misleading or missing
+
+6. determinism — Are the generated steps as reproducible as the reference? No unnecessary AI-driven steps, no flaky waits, concrete parameters?
+   5 = equally deterministic, 4 = one minor non-determinism added, 3 = some flaky steps, 2 = relies heavily on AI where reference is deterministic, 1 = non-reproducible
+
+Respond with ONLY valid JSON (no markdown fences, no extra text):
+{{"structural_correctness": {{"score": N, "rationale": "..."}}, "command_accuracy": {{"score": N, "rationale": "..."}}, "phase_flow_logic": {{"score": N, "rationale": "..."}}, "step_completeness": {{"score": N, "rationale": "..."}}, "prompt_quality": {{"score": N, "rationale": "..."}}, "determinism": {{"score": N, "rationale": "..."}}}}"#,
+        prompt = test_prompt.prompt,
+    )
+}
+
+/// Generic quality scoring without a reference workflow.
+fn build_generic_prompt(test_prompt: &TestPrompt, workflow_json: &str) -> String {
     let expected_phases = test_prompt
         .expected_phases
         .as_ref()
@@ -52,13 +118,14 @@ Respond with ONLY valid JSON (no markdown fences, no extra text):
     )
 }
 
-/// Score a workflow by spawning `claude --print` with the scoring prompt.
+/// Score a workflow by spawning `claude --print` with a system prompt override.
 pub async fn score_workflow(
     state: &SharedState,
     test_prompt: &TestPrompt,
     workflow_json: &str,
 ) -> anyhow::Result<ScoreResponse> {
     let prompt = build_scoring_prompt(test_prompt, workflow_json);
+    let has_ground_truth = test_prompt.ground_truth_json.is_some();
 
     // Resolve model from supervisor's AI state
     let (provider, model_key) = {
@@ -69,38 +136,48 @@ pub async fn score_workflow(
         resolve_model_id(&provider, &model_key).unwrap_or_else(|| "claude-opus-4-6".to_string());
 
     info!(
-        "Scoring workflow for prompt '{}' with {}/{}",
-        test_prompt.id, provider, model_key
+        "Scoring workflow for prompt '{}' with {}/{} (ground_truth={})",
+        test_prompt.id, provider, model_key, has_ground_truth
     );
 
-    // Write prompt to temp file
     let temp_dir = std::env::temp_dir();
-    let prompt_file = temp_dir.join("qontinui-eval-scoring-prompt.md");
-    tokio::fs::write(&prompt_file, &prompt).await?;
 
-    // Spawn claude --print
     let output = match provider.as_str() {
         "claude" => {
-            let child = tokio::process::Command::new("claude")
+            // Pipe prompt via stdin with --system-prompt and --tools "" for
+            // reliable JSON output. Disabling tools prevents Claude Code from
+            // trying to read files or use other tools instead of responding directly.
+            let mut child = tokio::process::Command::new("claude")
                 .args([
                     "--print",
-                    &prompt_file.display().to_string(),
-                    "--permission-mode",
-                    "bypassPermissions",
                     "--output-format",
                     "text",
                     "--model",
                     &model_id,
+                    "--system-prompt",
+                    JUDGE_SYSTEM_PROMPT,
+                    "--tools",
+                    "",
                 ])
                 .env_remove("CLAUDECODE")
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .output()
-                .await?;
+                .spawn()?;
 
-            String::from_utf8_lossy(&child.stdout).to_string()
+            // Write prompt to stdin, then drop to signal EOF
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(prompt.as_bytes()).await?;
+            }
+
+            let result = child.wait_with_output().await?;
+            String::from_utf8_lossy(&result.stdout).to_string()
         }
         "gemini" => {
+            let prompt_file = temp_dir.join("qontinui-eval-scoring-prompt.md");
+            tokio::fs::write(&prompt_file, &prompt).await?;
+
             let script_path = temp_dir.join("qontinui-eval-scoring.ps1");
             let script = format!(
                 "Get-Content -Raw '{}' | gemini --yolo -o text -m '{}'",
@@ -181,5 +258,45 @@ mod tests {
 ```"#;
         let result = parse_score_response(raw).unwrap();
         assert_eq!(result.structural_correctness.score, 4);
+    }
+
+    #[test]
+    fn test_ground_truth_prompt_used_when_available() {
+        let prompt = TestPrompt {
+            id: "test".to_string(),
+            prompt: "Check health".to_string(),
+            category: "api_validation".to_string(),
+            complexity: "simple".to_string(),
+            expected_phases: None,
+            expected_step_types: None,
+            tags: None,
+            ground_truth_json: Some(r#"{"name":"test"}"#.to_string()),
+            enabled: true,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        let result = build_scoring_prompt(&prompt, r#"{"name":"generated"}"#);
+        assert!(result.contains("Reference Workflow (Ground Truth)"));
+        assert!(result.contains("Compare Against Reference"));
+    }
+
+    #[test]
+    fn test_generic_prompt_used_without_ground_truth() {
+        let prompt = TestPrompt {
+            id: "test".to_string(),
+            prompt: "Check health".to_string(),
+            category: "api_validation".to_string(),
+            complexity: "simple".to_string(),
+            expected_phases: None,
+            expected_step_types: None,
+            tags: None,
+            ground_truth_json: None,
+            enabled: true,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        let result = build_scoring_prompt(&prompt, r#"{"name":"generated"}"#);
+        assert!(!result.contains("Ground Truth"));
+        assert!(result.contains("Expected Characteristics"));
     }
 }

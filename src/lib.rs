@@ -17,6 +17,7 @@ pub mod server;
 pub mod settings;
 pub mod state;
 pub mod velocity;
+pub mod velocity_improvement;
 pub mod velocity_layer;
 pub mod velocity_tests;
 pub mod watchdog;

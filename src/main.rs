@@ -14,6 +14,7 @@ mod server;
 mod settings;
 mod state;
 mod velocity;
+mod velocity_improvement;
 mod velocity_layer;
 mod velocity_tests;
 mod watchdog;
@@ -156,15 +157,27 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Build and start HTTP server (retry bind if port is lingering)
+    // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
     let listener = {
         let mut attempts = 0;
         loop {
-            match tokio::net::TcpListener::bind(&bind_addr).await {
-                Ok(l) => break l,
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
+            match socket.bind(&bind_addr.into()) {
+                Ok(()) => {
+                    socket.listen(1024)?;
+                    let std_listener: std::net::TcpListener = socket.into();
+                    break tokio::net::TcpListener::from_std(std_listener)?;
+                }
                 Err(e) if attempts < 30 => {
+                    drop(socket);
                     attempts += 1;
                     if attempts == 1 || attempts % 5 == 0 {
                         warn!(

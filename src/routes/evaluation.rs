@@ -37,6 +37,11 @@ pub struct ContinuousStartRequest {
     pub interval_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetGroundTruthRequest {
+    pub workflow_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MessageResponse {
     pub ok: bool,
@@ -78,6 +83,14 @@ pub fn eval_routes(dev_logs_dir: PathBuf, supervisor: SharedState) -> Router {
         .route("/eval/test-suite", post(add_test_prompt_handler))
         .route("/eval/test-suite/{id}", put(update_test_prompt_handler))
         .route("/eval/test-suite/{id}", delete(delete_test_prompt_handler))
+        .route(
+            "/eval/test-suite/{id}/ground-truth",
+            put(set_ground_truth_handler),
+        )
+        .route(
+            "/eval/test-suite/{id}/ground-truth",
+            delete(clear_ground_truth_handler),
+        )
         .with_state(state)
 }
 
@@ -334,6 +347,113 @@ async fn delete_test_prompt_handler(
         Err(e) => Json(MessageResponse {
             ok: false,
             message: format!("Failed to delete: {}", e),
+        }),
+    }
+}
+
+/// Set ground truth for a test prompt by fetching a workflow from the runner.
+async fn set_ground_truth_handler(
+    State(state): State<Arc<EvalState>>,
+    Path(prompt_id): Path<String>,
+    Json(req): Json<SetGroundTruthRequest>,
+) -> Json<MessageResponse> {
+    let runner_url = format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT);
+
+    // Fetch the workflow from the runner
+    let http_client = state.supervisor.http_client.clone();
+    let resp = match http_client
+        .get(format!(
+            "{}/unified-workflows/{}",
+            runner_url, req.workflow_id
+        ))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(MessageResponse {
+                ok: false,
+                message: format!("Failed to fetch workflow from runner: {}", e),
+            });
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Json(MessageResponse {
+            ok: false,
+            message: format!(
+                "Runner returned {} for workflow {}",
+                resp.status(),
+                req.workflow_id
+            ),
+        });
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(MessageResponse {
+                ok: false,
+                message: format!("Failed to parse workflow response: {}", e),
+            });
+        }
+    };
+
+    // Extract the workflow data (runner wraps in {"data": ...})
+    let wf_data = if body.get("data").is_some() {
+        &body["data"]
+    } else {
+        &body
+    };
+
+    let workflow_json = match serde_json::to_string(wf_data) {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(MessageResponse {
+                ok: false,
+                message: format!("Failed to serialize workflow: {}", e),
+            });
+        }
+    };
+
+    // Update the test prompt's ground_truth_json
+    match state.db.set_ground_truth(&prompt_id, &workflow_json) {
+        Ok(true) => Json(MessageResponse {
+            ok: true,
+            message: format!(
+                "Ground truth set for '{}' from workflow '{}'",
+                prompt_id, req.workflow_id
+            ),
+        }),
+        Ok(false) => Json(MessageResponse {
+            ok: false,
+            message: format!("Test prompt '{}' not found", prompt_id),
+        }),
+        Err(e) => Json(MessageResponse {
+            ok: false,
+            message: format!("Failed to set ground truth: {}", e),
+        }),
+    }
+}
+
+/// Clear ground truth for a test prompt.
+async fn clear_ground_truth_handler(
+    State(state): State<Arc<EvalState>>,
+    Path(prompt_id): Path<String>,
+) -> Json<MessageResponse> {
+    match state.db.set_ground_truth(&prompt_id, "") {
+        Ok(true) => Json(MessageResponse {
+            ok: true,
+            message: format!("Ground truth cleared for '{}'", prompt_id),
+        }),
+        Ok(false) => Json(MessageResponse {
+            ok: false,
+            message: format!("Test prompt '{}' not found", prompt_id),
+        }),
+        Err(e) => Json(MessageResponse {
+            ok: false,
+            message: format!("Failed to clear ground truth: {}", e),
         }),
     }
 }

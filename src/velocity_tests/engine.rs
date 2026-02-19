@@ -263,8 +263,9 @@ async fn run_single_test(
     // 8. Get browser performance entries (navigation timing + resource waterfall)
     let perf_entries = get_performance_entries(http_client).await;
 
-    // 9. Get long tasks from browser event capture
+    // 9. Get long tasks and long animation frames from browser event capture
     let long_tasks = get_long_tasks(http_client).await;
+    let loaf_events = get_loaf_events(http_client).await;
 
     // Extract metrics from performance data
     let (ttfb_ms, dom_interactive_ms, dom_complete_ms, fcp_ms) =
@@ -287,8 +288,8 @@ async fn run_single_test(
         slowest_resource_ms,
     );
 
-    // Build diagnostics JSON blob (full resource list + long task list)
-    let diagnostics_json = build_diagnostics_json(&perf_entries, &long_tasks);
+    // Build diagnostics JSON blob (full resource list + long task list + script attribution)
+    let diagnostics_json = build_diagnostics_json(&perf_entries, &long_tasks, &loaf_events);
 
     // 11. Compute score with new weights
     let score = compute_score(
@@ -328,51 +329,60 @@ async fn run_single_test(
     })
 }
 
-/// Fetch elements from the UI Bridge.
+/// Fetch elements from the UI Bridge via control snapshot (queries browser directly).
 async fn get_elements(http_client: &reqwest::Client) -> anyhow::Result<serde_json::Value> {
     let resp = http_client
         .get(format!(
-            "{}/api/ui-bridge/control/elements",
+            "{}/api/ui-bridge/control/snapshot",
             WEB_FRONTEND_BASE
         ))
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await?;
 
     if !resp.status().is_success() {
-        anyhow::bail!("Elements endpoint returned {}", resp.status());
+        anyhow::bail!("Snapshot endpoint returned {}", resp.status());
     }
 
     let body: serde_json::Value = resp.json().await?;
     Ok(body)
 }
 
-/// Check if the key element is present in the elements response.
-fn has_key_element(elements: &serde_json::Value, key: &str) -> bool {
+/// Check if the key element is present in the snapshot response.
+fn has_key_element(snapshot: &serde_json::Value, key: &str) -> bool {
     let key_lower = key.to_lowercase();
 
-    // The response is { "success": true, "data": [...elements...] }
-    if let Some(data) = elements.get("data").and_then(|d| d.as_array()) {
-        for element in data {
-            // Check id, label, type fields for the key substring
-            if let Some(id) = element.get("id").and_then(|v| v.as_str()) {
-                if id.to_lowercase().contains(&key_lower) {
-                    return true;
-                }
+    // Snapshot response: { "success": true, "data": { "elements": [...], ... } }
+    let elements = snapshot
+        .get("data")
+        .and_then(|d| d.get("elements"))
+        .and_then(|e| e.as_array());
+
+    let elements = match elements {
+        Some(e) => e,
+        None => return false,
+    };
+
+    for element in elements {
+        if let Some(id) = element.get("id").and_then(|v| v.as_str()) {
+            if id.to_lowercase().contains(&key_lower) {
+                return true;
             }
-            if let Some(label) = element.get("label").and_then(|v| v.as_str()) {
-                if label.to_lowercase().contains(&key_lower) {
-                    return true;
-                }
+        }
+        if let Some(label) = element.get("label").and_then(|v| v.as_str()) {
+            if label.to_lowercase().contains(&key_lower) {
+                return true;
             }
-            if let Some(etype) = element.get("type").and_then(|v| v.as_str()) {
-                if etype.to_lowercase().contains(&key_lower) {
-                    return true;
-                }
+        }
+        if let Some(etype) = element.get("type").and_then(|v| v.as_str()) {
+            if etype.to_lowercase().contains(&key_lower) {
+                return true;
             }
-            // Also check text_content in state
-            if let Some(state) = element.get("state") {
-                if let Some(tc) = state.get("text_content").and_then(|v| v.as_str()) {
+        }
+        // Also check textContent in state
+        if let Some(state) = element.get("state") {
+            for field in &["text_content", "textContent"] {
+                if let Some(tc) = state.get(*field).and_then(|v| v.as_str()) {
                     if tc.to_lowercase().contains(&key_lower) {
                         return true;
                     }
@@ -553,6 +563,26 @@ async fn get_long_tasks(http_client: &reqwest::Client) -> Option<serde_json::Val
     body.get("data").cloned()
 }
 
+/// Fetch long animation frame events from browser event capture via UI Bridge.
+async fn get_loaf_events(http_client: &reqwest::Client) -> Option<serde_json::Value> {
+    let resp = http_client
+        .get(format!(
+            "{}/api/ui-bridge/control/browser-events?type=long-animation-frame",
+            WEB_FRONTEND_BASE
+        ))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("data").cloned()
+}
+
 /// Extract navigation timing metrics from performance entries.
 fn extract_navigation_timing(
     perf: &Option<serde_json::Value>,
@@ -625,10 +655,50 @@ fn extract_long_task_stats(events: &Option<serde_json::Value>) -> (i64, f64) {
     let count = events_arr.len() as i64;
     let total_ms: f64 = events_arr
         .iter()
-        .filter_map(|e| e.get("duration").and_then(|v| v.as_f64()))
+        .filter_map(|e| e.get("durationMs").and_then(|v| v.as_f64()))
         .sum();
 
     (count, total_ms)
+}
+
+/// Extract top script attributions from long animation frame events, sorted by duration.
+fn extract_script_attribution(events: &Option<serde_json::Value>) -> Vec<serde_json::Value> {
+    let events_arr = match events {
+        Some(e) => e.get("events").and_then(|ev| ev.as_array()),
+        None => return vec![],
+    };
+
+    let events_arr = match events_arr {
+        Some(a) => a,
+        None => return vec![],
+    };
+
+    let mut scripts: Vec<serde_json::Value> = events_arr
+        .iter()
+        .filter_map(|e| e.get("scripts").and_then(|s| s.as_array()))
+        .flatten()
+        .filter_map(|s| {
+            let duration = s.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if duration <= 0.0 {
+                return None;
+            }
+            Some(serde_json::json!({
+                "sourceURL": s.get("sourceURL").and_then(|v| v.as_str()).unwrap_or(""),
+                "sourceFunctionName": s.get("sourceFunctionName").and_then(|v| v.as_str()).unwrap_or(""),
+                "duration": duration as i64,
+                "invoker": s.get("invoker").and_then(|v| v.as_str()).unwrap_or(""),
+            }))
+        })
+        .collect();
+
+    scripts.sort_by(|a, b| {
+        let da = a.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        let db = b.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        db.cmp(&da)
+    });
+
+    scripts.truncate(10);
+    scripts
 }
 
 /// Classify the primary bottleneck for a page load.
@@ -685,10 +755,11 @@ fn classify_bottleneck(
     "Healthy".to_string()
 }
 
-/// Build a JSON blob with full resource waterfall and long task list for detail view.
+/// Build a JSON blob with full resource waterfall, long task list, and script attribution for detail view.
 fn build_diagnostics_json(
     perf: &Option<serde_json::Value>,
     long_tasks: &Option<serde_json::Value>,
+    loaf_events: &Option<serde_json::Value>,
 ) -> Option<String> {
     let mut diag = serde_json::Map::new();
 
@@ -708,6 +779,14 @@ fn build_diagnostics_json(
         if let Some(events) = lt.get("events") {
             diag.insert("longTasks".to_string(), events.clone());
         }
+    }
+
+    let script_attribution = extract_script_attribution(loaf_events);
+    if !script_attribution.is_empty() {
+        diag.insert(
+            "scriptAttribution".to_string(),
+            serde_json::Value::Array(script_attribution),
+        );
     }
 
     if diag.is_empty() {

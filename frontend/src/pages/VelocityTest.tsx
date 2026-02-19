@@ -155,6 +155,46 @@ function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
   );
 }
 
+function ScriptAttributionTable({ scripts }: { scripts: VtDiagnostics['scriptAttribution'] }) {
+  if (!scripts || scripts.length === 0) return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No LoAF data (requires Chrome 123+)</div>;
+
+  return (
+    <div style={{ fontSize: '0.8rem' }}>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Script Attribution (LoAF)</div>
+      <table style={{ width: '100%' }}>
+        <thead>
+          <tr>
+            <th style={{ textAlign: 'left', fontSize: '0.75rem' }}>Source File</th>
+            <th style={{ textAlign: 'left', fontSize: '0.75rem' }}>Function</th>
+            <th style={{ textAlign: 'right', fontSize: '0.75rem' }}>Duration</th>
+            <th style={{ textAlign: 'left', fontSize: '0.75rem' }}>Invoker</th>
+          </tr>
+        </thead>
+        <tbody>
+          {scripts.map((s, i) => {
+            const fileName = s.sourceURL.split('/').pop()?.split('?')[0] || s.sourceURL || '(unknown)';
+            const color = s.duration > 500 ? 'var(--danger)' : s.duration > 250 ? '#f97316' : s.duration > 100 ? 'var(--warning)' : 'inherit';
+            return (
+              <tr key={i} style={{ color }}>
+                <td title={s.sourceURL} style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {fileName}
+                </td>
+                <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {s.sourceFunctionName || '(anonymous)'}
+                </td>
+                <td className="text-mono" style={{ textAlign: 'right' }}>{formatMs(s.duration)}</td>
+                <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {s.invoker || '-'}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function DiagnosticDetail({ result }: { result: VtResult }) {
   const diag: VtDiagnostics | null = result.diagnostics_json ? (() => {
     try { return JSON.parse(result.diagnostics_json!) as VtDiagnostics; } catch { return null; }
@@ -220,6 +260,13 @@ function DiagnosticDetail({ result }: { result: VtResult }) {
         <ResourceTable resources={diag?.resources} />
         <LongTaskList tasks={diag?.longTasks} />
       </div>
+
+      {/* Section C2: Script Attribution from LoAF */}
+      {diag?.scriptAttribution && diag.scriptAttribution.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <ScriptAttributionTable scripts={diag.scriptAttribution} />
+        </div>
+      )}
 
       {/* Section D: Bottleneck Summary */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--bg-tertiary)' }}>

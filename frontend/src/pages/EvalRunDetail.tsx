@@ -94,6 +94,9 @@ export default function EvalRunDetail() {
             {run.status}
           </span>
         </div>
+
+        {/* Combined scores */}
+        <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Combined</div>
         <div className="stat-row">
           <div className="stat-item">
             <div className="stat-label">Overall</div>
@@ -126,6 +129,86 @@ export default function EvalRunDetail() {
             <div className="text-mono">{formatScore(run.avg_determinism)}</div>
           </div>
         </div>
+
+        {/* GT vs Generic side by side */}
+        {(run.gt_avg_overall !== null || run.gen_avg_overall !== null) && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border)' }}>
+            {/* Ground Truth */}
+            <div>
+              <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Ground Truth ({run.gt_count ?? 0})
+              </div>
+              <div className="stat-row" style={{ flexWrap: 'wrap' }}>
+                <div className="stat-item">
+                  <div className="stat-label">Overall</div>
+                  <div className="text-mono" style={{ color: 'var(--success)' }}>{formatScore(run.gt_avg_overall)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Struct</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_structural)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Cmd</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_command_accuracy)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Flow</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_phase_flow)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Complete</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_step_completeness)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Prompt</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_prompt_quality)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Determ</div>
+                  <div className="text-mono">{formatScore(run.gt_avg_determinism)}</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Generic */}
+            <div>
+              <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Generic ({run.gen_count ?? 0})
+              </div>
+              <div className="stat-row" style={{ flexWrap: 'wrap' }}>
+                <div className="stat-item">
+                  <div className="stat-label">Overall</div>
+                  <div className="text-mono" style={{ color: 'var(--accent)' }}>{formatScore(run.gen_avg_overall)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Struct</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_structural)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Cmd</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_command_accuracy)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Flow</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_phase_flow)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Complete</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_step_completeness)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Prompt</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_prompt_quality)}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Determ</div>
+                  <div className="text-mono">{formatScore(run.gen_avg_determinism)}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
           Mode: {run.mode} | Prompts: {run.prompts_completed}/{run.prompts_total} | Started: {new Date(run.started_at).toLocaleString()}
           {run.completed_at && <> | Completed: {new Date(run.completed_at).toLocaleString()}</>}

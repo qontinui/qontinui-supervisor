@@ -18,10 +18,10 @@ pub static TEST_CASES: &[TestCase] = &[
         api_endpoint: "/api/v1/projects/",
     },
     TestCase {
-        name: "Build Workflows",
-        page_url: "/build-workflows",
-        key_element: "workflow",
-        api_endpoint: "/api/v1/unified-workflows/",
+        name: "Settings",
+        page_url: "/settings",
+        key_element: "settings",
+        api_endpoint: "/api/v1/auth/users/me",
     },
     TestCase {
         name: "Runs History",
@@ -37,7 +37,7 @@ pub static TEST_CASES: &[TestCase] = &[
     },
     TestCase {
         name: "Build Tests",
-        page_url: "/build-tests",
+        page_url: "/build/tests",
         key_element: "test",
         api_endpoint: "/api/v1/test-suites/",
     },
