@@ -1,161 +1,608 @@
-import { useState, useEffect, useCallback } from 'react';
-import { api, HealthResponse } from '../lib/api';
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { api, HealthResponse, DevStartResponse } from "../lib/api";
 
 type ActionState = string | null;
 
-function ActionButton({ label, activeLabel, action, busy }: {
+interface StatusData {
+  health: HealthResponse | null;
+  services: { name: string; port: number; available: boolean }[];
+  expo: Record<string, unknown> | null;
+}
+
+// Tracks a failed action: which service, what went wrong
+interface ServiceError {
+  service: string;
+  stderr: string;
+  stdout: string;
+  action: string;
+}
+
+function SmallBtn({
+  label,
+  activeLabel,
+  onClick,
+  busy,
+  busyKey,
+  variant,
+}: {
   label: string;
   activeLabel: string;
-  action: () => Promise<unknown>;
+  onClick: () => void;
   busy: ActionState;
+  busyKey?: string;
+  variant?: "danger" | "warning";
 }) {
-  const isActive = busy === label;
-  const handleClick = async () => action();
+  const isActive = busy === (busyKey ?? label);
+  const style: React.CSSProperties = {
+    padding: "0.2rem 0.5rem",
+    fontSize: "0.75rem",
+  };
+  if (variant === "danger") {
+    style.borderColor = "var(--danger)";
+    style.color = "var(--danger)";
+  } else if (variant === "warning") {
+    style.borderColor = "var(--warning)";
+    style.color = "var(--warning)";
+  }
   return (
-    <button className="btn" disabled={busy !== null} onClick={handleClick}>
+    <button
+      className="btn"
+      style={style}
+      disabled={busy !== null}
+      onClick={onClick}
+    >
       {isActive ? activeLabel : label}
     </button>
   );
 }
 
+function StatusDot({ up, error }: { up: boolean; error?: boolean }) {
+  const color = error
+    ? "var(--warning)"
+    : up
+      ? "var(--success)"
+      : "var(--danger)";
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: 8,
+        height: 8,
+        borderRadius: "50%",
+        background: color,
+        marginRight: 6,
+      }}
+    />
+  );
+}
+
+// Map service row names to their log file type for error context
+const SERVICE_LOG_MAP: Record<string, string> = {
+  Runner: "runner-tauri",
+  Backend: "backend-err",
+  Frontend: "frontend-err",
+};
+
+interface ActionDef {
+  key: string;
+  display: string;
+  activeLabel: string;
+  service: string;
+  fn: () => Promise<unknown>;
+}
+
+interface RowDef {
+  name: string;
+  port: string;
+  up: boolean;
+  actions?: ActionDef[];
+}
+
 export default function Dashboard() {
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [ports, setPorts] = useState<Record<string, unknown> | null>(null);
-  const [expo, setExpo] = useState<Record<string, unknown> | null>(null);
-  const [runnerAction, setRunnerAction] = useState<ActionState>(null);
-  const [devStartAction, setDevStartAction] = useState<ActionState>(null);
-  const [expoAction, setExpoAction] = useState<ActionState>(null);
+  const [data, setData] = useState<StatusData>({
+    health: null,
+    services: [],
+    expo: null,
+  });
+  const [busy, setBusy] = useState<ActionState>(null);
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [errors, setErrors] = useState<Map<string, ServiceError>>(new Map());
+  const [aiFixBusy, setAiFixBusy] = useState<string | null>(null);
+  const mountedRef = useRef(true);
 
-  const wrapAction = useCallback((setter: (v: ActionState) => void, label: string, fn: () => Promise<unknown>) => {
-    return async () => {
-      setter(label);
-      try { await fn(); } catch { /* status polling shows result */ } finally { setter(null); }
+  const refresh = useCallback(async () => {
+    const [health, devStatus, expo] = await Promise.allSettled([
+      api.health(),
+      api.devStartStatus(),
+      api.expoStatus(),
+    ]);
+    if (!mountedRef.current) return;
+    setData({
+      health: health.status === "fulfilled" ? health.value : null,
+      services:
+        devStatus.status === "fulfilled"
+          ? (devStatus.value.services ?? [])
+          : [],
+      expo: expo.status === "fulfilled" ? expo.value : null,
+    });
+    setLastRefresh(new Date());
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    refresh();
+    const id = setInterval(refresh, 5000);
+    return () => {
+      mountedRef.current = false;
+      clearInterval(id);
     };
+  }, [refresh]);
+
+  // Run an action, detect failures from the response, and record errors
+  const doAction = useCallback(
+    (key: string, service: string, fn: () => Promise<unknown>) => {
+      return async () => {
+        setBusy(key);
+        try {
+          const result = await fn();
+          // Check if the response indicates failure (DevStartResponse shape)
+          const resp = result as DevStartResponse | undefined;
+          if (
+            resp &&
+            typeof resp.status === "string" &&
+            (resp.status === "error" || resp.status === "timeout")
+          ) {
+            setErrors((prev) => {
+              const next = new Map(prev);
+              next.set(service, {
+                service,
+                stderr: resp.stderr || "",
+                stdout: resp.stdout || "",
+                action: key,
+              });
+              return next;
+            });
+          } else {
+            // Success — clear any previous error for this service
+            setErrors((prev) => {
+              if (!prev.has(service)) return prev;
+              const next = new Map(prev);
+              next.delete(service);
+              return next;
+            });
+          }
+        } catch {
+          // Network/HTTP error
+          setErrors((prev) => {
+            const next = new Map(prev);
+            next.set(service, {
+              service,
+              stderr: "Request failed",
+              stdout: "",
+              action: key,
+            });
+            return next;
+          });
+        }
+        setBusy(null);
+        setTimeout(refresh, 1500);
+      };
+    },
+    [refresh],
+  );
+
+  // Trigger AI debug with service-specific context
+  const triggerAiFix = useCallback(
+    async (service: string) => {
+      setAiFixBusy(service);
+      try {
+        // Gather error context
+        const err = errors.get(service);
+        const parts: string[] = [`Service "${service}" failed to start/load.`];
+
+        if (err?.stderr) parts.push(`\nStderr:\n${err.stderr}`);
+        if (err?.stdout) parts.push(`\nStdout:\n${err.stdout}`);
+
+        // Try to fetch relevant log tail for extra context
+        const logType = SERVICE_LOG_MAP[service];
+        if (logType) {
+          try {
+            const log = await api.logFile(logType, 80);
+            if (log.content?.trim()) {
+              parts.push(
+                `\nRecent ${logType} log (last 80 lines):\n${log.content}`,
+              );
+            }
+          } catch {
+            /* log may not exist */
+          }
+        }
+
+        parts.push("\nPlease diagnose the root cause and fix the issue.");
+
+        await api.aiDebug(parts.join("\n"));
+      } catch {
+        // AI debug endpoint may fail (cooldown, already running, etc.)
+      }
+      setAiFixBusy(null);
+    },
+    [errors],
+  );
+
+  const clearError = useCallback((service: string) => {
+    setErrors((prev) => {
+      if (!prev.has(service)) return prev;
+      const next = new Map(prev);
+      next.delete(service);
+      return next;
+    });
   }, []);
 
+  const runner = data.health?.runner;
+  const watchdog = data.health?.watchdog;
+  const build = data.health?.build;
+  const expo = data.expo;
+
+  // If build has an error, surface it on the Runner row
   useEffect(() => {
-    const fetchHealth = () => api.health().then(setHealth).catch(() => {});
-    fetchHealth();
-    const id = setInterval(fetchHealth, 3000);
-    return () => clearInterval(id);
-  }, []);
+    if (build?.error_detected && build.last_error) {
+      setErrors((prev) => {
+        if (prev.has("Runner") && prev.get("Runner")!.action === "build-error")
+          return prev;
+        const next = new Map(prev);
+        next.set("Runner", {
+          service: "Runner",
+          stderr: build.last_error!,
+          stdout: "",
+          action: "build-error",
+        });
+        return next;
+      });
+    } else {
+      setErrors((prev) => {
+        if (!prev.has("Runner") || prev.get("Runner")!.action !== "build-error")
+          return prev;
+        const next = new Map(prev);
+        next.delete("Runner");
+        return next;
+      });
+    }
+  }, [build?.error_detected, build?.last_error]);
 
-  useEffect(() => {
-    const fetchPorts = () => api.devStartStatus().then(setPorts).catch(() => {});
-    fetchPorts();
-    const id = setInterval(fetchPorts, 5000);
-    return () => clearInterval(id);
-  }, []);
+  // Build service rows from port status + health data
+  const svcMap = new Map(data.services.map((s) => [s.name, s]));
 
-  useEffect(() => {
-    const fetchExpo = () => api.expoStatus().then(setExpo).catch(() => {});
-    fetchExpo();
-    const id = setInterval(fetchExpo, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  const runner = health?.runner as Record<string, unknown> | undefined;
+  const rows: RowDef[] = [
+    {
+      name: "Runner",
+      port: "9876",
+      up: !!runner?.running,
+      actions: [
+        {
+          key: "runner-restart",
+          display: "Restart",
+          activeLabel: "Restarting…",
+          service: "Runner",
+          fn: () => api.runnerRestart(false),
+        },
+        {
+          key: "runner-rebuild",
+          display: "Rebuild",
+          activeLabel: "Rebuilding…",
+          service: "Runner",
+          fn: () => api.runnerRestart(true),
+        },
+        {
+          key: "runner-stop",
+          display: "Stop",
+          activeLabel: "Stopping…",
+          service: "Runner",
+          fn: () => api.runnerStop(),
+        },
+      ],
+    },
+    {
+      name: "Backend",
+      port: "8000",
+      up: svcMap.get("backend")?.available ?? false,
+      actions: [
+        {
+          key: "backend-start",
+          display: "Start",
+          activeLabel: "Starting…",
+          service: "Backend",
+          fn: () => api.devStartAction("backend"),
+        },
+        {
+          key: "backend-stop",
+          display: "Stop",
+          activeLabel: "Stopping…",
+          service: "Backend",
+          fn: () => api.devStartAction("backend/stop"),
+        },
+      ],
+    },
+    {
+      name: "Frontend",
+      port: "3001",
+      up: svcMap.get("frontend")?.available ?? false,
+      actions: [
+        {
+          key: "frontend-start",
+          display: "Start",
+          activeLabel: "Starting…",
+          service: "Frontend",
+          fn: () => api.devStartAction("frontend"),
+        },
+        {
+          key: "frontend-stop",
+          display: "Stop",
+          activeLabel: "Stopping…",
+          service: "Frontend",
+          fn: () => api.devStartAction("frontend/stop"),
+        },
+      ],
+    },
+    {
+      name: "PostgreSQL",
+      port: "5432",
+      up: svcMap.get("postgresql")?.available ?? false,
+    },
+    {
+      name: "Redis",
+      port: "6379",
+      up: svcMap.get("redis")?.available ?? false,
+    },
+    {
+      name: "MinIO",
+      port: "9000",
+      up: svcMap.get("minio")?.available ?? false,
+    },
+    {
+      name: "Vite",
+      port: "1420",
+      up: svcMap.get("vite")?.available ?? false,
+    },
+    {
+      name: "Expo",
+      port: "8081",
+      up: !!expo?.running,
+      actions: [
+        {
+          key: "expo-start",
+          display: "Start",
+          activeLabel: "Starting…",
+          service: "Expo",
+          fn: () => api.expoStart(),
+        },
+        {
+          key: "expo-stop",
+          display: "Stop",
+          activeLabel: "Stopping…",
+          service: "Expo",
+          fn: () => api.expoStop(),
+        },
+      ],
+    },
+    {
+      name: "Watchdog",
+      port: "—",
+      up: !!watchdog?.enabled,
+    },
+  ];
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Dashboard</h1>
+        <div className="flex items-center gap-2">
+          {lastRefresh && (
+            <span className="text-muted" style={{ fontSize: "0.75rem" }}>
+              {lastRefresh.toLocaleTimeString()}
+            </span>
+          )}
+          <button className="btn" onClick={refresh} disabled={busy !== null}>
+            Refresh
+          </button>
+        </div>
       </div>
 
-      <div className="card-grid">
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Runner</span>
-            <span className={`badge ${runner?.running ? 'badge-success' : 'badge-danger'}`}>
-              {runner?.running ? 'Running' : 'Stopped'}
-            </span>
-          </div>
-          {runner?.pid != null && <div className="text-mono text-muted">PID: {String(runner.pid)}</div>}
-          <div className="mt-1 flex gap-2">
-            <ActionButton label="Restart" activeLabel="Restarting…" busy={runnerAction}
-              action={wrapAction(setRunnerAction, 'Restart', () => api.runnerRestart(false))} />
-            <ActionButton label="Rebuild" activeLabel="Rebuilding…" busy={runnerAction}
-              action={wrapAction(setRunnerAction, 'Rebuild', () => api.runnerRestart(true))} />
-            <ActionButton label="Stop" activeLabel="Stopping…" busy={runnerAction}
-              action={wrapAction(setRunnerAction, 'Stop', () => api.runnerStop())} />
-          </div>
+      <div className="card" style={{ marginBottom: "1rem" }}>
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Service</th>
+                <th style={{ width: 70 }}>Port</th>
+                <th style={{ width: 80 }}>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => {
+                const err = errors.get(row.name);
+                return (
+                  <React.Fragment key={row.name}>
+                    <tr>
+                      <td style={{ fontFamily: "inherit", fontWeight: 500 }}>
+                        {row.name}
+                      </td>
+                      <td>{row.port}</td>
+                      <td>
+                        <StatusDot up={row.up} error={!!err} />
+                        <span
+                          className={
+                            err
+                              ? "text-warning"
+                              : row.up
+                                ? "text-success"
+                                : "text-danger"
+                          }
+                          style={{ fontSize: "0.75rem" }}
+                        >
+                          {err
+                            ? "ERR"
+                            : row.name === "Watchdog"
+                              ? row.up
+                                ? "ON"
+                                : "OFF"
+                              : row.up
+                                ? "UP"
+                                : "DOWN"}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="flex gap-2">
+                          {row.actions?.map((a) => (
+                            <SmallBtn
+                              key={a.key}
+                              label={a.display}
+                              activeLabel={a.activeLabel}
+                              onClick={doAction(a.key, a.service, a.fn)}
+                              busy={busy}
+                              busyKey={a.key}
+                            />
+                          ))}
+                          {err && (
+                            <SmallBtn
+                              label="AI Fix"
+                              activeLabel="Sending…"
+                              onClick={() => triggerAiFix(row.name)}
+                              busy={aiFixBusy}
+                              busyKey={row.name}
+                              variant="warning"
+                            />
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {err && (
+                      <tr>
+                        <td
+                          colSpan={4}
+                          style={{
+                            padding: "0 0.75rem 0.5rem",
+                            borderBottom: "1px solid var(--border)",
+                          }}
+                        >
+                          <div
+                            style={{
+                              background: "rgba(239,68,68,0.08)",
+                              border: "1px solid rgba(239,68,68,0.2)",
+                              borderRadius: 4,
+                              padding: "0.4rem 0.6rem",
+                              fontSize: "0.75rem",
+                              fontFamily: "var(--font-mono)",
+                              whiteSpace: "pre-wrap",
+                              maxHeight: 120,
+                              overflowY: "auto",
+                              position: "relative",
+                            }}
+                          >
+                            <button
+                              onClick={() => clearError(row.name)}
+                              style={{
+                                position: "absolute",
+                                top: 2,
+                                right: 6,
+                                background: "none",
+                                border: "none",
+                                color: "var(--text-muted)",
+                                cursor: "pointer",
+                                fontSize: "0.8rem",
+                                padding: "0 4px",
+                              }}
+                              title="Dismiss"
+                            >
+                              x
+                            </button>
+                            {(err.stderr || err.stdout).trim() ||
+                              "Action failed (no output)"}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
+      </div>
 
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Watchdog</span>
-            <span className={`badge ${(health?.watchdog as Record<string, unknown>)?.enabled ? 'badge-success' : 'badge-warning'}`}>
-              {(health?.watchdog as Record<string, unknown>)?.enabled ? 'Enabled' : 'Disabled'}
-            </span>
-          </div>
+      <div className="card">
+        <div className="card-header" style={{ marginBottom: "0.5rem" }}>
+          <span className="card-title">Bulk Actions</span>
         </div>
-
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Services</span>
-          </div>
-          {ports && (
-            <div className="text-mono" style={{ fontSize: '0.8rem' }}>
-              {Object.entries(ports).filter(([k]) => k !== 'timestamp').map(([name, info]) => (
-                <div key={name} className="flex justify-between" style={{ padding: '2px 0' }}>
-                  <span>{name}</span>
-                  <span className={(info as Record<string, unknown>)?.listening ? 'text-success' : 'text-danger'}>
-                    {(info as Record<string, unknown>)?.listening ? 'UP' : 'DOWN'}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Dev-Start Controls</span>
-          </div>
-          <div className="mt-1 flex gap-2" style={{ flexWrap: 'wrap' }}>
-            <ActionButton label="Backend" activeLabel="Starting…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Backend', () => api.devStartAction('backend'))} />
-            <ActionButton label="Frontend" activeLabel="Starting…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Frontend', () => api.devStartAction('frontend'))} />
-            <ActionButton label="Docker" activeLabel="Starting…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Docker', () => api.devStartAction('docker'))} />
-            <ActionButton label="All" activeLabel="Starting…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'All', () => api.devStartAction('all'))} />
-          </div>
-          <div className="mt-1 flex gap-2" style={{ flexWrap: 'wrap' }}>
-            <ActionButton label="Stop All" activeLabel="Stopping…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Stop All', () => api.devStartAction('stop'))} />
-            <ActionButton label="Stop Backend" activeLabel="Stopping…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Stop Backend', () => api.devStartAction('backend/stop'))} />
-            <ActionButton label="Stop Frontend" activeLabel="Stopping…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Stop Frontend', () => api.devStartAction('frontend/stop'))} />
-            <ActionButton label="Stop Docker" activeLabel="Stopping…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Stop Docker', () => api.devStartAction('docker/stop'))} />
-          </div>
-          <div className="mt-1 flex gap-2">
-            <ActionButton label="Clean" activeLabel="Cleaning…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Clean', () => api.devStartAction('clean'))} />
-            <ActionButton label="Fresh" activeLabel="Starting…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Fresh', () => api.devStartAction('fresh'))} />
-            <ActionButton label="Migrate" activeLabel="Migrating…" busy={devStartAction}
-              action={wrapAction(setDevStartAction, 'Migrate', () => api.devStartAction('migrate'))} />
-          </div>
-        </div>
-
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Expo</span>
-            <span className={`badge ${expo?.running ? 'badge-success' : 'badge-danger'}`}>
-              {expo?.running ? 'Running' : 'Stopped'}
-            </span>
-          </div>
-          {expo?.pid != null && <div className="text-mono text-muted">PID: {String(expo.pid)}</div>}
-          <div className="mt-1 flex gap-2">
-            <ActionButton label="Start" activeLabel="Starting…" busy={expoAction}
-              action={wrapAction(setExpoAction, 'Start', () => api.expoStart())} />
-            <ActionButton label="Stop" activeLabel="Stopping…" busy={expoAction}
-              action={wrapAction(setExpoAction, 'Stop', () => api.expoStop())} />
-          </div>
+        <div className="flex gap-2" style={{ flexWrap: "wrap" }}>
+          <SmallBtn
+            label="Docker"
+            activeLabel="Starting…"
+            onClick={doAction("Docker", "Docker", () =>
+              api.devStartAction("docker"),
+            )}
+            busy={busy}
+          />
+          <SmallBtn
+            label="Stop Docker"
+            activeLabel="Stopping…"
+            onClick={doAction("Stop Docker", "Docker", () =>
+              api.devStartAction("docker/stop"),
+            )}
+            busy={busy}
+          />
+          <span
+            style={{
+              borderLeft: "1px solid var(--border)",
+              margin: "0 0.25rem",
+            }}
+          />
+          <SmallBtn
+            label="Start All"
+            activeLabel="Starting…"
+            onClick={doAction("Start All", "All", () =>
+              api.devStartAction("all"),
+            )}
+            busy={busy}
+          />
+          <SmallBtn
+            label="Stop All"
+            activeLabel="Stopping…"
+            onClick={doAction("Stop All", "All", () =>
+              api.devStartAction("stop"),
+            )}
+            busy={busy}
+          />
+          <span
+            style={{
+              borderLeft: "1px solid var(--border)",
+              margin: "0 0.25rem",
+            }}
+          />
+          <SmallBtn
+            label="Clean"
+            activeLabel="Cleaning…"
+            onClick={doAction("Clean", "Clean", () =>
+              api.devStartAction("clean"),
+            )}
+            busy={busy}
+          />
+          <SmallBtn
+            label="Fresh"
+            activeLabel="Starting…"
+            onClick={doAction("Fresh", "Fresh", () =>
+              api.devStartAction("fresh"),
+            )}
+            busy={busy}
+          />
+          <SmallBtn
+            label="Migrate"
+            activeLabel="Migrating…"
+            onClick={doAction("Migrate", "Migrate", () =>
+              api.devStartAction("migrate"),
+            )}
+            busy={busy}
+          />
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-const BASE = '';
+const BASE = "";
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
@@ -86,7 +86,27 @@ export interface IngestResult {
 export interface HealthResponse {
   runner: { running: boolean; pid?: number };
   watchdog: { enabled: boolean };
-  [key: string]: unknown;
+  build: { in_progress: boolean; error_detected: boolean; last_error?: string };
+}
+
+export interface DevStartResponse {
+  status: string;
+  flag: string;
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+}
+
+export interface AiDebugResponse {
+  status: string;
+  message: string;
+}
+
+export interface LogFileResponse {
+  file: string;
+  type: string;
+  content: string;
+  lines: number;
 }
 
 // Evaluation types
@@ -387,101 +407,173 @@ export interface RunnerTaskRun {
 
 export const api = {
   // Velocity
-  ingest: () => fetchJson<IngestResult>('/velocity/ingest', { method: 'POST' }),
-  summary: (params?: string) => fetchJson<ServiceSummary[]>(`/velocity/summary${params ? `?${params}` : ''}`),
-  endpoints: (params?: string) => fetchJson<EndpointSummary[]>(`/velocity/endpoints${params ? `?${params}` : ''}`),
-  slow: (params?: string) => fetchJson<SlowRequest[]>(`/velocity/slow${params ? `?${params}` : ''}`),
-  timeline: (params?: string) => fetchJson<TimelineBucket[]>(`/velocity/timeline${params ? `?${params}` : ''}`),
-  compare: (params: string) => fetchJson<CompareResult[]>(`/velocity/compare?${params}`),
-  trace: (requestId: string) => fetchJson<TraceSpan[]>(`/velocity/trace/${encodeURIComponent(requestId)}`),
+  ingest: () => fetchJson<IngestResult>("/velocity/ingest", { method: "POST" }),
+  summary: (params?: string) =>
+    fetchJson<ServiceSummary[]>(
+      `/velocity/summary${params ? `?${params}` : ""}`,
+    ),
+  endpoints: (params?: string) =>
+    fetchJson<EndpointSummary[]>(
+      `/velocity/endpoints${params ? `?${params}` : ""}`,
+    ),
+  slow: (params?: string) =>
+    fetchJson<SlowRequest[]>(`/velocity/slow${params ? `?${params}` : ""}`),
+  timeline: (params?: string) =>
+    fetchJson<TimelineBucket[]>(
+      `/velocity/timeline${params ? `?${params}` : ""}`,
+    ),
+  compare: (params: string) =>
+    fetchJson<CompareResult[]>(`/velocity/compare?${params}`),
+  trace: (requestId: string) =>
+    fetchJson<TraceSpan[]>(`/velocity/trace/${encodeURIComponent(requestId)}`),
 
   // Evaluation
-  evalStatus: () => fetchJson<EvalStatus>('/eval/status'),
-  evalStart: (promptIds?: string[]) => fetchJson<MessageResponse>('/eval/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt_ids: promptIds ?? null }),
-  }),
-  evalStop: () => fetchJson<MessageResponse>('/eval/stop', { method: 'POST' }),
-  evalContinuousStart: (intervalSecs: number) => fetchJson<MessageResponse>('/eval/continuous/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ interval_secs: intervalSecs }),
-  }),
-  evalContinuousStop: () => fetchJson<MessageResponse>('/eval/continuous/stop', { method: 'POST' }),
-  evalRuns: () => fetchJson<EvalRunSummary[]>('/eval/runs'),
+  evalStatus: () => fetchJson<EvalStatus>("/eval/status"),
+  evalStart: (promptIds?: string[]) =>
+    fetchJson<MessageResponse>("/eval/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt_ids: promptIds ?? null }),
+    }),
+  evalStop: () => fetchJson<MessageResponse>("/eval/stop", { method: "POST" }),
+  evalContinuousStart: (intervalSecs: number) =>
+    fetchJson<MessageResponse>("/eval/continuous/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interval_secs: intervalSecs }),
+    }),
+  evalContinuousStop: () =>
+    fetchJson<MessageResponse>("/eval/continuous/stop", { method: "POST" }),
+  evalRuns: () => fetchJson<EvalRunSummary[]>("/eval/runs"),
   evalRun: (id: string) => fetchJson<EvalRunWithResults>(`/eval/runs/${id}`),
-  evalCompare: (id: string, baselineId: string) => fetchJson<CompareReport>(`/eval/runs/${id}/compare/${baselineId}`),
-  evalTestSuite: () => fetchJson<TestPrompt[]>('/eval/test-suite'),
-  evalTestSuiteAdd: (prompt: TestPrompt) => fetchJson<MessageResponse>('/eval/test-suite', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(prompt),
-  }),
-  evalTestSuiteUpdate: (id: string, prompt: TestPrompt) => fetchJson<MessageResponse>(`/eval/test-suite/${id}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(prompt),
-  }),
-  evalTestSuiteDelete: (id: string) => fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: 'DELETE' }),
-  evalSetGroundTruth: (promptId: string, workflowId: string) => fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workflow_id: workflowId }),
-  }),
-  evalClearGroundTruth: (promptId: string) => fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, { method: 'DELETE' }),
+  evalCompare: (id: string, baselineId: string) =>
+    fetchJson<CompareReport>(`/eval/runs/${id}/compare/${baselineId}`),
+  evalTestSuite: () => fetchJson<TestPrompt[]>("/eval/test-suite"),
+  evalTestSuiteAdd: (prompt: TestPrompt) =>
+    fetchJson<MessageResponse>("/eval/test-suite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(prompt),
+    }),
+  evalTestSuiteUpdate: (id: string, prompt: TestPrompt) =>
+    fetchJson<MessageResponse>(`/eval/test-suite/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(prompt),
+    }),
+  evalTestSuiteDelete: (id: string) =>
+    fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: "DELETE" }),
+  evalSetGroundTruth: (promptId: string, workflowId: string) =>
+    fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workflow_id: workflowId }),
+    }),
+  evalClearGroundTruth: (promptId: string) =>
+    fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
+      method: "DELETE",
+    }),
 
   // Velocity Tests
-  vtStatus: () => fetchJson<VtStatus>('/velocity-tests/status'),
-  vtStart: () => fetchJson<MessageResponse>('/velocity-tests/start', { method: 'POST' }),
-  vtStop: () => fetchJson<MessageResponse>('/velocity-tests/stop', { method: 'POST' }),
-  vtRuns: () => fetchJson<VtRun[]>('/velocity-tests/runs'),
-  vtRun: (id: string) => fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
-  vtTrend: (limit?: number) => fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
+  vtStatus: () => fetchJson<VtStatus>("/velocity-tests/status"),
+  vtStart: () =>
+    fetchJson<MessageResponse>("/velocity-tests/start", { method: "POST" }),
+  vtStop: () =>
+    fetchJson<MessageResponse>("/velocity-tests/stop", { method: "POST" }),
+  vtRuns: () => fetchJson<VtRun[]>("/velocity-tests/runs"),
+  vtRun: (id: string) =>
+    fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
+  vtTrend: (limit?: number) =>
+    fetchJson<VtTrendPoint[]>(
+      `/velocity-tests/trend${limit ? `?limit=${limit}` : ""}`,
+    ),
 
   // Workflow Loop
-  wlStatus: () => fetchJson<WorkflowLoopStatus>('/workflow-loop/status'),
-  wlHistory: () => fetchJson<WorkflowLoopHistory>('/workflow-loop/history'),
-  wlStart: (config: Record<string, unknown>) => fetchJson<unknown>('/workflow-loop/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
-  }),
-  wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
-  wlWorkflows: () => fetch('http://127.0.0.1:9876/unified-workflows').then(r => r.json()).then((d: { data?: UnifiedWorkflow[] }) => (d.data || d) as UnifiedWorkflow[]),
+  wlStatus: () => fetchJson<WorkflowLoopStatus>("/workflow-loop/status"),
+  wlHistory: () => fetchJson<WorkflowLoopHistory>("/workflow-loop/history"),
+  wlStart: (config: Record<string, unknown>) =>
+    fetchJson<unknown>("/workflow-loop/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    }),
+  wlStop: () => fetchJson<unknown>("/workflow-loop/stop", { method: "POST" }),
+  wlWorkflows: () =>
+    fetch("http://127.0.0.1:9876/unified-workflows")
+      .then((r) => r.json())
+      .then(
+        (d: { data?: UnifiedWorkflow[] }) => (d.data || d) as UnifiedWorkflow[],
+      ),
 
   // Velocity Improvement
-  viStatus: () => fetchJson<VelocityImprovementStatus>('/velocity-improvement/status'),
-  viStart: (config: Record<string, unknown>) => fetchJson<MessageResponse>('/velocity-improvement/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
-  }),
-  viStop: () => fetchJson<MessageResponse>('/velocity-improvement/stop', { method: 'POST' }),
-  viHistory: () => fetchJson<VelocityImprovementHistory>('/velocity-improvement/history'),
+  viStatus: () =>
+    fetchJson<VelocityImprovementStatus>("/velocity-improvement/status"),
+  viStart: (config: Record<string, unknown>) =>
+    fetchJson<MessageResponse>("/velocity-improvement/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config),
+    }),
+  viStop: () =>
+    fetchJson<MessageResponse>("/velocity-improvement/stop", {
+      method: "POST",
+    }),
+  viHistory: () =>
+    fetchJson<VelocityImprovementHistory>("/velocity-improvement/history"),
 
   // Supervisor
-  health: () => fetchJson<HealthResponse>('/health'),
-  runnerRestart: (rebuild: boolean) => fetchJson<unknown>('/runner/restart', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rebuild }),
-  }),
-  devStartStatus: () => fetchJson<Record<string, unknown>>('/dev-start/status'),
-  devStartAction: (action: string) => fetchJson<unknown>(`/dev-start/${action}`, { method: 'POST' }),
-  runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
+  health: () => fetchJson<HealthResponse>("/health"),
+  runnerRestart: (rebuild: boolean) =>
+    fetchJson<unknown>("/runner/restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rebuild }),
+    }),
+  devStartStatus: () =>
+    fetchJson<{
+      services: { name: string; port: number; available: boolean }[];
+    }>("/dev-start/status"),
+  devStartAction: (action: string) =>
+    fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: "POST" }),
+  runnerStop: () => fetchJson<unknown>("/runner/stop", { method: "POST" }),
+
+  // AI Debug
+  aiDebug: (prompt: string) =>
+    fetchJson<AiDebugResponse>("/ai/debug", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    }),
+
+  // Logs
+  logFile: (type: string, tailLines?: number) =>
+    fetchJson<LogFileResponse>(
+      `/logs/file/${type}${tailLines ? `?tail_lines=${tailLines}` : ""}`,
+    ),
 
   // Runner Monitor (proxied to runner at port 9876)
-  runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
-  runnerTaskRunsRunning: () => fetchJson<RunnerTaskRun[]>('/runner-api/task-runs/running'),
-  runnerWorkflowState: (id: string) => fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`),
+  runnerHealth: () => fetchJson<Record<string, unknown>>("/runner-api/health"),
+  runnerTaskRunsRunning: () =>
+    fetchJson<RunnerTaskRun[]>("/runner-api/task-runs/running"),
+  runnerWorkflowState: (id: string) =>
+    fetchJson<Record<string, unknown>>(
+      `/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`,
+    ),
   runnerTaskOutput: (id: string, tailChars = 15000) =>
-    fetch(`/runner-api/task-runs/${encodeURIComponent(id)}/output?tail_chars=${tailChars}`)
-      .then(r => { if (!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.text(); }),
-  runnerStopTask: (id: string) => fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+    fetch(
+      `/runner-api/task-runs/${encodeURIComponent(id)}/output?tail_chars=${tailChars}`,
+    ).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.text();
+    }),
+  runnerStopTask: (id: string) =>
+    fetchJson<Record<string, unknown>>(
+      `/runner-api/task-runs/${encodeURIComponent(id)}/stop`,
+      { method: "POST" },
+    ),
 
   // Expo
-  expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
-  expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
-  expoStatus: () => fetchJson<Record<string, unknown>>('/expo/status'),
+  expoStart: () => fetchJson<unknown>("/expo/start", { method: "POST" }),
+  expoStop: () => fetchJson<unknown>("/expo/stop", { method: "POST" }),
+  expoStatus: () => fetchJson<Record<string, unknown>>("/expo/status"),
 };
