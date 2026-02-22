@@ -131,7 +131,7 @@ export default function Dashboard() {
   useEffect(() => {
     mountedRef.current = true;
     refresh();
-    const id = setInterval(refresh, 5000);
+    const id = setInterval(refresh, 600_000);
     return () => {
       mountedRef.current = false;
       clearInterval(id);
@@ -196,9 +196,12 @@ export default function Dashboard() {
     async (service: string) => {
       setAiFixBusy(service);
       try {
-        // Gather error context
         const err = errors.get(service);
-        const parts: string[] = [`Service "${service}" failed to start/load.`];
+        const parts: string[] = [
+          err
+            ? `Service "${service}" failed to start/load.`
+            : `Service "${service}" is down and not responding on its expected port.`,
+        ];
 
         if (err?.stderr) parts.push(`\nStderr:\n${err.stderr}`);
         if (err?.stdout) parts.push(`\nStdout:\n${err.stdout}`);
@@ -241,6 +244,7 @@ export default function Dashboard() {
   const runner = data.health?.runner;
   const watchdog = data.health?.watchdog;
   const build = data.health?.build;
+  const ai = data.health?.ai;
   const expo = data.expo;
 
   // If build has an error, surface it on the Runner row
@@ -272,11 +276,15 @@ export default function Dashboard() {
   // Build service rows from port status + health data
   const svcMap = new Map(data.services.map((s) => [s.name, s]));
 
+  const backendUp = svcMap.get("backend")?.available ?? false;
+  const frontendUp = svcMap.get("frontend")?.available ?? false;
+  const expoUp = !!expo?.running;
+
   const rows: RowDef[] = [
     {
       name: "Runner",
       port: "9876",
-      up: !!runner?.running,
+      up: !!runner?.api_responding || !!runner?.running,
       actions: [
         {
           key: "runner-restart",
@@ -304,12 +312,12 @@ export default function Dashboard() {
     {
       name: "Backend",
       port: "8000",
-      up: svcMap.get("backend")?.available ?? false,
+      up: backendUp,
       actions: [
         {
           key: "backend-start",
-          display: "Start",
-          activeLabel: "Starting…",
+          display: backendUp ? "Restart" : "Start",
+          activeLabel: backendUp ? "Restarting…" : "Starting…",
           service: "Backend",
           fn: () => api.devStartAction("backend"),
         },
@@ -325,12 +333,12 @@ export default function Dashboard() {
     {
       name: "Frontend",
       port: "3001",
-      up: svcMap.get("frontend")?.available ?? false,
+      up: frontendUp,
       actions: [
         {
           key: "frontend-start",
-          display: "Start",
-          activeLabel: "Starting…",
+          display: frontendUp ? "Restart" : "Start",
+          activeLabel: frontendUp ? "Restarting…" : "Starting…",
           service: "Frontend",
           fn: () => api.devStartAction("frontend"),
         },
@@ -366,12 +374,12 @@ export default function Dashboard() {
     {
       name: "Expo",
       port: "8081",
-      up: !!expo?.running,
+      up: expoUp,
       actions: [
         {
           key: "expo-start",
-          display: "Start",
-          activeLabel: "Starting…",
+          display: expoUp ? "Restart" : "Start",
+          activeLabel: expoUp ? "Restarting…" : "Starting…",
           service: "Expo",
           fn: () => api.expoStart(),
         },
@@ -406,6 +414,49 @@ export default function Dashboard() {
           </button>
         </div>
       </div>
+
+      {ai?.ai_running && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.75rem",
+            padding: "0.5rem 1rem",
+            marginBottom: "1rem",
+            background: "rgba(99,102,241,0.1)",
+            border: "1px solid rgba(99,102,241,0.3)",
+            borderRadius: 6,
+            fontSize: "0.8rem",
+          }}
+        >
+          <span
+            style={{
+              display: "inline-block",
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: "var(--accent)",
+              animation: "pulse 1.5s ease-in-out infinite",
+            }}
+          />
+          <span>
+            AI debug session running ({ai.ai_provider}/{ai.ai_model})
+          </span>
+          <SmallBtn
+            label="Stop AI"
+            activeLabel="Stopping…"
+            onClick={async () => {
+              setAiFixBusy("stop-ai");
+              try { await api.aiStop(); } catch {}
+              setAiFixBusy(null);
+              setTimeout(refresh, 500);
+            }}
+            busy={aiFixBusy}
+            busyKey="stop-ai"
+            variant="danger"
+          />
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: "1rem" }}>
         <div className="table-container">
@@ -463,7 +514,7 @@ export default function Dashboard() {
                               busyKey={a.key}
                             />
                           ))}
-                          {err && (
+                          {(err || (!row.up && row.actions)) && (
                             <SmallBtn
                               label="AI Fix"
                               activeLabel="Sending…"

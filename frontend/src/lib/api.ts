@@ -84,9 +84,14 @@ export interface IngestResult {
 }
 
 export interface HealthResponse {
-  runner: { running: boolean; pid?: number };
+  runner: {
+    running: boolean;
+    pid?: number;
+    api_responding: boolean;
+  };
   watchdog: { enabled: boolean };
   build: { in_progress: boolean; error_detected: boolean; last_error?: string };
+  ai: { ai_running: boolean; ai_provider: string; ai_model: string };
 }
 
 export interface DevStartResponse {
@@ -544,6 +549,8 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
     }),
+  aiStop: () =>
+    fetchJson<AiDebugResponse>("/ai/stop", { method: "POST" }),
 
   // Logs
   logFile: (type: string, tailLines?: number) =>
