@@ -84,14 +84,54 @@ export interface IngestResult {
 }
 
 export interface HealthResponse {
+  status: string;
   runner: {
     running: boolean;
     pid?: number;
+    started_at?: string;
     api_responding: boolean;
+    mode: string;
   };
-  watchdog: { enabled: boolean };
-  build: { in_progress: boolean; error_detected: boolean; last_error?: string };
-  ai: { ai_running: boolean; ai_provider: string; ai_model: string };
+  ports: {
+    api_port: { port: number; in_use: boolean };
+    vite_port?: { port: number; in_use: boolean };
+  };
+  watchdog: {
+    enabled: boolean;
+    restart_attempts: number;
+    last_restart_at?: string;
+    disabled_reason?: string;
+    crash_count: number;
+  };
+  build: {
+    in_progress: boolean;
+    error_detected: boolean;
+    last_error?: string;
+    last_build_at?: string;
+  };
+  ai: {
+    ai_running: boolean;
+    ai_provider: string;
+    ai_model: string;
+    auto_debug_enabled: boolean;
+  };
+  code_activity: {
+    code_being_edited: boolean;
+    external_claude_session: boolean;
+    pending_debug: boolean;
+    pending_debug_reason?: string;
+  };
+  expo: {
+    running: boolean;
+    pid?: number;
+    port: number;
+    configured: boolean;
+  };
+  supervisor: {
+    version: string;
+    dev_mode: boolean;
+    project_dir: string;
+  };
 }
 
 export interface DevStartResponse {

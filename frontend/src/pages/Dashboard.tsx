@@ -131,7 +131,7 @@ export default function Dashboard() {
   useEffect(() => {
     mountedRef.current = true;
     refresh();
-    const id = setInterval(refresh, 600_000);
+    const id = setInterval(refresh, 5_000);
     return () => {
       mountedRef.current = false;
       clearInterval(id);
