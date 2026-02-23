@@ -35,17 +35,31 @@ export default function RunnerMonitor() {
 
   const refreshHealth = useCallback(() => {
     setBusy('Refresh Health');
-    api.runnerHealth()
-      .then(h => { setRunnerHealth(h); setHealthError(null); })
-      .catch(e => { setRunnerHealth(null); setHealthError(String(e)); })
+    api
+      .runnerHealth()
+      .then((h) => {
+        setRunnerHealth(h);
+        setHealthError(null);
+      })
+      .catch((e) => {
+        setRunnerHealth(null);
+        setHealthError(String(e));
+      })
       .finally(() => setBusy(null));
   }, []);
 
   const refreshTaskRuns = useCallback(() => {
     setBusy('Refresh Tasks');
-    api.runnerTaskRunsRunning()
-      .then(runs => { setTaskRuns(Array.isArray(runs) ? runs : []); setTaskRunsError(null); })
-      .catch(e => { setTaskRuns([]); setTaskRunsError(String(e)); })
+    api
+      .runnerTaskRunsRunning()
+      .then((runs) => {
+        setTaskRuns(Array.isArray(runs) ? runs : []);
+        setTaskRunsError(null);
+      })
+      .catch((e) => {
+        setTaskRuns([]);
+        setTaskRunsError(String(e));
+      })
       .finally(() => setBusy(null));
   }, []);
 
@@ -70,16 +84,30 @@ export default function RunnerMonitor() {
           <div className="card-header">
             <span className="card-title">Runner Health</span>
             <div className="flex gap-2" style={{ alignItems: 'center' }}>
-              <span className={`badge ${isHealthy ? 'badge-success' : runnerHealth === null && !healthError ? 'badge-warning' : 'badge-danger'}`}>
-                {isHealthy ? 'Healthy' : runnerHealth === null && !healthError ? 'Unknown' : 'Unreachable'}
+              <span
+                className={`badge ${isHealthy ? 'badge-success' : runnerHealth === null && !healthError ? 'badge-warning' : 'badge-danger'}`}
+              >
+                {isHealthy
+                  ? 'Healthy'
+                  : runnerHealth === null && !healthError
+                    ? 'Unknown'
+                    : 'Unreachable'}
               </span>
-              <button className="btn" style={{ fontSize: '0.75rem', padding: '2px 8px' }} disabled={busy !== null} onClick={refreshHealth}>
+              <button
+                className="btn"
+                style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                disabled={busy !== null}
+                onClick={refreshHealth}
+              >
                 {busy === 'Refresh Health' ? 'Checking...' : 'Check'}
               </button>
             </div>
           </div>
           {healthError && (
-            <div className="text-mono text-danger" style={{ fontSize: '0.8rem', marginTop: '0.5rem' }}>
+            <div
+              className="text-mono text-danger"
+              style={{ fontSize: '0.8rem', marginTop: '0.5rem' }}
+            >
               {healthError}
             </div>
           )}
@@ -103,29 +131,61 @@ export default function RunnerMonitor() {
               <span className={`badge ${taskRuns.length > 0 ? 'badge-success' : 'badge-warning'}`}>
                 {taskRuns.length} active
               </span>
-              <button className="btn" style={{ fontSize: '0.75rem', padding: '2px 8px' }} disabled={busy !== null} onClick={refreshTaskRuns}>
+              <button
+                className="btn"
+                style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                disabled={busy !== null}
+                onClick={refreshTaskRuns}
+              >
                 {busy === 'Refresh Tasks' ? 'Refreshing...' : 'Refresh'}
               </button>
             </div>
           </div>
           {taskRunsError && (
-            <div className="text-mono text-danger" style={{ fontSize: '0.8rem', marginTop: '0.5rem' }}>
+            <div
+              className="text-mono text-danger"
+              style={{ fontSize: '0.8rem', marginTop: '0.5rem' }}
+            >
               {taskRunsError}
             </div>
           )}
           {taskRuns.length === 0 && !taskRunsError && (
-            <div className="text-muted" style={{ marginTop: '0.5rem' }}>No running task runs</div>
+            <div className="text-muted" style={{ marginTop: '0.5rem' }}>
+              No running task runs
+            </div>
           )}
-          {taskRuns.map(run => (
-            <div key={run.id} style={{ marginTop: '0.75rem', padding: '0.75rem', background: 'var(--bg-tertiary, #1a1a2e)', borderRadius: '6px' }}>
-              <div className="flex justify-between" style={{ alignItems: 'center', marginBottom: '0.5rem' }}>
+          {taskRuns.map((run) => (
+            <div
+              key={run.id}
+              style={{
+                marginTop: '0.75rem',
+                padding: '0.75rem',
+                background: 'var(--bg-tertiary, #1a1a2e)',
+                borderRadius: '6px',
+              }}
+            >
+              <div
+                className="flex justify-between"
+                style={{ alignItems: 'center', marginBottom: '0.5rem' }}
+              >
                 <span className="text-mono" style={{ fontSize: '0.85rem' }}>
                   <strong>{run.id}</strong>
-                  <span className="text-muted" style={{ marginLeft: '0.75rem' }}>{run.status}</span>
+                  <span className="text-muted" style={{ marginLeft: '0.75rem' }}>
+                    {run.status}
+                  </span>
                 </span>
               </div>
               {run.prompt && (
-                <div className="text-muted" style={{ fontSize: '0.8rem', marginBottom: '0.5rem', maxHeight: '3em', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                <div
+                  className="text-muted"
+                  style={{
+                    fontSize: '0.8rem',
+                    marginBottom: '0.5rem',
+                    maxHeight: '3em',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
                   {String(run.prompt).slice(0, 200)}
                 </div>
               )}
@@ -133,7 +193,9 @@ export default function RunnerMonitor() {
                 <button
                   className="btn"
                   disabled={busy !== null}
-                  onClick={wrapAction(`Workflow State (${run.id})`, () => api.runnerWorkflowState(run.id))}
+                  onClick={wrapAction(`Workflow State (${run.id})`, () =>
+                    api.runnerWorkflowState(run.id),
+                  )}
                 >
                   {busy === `Workflow State (${run.id})` ? 'Loading...' : 'Workflow State'}
                 </button>
@@ -163,7 +225,14 @@ export default function RunnerMonitor() {
         <div className="card" style={{ marginTop: '1rem' }}>
           <div className="card-header">
             <span className="card-title">{resultTitle || 'Result'}</span>
-            <button className="btn" style={{ fontSize: '0.75rem', padding: '2px 8px' }} onClick={() => { setResultContent(''); setResultTitle(''); }}>
+            <button
+              className="btn"
+              style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+              onClick={() => {
+                setResultContent('');
+                setResultTitle('');
+              }}
+            >
               Clear
             </button>
           </div>

@@ -1,6 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import {
+  BarChart,
+  Bar,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
 import { api, TimelineBucket, SlowRequest } from '../lib/api';
 
 const SERVICE_COLORS: Record<string, string> = {
@@ -35,9 +45,9 @@ export default function VelocityEndpoint() {
         api.slow(`${filterParams}&threshold_ms=0&limit=100`),
       ]);
       // Filter timeline to only this endpoint's service
-      setTimeline(t.filter(b => b.service === service));
+      setTimeline(t.filter((b) => b.service === service));
       // Filter slow requests to this specific endpoint
-      setSlow(s.filter(r => r.http_method === method && r.http_route === route));
+      setSlow(s.filter((r) => r.http_method === method && r.http_route === route));
     } catch (err) {
       console.error('Failed to load endpoint data:', err);
     } finally {
@@ -45,7 +55,9 @@ export default function VelocityEndpoint() {
     }
   }, [route, method, service]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   // Build latency distribution buckets from slow request durations
   const distributionBuckets = (() => {
@@ -60,14 +72,16 @@ export default function VelocityEndpoint() {
       { label: '2-5s', min: 2000, max: 5000 },
       { label: '>5s', min: 5000, max: Infinity },
     ];
-    return ranges.map(r => ({
-      range: r.label,
-      count: slow.filter(s => s.duration_ms >= r.min && s.duration_ms < r.max).length,
-    })).filter(b => b.count > 0);
+    return ranges
+      .map((r) => ({
+        range: r.label,
+        count: slow.filter((s) => s.duration_ms >= r.min && s.duration_ms < r.max).length,
+      }))
+      .filter((b) => b.count > 0);
   })();
 
   // Timeline chart data
-  const chartData = timeline.map(t => ({
+  const chartData = timeline.map((t) => ({
     bucket: t.bucket.slice(11, 16), // HH:MM
     avg: Math.round(t.avg_duration_ms),
     p95: Math.round(t.p95_duration_ms),
@@ -75,17 +89,21 @@ export default function VelocityEndpoint() {
   }));
 
   // Summary stats from slow requests (which has threshold_ms=0 so it's all requests)
-  const durations = slow.map(s => s.duration_ms).sort((a, b) => a - b);
-  const stats = durations.length > 0 ? {
-    count: durations.length,
-    avg: Math.round(durations.reduce((a, b) => a + b, 0) / durations.length),
-    p50: durations[Math.floor(durations.length * 0.5)],
-    p95: durations[Math.floor(durations.length * 0.95)],
-    p99: durations[Math.floor(durations.length * 0.99)],
-    min: durations[0],
-    max: durations[durations.length - 1],
-    errors: slow.filter(s => s.http_status_code != null && s.http_status_code >= 500).length,
-  } : null;
+  const durations = slow.map((s) => s.duration_ms).sort((a, b) => a - b);
+  const stats =
+    durations.length > 0
+      ? {
+          count: durations.length,
+          avg: Math.round(durations.reduce((a, b) => a + b, 0) / durations.length),
+          p50: durations[Math.floor(durations.length * 0.5)],
+          p95: durations[Math.floor(durations.length * 0.95)],
+          p99: durations[Math.floor(durations.length * 0.99)],
+          min: durations[0],
+          max: durations[durations.length - 1],
+          errors: slow.filter((s) => s.http_status_code != null && s.http_status_code >= 500)
+            .length,
+        }
+      : null;
 
   const color = SERVICE_COLORS[service] || '#888';
 
@@ -93,15 +111,22 @@ export default function VelocityEndpoint() {
     <div>
       <div className="page-header">
         <h1 className="page-title">
-          <Link to="/velocity" style={{ color: 'var(--text-muted)', marginRight: '0.5rem' }}>Velocity</Link>
-          /
-          <span style={{ color, marginLeft: '0.5rem' }}>{service}</span>
-          <span className="text-muted" style={{ margin: '0 0.5rem' }}>{method}</span>
+          <Link to="/velocity" style={{ color: 'var(--text-muted)', marginRight: '0.5rem' }}>
+            Velocity
+          </Link>
+          /<span style={{ color, marginLeft: '0.5rem' }}>{service}</span>
+          <span className="text-muted" style={{ margin: '0 0.5rem' }}>
+            {method}
+          </span>
           {route}
         </h1>
       </div>
 
-      {loading && <div className="card"><p className="text-muted">Loading...</p></div>}
+      {loading && (
+        <div className="card">
+          <p className="text-muted">Loading...</p>
+        </div>
+      )}
 
       {!loading && stats && (
         <>
@@ -163,7 +188,13 @@ export default function VelocityEndpoint() {
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                   <XAxis dataKey="range" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
                   <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }} />
+                  <Tooltip
+                    contentStyle={{
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 6,
+                    }}
+                  />
                   <Bar dataKey="count" fill={color} radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -178,10 +209,34 @@ export default function VelocityEndpoint() {
                 <LineChart data={chartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                   <XAxis dataKey="bucket" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
-                  <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} label={{ value: 'ms', position: 'insideLeft', fill: 'var(--text-muted)' }} />
-                  <Tooltip contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }} />
-                  <Line type="monotone" dataKey="p95" name="P95" stroke={color} strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="avg" name="Avg" stroke="var(--text-muted)" strokeWidth={1} strokeDasharray="5 5" dot={false} />
+                  <YAxis
+                    tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                    label={{ value: 'ms', position: 'insideLeft', fill: 'var(--text-muted)' }}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 6,
+                    }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="p95"
+                    name="P95"
+                    stroke={color}
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="avg"
+                    name="Avg"
+                    stroke="var(--text-muted)"
+                    strokeWidth={1}
+                    strokeDasharray="5 5"
+                    dot={false}
+                  />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -203,12 +258,26 @@ export default function VelocityEndpoint() {
                   </tr>
                 </thead>
                 <tbody>
-                  {slow.slice(0, 50).map(s => (
+                  {slow.slice(0, 50).map((s) => (
                     <tr key={s.id}>
-                      <td className={s.duration_ms > 1000 ? 'text-danger' : s.duration_ms > 500 ? 'text-warning' : ''}>
+                      <td
+                        className={
+                          s.duration_ms > 1000
+                            ? 'text-danger'
+                            : s.duration_ms > 500
+                              ? 'text-warning'
+                              : ''
+                        }
+                      >
                         {formatMs(s.duration_ms)}
                       </td>
-                      <td className={s.http_status_code != null && s.http_status_code >= 500 ? 'text-danger' : ''}>
+                      <td
+                        className={
+                          s.http_status_code != null && s.http_status_code >= 500
+                            ? 'text-danger'
+                            : ''
+                        }
+                      >
                         {s.http_status_code ?? '-'}
                       </td>
                       <td>{new Date(s.start_ts).toLocaleTimeString()}</td>
@@ -217,12 +286,18 @@ export default function VelocityEndpoint() {
                           <Link to={`/velocity/trace?id=${encodeURIComponent(s.request_id)}`}>
                             {s.request_id.slice(0, 12)}...
                           </Link>
-                        ) : '-'}
+                        ) : (
+                          '-'
+                        )}
                       </td>
                     </tr>
                   ))}
                   {slow.length === 0 && (
-                    <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No requests found.</td></tr>
+                    <tr>
+                      <td colSpan={4} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                        No requests found.
+                      </td>
+                    </tr>
                   )}
                 </tbody>
               </table>

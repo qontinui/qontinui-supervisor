@@ -32,7 +32,7 @@ const BOTTLENECK_COLORS: Record<string, string> = {
   'Backend Slow': '#95a5a6',
   'TTFB Slow': '#95a5a6',
   'Network Slow': '#3498db',
-  'Healthy': '#2ecc71',
+  Healthy: '#2ecc71',
 };
 
 function scoreColor(score: number): string {
@@ -49,7 +49,15 @@ function formatDelta(current: number, previous: number | null): string {
   return '0';
 }
 
-function PhaseBadge({ phase, iteration, maxIterations }: { phase: string; iteration: number; maxIterations: number }) {
+function PhaseBadge({
+  phase,
+  iteration,
+  maxIterations,
+}: {
+  phase: string;
+  iteration: number;
+  maxIterations: number;
+}) {
   const label = PHASE_LABELS[phase] || phase;
   const color = PHASE_COLORS[phase] || 'var(--text-muted)';
   return (
@@ -67,7 +75,10 @@ function PhaseBadge({ phase, iteration, maxIterations }: { phase: string; iterat
         border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
       }}
     >
-      {phase === 'running_tests' || phase === 'fixing' || phase === 'restarting_frontend' || phase === 'waiting_frontend' ? (
+      {phase === 'running_tests' ||
+      phase === 'fixing' ||
+      phase === 'restarting_frontend' ||
+      phase === 'waiting_frontend' ? (
         <span className="spinner" style={{ width: 12, height: 12 }} />
       ) : null}
       {label}
@@ -130,7 +141,9 @@ export default function VelocityImprovement() {
         const [s, h] = await Promise.all([api.viStatus(), api.viHistory()]);
         setStatus(s);
         setIterations(h.iterations);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }, 3000);
     return () => clearInterval(interval);
   }, [status?.running]);
@@ -162,17 +175,21 @@ export default function VelocityImprovement() {
   }
 
   const isRunning = status?.running ?? false;
-  const latestScore = iterations.length > 0
-    ? iterations[iterations.length - 1].overall_score
-    : null;
-  const initialScore = iterations.length > 0
-    ? iterations[0].overall_score
-    : null;
+  const latestScore =
+    iterations.length > 0 ? iterations[iterations.length - 1].overall_score : null;
+  const initialScore = iterations.length > 0 ? iterations[0].overall_score : null;
 
   return (
     <div style={{ padding: 24, maxWidth: 1200 }}>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 24,
+        }}
+      >
         <h1 style={{ margin: 0, fontSize: '1.5rem' }}>Velocity Improvement</h1>
         {status && (
           <PhaseBadge
@@ -187,7 +204,14 @@ export default function VelocityImprovement() {
       <div className="card" style={{ padding: 20, marginBottom: 24 }}>
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
           <div>
-            <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 4 }}>
+            <label
+              style={{
+                display: 'block',
+                fontSize: '0.8rem',
+                color: 'var(--text-muted)',
+                marginBottom: 4,
+              }}
+            >
               Max Iterations
             </label>
             <input
@@ -209,7 +233,14 @@ export default function VelocityImprovement() {
             />
           </div>
           <div>
-            <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 4 }}>
+            <label
+              style={{
+                display: 'block',
+                fontSize: '0.8rem',
+                color: 'var(--text-muted)',
+                marginBottom: 4,
+              }}
+            >
               Target Score
             </label>
             <input
@@ -268,7 +299,16 @@ export default function VelocityImprovement() {
         </div>
 
         {status?.error && (
-          <div style={{ marginTop: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--danger-bg, #fee)', color: 'var(--danger)', fontSize: '0.85rem' }}>
+          <div
+            style={{
+              marginTop: 12,
+              padding: '8px 12px',
+              borderRadius: 6,
+              background: 'var(--danger-bg, #fee)',
+              color: 'var(--danger)',
+              fontSize: '0.85rem',
+            }}
+          >
             {status.error}
           </div>
         )}
@@ -276,17 +316,27 @@ export default function VelocityImprovement() {
 
       {/* Summary when complete */}
       {status?.phase === 'complete' && initialScore !== null && latestScore !== null && (
-        <div className="card" style={{ padding: 20, marginBottom: 24, borderLeft: '4px solid var(--success)' }}>
-          <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Improvement Complete</div>
+        <div
+          className="card"
+          style={{ padding: 20, marginBottom: 24, borderLeft: '4px solid var(--success)' }}
+        >
+          <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>
+            Improvement Complete
+          </div>
           <div style={{ display: 'flex', gap: 32, fontSize: '0.95rem' }}>
             <div>
-              Initial Score: <strong style={{ color: scoreColor(initialScore) }}>{initialScore.toFixed(1)}</strong>
+              Initial Score:{' '}
+              <strong style={{ color: scoreColor(initialScore) }}>{initialScore.toFixed(1)}</strong>
             </div>
             <div>
-              Final Score: <strong style={{ color: scoreColor(latestScore) }}>{latestScore.toFixed(1)}</strong>
+              Final Score:{' '}
+              <strong style={{ color: scoreColor(latestScore) }}>{latestScore.toFixed(1)}</strong>
             </div>
             <div>
-              Change: <strong style={{ color: latestScore > initialScore ? 'var(--success)' : 'var(--danger)' }}>
+              Change:{' '}
+              <strong
+                style={{ color: latestScore > initialScore ? 'var(--success)' : 'var(--danger)' }}
+              >
                 {formatDelta(latestScore, initialScore)}
               </strong>
             </div>
@@ -306,7 +356,16 @@ export default function VelocityImprovement() {
               const score = iter.overall_score ?? 0;
               const height = Math.max(4, (score / 100) * 72);
               return (
-                <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, flex: 1 }}>
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 4,
+                    flex: 1,
+                  }}
+                >
                   <span style={{ fontSize: '0.75rem', fontWeight: 600, color: scoreColor(score) }}>
                     {score.toFixed(0)}
                   </span>
@@ -320,7 +379,9 @@ export default function VelocityImprovement() {
                       opacity: 0.8,
                     }}
                   />
-                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>#{iter.iteration}</span>
+                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                    #{iter.iteration}
+                  </span>
                 </div>
               );
             })}
@@ -366,25 +427,44 @@ export default function VelocityImprovement() {
                         <span style={{ color: scoreColor(score), fontWeight: 600 }}>
                           {score.toFixed(1)}
                         </span>
-                        <span style={{
-                          color: prevScore !== null
-                            ? (score > prevScore ? 'var(--success)' : score < prevScore ? 'var(--danger)' : 'var(--text-muted)')
-                            : 'var(--text-muted)'
-                        }}>
+                        <span
+                          style={{
+                            color:
+                              prevScore !== null
+                                ? score > prevScore
+                                  ? 'var(--success)'
+                                  : score < prevScore
+                                    ? 'var(--danger)'
+                                    : 'var(--text-muted)'
+                                : 'var(--text-muted)',
+                          }}
+                        >
                           {formatDelta(score, prevScore) || '-'}
                         </span>
                         <span>{iter.per_page_scores.length} pages</span>
                         <span>{iter.fix_applied ? 'Yes' : 'No'}</span>
-                        <span>{iter.exit_reason || (iter.completed_at ? 'Continued' : 'In progress')}</span>
+                        <span>
+                          {iter.exit_reason || (iter.completed_at ? 'Continued' : 'In progress')}
+                        </span>
                       </div>
 
                       {/* Expanded detail */}
                       {isExpanded && (
-                        <div style={{ padding: '12px 24px', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border)' }}>
+                        <div
+                          style={{
+                            padding: '12px 24px',
+                            background: 'var(--bg-secondary)',
+                            borderBottom: '1px solid var(--border)',
+                          }}
+                        >
                           {/* Per-page scores */}
                           <div style={{ marginBottom: 12 }}>
-                            <strong style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Per-Page Scores</strong>
-                            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 6 }}>
+                            <strong style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                              Per-Page Scores
+                            </strong>
+                            <div
+                              style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 6 }}
+                            >
                               {iter.per_page_scores.map((page) => (
                                 <div
                                   key={page.name}
@@ -411,18 +491,22 @@ export default function VelocityImprovement() {
                           {/* Fix summary */}
                           {iter.fix_summary && (
                             <div style={{ marginBottom: 8 }}>
-                              <strong style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Fix Summary</strong>
-                              <div style={{
-                                marginTop: 4,
-                                padding: '8px 12px',
-                                borderRadius: 6,
-                                background: 'var(--bg)',
-                                border: '1px solid var(--border)',
-                                fontSize: '0.8rem',
-                                whiteSpace: 'pre-wrap',
-                                maxHeight: 200,
-                                overflow: 'auto',
-                              }}>
+                              <strong style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                                Fix Summary
+                              </strong>
+                              <div
+                                style={{
+                                  marginTop: 4,
+                                  padding: '8px 12px',
+                                  borderRadius: 6,
+                                  background: 'var(--bg)',
+                                  border: '1px solid var(--border)',
+                                  fontSize: '0.8rem',
+                                  whiteSpace: 'pre-wrap',
+                                  maxHeight: 200,
+                                  overflow: 'auto',
+                                }}
+                              >
                                 {iter.fix_summary}
                               </div>
                             </div>
@@ -447,14 +531,20 @@ export default function VelocityImprovement() {
 
       {/* Empty state */}
       {iterations.length === 0 && !isRunning && (
-        <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>
+        <div
+          className="card"
+          style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}
+        >
           No improvement iterations yet. Start the loop to begin optimizing frontend performance.
         </div>
       )}
 
       {/* Running state with no iterations yet */}
       {iterations.length === 0 && isRunning && (
-        <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>
+        <div
+          className="card"
+          style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}
+        >
           <div className="spinner" style={{ width: 24, height: 24, margin: '0 auto 12px' }} />
           Running initial velocity tests...
         </div>

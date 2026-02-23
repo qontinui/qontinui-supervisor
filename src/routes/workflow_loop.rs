@@ -17,6 +17,19 @@ pub async fn start(
     State(state): State<SharedState>,
     Json(config): Json<WorkflowLoopConfig>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    // Validate max_iterations bounds
+    if config.max_iterations == 0 {
+        return Err(SupervisorError::Validation(
+            "max_iterations must be greater than 0".to_string(),
+        ));
+    }
+    if config.max_iterations > 100 {
+        return Err(SupervisorError::Validation(format!(
+            "max_iterations too large ({}, max 100)",
+            config.max_iterations
+        )));
+    }
+
     // Validate config: pipeline mode vs simple mode
     if let Some(phases) = &config.phases {
         // Pipeline mode: need either build or execute_workflow_id
@@ -25,12 +38,55 @@ pub async fn start(
                 "Pipeline mode requires either a build phase or execute_workflow_id".to_string(),
             ));
         }
+        // Validate build phase description is non-empty
+        if let Some(ref build) = phases.build {
+            if build.description.trim().is_empty() {
+                return Err(SupervisorError::Validation(
+                    "build phase description must not be empty".to_string(),
+                ));
+            }
+            if build.description.len() > 50_000 {
+                return Err(SupervisorError::Validation(format!(
+                    "build phase description too long ({} chars, max 50000)",
+                    build.description.len()
+                )));
+            }
+        }
+        // Validate execute_workflow_id is non-empty if provided
+        if let Some(ref wf_id) = phases.execute_workflow_id {
+            if wf_id.trim().is_empty() {
+                return Err(SupervisorError::Validation(
+                    "execute_workflow_id must not be empty".to_string(),
+                ));
+            }
+        }
+        // Validate implement_fixes timeout bounds
+        if let Some(ref fixes) = phases.implement_fixes {
+            if fixes.timeout_secs == 0 {
+                return Err(SupervisorError::Validation(
+                    "implement_fixes timeout_secs must be greater than 0".to_string(),
+                ));
+            }
+            if fixes.timeout_secs > 3600 {
+                return Err(SupervisorError::Validation(format!(
+                    "implement_fixes timeout_secs too large ({}, max 3600)",
+                    fixes.timeout_secs
+                )));
+            }
+        }
     } else {
         // Simple mode: workflow_id and exit_strategy required
         if config.workflow_id.is_none() {
             return Err(SupervisorError::Validation(
                 "workflow_id is required in simple mode (when phases is absent)".to_string(),
             ));
+        }
+        if let Some(ref wf_id) = config.workflow_id {
+            if wf_id.trim().is_empty() {
+                return Err(SupervisorError::Validation(
+                    "workflow_id must not be empty".to_string(),
+                ));
+            }
         }
         if config.exit_strategy.is_none() {
             return Err(SupervisorError::Validation(

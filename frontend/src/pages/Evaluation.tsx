@@ -31,11 +31,7 @@ export default function Evaluation() {
 
   const loadData = useCallback(async () => {
     try {
-      const [s, r, ts] = await Promise.all([
-        api.evalStatus(),
-        api.evalRuns(),
-        api.evalTestSuite(),
-      ]);
+      const [s, r, ts] = await Promise.all([api.evalStatus(), api.evalRuns(), api.evalTestSuite()]);
       setStatus(s);
       setRuns(r);
       setTestSuite(ts);
@@ -46,7 +42,9 @@ export default function Evaluation() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   // Poll status while running
   useEffect(() => {
@@ -59,31 +57,33 @@ export default function Evaluation() {
           const r = await api.evalRuns();
           setRuns(r);
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }, 3000);
     return () => clearInterval(interval);
   }, [status?.running]);
 
   // Derived data
   const categories = useMemo(() => {
-    const cats = new Set(testSuite.map(p => p.category));
+    const cats = new Set(testSuite.map((p) => p.category));
     return ['all', ...Array.from(cats).sort()];
   }, [testSuite]);
 
   const complexities = useMemo(() => {
-    const cmps = new Set(testSuite.map(p => p.complexity));
+    const cmps = new Set(testSuite.map((p) => p.complexity));
     return ['all', ...Array.from(cmps).sort()];
   }, [testSuite]);
 
   const filteredSuite = useMemo(() => {
-    return testSuite.filter(p => {
+    return testSuite.filter((p) => {
       if (categoryFilter !== 'all' && p.category !== categoryFilter) return false;
       if (complexityFilter !== 'all' && p.complexity !== complexityFilter) return false;
       return true;
     });
   }, [testSuite, categoryFilter, complexityFilter]);
 
-  const enabledFiltered = filteredSuite.filter(p => p.enabled);
+  const enabledFiltered = filteredSuite.filter((p) => p.enabled);
 
   const handleStart = async (promptIds?: string[]) => {
     try {
@@ -129,10 +129,12 @@ export default function Evaluation() {
     try {
       const wfs = await api.wlWorkflows();
       // Filter out meta workflows
-      setWorkflows(wfs.filter((w: UnifiedWorkflow) => {
-        const name = w.name || '';
-        return !name.startsWith('AI Generate:') && !name.startsWith('Meta:');
-      }));
+      setWorkflows(
+        wfs.filter((w: UnifiedWorkflow) => {
+          const name = w.name || '';
+          return !name.startsWith('AI Generate:') && !name.startsWith('Meta:');
+        }),
+      );
     } catch (err) {
       console.error('Failed to load workflows:', err);
     }
@@ -163,7 +165,7 @@ export default function Evaluation() {
   };
 
   const handleSelectAll = () => {
-    const allIds = new Set(filteredSuite.map(p => p.id));
+    const allIds = new Set(filteredSuite.map((p) => p.id));
     setSelectedIds(allIds);
   };
 
@@ -172,7 +174,7 @@ export default function Evaluation() {
   };
 
   const handleToggleSelect = (id: string) => {
-    setSelectedIds(prev => {
+    setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -184,8 +186,8 @@ export default function Evaluation() {
     try {
       await Promise.all(
         filteredSuite
-          .filter(p => p.enabled !== enabled)
-          .map(p => api.evalTestSuiteUpdate(p.id, { ...p, enabled }))
+          .filter((p) => p.enabled !== enabled)
+          .map((p) => api.evalTestSuiteUpdate(p.id, { ...p, enabled })),
       );
       await loadData();
     } catch (err) {
@@ -194,7 +196,9 @@ export default function Evaluation() {
   };
 
   // Build score chart data from latest completed run
-  const latestCompleted = runs.find(r => r.status === 'completed' && r.avg_overall_score !== null);
+  const latestCompleted = runs.find(
+    (r) => r.status === 'completed' && r.avg_overall_score !== null,
+  );
 
   type ScoreSet = 'combined' | 'gt' | 'generic';
   const [scoreView, setScoreView] = useState<ScoreSet>('combined');
@@ -202,28 +206,57 @@ export default function Evaluation() {
   const buildChartData = (run: EvalRunSummary | undefined, view: ScoreSet) => {
     if (!run) return [];
     const prefix = view === 'gt' ? 'gt_avg_' : view === 'generic' ? 'gen_avg_' : 'avg_';
-    const get = (field: string) => (run as unknown as Record<string, unknown>)[`${prefix}${field}`] as number | null;
+    const get = (field: string) =>
+      (run as unknown as Record<string, unknown>)[`${prefix}${field}`] as number | null;
     return [
-      { name: 'Structural', score: view === 'combined' ? run.avg_structural : get('structural'), fill: DIMENSION_COLORS.structural },
-      { name: 'Commands', score: view === 'combined' ? run.avg_command_accuracy : get('command_accuracy'), fill: DIMENSION_COLORS.command_accuracy },
-      { name: 'Phase Flow', score: view === 'combined' ? run.avg_phase_flow : get('phase_flow'), fill: DIMENSION_COLORS.phase_flow },
-      { name: 'Completeness', score: view === 'combined' ? run.avg_step_completeness : get('step_completeness'), fill: DIMENSION_COLORS.step_completeness },
-      { name: 'Prompts', score: view === 'combined' ? run.avg_prompt_quality : get('prompt_quality'), fill: DIMENSION_COLORS.prompt_quality },
-      { name: 'Determinism', score: view === 'combined' ? run.avg_determinism : get('determinism'), fill: DIMENSION_COLORS.determinism },
+      {
+        name: 'Structural',
+        score: view === 'combined' ? run.avg_structural : get('structural'),
+        fill: DIMENSION_COLORS.structural,
+      },
+      {
+        name: 'Commands',
+        score: view === 'combined' ? run.avg_command_accuracy : get('command_accuracy'),
+        fill: DIMENSION_COLORS.command_accuracy,
+      },
+      {
+        name: 'Phase Flow',
+        score: view === 'combined' ? run.avg_phase_flow : get('phase_flow'),
+        fill: DIMENSION_COLORS.phase_flow,
+      },
+      {
+        name: 'Completeness',
+        score: view === 'combined' ? run.avg_step_completeness : get('step_completeness'),
+        fill: DIMENSION_COLORS.step_completeness,
+      },
+      {
+        name: 'Prompts',
+        score: view === 'combined' ? run.avg_prompt_quality : get('prompt_quality'),
+        fill: DIMENSION_COLORS.prompt_quality,
+      },
+      {
+        name: 'Determinism',
+        score: view === 'combined' ? run.avg_determinism : get('determinism'),
+        fill: DIMENSION_COLORS.determinism,
+      },
     ];
   };
 
   const chartData = buildChartData(latestCompleted, scoreView);
-  const overallScore = latestCompleted ? (
-    scoreView === 'gt' ? latestCompleted.gt_avg_overall :
-    scoreView === 'generic' ? latestCompleted.gen_avg_overall :
-    latestCompleted.avg_overall_score
-  ) : null;
-  const scoreCount = latestCompleted ? (
-    scoreView === 'gt' ? latestCompleted.gt_count :
-    scoreView === 'generic' ? latestCompleted.gen_count :
-    null
-  ) : null;
+  const overallScore = latestCompleted
+    ? scoreView === 'gt'
+      ? latestCompleted.gt_avg_overall
+      : scoreView === 'generic'
+        ? latestCompleted.gen_avg_overall
+        : latestCompleted.avg_overall_score
+    : null;
+  const scoreCount = latestCompleted
+    ? scoreView === 'gt'
+      ? latestCompleted.gt_count
+      : scoreView === 'generic'
+        ? latestCompleted.gen_count
+        : null
+    : null;
 
   if (loading) {
     return <div style={{ padding: '2rem', color: 'var(--text-muted)' }}>Loading...</div>;
@@ -239,14 +272,18 @@ export default function Evaluation() {
               <span className="text-mono" style={{ fontSize: '0.85rem', color: 'var(--warning)' }}>
                 Running: {status.current_prompt_index + 1}/{status.total_prompts}
               </span>
-              <button className="btn" onClick={handleStop} style={{ background: 'var(--danger)', color: '#fff' }}>
+              <button
+                className="btn"
+                onClick={handleStop}
+                style={{ background: 'var(--danger)', color: '#fff' }}
+              >
                 Stop
               </button>
             </>
           ) : (
             <div style={{ display: 'flex', gap: '0.5rem' }}>
               <button className="btn btn-primary" onClick={() => handleStart()}>
-                Run All Enabled ({testSuite.filter(p => p.enabled).length})
+                Run All Enabled ({testSuite.filter((p) => p.enabled).length})
               </button>
               {selectedIds.size > 0 && (
                 <button
@@ -261,7 +298,7 @@ export default function Evaluation() {
                 <button
                   className="btn"
                   style={{ background: 'var(--accent)', color: '#fff' }}
-                  onClick={() => handleStart(enabledFiltered.map(p => p.id))}
+                  onClick={() => handleStart(enabledFiltered.map((p) => p.id))}
                 >
                   Run {categoryFilter} ({enabledFiltered.length})
                 </button>
@@ -276,16 +313,21 @@ export default function Evaluation() {
         <div className="card mb-2" style={{ borderLeft: '3px solid var(--warning)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <div className="text-mono" style={{ fontSize: '0.85rem' }}>
-              Run: <span style={{ color: 'var(--text-muted)' }}>{status.current_run_id?.slice(0, 8)}...</span>
+              Run:{' '}
+              <span style={{ color: 'var(--text-muted)' }}>
+                {status.current_run_id?.slice(0, 8)}...
+              </span>
             </div>
             <div style={{ flex: 1, background: 'var(--bg-tertiary)', borderRadius: 4, height: 8 }}>
-              <div style={{
-                width: `${status.total_prompts > 0 ? ((status.current_prompt_index + 1) / status.total_prompts * 100) : 0}%`,
-                background: 'var(--accent)',
-                height: '100%',
-                borderRadius: 4,
-                transition: 'width 0.3s ease',
-              }} />
+              <div
+                style={{
+                  width: `${status.total_prompts > 0 ? ((status.current_prompt_index + 1) / status.total_prompts) * 100 : 0}%`,
+                  background: 'var(--accent)',
+                  height: '100%',
+                  borderRadius: 4,
+                  transition: 'width 0.3s ease',
+                }}
+              />
             </div>
             <span className="text-mono" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
               {status.continuous_mode ? 'Continuous' : 'On-demand'}
@@ -300,8 +342,16 @@ export default function Evaluation() {
           <div className="card-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
               <span className="card-title">Latest Scores</span>
-              <div style={{ display: 'flex', gap: '2px', background: 'var(--bg-tertiary)', borderRadius: 4, padding: 2 }}>
-                {(['combined', 'gt', 'generic'] as ScoreSet[]).map(v => (
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '2px',
+                  background: 'var(--bg-tertiary)',
+                  borderRadius: 4,
+                  padding: 2,
+                }}
+              >
+                {(['combined', 'gt', 'generic'] as ScoreSet[]).map((v) => (
                   <button
                     key={v}
                     onClick={() => setScoreView(v)}
@@ -316,22 +366,46 @@ export default function Evaluation() {
                       fontWeight: scoreView === v ? 600 : 400,
                     }}
                   >
-                    {v === 'combined' ? 'Combined' : v === 'gt' ? `Ground Truth (${latestCompleted?.gt_count ?? 0})` : `Generic (${latestCompleted?.gen_count ?? 0})`}
+                    {v === 'combined'
+                      ? 'Combined'
+                      : v === 'gt'
+                        ? `Ground Truth (${latestCompleted?.gt_count ?? 0})`
+                        : `Generic (${latestCompleted?.gen_count ?? 0})`}
                   </button>
                 ))}
               </div>
             </div>
             <span className="text-mono" style={{ color: 'var(--accent)' }}>
               Overall: {formatScore(overallScore ?? null)}
-              {scoreCount !== null && <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}> (n={scoreCount})</span>}
+              {scoreCount !== null && (
+                <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+                  {' '}
+                  (n={scoreCount})
+                </span>
+              )}
             </span>
           </div>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={chartData} layout="vertical" margin={{ left: 90 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis type="number" domain={[0, 5]} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
-              <YAxis type="category" dataKey="name" tick={{ fill: 'var(--text-secondary)', fontSize: 12 }} width={80} />
-              <Tooltip contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }} />
+              <XAxis
+                type="number"
+                domain={[0, 5]}
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+              />
+              <YAxis
+                type="category"
+                dataKey="name"
+                tick={{ fill: 'var(--text-secondary)', fontSize: 12 }}
+                width={80}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                }}
+              />
               <Bar dataKey="score" radius={[0, 4, 4, 0]} />
             </BarChart>
           </ResponsiveContainer>
@@ -342,7 +416,9 @@ export default function Evaluation() {
       <div className="card mb-2">
         <div className="card-header">
           <span className="card-title">Run History</span>
-          <span className="text-muted" style={{ fontSize: '0.8rem' }}>{runs.length} runs</span>
+          <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+            {runs.length} runs
+          </span>
         </div>
         <div className="table-container">
           <table>
@@ -358,39 +434,68 @@ export default function Evaluation() {
               </tr>
             </thead>
             <tbody>
-              {runs.map(r => (
+              {runs.map((r) => (
                 <tr key={r.id}>
                   <td>
-                    <Link to={`/evaluation/run/${r.id}`} style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>
+                    <Link
+                      to={`/evaluation/run/${r.id}`}
+                      style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}
+                    >
                       {r.id.slice(0, 8)}...
                     </Link>
                   </td>
                   <td>
-                    <span className={
-                      r.status === 'completed' ? 'text-success' :
-                      r.status === 'running' ? 'text-warning' :
-                      r.status === 'failed' || r.status === 'interrupted' ? 'text-danger' : ''
-                    }>
+                    <span
+                      className={
+                        r.status === 'completed'
+                          ? 'text-success'
+                          : r.status === 'running'
+                            ? 'text-warning'
+                            : r.status === 'failed' || r.status === 'interrupted'
+                              ? 'text-danger'
+                              : ''
+                      }
+                    >
                       {r.status}
                     </span>
                   </td>
-                  <td>{r.prompts_completed}/{r.prompts_total}</td>
+                  <td>
+                    {r.prompts_completed}/{r.prompts_total}
+                  </td>
                   <td className="text-mono">{formatScore(r.avg_overall_score)}</td>
                   <td className="text-mono">
                     {r.gt_avg_overall !== null ? (
-                      <span>{formatScore(r.gt_avg_overall)} <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>({r.gt_count})</span></span>
-                    ) : '-'}
+                      <span>
+                        {formatScore(r.gt_avg_overall)}{' '}
+                        <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>
+                          ({r.gt_count})
+                        </span>
+                      </span>
+                    ) : (
+                      '-'
+                    )}
                   </td>
                   <td className="text-mono">
                     {r.gen_avg_overall !== null ? (
-                      <span>{formatScore(r.gen_avg_overall)} <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>({r.gen_count})</span></span>
-                    ) : '-'}
+                      <span>
+                        {formatScore(r.gen_avg_overall)}{' '}
+                        <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>
+                          ({r.gen_count})
+                        </span>
+                      </span>
+                    ) : (
+                      '-'
+                    )}
                   </td>
                   <td>{new Date(r.started_at).toLocaleString()}</td>
                 </tr>
               ))}
               {runs.length === 0 && (
-                <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No eval runs yet. Click "Start Eval Run" to begin.</td></tr>
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No eval runs yet. Click "Start Eval Run" to begin.
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>
@@ -402,23 +507,49 @@ export default function Evaluation() {
         <div className="card-header">
           <span className="card-title">Test Suite</span>
           <span className="text-muted" style={{ fontSize: '0.8rem' }}>
-            {testSuite.filter(p => p.enabled).length}/{testSuite.length} enabled
+            {testSuite.filter((p) => p.enabled).length}/{testSuite.length} enabled
             {filteredSuite.length !== testSuite.length && ` (showing ${filteredSuite.length})`}
-            {' | '}{testSuite.filter(p => p.ground_truth_json).length} with ground truth
+            {' | '}
+            {testSuite.filter((p) => p.ground_truth_json).length} with ground truth
           </span>
         </div>
 
         {/* Filters */}
-        <div style={{ display: 'flex', gap: '0.75rem', padding: '0.75rem 1rem', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', alignItems: 'center' }}>
+        <div
+          style={{
+            display: 'flex',
+            gap: '0.75rem',
+            padding: '0.75rem 1rem',
+            borderBottom: '1px solid var(--border)',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+          }}
+        >
           <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
             <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Category:</label>
             <select
               value={categoryFilter}
-              onChange={e => { setCategoryFilter(e.target.value); setSelectedIds(new Set()); }}
-              style={{ fontSize: '0.8rem', padding: '2px 6px', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-primary)' }}
+              onChange={(e) => {
+                setCategoryFilter(e.target.value);
+                setSelectedIds(new Set());
+              }}
+              style={{
+                fontSize: '0.8rem',
+                padding: '2px 6px',
+                background: 'var(--bg-tertiary)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                color: 'var(--text-primary)',
+              }}
             >
-              {categories.map(c => (
-                <option key={c} value={c}>{c === 'all' ? 'All Categories' : c} ({c === 'all' ? testSuite.length : testSuite.filter(p => p.category === c).length})</option>
+              {categories.map((c) => (
+                <option key={c} value={c}>
+                  {c === 'all' ? 'All Categories' : c} (
+                  {c === 'all'
+                    ? testSuite.length
+                    : testSuite.filter((p) => p.category === c).length}
+                  )
+                </option>
               ))}
             </select>
           </div>
@@ -426,19 +557,59 @@ export default function Evaluation() {
             <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Complexity:</label>
             <select
               value={complexityFilter}
-              onChange={e => { setComplexityFilter(e.target.value); setSelectedIds(new Set()); }}
-              style={{ fontSize: '0.8rem', padding: '2px 6px', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-primary)' }}
+              onChange={(e) => {
+                setComplexityFilter(e.target.value);
+                setSelectedIds(new Set());
+              }}
+              style={{
+                fontSize: '0.8rem',
+                padding: '2px 6px',
+                background: 'var(--bg-tertiary)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                color: 'var(--text-primary)',
+              }}
             >
-              {complexities.map(c => (
-                <option key={c} value={c}>{c === 'all' ? 'All' : c} ({c === 'all' ? testSuite.length : testSuite.filter(p => p.complexity === c).length})</option>
+              {complexities.map((c) => (
+                <option key={c} value={c}>
+                  {c === 'all' ? 'All' : c} (
+                  {c === 'all'
+                    ? testSuite.length
+                    : testSuite.filter((p) => p.complexity === c).length}
+                  )
+                </option>
               ))}
             </select>
           </div>
           <div style={{ display: 'flex', gap: '0.35rem', marginLeft: 'auto' }}>
-            <button className="btn" style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={handleSelectAll}>Select All</button>
-            <button className="btn" style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={handleSelectNone}>Select None</button>
-            <button className="btn" style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={() => handleEnableFiltered(true)}>Enable Shown</button>
-            <button className="btn" style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={() => handleEnableFiltered(false)}>Disable Shown</button>
+            <button
+              className="btn"
+              style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+              onClick={handleSelectAll}
+            >
+              Select All
+            </button>
+            <button
+              className="btn"
+              style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+              onClick={handleSelectNone}
+            >
+              Select None
+            </button>
+            <button
+              className="btn"
+              style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+              onClick={() => handleEnableFiltered(true)}
+            >
+              Enable Shown
+            </button>
+            <button
+              className="btn"
+              style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+              onClick={() => handleEnableFiltered(false)}
+            >
+              Disable Shown
+            </button>
           </div>
         </div>
 
@@ -457,7 +628,7 @@ export default function Evaluation() {
               </tr>
             </thead>
             <tbody>
-              {filteredSuite.map(p => (
+              {filteredSuite.map((p) => (
                 <tr key={p.id} style={{ opacity: p.enabled ? 1 : 0.5 }}>
                   <td>
                     <input
@@ -466,8 +637,17 @@ export default function Evaluation() {
                       onChange={() => handleToggleSelect(p.id)}
                     />
                   </td>
-                  <td className="text-mono" style={{ fontSize: '0.8rem' }}>{p.id}</td>
-                  <td style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <td className="text-mono" style={{ fontSize: '0.8rem' }}>
+                    {p.id}
+                  </td>
+                  <td
+                    style={{
+                      maxWidth: 300,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
                     {p.prompt}
                   </td>
                   <td>{p.category}</td>
@@ -475,10 +655,19 @@ export default function Evaluation() {
                   <td style={{ textAlign: 'center' }}>
                     {p.ground_truth_json ? (
                       <span style={{ display: 'inline-flex', gap: '4px', alignItems: 'center' }}>
-                        <span title="Has ground truth reference" style={{ color: 'var(--success)', fontWeight: 600, fontSize: '0.75rem' }}>REF</span>
+                        <span
+                          title="Has ground truth reference"
+                          style={{ color: 'var(--success)', fontWeight: 600, fontSize: '0.75rem' }}
+                        >
+                          REF
+                        </span>
                         <button
                           className="btn"
-                          style={{ padding: '1px 4px', fontSize: '0.65rem', color: 'var(--text-muted)' }}
+                          style={{
+                            padding: '1px 4px',
+                            fontSize: '0.65rem',
+                            color: 'var(--text-muted)',
+                          }}
                           onClick={() => handleClearGroundTruth(p.id)}
                           title="Clear ground truth"
                         >
@@ -525,35 +714,68 @@ export default function Evaluation() {
       {gtPickerPromptId && (
         <div
           style={{
-            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-            background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
             zIndex: 1000,
           }}
           onClick={() => setGtPickerPromptId(null)}
         >
           <div
             style={{
-              background: 'var(--bg-secondary)', borderRadius: 8, padding: '1.5rem',
-              width: '90%', maxWidth: 700, maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+              background: 'var(--bg-secondary)',
+              borderRadius: 8,
+              padding: '1.5rem',
+              width: '90%',
+              maxWidth: 700,
+              maxHeight: '80vh',
+              display: 'flex',
+              flexDirection: 'column',
               border: '1px solid var(--border)',
             }}
-            onClick={e => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '1rem',
+              }}
+            >
               <h3 style={{ margin: 0 }}>
-                Set Ground Truth for <span className="text-mono" style={{ color: 'var(--accent)' }}>{gtPickerPromptId}</span>
+                Set Ground Truth for{' '}
+                <span className="text-mono" style={{ color: 'var(--accent)' }}>
+                  {gtPickerPromptId}
+                </span>
               </h3>
-              <button className="btn" onClick={() => setGtPickerPromptId(null)} style={{ padding: '2px 8px' }}>&times;</button>
+              <button
+                className="btn"
+                onClick={() => setGtPickerPromptId(null)}
+                style={{ padding: '2px 8px' }}
+              >
+                &times;
+              </button>
             </div>
             <div style={{ marginBottom: '0.75rem' }}>
               <input
                 type="text"
                 placeholder="Search workflows by name..."
                 value={wfSearch}
-                onChange={e => setWfSearch(e.target.value)}
+                onChange={(e) => setWfSearch(e.target.value)}
                 style={{
-                  width: '100%', padding: '6px 10px', background: 'var(--bg-tertiary)',
-                  border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text-primary)',
+                  width: '100%',
+                  padding: '6px 10px',
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                  color: 'var(--text-primary)',
                   fontSize: '0.85rem',
                 }}
               />
@@ -568,13 +790,21 @@ export default function Evaluation() {
                 </thead>
                 <tbody>
                   {workflows
-                    .filter(w => !wfSearch || (w.name || '').toLowerCase().includes(wfSearch.toLowerCase()))
+                    .filter(
+                      (w) =>
+                        !wfSearch || (w.name || '').toLowerCase().includes(wfSearch.toLowerCase()),
+                    )
                     .slice(0, 50)
-                    .map(w => (
+                    .map((w) => (
                       <tr key={w.id}>
                         <td style={{ fontSize: '0.8rem' }}>
                           <div>{w.name}</div>
-                          <div className="text-mono" style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{w.id.slice(0, 12)}...</div>
+                          <div
+                            className="text-mono"
+                            style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}
+                          >
+                            {w.id.slice(0, 12)}...
+                          </div>
                         </td>
                         <td>
                           <button
@@ -587,8 +817,18 @@ export default function Evaluation() {
                         </td>
                       </tr>
                     ))}
-                  {workflows.filter(w => !wfSearch || (w.name || '').toLowerCase().includes(wfSearch.toLowerCase())).length === 0 && (
-                    <tr><td colSpan={2} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '1rem' }}>No workflows found</td></tr>
+                  {workflows.filter(
+                    (w) =>
+                      !wfSearch || (w.name || '').toLowerCase().includes(wfSearch.toLowerCase()),
+                  ).length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={2}
+                        style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '1rem' }}
+                      >
+                        No workflows found
+                      </td>
+                    </tr>
                   )}
                 </tbody>
               </table>

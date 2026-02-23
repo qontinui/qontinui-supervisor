@@ -48,16 +48,18 @@ export default function VelocityTrace() {
   });
 
   // Compute waterfall layout
-  const traceStart = spans.length > 0
-    ? Math.min(...spans.map(s => new Date(s.start_ts).getTime()))
-    : 0;
-  const traceEnd = spans.length > 0
-    ? Math.max(...spans.map(s => {
-        if (s.end_ts) return new Date(s.end_ts).getTime();
-        if (s.duration_ms != null) return new Date(s.start_ts).getTime() + s.duration_ms;
-        return new Date(s.start_ts).getTime();
-      }))
-    : 0;
+  const traceStart =
+    spans.length > 0 ? Math.min(...spans.map((s) => new Date(s.start_ts).getTime())) : 0;
+  const traceEnd =
+    spans.length > 0
+      ? Math.max(
+          ...spans.map((s) => {
+            if (s.end_ts) return new Date(s.end_ts).getTime();
+            if (s.duration_ms != null) return new Date(s.start_ts).getTime() + s.duration_ms;
+            return new Date(s.start_ts).getTime();
+          }),
+        )
+      : 0;
   const traceTotal = traceEnd - traceStart || 1;
 
   return (
@@ -72,8 +74,8 @@ export default function VelocityTrace() {
           <input
             type="text"
             value={inputValue}
-            onChange={e => setInputValue(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
             placeholder="Enter Request ID..."
             style={{
               flex: 1,
@@ -92,23 +94,30 @@ export default function VelocityTrace() {
         </div>
       </div>
 
-      {error && <div className="card mb-2"><p className="text-danger">{error}</p></div>}
+      {error && (
+        <div className="card mb-2">
+          <p className="text-danger">{error}</p>
+        </div>
+      )}
 
       {/* Trace summary */}
       {spans.length > 0 && (
         <div className="card mb-2">
           <div className="card-header">
             <span className="card-title">Trace: {requestId}</span>
-            <span className="text-mono">{spans.length} span{spans.length !== 1 ? 's' : ''} | {formatMs(traceTotal)}</span>
+            <span className="text-mono">
+              {spans.length} span{spans.length !== 1 ? 's' : ''} | {formatMs(traceTotal)}
+            </span>
           </div>
           <div className="stat-row">
-            {[...new Set(spans.map(s => s.service))].map(svc => (
+            {[...new Set(spans.map((s) => s.service))].map((svc) => (
               <div key={svc} className="stat-item">
                 <div className="stat-label">{svc}</div>
                 <div className="text-mono" style={{ color: SERVICE_COLORS[svc] || '#888' }}>
                   {formatMs(
-                    spans.filter(s => s.service === svc)
-                      .reduce((sum, s) => sum + (s.duration_ms || 0), 0)
+                    spans
+                      .filter((s) => s.service === svc)
+                      .reduce((sum, s) => sum + (s.duration_ms || 0), 0),
                   )}
                 </div>
               </div>
@@ -124,7 +133,7 @@ export default function VelocityTrace() {
             <span className="card-title">Waterfall</span>
           </div>
           <div style={{ position: 'relative' }}>
-            {spans.map(span => {
+            {spans.map((span) => {
               const start = new Date(span.start_ts).getTime();
               const duration = span.duration_ms || 0;
               const leftPct = ((start - traceStart) / traceTotal) * 100;
@@ -143,10 +152,16 @@ export default function VelocityTrace() {
                 >
                   {/* Label */}
                   <div style={{ width: 200, flexShrink: 0, paddingRight: '0.75rem' }}>
-                    <div style={{ fontSize: '0.8rem', color }}>
-                      {span.service}
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    <div style={{ fontSize: '0.8rem', color }}>{span.service}</div>
+                    <div
+                      style={{
+                        fontSize: '0.75rem',
+                        color: 'var(--text-muted)',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
                       {span.http_method && span.http_route
                         ? `${span.http_method} ${span.http_route}`
                         : span.name}
@@ -170,12 +185,23 @@ export default function VelocityTrace() {
                   </div>
 
                   {/* Duration + Status */}
-                  <div style={{ width: 120, flexShrink: 0, textAlign: 'right', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
+                  <div
+                    style={{
+                      width: 120,
+                      flexShrink: 0,
+                      textAlign: 'right',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '0.75rem',
+                    }}
+                  >
                     <span className={!span.success ? 'text-danger' : ''}>
                       {span.duration_ms != null ? formatMs(span.duration_ms) : '-'}
                     </span>
                     {span.http_status_code != null && (
-                      <span className={span.http_status_code >= 500 ? 'text-danger' : 'text-muted'} style={{ marginLeft: '0.5rem' }}>
+                      <span
+                        className={span.http_status_code >= 500 ? 'text-danger' : 'text-muted'}
+                        style={{ marginLeft: '0.5rem' }}
+                      >
                         {span.http_status_code}
                       </span>
                     )}
@@ -187,7 +213,16 @@ export default function VelocityTrace() {
 
           {/* Time scale */}
           <div style={{ display: 'flex', paddingTop: '0.5rem', marginLeft: 200 }}>
-            <div style={{ flex: 1, display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            <div
+              style={{
+                flex: 1,
+                display: 'flex',
+                justifyContent: 'space-between',
+                fontSize: '0.7rem',
+                color: 'var(--text-muted)',
+                fontFamily: 'var(--font-mono)',
+              }}
+            >
               <span>0ms</span>
               <span>{formatMs(traceTotal * 0.25)}</span>
               <span>{formatMs(traceTotal * 0.5)}</span>
@@ -219,18 +254,29 @@ export default function VelocityTrace() {
                 </tr>
               </thead>
               <tbody>
-                {spans.map(span => (
+                {spans.map((span) => (
                   <tr key={span.id}>
-                    <td style={{ color: SERVICE_COLORS[span.service] || '#888' }}>{span.service}</td>
+                    <td style={{ color: SERVICE_COLORS[span.service] || '#888' }}>
+                      {span.service}
+                    </td>
                     <td>{span.name}</td>
                     <td>{span.http_method || '-'}</td>
                     <td>{span.http_route || '-'}</td>
-                    <td className={span.http_status_code != null && span.http_status_code >= 500 ? 'text-danger' : ''}>
+                    <td
+                      className={
+                        span.http_status_code != null && span.http_status_code >= 500
+                          ? 'text-danger'
+                          : ''
+                      }
+                    >
                       {span.http_status_code ?? '-'}
                     </td>
                     <td>{span.duration_ms != null ? formatMs(span.duration_ms) : '-'}</td>
                     <td>{new Date(span.start_ts).toLocaleTimeString()}</td>
-                    <td className="text-danger" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    <td
+                      className="text-danger"
+                      style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}
+                    >
                       {span.error || '-'}
                     </td>
                   </tr>

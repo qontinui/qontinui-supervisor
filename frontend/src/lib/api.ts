@@ -1,4 +1,4 @@
-const BASE = "";
+const BASE = '';
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
@@ -152,6 +152,31 @@ export interface LogFileResponse {
   type: string;
   content: string;
   lines: number;
+}
+
+export interface AiProviderResponse {
+  provider: string;
+  model: string;
+  model_id: string;
+  display_name: string;
+}
+
+export interface AiModelInfo {
+  provider: string;
+  key: string;
+  model_id: string;
+  display_name: string;
+}
+
+export interface AiModelsResponse {
+  models: AiModelInfo[];
+}
+
+export interface LogEntry {
+  timestamp: string;
+  level: string;
+  source: string;
+  message: string;
 }
 
 // Evaluation types
@@ -452,175 +477,161 @@ export interface RunnerTaskRun {
 
 export const api = {
   // Velocity
-  ingest: () => fetchJson<IngestResult>("/velocity/ingest", { method: "POST" }),
+  ingest: () => fetchJson<IngestResult>('/velocity/ingest', { method: 'POST' }),
   summary: (params?: string) =>
-    fetchJson<ServiceSummary[]>(
-      `/velocity/summary${params ? `?${params}` : ""}`,
-    ),
+    fetchJson<ServiceSummary[]>(`/velocity/summary${params ? `?${params}` : ''}`),
   endpoints: (params?: string) =>
-    fetchJson<EndpointSummary[]>(
-      `/velocity/endpoints${params ? `?${params}` : ""}`,
-    ),
+    fetchJson<EndpointSummary[]>(`/velocity/endpoints${params ? `?${params}` : ''}`),
   slow: (params?: string) =>
-    fetchJson<SlowRequest[]>(`/velocity/slow${params ? `?${params}` : ""}`),
+    fetchJson<SlowRequest[]>(`/velocity/slow${params ? `?${params}` : ''}`),
   timeline: (params?: string) =>
-    fetchJson<TimelineBucket[]>(
-      `/velocity/timeline${params ? `?${params}` : ""}`,
-    ),
-  compare: (params: string) =>
-    fetchJson<CompareResult[]>(`/velocity/compare?${params}`),
+    fetchJson<TimelineBucket[]>(`/velocity/timeline${params ? `?${params}` : ''}`),
+  compare: (params: string) => fetchJson<CompareResult[]>(`/velocity/compare?${params}`),
   trace: (requestId: string) =>
     fetchJson<TraceSpan[]>(`/velocity/trace/${encodeURIComponent(requestId)}`),
 
   // Evaluation
-  evalStatus: () => fetchJson<EvalStatus>("/eval/status"),
+  evalStatus: () => fetchJson<EvalStatus>('/eval/status'),
   evalStart: (promptIds?: string[]) =>
-    fetchJson<MessageResponse>("/eval/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<MessageResponse>('/eval/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt_ids: promptIds ?? null }),
     }),
-  evalStop: () => fetchJson<MessageResponse>("/eval/stop", { method: "POST" }),
+  evalStop: () => fetchJson<MessageResponse>('/eval/stop', { method: 'POST' }),
   evalContinuousStart: (intervalSecs: number) =>
-    fetchJson<MessageResponse>("/eval/continuous/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<MessageResponse>('/eval/continuous/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ interval_secs: intervalSecs }),
     }),
-  evalContinuousStop: () =>
-    fetchJson<MessageResponse>("/eval/continuous/stop", { method: "POST" }),
-  evalRuns: () => fetchJson<EvalRunSummary[]>("/eval/runs"),
+  evalContinuousStop: () => fetchJson<MessageResponse>('/eval/continuous/stop', { method: 'POST' }),
+  evalRuns: () => fetchJson<EvalRunSummary[]>('/eval/runs'),
   evalRun: (id: string) => fetchJson<EvalRunWithResults>(`/eval/runs/${id}`),
   evalCompare: (id: string, baselineId: string) =>
     fetchJson<CompareReport>(`/eval/runs/${id}/compare/${baselineId}`),
-  evalTestSuite: () => fetchJson<TestPrompt[]>("/eval/test-suite"),
+  evalTestSuite: () => fetchJson<TestPrompt[]>('/eval/test-suite'),
   evalTestSuiteAdd: (prompt: TestPrompt) =>
-    fetchJson<MessageResponse>("/eval/test-suite", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<MessageResponse>('/eval/test-suite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(prompt),
     }),
   evalTestSuiteUpdate: (id: string, prompt: TestPrompt) =>
     fetchJson<MessageResponse>(`/eval/test-suite/${id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(prompt),
     }),
   evalTestSuiteDelete: (id: string) =>
-    fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: "DELETE" }),
+    fetchJson<MessageResponse>(`/eval/test-suite/${id}`, { method: 'DELETE' }),
   evalSetGroundTruth: (promptId: string, workflowId: string) =>
     fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ workflow_id: workflowId }),
     }),
   evalClearGroundTruth: (promptId: string) =>
     fetchJson<MessageResponse>(`/eval/test-suite/${promptId}/ground-truth`, {
-      method: "DELETE",
+      method: 'DELETE',
     }),
 
   // Velocity Tests
-  vtStatus: () => fetchJson<VtStatus>("/velocity-tests/status"),
-  vtStart: () =>
-    fetchJson<MessageResponse>("/velocity-tests/start", { method: "POST" }),
-  vtStop: () =>
-    fetchJson<MessageResponse>("/velocity-tests/stop", { method: "POST" }),
-  vtRuns: () => fetchJson<VtRun[]>("/velocity-tests/runs"),
-  vtRun: (id: string) =>
-    fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
+  vtStatus: () => fetchJson<VtStatus>('/velocity-tests/status'),
+  vtStart: () => fetchJson<MessageResponse>('/velocity-tests/start', { method: 'POST' }),
+  vtStop: () => fetchJson<MessageResponse>('/velocity-tests/stop', { method: 'POST' }),
+  vtRuns: () => fetchJson<VtRun[]>('/velocity-tests/runs'),
+  vtRun: (id: string) => fetchJson<VtRunWithResults>(`/velocity-tests/runs/${id}`),
   vtTrend: (limit?: number) =>
-    fetchJson<VtTrendPoint[]>(
-      `/velocity-tests/trend${limit ? `?limit=${limit}` : ""}`,
-    ),
+    fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
 
   // Workflow Loop
-  wlStatus: () => fetchJson<WorkflowLoopStatus>("/workflow-loop/status"),
-  wlHistory: () => fetchJson<WorkflowLoopHistory>("/workflow-loop/history"),
+  wlStatus: () => fetchJson<WorkflowLoopStatus>('/workflow-loop/status'),
+  wlHistory: () => fetchJson<WorkflowLoopHistory>('/workflow-loop/history'),
   wlStart: (config: Record<string, unknown>) =>
-    fetchJson<unknown>("/workflow-loop/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<unknown>('/workflow-loop/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
     }),
-  wlStop: () => fetchJson<unknown>("/workflow-loop/stop", { method: "POST" }),
+  wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
   wlWorkflows: () =>
-    fetch("http://127.0.0.1:9876/unified-workflows")
+    fetch('http://127.0.0.1:9876/unified-workflows')
       .then((r) => r.json())
-      .then(
-        (d: { data?: UnifiedWorkflow[] }) => (d.data || d) as UnifiedWorkflow[],
-      ),
+      .then((d: { data?: UnifiedWorkflow[] }) => (d.data || d) as UnifiedWorkflow[]),
 
   // Velocity Improvement
-  viStatus: () =>
-    fetchJson<VelocityImprovementStatus>("/velocity-improvement/status"),
+  viStatus: () => fetchJson<VelocityImprovementStatus>('/velocity-improvement/status'),
   viStart: (config: Record<string, unknown>) =>
-    fetchJson<MessageResponse>("/velocity-improvement/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<MessageResponse>('/velocity-improvement/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
     }),
   viStop: () =>
-    fetchJson<MessageResponse>("/velocity-improvement/stop", {
-      method: "POST",
+    fetchJson<MessageResponse>('/velocity-improvement/stop', {
+      method: 'POST',
     }),
-  viHistory: () =>
-    fetchJson<VelocityImprovementHistory>("/velocity-improvement/history"),
+  viHistory: () => fetchJson<VelocityImprovementHistory>('/velocity-improvement/history'),
 
   // Supervisor
-  health: () => fetchJson<HealthResponse>("/health"),
+  health: () => fetchJson<HealthResponse>('/health'),
   runnerRestart: (rebuild: boolean) =>
-    fetchJson<unknown>("/runner/restart", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<unknown>('/runner/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rebuild }),
     }),
   devStartStatus: () =>
     fetchJson<{
       services: { name: string; port: number; available: boolean }[];
-    }>("/dev-start/status"),
+    }>('/dev-start/status'),
   devStartAction: (action: string) =>
-    fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: "POST" }),
-  runnerStop: () => fetchJson<unknown>("/runner/stop", { method: "POST" }),
+    fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: 'POST' }),
+  runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
 
   // AI Debug
   aiDebug: (prompt: string) =>
-    fetchJson<AiDebugResponse>("/ai/debug", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    fetchJson<AiDebugResponse>('/ai/debug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt }),
     }),
-  aiStop: () =>
-    fetchJson<AiDebugResponse>("/ai/stop", { method: "POST" }),
+  aiStop: () => fetchJson<AiDebugResponse>('/ai/stop', { method: 'POST' }),
+  aiProvider: () => fetchJson<AiProviderResponse>('/ai/provider'),
+  aiSetProvider: (provider: string, model: string) =>
+    fetchJson<AiProviderResponse>('/ai/provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, model }),
+    }),
+  aiModels: () => fetchJson<AiModelsResponse>('/ai/models'),
 
   // Logs
   logFile: (type: string, tailLines?: number) =>
-    fetchJson<LogFileResponse>(
-      `/logs/file/${type}${tailLines ? `?tail_lines=${tailLines}` : ""}`,
-    ),
+    fetchJson<LogFileResponse>(`/logs/file/${type}${tailLines ? `?tail_lines=${tailLines}` : ''}`),
 
   // Runner Monitor (proxied to runner at port 9876)
-  runnerHealth: () => fetchJson<Record<string, unknown>>("/runner-api/health"),
-  runnerTaskRunsRunning: () =>
-    fetchJson<RunnerTaskRun[]>("/runner-api/task-runs/running"),
+  runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
+  runnerTaskRunsRunning: () => fetchJson<RunnerTaskRun[]>('/runner-api/task-runs/running'),
   runnerWorkflowState: (id: string) =>
     fetchJson<Record<string, unknown>>(
       `/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`,
     ),
   runnerTaskOutput: (id: string, tailChars = 15000) =>
-    fetch(
-      `/runner-api/task-runs/${encodeURIComponent(id)}/output?tail_chars=${tailChars}`,
-    ).then((r) => {
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      return r.text();
-    }),
-  runnerStopTask: (id: string) =>
-    fetchJson<Record<string, unknown>>(
-      `/runner-api/task-runs/${encodeURIComponent(id)}/stop`,
-      { method: "POST" },
+    fetch(`/runner-api/task-runs/${encodeURIComponent(id)}/output?tail_chars=${tailChars}`).then(
+      (r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r.text();
+      },
     ),
+  runnerStopTask: (id: string) =>
+    fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/stop`, {
+      method: 'POST',
+    }),
 
   // Expo
-  expoStart: () => fetchJson<unknown>("/expo/start", { method: "POST" }),
-  expoStop: () => fetchJson<unknown>("/expo/stop", { method: "POST" }),
-  expoStatus: () => fetchJson<Record<string, unknown>>("/expo/status"),
+  expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
+  expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
+  expoStatus: () => fetchJson<Record<string, unknown>>('/expo/status'),
 };

@@ -89,7 +89,9 @@ export default function WorkflowLoop() {
   const [error, setError] = useState<string | null>(null);
 
   // Form state
-  const [mode, setMode] = useState<Mode>(() => (localStorage.getItem('wl-mode') as Mode) || 'simple');
+  const [mode, setMode] = useState<Mode>(
+    () => (localStorage.getItem('wl-mode') as Mode) || 'simple',
+  );
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
   const [exitStrategy, setExitStrategy] = useState('fixed_iterations');
   const [between, setBetween] = useState('restart_on_signal');
@@ -138,7 +140,9 @@ export default function WorkflowLoop() {
         setStatus(s);
         setHistory(h.iterations || []);
         if (!s.running) loadWorkflows();
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }, 3000);
     return () => clearInterval(interval);
   }, [status?.running, loadWorkflows]);
@@ -150,23 +154,31 @@ export default function WorkflowLoop() {
       try {
         const s = JSON.parse(e.data) as WorkflowLoopStatus;
         setStatus(s);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     });
-    sse.onerror = () => { sse.close(); };
+    sse.onerror = () => {
+      sse.close();
+    };
     return () => sse.close();
   }, []);
 
   const handleModeChange = (m: Mode) => {
     setMode(m);
     localStorage.setItem('wl-mode', m);
-    if (m === 'pipeline' && (between === 'restart_on_signal' || between === 'restart_on_signal_no_rebuild')) {
+    if (
+      m === 'pipeline' &&
+      (between === 'restart_on_signal' || between === 'restart_on_signal_no_rebuild')
+    ) {
       setBetween('restart_runner');
     }
   };
 
   const buildBetween = () => {
     if (between === 'restart_on_signal') return { type: 'restart_on_signal', rebuild: true };
-    if (between === 'restart_on_signal_no_rebuild') return { type: 'restart_on_signal', rebuild: false };
+    if (between === 'restart_on_signal_no_rebuild')
+      return { type: 'restart_on_signal', rebuild: false };
     if (between === 'restart_runner') return { type: 'restart_runner', rebuild: true };
     if (between === 'restart_runner_no_rebuild') return { type: 'restart_runner', rebuild: false };
     if (between === 'wait_healthy') return { type: 'wait_healthy' };
@@ -184,7 +196,10 @@ export default function WorkflowLoop() {
       }
       const phases: Record<string, unknown> = { reflect: { reflection_workflow_id: null } };
       if (buildDesc) {
-        phases.build = { description: buildDesc, ...(buildContext ? { context: buildContext } : {}) };
+        phases.build = {
+          description: buildDesc,
+          ...(buildContext ? { context: buildContext } : {}),
+        };
       }
       if (pipelineExecId) phases.execute_workflow_id = pipelineExecId;
       if (enableFixes) {
@@ -204,7 +219,12 @@ export default function WorkflowLoop() {
       else if (exitStrategy === 'workflow_verification') es = { type: 'workflow_verification' };
       else es = { type: 'fixed_iterations' };
 
-      body = { workflow_id: selectedWorkflowId, max_iterations: maxIter, exit_strategy: es, between_iterations: buildBetween() };
+      body = {
+        workflow_id: selectedWorkflowId,
+        max_iterations: maxIter,
+        exit_strategy: es,
+        between_iterations: buildBetween(),
+      };
     }
 
     try {
@@ -229,8 +249,13 @@ export default function WorkflowLoop() {
   const running = status?.running ?? false;
   const phase = status?.phase || 'idle';
   const cfgMax = status?.config?.max_iterations ?? maxIter;
-  const progressPct = running && cfgMax > 0 ? Math.min(100, Math.round(((status?.current_iteration ?? 0) / cfgMax) * 100)) : (phase === 'complete' ? 100 : 0);
-  const isPipelineMode = !!(status?.config?.phases);
+  const progressPct =
+    running && cfgMax > 0
+      ? Math.min(100, Math.round(((status?.current_iteration ?? 0) / cfgMax) * 100))
+      : phase === 'complete'
+        ? 100
+        : 0;
+  const isPipelineMode = !!status?.config?.phases;
 
   if (loading) {
     return <div style={{ padding: '2rem', color: 'var(--text-muted)' }}>Loading...</div>;
@@ -247,18 +272,31 @@ export default function WorkflowLoop() {
               <span className="text-mono" style={{ fontSize: '0.85rem', color: 'var(--warning)' }}>
                 Iteration {status?.current_iteration ?? 0} / {cfgMax}
               </span>
-              <button className="btn" onClick={handleStop} style={{ background: 'var(--danger)', color: '#fff' }}>
+              <button
+                className="btn"
+                onClick={handleStop}
+                style={{ background: 'var(--danger)', color: '#fff' }}
+              >
                 Stop
               </button>
             </>
           ) : (
-            <button className="btn btn-primary" onClick={handleStart}>Run Loop</button>
+            <button className="btn btn-primary" onClick={handleStart}>
+              Run Loop
+            </button>
           )}
         </div>
       </div>
 
       {error && (
-        <div className="card mb-2" style={{ borderLeft: '3px solid var(--danger)', color: 'var(--danger)', fontSize: '0.85rem' }}>
+        <div
+          className="card mb-2"
+          style={{
+            borderLeft: '3px solid var(--danger)',
+            color: 'var(--danger)',
+            fontSize: '0.85rem',
+          }}
+        >
           {error}
         </div>
       )}
@@ -269,13 +307,15 @@ export default function WorkflowLoop() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <span style={phaseBadgeStyle(phase)}>{phase.replace(/_/g, ' ')}</span>
             <div style={{ flex: 1, background: 'var(--bg-tertiary)', borderRadius: 4, height: 8 }}>
-              <div style={{
-                width: `${progressPct}%`,
-                background: phase === 'complete' ? 'var(--success)' : 'var(--accent)',
-                height: '100%',
-                borderRadius: 4,
-                transition: 'width 0.3s ease',
-              }} />
+              <div
+                style={{
+                  width: `${progressPct}%`,
+                  background: phase === 'complete' ? 'var(--success)' : 'var(--accent)',
+                  height: '100%',
+                  borderRadius: 4,
+                  transition: 'width 0.3s ease',
+                }}
+              />
             </div>
             <span className="text-mono" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
               {status?.current_iteration ?? 0}/{cfgMax}
@@ -283,7 +323,9 @@ export default function WorkflowLoop() {
             {isPipelineMode && <span className="badge badge-warning">Pipeline</span>}
           </div>
           {status?.error && (
-            <div style={{ marginTop: 8, fontSize: '0.8rem', color: 'var(--danger)' }}>{status.error}</div>
+            <div style={{ marginTop: 8, fontSize: '0.8rem', color: 'var(--danger)' }}>
+              {status.error}
+            </div>
           )}
         </div>
       )}
@@ -297,11 +339,39 @@ export default function WorkflowLoop() {
 
           {/* Mode selector */}
           <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.85rem', cursor: 'pointer' }}>
-              <input type="radio" name="wlMode" checked={mode === 'simple'} onChange={() => handleModeChange('simple')} /> Simple
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: '0.85rem',
+                cursor: 'pointer',
+              }}
+            >
+              <input
+                type="radio"
+                name="wlMode"
+                checked={mode === 'simple'}
+                onChange={() => handleModeChange('simple')}
+              />{' '}
+              Simple
             </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.85rem', cursor: 'pointer' }}>
-              <input type="radio" name="wlMode" checked={mode === 'pipeline'} onChange={() => handleModeChange('pipeline')} /> Pipeline
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: '0.85rem',
+                cursor: 'pointer',
+              }}
+            >
+              <input
+                type="radio"
+                name="wlMode"
+                checked={mode === 'pipeline'}
+                onChange={() => handleModeChange('pipeline')}
+              />{' '}
+              Pipeline
             </label>
           </div>
 
@@ -312,18 +382,26 @@ export default function WorkflowLoop() {
                 <>
                   <div style={rowStyle}>
                     <span style={labelStyle}>Workflow</span>
-                    <select value={selectedWorkflowId} onChange={e => setSelectedWorkflowId(e.target.value)} style={{ ...selectStyle, flex: 1, maxWidth: 250 }}>
+                    <select
+                      value={selectedWorkflowId}
+                      onChange={(e) => setSelectedWorkflowId(e.target.value)}
+                      style={{ ...selectStyle, flex: 1, maxWidth: 250 }}
+                    >
                       <option value="">Select a workflow...</option>
-                      {workflows.map(wf => (
+                      {workflows.map((wf) => (
                         <option key={wf.id} value={wf.id}>
-                          {wf.name || wf.id} ({(wf.steps?.length ?? 0)} steps)
+                          {wf.name || wf.id} ({wf.steps?.length ?? 0} steps)
                         </option>
                       ))}
                     </select>
                   </div>
                   <div style={rowStyle}>
                     <span style={labelStyle}>Exit Strategy</span>
-                    <select value={exitStrategy} onChange={e => setExitStrategy(e.target.value)} style={selectStyle}>
+                    <select
+                      value={exitStrategy}
+                      onChange={(e) => setExitStrategy(e.target.value)}
+                      style={selectStyle}
+                    >
                       <option value="fixed_iterations">Fixed Iterations</option>
                       <option value="reflection">Reflection (0 fixes = exit)</option>
                       <option value="workflow_verification">Verification (pass = exit)</option>
@@ -336,7 +414,7 @@ export default function WorkflowLoop() {
                     <div style={{ ...labelStyle, marginBottom: 4 }}>Build Description</div>
                     <textarea
                       value={buildDesc}
-                      onChange={e => setBuildDesc(e.target.value)}
+                      onChange={(e) => setBuildDesc(e.target.value)}
                       placeholder="Describe the workflow to generate..."
                       rows={3}
                       style={textareaStyle}
@@ -346,7 +424,7 @@ export default function WorkflowLoop() {
                     <div style={{ ...labelStyle, marginBottom: 4 }}>Build Context (optional)</div>
                     <textarea
                       value={buildContext}
-                      onChange={e => setBuildContext(e.target.value)}
+                      onChange={(e) => setBuildContext(e.target.value)}
                       placeholder="Additional context for the builder..."
                       rows={2}
                       style={textareaStyle}
@@ -354,26 +432,46 @@ export default function WorkflowLoop() {
                   </div>
                   <div style={rowStyle}>
                     <span style={labelStyle}>Execute Workflow (fallback)</span>
-                    <select value={pipelineExecId} onChange={e => setPipelineExecId(e.target.value)} style={{ ...selectStyle, maxWidth: 200 }}>
+                    <select
+                      value={pipelineExecId}
+                      onChange={(e) => setPipelineExecId(e.target.value)}
+                      style={{ ...selectStyle, maxWidth: 200 }}
+                    >
                       <option value="">None (use build)</option>
-                      {workflows.map(wf => (
+                      {workflows.map((wf) => (
                         <option key={wf.id} value={wf.id}>
                           {wf.name || wf.id}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', fontSize: '0.85rem' }}>
-                    <input type="checkbox" checked={enableFixes} onChange={e => setEnableFixes(e.target.checked)} />
-                    <span style={{ color: 'var(--text-secondary)' }}>Enable Fix Implementation</span>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '6px 0',
+                      fontSize: '0.85rem',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={enableFixes}
+                      onChange={(e) => setEnableFixes(e.target.checked)}
+                    />
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      Enable Fix Implementation
+                    </span>
                   </div>
                   {enableFixes && (
                     <>
                       <div style={{ marginBottom: 8 }}>
-                        <div style={{ ...labelStyle, marginBottom: 4 }}>Fix Additional Context (optional)</div>
+                        <div style={{ ...labelStyle, marginBottom: 4 }}>
+                          Fix Additional Context (optional)
+                        </div>
                         <textarea
                           value={fixContext}
-                          onChange={e => setFixContext(e.target.value)}
+                          onChange={(e) => setFixContext(e.target.value)}
                           placeholder="Extra instructions for the fix agent..."
                           rows={2}
                           style={textareaStyle}
@@ -381,7 +479,14 @@ export default function WorkflowLoop() {
                       </div>
                       <div style={rowStyle}>
                         <span style={labelStyle}>Fix Timeout (seconds)</span>
-                        <input type="number" value={fixTimeout} onChange={e => setFixTimeout(Number(e.target.value))} min={60} max={3600} style={inputStyle} />
+                        <input
+                          type="number"
+                          value={fixTimeout}
+                          onChange={(e) => setFixTimeout(Number(e.target.value))}
+                          min={60}
+                          max={3600}
+                          style={inputStyle}
+                        />
                       </div>
                     </>
                   )}
@@ -393,9 +498,15 @@ export default function WorkflowLoop() {
             <div>
               <div style={rowStyle}>
                 <span style={labelStyle}>Between Iterations</span>
-                <select value={between} onChange={e => setBetween(e.target.value)} style={selectStyle}>
+                <select
+                  value={between}
+                  onChange={(e) => setBetween(e.target.value)}
+                  style={selectStyle}
+                >
                   <option value="restart_on_signal">Restart on Signal (rebuild)</option>
-                  <option value="restart_on_signal_no_rebuild">Restart on Signal (no rebuild)</option>
+                  <option value="restart_on_signal_no_rebuild">
+                    Restart on Signal (no rebuild)
+                  </option>
                   <option value="restart_runner">Always Restart (rebuild)</option>
                   <option value="restart_runner_no_rebuild">Always Restart (no rebuild)</option>
                   <option value="wait_healthy">Wait for Healthy</option>
@@ -404,7 +515,14 @@ export default function WorkflowLoop() {
               </div>
               <div style={rowStyle}>
                 <span style={labelStyle}>Max Iterations</span>
-                <input type="number" value={maxIter} onChange={e => setMaxIter(Number(e.target.value))} min={1} max={50} style={inputStyle} />
+                <input
+                  type="number"
+                  value={maxIter}
+                  onChange={(e) => setMaxIter(Number(e.target.value))}
+                  min={1}
+                  max={50}
+                  style={inputStyle}
+                />
               </div>
             </div>
           </div>
@@ -415,7 +533,9 @@ export default function WorkflowLoop() {
       <div className="card">
         <div className="card-header">
           <span className="card-title">Iteration History</span>
-          <span className="text-muted" style={{ fontSize: '0.8rem' }}>{history.length} iterations</span>
+          <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+            {history.length} iterations
+          </span>
         </div>
         <div className="table-container">
           <table>
@@ -429,14 +549,20 @@ export default function WorkflowLoop() {
               </tr>
             </thead>
             <tbody>
-              {history.map(iter => {
+              {history.map((iter) => {
                 const exit = iter.exit_check;
-                const duration = iter.started_at && iter.completed_at
-                  ? ((new Date(iter.completed_at).getTime() - new Date(iter.started_at).getTime()) / 1000).toFixed(1) + 's'
-                  : '--';
+                const duration =
+                  iter.started_at && iter.completed_at
+                    ? (
+                        (new Date(iter.completed_at).getTime() -
+                          new Date(iter.started_at).getTime()) /
+                        1000
+                      ).toFixed(1) + 's'
+                    : '--';
                 const meta: string[] = [];
                 if (iter.fix_count != null) meta.push(`fixes=${iter.fix_count}`);
-                if (iter.fixes_implemented != null) meta.push(`applied=${iter.fixes_implemented ? 'yes' : 'no'}`);
+                if (iter.fixes_implemented != null)
+                  meta.push(`applied=${iter.fixes_implemented ? 'yes' : 'no'}`);
                 if (iter.rebuild_triggered) meta.push('rebuild');
                 if (iter.generated_workflow_id) meta.push('built');
                 return (
@@ -448,17 +574,36 @@ export default function WorkflowLoop() {
                         {exit?.should_exit ? 'EXIT' : 'CONTINUE'}
                       </span>
                     </td>
-                    <td style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: '-apple-system, sans-serif', fontSize: '0.8rem' }}>
+                    <td
+                      style={{
+                        maxWidth: 300,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        fontFamily: '-apple-system, sans-serif',
+                        fontSize: '0.8rem',
+                      }}
+                    >
                       {exit?.reason || '--'}
                     </td>
-                    <td style={{ fontFamily: '-apple-system, sans-serif', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    <td
+                      style={{
+                        fontFamily: '-apple-system, sans-serif',
+                        fontSize: '0.75rem',
+                        color: 'var(--text-muted)',
+                      }}
+                    >
                       {meta.length > 0 ? meta.join(', ') : '--'}
                     </td>
                   </tr>
                 );
               })}
               {history.length === 0 && (
-                <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No iterations yet</td></tr>
+                <tr>
+                  <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No iterations yet
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

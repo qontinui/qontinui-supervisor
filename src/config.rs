@@ -167,3 +167,258 @@ impl SupervisorConfig {
             .to_path_buf()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Port constant tests ---
+
+    #[test]
+    fn test_default_supervisor_port() {
+        assert_eq!(DEFAULT_SUPERVISOR_PORT, 9875);
+    }
+
+    #[test]
+    fn test_runner_api_port() {
+        assert_eq!(RUNNER_API_PORT, 9876);
+    }
+
+    #[test]
+    fn test_runner_vite_port() {
+        assert_eq!(RUNNER_VITE_PORT, 1420);
+    }
+
+    #[test]
+    fn test_expo_port() {
+        assert_eq!(EXPO_PORT, 8081);
+    }
+
+    // --- Watchdog constant tests ---
+
+    #[test]
+    fn test_watchdog_max_restart_attempts() {
+        assert_eq!(WATCHDOG_MAX_RESTART_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn test_watchdog_crash_loop_threshold() {
+        assert_eq!(WATCHDOG_CRASH_LOOP_THRESHOLD, 5);
+    }
+
+    #[test]
+    fn test_watchdog_crash_loop_window_is_10_minutes() {
+        assert_eq!(WATCHDOG_CRASH_LOOP_WINDOW_SECS, 600);
+    }
+
+    #[test]
+    fn test_watchdog_cooldown_is_60_seconds() {
+        assert_eq!(WATCHDOG_COOLDOWN_SECS, 60);
+    }
+
+    // --- Process constant tests ---
+
+    #[test]
+    fn test_build_timeout_is_5_minutes() {
+        assert_eq!(BUILD_TIMEOUT_SECS, 300);
+    }
+
+    #[test]
+    fn test_ai_debug_cooldown_is_5_minutes() {
+        assert_eq!(AI_DEBUG_COOLDOWN_SECS, 300);
+    }
+
+    // --- SERVICE_PORTS tests ---
+
+    #[test]
+    fn test_service_ports_has_expected_count() {
+        assert_eq!(SERVICE_PORTS.len(), 7);
+    }
+
+    #[test]
+    fn test_service_ports_contains_postgresql() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "postgresql" && *port == 5432));
+    }
+
+    #[test]
+    fn test_service_ports_contains_redis() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "redis" && *port == 6379));
+    }
+
+    #[test]
+    fn test_service_ports_contains_minio() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "minio" && *port == 9000));
+    }
+
+    #[test]
+    fn test_service_ports_contains_backend() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "backend" && *port == 8000));
+    }
+
+    #[test]
+    fn test_service_ports_contains_frontend() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "frontend" && *port == 3001));
+    }
+
+    #[test]
+    fn test_service_ports_contains_runner_api() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "runner_api" && *port == RUNNER_API_PORT));
+    }
+
+    #[test]
+    fn test_service_ports_contains_vite() {
+        assert!(SERVICE_PORTS
+            .iter()
+            .any(|(name, port)| *name == "vite" && *port == RUNNER_VITE_PORT));
+    }
+
+    // --- AI_MODELS tests ---
+
+    #[test]
+    fn test_ai_models_has_expected_count() {
+        assert_eq!(AI_MODELS.len(), 4);
+    }
+
+    #[test]
+    fn test_ai_models_contains_claude_opus() {
+        assert!(AI_MODELS
+            .iter()
+            .any(|(provider, key, _, _)| *provider == "claude" && *key == "opus"));
+    }
+
+    #[test]
+    fn test_ai_models_contains_claude_sonnet() {
+        assert!(AI_MODELS
+            .iter()
+            .any(|(provider, key, _, _)| *provider == "claude" && *key == "sonnet"));
+    }
+
+    #[test]
+    fn test_ai_models_contains_gemini_flash() {
+        assert!(AI_MODELS
+            .iter()
+            .any(|(provider, key, _, _)| *provider == "gemini" && *key == "flash"));
+    }
+
+    #[test]
+    fn test_ai_models_contains_gemini_pro() {
+        assert!(AI_MODELS
+            .iter()
+            .any(|(provider, key, _, _)| *provider == "gemini" && *key == "pro"));
+    }
+
+    #[test]
+    fn test_ai_models_all_have_model_ids() {
+        for (_, _, model_id, _) in AI_MODELS {
+            assert!(!model_id.is_empty(), "Model ID should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_ai_models_all_have_display_names() {
+        for (_, _, _, display_name) in AI_MODELS {
+            assert!(!display_name.is_empty(), "Display name should not be empty");
+        }
+    }
+
+    // --- SupervisorConfig tests ---
+
+    fn make_test_args(watchdog: bool, auto_start: bool) -> CliArgs {
+        CliArgs {
+            project_dir: PathBuf::from("/tmp/qontinui-runner/src-tauri"),
+            dev_mode: true,
+            watchdog,
+            auto_start,
+            log_file: None,
+            port: DEFAULT_SUPERVISOR_PORT,
+            auto_debug: false,
+            expo_dir: None,
+        }
+    }
+
+    #[test]
+    fn test_from_args_basic() {
+        let args = make_test_args(false, false);
+        let config = SupervisorConfig::from_args(args);
+        assert_eq!(
+            config.project_dir,
+            PathBuf::from("/tmp/qontinui-runner/src-tauri")
+        );
+        assert!(config.dev_mode);
+        assert!(!config.watchdog_enabled_at_start);
+        assert!(!config.auto_start);
+        assert!(!config.auto_debug);
+        assert_eq!(config.port, DEFAULT_SUPERVISOR_PORT);
+        assert_eq!(config.expo_port, EXPO_PORT);
+        assert!(config.expo_dir.is_none());
+    }
+
+    #[test]
+    fn test_from_args_watchdog_implies_auto_start() {
+        let args = make_test_args(true, false);
+        let config = SupervisorConfig::from_args(args);
+        assert!(config.watchdog_enabled_at_start);
+        assert!(config.auto_start, "watchdog should imply auto_start");
+    }
+
+    #[test]
+    fn test_from_args_auto_start_without_watchdog() {
+        let args = make_test_args(false, true);
+        let config = SupervisorConfig::from_args(args);
+        assert!(!config.watchdog_enabled_at_start);
+        assert!(config.auto_start);
+    }
+
+    #[test]
+    fn test_runner_exe_path() {
+        let args = make_test_args(false, false);
+        let config = SupervisorConfig::from_args(args);
+        let exe_path = config.runner_exe_path();
+        assert!(
+            exe_path.ends_with("target/debug/qontinui-runner.exe")
+                || exe_path.ends_with("target\\debug\\qontinui-runner.exe")
+        );
+    }
+
+    #[test]
+    fn test_runner_npm_dir() {
+        let args = make_test_args(false, false);
+        let config = SupervisorConfig::from_args(args);
+        let npm_dir = config.runner_npm_dir();
+        // src-tauri's parent is qontinui-runner
+        assert!(
+            npm_dir.ends_with("qontinui-runner")
+                || npm_dir.to_string_lossy().contains("qontinui-runner")
+        );
+    }
+
+    #[test]
+    fn test_dev_logs_dir_is_computed() {
+        let args = make_test_args(false, false);
+        let config = SupervisorConfig::from_args(args);
+        // project_dir = /tmp/qontinui-runner/src-tauri
+        // dev_logs_dir = project_dir.parent().parent().join(".dev-logs") = /tmp/.dev-logs
+        assert!(config.dev_logs_dir.ends_with(".dev-logs"));
+    }
+
+    #[test]
+    fn test_from_args_with_expo_dir() {
+        let mut args = make_test_args(false, false);
+        args.expo_dir = Some(PathBuf::from("/tmp/qontinui-mobile"));
+        let config = SupervisorConfig::from_args(args);
+        assert_eq!(config.expo_dir, Some(PathBuf::from("/tmp/qontinui-mobile")));
+        assert_eq!(config.expo_port, EXPO_PORT);
+    }
+}

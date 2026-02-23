@@ -1,6 +1,15 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from 'recharts';
 import { api, ServiceSummary, EndpointSummary, SlowRequest, TimelineBucket } from '../lib/api';
 
 const SERVICE_COLORS: Record<string, string> = {
@@ -42,7 +51,9 @@ export default function Velocity() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const handleIngest = async () => {
     setIngesting(true);
@@ -59,7 +70,7 @@ export default function Velocity() {
 
   const handleSort = (key: keyof EndpointSummary) => {
     if (sortKey === key) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
     } else {
       setSortKey(key);
       setSortDir('desc');
@@ -69,7 +80,10 @@ export default function Velocity() {
   const sortedEndpoints = [...endpoints].sort((a, b) => {
     const av = a[sortKey];
     const bv = b[sortKey];
-    const cmp = typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv));
+    const cmp =
+      typeof av === 'number' && typeof bv === 'number'
+        ? av - bv
+        : String(av).localeCompare(String(bv));
     return sortDir === 'asc' ? cmp : -cmp;
   });
 
@@ -83,14 +97,18 @@ export default function Velocity() {
   }
   const chartData = Array.from(timelineByBucket.values());
 
-  const services = [...new Set(timeline.map(t => t.service))];
+  const services = [...new Set(timeline.map((t) => t.service))];
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">Response Velocity</h1>
         <div className="flex gap-2 items-center">
-          {lastIngest && <span className="text-muted" style={{ fontSize: '0.8rem' }}>{lastIngest}</span>}
+          {lastIngest && (
+            <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+              {lastIngest}
+            </span>
+          )}
           <button className="btn btn-primary" onClick={handleIngest} disabled={ingesting}>
             {ingesting ? 'Ingesting...' : 'Ingest Latest Data'}
           </button>
@@ -99,10 +117,12 @@ export default function Velocity() {
 
       {/* Service summary cards */}
       <div className="card-grid">
-        {summary.map(s => (
+        {summary.map((s) => (
           <div key={s.service} className="card">
             <div className="card-header">
-              <span className="card-title" style={{ color: SERVICE_COLORS[s.service] }}>{s.service}</span>
+              <span className="card-title" style={{ color: SERVICE_COLORS[s.service] }}>
+                {s.service}
+              </span>
               <span className="text-mono">{s.total_requests} requests</span>
             </div>
             <div className="stat-row">
@@ -120,7 +140,9 @@ export default function Velocity() {
               </div>
               <div className="stat-item">
                 <div className="stat-label">Errors</div>
-                <div className={`text-mono ${s.error_rate > 0.05 ? 'text-danger' : 'text-success'}`}>
+                <div
+                  className={`text-mono ${s.error_rate > 0.05 ? 'text-danger' : 'text-success'}`}
+                >
                   {(s.error_rate * 100).toFixed(1)}%
                 </div>
               </div>
@@ -137,11 +159,28 @@ export default function Velocity() {
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis dataKey="bucket" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
-              <YAxis tick={{ fill: 'var(--text-muted)', fontSize: 11 }} label={{ value: 'ms', position: 'insideLeft', fill: 'var(--text-muted)' }} />
-              <Tooltip contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }} />
+              <YAxis
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                label={{ value: 'ms', position: 'insideLeft', fill: 'var(--text-muted)' }}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                }}
+              />
               <Legend />
-              {services.map(s => (
-                <Line key={s} type="monotone" dataKey={`${s}_p95`} name={`${s} P95`} stroke={SERVICE_COLORS[s] || '#888'} strokeWidth={2} dot={false} />
+              {services.map((s) => (
+                <Line
+                  key={s}
+                  type="monotone"
+                  dataKey={`${s}_p95`}
+                  name={`${s} P95`}
+                  stroke={SERVICE_COLORS[s] || '#888'}
+                  strokeWidth={2}
+                  dot={false}
+                />
               ))}
             </LineChart>
           </ResponsiveContainer>
@@ -174,20 +213,30 @@ export default function Velocity() {
                   <td style={{ color: SERVICE_COLORS[e.service] }}>{e.service}</td>
                   <td>{e.http_method}</td>
                   <td>
-                    <Link to={`/velocity/endpoint?service=${encodeURIComponent(e.service)}&method=${encodeURIComponent(e.http_method)}&route=${encodeURIComponent(e.http_route)}`}>
+                    <Link
+                      to={`/velocity/endpoint?service=${encodeURIComponent(e.service)}&method=${encodeURIComponent(e.http_method)}&route=${encodeURIComponent(e.http_route)}`}
+                    >
                       {e.http_route}
                     </Link>
                   </td>
                   <td>{e.request_count}</td>
                   <td>{formatMs(e.avg_duration_ms)}</td>
                   <td>{formatMs(e.p50_duration_ms)}</td>
-                  <td className={e.p95_duration_ms > 1000 ? 'text-warning' : ''}>{formatMs(e.p95_duration_ms)}</td>
-                  <td className={e.p99_duration_ms > 2000 ? 'text-danger' : ''}>{formatMs(e.p99_duration_ms)}</td>
+                  <td className={e.p95_duration_ms > 1000 ? 'text-warning' : ''}>
+                    {formatMs(e.p95_duration_ms)}
+                  </td>
+                  <td className={e.p99_duration_ms > 2000 ? 'text-danger' : ''}>
+                    {formatMs(e.p99_duration_ms)}
+                  </td>
                   <td className={e.error_count > 0 ? 'text-danger' : ''}>{e.error_count}</td>
                 </tr>
               ))}
               {sortedEndpoints.length === 0 && (
-                <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No data. Click "Ingest Latest Data" to load.</td></tr>
+                <tr>
+                  <td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No data. Click "Ingest Latest Data" to load.
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>
@@ -213,7 +262,7 @@ export default function Velocity() {
               </tr>
             </thead>
             <tbody>
-              {slow.map(s => (
+              {slow.map((s) => (
                 <tr key={s.id}>
                   <td style={{ color: SERVICE_COLORS[s.service] }}>{s.service}</td>
                   <td>{s.http_method}</td>
@@ -221,17 +270,30 @@ export default function Velocity() {
                   <td className="text-danger">{formatMs(s.duration_ms)}</td>
                   <td>{s.http_status_code ?? '-'}</td>
                   <td>{new Date(s.start_ts).toLocaleTimeString()}</td>
-                  <td style={{ fontSize: '0.7rem', maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  <td
+                    style={{
+                      fontSize: '0.7rem',
+                      maxWidth: '120px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
                     {s.request_id ? (
                       <Link to={`/velocity/trace?id=${encodeURIComponent(s.request_id)}`}>
                         {s.request_id.slice(0, 12)}...
                       </Link>
-                    ) : '-'}
+                    ) : (
+                      '-'
+                    )}
                   </td>
                 </tr>
               ))}
               {slow.length === 0 && (
-                <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No slow requests found.</td></tr>
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No slow requests found.
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

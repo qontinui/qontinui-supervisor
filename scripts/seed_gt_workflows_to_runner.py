@@ -62,15 +62,69 @@ def make_check(check_id, name, check_type, tool, command, working_dir):
     }
 
 
+def make_command(step_id, name, phase, command, working_dir=None, **kwargs):
+    """Create a plain command step."""
+    step = {
+        "id": step_id,
+        "type": "command",
+        "name": name,
+        "phase": phase,
+        "command": command,
+    }
+    if working_dir:
+        step["working_directory"] = working_dir
+    step.update(kwargs)
+    return step
 
-def make_agentic():
+
+def make_test(step_id, name, test_type, command, working_dir=None, **kwargs):
+    """Create a command step with test_type set (unified command type)."""
+    step = {
+        "id": step_id,
+        "type": "command",
+        "name": name,
+        "phase": "verification",
+        "test_type": test_type,
+        "command": command,
+    }
+    if working_dir:
+        step["working_directory"] = working_dir
+    step.update(kwargs)
+    return step
+
+
+def make_prompt(step_id, name, phase, content):
+    """Create a prompt step."""
+    return {
+        "id": step_id,
+        "type": "prompt",
+        "name": name,
+        "phase": phase,
+        "content": content,
+    }
+
+
+def make_ui_bridge(step_id, name, phase, action, **kwargs):
+    """Create a ui_bridge step."""
+    step = {
+        "id": step_id,
+        "type": "ui_bridge",
+        "name": name,
+        "phase": phase,
+        "action": action,
+    }
+    step.update(kwargs)
+    return step
+
+
+def make_agentic(content="Fix any check failures found in the verification phase."):
     """Standard agentic step for fixing check failures."""
     return {
         "id": "step-fix",
         "type": "prompt",
         "name": "Fix issues",
         "phase": "agentic",
-        "content": "Fix any check failures found in the verification phase.",
+        "content": content,
     }
 
 
@@ -81,18 +135,19 @@ def make_agentic():
 GT_WORKFLOWS = []
 
 
-def add_gt(name, description, checks):
+def add_gt(name, description, checks, tags=None, setup=None,
+           agentic=None, completion=None, max_iterations=5):
     """Add a ground truth workflow."""
     GT_WORKFLOWS.append({
         "name": name,
         "description": description,
         "category": "ground_truth",
-        "tags": ["ground_truth", "command", "reference"],
-        "setup_steps": [],
+        "tags": tags or ["ground_truth", "command", "reference"],
+        "setup_steps": setup or [],
         "verification_steps": checks,
-        "agentic_steps": [make_agentic()],
-        "completion_steps": [],
-        "max_iterations": 5,
+        "agentic_steps": agentic or [make_agentic()],
+        "completion_steps": completion or [],
+        "max_iterations": max_iterations,
     })
 
 
@@ -245,6 +300,175 @@ add_gt(
         make_check("check-supervisor-clippy", "Supervisor: cargo clippy", "lint", "cargo",
                     "cargo clippy -- -D warnings", f"{WS}\\qontinui-supervisor"),
     ],
+)
+
+
+# ── Web frontend UI Bridge verification ────────────────────────────────────
+add_gt(
+    "GT: qontinui-web frontend UI verification",
+    "Verify the qontinui-web frontend at http://localhost:3001 is working correctly. "
+    "Connect to the UI Bridge SDK, navigate to key pages, and verify elements render properly. "
+    "Fix any frontend issues found.",
+    tags=["ground_truth", "ui_bridge", "command", "web", "reference"],
+    setup=[
+        make_command("setup-sdk-connect", "Connect UI Bridge SDK", "setup",
+                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/connect '
+                     '-H "Content-Type: application/json" '
+                     '-d "{\\"url\\": \\"http://localhost:3001\\"}"',
+                     fail_on_error=True),
+        make_command("setup-navigate", "Navigate to workflows page", "setup",
+                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate '
+                     '-H "Content-Type: application/json" '
+                     '-d "{\\"url\\": \\"http://localhost:3001/build/workflows\\"}"'),
+    ],
+    checks=[
+        make_command("verify-navigate", "Navigate to target page", "verification",
+                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate '
+                     '-H "Content-Type: application/json" '
+                     '-d "{\\"url\\": \\"http://localhost:3001/build/workflows\\"}"',
+                     fail_on_error=True,
+                     retry={"count": 3, "delay_ms": 3000}),
+        make_command("verify-snapshot", "Verify page elements loaded", "verification",
+                     'curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep "elements"',
+                     fail_on_error=True,
+                     retry={"count": 3, "delay_ms": 3000}),
+        make_check("verify-eslint", "TypeScript lint (ESLint)", "lint", "eslint",
+                    "npx eslint .", f"{WS}\\qontinui-web\\frontend"),
+        make_check("verify-tsc", "TypeScript type check", "typecheck", "tsc",
+                    "npx tsc --noEmit", f"{WS}\\qontinui-web\\frontend"),
+    ],
+    agentic=[make_agentic(
+        "Fix any issues found in the verification phase. For UI rendering issues, "
+        "inspect the component code and fix JSX/CSS problems. For lint/type errors, "
+        "fix the TypeScript source. Use sdk_snapshot and sdk_elements tools to inspect "
+        "the current page state and identify what's wrong."
+    )],
+)
+
+# ── Backend API + test workflow ───────────────────────────────────────────
+add_gt(
+    "GT: qontinui-web backend tests and checks",
+    f"Run the qontinui-web backend test suite and code quality checks at {WS}\\qontinui-web\\backend. "
+    "Runs pytest for unit/integration tests along with ruff and mypy. Fixes any failures.",
+    tags=["ground_truth", "command", "test", "python", "reference"],
+    checks=[
+        make_test("verify-pytest", "Run pytest", "repository",
+                  "poetry run pytest -x --tb=short",
+                  f"{WS}\\qontinui-web\\backend"),
+        make_check("verify-ruff-lint", "Python lint (ruff)", "lint", "ruff",
+                    "ruff check .", f"{WS}\\qontinui-web\\backend"),
+        make_check("verify-mypy", "Python type check (mypy)", "typecheck", "mypy",
+                    "mypy .", f"{WS}\\qontinui-web\\backend"),
+    ],
+    agentic=[make_agentic(
+        "Fix any test failures or code quality issues found in the verification phase. "
+        "For test failures, read the test output carefully and fix the implementation code "
+        "(not the tests) unless the tests are clearly wrong. For lint/type errors, fix the "
+        "source code to comply with the project's coding standards."
+    )],
+)
+
+# ── Multi-phase feature development workflow ──────────────────────────────
+add_gt(
+    "GT: Web frontend feature development",
+    "Develop a feature on the qontinui-web frontend. Sets up the environment, "
+    "runs code quality checks and UI verification, iterates with AI to fix issues, "
+    "and cleans up on completion. Uses all 3 step types across all 4 phases.",
+    tags=["ground_truth", "command", "ui_bridge", "prompt", "multi-phase", "reference"],
+    setup=[
+        make_command("setup-sdk-connect", "Connect UI Bridge SDK", "setup",
+                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/connect '
+                     '-H "Content-Type: application/json" '
+                     '-d "{\\"url\\": \\"http://localhost:3001\\"}"',
+                     fail_on_error=True),
+        make_prompt("setup-plan", "Plan the implementation", "setup",
+                    "Read the task description and plan the implementation approach. "
+                    "Identify which files need to be modified, what components are involved, "
+                    "and what the acceptance criteria are. Read the relevant source files."),
+    ],
+    checks=[
+        make_check("verify-eslint", "TypeScript lint (ESLint)", "lint", "eslint",
+                    "npx eslint .", f"{WS}\\qontinui-web\\frontend"),
+        make_check("verify-tsc", "TypeScript type check", "typecheck", "tsc",
+                    "npx tsc --noEmit", f"{WS}\\qontinui-web\\frontend"),
+        make_check("verify-prettier", "Prettier format check", "format", "prettier",
+                    "npx prettier --check .", f"{WS}\\qontinui-web\\frontend"),
+        make_command("verify-ui-elements", "Verify UI renders correctly", "verification",
+                     'curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep "elements"',
+                     fail_on_error=True,
+                     retry={"count": 3, "delay_ms": 3000}),
+        make_prompt("verify-ai-review", "AI review of implementation", "verification",
+                    "Review the verification results. Check if the feature is correctly implemented "
+                    "by examining the UI state via SDK tools and the code quality check results. "
+                    "If there are issues, describe exactly what needs to be fixed."),
+    ],
+    agentic=[make_agentic(
+        "Based on the verification results, implement or fix the feature. Use the Edit tool "
+        "to modify source files. Use sdk_snapshot and sdk_elements to inspect the current UI state. "
+        "Fix any lint, type, or formatting errors. Ensure the feature matches the requirements."
+    )],
+    completion=[
+        make_command("completion-format", "Auto-format code", "completion",
+                     "npx prettier --write .", f"{WS}\\qontinui-web\\frontend",
+                     fail_on_error=False),
+        make_prompt("completion-summary", "Summarize changes", "completion",
+                    "Write a concise summary of all changes made during this workflow. "
+                    "Include: files modified, features implemented, issues fixed, "
+                    "and any remaining considerations."),
+    ],
+    max_iterations=8,
+)
+
+# ── Runner Rust test workflow ─────────────────────────────────────────────
+add_gt(
+    "GT: qontinui-runner Rust tests and checks",
+    f"Run the qontinui-runner Rust test suite and code quality checks at {WS}\\qontinui-runner\\src-tauri. "
+    "Runs cargo test for unit tests along with cargo fmt and clippy. Fixes any failures.",
+    tags=["ground_truth", "command", "test", "rust", "reference"],
+    checks=[
+        make_test("verify-cargo-test", "Run cargo test", "repository",
+                  "cargo test -- --nocapture",
+                  f"{WS}\\qontinui-runner\\src-tauri"),
+        make_check("verify-cargo-fmt", "Rust format (cargo fmt)", "format", "cargo",
+                    "cargo fmt -- --check", f"{WS}\\qontinui-runner\\src-tauri"),
+        make_check("verify-cargo-clippy", "Rust lint (cargo clippy)", "lint", "cargo",
+                    "cargo clippy -- -D warnings", f"{WS}\\qontinui-runner\\src-tauri"),
+    ],
+    agentic=[make_agentic(
+        "Fix any test failures or code quality issues in the Rust codebase. "
+        "For test failures, read the test output and fix the implementation. "
+        "For clippy warnings, apply the suggested fixes. "
+        "For formatting issues, the agentic phase should fix the source formatting."
+    )],
+)
+
+# ── Service health check workflow ─────────────────────────────────────────
+add_gt(
+    "GT: Dev environment health check",
+    "Verify that all qontinui development services are running and healthy. "
+    "Checks the web backend API, web frontend, runner API, and supervisor.",
+    tags=["ground_truth", "command", "health", "reference"],
+    checks=[
+        make_command("verify-backend", "Check backend health", "verification",
+                     "curl -sf http://localhost:8000/health",
+                     fail_on_error=True),
+        make_command("verify-frontend", "Check frontend health", "verification",
+                     "curl -sf http://localhost:3001",
+                     fail_on_error=True),
+        make_command("verify-runner", "Check runner API health", "verification",
+                     "curl -sf http://localhost:9876/health",
+                     fail_on_error=True),
+        make_command("verify-supervisor", "Check supervisor health", "verification",
+                     "curl -sf http://localhost:9875/health",
+                     fail_on_error=True),
+    ],
+    agentic=[make_agentic(
+        "Some services failed their health check. Diagnose which services are down "
+        "by reading the dev logs in .dev-logs/. Try restarting failed services using "
+        "the dev-start.ps1 script (e.g., dev-start.ps1 -Backend for backend). "
+        "Wait for the service to start before the next verification cycle."
+    )],
+    max_iterations=3,
 )
 
 

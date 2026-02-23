@@ -200,3 +200,127 @@ pub async fn status(_state: State<SharedState>) -> Json<DevStartStatusResponse> 
 
     Json(DevStartStatusResponse { services })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_find_dev_start_script_returns_none_for_nonexistent_path() {
+        let result = find_dev_start_script(std::path::Path::new("/nonexistent/path/src-tauri"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_dev_start_script_finds_in_grandparent() {
+        // Create temp dir structure: tmp/parent/child/src-tauri with dev-start.ps1 in tmp/
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let child_dir = tmp.path().join("parent").join("child").join("src-tauri");
+        fs::create_dir_all(&child_dir).expect("failed to create child dirs");
+        // Place dev-start.ps1 at grandparent (tmp/parent/)
+        // The function looks at project_dir.parent().parent() first
+        // project_dir = tmp/parent/child/src-tauri
+        // parent = tmp/parent/child
+        // grandparent = tmp/parent
+        let script_path = tmp.path().join("parent").join("dev-start.ps1");
+        fs::write(&script_path, "# test script").expect("failed to write script");
+
+        let result = find_dev_start_script(&child_dir);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), script_path);
+    }
+
+    #[test]
+    fn test_find_dev_start_script_finds_in_parent() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let child_dir = tmp.path().join("src-tauri");
+        fs::create_dir_all(&child_dir).expect("failed to create child dir");
+        // Place dev-start.ps1 in the parent (tmp/)
+        let script_path = tmp.path().join("dev-start.ps1");
+        fs::write(&script_path, "# test script").expect("failed to write script");
+
+        let result = find_dev_start_script(&child_dir);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), script_path);
+    }
+
+    #[test]
+    fn test_find_dev_start_script_prefers_grandparent_over_parent() {
+        // Both grandparent and parent have dev-start.ps1; grandparent should win
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let child_dir = tmp.path().join("runner").join("src-tauri");
+        fs::create_dir_all(&child_dir).expect("failed to create child dirs");
+
+        let grandparent_script = tmp.path().join("dev-start.ps1");
+        fs::write(&grandparent_script, "# grandparent").expect("failed to write");
+        let parent_script = tmp.path().join("runner").join("dev-start.ps1");
+        fs::write(&parent_script, "# parent").expect("failed to write");
+
+        let result = find_dev_start_script(&child_dir);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), grandparent_script);
+    }
+
+    #[test]
+    fn test_dev_start_response_serializes() {
+        let response = DevStartResponse {
+            status: "success".to_string(),
+            flag: "Backend".to_string(),
+            stdout: "Started".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        let json = serde_json::to_string(&response).expect("should serialize");
+        assert!(json.contains("\"status\":\"success\""));
+        assert!(json.contains("\"flag\":\"Backend\""));
+        assert!(json.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn test_dev_start_response_serializes_null_exit_code() {
+        let response = DevStartResponse {
+            status: "timeout".to_string(),
+            flag: "All".to_string(),
+            stdout: String::new(),
+            stderr: "Timed out after 300s".to_string(),
+            exit_code: None,
+        };
+        let json = serde_json::to_string(&response).expect("should serialize");
+        assert!(json.contains("\"exit_code\":null"));
+    }
+
+    #[test]
+    fn test_service_status_serializes() {
+        let status = ServiceStatus {
+            name: "postgresql".to_string(),
+            port: 5432,
+            available: true,
+        };
+        let json = serde_json::to_string(&status).expect("should serialize");
+        assert!(json.contains("\"name\":\"postgresql\""));
+        assert!(json.contains("\"port\":5432"));
+        assert!(json.contains("\"available\":true"));
+    }
+
+    #[test]
+    fn test_dev_start_status_response_serializes() {
+        let response = DevStartStatusResponse {
+            services: vec![
+                ServiceStatus {
+                    name: "redis".to_string(),
+                    port: 6379,
+                    available: false,
+                },
+                ServiceStatus {
+                    name: "backend".to_string(),
+                    port: 8000,
+                    available: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&response).expect("should serialize");
+        assert!(json.contains("\"redis\""));
+        assert!(json.contains("\"backend\""));
+    }
+}

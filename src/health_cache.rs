@@ -64,3 +64,54 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cached_port_health_default_all_false() {
+        let health = CachedPortHealth::default();
+        assert!(!health.runner_port_open);
+        assert!(!health.runner_responding);
+        assert!(!health.vite_port_open);
+    }
+
+    #[test]
+    fn test_cached_port_health_clone() {
+        let health = CachedPortHealth {
+            runner_port_open: true,
+            runner_responding: true,
+            vite_port_open: false,
+        };
+        let cloned = health.clone();
+        assert_eq!(cloned.runner_port_open, true);
+        assert_eq!(cloned.runner_responding, true);
+        assert_eq!(cloned.vite_port_open, false);
+    }
+
+    #[test]
+    fn test_cached_port_health_debug_format() {
+        let health = CachedPortHealth {
+            runner_port_open: true,
+            runner_responding: false,
+            vite_port_open: true,
+        };
+        let debug_str = format!("{:?}", health);
+        assert!(debug_str.contains("runner_port_open: true"));
+        assert!(debug_str.contains("runner_responding: false"));
+        assert!(debug_str.contains("vite_port_open: true"));
+    }
+
+    #[test]
+    fn test_cached_port_health_all_true() {
+        let health = CachedPortHealth {
+            runner_port_open: true,
+            runner_responding: true,
+            vite_port_open: true,
+        };
+        assert!(health.runner_port_open);
+        assert!(health.runner_responding);
+        assert!(health.vite_port_open);
+    }
+}

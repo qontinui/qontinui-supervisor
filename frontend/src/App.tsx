@@ -17,15 +17,57 @@ export default function App() {
       <aside className="sidebar">
         <div className="sidebar-logo">Supervisor</div>
         <ul className="sidebar-nav">
-          <li><NavLink to="/dashboard" className={({ isActive }) => isActive ? 'active' : ''}>Dashboard</NavLink></li>
-          <li><NavLink to="/velocity" className={({ isActive }) => isActive ? 'active' : ''}>Velocity</NavLink></li>
-          <li><NavLink to="/velocity/compare" className={({ isActive }) => isActive ? 'active' : ''}>Compare</NavLink></li>
-          <li><NavLink to="/velocity/trace" className={({ isActive }) => isActive ? 'active' : ''}>Trace</NavLink></li>
-          <li><NavLink to="/runner-monitor" className={({ isActive }) => isActive ? 'active' : ''}>Runner Monitor</NavLink></li>
-          <li><NavLink to="/workflow-loop" className={({ isActive }) => isActive ? 'active' : ''}>Workflow Loop</NavLink></li>
-          <li><NavLink to="/evaluation" className={({ isActive }) => isActive ? 'active' : ''}>Evaluation</NavLink></li>
-          <li><NavLink to="/velocity-tests" className={({ isActive }) => isActive ? 'active' : ''}>Velocity Tests</NavLink></li>
-          <li><NavLink to="/velocity-improvement" className={({ isActive }) => isActive ? 'active' : ''}>Improvement</NavLink></li>
+          <li>
+            <NavLink to="/dashboard" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Dashboard
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/velocity" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Velocity
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
+              to="/velocity/compare"
+              className={({ isActive }) => (isActive ? 'active' : '')}
+            >
+              Compare
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/velocity/trace" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Trace
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/runner-monitor" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Runner Monitor
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/workflow-loop" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Workflow Loop
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/evaluation" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Evaluation
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/velocity-tests" className={({ isActive }) => (isActive ? 'active' : '')}>
+              Velocity Tests
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
+              to="/velocity-improvement"
+              className={({ isActive }) => (isActive ? 'active' : '')}
+            >
+              Improvement
+            </NavLink>
+          </li>
         </ul>
       </aside>
       <main className="main-content">

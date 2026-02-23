@@ -1,5 +1,15 @@
 import { useState } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from 'recharts';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  Cell,
+} from 'recharts';
 import { api, CompareResult } from '../lib/api';
 
 function formatMs(ms: number): string {
@@ -12,13 +22,20 @@ function getTimePreset(label: string): { start: string; end: string } {
   const now = new Date();
   const fmt = (d: Date) => d.toISOString();
   switch (label) {
-    case '5m': return { start: fmt(new Date(now.getTime() - 5 * 60000)), end: fmt(now) };
-    case '15m': return { start: fmt(new Date(now.getTime() - 15 * 60000)), end: fmt(now) };
-    case '30m': return { start: fmt(new Date(now.getTime() - 30 * 60000)), end: fmt(now) };
-    case '1h': return { start: fmt(new Date(now.getTime() - 3600000)), end: fmt(now) };
-    case '2h': return { start: fmt(new Date(now.getTime() - 7200000)), end: fmt(now) };
-    case '4h': return { start: fmt(new Date(now.getTime() - 14400000)), end: fmt(now) };
-    default: return { start: fmt(new Date(now.getTime() - 3600000)), end: fmt(now) };
+    case '5m':
+      return { start: fmt(new Date(now.getTime() - 5 * 60000)), end: fmt(now) };
+    case '15m':
+      return { start: fmt(new Date(now.getTime() - 15 * 60000)), end: fmt(now) };
+    case '30m':
+      return { start: fmt(new Date(now.getTime() - 30 * 60000)), end: fmt(now) };
+    case '1h':
+      return { start: fmt(new Date(now.getTime() - 3600000)), end: fmt(now) };
+    case '2h':
+      return { start: fmt(new Date(now.getTime() - 7200000)), end: fmt(now) };
+    case '4h':
+      return { start: fmt(new Date(now.getTime() - 14400000)), end: fmt(now) };
+    default:
+      return { start: fmt(new Date(now.getTime() - 3600000)), end: fmt(now) };
   }
 }
 
@@ -58,7 +75,7 @@ export default function VelocityCompare() {
   };
 
   // Chart data: show P95 comparison for top endpoints
-  const chartData = results.slice(0, 15).map(r => ({
+  const chartData = results.slice(0, 15).map((r) => ({
     endpoint: `${r.http_method} ${r.http_route.length > 30 ? r.http_route.slice(0, 30) + '...' : r.http_route}`,
     before_p95: Math.round(r.before_p95),
     after_p95: Math.round(r.after_p95),
@@ -75,9 +92,11 @@ export default function VelocityCompare() {
       <div className="card mb-2">
         <div className="flex gap-4 items-center" style={{ flexWrap: 'wrap' }}>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>Before (baseline)</label>
+            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+              Before (baseline)
+            </label>
             <div className="flex gap-2">
-              {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map(p => (
+              {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map((p) => (
                 <button
                   key={p}
                   className={`btn ${beforePreset === p ? 'btn-primary' : ''}`}
@@ -90,9 +109,11 @@ export default function VelocityCompare() {
             </div>
           </div>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>After (current)</label>
+            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+              After (current)
+            </label>
             <div className="flex gap-2">
-              {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map(p => (
+              {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map((p) => (
                 <button
                   key={p}
                   className={`btn ${afterPreset === p ? 'btn-primary' : ''}`}
@@ -105,11 +126,13 @@ export default function VelocityCompare() {
             </div>
           </div>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>Service (optional)</label>
+            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+              Service (optional)
+            </label>
             <select
               className="btn"
               value={service}
-              onChange={e => setService(e.target.value)}
+              onChange={(e) => setService(e.target.value)}
               style={{ fontSize: '0.8rem' }}
             >
               <option value="">All</option>
@@ -126,7 +149,11 @@ export default function VelocityCompare() {
         </div>
       </div>
 
-      {error && <div className="card mb-2"><p className="text-danger">{error}</p></div>}
+      {error && (
+        <div className="card mb-2">
+          <p className="text-danger">{error}</p>
+        </div>
+      )}
 
       {/* P95 comparison chart */}
       {chartData.length > 0 && (
@@ -135,14 +162,43 @@ export default function VelocityCompare() {
           <ResponsiveContainer width="100%" height={Math.max(300, chartData.length * 35)}>
             <BarChart data={chartData} layout="vertical" margin={{ left: 180 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis type="number" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} label={{ value: 'ms', position: 'insideBottomRight', fill: 'var(--text-muted)' }} />
-              <YAxis type="category" dataKey="endpoint" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} width={170} />
-              <Tooltip contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }} />
+              <XAxis
+                type="number"
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                label={{ value: 'ms', position: 'insideBottomRight', fill: 'var(--text-muted)' }}
+              />
+              <YAxis
+                type="category"
+                dataKey="endpoint"
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                width={170}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                }}
+              />
               <Legend />
-              <Bar dataKey="before_p95" name="Before P95" fill="var(--text-muted)" radius={[0, 4, 4, 0]} />
+              <Bar
+                dataKey="before_p95"
+                name="Before P95"
+                fill="var(--text-muted)"
+                radius={[0, 4, 4, 0]}
+              />
               <Bar dataKey="after_p95" name="After P95" radius={[0, 4, 4, 0]}>
                 {chartData.map((entry, i) => (
-                  <Cell key={i} fill={entry.change > 10 ? 'var(--danger)' : entry.change < -10 ? 'var(--success)' : 'var(--accent)'} />
+                  <Cell
+                    key={i}
+                    fill={
+                      entry.change > 10
+                        ? 'var(--danger)'
+                        : entry.change < -10
+                          ? 'var(--success)'
+                          : 'var(--accent)'
+                    }
+                  />
                 ))}
               </Bar>
             </BarChart>
@@ -183,11 +239,29 @@ export default function VelocityCompare() {
                     <td>{r.after_count}</td>
                     <td>{formatMs(r.after_p50)}</td>
                     <td>{formatMs(r.after_p95)}</td>
-                    <td className={r.p50_change_pct > 10 ? 'text-danger' : r.p50_change_pct < -10 ? 'text-success' : ''}>
-                      {r.p50_change_pct > 0 ? '+' : ''}{r.p50_change_pct.toFixed(1)}%
+                    <td
+                      className={
+                        r.p50_change_pct > 10
+                          ? 'text-danger'
+                          : r.p50_change_pct < -10
+                            ? 'text-success'
+                            : ''
+                      }
+                    >
+                      {r.p50_change_pct > 0 ? '+' : ''}
+                      {r.p50_change_pct.toFixed(1)}%
                     </td>
-                    <td className={r.p95_change_pct > 10 ? 'text-danger' : r.p95_change_pct < -10 ? 'text-success' : ''}>
-                      {r.p95_change_pct > 0 ? '+' : ''}{r.p95_change_pct.toFixed(1)}%
+                    <td
+                      className={
+                        r.p95_change_pct > 10
+                          ? 'text-danger'
+                          : r.p95_change_pct < -10
+                            ? 'text-success'
+                            : ''
+                      }
+                    >
+                      {r.p95_change_pct > 0 ? '+' : ''}
+                      {r.p95_change_pct.toFixed(1)}%
                     </td>
                   </tr>
                 ))}

@@ -94,6 +94,22 @@ pub async fn debug(
     State(state): State<SharedState>,
     Json(body): Json<DebugRequest>,
 ) -> Result<Json<GenericResponse>, Json<GenericResponse>> {
+    // Validate prompt length if provided
+    if let Some(ref prompt) = body.prompt {
+        if prompt.trim().is_empty() {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: "prompt must not be empty or whitespace-only".to_string(),
+            }));
+        }
+        if prompt.len() > 50_000 {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: format!("prompt too long ({} chars, max 50000)", prompt.len()),
+            }));
+        }
+    }
+
     let reason = body.prompt.as_deref().unwrap_or("Manual trigger");
     match ai_debug::spawn_ai_debug(&state, Some(reason)).await {
         Ok(()) => Ok(Json(GenericResponse {
@@ -198,6 +214,36 @@ pub async fn set_provider(
     State(state): State<SharedState>,
     Json(body): Json<ProviderRequest>,
 ) -> Result<Json<ProviderResponse>, Json<GenericResponse>> {
+    // Validate provider and model strings if provided
+    if let Some(ref provider) = body.provider {
+        if provider.trim().is_empty() {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: "provider must not be empty".to_string(),
+            }));
+        }
+        if provider.len() > 100 {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: "provider name too long (max 100 chars)".to_string(),
+            }));
+        }
+    }
+    if let Some(ref model) = body.model {
+        if model.trim().is_empty() {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: "model must not be empty".to_string(),
+            }));
+        }
+        if model.len() > 100 {
+            return Err(Json(GenericResponse {
+                status: "error".to_string(),
+                message: "model name too long (max 100 chars)".to_string(),
+            }));
+        }
+    }
+
     let response = {
         let mut ai = state.ai.write().await;
 

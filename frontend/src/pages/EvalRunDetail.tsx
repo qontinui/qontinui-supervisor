@@ -16,7 +16,11 @@ function formatDuration(ms: number | null): string {
 function ScoreCell({ score }: { score: number | null }) {
   if (score === null) return <td className="text-muted">-</td>;
   const color = score >= 4 ? 'var(--success)' : score >= 3 ? 'var(--warning)' : 'var(--danger)';
-  return <td style={{ color }} className="text-mono">{score}</td>;
+  return (
+    <td style={{ color }} className="text-mono">
+      {score}
+    </td>
+  );
 }
 
 export default function EvalRunDetail() {
@@ -33,12 +37,9 @@ export default function EvalRunDetail() {
   const loadData = useCallback(async () => {
     if (!id) return;
     try {
-      const [runData, allRuns] = await Promise.all([
-        api.evalRun(id),
-        api.evalRuns(),
-      ]);
+      const [runData, allRuns] = await Promise.all([api.evalRun(id), api.evalRuns()]);
       setData(runData);
-      setRuns(allRuns.filter(r => r.id !== id && r.status === 'completed'));
+      setRuns(allRuns.filter((r) => r.id !== id && r.status === 'completed'));
     } catch (err) {
       console.error('Failed to load eval run:', err);
     } finally {
@@ -46,7 +47,9 @@ export default function EvalRunDetail() {
     }
   }, [id]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const handleCompare = async () => {
     if (!id || !compareBaselineId) return;
@@ -59,7 +62,7 @@ export default function EvalRunDetail() {
   };
 
   const toggleExpand = (resultId: number) => {
-    setExpandedResult(prev => prev === resultId ? null : resultId);
+    setExpandedResult((prev) => (prev === resultId ? null : resultId));
   };
 
   if (loading) {
@@ -77,9 +80,13 @@ export default function EvalRunDetail() {
     <div>
       <div className="page-header">
         <h1 className="page-title">
-          <Link to="/evaluation" style={{ color: 'var(--text-muted)', textDecoration: 'none' }}>Evaluation</Link>
+          <Link to="/evaluation" style={{ color: 'var(--text-muted)', textDecoration: 'none' }}>
+            Evaluation
+          </Link>
           {' / '}
-          <span className="text-mono" style={{ fontSize: '0.9rem' }}>{run.id.slice(0, 8)}</span>
+          <span className="text-mono" style={{ fontSize: '0.9rem' }}>
+            {run.id.slice(0, 8)}
+          </span>
         </h1>
       </div>
 
@@ -87,16 +94,32 @@ export default function EvalRunDetail() {
       <div className="card mb-2">
         <div className="card-header">
           <span className="card-title">Run Summary</span>
-          <span className={
-            run.status === 'completed' ? 'text-success' :
-            run.status === 'running' ? 'text-warning' : 'text-danger'
-          }>
+          <span
+            className={
+              run.status === 'completed'
+                ? 'text-success'
+                : run.status === 'running'
+                  ? 'text-warning'
+                  : 'text-danger'
+            }
+          >
             {run.status}
           </span>
         </div>
 
         {/* Combined scores */}
-        <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Combined</div>
+        <div
+          style={{
+            marginBottom: '0.25rem',
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            color: 'var(--text-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+          }}
+        >
+          Combined
+        </div>
         <div className="stat-row">
           <div className="stat-item">
             <div className="stat-label">Overall</div>
@@ -132,16 +155,36 @@ export default function EvalRunDetail() {
 
         {/* GT vs Generic side by side */}
         {(run.gt_avg_overall !== null || run.gen_avg_overall !== null) && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border)' }}>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '1rem',
+              marginTop: '0.75rem',
+              paddingTop: '0.75rem',
+              borderTop: '1px solid var(--border)',
+            }}
+          >
             {/* Ground Truth */}
             <div>
-              <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              <div
+                style={{
+                  marginBottom: '0.25rem',
+                  fontSize: '0.75rem',
+                  fontWeight: 600,
+                  color: 'var(--success)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                }}
+              >
                 Ground Truth ({run.gt_count ?? 0})
               </div>
               <div className="stat-row" style={{ flexWrap: 'wrap' }}>
                 <div className="stat-item">
                   <div className="stat-label">Overall</div>
-                  <div className="text-mono" style={{ color: 'var(--success)' }}>{formatScore(run.gt_avg_overall)}</div>
+                  <div className="text-mono" style={{ color: 'var(--success)' }}>
+                    {formatScore(run.gt_avg_overall)}
+                  </div>
                 </div>
                 <div className="stat-item">
                   <div className="stat-label">Struct</div>
@@ -172,13 +215,24 @@ export default function EvalRunDetail() {
 
             {/* Generic */}
             <div>
-              <div style={{ marginBottom: '0.25rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              <div
+                style={{
+                  marginBottom: '0.25rem',
+                  fontSize: '0.75rem',
+                  fontWeight: 600,
+                  color: 'var(--accent)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                }}
+              >
                 Generic ({run.gen_count ?? 0})
               </div>
               <div className="stat-row" style={{ flexWrap: 'wrap' }}>
                 <div className="stat-item">
                   <div className="stat-label">Overall</div>
-                  <div className="text-mono" style={{ color: 'var(--accent)' }}>{formatScore(run.gen_avg_overall)}</div>
+                  <div className="text-mono" style={{ color: 'var(--accent)' }}>
+                    {formatScore(run.gen_avg_overall)}
+                  </div>
                 </div>
                 <div className="stat-item">
                   <div className="stat-label">Struct</div>
@@ -210,7 +264,8 @@ export default function EvalRunDetail() {
         )}
 
         <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-          Mode: {run.mode} | Prompts: {run.prompts_completed}/{run.prompts_total} | Started: {new Date(run.started_at).toLocaleString()}
+          Mode: {run.mode} | Prompts: {run.prompts_completed}/{run.prompts_total} | Started:{' '}
+          {new Date(run.started_at).toLocaleString()}
           {run.completed_at && <> | Completed: {new Date(run.completed_at).toLocaleString()}</>}
         </div>
       </div>
@@ -221,10 +276,12 @@ export default function EvalRunDetail() {
           <div className="card-header">
             <span className="card-title">Compare with Baseline</span>
           </div>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', padding: '0.5rem 0' }}>
+          <div
+            style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', padding: '0.5rem 0' }}
+          >
             <select
               value={compareBaselineId}
-              onChange={e => setCompareBaselineId(e.target.value)}
+              onChange={(e) => setCompareBaselineId(e.target.value)}
               style={{
                 background: 'var(--bg-tertiary)',
                 color: 'var(--text-primary)',
@@ -235,13 +292,18 @@ export default function EvalRunDetail() {
               }}
             >
               <option value="">Select baseline run...</option>
-              {runs.map(r => (
+              {runs.map((r) => (
                 <option key={r.id} value={r.id}>
-                  {r.id.slice(0, 8)} — {formatScore(r.avg_overall_score)} avg — {new Date(r.started_at).toLocaleDateString()}
+                  {r.id.slice(0, 8)} — {formatScore(r.avg_overall_score)} avg —{' '}
+                  {new Date(r.started_at).toLocaleDateString()}
                 </option>
               ))}
             </select>
-            <button className="btn btn-primary" onClick={handleCompare} disabled={!compareBaselineId}>
+            <button
+              className="btn btn-primary"
+              onClick={handleCompare}
+              disabled={!compareBaselineId}
+            >
               Compare
             </button>
           </div>
@@ -251,24 +313,36 @@ export default function EvalRunDetail() {
               <div className="stat-row">
                 <div className="stat-item">
                   <div className="stat-label">Avg Delta</div>
-                  <div className="text-mono" style={{
-                    color: (compareReport.aggregate.avg_overall_delta ?? 0) > 0 ? 'var(--success)' :
-                           (compareReport.aggregate.avg_overall_delta ?? 0) < 0 ? 'var(--danger)' : 'var(--text-secondary)',
-                  }}>
+                  <div
+                    className="text-mono"
+                    style={{
+                      color:
+                        (compareReport.aggregate.avg_overall_delta ?? 0) > 0
+                          ? 'var(--success)'
+                          : (compareReport.aggregate.avg_overall_delta ?? 0) < 0
+                            ? 'var(--danger)'
+                            : 'var(--text-secondary)',
+                    }}
+                  >
                     {compareReport.aggregate.avg_overall_delta !== null
-                      ? (compareReport.aggregate.avg_overall_delta > 0 ? '+' : '') + compareReport.aggregate.avg_overall_delta.toFixed(2)
+                      ? (compareReport.aggregate.avg_overall_delta > 0 ? '+' : '') +
+                        compareReport.aggregate.avg_overall_delta.toFixed(2)
                       : '-'}
                   </div>
                 </div>
                 <div className="stat-item">
                   <div className="stat-label">Regressions</div>
-                  <div className={`text-mono ${compareReport.aggregate.regressions > 0 ? 'text-danger' : ''}`}>
+                  <div
+                    className={`text-mono ${compareReport.aggregate.regressions > 0 ? 'text-danger' : ''}`}
+                  >
                     {compareReport.aggregate.regressions}
                   </div>
                 </div>
                 <div className="stat-item">
                   <div className="stat-label">Improvements</div>
-                  <div className={`text-mono ${compareReport.aggregate.improvements > 0 ? 'text-success' : ''}`}>
+                  <div
+                    className={`text-mono ${compareReport.aggregate.improvements > 0 ? 'text-success' : ''}`}
+                  >
                     {compareReport.aggregate.improvements}
                   </div>
                 </div>
@@ -289,20 +363,32 @@ export default function EvalRunDetail() {
                     </tr>
                   </thead>
                   <tbody>
-                    {compareReport.per_prompt.map(p => (
+                    {compareReport.per_prompt.map((p) => (
                       <tr key={p.test_prompt_id}>
-                        <td className="text-mono" style={{ fontSize: '0.8rem' }}>{p.test_prompt_id}</td>
+                        <td className="text-mono" style={{ fontSize: '0.8rem' }}>
+                          {p.test_prompt_id}
+                        </td>
                         <td className="text-mono">{formatScore(p.baseline_overall)}</td>
                         <td className="text-mono">{formatScore(p.current_overall)}</td>
-                        <td className="text-mono" style={{
-                          color: (p.delta ?? 0) > 0 ? 'var(--success)' : (p.delta ?? 0) < 0 ? 'var(--danger)' : '',
-                        }}>
+                        <td
+                          className="text-mono"
+                          style={{
+                            color:
+                              (p.delta ?? 0) > 0
+                                ? 'var(--success)'
+                                : (p.delta ?? 0) < 0
+                                  ? 'var(--danger)'
+                                  : '',
+                          }}
+                        >
                           {p.delta !== null ? (p.delta > 0 ? '+' : '') + p.delta.toFixed(2) : '-'}
                         </td>
                         <td>
                           {p.regression && <span className="text-danger">Regression</span>}
                           {p.improvement && <span className="text-success">Improved</span>}
-                          {!p.regression && !p.improvement && <span className="text-muted">Same</span>}
+                          {!p.regression && !p.improvement && (
+                            <span className="text-muted">Same</span>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -342,13 +428,22 @@ export default function EvalRunDetail() {
                     <td className="text-mono" style={{ fontSize: '0.8rem' }}>
                       {r.generation_error || r.scoring_error ? (
                         <span style={{ color: 'var(--danger)' }}>{r.test_prompt_id}</span>
-                      ) : r.test_prompt_id}
+                      ) : (
+                        r.test_prompt_id
+                      )}
                     </td>
-                    <td className="text-mono" style={{
-                      color: (r.overall_score ?? 0) >= 4 ? 'var(--success)' :
-                             (r.overall_score ?? 0) >= 3 ? 'var(--warning)' : 'var(--danger)',
-                      fontWeight: 600,
-                    }}>
+                    <td
+                      className="text-mono"
+                      style={{
+                        color:
+                          (r.overall_score ?? 0) >= 4
+                            ? 'var(--success)'
+                            : (r.overall_score ?? 0) >= 3
+                              ? 'var(--warning)'
+                              : 'var(--danger)',
+                        fontWeight: 600,
+                      }}
+                    >
                       {formatScore(r.overall_score)}
                     </td>
                     <ScoreCell score={r.structural_correctness} />
@@ -357,48 +452,95 @@ export default function EvalRunDetail() {
                     <ScoreCell score={r.step_completeness} />
                     <ScoreCell score={r.prompt_quality} />
                     <ScoreCell score={r.determinism} />
-                    <td className="text-mono" style={{ fontSize: '0.8rem' }}>{formatDuration(r.generation_duration_ms)}</td>
-                    <td className="text-mono" style={{ fontSize: '0.8rem' }}>{formatDuration(r.scoring_duration_ms)}</td>
+                    <td className="text-mono" style={{ fontSize: '0.8rem' }}>
+                      {formatDuration(r.generation_duration_ms)}
+                    </td>
+                    <td className="text-mono" style={{ fontSize: '0.8rem' }}>
+                      {formatDuration(r.scoring_duration_ms)}
+                    </td>
                   </tr>
                   {expandedResult === r.id && (
                     <tr key={`${r.id}-detail`}>
-                      <td colSpan={10} style={{ background: 'var(--bg-tertiary)', padding: '0.75rem' }}>
+                      <td
+                        colSpan={10}
+                        style={{ background: 'var(--bg-tertiary)', padding: '0.75rem' }}
+                      >
                         {r.generation_error && (
                           <div style={{ marginBottom: '0.5rem' }}>
                             <strong className="text-danger">Generation Error:</strong>
-                            <pre style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', marginTop: '0.25rem' }}>{r.generation_error}</pre>
+                            <pre
+                              style={{
+                                fontSize: '0.8rem',
+                                whiteSpace: 'pre-wrap',
+                                marginTop: '0.25rem',
+                              }}
+                            >
+                              {r.generation_error}
+                            </pre>
                           </div>
                         )}
                         {r.scoring_error && (
                           <div style={{ marginBottom: '0.5rem' }}>
                             <strong className="text-danger">Scoring Error:</strong>
-                            <pre style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', marginTop: '0.25rem' }}>{r.scoring_error}</pre>
+                            <pre
+                              style={{
+                                fontSize: '0.8rem',
+                                whiteSpace: 'pre-wrap',
+                                marginTop: '0.25rem',
+                              }}
+                            >
+                              {r.scoring_error}
+                            </pre>
                           </div>
                         )}
-                        {r.score_rationales && (() => {
-                          try {
-                            const rationales = JSON.parse(r.score_rationales);
-                            return (
-                              <div>
-                                <strong>Score Rationales:</strong>
-                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginTop: '0.25rem' }}>
-                                  {Object.entries(rationales).map(([key, val]: [string, unknown]) => {
-                                    const v = val as { score: number; rationale: string };
-                                    return (
-                                      <div key={key} style={{ fontSize: '0.8rem', padding: '0.25rem 0.5rem', background: 'var(--bg-secondary)', borderRadius: 4 }}>
-                                        <strong>{key}:</strong> {v.score}/5 — {v.rationale}
-                                      </div>
-                                    );
-                                  })}
+                        {r.score_rationales &&
+                          (() => {
+                            try {
+                              const rationales = JSON.parse(r.score_rationales);
+                              return (
+                                <div>
+                                  <strong>Score Rationales:</strong>
+                                  <div
+                                    style={{
+                                      display: 'grid',
+                                      gridTemplateColumns: '1fr 1fr',
+                                      gap: '0.5rem',
+                                      marginTop: '0.25rem',
+                                    }}
+                                  >
+                                    {Object.entries(rationales).map(
+                                      ([key, val]: [string, unknown]) => {
+                                        const v = val as { score: number; rationale: string };
+                                        return (
+                                          <div
+                                            key={key}
+                                            style={{
+                                              fontSize: '0.8rem',
+                                              padding: '0.25rem 0.5rem',
+                                              background: 'var(--bg-secondary)',
+                                              borderRadius: 4,
+                                            }}
+                                          >
+                                            <strong>{key}:</strong> {v.score}/5 — {v.rationale}
+                                          </div>
+                                        );
+                                      },
+                                    )}
+                                  </div>
                                 </div>
-                              </div>
-                            );
-                          } catch {
-                            return <pre style={{ fontSize: '0.8rem' }}>{r.score_rationales}</pre>;
-                          }
-                        })()}
+                              );
+                            } catch {
+                              return <pre style={{ fontSize: '0.8rem' }}>{r.score_rationales}</pre>;
+                            }
+                          })()}
                         {r.task_run_id && (
-                          <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                          <div
+                            style={{
+                              marginTop: '0.5rem',
+                              fontSize: '0.8rem',
+                              color: 'var(--text-muted)',
+                            }}
+                          >
                             Task Run: {r.task_run_id} | Workflow: {r.workflow_id}
                           </div>
                         )}
@@ -408,7 +550,11 @@ export default function EvalRunDetail() {
                 </>
               ))}
               {results.length === 0 && (
-                <tr><td colSpan={10} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No results yet.</td></tr>
+                <tr>
+                  <td colSpan={10} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No results yet.
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

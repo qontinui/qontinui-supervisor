@@ -1,6 +1,22 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { api, VtStatus, VtRun, VtRunWithResults, VtResult, VtTrendPoint, VtDiagnostics } from '../lib/api';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
+import {
+  api,
+  VtStatus,
+  VtRun,
+  VtRunWithResults,
+  VtResult,
+  VtTrendPoint,
+  VtDiagnostics,
+} from '../lib/api';
 
 function scoreColor(score: number | null): string {
   if (score === null) return 'var(--text-muted)';
@@ -33,22 +49,24 @@ const BOTTLENECK_COLORS: Record<string, string> = {
   'TTFB Slow': '#f97316',
   'Render Slow': '#3b82f6',
   'Network Slow': '#06b6d4',
-  'Healthy': 'var(--success)',
+  Healthy: 'var(--success)',
 };
 
 function BottleneckBadge({ type }: { type: string | null }) {
   if (!type) return <span style={{ color: 'var(--text-muted)' }}>-</span>;
   const color = BOTTLENECK_COLORS[type] || 'var(--text-muted)';
   return (
-    <span style={{
-      display: 'inline-block',
-      padding: '2px 8px',
-      borderRadius: 4,
-      fontSize: '0.75rem',
-      fontWeight: 600,
-      color: '#fff',
-      background: color,
-    }}>
+    <span
+      style={{
+        display: 'inline-block',
+        padding: '2px 8px',
+        borderRadius: 4,
+        fontSize: '0.75rem',
+        fontWeight: 600,
+        color: '#fff',
+        background: color,
+      }}
+    >
       {type}
     </span>
   );
@@ -70,10 +88,19 @@ function TimingBar({ result }: { result: VtResult }) {
     { label: 'FCP', ms: Math.max(0, fcp - domInteractive), color: '#22c55e' },
     { label: 'DOM Complete', ms: Math.max(0, domComplete - fcp), color: '#3b82f6' },
     { label: 'Key Element', ms: Math.max(0, total - domComplete), color: '#a855f7' },
-  ].filter(s => s.ms > 0);
+  ].filter((s) => s.ms > 0);
 
   return (
-    <div style={{ display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', background: 'var(--bg-tertiary)', marginTop: 4 }}>
+    <div
+      style={{
+        display: 'flex',
+        height: 8,
+        borderRadius: 4,
+        overflow: 'hidden',
+        background: 'var(--bg-tertiary)',
+        marginTop: 4,
+      }}
+    >
       {segments.map((seg, i) => (
         <div
           key={i}
@@ -90,7 +117,10 @@ function TimingBar({ result }: { result: VtResult }) {
 }
 
 function ResourceTable({ resources }: { resources: VtDiagnostics['resources'] }) {
-  if (!resources || resources.length === 0) return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No resources recorded</div>;
+  if (!resources || resources.length === 0)
+    return (
+      <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No resources recorded</div>
+    );
 
   const sorted = [...resources].sort((a, b) => b.duration - a.duration).slice(0, 10);
 
@@ -112,12 +142,24 @@ function ResourceTable({ resources }: { resources: VtDiagnostics['resources'] })
             const isSlowResource = r.duration > 500;
             return (
               <tr key={i} style={{ color: isSlowResource ? 'var(--danger)' : 'inherit' }}>
-                <td title={r.name} style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <td
+                  title={r.name}
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   {shortName}
                 </td>
                 <td>{r.initiatorType}</td>
-                <td className="text-mono" style={{ textAlign: 'right' }}>{formatMs(r.duration)}</td>
-                <td className="text-mono" style={{ textAlign: 'right' }}>{formatBytes(r.transferSize)}</td>
+                <td className="text-mono" style={{ textAlign: 'right' }}>
+                  {formatMs(r.duration)}
+                </td>
+                <td className="text-mono" style={{ textAlign: 'right' }}>
+                  {formatBytes(r.transferSize)}
+                </td>
               </tr>
             );
           })}
@@ -128,7 +170,10 @@ function ResourceTable({ resources }: { resources: VtDiagnostics['resources'] })
 }
 
 function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
-  if (!tasks || tasks.length === 0) return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No long tasks detected</div>;
+  if (!tasks || tasks.length === 0)
+    return (
+      <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No long tasks detected</div>
+    );
 
   const totalBlocking = tasks.reduce((sum, t) => sum + (t.duration || 0), 0);
 
@@ -141,12 +186,21 @@ function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
         const dur = t.duration || 0;
         const color = dur > 500 ? 'var(--danger)' : dur > 250 ? '#f97316' : 'var(--warning)';
         const maxBar = 1000;
-        const barWidth = Math.min(dur / maxBar * 100, 100);
+        const barWidth = Math.min((dur / maxBar) * 100, 100);
         return (
           <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
-            <span className="text-mono" style={{ width: 60, textAlign: 'right', color }}>{formatMs(dur)}</span>
+            <span className="text-mono" style={{ width: 60, textAlign: 'right', color }}>
+              {formatMs(dur)}
+            </span>
             <div style={{ flex: 1, background: 'var(--bg-tertiary)', borderRadius: 2, height: 10 }}>
-              <div style={{ width: `${barWidth}%`, background: color, height: '100%', borderRadius: 2 }} />
+              <div
+                style={{
+                  width: `${barWidth}%`,
+                  background: color,
+                  height: '100%',
+                  borderRadius: 2,
+                }}
+              />
             </div>
           </div>
         );
@@ -156,7 +210,12 @@ function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
 }
 
 function ScriptAttributionTable({ scripts }: { scripts: VtDiagnostics['scriptAttribution'] }) {
-  if (!scripts || scripts.length === 0) return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No LoAF data (requires Chrome 123+)</div>;
+  if (!scripts || scripts.length === 0)
+    return (
+      <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+        No LoAF data (requires Chrome 123+)
+      </div>
+    );
 
   return (
     <div style={{ fontSize: '0.8rem' }}>
@@ -172,18 +231,50 @@ function ScriptAttributionTable({ scripts }: { scripts: VtDiagnostics['scriptAtt
         </thead>
         <tbody>
           {scripts.map((s, i) => {
-            const fileName = s.sourceURL.split('/').pop()?.split('?')[0] || s.sourceURL || '(unknown)';
-            const color = s.duration > 500 ? 'var(--danger)' : s.duration > 250 ? '#f97316' : s.duration > 100 ? 'var(--warning)' : 'inherit';
+            const fileName =
+              s.sourceURL.split('/').pop()?.split('?')[0] || s.sourceURL || '(unknown)';
+            const color =
+              s.duration > 500
+                ? 'var(--danger)'
+                : s.duration > 250
+                  ? '#f97316'
+                  : s.duration > 100
+                    ? 'var(--warning)'
+                    : 'inherit';
             return (
               <tr key={i} style={{ color }}>
-                <td title={s.sourceURL} style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <td
+                  title={s.sourceURL}
+                  style={{
+                    maxWidth: 200,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   {fileName}
                 </td>
-                <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <td
+                  style={{
+                    maxWidth: 150,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   {s.sourceFunctionName || '(anonymous)'}
                 </td>
-                <td className="text-mono" style={{ textAlign: 'right' }}>{formatMs(s.duration)}</td>
-                <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <td className="text-mono" style={{ textAlign: 'right' }}>
+                  {formatMs(s.duration)}
+                </td>
+                <td
+                  style={{
+                    maxWidth: 150,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   {s.invoker || '-'}
                 </td>
               </tr>
@@ -196,16 +287,26 @@ function ScriptAttributionTable({ scripts }: { scripts: VtDiagnostics['scriptAtt
 }
 
 function DiagnosticDetail({ result }: { result: VtResult }) {
-  const diag: VtDiagnostics | null = result.diagnostics_json ? (() => {
-    try { return JSON.parse(result.diagnostics_json!) as VtDiagnostics; } catch { return null; }
-  })() : null;
+  const diag: VtDiagnostics | null = result.diagnostics_json
+    ? (() => {
+        try {
+          return JSON.parse(result.diagnostics_json!) as VtDiagnostics;
+        } catch {
+          return null;
+        }
+      })()
+    : null;
 
-  const bottleneckColor = result.bottleneck ? BOTTLENECK_COLORS[result.bottleneck] || 'var(--text-muted)' : 'var(--text-muted)';
+  const bottleneckColor = result.bottleneck
+    ? BOTTLENECK_COLORS[result.bottleneck] || 'var(--text-muted)'
+    : 'var(--text-muted)';
 
   // Build explanation text for bottleneck
   let explanation = '';
   if (result.bottleneck === 'Backend Slow' && result.api_response_time_ms != null) {
-    const pct = result.load_time_ms ? ((result.api_response_time_ms / result.load_time_ms) * 100).toFixed(0) : '?';
+    const pct = result.load_time_ms
+      ? ((result.api_response_time_ms / result.load_time_ms) * 100).toFixed(0)
+      : '?';
     explanation = `API response took ${formatMs(result.api_response_time_ms)} (${pct}% of total load time)`;
   } else if (result.bottleneck === 'JS Blocking') {
     explanation = `${result.long_task_count} long tasks totaling ${formatMs(result.long_task_total_ms)} of main thread blocking`;
@@ -223,11 +324,26 @@ function DiagnosticDetail({ result }: { result: VtResult }) {
   }
 
   return (
-    <div style={{ padding: '12px 16px', background: 'var(--bg-secondary)', borderTop: '1px solid var(--border)' }}>
+    <div
+      style={{
+        padding: '12px 16px',
+        background: 'var(--bg-secondary)',
+        borderTop: '1px solid var(--border)',
+      }}
+    >
       {/* Section A: Timing Phases */}
       <div style={{ marginBottom: 12 }}>
-        <div style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: 6 }}>Timing Breakdown</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8, fontSize: '0.8rem' }}>
+        <div style={{ fontWeight: 600, fontSize: '0.85rem', marginBottom: 6 }}>
+          Timing Breakdown
+        </div>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(5, 1fr)',
+            gap: 8,
+            fontSize: '0.8rem',
+          }}
+        >
           <div>
             <div style={{ color: 'var(--text-muted)' }}>TTFB</div>
             <div className="text-mono">{formatMs(result.ttfb_ms)}</div>
@@ -246,9 +362,18 @@ function DiagnosticDetail({ result }: { result: VtResult }) {
           </div>
           <div>
             <div style={{ color: 'var(--text-muted)' }}>API Time</div>
-            <div className="text-mono" style={{ color: (result.api_response_time_ms ?? 0) > 500 ? 'var(--danger)' : 'inherit' }}>
+            <div
+              className="text-mono"
+              style={{
+                color: (result.api_response_time_ms ?? 0) > 500 ? 'var(--danger)' : 'inherit',
+              }}
+            >
               {formatMs(result.api_response_time_ms)}
-              {result.api_status_code != null && <span style={{ color: 'var(--text-muted)', marginLeft: 4 }}>({result.api_status_code})</span>}
+              {result.api_status_code != null && (
+                <span style={{ color: 'var(--text-muted)', marginLeft: 4 }}>
+                  ({result.api_status_code})
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -269,16 +394,27 @@ function DiagnosticDetail({ result }: { result: VtResult }) {
       )}
 
       {/* Section D: Bottleneck Summary */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--bg-tertiary)' }}>
-        <span style={{
-          display: 'inline-block',
-          padding: '4px 12px',
-          borderRadius: 4,
-          fontSize: '0.85rem',
-          fontWeight: 700,
-          color: '#fff',
-          background: bottleneckColor,
-        }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          padding: '8px 12px',
+          borderRadius: 6,
+          background: 'var(--bg-tertiary)',
+        }}
+      >
+        <span
+          style={{
+            display: 'inline-block',
+            padding: '4px 12px',
+            borderRadius: 4,
+            fontSize: '0.85rem',
+            fontWeight: 700,
+            color: '#fff',
+            background: bottleneckColor,
+          }}
+        >
           {result.bottleneck || 'Unknown'}
         </span>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{explanation}</span>
@@ -299,16 +435,12 @@ export default function VelocityTest() {
 
   const loadData = useCallback(async () => {
     try {
-      const [s, r, t] = await Promise.all([
-        api.vtStatus(),
-        api.vtRuns(),
-        api.vtTrend(),
-      ]);
+      const [s, r, t] = await Promise.all([api.vtStatus(), api.vtRuns(), api.vtTrend()]);
       setStatus(s);
       setRuns(r);
       setTrend(t);
 
-      const latestCompleted = r.find(run => run.status === 'completed');
+      const latestCompleted = r.find((run) => run.status === 'completed');
       if (latestCompleted) {
         const detail = await api.vtRun(latestCompleted.id);
         if (detail) setLatestResults(detail);
@@ -320,7 +452,9 @@ export default function VelocityTest() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   useEffect(() => {
     if (!status?.running) return;
@@ -332,13 +466,15 @@ export default function VelocityTest() {
           const [r, t] = await Promise.all([api.vtRuns(), api.vtTrend()]);
           setRuns(r);
           setTrend(t);
-          const latestCompleted = r.find(run => run.status === 'completed');
+          const latestCompleted = r.find((run) => run.status === 'completed');
           if (latestCompleted) {
             const detail = await api.vtRun(latestCompleted.id);
             if (detail) setLatestResults(detail);
           }
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }, 2000);
     return () => clearInterval(interval);
   }, [status?.running]);
@@ -394,12 +530,16 @@ export default function VelocityTest() {
           {status?.running ? (
             <>
               <span className="text-mono" style={{ fontSize: '0.85rem', color: 'var(--warning)' }}>
-                Testing: {(status.current_test_index + 1)}/{status.total_tests}
+                Testing: {status.current_test_index + 1}/{status.total_tests}
                 {status.current_test_index < testNames.length && (
                   <> — {testNames[status.current_test_index]}</>
                 )}
               </span>
-              <button className="btn" onClick={handleStop} style={{ background: 'var(--danger)', color: '#fff' }}>
+              <button
+                className="btn"
+                onClick={handleStop}
+                style={{ background: 'var(--danger)', color: '#fff' }}
+              >
                 Stop
               </button>
             </>
@@ -416,16 +556,21 @@ export default function VelocityTest() {
         <div className="card mb-2" style={{ borderLeft: '3px solid var(--warning)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <div className="text-mono" style={{ fontSize: '0.85rem' }}>
-              Run: <span style={{ color: 'var(--text-muted)' }}>{status.current_run_id?.slice(0, 8)}...</span>
+              Run:{' '}
+              <span style={{ color: 'var(--text-muted)' }}>
+                {status.current_run_id?.slice(0, 8)}...
+              </span>
             </div>
             <div style={{ flex: 1, background: 'var(--bg-tertiary)', borderRadius: 4, height: 8 }}>
-              <div style={{
-                width: `${status.total_tests > 0 ? ((status.current_test_index + 1) / status.total_tests * 100) : 0}%`,
-                background: 'var(--accent)',
-                height: '100%',
-                borderRadius: 4,
-                transition: 'width 0.3s ease',
-              }} />
+              <div
+                style={{
+                  width: `${status.total_tests > 0 ? ((status.current_test_index + 1) / status.total_tests) * 100 : 0}%`,
+                  background: 'var(--accent)',
+                  height: '100%',
+                  borderRadius: 4,
+                  transition: 'width 0.3s ease',
+                }}
+              />
             </div>
           </div>
         </div>
@@ -454,7 +599,7 @@ export default function VelocityTest() {
                 </tr>
               </thead>
               <tbody>
-                {latestResults.results.map(r => (
+                {latestResults.results.map((r) => (
                   <React.Fragment key={r.id}>
                     <tr
                       onClick={() => setExpandedResultId(expandedResultId === r.id ? null : r.id)}
@@ -465,19 +610,34 @@ export default function VelocityTest() {
                         {formatMs(r.load_time_ms)}
                         <TimingBar result={r} />
                       </td>
-                      <td className="text-mono" style={{ color: (r.api_response_time_ms ?? 0) > 500 ? 'var(--danger)' : 'inherit' }}>
+                      <td
+                        className="text-mono"
+                        style={{
+                          color: (r.api_response_time_ms ?? 0) > 500 ? 'var(--danger)' : 'inherit',
+                        }}
+                      >
                         {formatMs(r.api_response_time_ms)}
                       </td>
-                      <td className="text-mono" style={{ color: r.console_errors > 0 ? 'var(--danger)' : 'var(--success)' }}>
+                      <td
+                        className="text-mono"
+                        style={{ color: r.console_errors > 0 ? 'var(--danger)' : 'var(--success)' }}
+                      >
                         {r.console_errors}
                       </td>
                       <td>
-                        <span style={{ color: r.element_found ? 'var(--success)' : 'var(--danger)' }}>
+                        <span
+                          style={{ color: r.element_found ? 'var(--success)' : 'var(--danger)' }}
+                        >
                           {r.element_found ? 'Yes' : 'No'}
                         </span>
                       </td>
-                      <td><BottleneckBadge type={r.bottleneck} /></td>
-                      <td className="text-mono" style={{ color: scoreColor(r.score), fontWeight: 600 }}>
+                      <td>
+                        <BottleneckBadge type={r.bottleneck} />
+                      </td>
+                      <td
+                        className="text-mono"
+                        style={{ color: scoreColor(r.score), fontWeight: 600 }}
+                      >
                         {formatScore(r.score)}
                       </td>
                     </tr>
@@ -501,7 +661,9 @@ export default function VelocityTest() {
         <div className="card mb-2">
           <div className="card-header">
             <span className="card-title">Score Trend</span>
-            <span className="text-muted" style={{ fontSize: '0.8rem' }}>{trend.length} runs</span>
+            <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+              {trend.length} runs
+            </span>
           </div>
           <ResponsiveContainer width="100%" height={200}>
             <LineChart data={trend} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
@@ -511,12 +673,13 @@ export default function VelocityTest() {
                 tickFormatter={(v: string) => new Date(v).toLocaleDateString()}
                 tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
               />
-              <YAxis
-                domain={[0, 100]}
-                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-              />
+              <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} />
               <Tooltip
-                contentStyle={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 6 }}
+                contentStyle={{
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                }}
                 labelFormatter={(v: string) => new Date(v).toLocaleString()}
                 formatter={(value: number) => [value.toFixed(1), 'Score']}
               />
@@ -536,7 +699,9 @@ export default function VelocityTest() {
       <div className="card">
         <div className="card-header">
           <span className="card-title">Run History</span>
-          <span className="text-muted" style={{ fontSize: '0.8rem' }}>{runs.length} runs</span>
+          <span className="text-muted" style={{ fontSize: '0.8rem' }}>
+            {runs.length} runs
+          </span>
         </div>
         <div className="table-container">
           <table>
@@ -550,27 +715,36 @@ export default function VelocityTest() {
               </tr>
             </thead>
             <tbody>
-              {runs.map(r => (
+              {runs.map((r) => (
                 <React.Fragment key={r.id}>
-                  <tr
-                    onClick={() => handleExpandRun(r.id)}
-                    style={{ cursor: 'pointer' }}
-                  >
+                  <tr onClick={() => handleExpandRun(r.id)} style={{ cursor: 'pointer' }}>
                     <td className="text-mono" style={{ fontSize: '0.8rem' }}>
                       {r.id.slice(0, 8)}...
                     </td>
                     <td>
-                      <span className={
-                        r.status === 'completed' ? 'text-success' :
-                        r.status === 'running' ? 'text-warning' :
-                        r.status === 'failed' ? 'text-danger' :
-                        r.status === 'stopped' ? 'text-muted' : ''
-                      }>
+                      <span
+                        className={
+                          r.status === 'completed'
+                            ? 'text-success'
+                            : r.status === 'running'
+                              ? 'text-warning'
+                              : r.status === 'failed'
+                                ? 'text-danger'
+                                : r.status === 'stopped'
+                                  ? 'text-muted'
+                                  : ''
+                        }
+                      >
                         {r.status}
                       </span>
                     </td>
-                    <td>{r.tests_completed}/{r.tests_total}</td>
-                    <td className="text-mono" style={{ color: scoreColor(r.overall_score), fontWeight: 600 }}>
+                    <td>
+                      {r.tests_completed}/{r.tests_total}
+                    </td>
+                    <td
+                      className="text-mono"
+                      style={{ color: scoreColor(r.overall_score), fontWeight: 600 }}
+                    >
                       {formatScore(r.overall_score)}
                     </td>
                     <td>{new Date(r.started_at).toLocaleString()}</td>
@@ -589,15 +763,28 @@ export default function VelocityTest() {
                             </tr>
                           </thead>
                           <tbody>
-                            {expandedResults.results.map(er => (
+                            {expandedResults.results.map((er) => (
                               <tr key={er.id}>
                                 <td style={{ paddingLeft: '2rem' }}>{er.test_name}</td>
                                 <td className="text-mono">{formatMs(er.load_time_ms)}</td>
-                                <td className="text-mono" style={{ color: (er.api_response_time_ms ?? 0) > 500 ? 'var(--danger)' : 'inherit' }}>
+                                <td
+                                  className="text-mono"
+                                  style={{
+                                    color:
+                                      (er.api_response_time_ms ?? 0) > 500
+                                        ? 'var(--danger)'
+                                        : 'inherit',
+                                  }}
+                                >
                                   {formatMs(er.api_response_time_ms)}
                                 </td>
-                                <td><BottleneckBadge type={er.bottleneck} /></td>
-                                <td className="text-mono" style={{ color: scoreColor(er.score), fontWeight: 600 }}>
+                                <td>
+                                  <BottleneckBadge type={er.bottleneck} />
+                                </td>
+                                <td
+                                  className="text-mono"
+                                  style={{ color: scoreColor(er.score), fontWeight: 600 }}
+                                >
                                   {formatScore(er.score)}
                                 </td>
                               </tr>
@@ -610,9 +797,11 @@ export default function VelocityTest() {
                 </React.Fragment>
               ))}
               {runs.length === 0 && (
-                <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
-                  No velocity test runs yet. Click "Run Tests" to begin.
-                </td></tr>
+                <tr>
+                  <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
+                    No velocity test runs yet. Click "Run Tests" to begin.
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>

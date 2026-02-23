@@ -31,6 +31,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/", get(crate::routes::dashboard::index))
         // Health
         .route("/health", get(crate::routes::health::health))
+        .route("/health/stream", get(crate::routes::health::health_stream))
         // Runner lifecycle
         .route("/runner/stop", post(crate::routes::runner::stop_runner))
         .route(
