@@ -838,6 +838,13 @@ function DashboardInner() {
           service: 'Frontend',
           fn: () => api.devStartAction('frontend/stop'),
         },
+        {
+          key: 'frontend-clear-cache',
+          display: 'Clear Cache',
+          activeLabel: 'Clearing…',
+          service: 'Frontend',
+          fn: () => api.devStartAction('frontend/clear-cache'),
+        },
       ],
     },
     {

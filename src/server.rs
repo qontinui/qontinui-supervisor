@@ -82,6 +82,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/dev-start/frontend/stop",
             post(crate::routes::dev_start::frontend_stop),
         )
+        .route(
+            "/dev-start/frontend/clear-cache",
+            post(crate::routes::dev_start::frontend_clear_cache),
+        )
         .route("/dev-start/docker", post(crate::routes::dev_start::docker))
         .route(
             "/dev-start/docker/stop",

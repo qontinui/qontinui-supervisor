@@ -152,6 +152,59 @@ pub async fn frontend_stop(State(state): State<SharedState>) -> Json<DevStartRes
     Json(run_dev_start(&state.config.project_dir, "StopApps", 30).await)
 }
 
+pub async fn frontend_clear_cache(State(state): State<SharedState>) -> Json<DevStartResponse> {
+    // project_dir = qontinui-runner/src-tauri → go up to parent, then into qontinui-web/frontend
+    let cache_path = state
+        .config
+        .project_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| {
+            p.join("qontinui-web")
+                .join("frontend")
+                .join(".next")
+                .join("cache")
+                .join("webpack")
+        })
+        .unwrap_or_default();
+
+    info!("Clearing frontend webpack cache: {}", cache_path.display());
+
+    match tokio::fs::remove_dir_all(&cache_path).await {
+        Ok(()) => {
+            info!("Cleared webpack cache at {}", cache_path.display());
+            DevStartResponse {
+                status: "success".into(),
+                flag: "frontend/clear-cache".into(),
+                stdout: format!("Cleared webpack cache at {}", cache_path.display()),
+                stderr: String::new(),
+                exit_code: Some(0),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("No webpack cache to clear at {}", cache_path.display());
+            DevStartResponse {
+                status: "success".into(),
+                flag: "frontend/clear-cache".into(),
+                stdout: "No webpack cache to clear".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+            }
+        }
+        Err(e) => {
+            warn!("Failed to clear webpack cache: {}", e);
+            DevStartResponse {
+                status: "error".into(),
+                flag: "frontend/clear-cache".into(),
+                stdout: String::new(),
+                stderr: format!("Failed to clear webpack cache: {}", e),
+                exit_code: Some(1),
+            }
+        }
+    }
+    .into()
+}
+
 pub async fn docker(State(state): State<SharedState>) -> Json<DevStartResponse> {
     Json(run_dev_start(&state.config.project_dir, "Docker", 60).await)
 }
