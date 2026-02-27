@@ -67,6 +67,7 @@ export default function VelocityTrace() {
       <div className="page-header">
         <h1 className="page-title">Request Trace</h1>
       </div>
+      <p className="page-desc">Distributed trace waterfall for a single request — see all spans across services.</p>
 
       {/* Search */}
       <div className="card mb-2">

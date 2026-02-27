@@ -114,6 +114,7 @@ export default function Velocity() {
           </button>
         </div>
       </div>
+      <p className="page-desc">API response latency across services — P50/P95/P99 percentiles, timeline, and slow request detection.</p>
 
       {/* Service summary cards */}
       <div className="card-grid">

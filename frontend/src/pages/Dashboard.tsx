@@ -908,6 +908,7 @@ function DashboardInner() {
           )}
         </div>
       </div>
+      <p className="page-desc">Monitor service health, control dev-start services, and run AI debug sessions.</p>
 
       {showAiPanel && ai && (
         <AiSessionPanel

@@ -141,7 +141,7 @@ pub async fn backend(State(state): State<SharedState>) -> Json<DevStartResponse>
 }
 
 pub async fn backend_stop(State(state): State<SharedState>) -> Json<DevStartResponse> {
-    Json(run_dev_start(&state.config.project_dir, "StopApps", 30).await)
+    Json(run_dev_start(&state.config.project_dir, "StopBackend", 30).await)
 }
 
 pub async fn frontend(State(state): State<SharedState>) -> Json<DevStartResponse> {
@@ -149,7 +149,7 @@ pub async fn frontend(State(state): State<SharedState>) -> Json<DevStartResponse
 }
 
 pub async fn frontend_stop(State(state): State<SharedState>) -> Json<DevStartResponse> {
-    Json(run_dev_start(&state.config.project_dir, "StopApps", 30).await)
+    Json(run_dev_start(&state.config.project_dir, "StopFrontend", 30).await)
 }
 
 pub async fn frontend_clear_cache(State(state): State<SharedState>) -> Json<DevStartResponse> {
@@ -210,7 +210,7 @@ pub async fn docker(State(state): State<SharedState>) -> Json<DevStartResponse> 
 }
 
 pub async fn docker_stop(State(state): State<SharedState>) -> Json<DevStartResponse> {
-    Json(run_dev_start(&state.config.project_dir, "Stop", 30).await)
+    Json(run_dev_start(&state.config.project_dir, "StopDocker", 30).await)
 }
 
 pub async fn all(State(state): State<SharedState>) -> Json<DevStartResponse> {

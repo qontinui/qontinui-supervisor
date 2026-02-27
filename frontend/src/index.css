@@ -179,6 +179,7 @@ tr:hover { background: var(--bg-hover); }
   margin-bottom: 1.5rem;
 }
 .page-title { font-size: 1.5rem; font-weight: 600; }
+.page-desc { margin: -1rem 0 1.5rem; font-size: 0.8rem; color: var(--text-muted); }
 
 /* Utility */
 .text-mono { font-family: var(--font-mono); }

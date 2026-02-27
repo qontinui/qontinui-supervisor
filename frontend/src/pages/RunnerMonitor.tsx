@@ -77,6 +77,7 @@ export default function RunnerMonitor() {
       <div className="page-header">
         <h1 className="page-title">Runner Monitor</h1>
       </div>
+      <p className="page-desc">Runner process health and active task runs — view workflow state, AI output, or stop tasks.</p>
 
       <div className="card-grid">
         {/* Runner Health */}

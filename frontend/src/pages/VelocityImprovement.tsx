@@ -199,6 +199,7 @@ export default function VelocityImprovement() {
           />
         )}
       </div>
+      <p className="page-desc">Automated loop that runs velocity tests, analyzes bottlenecks, applies fixes, and tracks score improvements.</p>
 
       {/* Controls */}
       <div className="card" style={{ padding: 20, marginBottom: 24 }}>

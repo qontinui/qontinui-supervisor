@@ -550,6 +550,7 @@ export default function VelocityTest() {
           )}
         </div>
       </div>
+      <p className="page-desc">Automated page load performance tests — timing breakdown, bottleneck detection, and score trends.</p>
 
       {/* Progress bar */}
       {status?.running && (

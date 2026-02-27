@@ -307,6 +307,7 @@ export default function Evaluation() {
           )}
         </div>
       </div>
+      <p className="page-desc">Benchmark workflow generation quality — run test prompts and score across structural, command, and completeness dimensions.</p>
 
       {/* Status bar */}
       {status?.running && (

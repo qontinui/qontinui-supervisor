@@ -269,6 +269,7 @@ export default function WorkflowLoop() {
           {running ? (
             <>
               <span style={phaseBadgeStyle(phase)}>{phase.replace(/_/g, ' ')}</span>
+
               <span className="text-mono" style={{ fontSize: '0.85rem', color: 'var(--warning)' }}>
                 Iteration {status?.current_iteration ?? 0} / {cfgMax}
               </span>
@@ -287,6 +288,7 @@ export default function WorkflowLoop() {
           )}
         </div>
       </div>
+      <p className="page-desc">Iterative develop-rebuild-verify loop for testing changes to the runner itself. Runs a workflow, applies fixes, rebuilds the runner, and re-runs until the exit condition is met.</p>
 
       {error && (
         <div

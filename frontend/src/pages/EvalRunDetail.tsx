@@ -89,6 +89,7 @@ export default function EvalRunDetail() {
           </span>
         </h1>
       </div>
+      <p className="page-desc">Per-prompt scores, dimension breakdowns, and baseline comparison for this evaluation run.</p>
 
       {/* Summary card */}
       <div className="card mb-2">

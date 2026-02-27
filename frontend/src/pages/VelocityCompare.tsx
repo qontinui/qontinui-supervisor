@@ -87,6 +87,7 @@ export default function VelocityCompare() {
       <div className="page-header">
         <h1 className="page-title">Compare Time Windows</h1>
       </div>
+      <p className="page-desc">Compare API latency between two time windows to detect performance regressions or improvements.</p>
 
       {/* Controls */}
       <div className="card mb-2">
