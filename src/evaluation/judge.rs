@@ -147,23 +147,25 @@ pub async fn score_workflow(
             // Pipe prompt via stdin with --system-prompt and --tools "" for
             // reliable JSON output. Disabling tools prevents Claude Code from
             // trying to read files or use other tools instead of responding directly.
-            let mut child = tokio::process::Command::new("claude")
-                .args([
-                    "--print",
-                    "--output-format",
-                    "text",
-                    "--model",
-                    &model_id,
-                    "--system-prompt",
-                    JUDGE_SYSTEM_PROMPT,
-                    "--tools",
-                    "",
-                ])
-                .env_remove("CLAUDECODE")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
+            let mut cmd = tokio::process::Command::new("claude");
+            cmd.args([
+                "--print",
+                "--output-format",
+                "text",
+                "--model",
+                &model_id,
+                "--system-prompt",
+                JUDGE_SYSTEM_PROMPT,
+                "--tools",
+                "",
+            ])
+            .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            let mut child = cmd.spawn()?;
 
             // Write prompt to stdin, then drop to signal EOF
             if let Some(mut stdin) = child.stdin.take() {
@@ -186,17 +188,18 @@ pub async fn score_workflow(
             );
             tokio::fs::write(&script_path, &script).await?;
 
-            let child = tokio::process::Command::new("powershell.exe")
-                .args([
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    &script_path.display().to_string(),
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await?;
+            let mut cmd = tokio::process::Command::new("powershell.exe");
+            cmd.args([
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &script_path.display().to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            let child = cmd.output().await?;
 
             String::from_utf8_lossy(&child.stdout).to_string()
         }

@@ -94,14 +94,15 @@ async fn start_dev_mode(state: &SharedState) -> Result<tokio::process::Child, Su
 
     #[cfg(windows)]
     let child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         Command::new("cmd")
             .args(["/C", "npm.cmd run tauri dev -- --no-watch"])
             .current_dir(&npm_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
@@ -136,13 +137,14 @@ async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, Su
 
     #[cfg(windows)]
     let child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         Command::new(&exe_path)
             .current_dir(&state.config.project_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?

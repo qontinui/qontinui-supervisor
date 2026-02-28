@@ -88,12 +88,12 @@ pub fn is_code_being_edited(project_dir: &Path, quiet_period_secs: i64) -> bool 
 /// On Windows, uses tasklist to look for node.exe processes with "claude" in the window title.
 #[cfg(windows)]
 pub async fn is_external_claude_session() -> bool {
-    let output = tokio::process::Command::new("cmd")
-        .args(["/C", "tasklist /FI \"IMAGENAME eq node.exe\" /V /FO CSV"])
+    let mut cmd = tokio::process::Command::new("cmd");
+    cmd.args(["/C", "tasklist /FI \"IMAGENAME eq node.exe\" /V /FO CSV"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
+        .stderr(std::process::Stdio::null());
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let output = cmd.output().await;
 
     match output {
         Ok(out) => {

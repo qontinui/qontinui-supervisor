@@ -76,21 +76,19 @@ async fn run_dev_start(
         flag, timeout_secs
     );
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        tokio::process::Command::new("powershell.exe")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                &script.display().to_string(),
-                &format!("-{}", flag),
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await;
+    let mut cmd = tokio::process::Command::new("powershell.exe");
+    cmd.args([
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script.display().to_string(),
+        &format!("-{}", flag),
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
     match result {
         Ok(Ok(output)) => {

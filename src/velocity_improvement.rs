@@ -717,20 +717,23 @@ async fn spawn_fix_agent(
     .await;
 
     // Spawn claude --print
-    let mut child = tokio::process::Command::new("claude")
-        .args([
-            "--print",
-            &prompt_path.display().to_string(),
-            "--permission-mode",
-            "bypassPermissions",
-            "--output-format",
-            "text",
-            "--model",
-            &model_id,
-        ])
-        .env_remove("CLAUDECODE")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args([
+        "--print",
+        &prompt_path.display().to_string(),
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "text",
+        "--model",
+        &model_id,
+    ])
+    .env_remove("CLAUDECODE")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
 

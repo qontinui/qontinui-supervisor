@@ -2,6 +2,8 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, info};
 
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Kill a process by its image name using taskkill.
 pub async fn taskkill_by_name(name: &str, force: bool) -> anyhow::Result<bool> {
     let mut cmd = Command::new("taskkill");
@@ -9,6 +11,7 @@ pub async fn taskkill_by_name(name: &str, force: bool) -> anyhow::Result<bool> {
         cmd.arg("/F");
     }
     cmd.arg("/IM").arg(name);
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await?;
@@ -32,6 +35,7 @@ pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
             "/C",
             &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -49,6 +53,7 @@ pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
                     info!("Killing PID {} on port {}", pid, port);
                     let kill_output = Command::new("taskkill")
                         .args(["/F", "/PID", &pid.to_string()])
+                        .creation_flags(CREATE_NO_WINDOW)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .output()
@@ -80,6 +85,7 @@ pub async fn cleanup_orphaned_build_processes() {
                     proc_name
                 ),
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -94,6 +100,7 @@ pub async fn cleanup_orphaned_build_processes() {
                             debug!("Cleaning up orphaned {} (PID {})", proc_name, pid);
                             let _ = Command::new("taskkill")
                                 .args(["/F", "/PID", &pid.to_string()])
+                                .creation_flags(CREATE_NO_WINDOW)
                                 .stdout(Stdio::piped())
                                 .stderr(Stdio::piped())
                                 .output()

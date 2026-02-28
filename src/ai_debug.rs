@@ -281,14 +281,15 @@ async fn get_git_info(state: &SharedState) -> String {
     let mut info = String::new();
 
     // git log --oneline -5
-    if let Ok(output) = tokio::process::Command::new("git")
+    let mut git_log_cmd = tokio::process::Command::new("git");
+    git_log_cmd
         .args(["log", "--oneline", "-5"])
         .current_dir(runner_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-    {
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    git_log_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    if let Ok(output) = git_log_cmd.output().await {
         if output.status.success() {
             info.push_str("Recent commits:\n");
             info.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -297,14 +298,15 @@ async fn get_git_info(state: &SharedState) -> String {
     }
 
     // git diff --stat
-    if let Ok(output) = tokio::process::Command::new("git")
+    let mut git_diff_cmd = tokio::process::Command::new("git");
+    git_diff_cmd
         .args(["diff", "--stat"])
         .current_dir(runner_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-    {
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    git_diff_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    if let Ok(output) = git_diff_cmd.output().await {
         if output.status.success() {
             let diff = String::from_utf8_lossy(&output.stdout);
             if !diff.trim().is_empty() {
@@ -336,20 +338,23 @@ async fn spawn_claude_process(
     prompt_file: &std::path::Path,
     model_id: &str,
 ) -> Result<tokio::process::Child, SupervisorError> {
-    let child = tokio::process::Command::new("claude")
-        .args([
-            "--print",
-            &prompt_file.display().to_string(),
-            "--permission-mode",
-            "bypassPermissions",
-            "--output-format",
-            "text",
-            "--model",
-            model_id,
-        ])
-        .env_remove("CLAUDECODE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args([
+        "--print",
+        &prompt_file.display().to_string(),
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "text",
+        "--model",
+        model_id,
+    ])
+    .env_remove("CLAUDECODE")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = cmd
         .spawn()
         .map_err(|e| SupervisorError::Process(format!("Failed to spawn Claude CLI: {}", e)))?;
 
@@ -380,15 +385,18 @@ async fn spawn_gemini_process(
         .await
         .map_err(|e| SupervisorError::Other(format!("Failed to write script: {}", e)))?;
 
-    let child = tokio::process::Command::new("powershell.exe")
-        .args([
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script_path.display().to_string(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = tokio::process::Command::new("powershell.exe");
+    cmd.args([
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script_path.display().to_string(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = cmd
         .spawn()
         .map_err(|e| SupervisorError::Process(format!("Failed to spawn Gemini CLI: {}", e)))?;
 

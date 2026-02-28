@@ -92,14 +92,15 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
     #[cfg(windows)]
     let mut child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         Command::new("cargo")
             .args(["build", "--bin", "qontinui-runner"])
             .current_dir(&state.config.project_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
     };

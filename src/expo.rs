@@ -45,14 +45,15 @@ pub async fn start_expo(state: &SharedState) -> Result<(), SupervisorError> {
 
     #[cfg(windows)]
     let mut child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         Command::new("cmd")
             .args(["/C", "npx expo start"])
             .current_dir(&expo_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn Expo: {}", e)))?
