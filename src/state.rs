@@ -21,6 +21,7 @@ pub struct SupervisorState {
     pub ai: RwLock<AiState>,
     pub code_activity: RwLock<CodeActivityState>,
     pub expo: RwLock<ExpoState>,
+    pub overnight_watchdog: RwLock<OvernightWatchdogState>,
     pub workflow_loop: RwLock<WorkflowLoopState>,
     pub diagnostics: RwLock<DiagnosticsState>,
     pub evaluation: RwLock<EvaluationState>,
@@ -84,6 +85,15 @@ pub struct CodeActivityState {
     pub pending_debug_reason: Option<String>,
 }
 
+pub struct OvernightWatchdogState {
+    pub active: bool,
+    pub last_check_at: Option<DateTime<Utc>>,
+    pub last_successful_check_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub last_failure_reason: Option<String>,
+    pub last_action_taken: Option<String>,
+}
+
 pub struct ExpoState {
     pub process: Option<Child>,
     pub running: bool,
@@ -112,6 +122,7 @@ impl SupervisorState {
             ai: RwLock::new(AiState::new(auto_debug)),
             code_activity: RwLock::new(CodeActivityState::new()),
             expo: RwLock::new(ExpoState::new(expo_port)),
+            overnight_watchdog: RwLock::new(OvernightWatchdogState::new()),
             workflow_loop: RwLock::new(WorkflowLoopState::new()),
             diagnostics: RwLock::new(DiagnosticsState::new()),
             evaluation: RwLock::new(EvaluationState::new()),
@@ -239,6 +250,25 @@ impl CodeActivityState {
             pending_debug: false,
             pending_debug_reason: None,
         }
+    }
+}
+
+impl OvernightWatchdogState {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            last_check_at: None,
+            last_successful_check_at: None,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+            last_action_taken: None,
+        }
+    }
+}
+
+impl Default for OvernightWatchdogState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

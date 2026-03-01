@@ -24,6 +24,7 @@ pub enum LogSource {
     Supervisor,
     Build,
     Watchdog,
+    OvernightWatchdog,
     Expo,
     WorkflowLoop,
 }

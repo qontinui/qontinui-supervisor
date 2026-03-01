@@ -87,6 +87,13 @@ pub const AI_OUTPUT_BUFFER_SIZE: usize = 2000;
 pub const CODE_QUIET_PERIOD_SECS: i64 = 300; // 5 minutes
 pub const CODE_CHECK_RETRY_INTERVAL_SECS: u64 = 30;
 
+// Overnight watchdog constants
+pub const OVERNIGHT_CHECK_INTERVAL_SECS: u64 = 180; // 3 minutes
+pub const OVERNIGHT_START_HOUR: u32 = 23; // 11 PM local
+pub const OVERNIGHT_END_HOUR: u32 = 6; // 6 AM local
+pub const OVERNIGHT_MAX_CONSECUTIVE_FAILURES: u32 = 3; // ~9min before restart
+pub const OVERNIGHT_SNAPSHOT_TIMEOUT_SECS: u64 = 15;
+
 // Workflow loop constants
 pub const WORKFLOW_LOOP_POLL_INTERVAL_SECS: u64 = 5;
 pub const WORKFLOW_LOOP_MAX_ITERATIONS_DEFAULT: u32 = 5;

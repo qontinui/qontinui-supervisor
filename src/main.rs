@@ -17,6 +17,7 @@ mod velocity;
 mod velocity_improvement;
 mod velocity_layer;
 mod velocity_tests;
+mod overnight_watchdog;
 mod watchdog;
 mod workflow_loop;
 
@@ -121,6 +122,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn code activity monitor
     let _code_activity_handle = code_activity::spawn_code_activity_monitor(state.clone());
+
+    // Spawn overnight watchdog (UI Bridge health checks during 11pm-6am)
+    let _overnight_handle = overnight_watchdog::spawn_overnight_watchdog(state.clone());
 
     // Auto-start runner if configured
     if auto_start {
