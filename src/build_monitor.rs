@@ -125,6 +125,7 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             let mut error_lines = Vec::new();
+            let mut all_lines = Vec::new();
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&line));
@@ -135,13 +136,14 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
                 };
 
                 state_clone.logs.emit(LogSource::Build, level, &line).await;
+                all_lines.push(line.clone());
 
                 if is_error {
                     error_lines.push(line);
                 }
             }
 
-            error_lines
+            (error_lines, all_lines)
         }))
     } else {
         None
@@ -170,11 +172,17 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
     };
 
     // Collect any error output
-    let error_lines = if let Some(handle) = stderr_handle {
+    let (error_lines, all_stderr_lines) = if let Some(handle) = stderr_handle {
         handle.await.unwrap_or_default()
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+
+    // Store full stderr for smart rebuild AI fix prompt
+    if !all_stderr_lines.is_empty() {
+        let mut build = state.build.write().await;
+        build.last_build_stderr = Some(all_stderr_lines.join("\n"));
+    }
 
     if status.success() {
         state

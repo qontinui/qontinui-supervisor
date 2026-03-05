@@ -89,6 +89,25 @@ pub enum DiagnosticEventKind {
         iteration: u32,
         reason: String,
     },
+
+    // Smart rebuild
+    SmartRebuildStarted {
+        trigger: String,
+    },
+    SmartRebuildBuildFailed {
+        attempt: u32,
+        error: String,
+    },
+    SmartRebuildAiFix {
+        attempt: u32,
+    },
+    SmartRebuildCompleted {
+        total_attempts: u32,
+        duration_secs: f64,
+    },
+    SmartRebuildFailed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +187,12 @@ impl DiagnosticEvent {
             | DiagnosticEventKind::PipelinePhaseCompleted { .. }
             | DiagnosticEventKind::FixesImplemented { .. }
             | DiagnosticEventKind::RebuildTriggered { .. } => "pipeline",
+
+            DiagnosticEventKind::SmartRebuildStarted { .. }
+            | DiagnosticEventKind::SmartRebuildBuildFailed { .. }
+            | DiagnosticEventKind::SmartRebuildAiFix { .. }
+            | DiagnosticEventKind::SmartRebuildCompleted { .. }
+            | DiagnosticEventKind::SmartRebuildFailed { .. } => "smart_rebuild",
         }
     }
 }

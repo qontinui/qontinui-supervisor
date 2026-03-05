@@ -2,6 +2,7 @@ use crate::config::{SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::CachedPortHealth;
 use crate::log_capture::LogState;
+use crate::smart_rebuild::SmartRebuildState;
 use crate::velocity_improvement::VelocityImprovementState;
 use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
@@ -27,6 +28,7 @@ pub struct SupervisorState {
     pub evaluation: RwLock<EvaluationState>,
     pub velocity_tests: RwLock<VelocityTestState>,
     pub velocity_improvement: RwLock<VelocityImprovementState>,
+    pub smart_rebuild: RwLock<SmartRebuildState>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
@@ -57,6 +59,7 @@ pub struct BuildState {
     pub build_error_detected: bool,
     pub last_build_error: Option<String>,
     pub last_build_at: Option<DateTime<Utc>>,
+    pub last_build_stderr: Option<String>,
 }
 
 pub struct AiState {
@@ -106,6 +109,7 @@ impl SupervisorState {
     pub fn new(config: SupervisorConfig) -> Self {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
+        let smart_rebuild_enabled = config.smart_rebuild;
         let expo_port = config.expo_port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -128,6 +132,7 @@ impl SupervisorState {
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
+            smart_rebuild: RwLock::new(SmartRebuildState::new(smart_rebuild_enabled)),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
@@ -205,6 +210,7 @@ impl BuildState {
             build_error_detected: false,
             last_build_error: None,
             last_build_at: None,
+            last_build_stderr: None,
         }
     }
 }
@@ -355,6 +361,7 @@ mod tests {
             watchdog_enabled_at_start: false,
             auto_start: false,
             auto_debug: false,
+            smart_rebuild: false,
             log_file: None,
             port: DEFAULT_SUPERVISOR_PORT,
             dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),

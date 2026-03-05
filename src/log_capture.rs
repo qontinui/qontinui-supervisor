@@ -27,6 +27,7 @@ pub enum LogSource {
     OvernightWatchdog,
     Expo,
     WorkflowLoop,
+    SmartRebuild,
 }
 
 #[derive(Debug, Clone, Serialize)]

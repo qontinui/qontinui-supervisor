@@ -40,6 +40,14 @@ pub fn spawn_watchdog(state: SharedState) -> tokio::task::JoinHandle<()> {
                 continue;
             }
 
+            // Don't interfere with smart rebuild (runner is intentionally down)
+            {
+                let sr = state.smart_rebuild.read().await;
+                if !matches!(sr.phase, crate::smart_rebuild::SmartRebuildPhase::Idle) {
+                    continue;
+                }
+            }
+
             // Check if build is in progress
             {
                 let build = state.build.read().await;

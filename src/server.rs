@@ -146,6 +146,23 @@ pub fn build_router(state: SharedState) -> Router {
             "/diagnostics/clear",
             post(crate::routes::diagnostics::clear_diagnostics),
         )
+        // Smart rebuild
+        .route(
+            "/smart-rebuild/status",
+            get(crate::routes::smart_rebuild::status),
+        )
+        .route(
+            "/smart-rebuild/enable",
+            post(crate::routes::smart_rebuild::enable),
+        )
+        .route(
+            "/smart-rebuild/trigger",
+            post(crate::routes::smart_rebuild::trigger),
+        )
+        .route(
+            "/smart-rebuild/stop",
+            post(crate::routes::smart_rebuild::stop),
+        )
         // Expo
         .route("/expo/start", post(crate::routes::expo::start))
         .route("/expo/stop", post(crate::routes::expo::stop))

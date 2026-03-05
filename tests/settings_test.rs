@@ -68,6 +68,7 @@ fn test_settings_path() {
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,
+        smart_rebuild: false,
         log_file: None,
         port: 9875,
         dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),

@@ -8,16 +8,17 @@ mod evaluation;
 mod expo;
 mod health_cache;
 mod log_capture;
+mod overnight_watchdog;
 mod process;
 mod routes;
 mod server;
 mod settings;
+mod smart_rebuild;
 mod state;
 mod velocity;
 mod velocity_improvement;
 mod velocity_layer;
 mod velocity_tests;
-mod overnight_watchdog;
 mod watchdog;
 mod workflow_loop;
 
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Watchdog: {}", args.watchdog);
     info!("Auto-start: {}", args.auto_start || args.watchdog);
     info!("Auto-debug: {}", args.auto_debug);
+    info!("Smart rebuild: {}", args.smart_rebuild);
     if let Some(ref expo_dir) = args.expo_dir {
         info!("Expo dir: {:?}", expo_dir);
     }
@@ -125,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn overnight watchdog (UI Bridge health checks during 11pm-6am)
     let _overnight_handle = overnight_watchdog::spawn_overnight_watchdog(state.clone());
+
+    // Spawn smart rebuild source watcher
+    let _smart_rebuild_handle = smart_rebuild::spawn_source_watcher(state.clone());
 
     // Auto-start runner if configured
     if auto_start {

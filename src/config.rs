@@ -36,6 +36,10 @@ pub struct CliArgs {
     /// Path to Expo/React Native project directory
     #[arg(long = "expo-dir")]
     pub expo_dir: Option<PathBuf>,
+
+    /// Enable smart rebuild (auto-detect source changes, rebuild, fix with AI)
+    #[arg(long = "smart-rebuild")]
+    pub smart_rebuild: bool,
 }
 
 #[allow(dead_code)]
@@ -45,6 +49,7 @@ pub struct SupervisorConfig {
     pub watchdog_enabled_at_start: bool,
     pub auto_start: bool,
     pub auto_debug: bool,
+    pub smart_rebuild: bool,
     pub log_file: Option<PathBuf>,
     pub port: u16,
     pub dev_logs_dir: PathBuf,
@@ -86,6 +91,12 @@ pub const AI_OUTPUT_BUFFER_SIZE: usize = 2000;
 // Code activity constants
 pub const CODE_QUIET_PERIOD_SECS: i64 = 300; // 5 minutes
 pub const CODE_CHECK_RETRY_INTERVAL_SECS: u64 = 30;
+
+// Smart rebuild constants
+pub const SMART_REBUILD_CHECK_INTERVAL_SECS: u64 = 10;
+pub const SMART_REBUILD_QUIET_PERIOD_SECS: i64 = 30;
+pub const SMART_REBUILD_MAX_FIX_ATTEMPTS: u32 = 3;
+pub const SMART_REBUILD_FIX_TIMEOUT_SECS: u64 = 300;
 
 // Overnight watchdog constants
 pub const OVERNIGHT_CHECK_INTERVAL_SECS: u64 = 180; // 3 minutes
@@ -149,6 +160,7 @@ impl SupervisorConfig {
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
             auto_debug: args.auto_debug,
+            smart_rebuild: args.smart_rebuild,
             log_file: args.log_file,
             port: args.port,
             dev_logs_dir,
@@ -352,6 +364,7 @@ mod tests {
             port: DEFAULT_SUPERVISOR_PORT,
             auto_debug: false,
             expo_dir: None,
+            smart_rebuild: false,
         }
     }
 

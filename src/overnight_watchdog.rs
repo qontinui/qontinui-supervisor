@@ -189,13 +189,7 @@ async fn handle_failure(state: &SharedState, reason: String) {
             rebuild: false,
         });
 
-    match crate::process::manager::restart_runner(
-        state,
-        false,
-        RestartSource::Watchdog,
-    )
-    .await
-    {
+    match crate::process::manager::restart_runner(state, false, RestartSource::Watchdog).await {
         Ok(()) => {
             info!("Overnight watchdog: runner restarted successfully");
             let mut ow = state.overnight_watchdog.write().await;
@@ -216,7 +210,10 @@ async fn handle_failure(state: &SharedState, reason: String) {
             state.notify_health_change();
         }
         Err(e) => {
-            warn!("Overnight watchdog: restart failed: {}, scheduling AI debug", e);
+            warn!(
+                "Overnight watchdog: restart failed: {}, scheduling AI debug",
+                e
+            );
             let mut ow = state.overnight_watchdog.write().await;
             ow.last_action_taken = Some(format!("Restart failed: {}", e));
             drop(ow);

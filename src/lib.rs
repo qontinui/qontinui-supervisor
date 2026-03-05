@@ -15,6 +15,7 @@ pub mod process;
 pub mod routes;
 pub mod server;
 pub mod settings;
+pub mod smart_rebuild;
 pub mod state;
 pub mod velocity;
 pub mod velocity_improvement;

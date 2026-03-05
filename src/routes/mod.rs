@@ -8,6 +8,7 @@ pub mod health;
 pub mod logs;
 pub mod runner;
 pub mod runner_monitor;
+pub mod smart_rebuild;
 pub mod ui_bridge;
 pub mod velocity;
 pub mod velocity_improvement;

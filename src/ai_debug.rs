@@ -24,9 +24,17 @@ pub async fn schedule_debug(state: &SharedState, reason: &str) {
         (ca.code_being_edited, ca.external_claude_session)
     };
 
-    if editing || external {
+    // Don't compete with smart rebuild's AI fix session
+    let smart_rebuild_active = {
+        let sr = state.smart_rebuild.read().await;
+        !matches!(sr.phase, crate::smart_rebuild::SmartRebuildPhase::Idle)
+    };
+
+    if editing || external || smart_rebuild_active {
         // Defer the debug session
-        let defer_reason = if editing {
+        let defer_reason = if smart_rebuild_active {
+            "Smart rebuild in progress"
+        } else if editing {
             "Code being edited"
         } else {
             "External Claude session detected"
