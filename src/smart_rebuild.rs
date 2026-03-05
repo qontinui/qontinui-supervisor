@@ -526,8 +526,80 @@ async fn run_ai_fix(state: &SharedState, build_stderr: &str) -> Result<(), Strin
     }
 }
 
+/// Maximum stderr bytes to include in the AI prompt (50 KB).
+const MAX_STDERR_LEN: usize = 50_000;
+
+/// Strip ANSI escape sequences from text.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1B' {
+            // Consume the escape sequence
+            match chars.peek() {
+                Some('[') => {
+                    // CSI sequence: ESC [ ... final_byte
+                    chars.next();
+                    while let Some(&ch) = chars.peek() {
+                        if ch.is_ascii_alphabetic() || ch == '@' || ch == '~' {
+                            chars.next();
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some(']') => {
+                    // OSC sequence: ESC ] ... (BEL or ESC \)
+                    chars.next();
+                    while let Some(&ch) = chars.peek() {
+                        if ch == '\x07' {
+                            chars.next();
+                            break;
+                        }
+                        if ch == '\x1B' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                _ => {
+                    // Single-char escape — skip the next char
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Build a focused prompt for fixing compilation errors.
+///
+/// Sanitizes inputs: canonicalizes the project path, strips ANSI escape codes,
+/// and truncates stderr to [`MAX_STDERR_LEN`] bytes.
 fn build_compilation_fix_prompt(stderr: &str, project_dir: &std::path::Path) -> String {
+    // Canonicalize path to prevent traversal in the prompt
+    let canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
+    // Strip ANSI codes and truncate
+    let clean = strip_ansi_codes(stderr);
+    let truncated = if clean.len() > MAX_STDERR_LEN {
+        let cut = &clean[..MAX_STDERR_LEN];
+        format!(
+            "{cut}\n\n... (truncated — {total} bytes total)",
+            total = clean.len()
+        )
+    } else {
+        clean
+    };
+
     format!(
         r#"# Fix Compilation Errors
 
@@ -547,8 +619,8 @@ The Rust project at `{}` has compilation errors. Fix them.
 4. Do NOT add new features or change behavior
 5. Do NOT explore the filesystem beyond reading files mentioned in the errors
 "#,
-        project_dir.display(),
-        stderr
+        canonical.display(),
+        truncated
     )
 }
 
