@@ -1093,10 +1093,13 @@
       } else {
         showToast(data.message || action + ' completed', 'success');
       }
+      // Poll multiple times with increasing delays — ports may not release immediately
       setTimeout(function() { pollHealth(); pollDevStartStatus(); }, 500);
+      setTimeout(function() { pollDevStartStatus(); }, 2000);
+      setTimeout(function() { pollDevStartStatus(); }, 5000);
     } catch(e) {
       showToast('Request failed: ' + e.message, 'error');
-      setTimeout(function() { pollHealth(); }, 500);
+      setTimeout(function() { pollHealth(); pollDevStartStatus(); }, 500);
     } finally {
       if (btn && btn.classList) {
         setTimeout(function() { btn.classList.remove('loading'); }, 500);
