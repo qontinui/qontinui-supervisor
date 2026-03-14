@@ -21,6 +21,7 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"error: linking with .* failed").unwrap(),
         Regex::new(r"error: cannot find").unwrap(),
         Regex::new(r"error: no matching package").unwrap(),
+        Regex::new(r"error: failed to remove file").unwrap(),
     ]
 });
 
@@ -59,6 +60,9 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 
     // Cleanup orphaned build processes first
     cleanup_orphaned_build_processes().await;
+
+    // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit)
+    wait_for_exe_unlocked(state).await;
 
     let build_start = std::time::Instant::now();
     let result = run_build_inner(state).await;
@@ -207,6 +211,41 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
             .emit(LogSource::Build, LogLevel::Error, &error_summary)
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
+    }
+}
+
+/// Wait for the runner exe to be writable (unlocked) before building.
+/// On Windows, the OS can hold file locks briefly after a process is killed.
+async fn wait_for_exe_unlocked(state: &SharedState) {
+    let exe_path = state.config.runner_exe_path();
+    if !exe_path.exists() {
+        return;
+    }
+
+    let max_attempts = 20; // 20 × 500ms = 10s max wait
+    for attempt in 1..=max_attempts {
+        match std::fs::OpenOptions::new().write(true).open(&exe_path) {
+            Ok(_) => {
+                if attempt > 1 {
+                    info!("Runner exe unlocked after {}ms", attempt * 500);
+                }
+                return;
+            }
+            Err(e) if attempt < max_attempts => {
+                warn!(
+                    "Runner exe still locked (attempt {}/{}): {}",
+                    attempt, max_attempts, e
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                warn!(
+                    "Runner exe still locked after {}s, proceeding anyway: {}",
+                    max_attempts / 2,
+                    e
+                );
+            }
+        }
     }
 }
 

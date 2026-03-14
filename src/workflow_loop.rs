@@ -611,6 +611,282 @@ pub fn should_rebuild(fixes: &[serde_json::Value]) -> bool {
     })
 }
 
+// --- Fix taxonomy types ---
+
+/// Categories of fixes with different implementation strategies
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixCategory {
+    /// Workflow structural changes (step rewrite, instruction updates) - regenerate specific steps via runner API
+    WorkflowStructural,
+    /// Application code bugs - Claude Code with scoped file paths
+    CodeFix,
+    /// Configuration issues (env vars, ports, paths) - direct targeted edits
+    ConfigFix,
+    /// Test/verification improvements - targeted step modification
+    VerificationFix,
+}
+
+impl std::fmt::Display for FixCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FixCategory::WorkflowStructural => write!(f, "workflow_structural"),
+            FixCategory::CodeFix => write!(f, "code_fix"),
+            FixCategory::ConfigFix => write!(f, "config_fix"),
+            FixCategory::VerificationFix => write!(f, "verification_fix"),
+        }
+    }
+}
+
+/// A categorized fix with routing metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategorizedFix {
+    pub category: FixCategory,
+    pub original_fix: serde_json::Value,
+    /// Specific file paths relevant to this fix (for scoped Claude sessions)
+    pub relevant_paths: Vec<String>,
+    /// Summary of what needs to change
+    pub summary: String,
+}
+
+/// Keywords that map fix types to the WorkflowStructural category
+const WORKFLOW_STRUCTURAL_KEYWORDS: &[&str] = &[
+    "workflow_step_rewrite",
+    "instruction_clarification",
+    "context_addition",
+];
+
+/// Keywords that map fix types to the ConfigFix category.
+/// Use underscore-delimited phrases to avoid false positives (e.g. "port" matching "import").
+const CONFIG_FIX_KEYWORDS: &[&str] = &[
+    "config_",
+    "_config",
+    "env_var",
+    "environment_variable",
+    "port_number",
+    "port_config",
+    "missing_env",
+    "setting_",
+    "_setting",
+];
+
+/// Keywords that map fix types to the VerificationFix category.
+const VERIFICATION_FIX_KEYWORDS: &[&str] = &[
+    "test_",
+    "_test",
+    "verification_",
+    "assertion_",
+    "_assertion",
+    "check_",
+    "test_fix",
+    "test_update",
+];
+
+/// Keywords that map fix types to the CodeFix category.
+const CODE_FIX_KEYWORDS: &[&str] = &[
+    "code_",
+    "bug_",
+    "_bug",
+    "code_fix",
+    "implementation_",
+    "logic_error",
+    "runtime_error",
+];
+
+/// Categorize fixes from reflection into actionable groups
+fn categorize_fixes(fixes: &[serde_json::Value]) -> Vec<CategorizedFix> {
+    fixes
+        .iter()
+        .map(|fix| {
+            let fix_type = fix
+                .get("fix_type")
+                .or_else(|| fix.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            // Determine category based on fix type keywords
+            let category = if WORKFLOW_STRUCTURAL_KEYWORDS
+                .iter()
+                .any(|kw| fix_type.contains(kw))
+            {
+                FixCategory::WorkflowStructural
+            } else if CONFIG_FIX_KEYWORDS.iter().any(|kw| fix_type.contains(kw)) {
+                FixCategory::ConfigFix
+            } else if VERIFICATION_FIX_KEYWORDS
+                .iter()
+                .any(|kw| fix_type.contains(kw))
+            {
+                FixCategory::VerificationFix
+            } else if CODE_FIX_KEYWORDS.iter().any(|kw| fix_type.contains(kw)) {
+                FixCategory::CodeFix
+            } else {
+                // Unknown types default to CodeFix (safe default)
+                FixCategory::CodeFix
+            };
+
+            // Extract relevant file paths from various possible field names
+            let mut relevant_paths = Vec::new();
+            if let Some(path) = fix.get("file_path").and_then(|v| v.as_str()) {
+                relevant_paths.push(path.to_string());
+            }
+            if let Some(path) = fix.get("path").and_then(|v| v.as_str()) {
+                if !relevant_paths.contains(&path.to_string()) {
+                    relevant_paths.push(path.to_string());
+                }
+            }
+            if let Some(files) = fix.get("files").and_then(|v| v.as_array()) {
+                for file_val in files {
+                    if let Some(p) = file_val.as_str() {
+                        if !relevant_paths.contains(&p.to_string()) {
+                            relevant_paths.push(p.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Extract summary from fix JSON
+            let summary = fix
+                .get("description")
+                .or_else(|| fix.get("summary"))
+                .or_else(|| fix.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("No description available")
+                .to_string();
+
+            CategorizedFix {
+                category,
+                original_fix: fix.clone(),
+                relevant_paths,
+                summary,
+            }
+        })
+        .collect()
+}
+
+/// Count fixes by category for logging
+fn count_by_category(categorized: &[CategorizedFix]) -> (usize, usize, usize, usize) {
+    let mut workflow = 0;
+    let mut code = 0;
+    let mut config = 0;
+    let mut verification = 0;
+    for fix in categorized {
+        match fix.category {
+            FixCategory::WorkflowStructural => workflow += 1,
+            FixCategory::CodeFix => code += 1,
+            FixCategory::ConfigFix => config += 1,
+            FixCategory::VerificationFix => verification += 1,
+        }
+    }
+    (workflow, code, config, verification)
+}
+
+/// Implement workflow structural fixes by deferring them to the next build iteration.
+/// These fixes require workflow regeneration, not direct code changes.
+async fn implement_workflow_fixes(fixes: &[CategorizedFix]) -> Result<u32, String> {
+    if fixes.is_empty() {
+        return Ok(0);
+    }
+    info!(
+        "Deferring {} workflow structural fixes to next build iteration",
+        fixes.len()
+    );
+    for fix in fixes {
+        info!("  Deferred workflow fix: {}", fix.summary);
+    }
+    Ok(fixes.len() as u32)
+}
+
+/// Build a focused fix prompt with category groupings and file scope
+fn build_categorized_fix_prompt(
+    categorized: &[CategorizedFix],
+    additional_context: Option<&str>,
+) -> String {
+    let mut prompt = String::from(
+        "You are an autonomous code fix agent. A workflow was executed and a reflection phase \
+         identified the following issues that need to be fixed.\n\n\
+         # Fix Implementation Plan\n\n",
+    );
+
+    // Group by category (excluding WorkflowStructural which is deferred)
+    let code_fixes: Vec<&CategorizedFix> = categorized
+        .iter()
+        .filter(|f| matches!(f.category, FixCategory::CodeFix))
+        .collect();
+    let config_fixes: Vec<&CategorizedFix> = categorized
+        .iter()
+        .filter(|f| matches!(f.category, FixCategory::ConfigFix))
+        .collect();
+    let verification_fixes: Vec<&CategorizedFix> = categorized
+        .iter()
+        .filter(|f| matches!(f.category, FixCategory::VerificationFix))
+        .collect();
+
+    if !config_fixes.is_empty() {
+        prompt.push_str("## Configuration Fixes (quick targeted edits)\n\n");
+        for (i, fix) in config_fixes.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", i + 1, fix.summary));
+            prompt.push_str(&format!(
+                "   Fix data: {}\n\n",
+                serde_json::to_string(&fix.original_fix).unwrap_or_default()
+            ));
+        }
+    }
+
+    if !code_fixes.is_empty() {
+        prompt.push_str("## Code Fixes (bug fixes and implementation changes)\n\n");
+        for (i, fix) in code_fixes.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", i + 1, fix.summary));
+            prompt.push_str(&format!(
+                "   Fix data: {}\n\n",
+                serde_json::to_string(&fix.original_fix).unwrap_or_default()
+            ));
+        }
+    }
+
+    if !verification_fixes.is_empty() {
+        prompt.push_str("## Verification/Test Fixes (test and assertion improvements)\n\n");
+        for (i, fix) in verification_fixes.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", i + 1, fix.summary));
+            prompt.push_str(&format!(
+                "   Fix data: {}\n\n",
+                serde_json::to_string(&fix.original_fix).unwrap_or_default()
+            ));
+        }
+    }
+
+    // Collect all unique file paths for focused scope
+    let mut all_paths: Vec<String> = categorized
+        .iter()
+        .flat_map(|f| f.relevant_paths.iter().cloned())
+        .collect();
+    all_paths.sort();
+    all_paths.dedup();
+
+    if !all_paths.is_empty() {
+        prompt.push_str("## Files to Focus On\n\n");
+        for path in &all_paths {
+            prompt.push_str(&format!("- `{}`\n", path));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str(
+        "## Instructions\n\n\
+         1. Read the relevant source files mentioned in the fixes\n\
+         2. Apply each fix carefully, starting with configuration fixes (quickest wins)\n\
+         3. Verify your changes make sense in context\n\
+         4. Do NOT create new files unless absolutely necessary\n\
+         5. Focus on the specific issues identified — do not refactor unrelated code\n",
+    );
+
+    if let Some(ctx) = additional_context {
+        prompt.push_str(&format!("\n## Additional Context\n\n{}\n", ctx));
+    }
+
+    prompt
+}
+
 /// Generate a workflow via the runner's async generator endpoint.
 /// Returns the generated workflow ID.
 async fn generate_workflow(
@@ -759,7 +1035,32 @@ async fn run_reflection(
 }
 
 /// Build a prompt for the fix agent containing the reflection findings.
+/// Uses categorized fix routing when fixes can be meaningfully categorized,
+/// falls back to the original flat format otherwise.
 pub fn build_fix_prompt(fixes: &[serde_json::Value], additional_context: Option<&str>) -> String {
+    // Try categorized approach first
+    let categorized = categorize_fixes(fixes);
+    let (workflow, code, config, verification) = count_by_category(&categorized);
+
+    // Use categorized prompt if we have meaningful groupings (more than one category present,
+    // or if we have workflow-structural fixes that should be called out)
+    let has_meaningful_grouping =
+        (workflow > 0) as u8 + (code > 0) as u8 + (config > 0) as u8 + (verification > 0) as u8 > 1
+            || workflow > 0;
+
+    if has_meaningful_grouping {
+        // Filter out workflow-structural fixes (they're deferred, not sent to Claude)
+        let actionable: Vec<CategorizedFix> = categorized
+            .into_iter()
+            .filter(|f| !matches!(f.category, FixCategory::WorkflowStructural))
+            .collect();
+
+        if !actionable.is_empty() {
+            return build_categorized_fix_prompt(&actionable, additional_context);
+        }
+    }
+
+    // Fallback: original flat format
     let fixes_json = serde_json::to_string_pretty(fixes).unwrap_or_else(|_| "[]".to_string());
 
     let mut prompt = format!(
@@ -784,6 +1085,7 @@ pub fn build_fix_prompt(fixes: &[serde_json::Value], additional_context: Option<
 }
 
 /// Spawn a Claude Code session to implement the reflection fixes.
+/// Uses fix taxonomy to categorize and route fixes appropriately.
 /// Returns Ok(true) if fixes were successfully applied.
 async fn implement_fixes(
     state: &SharedState,
@@ -828,8 +1130,75 @@ async fn implement_fixes(
         fixes.to_vec()
     };
 
-    // Build the prompt
+    // Categorize fixes using the taxonomy router
+    let categorized = categorize_fixes(&fixes_to_use);
+    let (workflow_count, code_count, config_count, verification_count) =
+        count_by_category(&categorized);
+
+    state
+        .logs
+        .emit(
+            LogSource::WorkflowLoop,
+            LogLevel::Info,
+            format!(
+                "Fix breakdown: {} workflow, {} code, {} config, {} verification",
+                workflow_count, code_count, config_count, verification_count
+            ),
+        )
+        .await;
+
+    // Handle WorkflowStructural fixes by logging them as deferred (they'll trigger rebuild)
+    let workflow_fixes: Vec<CategorizedFix> = categorized
+        .iter()
+        .filter(|f| matches!(f.category, FixCategory::WorkflowStructural))
+        .cloned()
+        .collect();
+    if !workflow_fixes.is_empty() {
+        if let Err(e) = implement_workflow_fixes(&workflow_fixes).await {
+            warn!("Error deferring workflow fixes: {}", e);
+        }
+    }
+
+    // Combine CodeFix + ConfigFix + VerificationFix into actionable fixes
+    let actionable_fixes: Vec<CategorizedFix> = categorized
+        .into_iter()
+        .filter(|f| !matches!(f.category, FixCategory::WorkflowStructural))
+        .collect();
+
+    // If there are no actionable fixes (only workflow-structural), we're done
+    if actionable_fixes.is_empty() {
+        state
+            .logs
+            .emit(
+                LogSource::WorkflowLoop,
+                LogLevel::Info,
+                "All fixes are workflow-structural (deferred to next build) — no code changes needed",
+            )
+            .await;
+        return Ok(true);
+    }
+
+    // Build the prompt using categorized fix routing
     let prompt = build_fix_prompt(&fixes_to_use, fix_config.additional_context.as_deref());
+
+    // Collect relevant paths from categorized fixes for logging
+    let focus_paths: Vec<String> = actionable_fixes
+        .iter()
+        .flat_map(|f| f.relevant_paths.iter().cloned())
+        .collect::<std::collections::HashSet<String>>()
+        .into_iter()
+        .collect();
+
+    if !focus_paths.is_empty() {
+        state
+            .logs
+            .emit(
+                LogSource::WorkflowLoop,
+                LogLevel::Info,
+                format!("Fix agent will focus on {} file(s)", focus_paths.len()),
+            )
+            .await;
+    }
 
     // Write prompt to temp file
     let prompt_path = std::env::temp_dir().join("qontinui-fix-prompt.md");
@@ -846,14 +1215,15 @@ async fn implement_fixes(
         resolve_model_id(&ai.provider, &ai.model).unwrap_or_else(|| "claude-opus-4-6".to_string())
     };
 
+    let actionable_count = actionable_fixes.len();
     state
         .logs
         .emit(
             LogSource::WorkflowLoop,
             LogLevel::Info,
             format!(
-                "Spawning fix agent (model={}, fixes={})...",
-                model_id, fix_count
+                "Spawning fix agent (model={}, actionable_fixes={}, deferred_workflow={})...",
+                model_id, actionable_count, workflow_count
             ),
         )
         .await;
