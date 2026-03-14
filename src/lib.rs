@@ -5,6 +5,7 @@ pub mod ai_debug;
 pub mod build_monitor;
 pub mod code_activity;
 pub mod config;
+pub mod database;
 pub mod diagnostics;
 pub mod error;
 pub mod evaluation;

@@ -130,6 +130,10 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::workflow_loop::history),
         )
         .route(
+            "/workflow-loop/loops",
+            get(crate::routes::workflow_loop::list_loops),
+        )
+        .route(
             "/workflow-loop/stream",
             get(crate::routes::workflow_loop::stream),
         )

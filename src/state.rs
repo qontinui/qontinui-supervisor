@@ -8,7 +8,7 @@ use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock};
 
@@ -35,6 +35,7 @@ pub struct SupervisorState {
     pub cached_health: RwLock<CachedPortHealth>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
+    pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
 }
 
 pub struct RunnerState {
@@ -139,6 +140,7 @@ impl SupervisorState {
             cached_health: RwLock::new(CachedPortHealth::default()),
             health_cache_notify: Notify::new(),
             http_client,
+            db: None,
         }
     }
 

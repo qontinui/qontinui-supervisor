@@ -2,6 +2,7 @@ mod ai_debug;
 mod build_monitor;
 mod code_activity;
 mod config;
+mod database;
 mod diagnostics;
 mod error;
 mod evaluation;
@@ -84,7 +85,20 @@ async fn main() -> anyhow::Result<()> {
     let port = config.port;
     let auto_start = config.auto_start;
 
-    let state = Arc::new(SupervisorState::new(config));
+    let mut supervisor_state = SupervisorState::new(config);
+
+    // Initialize persistent SQLite database for workflow loop history
+    match database::init_db() {
+        Ok(conn) => {
+            info!("Supervisor database initialized successfully");
+            supervisor_state.db = Some(Arc::new(std::sync::Mutex::new(conn)));
+        }
+        Err(e) => {
+            warn!("Failed to initialize supervisor database: {} — workflow loop history will not be persisted", e);
+        }
+    }
+
+    let state = Arc::new(supervisor_state);
 
     // Load persistent settings and apply to state
     {

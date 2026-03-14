@@ -11,6 +11,7 @@ use crate::config::{
     WORKFLOW_LOOP_POLL_INTERVAL_SECS, WORKFLOW_LOOP_RUNNER_HEALTH_POLL_SECS,
     WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS,
 };
+use crate::database;
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::is_runner_responding;
@@ -1096,6 +1097,77 @@ async fn handle_between_iterations(
     Ok(())
 }
 
+// --- DB persistence helpers ---
+
+fn db_insert_loop(state: &SharedState, loop_id: &str, config: &WorkflowLoopConfig, mode: &str) {
+    if let Some(db) = &state.db {
+        if let Ok(conn) = db.lock() {
+            let config_json = serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string());
+            let workflow_id = config.workflow_id.as_deref().or_else(|| {
+                config
+                    .phases
+                    .as_ref()
+                    .and_then(|p| p.execute_workflow_id.as_deref())
+            });
+            if let Err(e) = database::insert_loop(&conn, loop_id, &config_json, mode, workflow_id) {
+                warn!("Failed to persist loop start to DB: {}", e);
+            }
+        } else {
+            warn!("Failed to acquire database lock for insert_loop");
+        }
+    }
+}
+
+fn db_complete_loop(
+    state: &SharedState,
+    loop_id: &str,
+    status: &str,
+    total_iterations: u32,
+    error: Option<&str>,
+) {
+    if let Some(db) = &state.db {
+        if let Ok(conn) = db.lock() {
+            if let Err(e) = database::complete_loop(&conn, loop_id, status, total_iterations, error)
+            {
+                warn!("Failed to persist loop completion to DB: {}", e);
+            }
+        } else {
+            warn!("Failed to acquire database lock for complete_loop");
+        }
+    }
+}
+
+fn db_insert_iteration(state: &SharedState, loop_id: &str, result: &IterationResult) {
+    if let Some(db) = &state.db {
+        if let Ok(conn) = db.lock() {
+            let iter_id = uuid::Uuid::new_v4().to_string();
+            let exit_check_json =
+                serde_json::to_string(&result.exit_check).unwrap_or_else(|_| "{}".to_string());
+            if let Err(e) = database::insert_iteration(
+                &conn,
+                &database::InsertIterationParams {
+                    id: &iter_id,
+                    loop_id,
+                    iteration: result.iteration,
+                    started_at: &result.started_at.to_rfc3339(),
+                    completed_at: &result.completed_at.to_rfc3339(),
+                    task_run_id: &result.task_run_id,
+                    exit_check_json: Some(&exit_check_json),
+                    generated_workflow_id: result.generated_workflow_id.as_deref(),
+                    reflection_task_run_id: result.reflection_task_run_id.as_deref(),
+                    fix_count: result.fix_count,
+                    fixes_implemented: result.fixes_implemented,
+                    rebuild_triggered: result.rebuild_triggered,
+                },
+            ) {
+                warn!("Failed to persist iteration to DB: {}", e);
+            }
+        } else {
+            warn!("Failed to acquire database lock for insert_iteration");
+        }
+    }
+}
+
 // --- Core loop ---
 
 pub async fn run_loop(state: SharedState, stop_rx: watch::Receiver<bool>) {
@@ -1129,6 +1201,10 @@ async fn run_simple_loop(
         .exit_strategy
         .clone()
         .unwrap_or(ExitStrategy::FixedIterations);
+    let loop_id = uuid::Uuid::new_v4().to_string();
+
+    // Persist loop start to DB
+    db_insert_loop(&state, &loop_id, &config, "simple");
 
     state
         .logs
@@ -1228,6 +1304,13 @@ async fn run_simple_loop(
                         error: msg.clone(),
                     });
                 set_error(&state, &msg).await;
+                db_complete_loop(
+                    &state,
+                    &loop_id,
+                    "error",
+                    iteration.saturating_sub(1),
+                    Some(&msg),
+                );
                 return;
             }
         };
@@ -1273,6 +1356,13 @@ async fn run_simple_loop(
                         error: msg.clone(),
                     });
                 set_error(&state, &msg).await;
+                db_complete_loop(
+                    &state,
+                    &loop_id,
+                    "error",
+                    iteration.saturating_sub(1),
+                    Some(&msg),
+                );
                 return;
             }
         };
@@ -1314,6 +1404,13 @@ async fn run_simple_loop(
                                 error: msg.clone(),
                             });
                         set_error(&state, &msg).await;
+                        db_complete_loop(
+                            &state,
+                            &loop_id,
+                            "error",
+                            iteration.saturating_sub(1),
+                            Some(&msg),
+                        );
                         return;
                     }
                 }
@@ -1358,6 +1455,9 @@ async fn run_simple_loop(
             fixes_implemented: None,
             rebuild_triggered: None,
         };
+
+        // Persist iteration to DB
+        db_insert_iteration(&state, &loop_id, &iter_result);
 
         {
             let mut wl = state.workflow_loop.write().await;
@@ -1410,6 +1510,7 @@ async fn run_simple_loop(
                     error: e.clone(),
                 });
             set_error(&state, &e).await;
+            db_complete_loop(&state, &loop_id, "error", iteration, Some(&e));
             return;
         }
 
@@ -1432,6 +1533,18 @@ async fn run_simple_loop(
                 });
             update_phase(&state, LoopPhase::Complete).await;
         }
+    }
+
+    // Persist loop completion to DB
+    {
+        let wl = state.workflow_loop.read().await;
+        let total = wl.iteration_results.len() as u32;
+        let status = match wl.phase {
+            LoopPhase::Complete => "complete",
+            LoopPhase::Stopped => "stopped",
+            _ => "complete",
+        };
+        db_complete_loop(&state, &loop_id, status, total, None);
     }
 
     // Mark as not running
@@ -1458,6 +1571,10 @@ async fn run_pipeline_loop(
 ) {
     let client = build_client();
     let phases = config.phases.as_ref().unwrap();
+    let loop_id = uuid::Uuid::new_v4().to_string();
+
+    // Persist loop start to DB
+    db_insert_loop(&state, &loop_id, &config, "pipeline");
 
     state
         .logs
@@ -1603,6 +1720,13 @@ async fn run_pipeline_loop(
                                 error: msg.clone(),
                             });
                         set_error(&state, &msg).await;
+                        db_complete_loop(
+                            &state,
+                            &loop_id,
+                            "error",
+                            iteration.saturating_sub(1),
+                            Some(&msg),
+                        );
                         return;
                     }
                 }
@@ -1634,6 +1758,13 @@ async fn run_pipeline_loop(
                         error: msg.to_string(),
                     });
                 set_error(&state, msg).await;
+                db_complete_loop(
+                    &state,
+                    &loop_id,
+                    "error",
+                    iteration.saturating_sub(1),
+                    Some(msg),
+                );
                 return;
             }
         };
@@ -1673,6 +1804,13 @@ async fn run_pipeline_loop(
                         error: msg.clone(),
                     });
                 set_error(&state, &msg).await;
+                db_complete_loop(
+                    &state,
+                    &loop_id,
+                    "error",
+                    iteration.saturating_sub(1),
+                    Some(&msg),
+                );
                 return;
             }
         };
@@ -1708,6 +1846,13 @@ async fn run_pipeline_loop(
                         error: msg.clone(),
                     });
                 set_error(&state, &msg).await;
+                db_complete_loop(
+                    &state,
+                    &loop_id,
+                    "error",
+                    iteration.saturating_sub(1),
+                    Some(&msg),
+                );
                 return;
             }
         }
@@ -1767,6 +1912,13 @@ async fn run_pipeline_loop(
                             error: msg.clone(),
                         });
                     set_error(&state, &msg).await;
+                    db_complete_loop(
+                        &state,
+                        &loop_id,
+                        "error",
+                        iteration.saturating_sub(1),
+                        Some(&msg),
+                    );
                     return;
                 }
             };
@@ -1916,6 +2068,9 @@ async fn run_pipeline_loop(
             rebuild_triggered: iter_rebuild_triggered,
         };
 
+        // Persist iteration to DB
+        db_insert_iteration(&state, &loop_id, &iter_result);
+
         {
             let mut wl = state.workflow_loop.write().await;
             wl.iteration_results.push(iter_result);
@@ -1967,6 +2122,7 @@ async fn run_pipeline_loop(
                     error: e.clone(),
                 });
             set_error(&state, &e).await;
+            db_complete_loop(&state, &loop_id, "error", iteration, Some(&e));
             return;
         }
 
@@ -1989,6 +2145,18 @@ async fn run_pipeline_loop(
                 });
             update_phase(&state, LoopPhase::Complete).await;
         }
+    }
+
+    // Persist loop completion to DB
+    {
+        let wl = state.workflow_loop.read().await;
+        let total = wl.iteration_results.len() as u32;
+        let status = match wl.phase {
+            LoopPhase::Complete => "complete",
+            LoopPhase::Stopped => "stopped",
+            _ => "complete",
+        };
+        db_complete_loop(&state, &loop_id, status, total, None);
     }
 
     // Mark as not running

@@ -7,6 +7,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::database;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::state::SharedState;
@@ -205,9 +206,47 @@ pub async fn history(
 ) -> Result<impl IntoResponse, SupervisorError> {
     let wl = state.workflow_loop.read().await;
     let results = wl.iteration_results.clone();
+    drop(wl);
+
+    // Include past loops from DB
+    let past_loops = if let Some(db) = &state.db {
+        match db.lock() {
+            Ok(conn) => database::get_loop_history(&conn).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!("Failed to acquire database lock: {:?}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     Ok(Json(serde_json::json!({
         "iterations": results,
         "total": results.len(),
+        "past_loops": past_loops,
+    })))
+}
+
+/// GET /workflow-loop/loops
+pub async fn list_loops(
+    State(state): State<SharedState>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    let loops = if let Some(db) = &state.db {
+        match db.lock() {
+            Ok(conn) => database::get_loop_history(&conn).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!("Failed to acquire database lock: {:?}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(serde_json::json!({
+        "loops": loops,
+        "total": loops.len(),
     })))
 }
 
