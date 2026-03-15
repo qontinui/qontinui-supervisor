@@ -304,6 +304,18 @@ export interface WorkflowLoopStatus {
   error: string | null;
   iteration_count: number;
   restart_signaled: boolean;
+  build_task_run_id?: string | null;
+  execute_task_run_id?: string | null;
+}
+
+export interface Checkpoint {
+  step_index: number;
+  step_name: string;
+  status: string;
+  phase: string;
+  duration_ms: number | null;
+  error: string | null;
+  stage_index: number;
 }
 
 export interface WorkflowLoopConfig {
@@ -555,6 +567,8 @@ export const api = {
       body: JSON.stringify(config),
     }),
   wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
+  wlCheckpoints: (taskRunId: string) =>
+    fetchJson<{ checkpoints: Checkpoint[] }>(`/workflow-loop/checkpoints/${taskRunId}`),
   wlWorkflows: () =>
     fetch('http://127.0.0.1:9876/unified-workflows')
       .then((r) => r.json())

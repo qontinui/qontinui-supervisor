@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { api, WorkflowLoopStatus, IterationResult, UnifiedWorkflow } from '../lib/api';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { api, WorkflowLoopStatus, IterationResult, UnifiedWorkflow, Checkpoint } from '../lib/api';
 
 type Mode = 'simple' | 'pipeline';
 
@@ -46,7 +46,7 @@ const selectStyle: React.CSSProperties = {
 
 const textareaStyle: React.CSSProperties = {
   width: '100%',
-  minHeight: 60,
+  minHeight: 200,
   padding: '6px 8px',
   fontSize: '0.85rem',
   fontFamily: '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif',
@@ -81,12 +81,96 @@ const rowStyle: React.CSSProperties = {
   padding: '4px 0',
 };
 
+function BuildOutput({ buildTaskRunId, executeTaskRunId, phase, error }: {
+  buildTaskRunId?: string | null;
+  executeTaskRunId?: string | null;
+  phase: string;
+  error?: string | null;
+}) {
+  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [execCheckpoints, setExecCheckpoints] = useState<Checkpoint[]>([]);
+
+  useEffect(() => {
+    const fetchCheckpoints = async () => {
+      if (buildTaskRunId) {
+        try {
+          const data = await api.wlCheckpoints(buildTaskRunId);
+          setCheckpoints(data.checkpoints || []);
+        } catch (err) { console.warn('Failed to fetch build checkpoints:', err); }
+      }
+      if (executeTaskRunId) {
+        try {
+          const data = await api.wlCheckpoints(executeTaskRunId);
+          setExecCheckpoints(data.checkpoints || []);
+        } catch (err) { console.warn('Failed to fetch execute checkpoints:', err); }
+      }
+    };
+    fetchCheckpoints();
+    const interval = setInterval(fetchCheckpoints, 3000);
+    return () => clearInterval(interval);
+  }, [buildTaskRunId, executeTaskRunId]);
+
+  const statusIcon = (s: string) => {
+    if (s === 'success') return '\u2713';
+    if (s === 'failed') return '\u2717';
+    if (s === 'running') return '\u27F3';
+    return '\u00B7';
+  };
+  const statusColor = (s: string) => {
+    if (s === 'success') return 'var(--success)';
+    if (s === 'failed') return 'var(--danger)';
+    if (s === 'running') return 'var(--accent)';
+    return 'var(--text-muted)';
+  };
+
+  const renderCheckpoints = (cps: Checkpoint[], label: string) => {
+    if (cps.length === 0) return null;
+    return (
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: 4, fontWeight: 600 }}>{label}</div>
+        {cps.map((cp, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '2px 0', fontSize: '0.8rem', fontFamily: 'var(--font-mono)' }}>
+            <span style={{ color: statusColor(cp.status), fontWeight: 700, minWidth: 14, textAlign: 'center' }}>{statusIcon(cp.status)}</span>
+            <span style={{ color: 'var(--text-primary)', flex: 1 }}>{cp.step_name}</span>
+            <span style={{ color: 'var(--text-muted)', minWidth: 60, textAlign: 'right' }}>
+              {cp.duration_ms != null ? (cp.duration_ms < 1000 ? `${cp.duration_ms}ms` : `${(cp.duration_ms / 1000).toFixed(1)}s`) : '...'}
+            </span>
+            {cp.error && (
+              <span style={{ color: 'var(--danger)', fontSize: '0.75rem', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                title={cp.error}>{cp.error}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="card mb-2" style={{ borderLeft: `3px solid ${phase === 'error' ? 'var(--danger)' : 'var(--accent)'}` }}>
+      <div className="card-header">
+        <span className="card-title">Build Output</span>
+      </div>
+      {renderCheckpoints(checkpoints, 'Build Phase')}
+      {renderCheckpoints(execCheckpoints, 'Execute Phase')}
+      {error && (
+        <div style={{ padding: '6px 0', fontSize: '0.8rem', color: 'var(--danger)', borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 8 }}>
+          {error}
+        </div>
+      )}
+      {checkpoints.length === 0 && execCheckpoints.length === 0 && !error && (
+        <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Waiting for steps...</div>
+      )}
+    </div>
+  );
+}
+
 export default function WorkflowLoop() {
   const [status, setStatus] = useState<WorkflowLoopStatus | null>(null);
   const [history, setHistory] = useState<IterationResult[]>([]);
   const [workflows, setWorkflows] = useState<UnifiedWorkflow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [saveFlash, setSaveFlash] = useState(false);
 
   // Form state
   const [mode, setMode] = useState<Mode>(
@@ -94,16 +178,44 @@ export default function WorkflowLoop() {
   );
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
   const [exitStrategy, setExitStrategy] = useState('fixed_iterations');
-  const [between, setBetween] = useState('restart_on_signal');
-  const [maxIter, setMaxIter] = useState(5);
+  const [between, setBetween] = useState(
+    () => localStorage.getItem('wl-between') || 'restart_on_signal',
+  );
+  const [maxIter, setMaxIter] = useState(
+    () => Number(localStorage.getItem('wl-maxIter')) || 5,
+  );
 
-  // Pipeline form state
-  const [buildDesc, setBuildDesc] = useState('');
-  const [buildContext, setBuildContext] = useState('');
+  // Pipeline form state — restore from localStorage
+  const [buildDesc, setBuildDesc] = useState(
+    () => localStorage.getItem('wl-buildDesc') || '',
+  );
+  const [buildContext, setBuildContext] = useState(
+    () => localStorage.getItem('wl-buildContext') || '',
+  );
   const [pipelineExecId, setPipelineExecId] = useState('');
-  const [enableFixes, setEnableFixes] = useState(false);
-  const [fixContext, setFixContext] = useState('');
-  const [fixTimeout, setFixTimeout] = useState(600);
+  const [enableFixes, setEnableFixes] = useState(
+    () => localStorage.getItem('wl-enableFixes') === 'true',
+  );
+  const [fixContext, setFixContext] = useState(
+    () => localStorage.getItem('wl-fixContext') || '',
+  );
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSave = useCallback(() => {
+    localStorage.setItem('wl-buildDesc', buildDesc);
+    localStorage.setItem('wl-buildContext', buildContext);
+    localStorage.setItem('wl-fixContext', fixContext);
+    localStorage.setItem('wl-enableFixes', String(enableFixes));
+    localStorage.setItem('wl-between', between);
+    localStorage.setItem('wl-maxIter', String(maxIter));
+    setSaveFlash(true);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => setSaveFlash(false), 1500);
+  }, [buildDesc, buildContext, fixContext, enableFixes, between, maxIter]);
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, []);
 
   const loadData = useCallback(async () => {
     try {
@@ -205,7 +317,6 @@ export default function WorkflowLoop() {
       if (enableFixes) {
         phases.implement_fixes = {
           ...(fixContext ? { additional_context: fixContext } : {}),
-          ...(fixTimeout !== 600 ? { timeout_secs: fixTimeout } : {}),
         };
       }
       body = { max_iterations: maxIter, between_iterations: buildBetween(), phases };
@@ -332,6 +443,16 @@ export default function WorkflowLoop() {
         </div>
       )}
 
+      {/* Build Output (shown during running or after error/complete) */}
+      {(running || phase === 'error' || phase === 'complete') && (status?.build_task_run_id || status?.execute_task_run_id) && (
+        <BuildOutput
+          buildTaskRunId={status?.build_task_run_id}
+          executeTaskRunId={status?.execute_task_run_id}
+          phase={phase}
+          error={status?.error}
+        />
+      )}
+
       {/* Config form (hidden while running) */}
       {!running && (
         <div className="card mb-2">
@@ -339,195 +460,147 @@ export default function WorkflowLoop() {
             <span className="card-title">Configuration</span>
           </div>
 
-          {/* Mode selector */}
-          <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: '0.85rem',
-                cursor: 'pointer',
-              }}
-            >
-              <input
-                type="radio"
-                name="wlMode"
-                checked={mode === 'simple'}
-                onChange={() => handleModeChange('simple')}
-              />{' '}
-              Simple
-            </label>
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: '0.85rem',
-                cursor: 'pointer',
-              }}
-            >
-              <input
-                type="radio"
-                name="wlMode"
-                checked={mode === 'pipeline'}
-                onChange={() => handleModeChange('pipeline')}
-              />{' '}
-              Pipeline
-            </label>
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
-            {/* Left column: mode-specific config */}
-            <div>
-              {mode === 'simple' ? (
-                <>
-                  <div style={rowStyle}>
-                    <span style={labelStyle}>Workflow</span>
-                    <select
-                      value={selectedWorkflowId}
-                      onChange={(e) => setSelectedWorkflowId(e.target.value)}
-                      style={{ ...selectStyle, flex: 1, maxWidth: 250 }}
-                    >
-                      <option value="">Select a workflow...</option>
-                      {workflows.map((wf) => (
-                        <option key={wf.id} value={wf.id}>
-                          {wf.name || wf.id} ({wf.steps?.length ?? 0} steps)
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div style={rowStyle}>
-                    <span style={labelStyle}>Exit Strategy</span>
-                    <select
-                      value={exitStrategy}
-                      onChange={(e) => setExitStrategy(e.target.value)}
-                      style={selectStyle}
-                    >
-                      <option value="fixed_iterations">Fixed Iterations</option>
-                      <option value="reflection">Reflection (0 fixes = exit)</option>
-                      <option value="workflow_verification">Verification (pass = exit)</option>
-                    </select>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div style={{ marginBottom: 8 }}>
-                    <div style={{ ...labelStyle, marginBottom: 4 }}>Build Description</div>
-                    <textarea
-                      value={buildDesc}
-                      onChange={(e) => setBuildDesc(e.target.value)}
-                      placeholder="Describe the workflow to generate..."
-                      rows={3}
-                      style={textareaStyle}
-                    />
-                  </div>
-                  <div style={{ marginBottom: 8 }}>
-                    <div style={{ ...labelStyle, marginBottom: 4 }}>Build Context (optional)</div>
-                    <textarea
-                      value={buildContext}
-                      onChange={(e) => setBuildContext(e.target.value)}
-                      placeholder="Additional context for the builder..."
-                      rows={2}
-                      style={textareaStyle}
-                    />
-                  </div>
-                  <div style={rowStyle}>
-                    <span style={labelStyle}>Execute Workflow (fallback)</span>
-                    <select
-                      value={pipelineExecId}
-                      onChange={(e) => setPipelineExecId(e.target.value)}
-                      style={{ ...selectStyle, maxWidth: 200 }}
-                    >
-                      <option value="">None (use build)</option>
-                      {workflows.map((wf) => (
-                        <option key={wf.id} value={wf.id}>
-                          {wf.name || wf.id}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      padding: '6px 0',
-                      fontSize: '0.85rem',
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={enableFixes}
-                      onChange={(e) => setEnableFixes(e.target.checked)}
-                    />
-                    <span style={{ color: 'var(--text-secondary)' }}>
-                      Enable Fix Implementation
-                    </span>
-                  </div>
-                  {enableFixes && (
-                    <>
-                      <div style={{ marginBottom: 8 }}>
-                        <div style={{ ...labelStyle, marginBottom: 4 }}>
-                          Fix Additional Context (optional)
-                        </div>
-                        <textarea
-                          value={fixContext}
-                          onChange={(e) => setFixContext(e.target.value)}
-                          placeholder="Extra instructions for the fix agent..."
-                          rows={2}
-                          style={textareaStyle}
-                        />
-                      </div>
-                      <div style={rowStyle}>
-                        <span style={labelStyle}>Fix Timeout (seconds)</span>
-                        <input
-                          type="number"
-                          value={fixTimeout}
-                          onChange={(e) => setFixTimeout(Number(e.target.value))}
-                          min={60}
-                          max={3600}
-                          style={inputStyle}
-                        />
-                      </div>
-                    </>
-                  )}
-                </>
-              )}
+          {/* Top row: mode selector + shared config */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', gap: '0.75rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.85rem', cursor: 'pointer' }}>
+                <input type="radio" name="wlMode" checked={mode === 'simple'} onChange={() => handleModeChange('simple')} /> Simple
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.85rem', cursor: 'pointer' }}>
+                <input type="radio" name="wlMode" checked={mode === 'pipeline'} onChange={() => handleModeChange('pipeline')} /> Pipeline
+              </label>
             </div>
 
-            {/* Right column: shared config */}
-            <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ ...labelStyle, minWidth: 'auto' }}>Between</span>
+              <select value={between} onChange={(e) => setBetween(e.target.value)} style={selectStyle}>
+                <option value="restart_on_signal">Restart on Signal (rebuild)</option>
+                <option value="restart_on_signal_no_rebuild">Restart on Signal (no rebuild)</option>
+                <option value="restart_runner">Always Restart (rebuild)</option>
+                <option value="restart_runner_no_rebuild">Always Restart (no rebuild)</option>
+                <option value="wait_healthy">Wait for Healthy</option>
+                <option value="none">None</option>
+              </select>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ ...labelStyle, minWidth: 'auto' }}>Max</span>
+              <input type="number" value={maxIter} onChange={(e) => setMaxIter(Number(e.target.value))} min={1} max={50} style={{ ...inputStyle, width: 50 }} />
+            </div>
+
+            {mode === 'pipeline' && (
+              <button
+                className="btn"
+                onClick={handleSave}
+                style={{ fontSize: '0.8rem', padding: '3px 12px', background: saveFlash ? 'var(--success)' : 'var(--bg-tertiary)', border: '1px solid var(--border)', color: saveFlash ? '#fff' : 'var(--text-secondary)', cursor: 'pointer', borderRadius: 4, transition: 'all 0.2s' }}
+              >
+                {saveFlash ? 'Saved' : 'Save'}
+              </button>
+            )}
+          </div>
+
+          {/* Mode-specific config */}
+          {mode === 'simple' ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
               <div style={rowStyle}>
-                <span style={labelStyle}>Between Iterations</span>
+                <span style={labelStyle}>Workflow</span>
                 <select
-                  value={between}
-                  onChange={(e) => setBetween(e.target.value)}
-                  style={selectStyle}
+                  value={selectedWorkflowId}
+                  onChange={(e) => setSelectedWorkflowId(e.target.value)}
+                  style={{ ...selectStyle, flex: 1, maxWidth: 250 }}
                 >
-                  <option value="restart_on_signal">Restart on Signal (rebuild)</option>
-                  <option value="restart_on_signal_no_rebuild">
-                    Restart on Signal (no rebuild)
-                  </option>
-                  <option value="restart_runner">Always Restart (rebuild)</option>
-                  <option value="restart_runner_no_rebuild">Always Restart (no rebuild)</option>
-                  <option value="wait_healthy">Wait for Healthy</option>
-                  <option value="none">None</option>
+                  <option value="">Select a workflow...</option>
+                  {workflows.map((wf) => (
+                    <option key={wf.id} value={wf.id}>
+                      {wf.name || wf.id} ({wf.steps?.length ?? 0} steps)
+                    </option>
+                  ))}
                 </select>
               </div>
               <div style={rowStyle}>
-                <span style={labelStyle}>Max Iterations</span>
-                <input
-                  type="number"
-                  value={maxIter}
-                  onChange={(e) => setMaxIter(Number(e.target.value))}
-                  min={1}
-                  max={50}
-                  style={inputStyle}
-                />
+                <span style={labelStyle}>Exit Strategy</span>
+                <select
+                  value={exitStrategy}
+                  onChange={(e) => setExitStrategy(e.target.value)}
+                  style={selectStyle}
+                >
+                  <option value="fixed_iterations">Fixed Iterations</option>
+                  <option value="reflection">Reflection (0 fixes = exit)</option>
+                  <option value="workflow_verification">Verification (pass = exit)</option>
+                </select>
               </div>
             </div>
-          </div>
+          ) : (
+            <>
+              {/* Three textareas side-by-side */}
+              <div style={{ display: 'grid', gridTemplateColumns: enableFixes ? '1fr 1fr 1fr' : '1fr 1fr', gap: '0.75rem', marginBottom: 8 }}>
+                <div>
+                  <div style={{ ...labelStyle, marginBottom: 4 }}>Build Description</div>
+                  <textarea
+                    value={buildDesc}
+                    onChange={(e) => setBuildDesc(e.target.value)}
+                    placeholder="Describe the workflow to generate..."
+                    rows={10}
+                    style={textareaStyle}
+                  />
+                </div>
+                <div>
+                  <div style={{ ...labelStyle, marginBottom: 4 }}>Build Context (optional)</div>
+                  <textarea
+                    value={buildContext}
+                    onChange={(e) => setBuildContext(e.target.value)}
+                    placeholder="Additional context for the builder..."
+                    rows={10}
+                    style={textareaStyle}
+                  />
+                </div>
+                {enableFixes && (
+                  <div>
+                    <div style={{ ...labelStyle, marginBottom: 4 }}>Fix Context (optional)</div>
+                    <textarea
+                      value={fixContext}
+                      onChange={(e) => setFixContext(e.target.value)}
+                      placeholder="Extra instructions for the fix agent..."
+                      rows={10}
+                      style={textareaStyle}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Bottom row: fallback workflow, enable fixes */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ ...labelStyle, minWidth: 'auto' }}>Execute Workflow (fallback)</span>
+                  <select
+                    value={pipelineExecId}
+                    onChange={(e) => setPipelineExecId(e.target.value)}
+                    style={{ ...selectStyle, maxWidth: 200 }}
+                  >
+                    <option value="">None (use build)</option>
+                    {workflows.map((wf) => (
+                      <option key={wf.id} value={wf.id}>
+                        {wf.name || wf.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.85rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={enableFixes}
+                    onChange={(e) => setEnableFixes(e.target.checked)}
+                  />
+                  <span style={{ color: 'var(--text-secondary)' }}>Enable Fix Implementation</span>
+                  <span style={{ color: 'var(--text-tertiary, #888)', fontSize: '0.78rem' }}>
+                    — Spawns Claude Code after reflection to apply fixes
+                  </span>
+                </label>
+
+              </div>
+            </>
+          )}
         </div>
       )}
 

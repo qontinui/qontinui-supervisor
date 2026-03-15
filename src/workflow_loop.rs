@@ -68,7 +68,7 @@ pub struct ImplementFixesConfig {
     pub model: Option<String>,
     /// Extra instructions for the fix agent
     pub additional_context: Option<String>,
-    /// Max seconds to wait for Claude to finish
+    /// Max seconds to wait for Claude to finish (0 = no timeout, default: 600s)
     #[serde(default = "default_fix_timeout")]
     pub timeout_secs: u64,
 }
@@ -112,6 +112,10 @@ pub struct WorkflowLoopState {
     pub iteration_results: Vec<IterationResult>,
     pub stop_tx: Option<watch::Sender<bool>>,
     pub restart_signaled: bool,
+    /// Current build task run ID (for checkpoint tracking)
+    pub build_task_run_id: Option<String>,
+    /// Current execute task run ID
+    pub execute_task_run_id: Option<String>,
 }
 
 impl WorkflowLoopState {
@@ -126,6 +130,8 @@ impl WorkflowLoopState {
             iteration_results: Vec::new(),
             stop_tx: None,
             restart_signaled: false,
+            build_task_run_id: None,
+            execute_task_run_id: None,
         }
     }
 
@@ -139,6 +145,8 @@ impl WorkflowLoopState {
             error: self.error.clone(),
             iteration_count: self.iteration_results.len() as u32,
             restart_signaled: self.restart_signaled,
+            build_task_run_id: self.build_task_run_id.clone(),
+            execute_task_run_id: self.execute_task_run_id.clone(),
         }
     }
 }
@@ -161,6 +169,8 @@ pub struct WorkflowLoopStatus {
     pub error: Option<String>,
     pub iteration_count: u32,
     pub restart_signaled: bool,
+    pub build_task_run_id: Option<String>,
+    pub execute_task_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -232,6 +242,8 @@ async fn start_workflow(client: &reqwest::Client, workflow_id: &str) -> Result<S
     let url = runner_url(&format!("/unified-workflows/{}/run", workflow_id));
     let resp = client
         .post(&url)
+        .header("Content-Type", "application/json")
+        .body("{}")
         .send()
         .await
         .map_err(|e| format!("Failed to start workflow: {}", e))?;
@@ -247,11 +259,15 @@ async fn start_workflow(client: &reqwest::Client, workflow_id: &str) -> Result<S
         .await
         .map_err(|e| format!("Failed to parse workflow response: {}", e))?;
 
-    json.get("task_run_id")
+    // Runner wraps in ApiResponse: {"success": true, "data": {"task_run_id": "..."}}
+    let data = json.get("data").unwrap_or(&json);
+    data.get("task_run_id")
+        .or_else(|| data.get("id"))
+        .or_else(|| json.get("task_run_id"))
         .or_else(|| json.get("id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "No task_run_id in workflow response".to_string())
+        .ok_or_else(|| format!("No task_run_id in workflow response: {}", json))
 }
 
 async fn poll_until_complete(
@@ -888,12 +904,12 @@ fn build_categorized_fix_prompt(
 }
 
 /// Generate a workflow via the runner's async generator endpoint.
-/// Returns the generated workflow ID.
+/// Returns (generated_workflow_id, task_run_id).
 async fn generate_workflow(
     client: &reqwest::Client,
     build_config: &BuildPhaseConfig,
     stop_rx: &watch::Receiver<bool>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let url = runner_url("/unified-workflows/generate-async");
 
     let mut body = serde_json::json!({
@@ -935,7 +951,24 @@ async fn generate_workflow(
         .to_string();
 
     // Poll until the meta-workflow completes
-    poll_until_complete(client, &task_run_id, stop_rx).await?;
+    let workflow_state = poll_until_complete(client, &task_run_id, stop_rx).await?;
+
+    // Check if the generation itself failed
+    let current_state = workflow_state
+        .get("current_state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    if current_state == "failed" {
+        let reason = workflow_state
+            .get("state_data")
+            .and_then(|sd| sd.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown reason");
+        return Err(format!(
+            "Workflow generation failed: {}. Task run: {}",
+            reason, task_run_id
+        ));
+    }
 
     // Fetch result data to get the generated workflow ID
     let result_url = runner_url(&format!("/task-runs/{}/result-data", task_run_id));
@@ -954,12 +987,19 @@ async fn generate_workflow(
         .await
         .map_err(|e| format!("Failed to parse result-data: {}", e))?;
 
-    result_json
+    let workflow_id = result_json
         .get("generated_workflow_id")
         .or_else(|| result_json.get("workflow_id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "No generated_workflow_id in result-data".to_string())
+        .ok_or_else(|| {
+            format!(
+                "No generated_workflow_id in result-data (task_run state: {}). The AI may have failed to generate a valid workflow.",
+                current_state
+            )
+        })?;
+
+    Ok((workflow_id, task_run_id))
 }
 
 /// Run reflection and return (reflection_task_run_id, fix_count, fixes).
@@ -1249,9 +1289,13 @@ async fn implement_fixes(
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI for fixes: {}", e))?;
 
-    // Wait for completion with timeout and stop signal
-    let timeout = Duration::from_secs(fix_config.timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
+    // Wait for completion with optional timeout and stop signal
+    let has_timeout = fix_config.timeout_secs > 0;
+    let deadline = if has_timeout {
+        Some(tokio::time::Instant::now() + Duration::from_secs(fix_config.timeout_secs))
+    } else {
+        None
+    };
 
     loop {
         if *stop_rx.borrow() {
@@ -1303,14 +1347,16 @@ async fn implement_fixes(
                 }
             }
             Ok(None) => {
-                // Still running
-                if tokio::time::Instant::now() >= deadline {
-                    warn!("Fix agent timed out after {}s", fix_config.timeout_secs);
-                    let _ = child.kill().await;
-                    return Err(format!(
-                        "Fix agent timed out after {}s",
-                        fix_config.timeout_secs
-                    ));
+                // Still running — check timeout if configured
+                if let Some(dl) = deadline {
+                    if tokio::time::Instant::now() >= dl {
+                        warn!("Fix agent timed out after {}s", fix_config.timeout_secs);
+                        let _ = child.kill().await;
+                        return Err(format!(
+                            "Fix agent timed out after {}s",
+                            fix_config.timeout_secs
+                        ));
+                    }
                 }
                 sleep(Duration::from_secs(2)).await;
             }
@@ -1653,6 +1699,7 @@ async fn run_simple_loop(
 
         let task_run_id = match start_workflow(&client, workflow_id).await {
             Ok(id) => {
+                state.workflow_loop.write().await.execute_task_run_id = Some(id.clone());
                 state
                     .logs
                     .emit(
@@ -2058,7 +2105,8 @@ async fn run_pipeline_loop(
                     .await;
 
                 match generate_workflow(&client, build_config, &stop_rx).await {
-                    Ok(wf_id) => {
+                    Ok((wf_id, build_tr_id)) => {
+                        state.workflow_loop.write().await.build_task_run_id = Some(build_tr_id);
                         state
                             .logs
                             .emit(
@@ -2153,6 +2201,7 @@ async fn run_pipeline_loop(
 
         let task_run_id = match start_workflow(&client, &workflow_id).await {
             Ok(id) => {
+                state.workflow_loop.write().await.execute_task_run_id = Some(id.clone());
                 state
                     .logs
                     .emit(

@@ -141,6 +141,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/workflow-loop/signal-restart",
             post(crate::routes::workflow_loop::signal_restart),
         )
+        .route(
+            "/workflow-loop/checkpoints/{task_run_id}",
+            get(crate::routes::workflow_loop::get_checkpoints),
+        )
         // Diagnostics
         .route(
             "/diagnostics",

@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -61,16 +61,11 @@ pub async fn start(
                 ));
             }
         }
-        // Validate implement_fixes timeout bounds
+        // Validate implement_fixes timeout bounds (0 = no timeout)
         if let Some(ref fixes) = phases.implement_fixes {
-            if fixes.timeout_secs == 0 {
-                return Err(SupervisorError::Validation(
-                    "implement_fixes timeout_secs must be greater than 0".to_string(),
-                ));
-            }
-            if fixes.timeout_secs > 3600 {
+            if fixes.timeout_secs > 7200 {
                 return Err(SupervisorError::Validation(format!(
-                    "implement_fixes timeout_secs too large ({}, max 3600)",
+                    "implement_fixes timeout_secs too large ({}, max 7200)",
                     fixes.timeout_secs
                 )));
             }
@@ -134,6 +129,8 @@ pub async fn start(
         wl.error = None;
         wl.iteration_results.clear();
         wl.stop_tx = Some(stop_tx);
+        wl.build_task_run_id = None;
+        wl.execute_task_run_id = None;
     }
 
     state
@@ -318,4 +315,37 @@ pub async fn stream(
     });
 
     Sse::new(event_stream).keep_alive(KeepAlive::default())
+}
+
+/// GET /workflow-loop/checkpoints/:task_run_id
+pub async fn get_checkpoints(
+    State(state): State<SharedState>,
+    Path(task_run_id): Path<String>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    // Validate task_run_id: only alphanumeric, dashes, and underscores allowed
+    if !task_run_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(SupervisorError::Validation(
+            "task_run_id must contain only alphanumeric characters, dashes, and underscores"
+                .to_string(),
+        ));
+    }
+
+    let url = format!(
+        "http://127.0.0.1:9876/task-runs/{}/checkpoints",
+        task_run_id
+    );
+    let resp = state
+        .http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to fetch checkpoints: {}", e)))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to parse checkpoints: {}", e)))?;
+    Ok(Json(body))
 }

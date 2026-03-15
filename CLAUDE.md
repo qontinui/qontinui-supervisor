@@ -15,7 +15,7 @@ Standalone Axum HTTP server that manages the runner process:
 - **Expo process management** start/stop/monitor Expo/React Native dev server
 - **Workflow loop** orchestrates repeated workflow execution with exit strategies and runner restarts between iterations
 - **UI Bridge proxy** transparent proxy to runner's UI Bridge SDK endpoints (control + SDK modes)
-- **HTML dashboard** self-contained web UI at `GET /` for visual monitoring and control (embedded in binary via `include_str!`)
+- **React dashboard** SPA web UI at `GET /` for visual monitoring and control (built with Vite, embedded in binary via `rust-embed` from `dist/`; falls back to legacy `static/dashboard.html` if dist is missing)
 
 ## Building & Running
 
@@ -57,7 +57,7 @@ cargo clippy -- -D warnings    # Lint
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/` | HTML dashboard (self-contained, embedded in binary) |
+| GET | `/` | React SPA dashboard (embedded via rust-embed from `dist/`, fallback to legacy `static/dashboard.html`) |
 | GET | `/health` | Comprehensive status (runner, watchdog, build, AI, code activity, expo) |
 | POST | `/runner/stop` | Stop runner + cleanup |
 | POST | `/runner/restart` | Stop + rebuild + start. Body: `{"rebuild": bool}` |
@@ -213,22 +213,25 @@ Returns `502 Bad Gateway` with descriptive error if the runner is not responding
 
 ## Dashboard
 
-The supervisor serves a self-contained HTML dashboard at `GET /`. Open `http://localhost:9875/` in a browser.
+The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9875/` in a browser.
 
 **Features:**
-- Real-time status cards: Runner, Ports, Watchdog, Build, AI Debug, Code Activity, Expo
-- Dev-start controls: start/stop backend, frontend, Docker, all services
+- Real-time service table: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Vite, Expo, Watchdog with status dots and action buttons
+- Dev-start controls: start/stop/restart individual services, bulk actions (Docker, Start All, Stop All, Clean, Fresh, Migrate)
+- AI debug panel with live SSE streaming, provider/model selector
 - Log viewer with source/level filtering, pause/resume, auto-scroll
-- AI output panel with live SSE streaming
-- Action buttons for all supervisor operations
+- Workflow loop status panel with iteration tracking
+- AI Fix buttons for down services (auto-sends context to debug agent)
+- Confirmation dialogs for destructive actions
 
-**Implementation:** Single `static/dashboard.html` file (~800 lines) with inline CSS+JS, compiled into the binary via `include_str!()`. No external dependencies, no CDN, no build step.
+**Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite. Production build output in `dist/` is embedded into the binary via `rust-embed`. Falls back to legacy `static/dashboard.html` if the SPA dist is missing.
 
 **Data flow:**
-- Polls `GET /health` every 3s for card data
-- Polls `GET /dev-start/status` every 5s for port list
+- SSE `GET /health/stream` for real-time health data (replaces polling)
 - SSE `GET /logs/stream` for real-time log entries
 - SSE `GET /ai/output/stream` for AI output
+- SSE `GET /workflow-loop/stream` for workflow loop status
+- Fetches `GET /dev-start/status` for service port availability
 - Fetches `GET /ai/models` once on init for provider/model select
 
 ## AI Providers
