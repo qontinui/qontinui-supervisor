@@ -275,15 +275,18 @@ async fn poll_until_complete(
     task_run_id: &str,
     stop_rx: &watch::Receiver<bool>,
 ) -> Result<serde_json::Value, String> {
-    let url = runner_url(&format!("/task-runs/{}/workflow-state", task_run_id));
+    let wf_state_url = runner_url(&format!("/task-runs/{}/workflow-state", task_run_id));
+    let task_run_url = runner_url(&format!("/task-runs/{}", task_run_id));
     let interval = Duration::from_secs(WORKFLOW_LOOP_POLL_INTERVAL_SECS);
+    let mut stale_count: u32 = 0;
 
     loop {
         if *stop_rx.borrow() {
             return Err("Stop requested".to_string());
         }
 
-        let resp = client.get(&url).send().await;
+        // Primary check: workflow-state endpoint
+        let resp = client.get(&wf_state_url).send().await;
         match resp {
             Ok(r) if r.status().is_success() => {
                 let json: serde_json::Value =
@@ -296,6 +299,36 @@ async fn poll_until_complete(
 
                 if is_complete {
                     return Ok(json);
+                }
+
+                // Fallback: if workflow-state is stuck (not complete for 10+ polls),
+                // check the task run's actual status directly
+                stale_count += 1;
+                if stale_count > 10 && stale_count.is_multiple_of(5) {
+                    if let Ok(tr_resp) = client.get(&task_run_url).send().await {
+                        if tr_resp.status().is_success() {
+                            if let Ok(tr_json) = tr_resp.json::<serde_json::Value>().await {
+                                let tr_data = tr_json.get("data").unwrap_or(&tr_json);
+                                let status = tr_data
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if status == "failed" || status == "completed" || status == "stopped" {
+                                    warn!(
+                                        "Task run {} has status '{}' but workflow-state.is_complete=false — treating as complete",
+                                        task_run_id, status
+                                    );
+                                    // Synthesize a completed workflow-state from what we know
+                                    let mut result = json.clone();
+                                    if let Some(obj) = result.as_object_mut() {
+                                        obj.insert("is_complete".to_string(), serde_json::json!(true));
+                                        obj.insert("current_state".to_string(), serde_json::json!(status));
+                                    }
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Ok(r) => {
