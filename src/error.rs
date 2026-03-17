@@ -10,6 +10,9 @@ pub enum SupervisorError {
     #[error("Runner is already running")]
     RunnerAlreadyRunning,
 
+    #[error("Runner not found: {0}")]
+    RunnerNotFound(String),
+
     #[error("Build in progress")]
     BuildInProgress,
 
@@ -46,6 +49,7 @@ impl IntoResponse for SupervisorError {
         let status = match &self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
+            SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::WorkflowLoopAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::WorkflowLoopNotRunning => StatusCode::CONFLICT,

@@ -32,6 +32,7 @@ fn test_save_and_load_roundtrip() {
         ai_provider: Some("claude".to_string()),
         ai_model: Some("opus".to_string()),
         auto_debug_enabled: Some(true),
+        runners: vec![],
     };
 
     save_settings(&path, &settings);
@@ -58,7 +59,7 @@ fn test_partial_settings() {
 
 #[test]
 fn test_settings_path() {
-    use qontinui_supervisor::config::SupervisorConfig;
+    use qontinui_supervisor::config::{RunnerConfig, SupervisorConfig};
     use qontinui_supervisor::settings::settings_path;
     use std::path::PathBuf;
 
@@ -75,6 +76,7 @@ fn test_settings_path() {
         cli_args: vec![],
         expo_dir: None,
         expo_port: 8081,
+        runners: vec![RunnerConfig::default_primary()],
     };
 
     let path = settings_path(&config);

@@ -29,6 +29,7 @@ fn test_config_from_fields() {
         cli_args: vec!["supervisor".to_string()],
         expo_dir: None,
         expo_port: 8081,
+        runners: vec![RunnerConfig::default_primary()],
     };
 
     assert!(config.dev_mode);
@@ -56,6 +57,7 @@ fn test_config_runner_exe_path() {
         cli_args: vec![],
         expo_dir: None,
         expo_port: 8081,
+        runners: vec![RunnerConfig::default_primary()],
     };
 
     let exe_path = config.runner_exe_path();
@@ -81,6 +83,7 @@ fn test_config_runner_npm_dir() {
         cli_args: vec![],
         expo_dir: None,
         expo_port: 8081,
+        runners: vec![RunnerConfig::default_primary()],
     };
 
     let npm_dir = config.runner_npm_dir();

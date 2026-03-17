@@ -1,21 +1,48 @@
-use crate::config::{SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
+use crate::config::{RunnerConfig, SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
 use crate::diagnostics::DiagnosticsState;
-use crate::health_cache::CachedPortHealth;
+use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
 use crate::smart_rebuild::SmartRebuildState;
 use crate::velocity_improvement::VelocityImprovementState;
 use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock};
 
 pub type SharedState = Arc<SupervisorState>;
 
+/// Per-runner state container. Each managed runner has its own state.
+pub struct ManagedRunner {
+    pub config: RunnerConfig,
+    pub runner: RwLock<RunnerState>,
+    pub watchdog: RwLock<WatchdogState>,
+    pub cached_health: RwLock<CachedPortHealth>,
+    pub health_cache_notify: Notify,
+    pub logs: LogState,
+}
+
+impl ManagedRunner {
+    pub fn new(config: RunnerConfig, watchdog_enabled: bool) -> Self {
+        Self {
+            config,
+            runner: RwLock::new(RunnerState::new()),
+            watchdog: RwLock::new(WatchdogState::new(watchdog_enabled)),
+            cached_health: RwLock::new(CachedPortHealth::default()),
+            health_cache_notify: Notify::new(),
+            logs: LogState::new(),
+        }
+    }
+}
+
 pub struct SupervisorState {
     pub config: SupervisorConfig,
+    /// Multi-runner map: runner_id -> ManagedRunner
+    pub runners: RwLock<HashMap<String, Arc<ManagedRunner>>>,
+    // Legacy single-runner fields kept for backward compat during transition.
+    // These point to the primary runner's state.
     pub runner: RwLock<RunnerState>,
     pub watchdog: RwLock<WatchdogState>,
     pub build: RwLock<BuildState>,
@@ -33,6 +60,9 @@ pub struct SupervisorState {
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
     pub cached_health: RwLock<CachedPortHealth>,
+    /// Cached per-runner health snapshots, updated by the background health refresher.
+    /// Readable via `try_read()` in sync contexts (SSE streams).
+    pub cached_runner_health: RwLock<Vec<CachedRunnerHealth>>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
     pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
@@ -119,8 +149,17 @@ impl SupervisorState {
             .pool_max_idle_per_host(4)
             .build()
             .expect("Failed to create HTTP client");
+
+        // Build multi-runner map from config
+        let mut runners_map = HashMap::new();
+        for rc in &config.runners {
+            let managed = Arc::new(ManagedRunner::new(rc.clone(), watchdog_enabled));
+            runners_map.insert(rc.id.clone(), managed);
+        }
+
         Self {
             config,
+            runners: RwLock::new(runners_map),
             runner: RwLock::new(RunnerState::new()),
             watchdog: RwLock::new(WatchdogState::new(watchdog_enabled)),
             build: RwLock::new(BuildState::new()),
@@ -138,6 +177,7 @@ impl SupervisorState {
             health_tx,
             shutdown_tx,
             cached_health: RwLock::new(CachedPortHealth::default()),
+            cached_runner_health: RwLock::new(Vec::new()),
             health_cache_notify: Notify::new(),
             http_client,
             db: None,
@@ -146,6 +186,27 @@ impl SupervisorState {
 
     pub fn notify_health_change(&self) {
         let _ = self.health_tx.send(());
+    }
+
+    /// Get a managed runner by ID.
+    pub async fn get_runner(&self, id: &str) -> Option<Arc<ManagedRunner>> {
+        let runners = self.runners.read().await;
+        runners.get(id).cloned()
+    }
+
+    /// Get the primary runner.
+    pub async fn get_primary(&self) -> Option<Arc<ManagedRunner>> {
+        let runners = self.runners.read().await;
+        runners
+            .values()
+            .find(|r| r.config.is_primary)
+            .cloned()
+    }
+
+    /// Get all runners as a Vec.
+    pub async fn get_all_runners(&self) -> Vec<Arc<ManagedRunner>> {
+        let runners = self.runners.read().await;
+        runners.values().cloned().collect()
     }
 }
 
@@ -352,7 +413,7 @@ impl Default for VelocityTestState {
 mod tests {
     use super::*;
     use crate::config::{
-        SupervisorConfig, AI_OUTPUT_BUFFER_SIZE, DEFAULT_SUPERVISOR_PORT, EXPO_PORT,
+        RunnerConfig, SupervisorConfig, AI_OUTPUT_BUFFER_SIZE, DEFAULT_SUPERVISOR_PORT, EXPO_PORT,
     };
     use std::path::PathBuf;
 
@@ -370,6 +431,7 @@ mod tests {
             cli_args: vec![],
             expo_dir: None,
             expo_port: EXPO_PORT,
+            runners: vec![RunnerConfig::default_primary()],
         }
     }
 

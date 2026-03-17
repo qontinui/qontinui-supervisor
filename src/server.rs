@@ -1,4 +1,4 @@
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -176,6 +176,34 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/expo/stop", post(crate::routes::expo::stop))
         .route("/expo/status", get(crate::routes::expo::status))
         .route("/expo/logs/stream", get(crate::routes::expo::logs_stream))
+        // Multi-runner management
+        .route("/runners", get(crate::routes::runners::list_runners))
+        .route("/runners", post(crate::routes::runners::add_runner))
+        .route(
+            "/runners/{id}",
+            delete(crate::routes::runners::remove_runner),
+        )
+        .route(
+            "/runners/{id}/start",
+            post(crate::routes::runners::start_runner),
+        )
+        .route(
+            "/runners/{id}/stop",
+            post(crate::routes::runners::stop_runner),
+        )
+        .route(
+            "/runners/{id}/restart",
+            post(crate::routes::runners::restart_runner),
+        )
+        .route(
+            "/runners/{id}/watchdog",
+            post(crate::routes::runners::control_runner_watchdog),
+        )
+        .route(
+            "/runners/{id}/ui-bridge/{*path}",
+            get(crate::routes::runners::proxy_ui_bridge)
+                .post(crate::routes::runners::proxy_ui_bridge),
+        )
         .with_state(state);
 
     // Merge stateless routers (velocity/eval have their own state, SPA has none)

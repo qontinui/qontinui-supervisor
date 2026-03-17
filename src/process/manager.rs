@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
@@ -8,17 +9,22 @@ use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
-use crate::process::windows::{kill_by_port, kill_runner_comprehensive};
-use crate::state::SharedState;
+use crate::process::windows::{kill_by_pid, kill_by_port, kill_runner_comprehensive};
+use crate::state::{ManagedRunner, SharedState};
 
-/// Start the runner process. Returns error if already running.
-pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
-    {
-        let runner = state.runner.read().await;
-        if runner.running {
-            return Err(SupervisorError::RunnerAlreadyRunning);
-        }
-    }
+// =============================================================================
+// Per-Runner Process Management (multi-runner)
+// =============================================================================
+
+/// Start a specific runner by ID.
+pub async fn start_runner_by_id(
+    state: &SharedState,
+    runner_id: &str,
+) -> Result<(), SupervisorError> {
+    let managed = state
+        .get_runner(runner_id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
 
     // Check if build is in progress
     {
@@ -28,42 +34,72 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
         }
     }
 
+    {
+        let runner = managed.runner.read().await;
+        if runner.running {
+            return Err(SupervisorError::RunnerAlreadyRunning);
+        }
+    }
+
+    let is_primary = managed.config.is_primary;
+    let port = managed.config.port;
+    let runner_name = managed.config.name.clone();
+
     state
         .logs
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
             format!(
-                "Starting runner in {} mode",
-                if state.config.dev_mode { "dev" } else { "exe" }
+                "Starting runner '{}' (port {}) in {} mode",
+                runner_name,
+                port,
+                if is_primary && state.config.dev_mode {
+                    "dev"
+                } else {
+                    "exe"
+                }
             ),
         )
         .await;
 
-    let mut child = if state.config.dev_mode {
-        start_dev_mode(state).await?
+    // Primary in dev mode uses `npm run tauri dev`; non-primary always uses exe mode
+    let mut child = if is_primary && state.config.dev_mode {
+        start_dev_mode(state, port).await?
     } else {
-        start_exe_mode(state).await?
+        start_exe_mode_for_runner(state, &managed).await?
     };
 
     let pid = child.id();
-    info!("Runner started with PID {:?}", pid);
+    info!(
+        "Runner '{}' started with PID {:?} on port {}",
+        runner_name, pid, port
+    );
 
-    // Capture stdout/stderr
+    // Capture stdout/stderr to the managed runner's logs
     if let Some(stdout) = child.stdout.take() {
-        crate::log_capture::spawn_stdout_reader(stdout, &state.logs);
+        crate::log_capture::spawn_stdout_reader(stdout, &managed.logs);
     }
     if let Some(stderr) = child.stderr.take() {
-        crate::log_capture::spawn_stderr_reader(stderr, &state.logs);
+        crate::log_capture::spawn_stderr_reader(stderr, &managed.logs);
     }
 
-    // Update state
+    // Update per-runner state
     {
-        let mut runner = state.runner.write().await;
+        let mut runner = managed.runner.write().await;
         runner.process = Some(child);
         runner.running = true;
         runner.started_at = Some(chrono::Utc::now());
         runner.pid = pid;
+    }
+
+    // If this is the primary runner, also update legacy state for backward compat
+    if is_primary {
+        let mut runner = state.runner.write().await;
+        runner.running = true;
+        runner.started_at = Some(chrono::Utc::now());
+        runner.pid = pid;
+        // process stays None in legacy — managed runner owns it
     }
 
     state
@@ -71,26 +107,488 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            format!("Runner process started (PID: {:?})", pid),
+            format!(
+                "Runner '{}' process started (PID: {:?}, port: {})",
+                runner_name, pid, port
+            ),
         )
         .await;
 
     state.notify_health_change();
-    state.health_cache_notify.notify_one();
+    managed.health_cache_notify.notify_one();
 
     // Spawn a task to monitor the process exit
     let state_clone = state.clone();
+    let managed_clone = managed.clone();
+    let runner_id_owned = runner_id.to_string();
     tokio::spawn(async move {
-        monitor_process_exit(state_clone).await;
+        monitor_runner_process_exit(state_clone, managed_clone, runner_id_owned).await;
     });
 
     Ok(())
 }
 
-async fn start_dev_mode(state: &SharedState) -> Result<tokio::process::Child, SupervisorError> {
+/// Start exe mode for a specific runner with port/name env vars.
+async fn start_exe_mode_for_runner(
+    state: &SharedState,
+    managed: &ManagedRunner,
+) -> Result<tokio::process::Child, SupervisorError> {
+    let exe_path = state.config.runner_exe_path();
+
+    if !exe_path.exists() {
+        return Err(SupervisorError::Process(format!(
+            "Runner exe not found at {:?}. Run a build first.",
+            exe_path
+        )));
+    }
+
+    info!(
+        "Starting runner '{}' in exe mode from {:?} on port {}",
+        managed.config.name, exe_path, managed.config.port
+    );
+
+    #[cfg(windows)]
+    let child = {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let mut cmd = Command::new(&exe_path);
+        cmd.current_dir(&state.config.project_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+            .env_remove("CLAUDECODE")
+            .env("QONTINUI_PORT", managed.config.port.to_string());
+
+        // Non-primary runners get QONTINUI_INSTANCE_NAME to skip scheduler
+        // and QONTINUI_PRIMARY_PORT so they can proxy process commands to the primary
+        if !managed.config.is_primary {
+            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
+            // Find the primary runner's port for process log proxying
+            if let Some(primary) = state.get_primary().await {
+                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+        }
+
+        cmd.spawn()
+            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
+    };
+
+    #[cfg(not(windows))]
+    let child = {
+        let mut cmd = Command::new(&exe_path);
+        cmd.current_dir(&state.config.project_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove("CLAUDECODE")
+            .env("QONTINUI_PORT", managed.config.port.to_string());
+
+        if !managed.config.is_primary {
+            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
+            if let Some(primary) = state.get_primary().await {
+                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+        }
+
+        cmd.spawn()
+            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
+    };
+
+    Ok(child)
+}
+
+/// Monitor a specific runner's process for exit.
+async fn monitor_runner_process_exit(
+    state: SharedState,
+    managed: Arc<ManagedRunner>,
+    _runner_id: String,
+) {
+    let is_primary = managed.config.is_primary;
+    let runner_name = managed.config.name.clone();
+
+    // Take the child out of state so we can await without holding the lock.
+    let child = {
+        let mut runner = managed.runner.write().await;
+        runner.process.take()
+    };
+
+    let exit_status = if let Some(mut child) = child {
+        match child.wait().await {
+            Ok(status) => Some(status),
+            Err(e) => {
+                error!(
+                    "Error waiting for runner '{}' process: {}",
+                    runner_name, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Update per-runner state
+    {
+        let mut runner = managed.runner.write().await;
+        runner.running = false;
+        runner.process = None;
+        runner.pid = None;
+    }
+
+    // Update legacy state for primary
+    if is_primary {
+        let mut runner = state.runner.write().await;
+        runner.running = false;
+        runner.process = None;
+        runner.pid = None;
+    }
+
+    state.notify_health_change();
+
+    if let Some(status) = exit_status {
+        let msg = if status.success() {
+            format!("Runner '{}' process exited normally", runner_name)
+        } else {
+            format!(
+                "Runner '{}' process exited with status: {}",
+                runner_name, status
+            )
+        };
+
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Info, &msg)
+            .await;
+        info!("{}", msg);
+    } else {
+        let msg = format!(
+            "Runner '{}' process terminated unexpectedly",
+            runner_name
+        );
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, &msg)
+            .await;
+        warn!("{}", msg);
+    }
+}
+
+/// Stop a specific runner by ID. Kills by PID (not by process name).
+pub async fn stop_runner_by_id(
+    state: &SharedState,
+    runner_id: &str,
+) -> Result<(), SupervisorError> {
+    let managed = state
+        .get_runner(runner_id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+
+    let runner_name = managed.config.name.clone();
+    let port = managed.config.port;
+    let is_primary = managed.config.is_primary;
+
+    {
+        let mut runner = managed.runner.write().await;
+        runner.stop_requested = true;
+    }
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Stopping runner '{}'...", runner_name),
+        )
+        .await;
+
+    // 1. Kill the child process by PID
+    let child = {
+        let mut runner = managed.runner.write().await;
+        runner.process.take()
+    };
+
+    let pid_to_kill = {
+        let runner = managed.runner.read().await;
+        runner.pid
+    };
+
+    if let Some(mut child) = child {
+        info!("Killing runner '{}' child process", runner_name);
+        let _ = child.kill().await;
+
+        let wait_result = tokio::time::timeout(
+            Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
+            child.wait(),
+        )
+        .await;
+
+        match wait_result {
+            Ok(Ok(_)) => info!("Runner '{}' process exited gracefully", runner_name),
+            Ok(Err(e)) => warn!("Error waiting for runner '{}': {}", runner_name, e),
+            Err(_) => warn!("Runner '{}' did not exit within timeout", runner_name),
+        }
+    }
+
+    // 2. If we have a PID, try to kill it directly (may have been a grandchild)
+    if let Some(pid) = pid_to_kill {
+        let _ = kill_by_pid(pid).await;
+    }
+
+    // 3. Clean up the runner's port
+    let port_free = wait_for_port_free(port, 5).await;
+    if !port_free {
+        warn!(
+            "Port {} still in use after stopping runner '{}', force-killing",
+            port, runner_name
+        );
+        let _ = kill_by_port(port).await;
+    }
+
+    // For primary in dev mode, also clean up Vite port
+    if is_primary && state.config.dev_mode {
+        let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
+        if !vite_free {
+            warn!("Vite port {} still in use after stop", RUNNER_VITE_PORT);
+            let _ = kill_by_port(RUNNER_VITE_PORT).await;
+        }
+    }
+
+    // 4. Update per-runner state
+    {
+        let mut runner = managed.runner.write().await;
+        runner.process = None;
+        runner.running = false;
+        runner.started_at = None;
+        runner.pid = None;
+        runner.stop_requested = false;
+    }
+
+    // Update legacy state for primary
+    if is_primary {
+        let mut runner = state.runner.write().await;
+        runner.process = None;
+        runner.running = false;
+        runner.started_at = None;
+        runner.pid = None;
+        runner.stop_requested = false;
+    }
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Runner '{}' stopped", runner_name),
+        )
+        .await;
+    info!("Runner '{}' stopped", runner_name);
+
+    state.notify_health_change();
+    managed.health_cache_notify.notify_one();
+
+    Ok(())
+}
+
+/// Restart a specific runner by ID. Stop, optionally rebuild (global), then start.
+pub async fn restart_runner_by_id(
+    state: &SharedState,
+    runner_id: &str,
+    rebuild: bool,
+    source: RestartSource,
+) -> Result<(), SupervisorError> {
+    let restart_start = std::time::Instant::now();
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::RestartStarted {
+            source: source.clone(),
+            rebuild,
+        });
+
+    let managed = state
+        .get_runner(runner_id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+
+    {
+        let mut runner = managed.runner.write().await;
+        runner.restart_requested = true;
+    }
+
+    // Stop if running
+    {
+        let runner = managed.runner.read().await;
+        if runner.running {
+            drop(runner);
+            if let Err(e) = stop_runner_by_id(state, runner_id).await {
+                state
+                    .diagnostics
+                    .write()
+                    .await
+                    .emit(DiagnosticEventKind::RestartFailed {
+                        source,
+                        error: e.to_string(),
+                    });
+                return Err(e);
+            }
+        }
+    }
+
+    // Rebuild if requested (global — single binary)
+    let build_duration = if rebuild {
+        let build_start = std::time::Instant::now();
+        if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartFailed {
+                    source,
+                    error: e.to_string(),
+                });
+            return Err(e);
+        }
+        Some(build_start.elapsed().as_secs_f64())
+    } else {
+        None
+    };
+
+    // Start
+    if let Err(e) = start_runner_by_id(state, runner_id).await {
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::RestartFailed {
+                source,
+                error: e.to_string(),
+            });
+        return Err(e);
+    }
+
+    {
+        let mut runner = managed.runner.write().await;
+        runner.restart_requested = false;
+    }
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::RestartCompleted {
+            source,
+            rebuild,
+            duration_secs: restart_start.elapsed().as_secs_f64(),
+            build_duration_secs: build_duration,
+        });
+
+    Ok(())
+}
+
+/// Stop all runners. Primary is stopped last.
+pub async fn stop_all(state: &SharedState) -> Result<(), SupervisorError> {
+    let runners = state.get_all_runners().await;
+    let mut errors = Vec::new();
+
+    // Stop non-primary first
+    for managed in &runners {
+        if !managed.config.is_primary {
+            let running = managed.runner.read().await.running;
+            if running {
+                if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
+                    errors.push(format!("'{}': {}", managed.config.name, e));
+                }
+            }
+        }
+    }
+
+    // Then stop primary
+    for managed in &runners {
+        if managed.config.is_primary {
+            let running = managed.runner.read().await.running;
+            if running {
+                if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
+                    errors.push(format!("'{}': {}", managed.config.name, e));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(SupervisorError::Other(format!(
+            "Errors stopping runners: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+/// Restart all runners. Stop all, optionally rebuild, start all (primary first).
+#[allow(dead_code)]
+pub async fn restart_all(
+    state: &SharedState,
+    rebuild: bool,
+    _source: RestartSource,
+) -> Result<(), SupervisorError> {
+    // Collect which runners were running before stop
+    let runners = state.get_all_runners().await;
+    let mut was_running = Vec::new();
+    for managed in &runners {
+        let running = managed.runner.read().await.running;
+        if running {
+            was_running.push(managed.config.id.clone());
+        }
+    }
+
+    stop_all(state).await?;
+
+    if rebuild {
+        crate::build_monitor::run_cargo_build(state).await?;
+    }
+
+    // Start primary first
+    for managed in &runners {
+        if managed.config.is_primary && was_running.contains(&managed.config.id) {
+            start_runner_by_id(state, &managed.config.id).await?;
+        }
+    }
+
+    // Then start non-primary with 2s delay
+    for managed in &runners {
+        if !managed.config.is_primary && was_running.contains(&managed.config.id) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            start_runner_by_id(state, &managed.config.id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Legacy single-runner functions (backward compat — delegate to primary runner)
+// =============================================================================
+
+/// Start the runner process (primary). Returns error if already running.
+pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
+    // Find the primary runner ID
+    let primary = state
+        .get_primary()
+        .await
+        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
+
+    start_runner_by_id(state, &primary.config.id).await
+}
+
+async fn start_dev_mode(
+    state: &SharedState,
+    port: u16,
+) -> Result<tokio::process::Child, SupervisorError> {
     let npm_dir = state.config.runner_npm_dir();
 
-    info!("Starting in dev mode from {:?}", npm_dir);
+    info!("Starting in dev mode from {:?} (port {})", npm_dir, port);
 
     #[cfg(windows)]
     let child = {
@@ -104,6 +602,7 @@ async fn start_dev_mode(state: &SharedState) -> Result<tokio::process::Child, Su
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
+            .env("QONTINUI_PORT", port.to_string())
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
     };
@@ -116,6 +615,7 @@ async fn start_dev_mode(state: &SharedState) -> Result<tokio::process::Child, Su
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_remove("CLAUDECODE")
+            .env("QONTINUI_PORT", port.to_string())
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
     };
@@ -123,6 +623,7 @@ async fn start_dev_mode(state: &SharedState) -> Result<tokio::process::Child, Su
     Ok(child)
 }
 
+#[allow(dead_code)]
 async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, SupervisorError> {
     let exe_path = state.config.runner_exe_path();
 
@@ -165,6 +666,8 @@ async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, Su
 }
 
 /// Monitor the runner process for exit. Updates state when process terminates.
+/// Legacy — only used if start_runner is called directly without per-runner tracking.
+#[allow(dead_code)]
 async fn monitor_process_exit(state: SharedState) {
     // Take the child out of state so we can await without holding the lock.
     let child = {
@@ -219,8 +722,20 @@ async fn monitor_process_exit(state: SharedState) {
     }
 }
 
-/// Stop the runner process. Attempts graceful shutdown, then force kill.
+/// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
 pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
+    let primary = state.get_primary().await;
+
+    if let Some(primary) = primary {
+        stop_runner_by_id(state, &primary.config.id).await
+    } else {
+        // Fallback: legacy behavior for when no managed runners exist
+        legacy_stop_runner(state).await
+    }
+}
+
+/// Legacy stop implementation for backward compat.
+async fn legacy_stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
     {
         let mut runner = state.runner.write().await;
         runner.stop_requested = true;
@@ -231,7 +746,6 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         .emit(LogSource::Supervisor, LogLevel::Info, "Stopping runner...")
         .await;
 
-    // 1. Try to kill the child process gracefully (take child out to avoid holding lock across await)
     let child = {
         let mut runner = state.runner.write().await;
         runner.process.take()
@@ -241,7 +755,6 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         info!("Killing runner child process");
         let _ = child.kill().await;
 
-        // Wait briefly for process to exit
         let wait_result = tokio::time::timeout(
             Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
             child.wait(),
@@ -258,10 +771,8 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         false
     };
 
-    // 2. Comprehensive kill (taskkill + port cleanup)
     kill_runner_comprehensive().await;
 
-    // 3. Wait for ports to be free
     let api_free = wait_for_port_free(RUNNER_API_PORT, 5).await;
     if state.config.dev_mode {
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
@@ -275,7 +786,6 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
         let _ = kill_by_port(RUNNER_API_PORT).await;
     }
 
-    // 4. Update state
     {
         let mut runner = state.runner.write().await;
         runner.process = None;
@@ -297,34 +807,55 @@ pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
     Ok(())
 }
 
-/// Stop runner, optionally rebuild, then start.
+/// Stop runner, optionally rebuild, then start. (Legacy — targets primary)
 pub async fn restart_runner(
     state: &SharedState,
     rebuild: bool,
     source: RestartSource,
 ) -> Result<(), SupervisorError> {
-    let restart_start = std::time::Instant::now();
+    let primary = state.get_primary().await;
 
-    state
-        .diagnostics
-        .write()
-        .await
-        .emit(DiagnosticEventKind::RestartStarted {
-            source: source.clone(),
-            rebuild,
-        });
+    if let Some(primary) = primary {
+        restart_runner_by_id(state, &primary.config.id, rebuild, source).await
+    } else {
+        // Fallback legacy behavior
+        let restart_start = std::time::Instant::now();
 
-    {
-        let mut runner = state.runner.write().await;
-        runner.restart_requested = true;
-    }
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::RestartStarted {
+                source: source.clone(),
+                rebuild,
+            });
 
-    // Stop if running
-    {
-        let runner = state.runner.read().await;
-        if runner.running {
-            drop(runner);
-            if let Err(e) = stop_runner(state).await {
+        {
+            let mut runner = state.runner.write().await;
+            runner.restart_requested = true;
+        }
+
+        {
+            let runner = state.runner.read().await;
+            if runner.running {
+                drop(runner);
+                if let Err(e) = stop_runner(state).await {
+                    state
+                        .diagnostics
+                        .write()
+                        .await
+                        .emit(DiagnosticEventKind::RestartFailed {
+                            source,
+                            error: e.to_string(),
+                        });
+                    return Err(e);
+                }
+            }
+        }
+
+        let build_duration = if rebuild {
+            let build_start = std::time::Instant::now();
+            if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
                 state
                     .diagnostics
                     .write()
@@ -335,13 +866,12 @@ pub async fn restart_runner(
                     });
                 return Err(e);
             }
-        }
-    }
+            Some(build_start.elapsed().as_secs_f64())
+        } else {
+            None
+        };
 
-    // Rebuild if requested
-    let build_duration = if rebuild {
-        let build_start = std::time::Instant::now();
-        if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
+        if let Err(e) = start_runner(state).await {
             state
                 .diagnostics
                 .write()
@@ -352,39 +882,23 @@ pub async fn restart_runner(
                 });
             return Err(e);
         }
-        Some(build_start.elapsed().as_secs_f64())
-    } else {
-        None
-    };
 
-    // Start
-    if let Err(e) = start_runner(state).await {
+        {
+            let mut runner = state.runner.write().await;
+            runner.restart_requested = false;
+        }
+
         state
             .diagnostics
             .write()
             .await
-            .emit(DiagnosticEventKind::RestartFailed {
+            .emit(DiagnosticEventKind::RestartCompleted {
                 source,
-                error: e.to_string(),
+                rebuild,
+                duration_secs: restart_start.elapsed().as_secs_f64(),
+                build_duration_secs: build_duration,
             });
-        return Err(e);
+
+        Ok(())
     }
-
-    {
-        let mut runner = state.runner.write().await;
-        runner.restart_requested = false;
-    }
-
-    state
-        .diagnostics
-        .write()
-        .await
-        .emit(DiagnosticEventKind::RestartCompleted {
-            source,
-            rebuild,
-            duration_secs: restart_start.elapsed().as_secs_f64(),
-            build_duration_secs: build_duration,
-        });
-
-    Ok(())
 }

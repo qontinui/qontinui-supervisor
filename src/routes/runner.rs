@@ -60,7 +60,25 @@ pub async fn control_watchdog(
     State(state): State<SharedState>,
     Json(body): Json<WatchdogRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let response = {
+    // Update the primary runner's managed watchdog (used by the watchdog bg task)
+    let response = if let Some(primary) = state.get_primary().await {
+        let mut wd = primary.watchdog.write().await;
+        wd.enabled = body.enabled;
+
+        if body.reset_attempts {
+            wd.restart_attempts = 0;
+            wd.disabled_reason = None;
+            wd.crash_history.clear();
+        }
+
+        serde_json::json!({
+            "watchdog": {
+                "enabled": wd.enabled,
+                "restart_attempts": wd.restart_attempts,
+            }
+        })
+    } else {
+        // Fallback to legacy state if no managed runners
         let mut wd = state.watchdog.write().await;
         wd.enabled = body.enabled;
 
@@ -122,14 +140,8 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // Stop runner first
-    {
-        let runner = state.runner.read().await;
-        if runner.running {
-            drop(runner);
-            let _ = manager::stop_runner(&state).await;
-        }
-    }
+    // Stop all runners first
+    let _ = manager::stop_all(&state).await;
 
     // Spawn replacement process
     let mut cmd = std::process::Command::new(&exe);

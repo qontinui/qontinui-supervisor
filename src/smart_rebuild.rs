@@ -204,9 +204,19 @@ async fn run_smart_rebuild(state: &SharedState) {
         sr.last_build_error = None;
     }
 
-    // Phase: StoppingRunner — stop runner if running
-    let runner_running = { state.runner.read().await.running };
-    if runner_running {
+    // Phase: StoppingRunner — stop ALL runners since they share the same binary.
+    // Record which runners are running so we only restart those after rebuild.
+    let was_running: Vec<String> = {
+        let runners = state.get_all_runners().await;
+        let mut ids = Vec::new();
+        for managed in &runners {
+            if managed.runner.read().await.running {
+                ids.push(managed.config.id.clone());
+            }
+        }
+        ids
+    };
+    if !was_running.is_empty() {
         {
             let mut sr = state.smart_rebuild.write().await;
             sr.phase = SmartRebuildPhase::StoppingRunner;
@@ -216,13 +226,13 @@ async fn run_smart_rebuild(state: &SharedState) {
             .emit(
                 LogSource::SmartRebuild,
                 LogLevel::Info,
-                "Stopping runner for rebuild",
+                "Stopping all runners for rebuild",
             )
             .await;
 
-        if let Err(e) = manager::stop_runner(state).await {
-            error!("Smart rebuild: failed to stop runner: {}", e);
-            set_failed(state, format!("Failed to stop runner: {}", e)).await;
+        if let Err(e) = manager::stop_all(state).await {
+            error!("Smart rebuild: failed to stop runners: {}", e);
+            set_failed(state, format!("Failed to stop runners: {}", e)).await;
             return;
         }
     }
@@ -333,7 +343,7 @@ async fn run_smart_rebuild(state: &SharedState) {
         }
     }
 
-    // Phase: Restarting
+    // Phase: Restarting — restart all runners that were running before rebuild
     {
         let mut sr = state.smart_rebuild.write().await;
         sr.phase = SmartRebuildPhase::Restarting;
@@ -344,78 +354,102 @@ async fn run_smart_rebuild(state: &SharedState) {
         .emit(
             LogSource::SmartRebuild,
             LogLevel::Info,
-            "Build succeeded, restarting runner",
+            format!(
+                "Build succeeded, restarting {} previously-running runner(s)",
+                was_running.len()
+            ),
         )
         .await;
 
-    match manager::start_runner(state).await {
-        Ok(()) => {
-            // Wait for runner to become healthy
-            let healthy = wait_for_runner_healthy(state, 60).await;
-            if !healthy {
-                warn!("Smart rebuild: runner started but not healthy after 60s");
-                state
-                    .logs
-                    .emit(
-                        LogSource::SmartRebuild,
-                        LogLevel::Warn,
-                        "Runner started but not healthy after 60s",
-                    )
-                    .await;
+    // Restart only runners that were running before the rebuild.
+    // Primary first, then non-primary with 2s delay.
+    let runners = state.get_all_runners().await;
+    let mut start_errors = Vec::new();
+
+    // Start primary first (if it was running)
+    for managed in &runners {
+        if managed.config.is_primary && was_running.contains(&managed.config.id) {
+            if let Err(e) = manager::start_runner_by_id(state, &managed.config.id).await {
+                start_errors.push(format!("'{}': {}", managed.config.name, e));
             }
+        }
+    }
 
-            let duration_secs = rebuild_start.elapsed().as_secs_f64();
-
-            // Update state
-            let new_mtime = code_activity::get_last_source_modification(&state.config.project_dir);
-            {
-                let mut sr = state.smart_rebuild.write().await;
-                sr.phase = SmartRebuildPhase::Idle;
-                sr.last_successful_build_mtime = new_mtime;
-                sr.total_rebuilds += 1;
-                sr.last_rebuild_at = Some(Utc::now());
-                sr.current_attempt = 0;
-                sr.last_build_error = None;
+    // Then non-primary with 2s delay (only those that were running)
+    for managed in &runners {
+        if !managed.config.is_primary && was_running.contains(&managed.config.id) {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Err(e) = manager::start_runner_by_id(state, &managed.config.id).await {
+                start_errors.push(format!("'{}': {}", managed.config.name, e));
             }
+        }
+    }
 
-            info!(
-                "Smart rebuild: completed successfully in {:.1}s ({} attempts)",
-                duration_secs, attempt
-            );
+    if !start_errors.is_empty() {
+        let reason = format!("Failed to restart runners: {}", start_errors.join("; "));
+        error!("Smart rebuild: {}", reason);
+        set_failed(state, reason.clone()).await;
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::SmartRebuildFailed { reason });
+    } else {
+        // Wait for primary runner to become healthy
+        let healthy = wait_for_runner_healthy(state, 60).await;
+        if !healthy {
+            warn!("Smart rebuild: runners started but primary not healthy after 60s");
             state
                 .logs
                 .emit(
                     LogSource::SmartRebuild,
-                    LogLevel::Info,
-                    format!(
-                        "Smart rebuild completed in {:.1}s ({} attempts)",
-                        duration_secs, attempt
-                    ),
+                    LogLevel::Warn,
+                    "Runners started but primary not healthy after 60s",
                 )
                 .await;
-
-            state
-                .diagnostics
-                .write()
-                .await
-                .emit(DiagnosticEventKind::SmartRebuildCompleted {
-                    total_attempts: attempt,
-                    duration_secs,
-                });
-
-            // Spawn build error monitor for the new runner
-            build_monitor::spawn_build_error_monitor(state.clone());
         }
-        Err(e) => {
-            let reason = format!("Failed to restart runner after rebuild: {}", e);
-            error!("Smart rebuild: {}", reason);
-            set_failed(state, reason.clone()).await;
-            state
-                .diagnostics
-                .write()
-                .await
-                .emit(DiagnosticEventKind::SmartRebuildFailed { reason });
+
+        let duration_secs = rebuild_start.elapsed().as_secs_f64();
+
+        // Update state
+        let new_mtime = code_activity::get_last_source_modification(&state.config.project_dir);
+        {
+            let mut sr = state.smart_rebuild.write().await;
+            sr.phase = SmartRebuildPhase::Idle;
+            sr.last_successful_build_mtime = new_mtime;
+            sr.total_rebuilds += 1;
+            sr.last_rebuild_at = Some(Utc::now());
+            sr.current_attempt = 0;
+            sr.last_build_error = None;
         }
+
+        info!(
+            "Smart rebuild: completed successfully in {:.1}s ({} attempts)",
+            duration_secs, attempt
+        );
+        state
+            .logs
+            .emit(
+                LogSource::SmartRebuild,
+                LogLevel::Info,
+                format!(
+                    "Smart rebuild completed in {:.1}s ({} attempts)",
+                    duration_secs, attempt
+                ),
+            )
+            .await;
+
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::SmartRebuildCompleted {
+                total_attempts: attempt,
+                duration_secs,
+            });
+
+        // Spawn build error monitor for the new runner
+        build_monitor::spawn_build_error_monitor(state.clone());
     }
 }
 

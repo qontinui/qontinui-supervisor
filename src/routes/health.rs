@@ -9,6 +9,7 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 
 use crate::config::{RUNNER_API_PORT, RUNNER_VITE_PORT};
+use crate::health_cache::CachedRunnerHealth;
 use crate::state::SharedState;
 
 #[derive(Serialize)]
@@ -23,6 +24,22 @@ pub struct HealthResponse {
     pub expo: ExpoHealth,
     pub overnight_watchdog: OvernightWatchdogHealth,
     pub supervisor: SupervisorInfo,
+    /// Multi-runner status array (includes all managed runners).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<RunnerInstanceHealth>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct RunnerInstanceHealth {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    pub is_primary: bool,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub started_at: Option<String>,
+    pub api_responding: bool,
+    pub watchdog_status: WatchdogHealth,
 }
 
 #[derive(Serialize)]
@@ -54,7 +71,7 @@ pub struct PortStatus {
     pub in_use: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct WatchdogHealth {
     pub enabled: bool,
     pub restart_attempts: u32,
@@ -121,13 +138,39 @@ pub fn determine_overall_status(
     }
 }
 
+/// Build runner instance health from the cached snapshot (sync-safe for SSE).
+fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
+    match state.cached_runner_health.try_read() {
+        Ok(snapshots) => snapshots
+            .iter()
+            .map(|r: &CachedRunnerHealth| RunnerInstanceHealth {
+                id: r.id.clone(),
+                name: r.name.clone(),
+                port: r.port,
+                is_primary: r.is_primary,
+                running: r.running,
+                pid: r.pid,
+                started_at: None, // Not cached — use GET /runners for full detail
+                api_responding: r.api_responding,
+                watchdog_status: WatchdogHealth {
+                    enabled: false,
+                    restart_attempts: 0,
+                    last_restart_at: None,
+                    disabled_reason: None,
+                    crash_count: 0,
+                },
+            })
+            .collect(),
+        Err(_) => Vec::new(), // Lock contended, skip this tick
+    }
+}
+
 pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     Json(build_health_response(&state).await)
 }
 
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let runner = state.runner.read().await;
-    let watchdog = state.watchdog.read().await;
     let build = state.build.read().await;
     let ai = state.ai.read().await;
     let ca = state.code_activity.read().await;
@@ -143,6 +186,58 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
 
     let overall_status =
         determine_overall_status(runner.running, api_responding, build.build_in_progress);
+
+    // Build multi-runner status array and capture primary watchdog for backward compat
+    let managed_runners = state.get_all_runners().await;
+    let mut runners_health = Vec::new();
+    let mut primary_watchdog = None;
+    for managed in &managed_runners {
+        let mr = managed.runner.read().await;
+        let mw = managed.watchdog.read().await;
+        let mc = managed.cached_health.read().await;
+        let wd_health = WatchdogHealth {
+            enabled: mw.enabled,
+            restart_attempts: mw.restart_attempts,
+            last_restart_at: mw.last_restart_at.map(|t| t.to_rfc3339()),
+            disabled_reason: mw.disabled_reason.clone(),
+            crash_count: mw.crash_history.len(),
+        };
+        if managed.config.is_primary {
+            primary_watchdog = Some(wd_health.clone());
+        }
+        runners_health.push(RunnerInstanceHealth {
+            id: managed.config.id.clone(),
+            name: managed.config.name.clone(),
+            port: managed.config.port,
+            is_primary: managed.config.is_primary,
+            running: mr.running,
+            pid: mr.pid,
+            started_at: mr.started_at.map(|t| t.to_rfc3339()),
+            api_responding: mc.runner_responding,
+            watchdog_status: wd_health,
+        });
+    }
+
+    // Use primary runner's watchdog for backward compat, fallback to legacy state
+    let watchdog_health = primary_watchdog.unwrap_or_else(|| {
+        let watchdog = state.watchdog.try_read();
+        match watchdog {
+            Ok(wd) => WatchdogHealth {
+                enabled: wd.enabled,
+                restart_attempts: wd.restart_attempts,
+                last_restart_at: wd.last_restart_at.map(|t| t.to_rfc3339()),
+                disabled_reason: wd.disabled_reason.clone(),
+                crash_count: wd.crash_history.len(),
+            },
+            Err(_) => WatchdogHealth {
+                enabled: false,
+                restart_attempts: 0,
+                last_restart_at: None,
+                disabled_reason: None,
+                crash_count: 0,
+            },
+        }
+    });
 
     HealthResponse {
         status: overall_status.to_string(),
@@ -171,13 +266,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
                 None
             },
         },
-        watchdog: WatchdogHealth {
-            enabled: watchdog.enabled,
-            restart_attempts: watchdog.restart_attempts,
-            last_restart_at: watchdog.last_restart_at.map(|t| t.to_rfc3339()),
-            disabled_reason: watchdog.disabled_reason.clone(),
-            crash_count: watchdog.crash_history.len(),
-        },
+        watchdog: watchdog_health,
         build: BuildHealth {
             in_progress: build.build_in_progress,
             error_detected: build.build_error_detected,
@@ -214,6 +303,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             dev_mode: state.config.dev_mode,
             project_dir: state.config.project_dir.display().to_string(),
         },
+        runners: runners_health,
     }
 }
 
@@ -337,6 +427,8 @@ pub async fn health_stream(
                     dev_mode: state.config.dev_mode,
                     project_dir: state.config.project_dir.display().to_string(),
                 },
+                // Read cached runner snapshots (built by background health refresher)
+                runners: build_sse_runners(&state),
             }
         };
 
@@ -459,6 +551,7 @@ mod tests {
                 dev_mode: true,
                 project_dir: "/tmp/test".to_string(),
             },
+            runners: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).expect("should serialize");

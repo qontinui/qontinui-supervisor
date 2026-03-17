@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use qontinui_supervisor::config::SupervisorConfig;
+use qontinui_supervisor::config::{RunnerConfig, SupervisorConfig};
 use qontinui_supervisor::health_cache::CachedPortHealth;
 use qontinui_supervisor::state::SupervisorState;
 
@@ -19,6 +19,7 @@ fn test_config() -> SupervisorConfig {
         cli_args: vec![],
         expo_dir: None,
         expo_port: 8081,
+        runners: vec![RunnerConfig::default_primary()],
     }
 }
 

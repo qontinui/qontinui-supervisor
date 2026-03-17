@@ -14,6 +14,19 @@ pub struct CachedPortHealth {
     pub vite_port_open: bool,
 }
 
+/// Cached per-runner health snapshot, built by the background refresher.
+/// Readable via `try_read()` in sync contexts (e.g., SSE streams).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CachedRunnerHealth {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    pub is_primary: bool,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub api_responding: bool,
+}
+
 pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(2));
@@ -28,22 +41,78 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 },
             }
 
-            let runner_port = crate::config::RUNNER_API_PORT;
-            let vite_port = RUNNER_VITE_PORT;
+            // Refresh health for all managed runners
+            let runners = state.get_all_runners().await;
+            let dev_mode = state.config.dev_mode;
 
-            let runner_port_open = port::is_port_in_use(runner_port);
-            let runner_responding = port::is_runner_responding(runner_port).await;
-            let vite_port_open = port::is_port_in_use(vite_port);
+            // Primary runner's health also goes into the legacy cached_health
+            let mut primary_health = CachedPortHealth::default();
+            let mut runner_snapshots = Vec::with_capacity(runners.len());
 
-            let new_health = CachedPortHealth {
-                runner_port_open,
-                runner_responding,
-                vite_port_open,
-            };
+            for managed in &runners {
+                let runner_port = managed.config.port;
+                let is_primary = managed.config.is_primary;
 
+                let runner_port_open = port::is_port_in_use(runner_port);
+                let runner_responding = port::is_runner_responding(runner_port).await;
+
+                // For primary in dev mode, also check Vite port
+                let vite_port_open = if is_primary && dev_mode {
+                    port::is_port_in_use(RUNNER_VITE_PORT)
+                } else {
+                    false
+                };
+
+                let new_health = CachedPortHealth {
+                    runner_port_open,
+                    runner_responding,
+                    vite_port_open,
+                };
+
+                // Build runner snapshot for SSE consumers
+                let runner_state = managed.runner.read().await;
+                runner_snapshots.push(CachedRunnerHealth {
+                    id: managed.config.id.clone(),
+                    name: managed.config.name.clone(),
+                    port: runner_port,
+                    is_primary,
+                    running: runner_state.running,
+                    pid: runner_state.pid,
+                    api_responding: runner_responding,
+                });
+                drop(runner_state);
+
+                // Update per-runner cache
+                let mut cache = managed.cached_health.write().await;
+                *cache = new_health.clone();
+                drop(cache);
+
+                if is_primary {
+                    primary_health = new_health;
+                }
+            }
+
+            // If no runners exist, check legacy ports
+            if runners.is_empty() {
+                let runner_port = crate::config::RUNNER_API_PORT;
+                let vite_port = RUNNER_VITE_PORT;
+
+                primary_health = CachedPortHealth {
+                    runner_port_open: port::is_port_in_use(runner_port),
+                    runner_responding: port::is_runner_responding(runner_port).await,
+                    vite_port_open: port::is_port_in_use(vite_port),
+                };
+            }
+
+            // Update legacy cached_health (from primary)
             let mut cache = state.cached_health.write().await;
-            *cache = new_health;
+            *cache = primary_health.clone();
             drop(cache);
+
+            // Update cached runner health snapshot (for SSE consumers)
+            let mut runner_cache = state.cached_runner_health.write().await;
+            *runner_cache = runner_snapshots;
+            drop(runner_cache);
 
             tick_count += 1;
             // Log to dashboard once per minute (every 30 ticks at 2s interval)
@@ -54,8 +123,11 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         LogSource::Supervisor,
                         LogLevel::Debug,
                         format!(
-                            "Health cache: runner_port={}, api_responding={}, vite={}",
-                            runner_port_open, runner_responding, vite_port_open
+                            "Health cache: runner_port={}, api_responding={}, vite={} (runners: {})",
+                            primary_health.runner_port_open,
+                            primary_health.runner_responding,
+                            primary_health.vite_port_open,
+                            runners.len()
                         ),
                     )
                     .await;

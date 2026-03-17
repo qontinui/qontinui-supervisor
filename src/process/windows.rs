@@ -113,15 +113,44 @@ pub async fn cleanup_orphaned_build_processes() {
     }
 }
 
+/// Kill a process by its PID using taskkill.
+pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
+    let output = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let success = output.status.success();
+    if success {
+        info!("taskkill: killed PID {}", pid);
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("taskkill PID {}: {}", pid, stderr.trim());
+    }
+
+    Ok(success)
+}
+
 /// Kill the runner by all known methods: process name, ports, etc.
-pub async fn kill_runner_comprehensive() {
+/// Accepts a list of ports to clean up (for multi-runner support).
+pub async fn kill_runner_comprehensive_ports(ports: &[u16]) {
     // 1. Kill by process name
     let _ = taskkill_by_name("qontinui-runner.exe", true).await;
 
     // 2. Kill by known ports
-    let _ = kill_by_port(9876).await;
-    let _ = kill_by_port(1420).await;
+    for &port in ports {
+        let _ = kill_by_port(port).await;
+    }
 
     // Small delay for OS to release resources
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+/// Kill the runner by all known methods: process name, ports, etc.
+/// Legacy single-runner version using hardcoded ports.
+pub async fn kill_runner_comprehensive() {
+    kill_runner_comprehensive_ports(&[9876, 1420]).await;
 }

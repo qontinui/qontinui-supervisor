@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Qontinui Supervisor — manages the qontinui-runner process lifecycle.
@@ -56,11 +57,36 @@ pub struct SupervisorConfig {
     pub cli_args: Vec<String>,
     pub expo_dir: Option<PathBuf>,
     pub expo_port: u16,
+    /// Runner configurations. If empty at startup, a default primary runner is created.
+    pub runners: Vec<RunnerConfig>,
+}
+
+/// Configuration for a single managed runner instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerConfig {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    pub is_primary: bool,
+}
+
+impl RunnerConfig {
+    /// Create the default primary runner config.
+    pub fn default_primary() -> Self {
+        Self {
+            id: "primary".to_string(),
+            name: "Primary".to_string(),
+            port: DEFAULT_RUNNER_API_PORT,
+            is_primary: true,
+        }
+    }
 }
 
 // Port constants
 pub const DEFAULT_SUPERVISOR_PORT: u16 = 9875;
-pub const RUNNER_API_PORT: u16 = 9876;
+pub const DEFAULT_RUNNER_API_PORT: u16 = 9876;
+/// Backward compat alias
+pub const RUNNER_API_PORT: u16 = DEFAULT_RUNNER_API_PORT;
 pub const RUNNER_VITE_PORT: u16 = 1420;
 pub const EXPO_PORT: u16 = 8081;
 
@@ -167,6 +193,8 @@ impl SupervisorConfig {
             cli_args,
             expo_dir: args.expo_dir,
             expo_port: EXPO_PORT,
+            // Default: single primary runner; settings may override later
+            runners: vec![RunnerConfig::default_primary()],
         }
     }
 
@@ -383,6 +411,10 @@ mod tests {
         assert_eq!(config.port, DEFAULT_SUPERVISOR_PORT);
         assert_eq!(config.expo_port, EXPO_PORT);
         assert!(config.expo_dir.is_none());
+        // Default single primary runner
+        assert_eq!(config.runners.len(), 1);
+        assert_eq!(config.runners[0].id, "primary");
+        assert!(config.runners[0].is_primary);
     }
 
     #[test]
