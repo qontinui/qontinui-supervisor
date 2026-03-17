@@ -74,6 +74,19 @@ pub async fn add_runner(
     State(state): State<SharedState>,
     Json(body): Json<AddRunnerRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    // Validate name
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(SupervisorError::Validation(
+            "Runner name must not be empty".to_string(),
+        ));
+    }
+    if name.len() > 64 {
+        return Err(SupervisorError::Validation(
+            "Runner name must be 64 characters or fewer".to_string(),
+        ));
+    }
+
     if body.port < 1024 {
         return Err(SupervisorError::Validation(
             "Port must be >= 1024".to_string(),
@@ -85,14 +98,18 @@ pub async fn add_runner(
 
     let runner_config = RunnerConfig {
         id: id.clone(),
-        name: body.name.clone(),
+        name: name.clone(),
         port: body.port,
         is_primary: false,
     };
 
-    // Check for port conflicts
+    // Check for port conflicts and insert under a single write lock to avoid TOCTOU race.
+    let managed = Arc::new(ManagedRunner::new(
+        runner_config.clone(),
+        state.config.watchdog_enabled_at_start,
+    ));
     {
-        let runners = state.runners.read().await;
+        let mut runners = state.runners.write().await;
         for existing in runners.values() {
             if existing.config.port == body.port {
                 return Err(SupervisorError::Validation(format!(
@@ -101,15 +118,6 @@ pub async fn add_runner(
                 )));
             }
         }
-    }
-
-    // Create and insert the managed runner
-    let managed = Arc::new(ManagedRunner::new(
-        runner_config.clone(),
-        state.config.watchdog_enabled_at_start,
-    ));
-    {
-        let mut runners = state.runners.write().await;
         runners.insert(id.clone(), managed);
     }
 
@@ -124,14 +132,14 @@ pub async fn add_runner(
             LogLevel::Info,
             format!(
                 "Added runner '{}' (id: {}, port: {})",
-                body.name, id, body.port
+                name, id, body.port
             ),
         )
         .await;
 
     Ok(Json(json!({
         "id": id,
-        "name": body.name,
+        "name": name,
         "port": body.port,
         "message": "Runner added successfully"
     })))

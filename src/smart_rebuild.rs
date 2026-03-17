@@ -677,14 +677,16 @@ async fn wait_for_runner_healthy(state: &SharedState, timeout_secs: u64) -> bool
 
 /// Cancel an in-progress smart rebuild, resetting to Idle.
 pub async fn cancel_smart_rebuild(state: &SharedState) {
-    let mut sr = state.smart_rebuild.write().await;
-    if sr.is_idle() {
-        return;
-    }
-    info!("Smart rebuild: cancelled");
-    sr.phase = SmartRebuildPhase::Idle;
-    sr.current_attempt = 0;
-    sr.last_build_error = None;
+    {
+        let mut sr = state.smart_rebuild.write().await;
+        if sr.is_idle() {
+            return;
+        }
+        info!("Smart rebuild: cancelled");
+        sr.phase = SmartRebuildPhase::Idle;
+        sr.current_attempt = 0;
+        sr.last_build_error = None;
+    } // write lock released before the await
 
     state
         .logs

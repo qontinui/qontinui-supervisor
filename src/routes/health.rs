@@ -329,26 +329,30 @@ pub async fn health_stream(
             let cached = state.cached_health.try_read();
 
             // If any lock is contended, skip this tick
-            if runner.is_err()
-                || watchdog.is_err()
-                || build.is_err()
-                || ai.is_err()
-                || ca.is_err()
-                || expo.is_err()
-                || ow.is_err()
-                || cached.is_err()
-            {
+            let Ok(runner) = runner else {
                 return Ok(Event::default().comment("keepalive"));
-            }
-
-            let runner = runner.unwrap();
-            let watchdog = watchdog.unwrap();
-            let build = build.unwrap();
-            let ai = ai.unwrap();
-            let ca = ca.unwrap();
-            let expo = expo.unwrap();
-            let ow = ow.unwrap();
-            let cached = cached.unwrap();
+            };
+            let Ok(watchdog) = watchdog else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(build) = build else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(ai) = ai else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(ca) = ca else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(expo) = expo else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(ow) = ow else {
+                return Ok(Event::default().comment("keepalive"));
+            };
+            let Ok(cached) = cached else {
+                return Ok(Event::default().comment("keepalive"));
+            };
 
             let api_responding = cached.runner_responding;
             let api_in_use = cached.runner_port_open;
