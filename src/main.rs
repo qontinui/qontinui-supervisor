@@ -171,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     if auto_start {
         let state_clone = state.clone();
         tokio::spawn(async move {
+            // Clean up orphaned runner processes from previous sessions
+            process::manager::cleanup_orphaned_runners(&state_clone).await;
+
             let runners = state_clone.get_all_runners().await;
             let runner_count = runners.len();
 

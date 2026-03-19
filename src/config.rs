@@ -206,6 +206,15 @@ impl SupervisorConfig {
             .join("qontinui-runner.exe")
     }
 
+    /// Path to a copied runner executable for non-primary runners.
+    /// This avoids locking the main build artifact so dev-mode rebuilds succeed.
+    pub fn runner_exe_copy_path(&self, runner_id: &str) -> PathBuf {
+        self.project_dir
+            .join("target")
+            .join("debug")
+            .join(format!("qontinui-runner-{}.exe", runner_id))
+    }
+
     /// Path to the runner npm project root (parent of src-tauri)
     pub fn runner_npm_dir(&self) -> PathBuf {
         self.project_dir

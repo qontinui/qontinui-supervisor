@@ -13,6 +13,43 @@ use crate::process::windows::{kill_by_pid, kill_by_port, kill_runner_comprehensi
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
+// Startup Cleanup
+// =============================================================================
+
+/// Kill any orphaned runner processes on ports managed by this supervisor.
+/// Called before auto-starting runners to avoid port conflicts and exe locks.
+pub async fn cleanup_orphaned_runners(state: &SharedState) {
+    let runners = state.get_all_runners().await;
+    let mut ports: Vec<u16> = runners.iter().map(|r| r.config.port).collect();
+
+    // Also clean up Vite port in dev mode
+    if state.config.dev_mode {
+        ports.push(crate::config::RUNNER_VITE_PORT);
+    }
+
+    let mut killed_any = false;
+    for &port in &ports {
+        if let Ok(true) = kill_by_port(port).await {
+            info!("Killed orphaned process on port {}", port);
+            killed_any = true;
+        }
+    }
+
+    if killed_any {
+        // Give OS time to release ports
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                "Cleaned up orphaned runner processes from previous session",
+            )
+            .await;
+    }
+}
+
+// =============================================================================
 // Per-Runner Process Management (multi-runner)
 // =============================================================================
 
@@ -133,14 +170,35 @@ async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
 ) -> Result<tokio::process::Child, SupervisorError> {
-    let exe_path = state.config.runner_exe_path();
+    let source_exe = state.config.runner_exe_path();
 
-    if !exe_path.exists() {
+    if !source_exe.exists() {
         return Err(SupervisorError::Process(format!(
             "Runner exe not found at {:?}. Run a build first.",
-            exe_path
+            source_exe
         )));
     }
+
+    // Non-primary runners use a copy of the exe to avoid locking the build artifact.
+    // This allows dev-mode rebuilds to succeed while exe-mode runners are running.
+    let exe_path = if !managed.config.is_primary {
+        let copy_path = state.config.runner_exe_copy_path(&managed.config.id);
+        if let Err(e) = std::fs::copy(&source_exe, &copy_path) {
+            warn!(
+                "Failed to copy runner exe for '{}': {} — falling back to original",
+                managed.config.name, e
+            );
+            source_exe
+        } else {
+            info!(
+                "Copied runner exe for '{}' to {:?}",
+                managed.config.name, copy_path
+            );
+            copy_path
+        }
+    } else {
+        source_exe
+    };
 
     info!(
         "Starting runner '{}' in exe mode from {:?} on port {}",

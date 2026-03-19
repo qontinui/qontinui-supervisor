@@ -47,6 +47,11 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/logs/stream", get(crate::routes::logs::log_stream))
         .route("/logs/file/{type}", get(crate::routes::logs::log_file))
         .route("/logs/files", get(crate::routes::logs::log_files))
+        // Build management
+        .route(
+            "/build/reset",
+            post(crate::routes::runner::reset_build),
+        )
         // Supervisor self-restart
         .route(
             "/supervisor/restart",

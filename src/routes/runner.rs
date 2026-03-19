@@ -118,6 +118,41 @@ pub async fn control_watchdog(
     Ok(Json(response))
 }
 
+/// POST /build/reset — clear a stuck build_in_progress flag.
+pub async fn reset_build(
+    State(state): State<SharedState>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    let was_stuck = {
+        let mut build = state.build.write().await;
+        let was = build.build_in_progress;
+        build.build_in_progress = false;
+        was
+    };
+
+    state.notify_health_change();
+
+    let message = if was_stuck {
+        "Build flag was stuck, now cleared"
+    } else {
+        "Build flag was not stuck (already false)"
+    };
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Build reset: {}", message),
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "was_stuck": was_stuck,
+        "message": message
+    })))
+}
+
 /// Self-restart the supervisor process with the same CLI args.
 pub async fn supervisor_restart(
     State(state): State<SharedState>,

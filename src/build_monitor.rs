@@ -58,6 +58,10 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
         .await
         .emit(DiagnosticEventKind::BuildStarted);
 
+    // Stop non-primary exe-mode runners that lock the build artifact.
+    // (Non-primary runners now use copied exes, but stop any still using the original.)
+    stop_exe_runners_for_build(state).await;
+
     // Cleanup orphaned build processes first
     cleanup_orphaned_build_processes().await;
 
@@ -243,6 +247,48 @@ async fn wait_for_exe_unlocked(state: &SharedState) {
                     "Runner exe still locked after {}s, proceeding anyway: {}",
                     max_attempts / 2,
                     e
+                );
+            }
+        }
+    }
+}
+
+/// Stop non-primary exe-mode runners before a cargo build.
+/// These runners may hold a file lock on the build output binary, causing "Access is denied".
+async fn stop_exe_runners_for_build(state: &SharedState) {
+    // Only relevant in dev mode — exe-mode-only supervisors don't do cargo build
+    if !state.config.dev_mode {
+        return;
+    }
+
+    let runners = state.get_all_runners().await;
+    for managed in &runners {
+        if managed.config.is_primary {
+            continue;
+        }
+        let running = managed.runner.read().await.running;
+        if running {
+            info!(
+                "Stopping exe-mode runner '{}' before build to release exe lock",
+                managed.config.name
+            );
+            state
+                .logs
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Info,
+                    format!(
+                        "Stopping runner '{}' to release exe lock for build",
+                        managed.config.name
+                    ),
+                )
+                .await;
+            if let Err(e) =
+                crate::process::manager::stop_runner_by_id(state, &managed.config.id).await
+            {
+                warn!(
+                    "Failed to stop runner '{}' before build: {}",
+                    managed.config.name, e
                 );
             }
         }
