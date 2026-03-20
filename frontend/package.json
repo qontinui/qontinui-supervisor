@@ -1,20 +1,6 @@
 {
-  "name": "qontinui-supervisor-frontend",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix",
-    "format": "prettier --write src/",
-    "format:check": "prettier --check src/"
-  },
   "dependencies": {
+    "@qontinui/ui-bridge": "latest",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.1.0",
@@ -38,5 +24,20 @@
     "typescript-eslint": "^8.56.1",
     "vite": "^6.0.0",
     "vitest": "^4.1.0"
-  }
+  },
+  "name": "qontinui-supervisor-frontend",
+  "private": true,
+  "scripts": {
+    "build": "tsc && vite build",
+    "dev": "vite",
+    "format": "prettier --write src/",
+    "format:check": "prettier --check src/",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "type": "module",
+  "version": "0.1.0"
 }
