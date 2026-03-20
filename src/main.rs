@@ -191,11 +191,8 @@ async fn main() -> anyhow::Result<()> {
             let mut primary_started = false;
             for managed in &runners {
                 if managed.config.is_primary {
-                    match process::manager::start_runner_by_id(
-                        &state_clone,
-                        &managed.config.id,
-                    )
-                    .await
+                    match process::manager::start_runner_by_id(&state_clone, &managed.config.id)
+                        .await
                     {
                         Ok(()) => {
                             info!("Primary runner auto-started successfully");
@@ -223,17 +220,11 @@ async fn main() -> anyhow::Result<()> {
                 for managed in &runners {
                     if !managed.config.is_primary {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        match process::manager::start_runner_by_id(
-                            &state_clone,
-                            &managed.config.id,
-                        )
-                        .await
+                        match process::manager::start_runner_by_id(&state_clone, &managed.config.id)
+                            .await
                         {
                             Ok(()) => {
-                                info!(
-                                    "Runner '{}' auto-started successfully",
-                                    managed.config.name
-                                );
+                                info!("Runner '{}' auto-started successfully", managed.config.name);
                             }
                             Err(e) => {
                                 error!(

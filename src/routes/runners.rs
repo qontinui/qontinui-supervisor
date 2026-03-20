@@ -130,10 +130,7 @@ pub async fn add_runner(
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            format!(
-                "Added runner '{}' (id: {}, port: {})",
-                name, id, body.port
-            ),
+            format!("Added runner '{}' (id: {}, port: {})", name, id, body.port),
         )
         .await;
 
@@ -313,10 +310,7 @@ pub async fn proxy_ui_bridge(
     let uri = req.uri().clone();
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
 
-    let target_url = format!(
-        "http://127.0.0.1:{}/ui-bridge/{}{}",
-        port, path, query
-    );
+    let target_url = format!("http://127.0.0.1:{}/ui-bridge/{}{}", port, path, query);
 
     let content_type = req
         .headers()

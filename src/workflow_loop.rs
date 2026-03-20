@@ -309,11 +309,12 @@ async fn poll_until_complete(
                         if tr_resp.status().is_success() {
                             if let Ok(tr_json) = tr_resp.json::<serde_json::Value>().await {
                                 let tr_data = tr_json.get("data").unwrap_or(&tr_json);
-                                let status = tr_data
-                                    .get("status")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                if status == "failed" || status == "completed" || status == "stopped" {
+                                let status =
+                                    tr_data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                if status == "failed"
+                                    || status == "completed"
+                                    || status == "stopped"
+                                {
                                     warn!(
                                         "Task run {} has status '{}' but workflow-state.is_complete=false — treating as complete",
                                         task_run_id, status
@@ -321,8 +322,14 @@ async fn poll_until_complete(
                                     // Synthesize a completed workflow-state from what we know
                                     let mut result = json.clone();
                                     if let Some(obj) = result.as_object_mut() {
-                                        obj.insert("is_complete".to_string(), serde_json::json!(true));
-                                        obj.insert("current_state".to_string(), serde_json::json!(status));
+                                        obj.insert(
+                                            "is_complete".to_string(),
+                                            serde_json::json!(true),
+                                        );
+                                        obj.insert(
+                                            "current_state".to_string(),
+                                            serde_json::json!(status),
+                                        );
                                     }
                                     return Ok(result);
                                 }

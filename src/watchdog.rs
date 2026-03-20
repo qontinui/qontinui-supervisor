@@ -111,10 +111,7 @@ async fn check_runner_watchdog(state: &SharedState, managed: &Arc<ManagedRunner>
 
     // Runner is not healthy
     if runner_running {
-        warn!(
-            "Watchdog: runner '{}' process not responding",
-            runner_name
-        );
+        warn!("Watchdog: runner '{}' process not responding", runner_name);
         state
             .logs
             .emit(
@@ -243,20 +240,14 @@ async fn check_runner_watchdog(state: &SharedState, managed: &Arc<ManagedRunner>
     // Stop first if runner state thinks it's running
     if runner_running {
         if let Err(e) = stop_runner_by_id(state, runner_id).await {
-            warn!(
-                "Watchdog: error stopping runner '{}': {}",
-                runner_name, e
-            );
+            warn!("Watchdog: error stopping runner '{}': {}", runner_name, e);
         }
     }
 
     // Start
     match start_runner_by_id(state, runner_id).await {
         Ok(()) => {
-            info!(
-                "Watchdog: runner '{}' restarted successfully",
-                runner_name
-            );
+            info!("Watchdog: runner '{}' restarted successfully", runner_name);
             state
                 .logs
                 .emit(

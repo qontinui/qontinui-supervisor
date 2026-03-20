@@ -274,10 +274,7 @@ async fn monitor_runner_process_exit(
         match child.wait().await {
             Ok(status) => Some(status),
             Err(e) => {
-                error!(
-                    "Error waiting for runner '{}' process: {}",
-                    runner_name, e
-                );
+                error!("Error waiting for runner '{}' process: {}", runner_name, e);
                 None
             }
         }
@@ -319,10 +316,7 @@ async fn monitor_runner_process_exit(
             .await;
         info!("{}", msg);
     } else {
-        let msg = format!(
-            "Runner '{}' process terminated unexpectedly",
-            runner_name
-        );
+        let msg = format!("Runner '{}' process terminated unexpectedly", runner_name);
         state
             .logs
             .emit(LogSource::Supervisor, LogLevel::Warn, &msg)
@@ -409,7 +403,10 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(RUNNER_VITE_PORT).await;
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
         if !vite_free {
-            warn!("Vite port {} still in use after forced kill", RUNNER_VITE_PORT);
+            warn!(
+                "Vite port {} still in use after forced kill",
+                RUNNER_VITE_PORT
+            );
             // Second attempt
             let _ = kill_by_port(RUNNER_VITE_PORT).await;
         }

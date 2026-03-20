@@ -99,7 +99,7 @@ pub const WATCHDOG_COOLDOWN_SECS: i64 = 60;
 
 // Process constants
 pub const GRACEFUL_KILL_TIMEOUT_SECS: u64 = 5;
-pub const BUILD_TIMEOUT_SECS: u64 = 300; // 5 minutes
+pub const BUILD_TIMEOUT_SECS: u64 = 600; // 10 minutes
 #[allow(dead_code)]
 pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;
 pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
@@ -275,8 +275,8 @@ mod tests {
     // --- Process constant tests ---
 
     #[test]
-    fn test_build_timeout_is_5_minutes() {
-        assert_eq!(BUILD_TIMEOUT_SECS, 300);
+    fn test_build_timeout_is_10_minutes() {
+        assert_eq!(BUILD_TIMEOUT_SECS, 600);
     }
 
     #[test]

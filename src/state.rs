@@ -197,10 +197,7 @@ impl SupervisorState {
     /// Get the primary runner.
     pub async fn get_primary(&self) -> Option<Arc<ManagedRunner>> {
         let runners = self.runners.read().await;
-        runners
-            .values()
-            .find(|r| r.config.is_primary)
-            .cloned()
+        runners.values().find(|r| r.config.is_primary).cloned()
     }
 
     /// Get all runners as a Vec.
