@@ -4,6 +4,7 @@ mod code_activity;
 mod config;
 mod database;
 mod diagnostics;
+mod discovery;
 mod error;
 mod evaluation;
 mod expo;
@@ -247,6 +248,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        });
+    }
+
+    // Discover runner instances from the primary runner (runs after auto-start delay)
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            // Give auto-start time to bring up the primary runner
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            discovery::discover_runner_instances(&state_clone).await;
         });
     }
 

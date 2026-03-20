@@ -266,6 +266,14 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
         if managed.config.is_primary {
             continue;
         }
+        // Protected runners use copied exes and don't hold locks on the build artifact
+        if managed.is_protected().await {
+            info!(
+                "Skipping protected runner '{}' — uses copied exe, no lock conflict",
+                managed.config.name
+            );
+            continue;
+        }
         let running = managed.runner.read().await.running;
         if running {
             info!(

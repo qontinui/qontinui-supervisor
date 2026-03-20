@@ -56,13 +56,17 @@ pub async fn list_runners(
         let cached = managed.cached_health.read().await;
         let is_protected = managed.is_protected().await;
 
+        // A runner is "up" if either the supervisor is tracking it as running
+        // OR its API is responding (e.g. spawned externally by the runner's instance manager).
+        let effectively_running = runner.running || cached.runner_responding;
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
             "is_primary": managed.config.is_primary,
             "protected": is_protected,
-            "running": runner.running,
+            "running": effectively_running,
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
             "api_responding": cached.runner_responding,

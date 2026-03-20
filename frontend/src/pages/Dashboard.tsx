@@ -547,6 +547,263 @@ interface StatusData {
   expo: Record<string, unknown> | null;
 }
 
+// ─── Runner Instances Panel ──────────────────────────────────────────────────
+
+interface RunnerInstance {
+  id: string;
+  name: string;
+  port: number;
+  is_primary: boolean;
+  protected: boolean;
+  running: boolean;
+  pid: number | null;
+  api_responding: boolean;
+}
+
+function RunnerInstancesPanel() {
+  const [runners, setRunners] = useState<RunnerInstance[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newPort, setNewPort] = useState('');
+
+  const refresh = useCallback(async () => {
+    try {
+      const list = await api.listRunners();
+      setRunners(list as RunnerInstance[]);
+    } catch {
+      /* may not be available */
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const interval = setInterval(refresh, 5000);
+    return () => clearInterval(interval);
+  }, [refresh]);
+
+  const doAction = async (key: string, fn: () => Promise<unknown>) => {
+    setBusy(key);
+    try {
+      await fn();
+      addToast(`${key} succeeded`, 'info');
+    } catch (e) {
+      addToast(`${key} failed: ${e instanceof Error ? e.message : 'unknown'}`, 'error');
+    }
+    setBusy(null);
+    refresh();
+  };
+
+  const handleSpawn = async () => {
+    const name = newName.trim();
+    const port = parseInt(newPort);
+    if (!name || !port || port < 1024) {
+      addToast('Enter a valid name and port (>= 1024)', 'error');
+      return;
+    }
+    setBusy('spawn');
+    try {
+      // Spawn via runner API (creates process), then register with supervisor
+      await api.spawnInstance(name, port);
+      addToast(`Instance "${name}" spawned on port ${port}`, 'info');
+      setNewName('');
+      setNewPort('');
+      setShowAdd(false);
+    } catch (e) {
+      // Fallback: just add to supervisor config
+      try {
+        await api.addRunner(name, port);
+        addToast(`Runner "${name}" added (start it manually)`, 'info');
+        setNewName('');
+        setNewPort('');
+        setShowAdd(false);
+      } catch (e2) {
+        addToast(`Failed: ${e2 instanceof Error ? e2.message : 'unknown'}`, 'error');
+      }
+    }
+    setBusy(null);
+    refresh();
+  };
+
+  const nonPrimary = runners.filter((r) => !r.is_primary);
+
+  return (
+    <div className="card" style={{ marginBottom: '1rem' }}>
+      <div className="card-header" style={{ marginBottom: '0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span className="card-title">Runner Instances</span>
+        <button
+          className="btn"
+          style={{ padding: '0.15rem 0.5rem', fontSize: '0.7rem' }}
+          onClick={() => setShowAdd(!showAdd)}
+        >
+          {showAdd ? 'Cancel' : '+ New'}
+        </button>
+      </div>
+
+      {showAdd && (
+        <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.5rem', alignItems: 'center' }}>
+          <input
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Name"
+            style={{
+              padding: '0.2rem 0.4rem',
+              fontSize: '0.75rem',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 3,
+              color: 'var(--text)',
+              width: 120,
+            }}
+          />
+          <input
+            type="number"
+            value={newPort}
+            onChange={(e) => setNewPort(e.target.value)}
+            placeholder="Port"
+            style={{
+              padding: '0.2rem 0.4rem',
+              fontSize: '0.75rem',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 3,
+              color: 'var(--text)',
+              width: 70,
+            }}
+          />
+          <button
+            className="btn"
+            style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
+            disabled={busy !== null}
+            onClick={handleSpawn}
+          >
+            {busy === 'spawn' ? 'Spawning...' : 'Spawn'}
+          </button>
+        </div>
+      )}
+
+      {nonPrimary.length === 0 && !showAdd && (
+        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', padding: '0.25rem 0' }}>
+          No secondary instances. Click "+ New" to spawn one.
+        </div>
+      )}
+
+      {nonPrimary.length > 0 && (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th style={{ width: 60 }}>Port</th>
+                <th style={{ width: 70 }}>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {nonPrimary.map((r) => (
+                <tr key={r.id}>
+                  <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
+                    {r.name}
+                    {r.protected && (
+                      <span
+                        style={{
+                          marginLeft: 6,
+                          padding: '1px 4px',
+                          background: 'rgba(34,197,94,0.15)',
+                          border: '1px solid rgba(34,197,94,0.4)',
+                          borderRadius: 3,
+                          fontSize: '0.6rem',
+                          fontWeight: 600,
+                          color: '#22c55e',
+                        }}
+                      >
+                        PROTECTED
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
+                  <td>
+                    <StatusDot up={r.running} />
+                    <span
+                      className={r.running ? 'text-success' : 'text-danger'}
+                      style={{ fontSize: '0.7rem' }}
+                    >
+                      {r.running ? 'UP' : 'DOWN'}
+                    </span>
+                  </td>
+                  <td>
+                    <div className="flex gap-2">
+                      {!r.running && (
+                        <button
+                          className="btn"
+                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+                          disabled={busy !== null}
+                          onClick={() => doAction(`Start ${r.name}`, () => api.startRunner(r.id))}
+                        >
+                          {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
+                        </button>
+                      )}
+                      {r.running && (
+                        <button
+                          className="btn"
+                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+                          disabled={busy !== null}
+                          onClick={() => doAction(`Stop ${r.name}`, () => api.stopRunner(r.id))}
+                        >
+                          {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
+                        </button>
+                      )}
+                      <button
+                        className="btn"
+                        style={{
+                          padding: '0.15rem 0.4rem',
+                          fontSize: '0.7rem',
+                          color: r.protected ? '#22c55e' : undefined,
+                          borderColor: r.protected ? 'rgba(34,197,94,0.4)' : undefined,
+                        }}
+                        disabled={busy !== null}
+                        onClick={() =>
+                          doAction(
+                            `${r.protected ? 'Unprotect' : 'Protect'} ${r.name}`,
+                            () => api.protectRunner(r.id, !r.protected),
+                          )
+                        }
+                      >
+                        {r.protected ? 'Unprotect' : 'Protect'}
+                      </button>
+                      {!r.running && (
+                        <button
+                          className="btn"
+                          style={{
+                            padding: '0.15rem 0.4rem',
+                            fontSize: '0.7rem',
+                            color: 'var(--danger)',
+                            borderColor: 'var(--danger)',
+                          }}
+                          disabled={busy !== null}
+                          onClick={() =>
+                            doAction(`Remove ${r.name}`, async () => {
+                              await confirm('Remove runner', `Remove "${r.name}" from the supervisor?`);
+                              await api.removeRunner(r.id);
+                            })
+                          }
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Dashboard ──────────────────────────────────────────────────────────
 
 function DashboardInner() {
@@ -1205,6 +1462,7 @@ function DashboardInner() {
         </div>
       </div>
 
+      <RunnerInstancesPanel />
       <WorkflowLoopPanel />
       <LogViewer />
     </div>

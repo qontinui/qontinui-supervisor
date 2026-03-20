@@ -627,6 +627,27 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ protected: isProtected }),
     }),
+  addRunner: (name: string, port: number) =>
+    fetchJson<{ id: string; name: string; port: number }>('/runners', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, port }),
+    }),
+  startRunner: (id: string) =>
+    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+  stopRunner: (id: string) =>
+    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  removeRunner: (id: string) =>
+    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  spawnInstance: (name: string, port: number) =>
+    fetchJson<{ success: boolean; data: { id: string; port: number; pid: number } }>(
+      '/runner-api/instances/spawn',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, port }),
+      },
+    ),
   runnerFixAndRebuild: (prompt: string) =>
     fetchJson<unknown>('/runner/fix-and-rebuild', {
       method: 'POST',
