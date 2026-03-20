@@ -303,18 +303,22 @@ pub async fn protect_runner(
 
     let name = managed.config.name.clone();
 
-    // Update the runtime protection flag
-    {
-        let mut protected = managed.protected.write().await;
-        *protected = body.protected;
-    }
-
-    // Persist to settings
+    // Persist to settings FIRST — if this fails, runtime state stays unchanged (no TOCTOU).
     let settings_path = settings::settings_path(&state.config);
     let mut settings = settings::load_settings(&settings_path);
     if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
         cfg.protected = body.protected;
-        settings::save_settings(&settings_path, &settings);
+        if let Err(e) = settings::try_save_settings(&settings_path, &settings) {
+            return Err(SupervisorError::Other(format!(
+                "Failed to persist protection setting: {e}"
+            )));
+        }
+    }
+
+    // Persistence succeeded — now update the runtime protection flag
+    {
+        let mut protected = managed.protected.write().await;
+        *protected = body.protected;
     }
 
     let action = if body.protected { "protected" } else { "unprotected" };

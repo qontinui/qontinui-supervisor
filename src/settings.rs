@@ -26,16 +26,17 @@ pub fn load_settings(path: &Path) -> PersistentSettings {
 }
 
 pub fn save_settings(path: &Path, settings: &PersistentSettings) {
-    match serde_json::to_string_pretty(settings) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
-                warn!("Failed to save settings to {:?}: {}", path, e);
-            }
-        }
-        Err(e) => {
-            warn!("Failed to serialize settings: {}", e);
-        }
+    if let Err(e) = try_save_settings(path, settings) {
+        warn!("Failed to save settings: {}", e);
     }
+}
+
+/// Save settings, returning an error on failure instead of logging a warning.
+pub fn try_save_settings(path: &Path, settings: &PersistentSettings) -> Result<(), String> {
+    let json =
+        serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {:?}: {e}", path))?;
+    Ok(())
 }
 
 // --- Runner CRUD helpers ---

@@ -3,7 +3,14 @@ const BASE = '';
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.json();
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch (e) {
+    throw new Error(
+      `Failed to parse JSON from ${path}: ${e instanceof Error ? e.message : String(e)}. Response body: ${text.slice(0, 200)}`,
+    );
+  }
 }
 
 export interface ServiceSummary {
