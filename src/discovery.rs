@@ -22,35 +22,65 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
 
     let primary_port = primary.config.port;
 
-    // Wait for the primary runner to be ready (up to 30s)
+    // Wait for the primary runner's API to be responding (checked by health cache)
+    // before attempting discovery. In dev mode this can take 3+ minutes.
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Runner discovery: waiting for primary runner on port {} to be ready...", primary_port),
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let responding = primary.cached_health.read().await.runner_responding;
+        if responding {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    "Runner discovery: primary not ready after 5min, skipping".to_string(),
+                )
+                .await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
 
     let url = format!("http://127.0.0.1:{}/instances", primary_port);
 
-    let mut attempts = 0;
-    let instances: Vec<DiscoveredInstance> = loop {
-        attempts += 1;
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                if let Ok(body) = resp.json::<ApiResponse<Vec<DiscoveredInstance>>>().await {
-                    if body.success {
-                        break body.data.unwrap_or_default();
-                    }
-                }
-                break Vec::new();
-            }
-            Err(_) if attempts < 15 => {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            Err(_) => {
-                info!("Runner discovery: primary runner not reachable, skipping");
-                return;
+    let instances: Vec<DiscoveredInstance> = match client.get(&url).send().await {
+        Ok(resp) => {
+            match resp.json::<ApiResponse<Vec<DiscoveredInstance>>>().await {
+                Ok(body) if body.success => body.data.unwrap_or_default(),
+                _ => Vec::new(),
             }
         }
+        Err(e) => {
+            info!("Runner discovery: failed to query /instances: {}", e);
+            return;
+        }
     };
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!("Runner discovery: found {} instance(s) from primary", instances.len()),
+        )
+        .await;
 
     if instances.is_empty() {
         return;
