@@ -8,6 +8,7 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::state::SharedState;
+use crate::{ai_debug, routes::ai::DebugRequest};
 
 #[derive(Deserialize)]
 pub struct RestartRequest {
@@ -150,6 +151,74 @@ pub async fn reset_build(
         "status": "ok",
         "was_stuck": was_stuck,
         "message": message
+    })))
+}
+
+/// POST /runner/fix-and-rebuild — Run AI debug, wait for completion, then rebuild the runner.
+pub async fn fix_and_rebuild(
+    State(state): State<SharedState>,
+    Json(body): Json<DebugRequest>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            "Fix & Rebuild: starting AI debug session",
+        )
+        .await;
+
+    // 1. Spawn AI debug (same as POST /ai/debug)
+    let reason = body.prompt.as_deref().unwrap_or("Fix & Rebuild trigger");
+    ai_debug::spawn_ai_debug(&state, Some(reason)).await.map_err(|e| {
+        SupervisorError::Other(format!("Failed to start AI debug: {}", e))
+    })?;
+
+    // 2. Poll until AI session completes (check every 2s, timeout 10 min)
+    let timeout = std::time::Duration::from_secs(600);
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let still_running = {
+            let ai = state.ai.read().await;
+            ai.running
+        };
+
+        if !still_running {
+            break;
+        }
+
+        if start.elapsed() > timeout {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    "Fix & Rebuild: AI session timed out after 10 min, proceeding with rebuild",
+                )
+                .await;
+            // Kill the stuck session
+            let _ = ai_debug::stop_ai_debug(&state).await;
+            break;
+        }
+    }
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            "Fix & Rebuild: AI debug complete, rebuilding runner",
+        )
+        .await;
+
+    // 3. Rebuild and restart the runner
+    manager::restart_runner(&state, true, RestartSource::Manual).await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "message": "AI fix applied and runner rebuilt successfully"
     })))
 }
 

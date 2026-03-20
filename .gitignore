@@ -5,3 +5,4 @@ Cargo.lock
 .env
 /dist
 /frontend/node_modules
+.worktrees/

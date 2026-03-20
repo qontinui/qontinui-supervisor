@@ -403,12 +403,12 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(RUNNER_VITE_PORT).await;
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
         if !vite_free {
-            warn!(
-                "Vite port {} still in use after forced kill",
-                RUNNER_VITE_PORT
-            );
-            // Second attempt
+            warn!("Vite port {} still in use after forced kill, retrying", RUNNER_VITE_PORT);
             let _ = kill_by_port(RUNNER_VITE_PORT).await;
+            let vite_free_retry = wait_for_port_free(RUNNER_VITE_PORT, 10).await;
+            if !vite_free_retry {
+                error!("Vite port {} still in use after two kill attempts", RUNNER_VITE_PORT);
+            }
         }
     }
 
@@ -449,6 +449,7 @@ pub async fn stop_runner_by_id(
 }
 
 /// Restart a specific runner by ID. Stop, optionally rebuild (global), then start.
+/// If `force` is false and the runner is protected, the restart is rejected.
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -470,6 +471,24 @@ pub async fn restart_runner_by_id(
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+
+    // Protected runners can only be restarted by explicit manual action
+    if managed.is_protected().await && !matches!(source, RestartSource::Manual) {
+        let msg = format!(
+            "Runner '{}' is protected and cannot be restarted by {}",
+            managed.config.name, source
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(
+                crate::log_capture::LogSource::Supervisor,
+                crate::log_capture::LogLevel::Warn,
+                &msg,
+            )
+            .await;
+        return Err(SupervisorError::Validation(msg));
+    }
 
     {
         let mut runner = managed.runner.write().await;

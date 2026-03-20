@@ -22,10 +22,14 @@ pub struct ManagedRunner {
     pub cached_health: RwLock<CachedPortHealth>,
     pub health_cache_notify: Notify,
     pub logs: LogState,
+    /// Runtime-mutable protection flag. When true, this runner cannot be stopped
+    /// or restarted by smart rebuild, watchdog, AI sessions, or workflow loop.
+    pub protected: RwLock<bool>,
 }
 
 impl ManagedRunner {
     pub fn new(config: RunnerConfig, watchdog_enabled: bool) -> Self {
+        let protected = config.protected;
         Self {
             config,
             runner: RwLock::new(RunnerState::new()),
@@ -33,7 +37,13 @@ impl ManagedRunner {
             cached_health: RwLock::new(CachedPortHealth::default()),
             health_cache_notify: Notify::new(),
             logs: LogState::new(),
+            protected: RwLock::new(protected),
         }
+    }
+
+    /// Check if this runner is protected.
+    pub async fn is_protected(&self) -> bool {
+        *self.protected.read().await
     }
 }
 

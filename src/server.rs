@@ -42,6 +42,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/runner/watchdog",
             post(crate::routes::runner::control_watchdog),
         )
+        .route(
+            "/runner/fix-and-rebuild",
+            post(crate::routes::runner::fix_and_rebuild),
+        )
         // Logs
         .route("/logs/history", get(crate::routes::logs::log_history))
         .route("/logs/stream", get(crate::routes::logs::log_stream))
@@ -200,6 +204,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/runners/{id}/watchdog",
             post(crate::routes::runners::control_runner_watchdog),
+        )
+        .route(
+            "/runners/{id}/protect",
+            post(crate::routes::runners::protect_runner),
         )
         .route(
             "/runners/{id}/ui-bridge/{*path}",

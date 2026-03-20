@@ -12,6 +12,16 @@ pub enum RestartSource {
     Watchdog,
 }
 
+impl std::fmt::Display for RestartSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Manual => write!(f, "manual request"),
+            Self::WorkflowLoop => write!(f, "workflow loop"),
+            Self::Watchdog => write!(f, "watchdog"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum DiagnosticEventKind {

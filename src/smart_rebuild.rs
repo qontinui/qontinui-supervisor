@@ -204,18 +204,37 @@ async fn run_smart_rebuild(state: &SharedState) {
         sr.last_build_error = None;
     }
 
-    // Phase: StoppingRunner — stop ALL runners since they share the same binary.
+    // Phase: StoppingRunner — stop unprotected runners for rebuild.
+    // Protected runners are left running (they use their own binary copy).
     // Record which runners are running so we only restart those after rebuild.
-    let was_running: Vec<String> = {
+    let (was_running, protected_skipped): (Vec<String>, Vec<String>) = {
         let runners = state.get_all_runners().await;
         let mut ids = Vec::new();
+        let mut skipped = Vec::new();
         for managed in &runners {
             if managed.runner.read().await.running {
-                ids.push(managed.config.id.clone());
+                if managed.is_protected().await {
+                    skipped.push(managed.config.name.clone());
+                } else {
+                    ids.push(managed.config.id.clone());
+                }
             }
         }
-        ids
+        (ids, skipped)
     };
+    if !protected_skipped.is_empty() {
+        state
+            .logs
+            .emit(
+                LogSource::SmartRebuild,
+                LogLevel::Info,
+                format!(
+                    "Skipping protected runner(s): {} — they will not be stopped for rebuild",
+                    protected_skipped.join(", ")
+                ),
+            )
+            .await;
+    }
     if !was_running.is_empty() {
         {
             let mut sr = state.smart_rebuild.write().await;
@@ -226,14 +245,20 @@ async fn run_smart_rebuild(state: &SharedState) {
             .emit(
                 LogSource::SmartRebuild,
                 LogLevel::Info,
-                "Stopping all runners for rebuild",
+                format!(
+                    "Stopping {} runner(s) for rebuild",
+                    was_running.len()
+                ),
             )
             .await;
 
-        if let Err(e) = manager::stop_all(state).await {
-            error!("Smart rebuild: failed to stop runners: {}", e);
-            set_failed(state, format!("Failed to stop runners: {}", e)).await;
-            return;
+        // Stop only unprotected runners individually
+        for runner_id in &was_running {
+            if let Err(e) = manager::stop_runner_by_id(state, runner_id).await {
+                error!("Smart rebuild: failed to stop runner '{}': {}", runner_id, e);
+                set_failed(state, format!("Failed to stop runner '{}': {}", runner_id, e)).await;
+                return;
+            }
         }
     }
 

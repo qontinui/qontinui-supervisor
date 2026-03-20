@@ -603,6 +603,29 @@ export const api = {
   devStartAction: (action: string) =>
     fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: 'POST' }),
   runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
+  listRunners: () =>
+    fetchJson<
+      {
+        id: string;
+        name: string;
+        port: number;
+        is_primary: boolean;
+        protected: boolean;
+        running: boolean;
+      }[]
+    >('/runners'),
+  protectRunner: (id: string, isProtected: boolean) =>
+    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/protect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ protected: isProtected }),
+    }),
+  runnerFixAndRebuild: (prompt: string) =>
+    fetchJson<unknown>('/runner/fix-and-rebuild', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    }),
 
   // AI Debug
   aiDebug: (prompt: string) =>

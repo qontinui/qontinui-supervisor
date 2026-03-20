@@ -559,7 +559,9 @@ function DashboardInner() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [errors, setErrors] = useState<Map<string, ServiceError>>(new Map());
   const [aiFixBusy, setAiFixBusy] = useState<string | null>(null);
+  const [fixAndRebuildBusy, setFixAndRebuildBusy] = useState(false);
   const [showAiPanel, setShowAiPanel] = useState(false);
+  const [runnerProtection, setRunnerProtection] = useState<Map<string, boolean>>(new Map());
   const mountedRef = useRef(true);
   const actionGuardRef = useRef(false); // Race condition guard
 
@@ -590,14 +592,26 @@ function DashboardInner() {
     setLastRefresh(new Date());
   }, []);
 
+  // Fetch runner protection status
+  const refreshRunners = useCallback(async () => {
+    try {
+      const runners = await api.listRunners();
+      if (!mountedRef.current) return;
+      setRunnerProtection(new Map(runners.map((r) => [r.id, r.protected])));
+    } catch {
+      /* runners endpoint may not be available */
+    }
+  }, []);
+
   // Initial fetch
   useEffect(() => {
     mountedRef.current = true;
     refresh();
+    refreshRunners();
     return () => {
       mountedRef.current = false;
     };
-  }, [refresh]);
+  }, [refresh, refreshRunners]);
 
   // Subscribe to health SSE — replaces polling
   useSSE<HealthResponse>('/health/stream', 'health', (health) => {
@@ -725,6 +739,45 @@ function DashboardInner() {
     [errors, ai?.ai_running],
   );
 
+  // Trigger AI fix then rebuild the runner
+  const triggerFixAndRebuild = useCallback(async () => {
+    if (ai?.ai_running || fixAndRebuildBusy) return;
+    setFixAndRebuildBusy(true);
+    setShowAiPanel(true);
+    try {
+      const err = errors.get('Runner');
+      const parts: string[] = [
+        err
+          ? 'Service "Runner" failed to start/load.'
+          : 'Service "Runner" is down and not responding on its expected port.',
+      ];
+
+      if (err?.stderr) parts.push(`\nStderr:\n${err.stderr}`);
+      if (err?.stdout) parts.push(`\nStdout:\n${err.stdout}`);
+
+      const logType = SERVICE_LOG_MAP['Runner'];
+      if (logType) {
+        try {
+          const log = await api.logFile(logType, 80);
+          if (log.content?.trim()) {
+            parts.push(`\nRecent ${logType} log (last 80 lines):\n${log.content}`);
+          }
+        } catch {
+          /* log may not exist */
+        }
+      }
+
+      parts.push('\nPlease diagnose the root cause and fix the issue.');
+
+      await api.runnerFixAndRebuild(parts.join('\n'));
+      addToast('Fix & Rebuild completed', 'info');
+    } catch (e) {
+      addToast(`Fix & Rebuild failed: ${e instanceof Error ? e.message : 'unknown error'}`, 'error');
+    }
+    setFixAndRebuildBusy(false);
+    refreshPorts();
+  }, [errors, ai?.ai_running, fixAndRebuildBusy, refreshPorts]);
+
   const clearError = useCallback((service: string) => {
     setErrors((prev) => {
       if (!prev.has(service)) return prev;
@@ -762,6 +815,19 @@ function DashboardInner() {
       });
     }
   }, [build?.error_detected, build?.last_error]);
+
+  // Toggle runner protection
+  const primaryProtected = runnerProtection.get('primary') ?? false;
+  const toggleProtection = useCallback(async () => {
+    const newVal = !primaryProtected;
+    try {
+      await api.protectRunner('primary', newVal);
+      setRunnerProtection((prev) => new Map(prev).set('primary', newVal));
+      addToast(newVal ? 'Runner protected — safe from rebuilds' : 'Runner unprotected', 'info');
+    } catch (e) {
+      addToast(`Failed to toggle protection: ${e instanceof Error ? e.message : 'unknown'}`, 'error');
+    }
+  }, [primaryProtected]);
 
   // Build service rows
   const svcMap = new Map(data.services.map((s) => [s.name, s]));
@@ -943,7 +1009,30 @@ function DashboardInner() {
                 return (
                   <React.Fragment key={row.name}>
                     <tr>
-                      <td style={{ fontFamily: 'inherit', fontWeight: 500 }}>{row.name}</td>
+                      <td style={{ fontFamily: 'inherit', fontWeight: 500 }}>
+                        {row.name}
+                        {row.name === 'Runner' && (
+                          <button
+                            onClick={toggleProtection}
+                            title={primaryProtected ? 'Protected from rebuilds — click to unprotect' : 'Click to protect from rebuilds'}
+                            style={{
+                              marginLeft: 6,
+                              padding: '1px 5px',
+                              background: primaryProtected ? 'rgba(34,197,94,0.15)' : 'transparent',
+                              border: `1px solid ${primaryProtected ? 'rgba(34,197,94,0.4)' : 'rgba(255,255,255,0.15)'}`,
+                              borderRadius: 3,
+                              cursor: 'pointer',
+                              fontSize: '0.65rem',
+                              fontWeight: 600,
+                              color: primaryProtected ? '#22c55e' : 'rgba(255,255,255,0.35)',
+                              verticalAlign: 'middle',
+                              letterSpacing: '0.02em',
+                            }}
+                          >
+                            {primaryProtected ? 'PROTECTED' : 'PROTECT'}
+                          </button>
+                        )}
+                      </td>
                       <td>{row.port}</td>
                       <td>
                         <StatusDot up={row.up} error={!!err} />
@@ -975,15 +1064,28 @@ function DashboardInner() {
                             />
                           ))}
                           {(err || (!row.up && row.actions)) && (
-                            <SmallBtn
-                              label={ai?.ai_running ? 'AI busy' : 'AI Fix'}
-                              activeLabel="Sending…"
-                              onClick={() => triggerAiFix(row.name)}
-                              busy={aiFixBusy}
-                              busyKey={row.name}
-                              variant="warning"
-                              disabled={!!ai?.ai_running}
-                            />
+                            <>
+                              <SmallBtn
+                                label={ai?.ai_running ? 'AI busy' : 'AI Fix'}
+                                activeLabel="Sending…"
+                                onClick={() => triggerAiFix(row.name)}
+                                busy={aiFixBusy}
+                                busyKey={row.name}
+                                variant="warning"
+                                disabled={!!ai?.ai_running}
+                              />
+                              {row.name === 'Runner' && (
+                                <SmallBtn
+                                  label={fixAndRebuildBusy ? 'Fixing…' : 'Fix & Rebuild'}
+                                  activeLabel="Fixing & Rebuilding…"
+                                  onClick={triggerFixAndRebuild}
+                                  busy={fixAndRebuildBusy ? 'Runner' : null}
+                                  busyKey="Runner"
+                                  variant="warning"
+                                  disabled={!!ai?.ai_running || fixAndRebuildBusy}
+                                />
+                              )}
+                            </>
                           )}
                         </div>
                       </td>

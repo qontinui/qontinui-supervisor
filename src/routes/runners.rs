@@ -26,6 +26,14 @@ pub struct AddRunnerRequest {
 pub struct RestartRunnerRequest {
     #[serde(default)]
     pub rebuild: bool,
+    /// Source of the restart request. Defaults to "manual".
+    /// Protected runners reject non-manual sources.
+    #[serde(default = "default_source_manual")]
+    pub source: String,
+}
+
+fn default_source_manual() -> String {
+    "manual".to_string()
 }
 
 #[derive(Deserialize)]
@@ -46,12 +54,14 @@ pub async fn list_runners(
         let runner = managed.runner.read().await;
         let watchdog = managed.watchdog.read().await;
         let cached = managed.cached_health.read().await;
+        let is_protected = managed.is_protected().await;
 
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
             "is_primary": managed.config.is_primary,
+            "protected": is_protected,
             "running": runner.running,
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
@@ -101,6 +111,7 @@ pub async fn add_runner(
         name: name.clone(),
         port: body.port,
         is_primary: false,
+        protected: false,
     };
 
     // Check for port conflicts and insert under a single write lock to avoid TOCTOU race.
@@ -225,13 +236,13 @@ pub async fn restart_runner(
     Path(id): Path<String>,
     Json(body): Json<RestartRunnerRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    manager::restart_runner_by_id(
-        &state,
-        &id,
-        body.rebuild,
-        crate::diagnostics::RestartSource::Manual,
-    )
-    .await?;
+    let source = match body.source.as_str() {
+        "workflow_loop" => crate::diagnostics::RestartSource::WorkflowLoop,
+        "watchdog" => crate::diagnostics::RestartSource::Watchdog,
+        _ => crate::diagnostics::RestartSource::Manual,
+    };
+
+    manager::restart_runner_by_id(&state, &id, body.rebuild, source).await?;
 
     Ok(Json(json!({
         "status": "restarted",
@@ -271,6 +282,58 @@ pub async fn control_runner_watchdog(
     state.notify_health_change();
 
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+pub struct ProtectRunnerRequest {
+    pub protected: bool,
+}
+
+/// POST /runners/{id}/protect — toggle protection on a runner.
+/// Protected runners cannot be stopped or restarted by smart rebuild, watchdog, or workflow loop.
+pub async fn protect_runner(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProtectRunnerRequest>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    let managed = state
+        .get_runner(&id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
+
+    let name = managed.config.name.clone();
+
+    // Update the runtime protection flag
+    {
+        let mut protected = managed.protected.write().await;
+        *protected = body.protected;
+    }
+
+    // Persist to settings
+    let settings_path = settings::settings_path(&state.config);
+    let mut settings = settings::load_settings(&settings_path);
+    if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
+        cfg.protected = body.protected;
+        settings::save_settings(&settings_path, &settings);
+    }
+
+    let action = if body.protected { "protected" } else { "unprotected" };
+    state
+        .logs
+        .emit(
+            crate::log_capture::LogSource::Supervisor,
+            crate::log_capture::LogLevel::Info,
+            format!("Runner '{}' is now {}", name, action),
+        )
+        .await;
+
+    state.notify_health_change();
+
+    Ok(Json(json!({
+        "status": action,
+        "protected": body.protected,
+        "message": format!("Runner '{}' is now {}", name, action)
+    })))
 }
 
 /// GET /runners/{id}/ui-bridge/{*path} — proxy UI Bridge to specific runner.
