@@ -402,11 +402,15 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(port).await;
     }
 
-    // For primary in dev mode, also clean up Vite port
+    // For primary in dev mode, always force-kill processes on Vite port.
+    // The cmd.exe → npm → tauri → vite process tree means grandchild node.exe
+    // often survives the parent kill despite CREATE_NEW_PROCESS_GROUP.
     if is_primary && state.config.dev_mode {
+        let _ = kill_by_port(RUNNER_VITE_PORT).await;
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
         if !vite_free {
-            warn!("Vite port {} still in use after stop", RUNNER_VITE_PORT);
+            warn!("Vite port {} still in use after forced kill", RUNNER_VITE_PORT);
+            // Second attempt
             let _ = kill_by_port(RUNNER_VITE_PORT).await;
         }
     }
