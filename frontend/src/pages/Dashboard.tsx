@@ -701,10 +701,12 @@ function RunnerInstancesPanel() {
               </tr>
             </thead>
             <tbody>
-              {nonPrimary.map((r) => (
+              {nonPrimary.map((r) => {
+                const isUp = r.running || r.api_responding;
+                return (
                 <tr key={r.id}>
                   <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
-                    {r.name}
+                    <span>{r.name}</span>
                     {r.protected && (
                       <span
                         style={{
@@ -716,6 +718,7 @@ function RunnerInstancesPanel() {
                           fontSize: '0.6rem',
                           fontWeight: 600,
                           color: '#22c55e',
+                          verticalAlign: 'middle',
                         }}
                       >
                         PROTECTED
@@ -724,17 +727,17 @@ function RunnerInstancesPanel() {
                   </td>
                   <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
                   <td>
-                    <StatusDot up={r.running} />
+                    <StatusDot up={isUp} />
                     <span
-                      className={r.running ? 'text-success' : 'text-danger'}
+                      className={isUp ? 'text-success' : 'text-danger'}
                       style={{ fontSize: '0.7rem' }}
                     >
-                      {r.running ? 'UP' : 'DOWN'}
+                      {isUp ? 'UP' : 'DOWN'}
                     </span>
                   </td>
                   <td>
                     <div className="flex gap-2">
-                      {!r.running && (
+                      {!isUp && (
                         <button
                           className="btn"
                           style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
@@ -744,7 +747,7 @@ function RunnerInstancesPanel() {
                           {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
                         </button>
                       )}
-                      {r.running && (
+                      {isUp && (
                         <button
                           className="btn"
                           style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
@@ -772,7 +775,7 @@ function RunnerInstancesPanel() {
                       >
                         {r.protected ? 'Unprotect' : 'Protect'}
                       </button>
-                      {!r.running && (
+                      {!isUp && (
                         <button
                           className="btn"
                           style={{
@@ -795,7 +798,8 @@ function RunnerInstancesPanel() {
                     </div>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
