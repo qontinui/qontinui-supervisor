@@ -10,12 +10,13 @@ import VelocityTest from './pages/VelocityTest';
 import VelocityImprovement from './pages/VelocityImprovement';
 import WorkflowLoop from './pages/WorkflowLoop';
 import RunnerMonitor from './pages/RunnerMonitor';
-import { UIBridgeProvider, AutoRegisterProvider } from '@qontinui/ui-bridge/react';
+import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';
 
 export default function App() {
   return (
     <UIBridgeProvider features={{ control: true }}>
     <AutoRegisterProvider>
+    <CommandRelayListener basePath="/supervisor-bridge" />
     <div className="layout">
       <aside className="sidebar">
         <div className="sidebar-logo">Supervisor</div>

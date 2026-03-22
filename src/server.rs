@@ -106,6 +106,55 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::dev_start::migrate),
         )
         .route("/dev-start/status", get(crate::routes::dev_start::status))
+        // Supervisor Bridge (command relay for supervisor's own dashboard UI)
+        .route(
+            "/supervisor-bridge/commands/stream",
+            get(crate::routes::supervisor_bridge::commands_stream),
+        )
+        .route(
+            "/supervisor-bridge/commands",
+            post(crate::routes::supervisor_bridge::command_response),
+        )
+        .route(
+            "/supervisor-bridge/heartbeat",
+            post(crate::routes::supervisor_bridge::heartbeat),
+        )
+        .route(
+            "/supervisor-bridge/control/snapshot",
+            get(crate::routes::supervisor_bridge::snapshot),
+        )
+        .route(
+            "/supervisor-bridge/control/elements",
+            get(crate::routes::supervisor_bridge::elements),
+        )
+        .route(
+            "/supervisor-bridge/control/element/{id}/action",
+            post(crate::routes::supervisor_bridge::element_action),
+        )
+        .route(
+            "/supervisor-bridge/control/discover",
+            post(crate::routes::supervisor_bridge::discover),
+        )
+        .route(
+            "/supervisor-bridge/control/console-errors",
+            get(crate::routes::supervisor_bridge::console_errors),
+        )
+        .route(
+            "/supervisor-bridge/control/page/evaluate",
+            post(crate::routes::supervisor_bridge::page_evaluate),
+        )
+        .route(
+            "/supervisor-bridge/control/page/navigate",
+            post(crate::routes::supervisor_bridge::page_navigate),
+        )
+        .route(
+            "/supervisor-bridge/control/page/refresh",
+            post(crate::routes::supervisor_bridge::page_refresh),
+        )
+        .route(
+            "/supervisor-bridge/health",
+            get(crate::routes::supervisor_bridge::bridge_health),
+        )
         // UI Bridge proxy (forwards to runner at port 9876)
         .route(
             "/ui-bridge/{*path}",
@@ -150,6 +199,15 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/workflow-loop/checkpoints/{task_run_id}",
             get(crate::routes::workflow_loop::get_checkpoints),
+        )
+        // Cascade detection events (proxy from qontinui-api)
+        .route(
+            "/cascade/events",
+            get(crate::routes::cascade::events),
+        )
+        .route(
+            "/cascade/stream",
+            get(crate::routes::cascade::stream),
         )
         // Diagnostics
         .route(

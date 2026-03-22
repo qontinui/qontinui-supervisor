@@ -2,6 +2,7 @@ use crate::config::{RunnerConfig, SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
+use crate::routes::supervisor_bridge::CommandRelay;
 use crate::smart_rebuild::SmartRebuildState;
 use crate::velocity_improvement::VelocityImprovementState;
 use crate::workflow_loop::WorkflowLoopState;
@@ -66,6 +67,7 @@ pub struct SupervisorState {
     pub velocity_tests: RwLock<VelocityTestState>,
     pub velocity_improvement: RwLock<VelocityImprovementState>,
     pub smart_rebuild: RwLock<SmartRebuildState>,
+    pub command_relay: Arc<CommandRelay>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
@@ -183,6 +185,7 @@ impl SupervisorState {
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
             smart_rebuild: RwLock::new(SmartRebuildState::new(smart_rebuild_enabled)),
+            command_relay: Arc::new(CommandRelay::new()),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,

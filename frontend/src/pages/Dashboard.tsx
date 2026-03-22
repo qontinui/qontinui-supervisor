@@ -240,6 +240,165 @@ interface LogLine {
   message: string;
 }
 
+// ─── Cascade Detection Panel ─────────────────────────────────────────────────
+
+interface CascadeEvent {
+  type: string;
+  data: {
+    needle?: string;
+    needle_type?: string;
+    backend?: string;
+    winning_backend?: string;
+    backends_tried?: number;
+    confidence?: number;
+    duration_ms?: number;
+    total_duration_ms?: number;
+    success?: boolean;
+    reason?: string;
+    result_count?: number;
+    min_confidence?: number;
+    timestamp?: number;
+  };
+  timestamp: number;
+}
+
+function CascadePanel() {
+  const [events, setEvents] = useState<CascadeEvent[]>([]);
+  const [expanded, setExpanded] = useState(false);
+  const maxEvents = 100;
+
+  useSSE<CascadeEvent>(
+    '/cascade/stream',
+    'cascade',
+    (evt) => {
+      setEvents((prev) => {
+        const next = [...prev, evt];
+        return next.length > maxEvents ? next.slice(-maxEvents) : next;
+      });
+    },
+    expanded,
+  );
+
+  // Fetch recent events when expanding
+  useEffect(() => {
+    if (!expanded) return;
+    fetch('/cascade/events')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data: CascadeEvent[]) => {
+        if (data.length > 0) setEvents(data.slice(-maxEvents));
+      })
+      .catch(() => {});
+  }, [expanded]);
+
+  const hits = events.filter((e) => e.type === 'cascade.hit').length;
+  const misses = events.filter((e) => e.type === 'cascade.miss').length;
+  const total = hits + misses;
+  const hitRate = total > 0 ? ((hits / total) * 100).toFixed(0) : '—';
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div
+        role="button"
+        tabIndex={0}
+        style={{ cursor: 'pointer', fontWeight: 600, fontSize: 15, marginBottom: 6 }}
+        onClick={() => setExpanded((e) => !e)}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded((v) => !v); } }}
+      >
+        {expanded ? '▼' : '▶'} Cascade Detection
+        {total > 0 && (
+          <span style={{ fontWeight: 400, fontSize: 13, marginLeft: 10, opacity: 0.7 }}>
+            {hits} hit / {misses} miss ({hitRate}%)
+          </span>
+        )}
+      </div>
+
+      {expanded && (
+        <div
+          style={{
+            background: '#1a1a2e',
+            border: '1px solid #333',
+            borderRadius: 6,
+            padding: '8px 12px',
+            maxHeight: 280,
+            overflowY: 'auto',
+            fontSize: 12,
+            fontFamily: 'monospace',
+          }}
+        >
+          {events.length === 0 ? (
+            <div style={{ opacity: 0.5, padding: '8px 0' }}>
+              No cascade events yet. Events appear when template matching triggers
+              fallback detection.
+            </div>
+          ) : (
+            events.map((evt, i) => <CascadeEventRow key={i} event={evt} />)
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CascadeEventRow({ event: evt }: { event: CascadeEvent }) {
+  const ts = evt.data.timestamp
+    ? new Date(evt.data.timestamp * 1000).toLocaleTimeString()
+    : '';
+
+  if (evt.type === 'cascade.hit') {
+    return (
+      <div style={{ color: '#4ade80', padding: '2px 0' }}>
+        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
+        <strong>HIT</strong> {evt.data.needle} → {evt.data.winning_backend}{' '}
+        <span style={{ opacity: 0.6 }}>
+          ({evt.data.backends_tried} tried, {evt.data.confidence?.toFixed(2)} conf,{' '}
+          {evt.data.total_duration_ms?.toFixed(0)}ms)
+        </span>
+      </div>
+    );
+  }
+
+  if (evt.type === 'cascade.miss') {
+    return (
+      <div style={{ color: '#f87171', padding: '2px 0' }}>
+        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
+        <strong>MISS</strong> {evt.data.needle}{' '}
+        <span style={{ opacity: 0.6 }}>
+          ({evt.data.backends_tried} tried, {evt.data.total_duration_ms?.toFixed(0)}ms)
+        </span>
+      </div>
+    );
+  }
+
+  if (evt.type === 'cascade.backend.tried') {
+    const icon = evt.data.success ? '✓' : '·';
+    const color = evt.data.success ? '#4ade80' : '#888';
+    return (
+      <div style={{ color, padding: '1px 0', paddingLeft: 16 }}>
+        <span style={{ opacity: 0.5 }}>{ts}</span> {icon} {evt.data.backend}{' '}
+        <span style={{ opacity: 0.5 }}>
+          {evt.data.duration_ms?.toFixed(0)}ms
+          {evt.data.result_count ? ` (${evt.data.result_count} results)` : ''}
+          {evt.data.reason && !evt.data.success ? ` — ${evt.data.reason}` : ''}
+        </span>
+      </div>
+    );
+  }
+
+  if (evt.type === 'cascade.started') {
+    return (
+      <div style={{ color: '#60a5fa', padding: '2px 0', borderTop: '1px solid #333', marginTop: 4, paddingTop: 4 }}>
+        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
+        ▸ {evt.data.needle}{' '}
+        <span style={{ opacity: 0.5 }}>
+          (type={evt.data.needle_type}, min_conf={evt.data.min_confidence})
+        </span>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 function LogViewer() {
   const [lines, setLines] = useState<LogLine[]>([]);
   const [expanded, setExpanded] = useState(false);
@@ -1468,6 +1627,7 @@ function DashboardInner() {
 
       <RunnerInstancesPanel />
       <WorkflowLoopPanel />
+      <CascadePanel />
       <LogViewer />
     </div>
   );
