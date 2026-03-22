@@ -403,11 +403,17 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(RUNNER_VITE_PORT).await;
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
         if !vite_free {
-            warn!("Vite port {} still in use after forced kill, retrying", RUNNER_VITE_PORT);
+            warn!(
+                "Vite port {} still in use after forced kill, retrying",
+                RUNNER_VITE_PORT
+            );
             let _ = kill_by_port(RUNNER_VITE_PORT).await;
             let vite_free_retry = wait_for_port_free(RUNNER_VITE_PORT, 10).await;
             if !vite_free_retry {
-                error!("Vite port {} still in use after two kill attempts", RUNNER_VITE_PORT);
+                error!(
+                    "Vite port {} still in use after two kill attempts",
+                    RUNNER_VITE_PORT
+                );
             }
         }
     }

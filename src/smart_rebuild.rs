@@ -245,18 +245,22 @@ async fn run_smart_rebuild(state: &SharedState) {
             .emit(
                 LogSource::SmartRebuild,
                 LogLevel::Info,
-                format!(
-                    "Stopping {} runner(s) for rebuild",
-                    was_running.len()
-                ),
+                format!("Stopping {} runner(s) for rebuild", was_running.len()),
             )
             .await;
 
         // Stop only unprotected runners individually
         for runner_id in &was_running {
             if let Err(e) = manager::stop_runner_by_id(state, runner_id).await {
-                error!("Smart rebuild: failed to stop runner '{}': {}", runner_id, e);
-                set_failed(state, format!("Failed to stop runner '{}': {}", runner_id, e)).await;
+                error!(
+                    "Smart rebuild: failed to stop runner '{}': {}",
+                    runner_id, e
+                );
+                set_failed(
+                    state,
+                    format!("Failed to stop runner '{}': {}", runner_id, e),
+                )
+                .await;
                 return;
             }
         }

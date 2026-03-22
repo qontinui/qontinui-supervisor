@@ -170,9 +170,9 @@ pub async fn fix_and_rebuild(
 
     // 1. Spawn AI debug (same as POST /ai/debug)
     let reason = body.prompt.as_deref().unwrap_or("Fix & Rebuild trigger");
-    ai_debug::spawn_ai_debug(&state, Some(reason)).await.map_err(|e| {
-        SupervisorError::Other(format!("Failed to start AI debug: {}", e))
-    })?;
+    ai_debug::spawn_ai_debug(&state, Some(reason))
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to start AI debug: {}", e)))?;
 
     // 2. Poll until AI session completes (check every 2s, timeout 10 min)
     let timeout = std::time::Duration::from_secs(600);

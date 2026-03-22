@@ -325,7 +325,11 @@ pub async fn protect_runner(
         *protected = body.protected;
     }
 
-    let action = if body.protected { "protected" } else { "unprotected" };
+    let action = if body.protected {
+        "protected"
+    } else {
+        "unprotected"
+    };
     state
         .logs
         .emit(

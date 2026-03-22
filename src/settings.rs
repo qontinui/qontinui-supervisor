@@ -33,8 +33,7 @@ pub fn save_settings(path: &Path, settings: &PersistentSettings) {
 
 /// Save settings, returning an error on failure instead of logging a warning.
 pub fn try_save_settings(path: &Path, settings: &PersistentSettings) -> Result<(), String> {
-    let json =
-        serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
+    let json = serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("write {:?}: {e}", path))?;
     Ok(())
 }

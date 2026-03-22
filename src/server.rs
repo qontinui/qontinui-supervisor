@@ -201,14 +201,8 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::workflow_loop::get_checkpoints),
         )
         // Cascade detection events (proxy from qontinui-api)
-        .route(
-            "/cascade/events",
-            get(crate::routes::cascade::events),
-        )
-        .route(
-            "/cascade/stream",
-            get(crate::routes::cascade::stream),
-        )
+        .route("/cascade/events", get(crate::routes::cascade::events))
+        .route("/cascade/stream", get(crate::routes::cascade::stream))
         // Diagnostics
         .route(
             "/diagnostics",

@@ -29,7 +29,10 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            format!("Runner discovery: waiting for primary runner on port {} to be ready...", primary_port),
+            format!(
+                "Runner discovery: waiting for primary runner on port {} to be ready...",
+                primary_port
+            ),
         )
         .await;
 
@@ -61,12 +64,10 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
     let url = format!("http://127.0.0.1:{}/instances", primary_port);
 
     let instances: Vec<DiscoveredInstance> = match client.get(&url).send().await {
-        Ok(resp) => {
-            match resp.json::<ApiResponse<Vec<DiscoveredInstance>>>().await {
-                Ok(body) if body.success => body.data.unwrap_or_default(),
-                _ => Vec::new(),
-            }
-        }
+        Ok(resp) => match resp.json::<ApiResponse<Vec<DiscoveredInstance>>>().await {
+            Ok(body) if body.success => body.data.unwrap_or_default(),
+            _ => Vec::new(),
+        },
         Err(e) => {
             info!("Runner discovery: failed to query /instances: {}", e);
             return;
@@ -78,7 +79,10 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            format!("Runner discovery: found {} instance(s) from primary", instances.len()),
+            format!(
+                "Runner discovery: found {} instance(s) from primary",
+                instances.len()
+            ),
         )
         .await;
 

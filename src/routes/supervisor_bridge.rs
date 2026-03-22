@@ -9,9 +9,9 @@
 //! with the supervisor dashboard UI the same way they do with the runner or web frontend.
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
-use axum::http::StatusCode;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,6 +48,12 @@ struct CommandResult {
     success: bool,
     result: serde_json::Value,
     error: Option<String>,
+}
+
+impl Default for CommandRelay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommandRelay {
@@ -245,9 +251,7 @@ pub async fn commands_stream(
     State(state): State<SharedState>,
     Query(query): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let tab_id = query
-        .tab_id
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let tab_id = query.tab_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let (tx, rx) = broadcast::channel::<String>(64);
 
@@ -262,11 +266,11 @@ pub async fn commands_stream(
     debug!("Supervisor bridge: tab {tab_id} connected to command stream");
 
     // Initial connected event
-    let connected_msg =
-        serde_json::json!({"type": "connected", "tabId": tab_id}).to_string();
-    let initial = futures::stream::once(async move {
-        Ok::<_, Infallible>(Event::default().data(connected_msg))
-    });
+    let connected_msg = serde_json::json!({"type": "connected", "tabId": tab_id}).to_string();
+    let initial =
+        futures::stream::once(
+            async move { Ok::<_, Infallible>(Event::default().data(connected_msg)) },
+        );
 
     // Command events from the broadcast channel
     let command_stream = BroadcastStream::new(rx).filter_map(|result| async {
@@ -478,7 +482,9 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
     drop(pending);
 
     let heartbeats = state.command_relay.heartbeats.read().await;
-    let responsive = heartbeats.values().any(|t| t.elapsed() < Duration::from_secs(30));
+    let responsive = heartbeats
+        .values()
+        .any(|t| t.elapsed() < Duration::from_secs(30));
     let last_heartbeat_ms_ago = heartbeats
         .values()
         .map(|t| t.elapsed().as_millis() as u64)
