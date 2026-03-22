@@ -61,8 +61,9 @@ pub async fn events(State(state): State<SharedState>) -> impl IntoResponse {
 /// GET /cascade/stream — SSE stream of cascade events.
 ///
 /// Polls qontinui-api `/cascade/events` every second and pushes new
-/// events as SSE messages. Uses event count as a cursor to avoid
-/// re-sending events the client already has.
+/// events as SSE messages. Uses the timestamp of the last forwarded
+/// event as a cursor so that upstream buffer wraps (deque eviction)
+/// do not cause missed or duplicated events.
 pub async fn stream(
     State(state): State<SharedState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -75,7 +76,7 @@ pub async fn stream(
             "http://127.0.0.1:{}/api/cascade/events",
             QONTINUI_API_PORT
         );
-        let mut last_count: usize = 0;
+        let mut last_timestamp: Option<String> = None;
 
         loop {
             // Poll for new events
@@ -84,18 +85,28 @@ pub async fn stream(
                     if let Ok(text) = resp.text().await {
                         if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
                         {
-                            let current_count = events.len();
-                            // Send only new events (those after last_count)
-                            if current_count > last_count {
-                                for evt in events.iter().skip(last_count) {
+                            // Forward only events whose timestamp is strictly
+                            // greater than the last one we sent.
+                            for evt in &events {
+                                let ts = evt
+                                    .get("timestamp")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                let is_new = match &last_timestamp {
+                                    Some(last) => ts > last.as_str(),
+                                    None => true,
+                                };
+
+                                if is_new && !ts.is_empty() {
                                     let data = serde_json::to_string(evt).unwrap_or_default();
                                     let sse_event =
                                         Event::default().event("cascade").data(data);
                                     if tx.send(Ok(sse_event)).await.is_err() {
                                         return; // Client disconnected
                                     }
+                                    last_timestamp = Some(ts.to_owned());
                                 }
-                                last_count = current_count;
                             }
                         }
                     }
