@@ -265,6 +265,7 @@ interface CascadeEvent {
 function CascadePanel() {
   const [events, setEvents] = useState<CascadeEvent[]>([]);
   const [expanded, setExpanded] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
   const maxEvents = 100;
 
   useSSE<CascadeEvent>(
@@ -290,43 +291,60 @@ function CascadePanel() {
       .catch(() => {});
   }, [expanded]);
 
+  // Auto-scroll to bottom when new events arrive
+  useEffect(() => {
+    if (listRef.current && expanded) {
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+    }
+  }, [events, expanded]);
+
   const hits = events.filter((e) => e.type === 'cascade.hit').length;
   const misses = events.filter((e) => e.type === 'cascade.miss').length;
   const total = hits + misses;
-  const hitRate = total > 0 ? ((hits / total) * 100).toFixed(0) : '—';
+  const hitRate = total > 0 ? ((hits / total) * 100).toFixed(0) : '--';
 
   return (
-    <div style={{ marginTop: 18 }}>
-      <div
-        role="button"
-        tabIndex={0}
-        style={{ cursor: 'pointer', fontWeight: 600, fontSize: 15, marginBottom: 6 }}
-        onClick={() => setExpanded((e) => !e)}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded((v) => !v); } }}
-      >
-        {expanded ? '▼' : '▶'} Cascade Detection
-        {total > 0 && (
-          <span style={{ fontWeight: 400, fontSize: 13, marginLeft: 10, opacity: 0.7 }}>
-            {hits} hit / {misses} miss ({hitRate}%)
-          </span>
-        )}
+    <div className="card" style={{ marginBottom: '1rem' }}>
+      <div className="card-header" style={{ marginBottom: expanded ? '0.5rem' : 0 }}>
+        <span className="card-title">
+          Cascade Detection
+          {total > 0 && (
+            <span
+              style={{
+                fontWeight: 400,
+                textTransform: 'none',
+                letterSpacing: 0,
+                marginLeft: 8,
+                fontSize: '0.75rem',
+              }}
+            >
+              {hits} hit / {misses} miss ({hitRate}%)
+            </span>
+          )}
+        </span>
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          style={{
+            background: 'none',
+            border: 'none',
+            color: 'var(--text-muted)',
+            cursor: 'pointer',
+            fontSize: '0.75rem',
+            padding: '0 4px',
+          }}
+        >
+          {expanded ? 'collapse' : 'expand'}
+        </button>
       </div>
 
       {expanded && (
         <div
-          style={{
-            background: '#1a1a2e',
-            border: '1px solid #333',
-            borderRadius: 6,
-            padding: '8px 12px',
-            maxHeight: 280,
-            overflowY: 'auto',
-            fontSize: 12,
-            fontFamily: 'monospace',
-          }}
+          ref={listRef}
+          className="log-viewer"
+          style={{ maxHeight: 280 }}
         >
           {events.length === 0 ? (
-            <div style={{ opacity: 0.5, padding: '8px 0' }}>
+            <div className="text-muted" style={{ padding: '0.5rem 0' }}>
               No cascade events yet. Events appear when template matching triggers
               fallback detection.
             </div>
@@ -346,9 +364,9 @@ function CascadeEventRow({ event: evt }: { event: CascadeEvent }) {
 
   if (evt.type === 'cascade.hit') {
     return (
-      <div style={{ color: '#4ade80', padding: '2px 0' }}>
-        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
-        <strong>HIT</strong> {evt.data.needle} → {evt.data.winning_backend}{' '}
+      <div className="log-line" style={{ color: 'var(--success)' }}>
+        <span className="text-muted">{ts}</span>{' '}
+        <strong>HIT</strong> {evt.data.needle} &rarr; {evt.data.winning_backend}{' '}
         <span style={{ opacity: 0.6 }}>
           ({evt.data.backends_tried} tried, {evt.data.confidence?.toFixed(2)} conf,{' '}
           {evt.data.total_duration_ms?.toFixed(0)}ms)
@@ -359,8 +377,8 @@ function CascadeEventRow({ event: evt }: { event: CascadeEvent }) {
 
   if (evt.type === 'cascade.miss') {
     return (
-      <div style={{ color: '#f87171', padding: '2px 0' }}>
-        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
+      <div className="log-line" style={{ color: 'var(--danger)' }}>
+        <span className="text-muted">{ts}</span>{' '}
         <strong>MISS</strong> {evt.data.needle}{' '}
         <span style={{ opacity: 0.6 }}>
           ({evt.data.backends_tried} tried, {evt.data.total_duration_ms?.toFixed(0)}ms)
@@ -370,15 +388,20 @@ function CascadeEventRow({ event: evt }: { event: CascadeEvent }) {
   }
 
   if (evt.type === 'cascade.backend.tried') {
-    const icon = evt.data.success ? '✓' : '·';
-    const color = evt.data.success ? '#4ade80' : '#888';
     return (
-      <div style={{ color, padding: '1px 0', paddingLeft: 16 }}>
-        <span style={{ opacity: 0.5 }}>{ts}</span> {icon} {evt.data.backend}{' '}
+      <div
+        className="log-line"
+        style={{
+          color: evt.data.success ? 'var(--success)' : 'var(--text-muted)',
+          paddingLeft: 16,
+        }}
+      >
+        <span className="text-muted">{ts}</span>{' '}
+        {evt.data.success ? '\u2713' : '\u00b7'} {evt.data.backend}{' '}
         <span style={{ opacity: 0.5 }}>
           {evt.data.duration_ms?.toFixed(0)}ms
           {evt.data.result_count ? ` (${evt.data.result_count} results)` : ''}
-          {evt.data.reason && !evt.data.success ? ` — ${evt.data.reason}` : ''}
+          {evt.data.reason && !evt.data.success ? ` -- ${evt.data.reason}` : ''}
         </span>
       </div>
     );
@@ -386,9 +409,17 @@ function CascadeEventRow({ event: evt }: { event: CascadeEvent }) {
 
   if (evt.type === 'cascade.started') {
     return (
-      <div style={{ color: '#60a5fa', padding: '2px 0', borderTop: '1px solid #333', marginTop: 4, paddingTop: 4 }}>
-        <span style={{ opacity: 0.5 }}>{ts}</span>{' '}
-        ▸ {evt.data.needle}{' '}
+      <div
+        className="log-line"
+        style={{
+          color: 'var(--accent-hover)',
+          borderTop: '1px solid var(--border)',
+          marginTop: 3,
+          paddingTop: 3,
+        }}
+      >
+        <span className="text-muted">{ts}</span>{' '}
+        &#9656; {evt.data.needle}{' '}
         <span style={{ opacity: 0.5 }}>
           (type={evt.data.needle_type}, min_conf={evt.data.min_confidence})
         </span>
