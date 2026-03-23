@@ -75,7 +75,7 @@ pub async fn stream(
 
     tokio::spawn(async move {
         let url = format!("http://127.0.0.1:{}/cascade/events", RUNNER_API_PORT);
-        let mut last_timestamp: Option<String> = None;
+        let mut last_ts: f64 = 0.0;
 
         loop {
             // Poll for new events
@@ -89,23 +89,21 @@ pub async fn stream(
                     if let Ok(text) = resp.text().await {
                         if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
                             // Forward only events whose timestamp is strictly
-                            // greater than the last one we sent.
+                            // greater than the last one we sent.  Timestamps are
+                            // floats (Python time.time()), not strings.
                             for evt in &events {
-                                let ts =
-                                    evt.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                                let ts = evt
+                                    .get("timestamp")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
 
-                                let is_new = match &last_timestamp {
-                                    Some(last) => ts > last.as_str(),
-                                    None => true,
-                                };
-
-                                if is_new && !ts.is_empty() {
+                                if ts > last_ts {
                                     let data = serde_json::to_string(evt).unwrap_or_default();
                                     let sse_event = Event::default().event("cascade").data(data);
                                     if tx.send(Ok(sse_event)).await.is_err() {
                                         return; // Client disconnected
                                     }
-                                    last_timestamp = Some(ts.to_owned());
+                                    last_ts = ts;
                                 }
                             }
                         }

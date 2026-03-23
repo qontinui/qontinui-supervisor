@@ -16,6 +16,7 @@ use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
@@ -40,7 +41,7 @@ pub struct CommandRelay {
 
 struct PendingCommand {
     tx: oneshot::Sender<CommandResult>,
-    _created_at: Instant,
+    created_at: Instant,
 }
 
 #[derive(Debug)]
@@ -50,19 +51,31 @@ struct CommandResult {
     error: Option<String>,
 }
 
-impl Default for CommandRelay {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CommandRelay {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Arc<Self> {
+        let relay = Arc::new(Self {
             pending: RwLock::new(HashMap::new()),
             subscribers: RwLock::new(HashMap::new()),
             heartbeats: RwLock::new(HashMap::new()),
-        }
+        });
+
+        // Spawn a background task to reap stale pending commands (30s TTL)
+        let relay_reaper = relay.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let mut pending = relay_reaper.pending.write().await;
+                let before = pending.len();
+                pending.retain(|_id, cmd| cmd.created_at.elapsed() < Duration::from_secs(30));
+                let reaped = before - pending.len();
+                if reaped > 0 {
+                    debug!("Supervisor bridge: reaped {reaped} stale pending commands");
+                }
+            }
+        });
+
+        relay
     }
 
     /// Queue a command and wait for the browser to execute it.
@@ -79,7 +92,7 @@ impl CommandRelay {
             command_id.clone(),
             PendingCommand {
                 tx,
-                _created_at: Instant::now(),
+                created_at: Instant::now(),
             },
         );
 
@@ -280,7 +293,26 @@ pub async fn commands_stream(
         }
     });
 
-    let stream = initial.chain(command_stream);
+    // Cleanup guard: removes subscriber and heartbeat when SSE stream is dropped
+    let relay_cleanup = state.command_relay.clone();
+    let tab_id_cleanup = tab_id.clone();
+    let cleanup_stream = futures::stream::once(async move {
+        // This runs when the upstream stream ends (browser disconnects).
+        relay_cleanup
+            .subscribers
+            .write()
+            .await
+            .remove(&tab_id_cleanup);
+        relay_cleanup
+            .heartbeats
+            .write()
+            .await
+            .remove(&tab_id_cleanup);
+        debug!("Supervisor bridge: tab {tab_id_cleanup} disconnected, cleaned up");
+        Ok::<_, Infallible>(Event::default().comment("disconnect"))
+    });
+
+    let stream = initial.chain(command_stream).chain(cleanup_stream);
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -306,9 +338,10 @@ pub async fn command_response(
         let _ = cmd.tx.send(result);
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
+        // Another tab may have already fulfilled this command — benign duplicate
         (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"ok": false, "error": "Unknown commandId"})),
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "duplicate": true})),
         )
     }
 }

@@ -185,7 +185,7 @@ impl SupervisorState {
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
             smart_rebuild: RwLock::new(SmartRebuildState::new(smart_rebuild_enabled)),
-            command_relay: Arc::new(CommandRelay::new()),
+            command_relay: CommandRelay::new(),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
