@@ -126,9 +126,15 @@ pub const CODE_CHECK_RETRY_INTERVAL_SECS: u64 = 30;
 
 // Smart rebuild constants
 pub const SMART_REBUILD_CHECK_INTERVAL_SECS: u64 = 10;
-pub const SMART_REBUILD_QUIET_PERIOD_SECS: i64 = 30;
-pub const SMART_REBUILD_MAX_FIX_ATTEMPTS: u32 = 3;
+pub const SMART_REBUILD_QUIET_PERIOD_SECS: i64 = 600; // 10 minutes of inactivity before rebuild
+/// Max AI fix attempts per rebuild cycle. After this, the cycle fails and waits
+/// for the retry cooldown before starting a new cycle. Effectively unlimited
+/// over time since failed cycles automatically retry.
+pub const SMART_REBUILD_MAX_FIX_ATTEMPTS: u32 = 5;
 pub const SMART_REBUILD_FIX_TIMEOUT_SECS: u64 = 300;
+/// Cooldown between retry cycles when a smart rebuild fails entirely.
+/// Prevents hammering the build immediately after all fix attempts in a cycle fail.
+pub const SMART_REBUILD_RETRY_COOLDOWN_SECS: i64 = 600; // 10 minutes
 
 // Overnight watchdog constants
 pub const OVERNIGHT_CHECK_INTERVAL_SECS: u64 = 180; // 3 minutes

@@ -501,6 +501,45 @@ pub async fn restart_runner_by_id(
         runner.restart_requested = true;
     }
 
+    // When restarting the primary, also stop non-protected secondary runners.
+    // Instance processes are not assigned to the Job Object (so that protected
+    // instances survive rebuilds), so the supervisor must explicitly stop the
+    // unprotected ones here.  They will be restored by the primary's instance
+    // manager when it starts back up.
+    if managed.config.is_primary {
+        let all_runners = state.get_all_runners().await;
+        for other in &all_runners {
+            if other.config.is_primary || other.is_protected().await {
+                continue;
+            }
+            // Check both supervisor-tracked state and health cache — instances
+            // spawned by the runner's own instance manager are only visible via
+            // the health cache (runner_responding), not via runner.running.
+            let supervisor_running = other.runner.read().await.running;
+            let api_responding = other.cached_health.read().await.runner_responding;
+            if supervisor_running || api_responding {
+                info!(
+                    "Stopping unprotected runner '{}' before primary restart",
+                    other.config.name
+                );
+                state
+                    .logs
+                    .emit(
+                        crate::log_capture::LogSource::Supervisor,
+                        crate::log_capture::LogLevel::Info,
+                        format!(
+                            "Stopping unprotected runner '{}' before primary restart",
+                            other.config.name
+                        ),
+                    )
+                    .await;
+                if let Err(e) = stop_runner_by_id(state, &other.config.id).await {
+                    warn!("Failed to stop runner '{}': {}", other.config.name, e);
+                }
+            }
+        }
+    }
+
     // Stop if running
     {
         let runner = managed.runner.read().await;

@@ -10,6 +10,7 @@ use crate::code_activity;
 use crate::config::{
     SMART_REBUILD_CHECK_INTERVAL_SECS, SMART_REBUILD_FIX_TIMEOUT_SECS,
     SMART_REBUILD_MAX_FIX_ATTEMPTS, SMART_REBUILD_QUIET_PERIOD_SECS,
+    SMART_REBUILD_RETRY_COOLDOWN_SECS,
 };
 use crate::diagnostics::DiagnosticEventKind;
 use crate::log_capture::{LogLevel, LogSource};
@@ -36,6 +37,7 @@ pub struct SmartRebuildState {
     pub last_build_error: Option<String>,
     pub total_rebuilds: u32,
     pub last_rebuild_at: Option<DateTime<Utc>>,
+    pub last_failed_at: Option<DateTime<Utc>>,
 }
 
 impl SmartRebuildState {
@@ -48,6 +50,7 @@ impl SmartRebuildState {
             last_build_error: None,
             total_rebuilds: 0,
             last_rebuild_at: None,
+            last_failed_at: None,
         }
     }
 
@@ -71,12 +74,52 @@ pub fn spawn_source_watcher(state: SharedState) -> tokio::task::JoinHandle<()> {
         loop {
             tokio::time::sleep(interval).await;
 
-            // Guard: enabled and idle
-            let (enabled, is_idle) = {
+            // Guard: enabled
+            let (enabled, is_idle, is_failed, last_failed_at) = {
                 let sr = state.smart_rebuild.read().await;
-                (sr.enabled, sr.is_idle())
+                (
+                    sr.enabled,
+                    sr.is_idle(),
+                    matches!(sr.phase, SmartRebuildPhase::Failed { .. }),
+                    sr.last_failed_at,
+                )
             };
-            if !enabled || !is_idle {
+            if !enabled {
+                continue;
+            }
+
+            // Auto-retry: if in Failed state and cooldown has elapsed, reset to Idle
+            if is_failed {
+                let cooldown_elapsed = last_failed_at
+                    .map(|t| (chrono::Utc::now() - t).num_seconds() >= SMART_REBUILD_RETRY_COOLDOWN_SECS)
+                    .unwrap_or(true);
+                let editing = code_activity::is_code_being_edited(
+                    &state.config.project_dir,
+                    SMART_REBUILD_QUIET_PERIOD_SECS,
+                );
+                let external_claude = code_activity::is_external_claude_session().await;
+
+                if cooldown_elapsed && !editing && !external_claude {
+                    info!("Smart rebuild: retry cooldown elapsed, resetting from Failed to retry");
+                    state
+                        .logs
+                        .emit(
+                            LogSource::SmartRebuild,
+                            LogLevel::Info,
+                            "Retry cooldown elapsed, retrying smart rebuild",
+                        )
+                        .await;
+                    let mut sr = state.smart_rebuild.write().await;
+                    sr.phase = SmartRebuildPhase::Idle;
+                    sr.current_attempt = 0;
+                    sr.last_build_error = None;
+                    // Clear last_successful_build_mtime to force rebuild even if no new changes
+                    sr.last_successful_build_mtime = None;
+                }
+                continue;
+            }
+
+            if !is_idle {
                 continue;
             }
 
@@ -482,7 +525,7 @@ async fn run_smart_rebuild(state: &SharedState) {
     }
 }
 
-/// Set the smart rebuild phase to Failed.
+/// Set the smart rebuild phase to Failed and record the timestamp for retry cooldown.
 async fn set_failed(state: &SharedState, reason: String) {
     state
         .logs
@@ -496,6 +539,7 @@ async fn set_failed(state: &SharedState, reason: String) {
     sr.phase = SmartRebuildPhase::Failed {
         reason: reason.clone(),
     };
+    sr.last_failed_at = Some(Utc::now());
 }
 
 /// Spawn Claude CLI to fix compilation errors.
@@ -741,6 +785,7 @@ mod tests {
         assert!(state.last_build_error.is_none());
         assert_eq!(state.total_rebuilds, 0);
         assert!(state.last_rebuild_at.is_none());
+        assert!(state.last_failed_at.is_none());
     }
 
     #[test]

@@ -261,6 +261,22 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 | AI output buffer | 2000 entries |
 | Code quiet period | 5min |
 | Code check interval | 30s |
+| Smart rebuild quiet period | 10min |
+| Smart rebuild fix attempts/cycle | 5 |
+| Smart rebuild retry cooldown | 10min |
+
+## Smart Rebuild Flow
+
+When `--smart-rebuild` is enabled, the supervisor monitors the runner's source files and automatically rebuilds after 10 minutes of inactivity:
+
+1. Source watcher polls every 10s for file changes in `src-tauri/src/` and `src/`
+2. When changes detected and 10min quiet period elapses → stop runner → cargo build
+3. If build fails → spawn Claude CLI to fix errors (up to 5 attempts per cycle)
+4. If all fix attempts in a cycle fail → wait 10min cooldown → retry from step 2
+5. Retries indefinitely until the build succeeds
+6. On success → restart runner → wait for healthy API
+
+Guards: skips if code is being edited, external Claude session active, workflow loop running, or manual stop/restart in progress.
 
 ## Auto-Debug Flow
 
