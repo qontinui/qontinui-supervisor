@@ -109,6 +109,13 @@ pub fn spawn_source_watcher(state: SharedState) -> tokio::task::JoinHandle<()> {
                             "Retry cooldown elapsed, retrying smart rebuild",
                         )
                         .await;
+                    state
+                        .diagnostics
+                        .write()
+                        .await
+                        .emit(DiagnosticEventKind::SmartRebuildStarted {
+                            trigger: "auto_retry".to_string(),
+                        });
                     let mut sr = state.smart_rebuild.write().await;
                     sr.phase = SmartRebuildPhase::Idle;
                     sr.current_attempt = 0;
@@ -363,7 +370,7 @@ async fn run_smart_rebuild(state: &SharedState) {
                     sr.last_build_error = Some(full_stderr.clone());
                 }
 
-                if attempt > SMART_REBUILD_MAX_FIX_ATTEMPTS {
+                if attempt >= SMART_REBUILD_MAX_FIX_ATTEMPTS {
                     let reason = format!(
                         "Build failed after {} attempts, last error: {}",
                         attempt,

@@ -698,16 +698,16 @@ mod tests {
 
     // --- SupervisorState tests ---
 
-    #[test]
-    fn test_supervisor_state_construction() {
+    #[tokio::test]
+    async fn test_supervisor_state_construction() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         assert!(state.config.dev_mode);
         assert_eq!(state.config.port, DEFAULT_SUPERVISOR_PORT);
     }
 
-    #[test]
-    fn test_supervisor_state_runner_initial_state() {
+    #[tokio::test]
+    async fn test_supervisor_state_runner_initial_state() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         let runner = state.runner.try_read().unwrap();
@@ -715,16 +715,16 @@ mod tests {
         assert!(runner.pid.is_none());
     }
 
-    #[test]
-    fn test_supervisor_state_watchdog_disabled_by_default() {
+    #[tokio::test]
+    async fn test_supervisor_state_watchdog_disabled_by_default() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         let watchdog = state.watchdog.try_read().unwrap();
         assert!(!watchdog.enabled);
     }
 
-    #[test]
-    fn test_supervisor_state_watchdog_enabled_from_config() {
+    #[tokio::test]
+    async fn test_supervisor_state_watchdog_enabled_from_config() {
         let mut config = make_test_config();
         config.watchdog_enabled_at_start = true;
         let state = SupervisorState::new(config);
@@ -732,16 +732,16 @@ mod tests {
         assert!(watchdog.enabled);
     }
 
-    #[test]
-    fn test_supervisor_state_auto_debug_disabled_by_default() {
+    #[tokio::test]
+    async fn test_supervisor_state_auto_debug_disabled_by_default() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         let ai = state.ai.try_read().unwrap();
         assert!(!ai.auto_debug_enabled);
     }
 
-    #[test]
-    fn test_supervisor_state_auto_debug_enabled_from_config() {
+    #[tokio::test]
+    async fn test_supervisor_state_auto_debug_enabled_from_config() {
         let mut config = make_test_config();
         config.auto_debug = true;
         let state = SupervisorState::new(config);
@@ -749,8 +749,8 @@ mod tests {
         assert!(ai.auto_debug_enabled);
     }
 
-    #[test]
-    fn test_supervisor_state_cached_health_defaults_to_all_false() {
+    #[tokio::test]
+    async fn test_supervisor_state_cached_health_defaults_to_all_false() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         let cached = state.cached_health.try_read().unwrap();
@@ -759,8 +759,8 @@ mod tests {
         assert!(!cached.vite_port_open);
     }
 
-    #[test]
-    fn test_supervisor_state_build_not_in_progress() {
+    #[tokio::test]
+    async fn test_supervisor_state_build_not_in_progress() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         let build = state.build.try_read().unwrap();
@@ -768,16 +768,16 @@ mod tests {
         assert!(!build.build_error_detected);
     }
 
-    #[test]
-    fn test_supervisor_state_notify_health_change_does_not_panic() {
+    #[tokio::test]
+    async fn test_supervisor_state_notify_health_change_does_not_panic() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         // Should not panic even with no subscribers
         state.notify_health_change();
     }
 
-    #[test]
-    fn test_supervisor_state_expo_port_from_config() {
+    #[tokio::test]
+    async fn test_supervisor_state_expo_port_from_config() {
         let mut config = make_test_config();
         config.expo_port = 9999;
         let state = SupervisorState::new(config);

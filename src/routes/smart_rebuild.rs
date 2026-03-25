@@ -12,6 +12,9 @@ pub struct SmartRebuildStatusResponse {
     pub last_build_error: Option<String>,
     pub total_rebuilds: u32,
     pub last_rebuild_at: Option<String>,
+    pub last_failed_at: Option<String>,
+    /// Seconds until the next automatic retry (only present when in Failed state).
+    pub retry_in_secs: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +31,14 @@ pub struct ActionResponse {
 /// GET /smart-rebuild/status
 pub async fn status(State(state): State<SharedState>) -> Json<SmartRebuildStatusResponse> {
     let sr = state.smart_rebuild.read().await;
+    let retry_in_secs = if matches!(sr.phase, crate::smart_rebuild::SmartRebuildPhase::Failed { .. }) {
+        sr.last_failed_at.map(|t| {
+            let elapsed = (chrono::Utc::now() - t).num_seconds();
+            (crate::config::SMART_REBUILD_RETRY_COOLDOWN_SECS - elapsed).max(0)
+        })
+    } else {
+        None
+    };
     Json(SmartRebuildStatusResponse {
         enabled: sr.enabled,
         phase: sr.phase.clone(),
@@ -35,6 +46,8 @@ pub async fn status(State(state): State<SharedState>) -> Json<SmartRebuildStatus
         last_build_error: sr.last_build_error.clone(),
         total_rebuilds: sr.total_rebuilds,
         last_rebuild_at: sr.last_rebuild_at.map(|t| t.to_rfc3339()),
+        last_failed_at: sr.last_failed_at.map(|t| t.to_rfc3339()),
+        retry_in_secs,
     })
 }
 
