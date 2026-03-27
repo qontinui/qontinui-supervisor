@@ -2027,7 +2027,13 @@ async fn run_pipeline_loop(
     stop_rx: watch::Receiver<bool>,
 ) {
     let client = build_client();
-    let phases = config.phases.as_ref().unwrap();
+    let phases = match config.phases.as_ref() {
+        Some(p) => p,
+        None => {
+            set_error(&state, "Pipeline loop started without phases config").await;
+            return;
+        }
+    };
     let loop_id = uuid::Uuid::new_v4().to_string();
 
     // Persist loop start to DB

@@ -142,8 +142,7 @@ pub async fn graphql_ws_proxy() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
-            "error": "GraphQL WebSocket proxy not yet implemented. Connect directly to ws://127.0.0.1:9876/graphql/ws for subscriptions.",
-            "runner_ws_url": format!("ws://127.0.0.1:{}/graphql/ws", RUNNER_API_PORT),
+            "error": "WebSocket subscriptions are not yet supported through the proxy",
         })),
     )
 }

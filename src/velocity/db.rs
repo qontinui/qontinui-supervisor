@@ -18,7 +18,7 @@ impl VelocityDb {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("velocity DB mutex poisoned: {e}"))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS velocity_spans (
@@ -59,6 +59,6 @@ impl VelocityDb {
     }
 
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
