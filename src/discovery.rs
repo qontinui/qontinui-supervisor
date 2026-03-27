@@ -56,10 +56,16 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .unwrap();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            info!("Runner discovery: failed to build HTTP client: {}", e);
+            return;
+        }
+    };
 
     let url = format!("http://127.0.0.1:{}/instances", primary_port);
 
