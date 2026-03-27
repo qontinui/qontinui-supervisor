@@ -5,6 +5,7 @@ pub mod dev_start;
 pub mod diagnostics;
 pub mod evaluation;
 pub mod expo;
+pub mod graphql_proxy;
 pub mod health;
 pub mod logs;
 pub mod runner;
