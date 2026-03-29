@@ -210,9 +210,11 @@ impl SupervisorConfig {
         }
     }
 
-    /// Path to the runner executable (for exe mode)
+    /// Path to the runner executable (for exe mode).
+    /// Cargo builds into the workspace root's target directory (parent of src-tauri),
+    /// not the package directory's target.
     pub fn runner_exe_path(&self) -> PathBuf {
-        self.project_dir
+        self.runner_npm_dir()
             .join("target")
             .join("debug")
             .join("qontinui-runner.exe")
@@ -221,7 +223,7 @@ impl SupervisorConfig {
     /// Path to a copied runner executable for non-primary runners.
     /// This avoids locking the main build artifact so dev-mode rebuilds succeed.
     pub fn runner_exe_copy_path(&self, runner_id: &str) -> PathBuf {
-        self.project_dir
+        self.runner_npm_dir()
             .join("target")
             .join("debug")
             .join(format!("qontinui-runner-{}.exe", runner_id))
