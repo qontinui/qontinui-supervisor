@@ -109,6 +109,27 @@ async fn check_runner_watchdog(state: &SharedState, managed: &Arc<ManagedRunner>
         return;
     }
 
+    // Protected runners must not be restarted by the watchdog — only manual
+    // action can restart them.  Log the issue but take no recovery action.
+    if managed.is_protected().await {
+        warn!(
+            "Watchdog: protected runner '{}' is unhealthy but will NOT be restarted (protected)",
+            runner_name
+        );
+        state
+            .logs
+            .emit(
+                LogSource::Watchdog,
+                LogLevel::Warn,
+                format!(
+                    "Protected runner '{}' is unhealthy — skipping automatic restart",
+                    runner_name
+                ),
+            )
+            .await;
+        return;
+    }
+
     // Runner is not healthy
     if runner_running {
         warn!("Watchdog: runner '{}' process not responding", runner_name);
