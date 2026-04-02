@@ -14,6 +14,8 @@ use crate::{ai_debug, routes::ai::DebugRequest};
 pub struct RestartRequest {
     #[serde(default)]
     pub rebuild: bool,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Deserialize)]
@@ -23,10 +25,18 @@ pub struct WatchdogRequest {
     pub reset_attempts: bool,
 }
 
+#[derive(Deserialize, Default)]
+pub struct StopRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
 pub async fn stop_runner(
     State(state): State<SharedState>,
+    body: Option<Json<StopRequest>>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    manager::stop_runner(&state).await?;
+    let force = body.map(|b| b.force).unwrap_or(false);
+    manager::stop_runner(&state, force).await?;
 
     Ok(Json(serde_json::json!({
         "status": "stopped",
@@ -49,7 +59,7 @@ pub async fn restart_runner(
         )
         .await;
 
-    manager::restart_runner(&state, rebuild, RestartSource::Manual).await?;
+    manager::restart_runner(&state, rebuild, RestartSource::Manual, body.force).await?;
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
@@ -214,7 +224,7 @@ pub async fn fix_and_rebuild(
         .await;
 
     // 3. Rebuild and restart the runner
-    manager::restart_runner(&state, true, RestartSource::Manual).await?;
+    manager::restart_runner(&state, true, RestartSource::Manual, true).await?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",

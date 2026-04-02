@@ -100,9 +100,11 @@ pub async fn start_runner_by_id(
         )
         .await;
 
-    // Primary in dev mode uses `npm run tauri dev`; non-primary always uses exe mode
+    // Primary in dev mode uses `npm run tauri dev` (Vite + Tauri).
+    // Non-primary runners always use exe mode — only one Vite instance can run at a time,
+    // and discovered runners share the compiled binary from the primary's build.
     let mut child = if is_primary && state.config.dev_mode {
-        start_dev_mode(state, port).await?
+        start_dev_mode_for_runner(state, &managed).await?
     } else {
         start_exe_mode_for_runner(state, &managed).await?
     };
@@ -461,6 +463,7 @@ pub async fn restart_runner_by_id(
     runner_id: &str,
     rebuild: bool,
     source: RestartSource,
+    force: bool,
 ) -> Result<(), SupervisorError> {
     let restart_start = std::time::Instant::now();
 
@@ -478,10 +481,10 @@ pub async fn restart_runner_by_id(
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
 
-    // Protected runners can only be restarted by explicit manual action
-    if managed.is_protected().await && !matches!(source, RestartSource::Manual) {
+    // Protected runners require force=true to restart
+    if managed.is_protected().await && !force {
         let msg = format!(
-            "Runner '{}' is protected and cannot be restarted by {}",
+            "Runner '{}' is protected. Use force=true to override. (source: {})",
             managed.config.name, source
         );
         warn!("{}", msg);
@@ -705,45 +708,83 @@ pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
     start_runner_by_id(state, &primary.config.id).await
 }
 
-async fn start_dev_mode(
+/// Start a runner in dev mode (`npm run tauri dev`), which launches both
+/// the Vite dev server and the Tauri/Rust backend.
+/// Works for both primary and discovered runners.
+async fn start_dev_mode_for_runner(
     state: &SharedState,
-    port: u16,
+    managed: &ManagedRunner,
 ) -> Result<tokio::process::Child, SupervisorError> {
     let npm_dir = state.config.runner_npm_dir();
+    let port = managed.config.port;
 
-    info!("Starting in dev mode from {:?} (port {})", npm_dir, port);
+    info!(
+        "Starting runner '{}' in dev mode from {:?} (port {})",
+        managed.config.name, npm_dir, port
+    );
 
     #[cfg(windows)]
     let child = {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        Command::new("cmd")
-            .args(["/C", "npm.cmd run tauri dev -- --no-watch"])
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "npm.cmd run tauri dev -- --no-watch"])
             .current_dir(&npm_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", port.to_string())
-            .spawn()
+            .env("QONTINUI_PORT", port.to_string());
+
+        // Non-primary runners get instance env vars so they skip scheduler
+        // and can proxy process commands to the primary
+        if !managed.config.is_primary {
+            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
+            if let Some(primary) = state.get_primary().await {
+                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+        }
+
+        cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
     };
 
     #[cfg(not(windows))]
     let child = {
-        Command::new("npm")
-            .args(["run", "tauri", "dev", "--", "--no-watch"])
+        let mut cmd = Command::new("npx");
+        cmd.args(["tauri", "dev", "--no-watch"])
             .current_dir(&npm_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", port.to_string())
-            .spawn()
+            .env("QONTINUI_PORT", port.to_string());
+
+        if !managed.config.is_primary {
+            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
+            if let Some(primary) = state.get_primary().await {
+                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+        }
+
+        cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
     };
 
     Ok(child)
+}
+
+/// Legacy wrapper — calls `start_dev_mode_for_runner` with the primary runner.
+#[allow(dead_code)]
+async fn start_dev_mode(
+    state: &SharedState,
+    _port: u16,
+) -> Result<tokio::process::Child, SupervisorError> {
+    let primary = state
+        .get_primary()
+        .await
+        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
+    start_dev_mode_for_runner(state, &primary).await
 }
 
 #[allow(dead_code)]
@@ -846,10 +887,16 @@ async fn monitor_process_exit(state: SharedState) {
 }
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
-pub async fn stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
+pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), SupervisorError> {
     let primary = state.get_primary().await;
 
-    if let Some(primary) = primary {
+    if let Some(ref primary) = primary {
+        if primary.is_protected().await && !force {
+            return Err(SupervisorError::Validation(format!(
+                "Runner '{}' is protected. Use force=true to override.",
+                primary.config.name
+            )));
+        }
         stop_runner_by_id(state, &primary.config.id).await
     } else {
         // Fallback: legacy behavior for when no managed runners exist
@@ -935,11 +982,12 @@ pub async fn restart_runner(
     state: &SharedState,
     rebuild: bool,
     source: RestartSource,
+    force: bool,
 ) -> Result<(), SupervisorError> {
     let primary = state.get_primary().await;
 
     if let Some(primary) = primary {
-        restart_runner_by_id(state, &primary.config.id, rebuild, source).await
+        restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
     } else {
         // Fallback legacy behavior
         let restart_start = std::time::Instant::now();
@@ -962,7 +1010,7 @@ pub async fn restart_runner(
             let runner = state.runner.read().await;
             if runner.running {
                 drop(runner);
-                if let Err(e) = stop_runner(state).await {
+                if let Err(e) = stop_runner(state, true).await {
                     state
                         .diagnostics
                         .write()

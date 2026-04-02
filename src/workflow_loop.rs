@@ -1434,7 +1434,7 @@ async fn handle_between_iterations(
                 )
                 .await;
 
-            crate::process::manager::restart_runner(state, *rebuild, RestartSource::WorkflowLoop)
+            crate::process::manager::restart_runner(state, *rebuild, RestartSource::WorkflowLoop, false)
                 .await
                 .map_err(|e| format!("Failed to restart runner: {}", e))?;
 
@@ -1486,6 +1486,7 @@ async fn handle_between_iterations(
                     state,
                     *rebuild,
                     RestartSource::WorkflowLoop,
+                    false,
                 )
                 .await
                 .map_err(|e| format!("Failed to restart runner: {}", e))?;

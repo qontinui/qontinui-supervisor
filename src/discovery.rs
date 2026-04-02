@@ -124,7 +124,7 @@ pub async fn discover_runner_instances(state: &Arc<SupervisorState>) {
             name: name.clone(),
             port: inst.port,
             is_primary: false,
-            protected: false,
+            protected: true,
         };
 
         // Add to runtime state

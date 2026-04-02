@@ -83,7 +83,7 @@ impl RunnerConfig {
             name: "Primary".to_string(),
             port: DEFAULT_RUNNER_API_PORT,
             is_primary: true,
-            protected: false,
+            protected: true,
         }
     }
 }
