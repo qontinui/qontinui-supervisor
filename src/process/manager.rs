@@ -9,7 +9,10 @@ use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
-use crate::process::windows::{kill_by_pid, kill_by_port, kill_runner_comprehensive};
+use crate::process::windows::{
+    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
+    kill_runner_comprehensive, kill_webview2_processes,
+};
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
@@ -398,15 +401,17 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(port).await;
     }
 
-    // For primary in dev mode, always force-kill processes on Vite port.
-    // The cmd.exe → npm → tauri → vite process tree means grandchild node.exe
-    // often survives the parent kill despite CREATE_NEW_PROCESS_GROUP.
+    // For primary in dev mode, always force-kill the Vite process tree.
+    // Use tree-kill (/T) to kill the entire cmd→npm→tauri→node chain, since
+    // the grandchild node.exe (Vite) often survives parent kills despite
+    // CREATE_NEW_PROCESS_GROUP. Without tree-kill, the old Vite process keeps
+    // running with stale in-memory module transforms after code changes.
     if is_primary && state.config.dev_mode {
-        let _ = kill_by_port(RUNNER_VITE_PORT).await;
+        let _ = kill_by_port_tree(RUNNER_VITE_PORT).await;
         let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
         if !vite_free {
             warn!(
-                "Vite port {} still in use after forced kill, retrying",
+                "Vite port {} still in use after tree-kill, retrying with port kill",
                 RUNNER_VITE_PORT
             );
             let _ = kill_by_port(RUNNER_VITE_PORT).await;
@@ -418,6 +423,15 @@ pub async fn stop_runner_by_id(
                 );
             }
         }
+
+        // Kill WebView2 processes and clear their cache so the webview
+        // fetches fresh JavaScript modules on next startup. WebView2 on
+        // Windows aggressively caches ES modules (ignoring no-store) and
+        // the cached bytecode survives process restarts via the EBWebView
+        // profile directory.
+        let _ = kill_webview2_processes().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = clear_webview2_cache().await;
     }
 
     // 4. Update per-runner state
@@ -449,6 +463,20 @@ pub async fn stop_runner_by_id(
         )
         .await;
     info!("Runner '{}' stopped", runner_name);
+
+    // Auto-remove ephemeral test runners (spawned via /runners/spawn-test)
+    // from the runners map so they don't accumulate over time. These have IDs
+    // prefixed with "test-" and are not persisted to settings.
+    let runner_id = managed.config.id.clone();
+    if runner_id.starts_with("test-") {
+        let mut runners = state.runners.write().await;
+        if runners.remove(&runner_id).is_some() {
+            info!(
+                "Removed ephemeral test runner '{}' (id: {}) from state",
+                runner_name, runner_id
+            );
+        }
+    }
 
     state.notify_health_change();
     managed.health_cache_notify.notify_one();

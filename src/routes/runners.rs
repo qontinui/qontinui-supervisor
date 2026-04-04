@@ -480,6 +480,111 @@ pub async fn proxy_ui_bridge(
     }
 }
 
+// --- Spawn test runner ---
+
+#[derive(Deserialize)]
+pub struct SpawnTestRequest {
+    /// Whether to rebuild before spawning. Default: false (uses existing binary).
+    #[serde(default)]
+    pub rebuild: bool,
+}
+
+/// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
+///
+/// Automatically picks a free port (9877-9899), creates a temporary runner,
+/// starts it, and returns the connection details. The runner is not protected
+/// and not persisted to settings — it gets cleaned up on primary restart or
+/// explicit stop.
+pub async fn spawn_test(
+    State(state): State<SharedState>,
+    Json(body): Json<SpawnTestRequest>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    // Find next available port by checking existing runners
+    let used_ports: Vec<u16> = {
+        let runners = state.runners.read().await;
+        runners.values().map(|r| r.config.port).collect()
+    };
+
+    let port = (9877..=9899)
+        .find(|p| !used_ports.contains(p))
+        .ok_or_else(|| {
+            SupervisorError::Validation(
+                "No available ports in range 9877-9899. Stop some test runners first.".to_string(),
+            )
+        })?;
+
+    // Rebuild if requested
+    if body.rebuild {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!("Rebuilding runner before spawning test runner on port {}", port),
+            )
+            .await;
+        crate::build_monitor::run_cargo_build(&state).await?;
+    }
+
+    // Check that the exe exists
+    let exe_path = state.config.runner_exe_path();
+    if !exe_path.exists() {
+        return Err(SupervisorError::Process(format!(
+            "Runner binary not found at {:?}. Use rebuild: true to build it first.",
+            exe_path
+        )));
+    }
+
+    let id = format!("test-{}", uuid_simple());
+    let name = format!("test-{}", port);
+
+    let runner_config = RunnerConfig {
+        id: id.clone(),
+        name: name.clone(),
+        port,
+        is_primary: false,
+        protected: false,
+    };
+
+    // Insert into state (not persisted — ephemeral)
+    let managed = Arc::new(ManagedRunner::new(runner_config, false));
+    {
+        let mut runners = state.runners.write().await;
+        runners.insert(id.clone(), managed);
+    }
+
+    // Start the runner
+    if let Err(e) = manager::start_runner_by_id(&state, &id).await {
+        // Clean up on failure
+        let mut runners = state.runners.write().await;
+        runners.remove(&id);
+        return Err(e);
+    }
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "Spawned test runner '{}' on port {} (id: {})",
+                name, port, id
+            ),
+        )
+        .await;
+
+    state.notify_health_change();
+
+    Ok(Json(json!({
+        "id": id,
+        "name": name,
+        "port": port,
+        "api_url": format!("http://localhost:{}", port),
+        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "message": format!("Test runner spawned on port {}", port)
+    })))
+}
+
 // --- Helpers ---
 
 /// Simple unique ID generator (timestamp + incrementing counter).

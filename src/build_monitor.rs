@@ -98,29 +98,109 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 }
 
 async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
+    // In exe mode the frontend is embedded in the binary via tauri_build, so we
+    // must run `npm run build` first to produce a fresh dist/ before cargo build.
+    // In dev mode Vite serves the frontend live, so this step is skipped.
+    if !state.config.dev_mode {
+        let npm_dir = state.config.runner_npm_dir();
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                "Building frontend (npm run build)...",
+            )
+            .await;
+        info!("Building frontend in {:?}", npm_dir);
+
+        #[cfg(windows)]
+        let npm_result = {
+            const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
+            Command::new("cmd")
+                .args(["/C", "npm.cmd run build"])
+                .current_dir(&npm_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW_)
+                .output()
+                .await
+        };
+
+        #[cfg(not(windows))]
+        let npm_result = {
+            Command::new("npm")
+                .args(["run", "build"])
+                .current_dir(&npm_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+        };
+
+        match npm_result {
+            Ok(output) if output.status.success() => {
+                info!("Frontend build succeeded");
+                state
+                    .logs
+                    .emit(LogSource::Build, LogLevel::Info, "Frontend build succeeded")
+                    .await;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Frontend build failed: {}", stderr);
+                state
+                    .logs
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Warn,
+                        format!("Frontend build failed: {}", stderr.chars().take(500).collect::<String>()),
+                    )
+                    .await;
+                // Continue with cargo build — the old dist/ may still be usable
+            }
+            Err(e) => {
+                warn!("Failed to spawn frontend build: {}", e);
+            }
+        }
+    }
+
     #[cfg(windows)]
     let mut child = {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        Command::new("cargo")
-            .args(["build", "--bin", "qontinui-runner"])
+        let mut cmd = Command::new("cargo");
+        // In exe mode, pass --features custom-protocol so Tauri embeds the frontend
+        // from dist/ instead of trying to connect to the Vite dev server (devUrl).
+        // The tauri crate sets cfg(dev) = !custom_protocol, so without this feature
+        // the binary loads from localhost:1420 which doesn't exist in exe mode.
+        let args: Vec<&str> = if state.config.dev_mode {
+            vec!["build", "--bin", "qontinui-runner"]
+        } else {
+            vec!["build", "--bin", "qontinui-runner", "--features", "custom-protocol"]
+        };
+        cmd.args(&args)
             .current_dir(&state.config.project_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .spawn()
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
     };
 
     #[cfg(not(windows))]
     let mut child = {
-        Command::new("cargo")
-            .args(["build", "--bin", "qontinui-runner"])
+        let mut cmd = Command::new("cargo");
+        let args: Vec<&str> = if state.config.dev_mode {
+            vec!["build", "--bin", "qontinui-runner"]
+        } else {
+            vec!["build", "--bin", "qontinui-runner", "--features", "custom-protocol"]
+        };
+        cmd.args(&args)
             .current_dir(&state.config.project_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
     };
 

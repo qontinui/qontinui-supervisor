@@ -31,8 +31,11 @@ cargo clippy -- -D warnings    # Lint
 # Start with auto-debug enabled
 ./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w --auto-debug
 
-# Start in exe mode (no Vite, runs compiled binary directly)
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -a
+# Start in exe mode (recommended — stable primary runner, no Vite)
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w
+
+# Start in dev mode (Vite + hot reload, less stable)
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w
 
 # Start with Expo dev server management
 ./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w --expo-dir ../qontinui-mobile
@@ -63,6 +66,21 @@ cargo clippy -- -D warnings    # Lint
 | POST | `/runner/restart` | Stop + rebuild + start. Body: `{"rebuild": bool}` |
 | POST | `/runner/watchdog` | Control watchdog. Body: `{"enabled": bool, "reset_attempts": bool}` |
 | POST | `/supervisor/restart` | Self-restart with same CLI args |
+
+### Multi-Runner Management
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/runners` | List all runners with status |
+| POST | `/runners` | Add a runner config. Body: `{"name": str, "port": u16}` |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{"rebuild": bool}`. Returns `{id, port, api_url, ui_bridge_url}`. Auto-cleaned up on stop. |
+| DELETE | `/runners/{id}` | Remove a runner config (must be stopped) |
+| POST | `/runners/{id}/start` | Start a runner |
+| POST | `/runners/{id}/stop` | Stop a runner |
+| POST | `/runners/{id}/restart` | Restart a runner. Body: `{"rebuild": bool, "force": bool}` |
+| POST | `/runners/{id}/watchdog` | Control runner watchdog. Body: `{"enabled": bool}` |
+| POST | `/runners/{id}/protect` | Toggle protection. Body: `{"protected": bool}` |
+| GET/POST | `/runners/{id}/ui-bridge/{*path}` | Proxy UI Bridge requests to a specific runner |
 
 ### Logs
 
