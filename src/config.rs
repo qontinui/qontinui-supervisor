@@ -71,7 +71,7 @@ pub struct RunnerConfig {
     /// When true, this runner cannot be stopped or restarted by smart rebuild,
     /// watchdog, AI sessions, or workflow loop between-iterations. Only manual
     /// API calls with `force: true` can override protection.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub protected: bool,
 }
 
@@ -86,6 +86,10 @@ impl RunnerConfig {
             protected: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // Port constants

@@ -897,23 +897,6 @@ function RunnerInstancesPanel() {
                 <tr key={r.id}>
                   <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
                     <span>{r.name}</span>
-                    {r.protected && (
-                      <span
-                        style={{
-                          marginLeft: 6,
-                          padding: '1px 4px',
-                          background: 'rgba(34,197,94,0.15)',
-                          border: '1px solid rgba(34,197,94,0.4)',
-                          borderRadius: 3,
-                          fontSize: '0.6rem',
-                          fontWeight: 600,
-                          color: '#22c55e',
-                          verticalAlign: 'middle',
-                        }}
-                      >
-                        PROTECTED
-                      </span>
-                    )}
                   </td>
                   <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
                   <td>
@@ -947,24 +930,6 @@ function RunnerInstancesPanel() {
                           {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
                         </button>
                       )}
-                      <button
-                        className="btn"
-                        style={{
-                          padding: '0.15rem 0.4rem',
-                          fontSize: '0.7rem',
-                          color: r.protected ? '#22c55e' : undefined,
-                          borderColor: r.protected ? 'rgba(34,197,94,0.4)' : undefined,
-                        }}
-                        disabled={busy !== null}
-                        onClick={() =>
-                          doAction(
-                            `${r.protected ? 'Unprotect' : 'Protect'} ${r.name}`,
-                            () => api.protectRunner(r.id, !r.protected),
-                          )
-                        }
-                      >
-                        {r.protected ? 'Unprotect' : 'Protect'}
-                      </button>
                       {!isUp && (
                         <button
                           className="btn"
@@ -1012,7 +977,6 @@ function DashboardInner() {
   const [aiFixBusy, setAiFixBusy] = useState<string | null>(null);
   const [fixAndRebuildBusy, setFixAndRebuildBusy] = useState(false);
   const [showAiPanel, setShowAiPanel] = useState(false);
-  const [runnerProtection, setRunnerProtection] = useState<Map<string, boolean>>(new Map());
   const mountedRef = useRef(true);
   const actionGuardRef = useRef(false); // Race condition guard
 
@@ -1043,26 +1007,15 @@ function DashboardInner() {
     setLastRefresh(new Date());
   }, []);
 
-  // Fetch runner protection status
-  const refreshRunners = useCallback(async () => {
-    try {
-      const runners = await api.listRunners();
-      if (!mountedRef.current) return;
-      setRunnerProtection(new Map(runners.map((r) => [r.id, r.protected])));
-    } catch {
-      /* runners endpoint may not be available */
-    }
-  }, []);
 
   // Initial fetch
   useEffect(() => {
     mountedRef.current = true;
     refresh();
-    refreshRunners();
     return () => {
       mountedRef.current = false;
     };
-  }, [refresh, refreshRunners]);
+  }, [refresh]);
 
   // Subscribe to health SSE — replaces polling
   useSSE<HealthResponse>('/health/stream', 'health', (health) => {
@@ -1267,18 +1220,6 @@ function DashboardInner() {
     }
   }, [build?.error_detected, build?.last_error]);
 
-  // Toggle runner protection
-  const primaryProtected = runnerProtection.get('primary') ?? false;
-  const toggleProtection = useCallback(async () => {
-    const newVal = !primaryProtected;
-    try {
-      await api.protectRunner('primary', newVal);
-      setRunnerProtection((prev) => new Map(prev).set('primary', newVal));
-      addToast(newVal ? 'Runner protected — safe from rebuilds' : 'Runner unprotected', 'info');
-    } catch (e) {
-      addToast(`Failed to toggle protection: ${e instanceof Error ? e.message : 'unknown'}`, 'error');
-    }
-  }, [primaryProtected]);
 
   // Build service rows
   const svcMap = new Map(data.services.map((s) => [s.name, s]));
@@ -1462,27 +1403,6 @@ function DashboardInner() {
                     <tr>
                       <td style={{ fontFamily: 'inherit', fontWeight: 500 }}>
                         {row.name}
-                        {row.name === 'Runner' && (
-                          <button
-                            onClick={toggleProtection}
-                            title={primaryProtected ? 'Protected from rebuilds — click to unprotect' : 'Click to protect from rebuilds'}
-                            style={{
-                              marginLeft: 6,
-                              padding: '1px 5px',
-                              background: primaryProtected ? 'rgba(34,197,94,0.15)' : 'transparent',
-                              border: `1px solid ${primaryProtected ? 'rgba(34,197,94,0.4)' : 'rgba(255,255,255,0.15)'}`,
-                              borderRadius: 3,
-                              cursor: 'pointer',
-                              fontSize: '0.65rem',
-                              fontWeight: 600,
-                              color: primaryProtected ? '#22c55e' : 'rgba(255,255,255,0.35)',
-                              verticalAlign: 'middle',
-                              letterSpacing: '0.02em',
-                            }}
-                          >
-                            {primaryProtected ? 'PROTECTED' : 'PROTECT'}
-                          </button>
-                        )}
                       </td>
                       <td>{row.port}</td>
                       <td>

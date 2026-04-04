@@ -556,7 +556,7 @@ pub async fn spawn_test(
         name: name.clone(),
         port,
         is_primary: false,
-        protected: false,
+        protected: true,
     };
 
     // Insert into state (not persisted — ephemeral)

@@ -2,6 +2,10 @@
 
 Rust-based process manager for the qontinui-runner. Replaces the Python `dev-supervisor.py` for core process lifecycle management.
 
+## CRITICAL: Never Kill or Restart Active Runners
+
+**All runners are protected. NEVER stop, restart, kill, or rebuild any running runner** — active runners have user sessions, terminal profiles, and in-flight workflows. Killing them causes data loss and disruption. To test code changes, use `POST /runners/spawn-test` to create an ephemeral test runner that is auto-cleaned up on stop. Only the user may restart active runners.
+
 ## Architecture
 
 Standalone Axum HTTP server that manages the runner process:
@@ -25,20 +29,14 @@ cargo check                    # Type-check only
 cargo fmt                      # Format code
 cargo clippy -- -D warnings    # Lint
 
-# Start in dev mode with watchdog
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w
-
-# Start with auto-debug enabled
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w --auto-debug
-
-# Start in exe mode (recommended — stable primary runner, no Vite)
+# Start with watchdog (recommended)
 ./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w
 
-# Start in dev mode (Vite + hot reload, less stable)
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w
+# Start with auto-debug enabled
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w --auto-debug
 
 # Start with Expo dev server management
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -d -w --expo-dir ../qontinui-mobile
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w --expo-dir ../qontinui-mobile
 ```
 
 ## CLI Flags
@@ -46,7 +44,7 @@ cargo clippy -- -D warnings    # Lint
 | Flag | Description |
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
-| `-d, --dev-mode` | Run `npm run tauri dev` instead of compiled exe |
+| `-d, --dev-mode` | (Legacy, unused) Run `npm run tauri dev` instead of compiled exe |
 | `-w, --watchdog` | Enable watchdog (implies auto-start) |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--auto-debug` | Enable AI auto-debug on startup |
@@ -234,7 +232,7 @@ Returns `502 Bad Gateway` with descriptive error if the runner is not responding
 The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9875/` in a browser.
 
 **Features:**
-- Real-time service table: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Vite, Expo, Watchdog with status dots and action buttons
+- Real-time service table: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog with status dots and action buttons
 - Dev-start controls: start/stop/restart individual services, bulk actions (Docker, Start All, Stop All, Clean, Fresh, Migrate)
 - AI debug panel with live SSE streaming, provider/model selector
 - Log viewer with source/level filtering, pause/resume, auto-scroll
@@ -267,7 +265,6 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 |----------|-------|
 | Supervisor port | 9875 |
 | Runner API port | 9876 |
-| Vite port | 1420 |
 | Expo port | 8081 |
 | Watchdog check interval | 10s |
 | Max restart attempts | 3 |
