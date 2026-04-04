@@ -487,6 +487,19 @@ pub struct SpawnTestRequest {
     /// Whether to rebuild before spawning. Default: false (uses existing binary).
     #[serde(default)]
     pub rebuild: bool,
+    /// If true, block until the runner's API is healthy before returning.
+    /// Polls the runner's /health endpoint every 2s, up to `wait_timeout_secs`.
+    /// Default: false (return immediately after process spawn).
+    #[serde(default)]
+    pub wait: bool,
+    /// Maximum seconds to wait for the runner to become healthy.
+    /// Only used when `wait` is true. Default: 120 seconds.
+    #[serde(default = "default_wait_timeout")]
+    pub wait_timeout_secs: u64,
+}
+
+fn default_wait_timeout() -> u64 {
+    120
 }
 
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
@@ -575,13 +588,86 @@ pub async fn spawn_test(
 
     state.notify_health_change();
 
+    // If wait=true, poll the runner's health endpoint until it responds or times out
+    let mut healthy = false;
+    let mut wait_ms: u64 = 0;
+    if body.wait {
+        let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        let health_url = format!("http://localhost:{}/health", port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "Waiting up to {}s for test runner '{}' to become healthy...",
+                    body.wait_timeout_secs, name
+                ),
+            )
+            .await;
+
+        loop {
+            if start.elapsed() >= timeout {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Test runner '{}' did not become healthy within {}s",
+                            name, body.wait_timeout_secs
+                        ),
+                    )
+                    .await;
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    healthy = true;
+                    wait_ms = start.elapsed().as_millis() as u64;
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Info,
+                            format!(
+                                "Test runner '{}' is healthy (took {}ms)",
+                                name, wait_ms
+                            ),
+                        )
+                        .await;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
     Ok(Json(json!({
         "id": id,
         "name": name,
         "port": port,
+        "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
+        "wait_ms": wait_ms,
         "api_url": format!("http://localhost:{}", port),
         "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
-        "message": format!("Test runner spawned on port {}", port)
+        "message": if body.wait && healthy {
+            format!("Test runner ready on port {} ({}ms)", port, wait_ms)
+        } else if body.wait {
+            format!("Test runner spawned on port {} but did not become healthy within {}s", port, body.wait_timeout_secs)
+        } else {
+            format!("Test runner spawned on port {}", port)
+        }
     })))
 }
 
