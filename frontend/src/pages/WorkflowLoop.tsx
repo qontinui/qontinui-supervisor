@@ -129,7 +129,7 @@ function BuildOutput({ buildTaskRunId, executeTaskRunId, phase, error }: {
       <div style={{ marginBottom: 8 }}>
         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: 4, fontWeight: 600 }}>{label}</div>
         {cps.map((cp, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '2px 0', fontSize: '0.8rem', fontFamily: 'var(--font-mono)' }}>
+          <div key={`${cp.step_name}-${i}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '2px 0', fontSize: '0.8rem', fontFamily: 'var(--font-mono)' }}>
             <span style={{ color: statusColor(cp.status), fontWeight: 700, minWidth: 14, textAlign: 'center' }}>{statusIcon(cp.status)}</span>
             <span style={{ color: 'var(--text-primary)', flex: 1 }}>{cp.step_name}</span>
             <span style={{ color: 'var(--text-muted)', minWidth: 60, textAlign: 'right' }}>

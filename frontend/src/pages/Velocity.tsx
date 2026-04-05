@@ -209,8 +209,8 @@ export default function Velocity() {
               </tr>
             </thead>
             <tbody>
-              {sortedEndpoints.map((e, i) => (
-                <tr key={i}>
+              {sortedEndpoints.map((e) => (
+                <tr key={`${e.service}-${e.http_method}-${e.http_route}`}>
                   <td style={{ color: SERVICE_COLORS[e.service] }}>{e.service}</td>
                   <td>{e.http_method}</td>
                   <td>

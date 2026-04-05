@@ -527,8 +527,9 @@ export default function Evaluation() {
           }}
         >
           <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
-            <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Category:</label>
+            <label htmlFor="eval-category-filter" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Category:</label>
             <select
+              id="eval-category-filter"
               value={categoryFilter}
               onChange={(e) => {
                 setCategoryFilter(e.target.value);
@@ -555,8 +556,9 @@ export default function Evaluation() {
             </select>
           </div>
           <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
-            <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Complexity:</label>
+            <label htmlFor="eval-complexity-filter" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Complexity:</label>
             <select
+              id="eval-complexity-filter"
               value={complexityFilter}
               onChange={(e) => {
                 setComplexityFilter(e.target.value);

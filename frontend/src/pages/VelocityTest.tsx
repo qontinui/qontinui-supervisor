@@ -101,9 +101,9 @@ function TimingBar({ result }: { result: VtResult }) {
         marginTop: 4,
       }}
     >
-      {segments.map((seg, i) => (
+      {segments.map((seg) => (
         <div
-          key={i}
+          key={seg.label}
           title={`${seg.label}: ${formatMs(seg.ms)}`}
           style={{
             width: `${(seg.ms / total) * 100}%`,
@@ -141,7 +141,7 @@ function ResourceTable({ resources }: { resources: VtDiagnostics['resources'] })
             const shortName = r.name.split('/').pop()?.split('?')[0] || r.name;
             const isSlowResource = r.duration > 500;
             return (
-              <tr key={i} style={{ color: isSlowResource ? 'var(--danger)' : 'inherit' }}>
+              <tr key={`${r.name}-${i}`} style={{ color: isSlowResource ? 'var(--danger)' : 'inherit' }}>
                 <td
                   title={r.name}
                   style={{
@@ -188,7 +188,7 @@ function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
         const maxBar = 1000;
         const barWidth = Math.min((dur / maxBar) * 100, 100);
         return (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+          <div key={`task-${i}-${dur}`} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
             <span className="text-mono" style={{ width: 60, textAlign: 'right', color }}>
               {formatMs(dur)}
             </span>
@@ -242,7 +242,7 @@ function ScriptAttributionTable({ scripts }: { scripts: VtDiagnostics['scriptAtt
                     ? 'var(--warning)'
                     : 'inherit';
             return (
-              <tr key={i} style={{ color }}>
+              <tr key={`${s.sourceURL}-${s.sourceFunctionName}-${i}`} style={{ color }}>
                 <td
                   title={s.sourceURL}
                   style={{

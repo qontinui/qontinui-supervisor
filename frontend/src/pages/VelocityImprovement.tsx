@@ -206,6 +206,7 @@ export default function VelocityImprovement() {
         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
           <div>
             <label
+              htmlFor="vi-max-iterations"
               style={{
                 display: 'block',
                 fontSize: '0.8rem',
@@ -216,6 +217,7 @@ export default function VelocityImprovement() {
               Max Iterations
             </label>
             <input
+              id="vi-max-iterations"
               type="number"
               min={1}
               max={20}
@@ -235,6 +237,7 @@ export default function VelocityImprovement() {
           </div>
           <div>
             <label
+              htmlFor="vi-target-score"
               style={{
                 display: 'block',
                 fontSize: '0.8rem',
@@ -245,6 +248,7 @@ export default function VelocityImprovement() {
               Target Score
             </label>
             <input
+              id="vi-target-score"
               type="number"
               min={0}
               max={100}
@@ -358,7 +362,7 @@ export default function VelocityImprovement() {
               const height = Math.max(4, (score / 100) * 72);
               return (
                 <div
-                  key={i}
+                  key={iter.iteration}
                   style={{
                     display: 'flex',
                     flexDirection: 'column',

@@ -85,7 +85,7 @@ export interface TraceSpan {
   attributes: string | null;
 }
 
-export interface IngestResult {
+interface IngestResult {
   total_new_spans: number;
   files_processed: { file: string; new_spans: number; errors: number }[];
 }

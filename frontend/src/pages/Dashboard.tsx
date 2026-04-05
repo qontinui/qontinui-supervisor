@@ -173,7 +173,7 @@ function AiSessionPanel({
           }}
         >
           {lines.map((line, i) => (
-            <div key={i}>{line}</div>
+            <div key={`${i}-${line.slice(0, 40)}`}>{line}</div>
           ))}
         </div>
       )}
@@ -349,7 +349,7 @@ function CascadePanel() {
               fallback detection.
             </div>
           ) : (
-            events.map((evt, i) => <CascadeEventRow key={i} event={evt} />)
+            events.map((evt, i) => <CascadeEventRow key={`${evt.type}-${evt.data.timestamp ?? ''}-${i}`} event={evt} />)
           )}
         </div>
       )}
@@ -531,7 +531,7 @@ function LogViewer() {
             </div>
           )}
           {filtered.map((l, i) => (
-            <div key={i} className={`log-line ${levelClass(l.level)}`}>
+            <div key={`${l.timestamp}-${l.source}-${i}`} className={`log-line ${levelClass(l.level)}`}>
               <span className="text-muted">{new Date(l.timestamp).toLocaleTimeString()} </span>[
               {l.source}] {l.message}
             </div>

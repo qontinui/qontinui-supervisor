@@ -93,9 +93,9 @@ export default function VelocityCompare() {
       <div className="card mb-2">
         <div className="flex gap-4 items-center" style={{ flexWrap: 'wrap' }}>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+            <span className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
               Before (baseline)
-            </label>
+            </span>
             <div className="flex gap-2">
               {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map((p) => (
                 <button
@@ -110,9 +110,9 @@ export default function VelocityCompare() {
             </div>
           </div>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+            <span className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
               After (current)
-            </label>
+            </span>
             <div className="flex gap-2">
               {(['5m', '15m', '30m', '1h', '2h', '4h'] as Preset[]).map((p) => (
                 <button
@@ -127,10 +127,11 @@ export default function VelocityCompare() {
             </div>
           </div>
           <div>
-            <label className="stat-label" style={{ display: 'block', marginBottom: '0.25rem' }}>
+            <label className="stat-label" htmlFor="vc-service-select" style={{ display: 'block', marginBottom: '0.25rem' }}>
               Service (optional)
             </label>
             <select
+              id="vc-service-select"
               className="btn"
               value={service}
               onChange={(e) => setService(e.target.value)}
@@ -189,9 +190,9 @@ export default function VelocityCompare() {
                 radius={[0, 4, 4, 0]}
               />
               <Bar dataKey="after_p95" name="After P95" radius={[0, 4, 4, 0]}>
-                {chartData.map((entry, i) => (
+                {chartData.map((entry) => (
                   <Cell
-                    key={i}
+                    key={entry.endpoint}
                     fill={
                       entry.change > 10
                         ? 'var(--danger)'
@@ -230,8 +231,8 @@ export default function VelocityCompare() {
                 </tr>
               </thead>
               <tbody>
-                {results.map((r, i) => (
-                  <tr key={i}>
+                {results.map((r) => (
+                  <tr key={`${r.http_method}-${r.http_route}`}>
                     <td>{r.http_method}</td>
                     <td>{r.http_route}</td>
                     <td>{r.before_count}</td>
