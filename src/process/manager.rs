@@ -10,8 +10,8 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
-    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
-    kill_runner_comprehensive, kill_webview2_processes,
+    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree, kill_runner_comprehensive,
+    kill_webview2_processes,
 };
 use crate::state::{ManagedRunner, SharedState};
 

@@ -92,10 +92,8 @@ pub async fn stream(
                             // greater than the last one we sent.  Timestamps are
                             // floats (Python time.time()), not strings.
                             for evt in &events {
-                                let ts = evt
-                                    .get("timestamp")
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
+                                let ts =
+                                    evt.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
                                 if ts > last_ts {
                                     let data = serde_json::to_string(evt).unwrap_or_default();

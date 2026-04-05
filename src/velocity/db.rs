@@ -18,7 +18,10 @@ impl VelocityDb {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("velocity DB mutex poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("velocity DB mutex poisoned: {e}"))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS velocity_spans (

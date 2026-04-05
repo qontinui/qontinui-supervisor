@@ -533,7 +533,10 @@ pub async fn spawn_test(
             .emit(
                 LogSource::Supervisor,
                 LogLevel::Info,
-                format!("Rebuilding runner before spawning test runner on port {}", port),
+                format!(
+                    "Rebuilding runner before spawning test runner on port {}",
+                    port
+                ),
             )
             .await;
         crate::build_monitor::run_cargo_build(&state).await?;
@@ -640,10 +643,7 @@ pub async fn spawn_test(
                         .emit(
                             LogSource::Supervisor,
                             LogLevel::Info,
-                            format!(
-                                "Test runner '{}' is healthy (took {}ms)",
-                                name, wait_ms
-                            ),
+                            format!("Test runner '{}' is healthy (took {}ms)", name, wait_ms),
                         )
                         .await;
                     break;

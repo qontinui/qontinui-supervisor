@@ -156,7 +156,10 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::supervisor_bridge::bridge_health),
         )
         // GraphQL proxy (forwards to runner at port 9876)
-        .route("/graphql", post(crate::routes::graphql_proxy::graphql_proxy))
+        .route(
+            "/graphql",
+            post(crate::routes::graphql_proxy::graphql_proxy),
+        )
         .route(
             "/graphql/ws",
             get(crate::routes::graphql_proxy::graphql_ws_proxy),

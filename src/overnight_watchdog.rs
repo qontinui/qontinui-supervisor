@@ -189,7 +189,9 @@ async fn handle_failure(state: &SharedState, reason: String) {
             rebuild: false,
         });
 
-    match crate::process::manager::restart_runner(state, false, RestartSource::Watchdog, false).await {
+    match crate::process::manager::restart_runner(state, false, RestartSource::Watchdog, false)
+        .await
+    {
         Ok(()) => {
             info!("Overnight watchdog: runner restarted successfully");
             let mut ow = state.overnight_watchdog.write().await;

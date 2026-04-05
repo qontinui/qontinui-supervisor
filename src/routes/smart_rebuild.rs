@@ -31,7 +31,10 @@ pub struct ActionResponse {
 /// GET /smart-rebuild/status
 pub async fn status(State(state): State<SharedState>) -> Json<SmartRebuildStatusResponse> {
     let sr = state.smart_rebuild.read().await;
-    let retry_in_secs = if matches!(sr.phase, crate::smart_rebuild::SmartRebuildPhase::Failed { .. }) {
+    let retry_in_secs = if matches!(
+        sr.phase,
+        crate::smart_rebuild::SmartRebuildPhase::Failed { .. }
+    ) {
         sr.last_failed_at.map(|t| {
             let elapsed = (chrono::Utc::now() - t).num_seconds();
             (crate::config::SMART_REBUILD_RETRY_COOLDOWN_SECS - elapsed).max(0)

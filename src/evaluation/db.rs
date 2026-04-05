@@ -28,7 +28,10 @@ impl EvalDb {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS test_prompts (
@@ -119,7 +122,10 @@ impl EvalDb {
 
     /// Run schema migrations for existing databases.
     fn migrate(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
 
         // Migration v2: Add ground_truth_json column to test_prompts
         if conn
@@ -160,7 +166,10 @@ impl EvalDb {
     }
 
     fn seed_defaults(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM test_prompts", [], |row| row.get(0))?;
         if count > 0 {
@@ -361,7 +370,10 @@ impl EvalDb {
     /// Mark any runs left in "running" status as "interrupted".
     /// Called on startup to clean up stale state from previous supervisor instances.
     pub fn cleanup_stale_runs(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
         let now = Utc::now().to_rfc3339();
         let count = conn.execute(
             "UPDATE eval_runs SET status='interrupted', completed_at=?1

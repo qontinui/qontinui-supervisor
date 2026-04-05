@@ -148,7 +148,10 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
                     .emit(
                         LogSource::Build,
                         LogLevel::Warn,
-                        format!("Frontend build failed: {}", stderr.chars().take(500).collect::<String>()),
+                        format!(
+                            "Frontend build failed: {}",
+                            stderr.chars().take(500).collect::<String>()
+                        ),
                     )
                     .await;
                 // Continue with cargo build — the old dist/ may still be usable
@@ -172,7 +175,13 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
         let args: Vec<&str> = if state.config.dev_mode {
             vec!["build", "--bin", "qontinui-runner"]
         } else {
-            vec!["build", "--bin", "qontinui-runner", "--features", "custom-protocol"]
+            vec![
+                "build",
+                "--bin",
+                "qontinui-runner",
+                "--features",
+                "custom-protocol",
+            ]
         };
         cmd.args(&args)
             .current_dir(&state.config.project_dir)
@@ -189,7 +198,13 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
         let args: Vec<&str> = if state.config.dev_mode {
             vec!["build", "--bin", "qontinui-runner"]
         } else {
-            vec!["build", "--bin", "qontinui-runner", "--features", "custom-protocol"]
+            vec![
+                "build",
+                "--bin",
+                "qontinui-runner",
+                "--features",
+                "custom-protocol",
+            ]
         };
         cmd.args(&args)
             .current_dir(&state.config.project_dir)

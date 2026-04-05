@@ -91,7 +91,9 @@ pub fn spawn_source_watcher(state: SharedState) -> tokio::task::JoinHandle<()> {
             // Auto-retry: if in Failed state and cooldown has elapsed, reset to Idle
             if is_failed {
                 let cooldown_elapsed = last_failed_at
-                    .map(|t| (chrono::Utc::now() - t).num_seconds() >= SMART_REBUILD_RETRY_COOLDOWN_SECS)
+                    .map(|t| {
+                        (chrono::Utc::now() - t).num_seconds() >= SMART_REBUILD_RETRY_COOLDOWN_SECS
+                    })
                     .unwrap_or(true);
                 let editing = code_activity::is_code_being_edited(
                     &state.config.project_dir,
@@ -109,13 +111,11 @@ pub fn spawn_source_watcher(state: SharedState) -> tokio::task::JoinHandle<()> {
                             "Retry cooldown elapsed, retrying smart rebuild",
                         )
                         .await;
-                    state
-                        .diagnostics
-                        .write()
-                        .await
-                        .emit(DiagnosticEventKind::SmartRebuildStarted {
+                    state.diagnostics.write().await.emit(
+                        DiagnosticEventKind::SmartRebuildStarted {
                             trigger: "auto_retry".to_string(),
-                        });
+                        },
+                    );
                     let mut sr = state.smart_rebuild.write().await;
                     sr.phase = SmartRebuildPhase::Idle;
                     sr.current_attempt = 0;
