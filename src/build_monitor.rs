@@ -27,17 +27,12 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 /// Run `cargo build` for the runner project.
 pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError> {
-    // Check if build already in progress
+    // Atomically check and mark build started (single write lock avoids TOCTOU race)
     {
-        let build = state.build.read().await;
+        let mut build = state.build.write().await;
         if build.build_in_progress {
             return Err(SupervisorError::BuildInProgress);
         }
-    }
-
-    // Mark build started
-    {
-        let mut build = state.build.write().await;
         build.build_in_progress = true;
         build.build_error_detected = false;
         build.last_build_error = None;
@@ -259,9 +254,17 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
         }
     };
 
-    // Collect any error output
+    // Collect any remaining error output.  Give the stderr reader a few seconds
+    // to finish — on Windows, orphaned grandchild processes (rustc, linker) can
+    // keep the pipe open long after cargo itself exits, causing an indefinite hang.
     let (error_lines, all_stderr_lines) = if let Some(handle) = stderr_handle {
-        handle.await.unwrap_or_default()
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                warn!("Timed out waiting for build stderr reader, proceeding without full output");
+                (Vec::new(), Vec::new())
+            }
+        }
     } else {
         (Vec::new(), Vec::new())
     };
