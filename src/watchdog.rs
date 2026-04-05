@@ -3,7 +3,10 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::config::*;
+use crate::config::{
+    WATCHDOG_CHECK_INTERVAL_SECS, WATCHDOG_COOLDOWN_SECS, WATCHDOG_CRASH_LOOP_THRESHOLD,
+    WATCHDOG_CRASH_LOOP_WINDOW_SECS, WATCHDOG_MAX_RESTART_ATTEMPTS,
+};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::{start_runner_by_id, stop_runner_by_id};
