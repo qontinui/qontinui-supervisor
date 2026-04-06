@@ -695,23 +695,6 @@ The Rust project at `{}` has compilation errors. Fix them.
     )
 }
 
-/// Wait for the runner to become healthy (API responding).
-async fn wait_for_runner_healthy(state: &SharedState, timeout_secs: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let poll_interval = Duration::from_secs(2);
-
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(poll_interval).await;
-
-        let cached = state.cached_health.read().await;
-        if cached.runner_responding {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Cancel an in-progress smart rebuild, resetting to Idle.
 pub async fn cancel_smart_rebuild(state: &SharedState) {
     {

@@ -4,13 +4,13 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::{GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_API_PORT, RUNNER_VITE_PORT};
+use crate::config::{GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_VITE_PORT};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
-    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree, kill_runner_comprehensive,
+    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
     kill_webview2_processes,
 };
 use crate::state::{ManagedRunner, SharedState};
@@ -691,17 +691,6 @@ pub async fn restart_all(
 // Legacy single-runner functions (backward compat — delegate to primary runner)
 // =============================================================================
 
-/// Start the runner process (primary). Returns error if already running.
-pub async fn start_runner(state: &SharedState) -> Result<(), SupervisorError> {
-    // Find the primary runner ID
-    let primary = state
-        .get_primary()
-        .await
-        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
-
-    start_runner_by_id(state, &primary.config.id).await
-}
-
 /// Start a runner in dev mode (`npm run tauri dev`), which launches both
 /// the Vite dev server and the Tauri/Rust backend.
 /// Works for both primary and discovered runners.
@@ -768,118 +757,6 @@ async fn start_dev_mode_for_runner(
     Ok(child)
 }
 
-/// Legacy wrapper — calls `start_dev_mode_for_runner` with the primary runner.
-#[allow(dead_code)]
-async fn start_dev_mode(
-    state: &SharedState,
-    _port: u16,
-) -> Result<tokio::process::Child, SupervisorError> {
-    let primary = state
-        .get_primary()
-        .await
-        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
-    start_dev_mode_for_runner(state, &primary).await
-}
-
-#[allow(dead_code)]
-async fn start_exe_mode(state: &SharedState) -> Result<tokio::process::Child, SupervisorError> {
-    let exe_path = state.config.runner_exe_path();
-
-    if !exe_path.exists() {
-        return Err(SupervisorError::Process(format!(
-            "Runner exe not found at {:?}. Run a build first.",
-            exe_path
-        )));
-    }
-
-    info!("Starting in exe mode from {:?}", exe_path);
-
-    #[cfg(windows)]
-    let child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        Command::new(&exe_path)
-            .current_dir(&state.config.project_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .env_remove("CLAUDECODE")
-            .spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
-    };
-
-    #[cfg(not(windows))]
-    let child = {
-        Command::new(&exe_path)
-            .current_dir(&state.config.project_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("CLAUDECODE")
-            .spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
-    };
-
-    Ok(child)
-}
-
-/// Monitor the runner process for exit. Updates state when process terminates.
-/// Legacy — only used if start_runner is called directly without per-runner tracking.
-#[allow(dead_code)]
-async fn monitor_process_exit(state: SharedState) {
-    // Take the child out of state so we can await without holding the lock.
-    let child = {
-        let mut runner = state.runner.write().await;
-        runner.process.take()
-    };
-
-    let exit_status = if let Some(mut child) = child {
-        match child.wait().await {
-            Ok(status) => Some(status),
-            Err(e) => {
-                error!("Error waiting for runner process: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Update state
-    {
-        let mut runner = state.runner.write().await;
-        runner.running = false;
-        runner.process = None;
-        runner.pid = None;
-    }
-
-    state.notify_health_change();
-
-    if let Some(status) = exit_status {
-        let msg = if status.success() {
-            "Runner process exited normally".to_string()
-        } else {
-            format!("Runner process exited with status: {}", status)
-        };
-
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Info, &msg)
-            .await;
-        info!("{}", msg);
-    } else {
-        state
-            .logs
-            .emit(
-                LogSource::Supervisor,
-                LogLevel::Warn,
-                "Runner process terminated unexpectedly",
-            )
-            .await;
-        warn!("Runner process terminated unexpectedly");
-    }
-}
-
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
 /// Legacy stop — targets the primary runner. Allowed for manual use.
 pub async fn stop_runner(state: &SharedState, _force: bool) -> Result<(), SupervisorError> {
@@ -889,79 +766,6 @@ pub async fn stop_runner(state: &SharedState, _force: bool) -> Result<(), Superv
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
     stop_runner_by_id(state, &primary.config.id).await
-}
-
-/// Legacy stop implementation for backward compat.
-async fn legacy_stop_runner(state: &SharedState) -> Result<(), SupervisorError> {
-    {
-        let mut runner = state.runner.write().await;
-        runner.stop_requested = true;
-    }
-
-    state
-        .logs
-        .emit(LogSource::Supervisor, LogLevel::Info, "Stopping runner...")
-        .await;
-
-    let child = {
-        let mut runner = state.runner.write().await;
-        runner.process.take()
-    };
-
-    let _had_process = if let Some(mut child) = child {
-        info!("Killing runner child process");
-        let _ = child.kill().await;
-
-        let wait_result = tokio::time::timeout(
-            Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
-            child.wait(),
-        )
-        .await;
-
-        match wait_result {
-            Ok(Ok(_)) => info!("Runner process exited gracefully"),
-            Ok(Err(e)) => warn!("Error waiting for runner: {}", e),
-            Err(_) => warn!("Runner did not exit within timeout"),
-        }
-        true
-    } else {
-        false
-    };
-
-    kill_runner_comprehensive().await;
-
-    let api_free = wait_for_port_free(RUNNER_API_PORT, 5).await;
-    if state.config.dev_mode {
-        let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
-        if !vite_free {
-            warn!("Vite port {} still in use after stop", RUNNER_VITE_PORT);
-            let _ = kill_by_port(RUNNER_VITE_PORT).await;
-        }
-    }
-    if !api_free {
-        warn!("API port {} still in use after stop", RUNNER_API_PORT);
-        let _ = kill_by_port(RUNNER_API_PORT).await;
-    }
-
-    {
-        let mut runner = state.runner.write().await;
-        runner.process = None;
-        runner.running = false;
-        runner.started_at = None;
-        runner.pid = None;
-        runner.stop_requested = false;
-    }
-
-    state
-        .logs
-        .emit(LogSource::Supervisor, LogLevel::Info, "Runner stopped")
-        .await;
-    info!("Runner stopped");
-
-    state.notify_health_change();
-    state.health_cache_notify.notify_one();
-
-    Ok(())
 }
 
 /// Legacy restart wrapper — targets the primary runner.

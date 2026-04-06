@@ -134,27 +134,6 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
     Ok(success)
 }
 
-/// Kill the runner by all known methods: process name, ports, etc.
-/// Accepts a list of ports to clean up (for multi-runner support).
-pub async fn kill_runner_comprehensive_ports(ports: &[u16]) {
-    // 1. Kill by process name
-    let _ = taskkill_by_name("qontinui-runner.exe", true).await;
-
-    // 2. Kill by known ports
-    for &port in ports {
-        let _ = kill_by_port(port).await;
-    }
-
-    // Small delay for OS to release resources
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-}
-
-/// Kill the runner by all known methods: process name, ports, etc.
-/// Legacy single-runner version using hardcoded ports.
-pub async fn kill_runner_comprehensive() {
-    kill_runner_comprehensive_ports(&[9876, 1420]).await;
-}
-
 /// Kill processes listening on a port using tree kill (/T flag).
 /// This kills the entire process tree rooted at the listening process,
 /// which is essential for the Vite dev server where the node.exe grandchild

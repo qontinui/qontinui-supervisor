@@ -254,20 +254,6 @@ impl WatchdogState {
         self.crash_history.push(Utc::now());
     }
 
-    pub fn is_crash_loop(&self, threshold: usize, window_secs: i64) -> bool {
-        let cutoff = Utc::now() - chrono::Duration::seconds(window_secs);
-        let recent = self.crash_history.iter().filter(|t| **t > cutoff).count();
-        recent >= threshold
-    }
-
-    pub fn is_in_cooldown(&self, cooldown_secs: i64) -> bool {
-        if let Some(last) = self.last_restart_at {
-            let elapsed = (Utc::now() - last).num_seconds();
-            elapsed < cooldown_secs
-        } else {
-            false
-        }
-    }
 }
 
 impl Default for BuildState {
@@ -494,55 +480,6 @@ mod tests {
         assert_eq!(state.crash_history.len(), 1);
         state.record_crash();
         assert_eq!(state.crash_history.len(), 2);
-    }
-
-    #[test]
-    fn test_watchdog_is_crash_loop_below_threshold() {
-        let mut state = WatchdogState::new(true);
-        // Add 4 crashes (below threshold of 5)
-        for _ in 0..4 {
-            state.record_crash();
-        }
-        assert!(!state.is_crash_loop(5, 600));
-    }
-
-    #[test]
-    fn test_watchdog_is_crash_loop_at_threshold() {
-        let mut state = WatchdogState::new(true);
-        // Add 5 crashes (at threshold of 5)
-        for _ in 0..5 {
-            state.record_crash();
-        }
-        assert!(state.is_crash_loop(5, 600));
-    }
-
-    #[test]
-    fn test_watchdog_is_crash_loop_above_threshold() {
-        let mut state = WatchdogState::new(true);
-        for _ in 0..10 {
-            state.record_crash();
-        }
-        assert!(state.is_crash_loop(5, 600));
-    }
-
-    #[test]
-    fn test_watchdog_is_not_in_cooldown_when_never_restarted() {
-        let state = WatchdogState::new(true);
-        assert!(!state.is_in_cooldown(60));
-    }
-
-    #[test]
-    fn test_watchdog_is_in_cooldown_when_just_restarted() {
-        let mut state = WatchdogState::new(true);
-        state.last_restart_at = Some(Utc::now());
-        assert!(state.is_in_cooldown(60));
-    }
-
-    #[test]
-    fn test_watchdog_is_not_in_cooldown_after_long_time() {
-        let mut state = WatchdogState::new(true);
-        state.last_restart_at = Some(Utc::now() - chrono::Duration::seconds(120));
-        assert!(!state.is_in_cooldown(60));
     }
 
     // --- BuildState tests ---

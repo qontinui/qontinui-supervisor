@@ -102,10 +102,6 @@ pub const EXPO_PORT: u16 = 8081;
 
 // Watchdog constants
 pub const WATCHDOG_CHECK_INTERVAL_SECS: u64 = 10;
-pub const WATCHDOG_MAX_RESTART_ATTEMPTS: u32 = 3;
-pub const WATCHDOG_CRASH_LOOP_THRESHOLD: usize = 5;
-pub const WATCHDOG_CRASH_LOOP_WINDOW_SECS: i64 = 600; // 10 minutes
-pub const WATCHDOG_COOLDOWN_SECS: i64 = 60;
 
 // Process constants
 pub const GRACEFUL_KILL_TIMEOUT_SECS: u64 = 5;
@@ -172,16 +168,6 @@ pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[
     ("gemini", "pro", "gemini-3-pro-preview", "Gemini 3 Pro"),
 ];
 
-// Dev-start service ports for status checking
-pub const SERVICE_PORTS: &[(&str, u16)] = &[
-    ("postgresql", 5432),
-    ("redis", 6379),
-    ("minio", 9000),
-    ("backend", 8000),
-    ("frontend", 3001),
-    ("runner_api", 9876),
-    ("vite", 1420),
-];
 
 impl SupervisorConfig {
     pub fn from_args(args: CliArgs) -> Self {
@@ -268,28 +254,6 @@ mod tests {
         assert_eq!(EXPO_PORT, 8081);
     }
 
-    // --- Watchdog constant tests ---
-
-    #[test]
-    fn test_watchdog_max_restart_attempts() {
-        assert_eq!(WATCHDOG_MAX_RESTART_ATTEMPTS, 3);
-    }
-
-    #[test]
-    fn test_watchdog_crash_loop_threshold() {
-        assert_eq!(WATCHDOG_CRASH_LOOP_THRESHOLD, 5);
-    }
-
-    #[test]
-    fn test_watchdog_crash_loop_window_is_10_minutes() {
-        assert_eq!(WATCHDOG_CRASH_LOOP_WINDOW_SECS, 600);
-    }
-
-    #[test]
-    fn test_watchdog_cooldown_is_60_seconds() {
-        assert_eq!(WATCHDOG_COOLDOWN_SECS, 60);
-    }
-
     // --- Process constant tests ---
 
     #[test]
@@ -300,62 +264,6 @@ mod tests {
     #[test]
     fn test_ai_debug_cooldown_is_5_minutes() {
         assert_eq!(AI_DEBUG_COOLDOWN_SECS, 300);
-    }
-
-    // --- SERVICE_PORTS tests ---
-
-    #[test]
-    fn test_service_ports_has_expected_count() {
-        assert_eq!(SERVICE_PORTS.len(), 7);
-    }
-
-    #[test]
-    fn test_service_ports_contains_postgresql() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "postgresql" && *port == 5432));
-    }
-
-    #[test]
-    fn test_service_ports_contains_redis() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "redis" && *port == 6379));
-    }
-
-    #[test]
-    fn test_service_ports_contains_minio() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "minio" && *port == 9000));
-    }
-
-    #[test]
-    fn test_service_ports_contains_backend() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "backend" && *port == 8000));
-    }
-
-    #[test]
-    fn test_service_ports_contains_frontend() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "frontend" && *port == 3001));
-    }
-
-    #[test]
-    fn test_service_ports_contains_runner_api() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "runner_api" && *port == RUNNER_API_PORT));
-    }
-
-    #[test]
-    fn test_service_ports_contains_vite() {
-        assert!(SERVICE_PORTS
-            .iter()
-            .any(|(name, port)| *name == "vite" && *port == RUNNER_VITE_PORT));
     }
 
     // --- AI_MODELS tests ---
