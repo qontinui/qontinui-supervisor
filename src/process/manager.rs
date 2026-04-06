@@ -207,9 +207,9 @@ async fn start_exe_mode_for_runner(
         )));
     }
 
-    // Non-primary runners use a copy of the exe to avoid locking the build artifact.
-    // This allows dev-mode rebuilds to succeed while exe-mode runners are running.
-    let exe_path = if !managed.config.is_primary {
+    // All runners use a copy of the exe to avoid locking the build artifact.
+    // This allows cargo build to succeed while any runner is running.
+    let exe_path = {
         let copy_path = state.config.runner_exe_copy_path(&managed.config.id);
         if let Err(e) = std::fs::copy(&source_exe, &copy_path) {
             warn!(
@@ -224,8 +224,6 @@ async fn start_exe_mode_for_runner(
             );
             copy_path
         }
-    } else {
-        source_exe
     };
 
     info!(
