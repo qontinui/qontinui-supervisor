@@ -442,51 +442,51 @@ async fn run_smart_rebuild(state: &SharedState) {
                 .write()
                 .await
                 .emit(DiagnosticEventKind::SmartRebuildFailed { reason });
+            return;
         }
-    } else {
-
-        let duration_secs = rebuild_start.elapsed().as_secs_f64();
-
-        // Update state
-        let new_mtime = code_activity::get_last_source_modification(&state.config.project_dir);
-        {
-            let mut sr = state.smart_rebuild.write().await;
-            sr.phase = SmartRebuildPhase::Idle;
-            sr.last_successful_build_mtime = new_mtime;
-            sr.total_rebuilds += 1;
-            sr.last_rebuild_at = Some(Utc::now());
-            sr.current_attempt = 0;
-            sr.last_build_error = None;
-        }
-
-        info!(
-            "Smart rebuild: completed successfully in {:.1}s ({} attempts)",
-            duration_secs, attempt
-        );
-        state
-            .logs
-            .emit(
-                LogSource::SmartRebuild,
-                LogLevel::Info,
-                format!(
-                    "Smart rebuild completed in {:.1}s ({} attempts)",
-                    duration_secs, attempt
-                ),
-            )
-            .await;
-
-        state
-            .diagnostics
-            .write()
-            .await
-            .emit(DiagnosticEventKind::SmartRebuildCompleted {
-                total_attempts: attempt,
-                duration_secs,
-            });
-
-        // Spawn build error monitor for the new runner
-        build_monitor::spawn_build_error_monitor(state.clone());
     }
+
+    // Success path: update state regardless of whether runners needed restarting
+    let duration_secs = rebuild_start.elapsed().as_secs_f64();
+
+    let new_mtime = code_activity::get_last_source_modification(&state.config.project_dir);
+    {
+        let mut sr = state.smart_rebuild.write().await;
+        sr.phase = SmartRebuildPhase::Idle;
+        sr.last_successful_build_mtime = new_mtime;
+        sr.total_rebuilds += 1;
+        sr.last_rebuild_at = Some(Utc::now());
+        sr.current_attempt = 0;
+        sr.last_build_error = None;
+    }
+
+    info!(
+        "Smart rebuild: completed successfully in {:.1}s ({} attempts)",
+        duration_secs, attempt
+    );
+    state
+        .logs
+        .emit(
+            LogSource::SmartRebuild,
+            LogLevel::Info,
+            format!(
+                "Smart rebuild completed in {:.1}s ({} attempts)",
+                duration_secs, attempt
+            ),
+        )
+        .await;
+
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::SmartRebuildCompleted {
+            total_attempts: attempt,
+            duration_secs,
+        });
+
+    // Spawn build error monitor for the new runner
+    build_monitor::spawn_build_error_monitor(state.clone());
 }
 
 /// Set the smart rebuild phase to Failed and record the timestamp for retry cooldown.
