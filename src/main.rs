@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let port = config.port;
-    let auto_start = config.auto_start;
+    let _auto_start = config.auto_start;
 
     let mut supervisor_state = SupervisorState::new(config);
 
@@ -168,86 +168,13 @@ async fn main() -> anyhow::Result<()> {
     // Spawn smart rebuild source watcher
     let _smart_rebuild_handle = smart_rebuild::spawn_source_watcher(state.clone());
 
-    // Auto-start runners if configured
-    if auto_start {
+    // Clean up any orphaned temp runner processes from previous sessions
+    // and detect already-running user runners for health tracking.
+    // The supervisor does NOT auto-start any runners — users start their own.
+    {
         let state_clone = state.clone();
         tokio::spawn(async move {
-            // Clean up orphaned runner processes from previous sessions
             process::manager::cleanup_orphaned_runners(&state_clone).await;
-
-            let runners = state_clone.get_all_runners().await;
-            let runner_count = runners.len();
-
-            info!("Auto-starting {} runner(s)...", runner_count);
-            state_clone
-                .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Info,
-                    format!("Auto-starting {} runner(s)", runner_count),
-                )
-                .await;
-
-            // Start primary first
-            let mut primary_started = false;
-            for managed in &runners {
-                if managed.config.is_primary {
-                    match process::manager::start_runner_by_id(&state_clone, &managed.config.id)
-                        .await
-                    {
-                        Ok(()) => {
-                            info!("Primary runner auto-started successfully");
-                            primary_started = true;
-                            // Start build error monitor
-                            build_monitor::spawn_build_error_monitor(state_clone.clone());
-                        }
-                        Err(e) => {
-                            error!("Failed to auto-start primary runner: {}", e);
-                            state_clone
-                                .logs
-                                .emit(
-                                    LogSource::Supervisor,
-                                    LogLevel::Error,
-                                    format!("Failed to auto-start primary runner: {}", e),
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-
-            // Then start non-primary runners with 2s delay
-            if primary_started {
-                for managed in &runners {
-                    if !managed.config.is_primary {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        match process::manager::start_runner_by_id(&state_clone, &managed.config.id)
-                            .await
-                        {
-                            Ok(()) => {
-                                info!("Runner '{}' auto-started successfully", managed.config.name);
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to auto-start runner '{}': {}",
-                                    managed.config.name, e
-                                );
-                                state_clone
-                                    .logs
-                                    .emit(
-                                        LogSource::Supervisor,
-                                        LogLevel::Error,
-                                        format!(
-                                            "Failed to auto-start runner '{}': {}",
-                                            managed.config.name, e
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            }
         });
     }
 
@@ -311,9 +238,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = expo::stop_expo(&state).await;
     }
 
-    // Stop all runners on shutdown (non-primary first, then primary)
-    info!("Stopping all runners before exit...");
-    let _ = process::manager::stop_all(&state).await;
+    // Only stop temp runners on shutdown — user runners are left running
+    info!("Stopping temp runners before exit...");
+    let _ = process::manager::stop_all_temp_runners(&state).await;
 
     Ok(())
 }

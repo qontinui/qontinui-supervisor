@@ -12,7 +12,7 @@ use crate::config::{
     WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS,
 };
 use crate::database;
-use crate::diagnostics::{DiagnosticEventKind, RestartSource};
+use crate::diagnostics::DiagnosticEventKind;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::is_runner_responding;
 use crate::state::SharedState;
@@ -1421,52 +1421,21 @@ async fn handle_between_iterations(
     update_phase(state, LoopPhase::BetweenIterations).await;
 
     match &config.between_iterations {
-        BetweenIterations::RestartRunner { rebuild } => {
+        BetweenIterations::RestartRunner { .. } => {
+            // The supervisor no longer restarts user runners.
+            // Log a warning and continue — the workflow should use temp runners for testing.
             state
                 .logs
                 .emit(
                     LogSource::WorkflowLoop,
-                    LogLevel::Info,
-                    format!(
-                        "Restarting runner (rebuild={}) between iterations...",
-                        rebuild
-                    ),
-                )
-                .await;
-
-            crate::process::manager::restart_runner(
-                state,
-                *rebuild,
-                RestartSource::WorkflowLoop,
-                false,
-            )
-            .await
-            .map_err(|e| format!("Failed to restart runner: {}", e))?;
-
-            update_phase(state, LoopPhase::WaitingForRunner).await;
-            state
-                .logs
-                .emit(
-                    LogSource::WorkflowLoop,
-                    LogLevel::Info,
-                    "Waiting for runner API to be healthy...",
-                )
-                .await;
-
-            if !wait_for_runner_healthy(WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS).await {
-                return Err("Runner did not become healthy after restart".to_string());
-            }
-
-            state
-                .logs
-                .emit(
-                    LogSource::WorkflowLoop,
-                    LogLevel::Info,
-                    "Runner is healthy, continuing to next iteration",
+                    LogLevel::Warn,
+                    "RestartRunner between-iterations action is no longer supported. \
+                     The supervisor does not restart user runners. Continuing without restart.",
                 )
                 .await;
         }
-        BetweenIterations::RestartOnSignal { rebuild } => {
+        BetweenIterations::RestartOnSignal { .. } => {
+            // Same — supervisor no longer restarts user runners.
             let signaled = {
                 let mut wl = state.workflow_loop.write().await;
                 let was = wl.restart_signaled;
@@ -1479,43 +1448,9 @@ async fn handle_between_iterations(
                     .logs
                     .emit(
                         LogSource::WorkflowLoop,
-                        LogLevel::Info,
-                        format!(
-                            "Restart signaled — restarting runner (rebuild={})...",
-                            rebuild
-                        ),
-                    )
-                    .await;
-
-                crate::process::manager::restart_runner(
-                    state,
-                    *rebuild,
-                    RestartSource::WorkflowLoop,
-                    false,
-                )
-                .await
-                .map_err(|e| format!("Failed to restart runner: {}", e))?;
-
-                update_phase(state, LoopPhase::WaitingForRunner).await;
-                state
-                    .logs
-                    .emit(
-                        LogSource::WorkflowLoop,
-                        LogLevel::Info,
-                        "Waiting for runner API to be healthy...",
-                    )
-                    .await;
-
-                if !wait_for_runner_healthy(WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS).await {
-                    return Err("Runner did not become healthy after restart".to_string());
-                }
-
-                state
-                    .logs
-                    .emit(
-                        LogSource::WorkflowLoop,
-                        LogLevel::Info,
-                        "Runner is healthy, continuing to next iteration",
+                        LogLevel::Warn,
+                        "Restart signaled but the supervisor no longer restarts user runners. \
+                         Continuing without restart.",
                     )
                     .await;
             } else {
@@ -1524,7 +1459,7 @@ async fn handle_between_iterations(
                     .emit(
                         LogSource::WorkflowLoop,
                         LogLevel::Info,
-                        "No restart signal — skipping runner restart",
+                        "No restart signal — continuing",
                     )
                     .await;
             }

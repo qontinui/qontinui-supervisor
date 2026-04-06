@@ -71,41 +71,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/claude/debug", post(crate::routes::ai::debug))
         .route("/claude/status", get(crate::routes::ai::status))
         .route("/claude/stop", post(crate::routes::ai::stop))
-        // Dev-start orchestration
-        .route(
-            "/dev-start/backend",
-            post(crate::routes::dev_start::backend),
-        )
-        .route(
-            "/dev-start/backend/stop",
-            post(crate::routes::dev_start::backend_stop),
-        )
-        .route(
-            "/dev-start/frontend",
-            post(crate::routes::dev_start::frontend),
-        )
-        .route(
-            "/dev-start/frontend/stop",
-            post(crate::routes::dev_start::frontend_stop),
-        )
-        .route(
-            "/dev-start/frontend/clear-cache",
-            post(crate::routes::dev_start::frontend_clear_cache),
-        )
-        .route("/dev-start/docker", post(crate::routes::dev_start::docker))
-        .route(
-            "/dev-start/docker/stop",
-            post(crate::routes::dev_start::docker_stop),
-        )
-        .route("/dev-start/all", post(crate::routes::dev_start::all))
-        .route("/dev-start/stop", post(crate::routes::dev_start::stop))
-        .route("/dev-start/clean", post(crate::routes::dev_start::clean))
-        .route("/dev-start/fresh", post(crate::routes::dev_start::fresh))
-        .route(
-            "/dev-start/migrate",
-            post(crate::routes::dev_start::migrate),
-        )
-        .route("/dev-start/status", get(crate::routes::dev_start::status))
+        // Dev-start orchestration removed — frontend/backend are managed by the runner directly
         // Supervisor Bridge (command relay for supervisor's own dashboard UI)
         .route(
             "/supervisor-bridge/commands/stream",

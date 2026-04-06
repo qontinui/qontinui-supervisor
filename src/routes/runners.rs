@@ -231,25 +231,12 @@ pub async fn start_runner(
 }
 
 /// POST /runners/{id}/stop — stop a specific runner.
-/// Protected runners require `force: true` in the request body.
 pub async fn stop_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     body: Option<Json<StopRunnerRequest>>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let force = body.map(|b| b.force).unwrap_or(false);
-
-    let managed = state
-        .get_runner(&id)
-        .await
-        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
-
-    if managed.is_protected().await && !force {
-        return Err(SupervisorError::Validation(format!(
-            "Runner '{}' is protected. Use force=true to override.",
-            managed.config.name
-        )));
-    }
+    let _force = body.map(|b| b.force).unwrap_or(false);
 
     manager::stop_runner_by_id(&state, &id).await?;
 

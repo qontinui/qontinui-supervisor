@@ -6,7 +6,7 @@ use crate::config::{
     OVERNIGHT_CHECK_INTERVAL_SECS, OVERNIGHT_END_HOUR, OVERNIGHT_MAX_CONSECUTIVE_FAILURES,
     OVERNIGHT_SNAPSHOT_TIMEOUT_SECS, OVERNIGHT_START_HOUR, RUNNER_API_PORT,
 };
-use crate::diagnostics::{DiagnosticEventKind, RestartSource};
+// DiagnosticEventKind and RestartSource no longer used — supervisor doesn't restart runners
 use crate::log_capture::{LogLevel, LogSource};
 use crate::state::SharedState;
 
@@ -164,9 +164,9 @@ async fn handle_failure(state: &SharedState, reason: String) {
         return;
     }
 
-    // Restart the runner (no rebuild)
+    // Log the issue but do NOT restart — the supervisor never restarts user runners.
     warn!(
-        "Overnight watchdog: UI broken for {} consecutive checks, restarting runner",
+        "Overnight watchdog: UI broken for {} consecutive checks (no auto-restart)",
         consecutive_failures
     );
     state
@@ -175,68 +175,22 @@ async fn handle_failure(state: &SharedState, reason: String) {
             LogSource::OvernightWatchdog,
             LogLevel::Warn,
             format!(
-                "UI broken for {} consecutive checks, restarting runner (no rebuild)",
+                "UI broken for {} consecutive checks — supervisor will not auto-restart",
                 consecutive_failures
             ),
         )
         .await;
 
-    let restart_start = std::time::Instant::now();
-
-    state
-        .diagnostics
-        .write()
-        .await
-        .emit(DiagnosticEventKind::RestartStarted {
-            source: RestartSource::Watchdog,
-            rebuild: false,
-        });
-
-    match crate::process::manager::restart_runner(state, false, RestartSource::Watchdog, false)
-        .await
     {
-        Ok(()) => {
-            info!("Overnight watchdog: runner restarted successfully");
-            let mut ow = state.overnight_watchdog.write().await;
-            ow.consecutive_failures = 0;
-            ow.last_action_taken = Some(format!(
-                "Restarted runner at {} (took {:.1}s)",
-                chrono::Utc::now().to_rfc3339(),
-                restart_start.elapsed().as_secs_f64()
-            ));
-            state
-                .logs
-                .emit(
-                    LogSource::OvernightWatchdog,
-                    LogLevel::Info,
-                    "Runner restarted successfully after UI failure",
-                )
-                .await;
-            state.notify_health_change();
-        }
-        Err(e) => {
-            warn!(
-                "Overnight watchdog: restart failed: {}, scheduling AI debug",
-                e
-            );
-            let mut ow = state.overnight_watchdog.write().await;
-            ow.last_action_taken = Some(format!("Restart failed: {}", e));
-            drop(ow);
-            state
-                .logs
-                .emit(
-                    LogSource::OvernightWatchdog,
-                    LogLevel::Error,
-                    format!("Restart failed: {}, scheduling AI debug", e),
-                )
-                .await;
-            crate::ai_debug::schedule_debug(
-                state,
-                "Overnight watchdog: runner restart failed after UI bridge health check failure",
-            )
-            .await;
-        }
+        let mut ow = state.overnight_watchdog.write().await;
+        ow.last_action_taken = Some(format!(
+            "UI broken at {} ({} consecutive failures, no restart)",
+            chrono::Utc::now().to_rfc3339(),
+            consecutive_failures
+        ));
     }
+
+    state.notify_health_change();
 }
 
 /// Check if the given hour (0-23) falls within overnight hours.

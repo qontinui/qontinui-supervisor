@@ -16,37 +16,60 @@ use crate::process::windows::{
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
+// Runner Category Helpers
+// =============================================================================
+
+/// Returns true if this runner is a temp/test runner managed by the supervisor.
+/// Only temp runners can be started, stopped, or restarted by the supervisor.
+/// All other runners (primary, user-opened) are observe-only.
+pub fn is_temp_runner(runner_id: &str) -> bool {
+    runner_id.starts_with("test-")
+}
+
+// =============================================================================
 // Startup Cleanup
 // =============================================================================
 
-/// Kill any orphaned runner processes on ports managed by this supervisor.
-/// Called before auto-starting runners to avoid port conflicts and exe locks.
+/// Kill any orphaned temp runner processes from previous supervisor sessions.
+/// Only cleans up temp runner ports — user runners are never touched.
 pub async fn cleanup_orphaned_runners(state: &SharedState) {
     let runners = state.get_all_runners().await;
-    let mut ports: Vec<u16> = runners.iter().map(|r| r.config.port).collect();
 
-    // Also clean up Vite port in dev mode
-    if state.config.dev_mode {
-        ports.push(crate::config::RUNNER_VITE_PORT);
+    // Only clean up temp runner ports
+    let mut ports: Vec<u16> = Vec::new();
+    for r in &runners {
+        if is_temp_runner(&r.config.id) {
+            ports.push(r.config.port);
+        } else {
+            // Mark non-temp runners as running if something is on their port,
+            // so the supervisor tracks their health without managing them.
+            if crate::process::port::is_port_in_use(r.config.port) {
+                info!(
+                    "Runner '{}' (port {}) already running — tracking health only",
+                    r.config.name, r.config.port
+                );
+                let mut runner = r.runner.write().await;
+                runner.running = true;
+            }
+        }
     }
 
     let mut killed_any = false;
     for &port in &ports {
         if let Ok(true) = kill_by_port(port).await {
-            info!("Killed orphaned process on port {}", port);
+            info!("Killed orphaned temp runner on port {}", port);
             killed_any = true;
         }
     }
 
     if killed_any {
-        // Give OS time to release ports
         tokio::time::sleep(Duration::from_secs(1)).await;
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 LogLevel::Info,
-                "Cleaned up orphaned runner processes from previous session",
+                "Cleaned up orphaned temp runner processes",
             )
             .await;
     }
@@ -484,15 +507,26 @@ pub async fn stop_runner_by_id(
     Ok(())
 }
 
-/// Restart a specific runner by ID. Stop, optionally rebuild (global), then start.
-/// If `force` is false and the runner is protected, the restart is rejected.
+/// Restart a specific runner by ID.
+/// Automated sources (watchdog, workflow loop, smart rebuild) are rejected for
+/// non-temp runners — only manual API calls can restart user runners.
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
     rebuild: bool,
     source: RestartSource,
-    force: bool,
+    _force: bool,
 ) -> Result<(), SupervisorError> {
+    if !is_temp_runner(runner_id) && !source.is_manual() {
+        let msg = format!(
+            "Automated restart of non-temp runner '{}' blocked (source: {}). \
+             Only manual restarts are allowed for user runners.",
+            runner_id, source
+        );
+        warn!("{}", msg);
+        return Err(SupervisorError::Validation(msg));
+    }
+
     let restart_start = std::time::Instant::now();
 
     state
@@ -509,66 +543,9 @@ pub async fn restart_runner_by_id(
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
 
-    // Protected runners require force=true to restart
-    if managed.is_protected().await && !force {
-        let msg = format!(
-            "Runner '{}' is protected. Use force=true to override. (source: {})",
-            managed.config.name, source
-        );
-        warn!("{}", msg);
-        state
-            .logs
-            .emit(
-                crate::log_capture::LogSource::Supervisor,
-                crate::log_capture::LogLevel::Warn,
-                &msg,
-            )
-            .await;
-        return Err(SupervisorError::Validation(msg));
-    }
-
     {
         let mut runner = managed.runner.write().await;
         runner.restart_requested = true;
-    }
-
-    // When restarting the primary, also stop non-protected secondary runners.
-    // Instance processes are not assigned to the Job Object (so that protected
-    // instances survive rebuilds), so the supervisor must explicitly stop the
-    // unprotected ones here.  They will be restored by the primary's instance
-    // manager when it starts back up.
-    if managed.config.is_primary {
-        let all_runners = state.get_all_runners().await;
-        for other in &all_runners {
-            if other.config.is_primary || other.is_protected().await {
-                continue;
-            }
-            // Check both supervisor-tracked state and health cache — instances
-            // spawned by the runner's own instance manager are only visible via
-            // the health cache (runner_responding), not via runner.running.
-            let supervisor_running = other.runner.read().await.running;
-            let api_responding = other.cached_health.read().await.runner_responding;
-            if supervisor_running || api_responding {
-                info!(
-                    "Stopping unprotected runner '{}' before primary restart",
-                    other.config.name
-                );
-                state
-                    .logs
-                    .emit(
-                        crate::log_capture::LogSource::Supervisor,
-                        crate::log_capture::LogLevel::Info,
-                        format!(
-                            "Stopping unprotected runner '{}' before primary restart",
-                            other.config.name
-                        ),
-                    )
-                    .await;
-                if let Err(e) = stop_runner_by_id(state, &other.config.id).await {
-                    warn!("Failed to stop runner '{}': {}", other.config.name, e);
-                }
-            }
-        }
     }
 
     // Stop if running
@@ -642,30 +619,19 @@ pub async fn restart_runner_by_id(
 }
 
 /// Stop all runners. Primary is stopped last.
-pub async fn stop_all(state: &SharedState) -> Result<(), SupervisorError> {
+/// Stop all temp runners. User runners (primary and secondary) are never touched.
+pub async fn stop_all_temp_runners(state: &SharedState) -> Result<(), SupervisorError> {
     let runners = state.get_all_runners().await;
     let mut errors = Vec::new();
 
-    // Stop non-primary first
     for managed in &runners {
-        if !managed.config.is_primary {
-            let running = managed.runner.read().await.running;
-            if running {
-                if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
-                    errors.push(format!("'{}': {}", managed.config.name, e));
-                }
-            }
+        if !is_temp_runner(&managed.config.id) {
+            continue;
         }
-    }
-
-    // Then stop primary
-    for managed in &runners {
-        if managed.config.is_primary {
-            let running = managed.runner.read().await.running;
-            if running {
-                if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
-                    errors.push(format!("'{}': {}", managed.config.name, e));
-                }
+        let running = managed.runner.read().await.running;
+        if running {
+            if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
+                errors.push(format!("'{}': {}", managed.config.name, e));
             }
         }
     }
@@ -674,7 +640,7 @@ pub async fn stop_all(state: &SharedState) -> Result<(), SupervisorError> {
         Ok(())
     } else {
         Err(SupervisorError::Other(format!(
-            "Errors stopping runners: {}",
+            "Errors stopping temp runners: {}",
             errors.join("; ")
         )))
     }
@@ -697,7 +663,7 @@ pub async fn restart_all(
         }
     }
 
-    stop_all(state).await?;
+    stop_all_temp_runners(state).await?;
 
     if rebuild {
         crate::build_monitor::run_cargo_build(state).await?;
@@ -915,21 +881,14 @@ async fn monitor_process_exit(state: SharedState) {
 }
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
-pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), SupervisorError> {
-    let primary = state.get_primary().await;
+/// Legacy stop — targets the primary runner. Allowed for manual use.
+pub async fn stop_runner(state: &SharedState, _force: bool) -> Result<(), SupervisorError> {
+    let primary = state
+        .get_primary()
+        .await
+        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    if let Some(ref primary) = primary {
-        if primary.is_protected().await && !force {
-            return Err(SupervisorError::Validation(format!(
-                "Runner '{}' is protected. Use force=true to override.",
-                primary.config.name
-            )));
-        }
-        stop_runner_by_id(state, &primary.config.id).await
-    } else {
-        // Fallback: legacy behavior for when no managed runners exist
-        legacy_stop_runner(state).await
-    }
+    stop_runner_by_id(state, &primary.config.id).await
 }
 
 /// Legacy stop implementation for backward compat.
@@ -1005,99 +964,18 @@ async fn legacy_stop_runner(state: &SharedState) -> Result<(), SupervisorError> 
     Ok(())
 }
 
-/// Stop runner, optionally rebuild, then start. (Legacy — targets primary)
+/// Legacy restart wrapper — targets the primary runner.
+/// Only manual restarts are allowed; automated sources are rejected.
 pub async fn restart_runner(
     state: &SharedState,
     rebuild: bool,
     source: RestartSource,
     force: bool,
 ) -> Result<(), SupervisorError> {
-    let primary = state.get_primary().await;
+    let primary = state
+        .get_primary()
+        .await
+        .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    if let Some(primary) = primary {
-        restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
-    } else {
-        // Fallback legacy behavior
-        let restart_start = std::time::Instant::now();
-
-        state
-            .diagnostics
-            .write()
-            .await
-            .emit(DiagnosticEventKind::RestartStarted {
-                source: source.clone(),
-                rebuild,
-            });
-
-        {
-            let mut runner = state.runner.write().await;
-            runner.restart_requested = true;
-        }
-
-        {
-            let runner = state.runner.read().await;
-            if runner.running {
-                drop(runner);
-                if let Err(e) = stop_runner(state, true).await {
-                    state
-                        .diagnostics
-                        .write()
-                        .await
-                        .emit(DiagnosticEventKind::RestartFailed {
-                            source,
-                            error: e.to_string(),
-                        });
-                    return Err(e);
-                }
-            }
-        }
-
-        let build_duration = if rebuild {
-            let build_start = std::time::Instant::now();
-            if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
-                state
-                    .diagnostics
-                    .write()
-                    .await
-                    .emit(DiagnosticEventKind::RestartFailed {
-                        source,
-                        error: e.to_string(),
-                    });
-                return Err(e);
-            }
-            Some(build_start.elapsed().as_secs_f64())
-        } else {
-            None
-        };
-
-        if let Err(e) = start_runner(state).await {
-            state
-                .diagnostics
-                .write()
-                .await
-                .emit(DiagnosticEventKind::RestartFailed {
-                    source,
-                    error: e.to_string(),
-                });
-            return Err(e);
-        }
-
-        {
-            let mut runner = state.runner.write().await;
-            runner.restart_requested = false;
-        }
-
-        state
-            .diagnostics
-            .write()
-            .await
-            .emit(DiagnosticEventKind::RestartCompleted {
-                source,
-                rebuild,
-                duration_secs: restart_start.elapsed().as_secs_f64(),
-                build_duration_secs: build_duration,
-            });
-
-        Ok(())
-    }
+    restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
 }

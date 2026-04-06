@@ -12,6 +12,13 @@ pub enum RestartSource {
     Watchdog,
 }
 
+impl RestartSource {
+    /// Returns true if this is a manual (user-initiated) restart.
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual)
+    }
+}
+
 impl std::fmt::Display for RestartSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -223,12 +223,12 @@ pub async fn fix_and_rebuild(
         )
         .await;
 
-    // 3. Rebuild and restart the runner
-    manager::restart_runner(&state, true, RestartSource::Manual, true).await?;
+    // 3. Build only — the supervisor does not restart user runners
+    crate::build_monitor::run_cargo_build(&state).await?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "message": "AI fix applied and runner rebuilt successfully"
+        "message": "AI fix applied and runner rebuilt (restart manually to apply)"
     })))
 }
 
@@ -254,8 +254,8 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // Stop all runners first
-    let _ = manager::stop_all(&state).await;
+    // Only stop temp runners — user runners survive supervisor restarts
+    let _ = manager::stop_all_temp_runners(&state).await;
 
     // Spawn replacement process
     let mut cmd = std::process::Command::new(&exe);

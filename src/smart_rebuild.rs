@@ -254,37 +254,21 @@ async fn run_smart_rebuild(state: &SharedState) {
         sr.last_build_error = None;
     }
 
-    // Phase: StoppingRunner — stop unprotected runners for rebuild.
-    // Protected runners are left running (they use their own binary copy).
-    // Record which runners are running so we only restart those after rebuild.
-    let (was_running, protected_skipped): (Vec<String>, Vec<String>) = {
+    // Phase: StoppingRunner — stop only temp runners for rebuild.
+    // User runners are never stopped — they use copied exes and don't lock the build artifact.
+    let was_running: Vec<String> = {
         let runners = state.get_all_runners().await;
         let mut ids = Vec::new();
-        let mut skipped = Vec::new();
         for managed in &runners {
+            if !manager::is_temp_runner(&managed.config.id) {
+                continue;
+            }
             if managed.runner.read().await.running {
-                if managed.is_protected().await {
-                    skipped.push(managed.config.name.clone());
-                } else {
-                    ids.push(managed.config.id.clone());
-                }
+                ids.push(managed.config.id.clone());
             }
         }
-        (ids, skipped)
+        ids
     };
-    if !protected_skipped.is_empty() {
-        state
-            .logs
-            .emit(
-                LogSource::SmartRebuild,
-                LogLevel::Info,
-                format!(
-                    "Skipping protected runner(s): {} — they will not be stopped for rebuild",
-                    protected_skipped.join(", ")
-                ),
-            )
-            .await;
-    }
     if !was_running.is_empty() {
         {
             let mut sr = state.smart_rebuild.write().await;
@@ -295,20 +279,19 @@ async fn run_smart_rebuild(state: &SharedState) {
             .emit(
                 LogSource::SmartRebuild,
                 LogLevel::Info,
-                format!("Stopping {} runner(s) for rebuild", was_running.len()),
+                format!("Stopping {} temp runner(s) for rebuild", was_running.len()),
             )
             .await;
 
-        // Stop only unprotected runners individually
         for runner_id in &was_running {
             if let Err(e) = manager::stop_runner_by_id(state, runner_id).await {
                 error!(
-                    "Smart rebuild: failed to stop runner '{}': {}",
+                    "Smart rebuild: failed to stop temp runner '{}': {}",
                     runner_id, e
                 );
                 set_failed(
                     state,
-                    format!("Failed to stop runner '{}': {}", runner_id, e),
+                    format!("Failed to stop temp runner '{}': {}", runner_id, e),
                 )
                 .await;
                 return;
@@ -428,65 +411,39 @@ async fn run_smart_rebuild(state: &SharedState) {
         sr.phase = SmartRebuildPhase::Restarting;
     }
 
-    state
-        .logs
-        .emit(
-            LogSource::SmartRebuild,
-            LogLevel::Info,
-            format!(
-                "Build succeeded, restarting {} previously-running runner(s)",
-                was_running.len()
-            ),
-        )
-        .await;
-
-    // Restart only runners that were running before the rebuild.
-    // Primary first, then non-primary with 2s delay.
-    let runners = state.get_all_runners().await;
-    let mut start_errors = Vec::new();
-
-    // Start primary first (if it was running)
-    for managed in &runners {
-        if managed.config.is_primary && was_running.contains(&managed.config.id) {
-            if let Err(e) = manager::start_runner_by_id(state, &managed.config.id).await {
-                start_errors.push(format!("'{}': {}", managed.config.name, e));
-            }
-        }
-    }
-
-    // Then non-primary with 2s delay (only those that were running)
-    for managed in &runners {
-        if !managed.config.is_primary && was_running.contains(&managed.config.id) {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if let Err(e) = manager::start_runner_by_id(state, &managed.config.id).await {
-                start_errors.push(format!("'{}': {}", managed.config.name, e));
-            }
-        }
-    }
-
-    if !start_errors.is_empty() {
-        let reason = format!("Failed to restart runners: {}", start_errors.join("; "));
-        error!("Smart rebuild: {}", reason);
-        set_failed(state, reason.clone()).await;
+    // Only restart temp runners that were stopped for the build.
+    // User runners were never stopped and don't need restarting.
+    if !was_running.is_empty() {
         state
-            .diagnostics
-            .write()
-            .await
-            .emit(DiagnosticEventKind::SmartRebuildFailed { reason });
-    } else {
-        // Wait for primary runner to become healthy
-        let healthy = wait_for_runner_healthy(state, 60).await;
-        if !healthy {
-            warn!("Smart rebuild: runners started but primary not healthy after 60s");
-            state
-                .logs
-                .emit(
-                    LogSource::SmartRebuild,
-                    LogLevel::Warn,
-                    "Runners started but primary not healthy after 60s",
-                )
-                .await;
+            .logs
+            .emit(
+                LogSource::SmartRebuild,
+                LogLevel::Info,
+                format!(
+                    "Build succeeded, restarting {} temp runner(s)",
+                    was_running.len()
+                ),
+            )
+            .await;
+
+        let mut start_errors = Vec::new();
+        for runner_id in &was_running {
+            if let Err(e) = manager::start_runner_by_id(state, runner_id).await {
+                start_errors.push(format!("'{}': {}", runner_id, e));
+            }
         }
+
+        if !start_errors.is_empty() {
+            let reason = format!("Failed to restart temp runners: {}", start_errors.join("; "));
+            error!("Smart rebuild: {}", reason);
+            set_failed(state, reason.clone()).await;
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::SmartRebuildFailed { reason });
+        }
+    } else {
 
         let duration_secs = rebuild_start.elapsed().as_secs_f64();
 

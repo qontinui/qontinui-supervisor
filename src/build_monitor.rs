@@ -352,48 +352,25 @@ async fn wait_for_exe_unlocked(state: &SharedState) {
 }
 
 /// Stop non-primary exe-mode runners before a cargo build.
-/// These runners may hold a file lock on the build output binary, causing "Access is denied".
+/// Stop only temp runners that may hold a file lock on the build output binary.
+/// User runners are never stopped — they use copied exes and don't lock the build artifact.
 async fn stop_exe_runners_for_build(state: &SharedState) {
-    // Only relevant in dev mode — exe-mode-only supervisors don't do cargo build
-    if !state.config.dev_mode {
-        return;
-    }
-
     let runners = state.get_all_runners().await;
     for managed in &runners {
-        if managed.config.is_primary {
-            continue;
-        }
-        // Protected runners use copied exes and don't hold locks on the build artifact
-        if managed.is_protected().await {
-            info!(
-                "Skipping protected runner '{}' — uses copied exe, no lock conflict",
-                managed.config.name
-            );
+        if !crate::process::manager::is_temp_runner(&managed.config.id) {
             continue;
         }
         let running = managed.runner.read().await.running;
         if running {
             info!(
-                "Stopping exe-mode runner '{}' before build to release exe lock",
+                "Stopping temp runner '{}' before build to release exe lock",
                 managed.config.name
             );
-            state
-                .logs
-                .emit(
-                    LogSource::Build,
-                    LogLevel::Info,
-                    format!(
-                        "Stopping runner '{}' to release exe lock for build",
-                        managed.config.name
-                    ),
-                )
-                .await;
             if let Err(e) =
                 crate::process::manager::stop_runner_by_id(state, &managed.config.id).await
             {
                 warn!(
-                    "Failed to stop runner '{}' before build: {}",
+                    "Failed to stop temp runner '{}' before build: {}",
                     managed.config.name, e
                 );
             }

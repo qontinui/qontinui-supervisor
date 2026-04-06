@@ -1,25 +1,27 @@
 # Qontinui Supervisor
 
-Rust-based process manager for the qontinui-runner. Replaces the Python `dev-supervisor.py` for core process lifecycle management.
+Rust-based build server and health monitor for qontinui-runner. Provides cargo builds, temp runner spawning for testing, and observe-only health monitoring.
 
-## CRITICAL: Never Kill or Restart Active Runners
+## CRITICAL: The Supervisor NEVER Manages User Runner Lifecycle
 
-**All runners are protected. NEVER stop, restart, kill, or rebuild any running runner** — active runners have user sessions, terminal profiles, and in-flight workflows. Killing them causes data loss and disruption. To test code changes, use `POST /runners/spawn-test` to create an ephemeral test runner that is auto-cleaned up on stop. Only the user may restart active runners.
+The supervisor **only** manages the lifecycle of temp/test runners (`test-*` IDs). All other runners (primary, secondary, discovered) are **user-managed** — the supervisor never starts, stops, restarts, or kills them. Users start runners manually and close them by closing the window.
+
+- **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. These are headless (no window) and used for testing code changes.
+- **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor tracks their health but takes no lifecycle action.
 
 ## Architecture
 
-Standalone Axum HTTP server that manages the runner process:
-- **Start/stop/restart** with optional cargo rebuild
-- **Watchdog** auto-recovery with crash loop detection
+Standalone Axum HTTP server:
+- **Temp runner spawning** for testing code changes
+- **Cargo build** without restarting any runner
+- **Health monitoring** (observe-only) for all runners
 - **Log capture** with SSE streaming and circular buffer
-- **Build error detection** during first 60s of runner startup
-- **AI auto-debug** spawns Claude/Gemini to diagnose build failures and crash loops
+- **AI auto-debug** spawns Claude/Gemini to diagnose build failures
 - **Code activity detection** defers debug sessions when files are being edited or external Claude is running
-- **Dev-start orchestration** HTTP endpoints to control `dev-start.ps1` services
 - **Expo process management** start/stop/monitor Expo/React Native dev server
-- **Workflow loop** orchestrates repeated workflow execution with exit strategies and runner restarts between iterations
+- **Workflow loop** orchestrates repeated workflow execution with exit strategies
 - **UI Bridge proxy** transparent proxy to runner's UI Bridge SDK endpoints (control + SDK modes)
-- **React dashboard** SPA web UI at `GET /` for visual monitoring and control (built with Vite, embedded in binary via `rust-embed` from `dist/`; falls back to legacy `static/dashboard.html` if dist is missing)
+- **React dashboard** SPA web UI at `GET /` for visual monitoring and control
 
 ## Building & Running
 
@@ -44,9 +46,7 @@ cargo clippy -- -D warnings    # Lint
 | Flag | Description |
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
-| `-d, --dev-mode` | (Legacy, unused) Run `npm run tauri dev` instead of compiled exe |
-| `-w, --watchdog` | Enable watchdog (implies auto-start) |
-| `-a, --auto-start` | Start runner on supervisor launch |
+| `-w, --watchdog` | Enable health monitoring (observe-only, no restarts) |
 | `--auto-debug` | Enable AI auto-debug on startup |
 | `--expo-dir` | Path to Expo/React Native project directory |
 | `-l, --log-file` | Log file for runner output |
@@ -54,30 +54,23 @@ cargo clippy -- -D warnings    # Lint
 
 ## API Endpoints
 
-### Runner Lifecycle
+### Health & Dashboard
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/` | React SPA dashboard (embedded via rust-embed from `dist/`, fallback to legacy `static/dashboard.html`) |
-| GET | `/health` | Comprehensive status (runner, watchdog, build, AI, code activity, expo) |
-| POST | `/runner/stop` | Stop runner + cleanup |
-| POST | `/runner/restart` | Stop + rebuild + start. Body: `{"rebuild": bool}` |
-| POST | `/runner/watchdog` | Control watchdog. Body: `{"enabled": bool, "reset_attempts": bool}` |
-| POST | `/supervisor/restart` | Self-restart with same CLI args |
+| GET | `/` | React SPA dashboard |
+| GET | `/health` | Comprehensive status (runners, build, AI, code activity, expo) |
+| POST | `/supervisor/restart` | Self-restart supervisor (runners are left running) |
 
-### Multi-Runner Management
+### Temp Runner Management (test-* only)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/runners` | List all runners with status |
-| POST | `/runners` | Add a runner config. Body: `{"name": str, "port": u16}` |
+| GET | `/runners` | List all runners with status (observe-only for user runners) |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{"rebuild": bool}`. Returns `{id, port, api_url, ui_bridge_url}`. Auto-cleaned up on stop. |
-| DELETE | `/runners/{id}` | Remove a runner config (must be stopped) |
-| POST | `/runners/{id}/start` | Start a runner |
-| POST | `/runners/{id}/stop` | Stop a runner |
-| POST | `/runners/{id}/restart` | Restart a runner. Body: `{"rebuild": bool, "force": bool}` |
-| POST | `/runners/{id}/watchdog` | Control runner watchdog. Body: `{"enabled": bool}` |
-| POST | `/runners/{id}/protect` | Toggle protection. Body: `{"protected": bool}` |
+| POST | `/runners/{id}/start` | Start a temp runner (rejects non-temp) |
+| POST | `/runners/{id}/stop` | Stop a temp runner (rejects non-temp) |
+| POST | `/runners/{id}/restart` | Restart a temp runner (rejects non-temp) |
 | GET/POST | `/runners/{id}/ui-bridge/{*path}` | Proxy UI Bridge requests to a specific runner |
 
 ### Logs
@@ -105,23 +98,6 @@ cargo clippy -- -D warnings    # Lint
 | GET | `/claude/status` | Alias for `/ai/status` |
 | POST | `/claude/stop` | Alias for `/ai/stop` |
 
-### Dev-Start Orchestration
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/dev-start/backend` | Start backend (60s timeout) |
-| POST | `/dev-start/backend/stop` | Stop backend (30s timeout) |
-| POST | `/dev-start/frontend` | Start frontend (180s timeout) |
-| POST | `/dev-start/frontend/stop` | Stop frontend (30s timeout) |
-| POST | `/dev-start/docker` | Start Docker services (60s timeout) |
-| POST | `/dev-start/docker/stop` | Stop Docker services (30s timeout) |
-| POST | `/dev-start/all` | Start everything (300s timeout) |
-| POST | `/dev-start/stop` | Stop everything (30s timeout) |
-| POST | `/dev-start/clean` | Clean caches (30s timeout) |
-| POST | `/dev-start/fresh` | Clean + start everything (300s timeout) |
-| POST | `/dev-start/migrate` | Run DB migrations (120s timeout) |
-| GET | `/dev-start/status` | Check service ports (PostgreSQL, Redis, MinIO, Backend, Frontend, Runner, Vite) |
-
 ### Expo
 
 | Method | Path | Description |
@@ -133,7 +109,7 @@ cargo clippy -- -D warnings    # Lint
 
 ### Workflow Loop
 
-Orchestrates repeated workflow execution with configurable exit strategies and between-iteration actions. Designed for scenarios where the runner must be restarted between iterations (e.g., verifying code changes to the runner itself).
+Orchestrates repeated workflow execution with configurable exit strategies. Note: `restart_runner` and `restart_on_signal` between-iteration actions are no longer supported — the supervisor does not restart user runners.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -282,28 +258,23 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 
 ## Smart Rebuild Flow
 
-When `--smart-rebuild` is enabled, the supervisor monitors the runner's source files and automatically rebuilds after 10 minutes of inactivity:
+When `--smart-rebuild` is enabled, the supervisor monitors source files and rebuilds after 10 minutes of inactivity. Only temp runners are stopped for rebuilds; user runners are left running (they use copied exes).
 
 1. Source watcher polls every 10s for file changes in `src-tauri/src/` and `src/`
-2. When changes detected and 10min quiet period elapses → stop runner → cargo build
+2. When changes detected and 10min quiet period elapses → stop temp runners → cargo build
 3. If build fails → spawn Claude CLI to fix errors (up to 5 attempts per cycle)
-4. If all fix attempts in a cycle fail → wait 10min cooldown → retry from step 2
-5. Retries indefinitely until the build succeeds
-6. On success → restart runner → wait for healthy API
-
-Guards: skips if code is being edited, external Claude session active, workflow loop running, or manual stop/restart in progress.
+4. If all fix attempts in a cycle fail → wait 10min cooldown → retry
+5. On success → restart stopped temp runners
 
 ## Auto-Debug Flow
 
-1. Watchdog detects crash loop or max restarts → calls `schedule_debug()`
-2. Build monitor detects build error in runner output → calls `schedule_debug()`
-3. `schedule_debug()` checks code activity:
+1. Build monitor detects build error in runner output → calls `schedule_debug()`
+2. `schedule_debug()` checks code activity:
    - If code being edited or external Claude session → defers to `pending_debug`
    - Otherwise → spawns AI debug session immediately
-4. Code activity monitor (every 30s) checks for deferred debug:
-   - If pending + quiet period elapsed + no external Claude → triggers `spawn_ai_debug()`
-5. Debug prompt includes: runner logs, build errors, git changes, running tasks
-6. Claude uses `--print` mode; Gemini uses piped stdin via PowerShell script
+3. Code activity monitor (every 30s) checks for deferred debug
+4. Debug prompt includes: runner logs, build errors, git changes, running tasks
+5. Claude uses `--print` mode; Gemini uses piped stdin via PowerShell script
 
 ## Code Standards
 
