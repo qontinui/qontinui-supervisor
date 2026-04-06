@@ -633,6 +633,21 @@ pub async fn spawn_test(
                             format!("Test runner '{}' is healthy (took {}ms)", name, wait_ms),
                         )
                         .await;
+
+                    // Clear localStorage for this port to avoid stale tab state
+                    let clear_url = format!(
+                        "http://localhost:{}/ui-bridge/control/clear-storage",
+                        port
+                    );
+                    if let Err(e) = client
+                        .post(&clear_url)
+                        .json(&serde_json::json!({}))
+                        .send()
+                        .await
+                    {
+                        tracing::warn!("Failed to clear storage for test runner: {}", e);
+                    }
+
                     break;
                 }
                 _ => continue,
