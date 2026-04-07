@@ -11,7 +11,7 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
     clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
-    kill_webview2_processes,
+    kill_webview2_processes, remove_webview2_user_data_folder, webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -242,7 +242,8 @@ async fn start_exe_mode_for_runner(
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", managed.config.port.to_string());
+            .env("QONTINUI_PORT", managed.config.port.to_string())
+            .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
 
         // Non-primary runners get QONTINUI_INSTANCE_NAME to skip scheduler
         // and QONTINUI_PRIMARY_PORT so they can proxy process commands to the primary
@@ -251,6 +252,32 @@ async fn start_exe_mode_for_runner(
             // Find the primary runner's port for process log proxying
             if let Some(primary) = state.get_primary().await {
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+        }
+
+        // Per-runner WebView2 data dir — non-primary runners get isolated
+        // localStorage, IndexedDB, cookies, and caches. Primary keeps the
+        // default path so its existing state (auth, terminal layouts, etc.)
+        // is preserved. This prevents state bleed-over when spawning temp
+        // test runners and eliminates the "216 restored terminals" problem
+        // where one runner's persisted UI state floods every other runner.
+        if let Some(webview_dir) =
+            webview2_user_data_folder(&managed.config.id, managed.config.is_primary)
+        {
+            if !managed.config.is_primary {
+                // Ensure the folder exists so WebView2 doesn't race to create
+                // it against the parent dir's permissions.
+                if let Err(e) = std::fs::create_dir_all(&webview_dir) {
+                    warn!(
+                        "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
+                        webview_dir, managed.config.name, e
+                    );
+                }
+                info!(
+                    "Runner '{}' using isolated WebView2 data dir: {:?}",
+                    managed.config.name, webview_dir
+                );
+                cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
             }
         }
 
@@ -265,12 +292,22 @@ async fn start_exe_mode_for_runner(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", managed.config.port.to_string());
+            .env("QONTINUI_PORT", managed.config.port.to_string())
+            .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
 
         if !managed.config.is_primary {
             cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
             if let Some(primary) = state.get_primary().await {
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
+            }
+            // Per-runner WebView2 data dir (see Windows branch for rationale).
+            // On non-Windows the variable is ignored by other webview backends,
+            // so this is harmless but keeps behavior consistent.
+            if let Some(webview_dir) =
+                webview2_user_data_folder(&managed.config.id, false)
+            {
+                let _ = std::fs::create_dir_all(&webview_dir);
+                cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
             }
         }
 
@@ -496,6 +533,18 @@ pub async fn stop_runner_by_id(
                 "Removed ephemeral test runner '{}' (id: {}) from state",
                 runner_name, runner_id
             );
+        }
+        drop(runners);
+        // Also remove the test runner's isolated WebView2 data folder so its
+        // localStorage, cookies, and caches don't accumulate on disk.
+        #[cfg(windows)]
+        {
+            if let Err(e) = remove_webview2_user_data_folder(&runner_id, false).await {
+                warn!(
+                    "Failed to remove WebView2 data folder for test runner '{}': {}",
+                    runner_id, e
+                );
+            }
         }
     }
 

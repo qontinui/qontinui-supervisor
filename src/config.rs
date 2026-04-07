@@ -206,7 +206,7 @@ impl SupervisorConfig {
     pub fn runner_exe_path(&self) -> PathBuf {
         self.runner_npm_dir()
             .join("target")
-            .join("debug")
+            .join("release")
             .join("qontinui-runner.exe")
     }
 
@@ -215,7 +215,7 @@ impl SupervisorConfig {
     pub fn runner_exe_copy_path(&self, runner_id: &str) -> PathBuf {
         self.runner_npm_dir()
             .join("target")
-            .join("debug")
+            .join("release")
             .join(format!("qontinui-runner-{}.exe", runner_id))
     }
 
@@ -374,8 +374,8 @@ mod tests {
         let config = SupervisorConfig::from_args(args);
         let exe_path = config.runner_exe_path();
         assert!(
-            exe_path.ends_with("target/debug/qontinui-runner.exe")
-                || exe_path.ends_with("target\\debug\\qontinui-runner.exe")
+            exe_path.ends_with("target/release/qontinui-runner.exe")
+                || exe_path.ends_with("target\\release\\qontinui-runner.exe")
         );
     }
 

@@ -183,6 +183,73 @@ pub async fn kill_webview2_processes() -> anyhow::Result<bool> {
     taskkill_by_name("msedgewebview2.exe", true).await
 }
 
+/// Return the WebView2 user data folder for a given runner id.
+///
+/// - The primary runner uses the default path `com.qontinui.runner\EBWebView`
+///   (unchanged) so existing auth, terminal layouts, and other local state
+///   are preserved.
+/// - All other runners (named secondaries, temp `test-*` runners) get a
+///   per-runner subdirectory `com.qontinui.runner\EBWebView-{id}` so their
+///   localStorage, IndexedDB, cookies, and WebView2 caches are isolated from
+///   the primary and from each other. This is what the runner process sees
+///   via the `WEBVIEW2_USER_DATA_FOLDER` env var.
+///
+/// Returns `None` if `LOCALAPPDATA` is not set (non-Windows or broken env).
+pub fn webview2_user_data_folder(runner_id: &str, is_primary: bool) -> Option<std::path::PathBuf> {
+    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
+    let base = std::path::PathBuf::from(local_app_data).join("com.qontinui.runner");
+    if is_primary {
+        Some(base.join("EBWebView"))
+    } else {
+        // Sanitize id for filesystem use (alphanumerics, dash, underscore only).
+        let safe_id: String = runner_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Some(base.join(format!("EBWebView-{}", safe_id)))
+    }
+}
+
+/// Remove a non-primary runner's WebView2 data folder. Used when a temp
+/// runner is deleted so its state doesn't accumulate on disk.
+///
+/// Refuses to touch the primary runner's folder as a safety check — always
+/// pass `is_primary: false`. Returns `Ok(false)` if the folder didn't exist
+/// (nothing to clean up).
+pub async fn remove_webview2_user_data_folder(
+    runner_id: &str,
+    is_primary: bool,
+) -> anyhow::Result<bool> {
+    if is_primary {
+        anyhow::bail!("refusing to remove the primary runner's WebView2 data folder");
+    }
+    let Some(folder) = webview2_user_data_folder(runner_id, false) else {
+        return Ok(false);
+    };
+    if !folder.exists() {
+        return Ok(false);
+    }
+    match tokio::fs::remove_dir_all(&folder).await {
+        Ok(()) => {
+            info!("Removed WebView2 data folder for runner '{}' at {:?}", runner_id, folder);
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to remove WebView2 data folder for runner '{}' at {:?}: {}",
+                runner_id, folder, e
+            );
+            Err(e.into())
+        }
+    }
+}
+
 /// Clear WebView2 browser cache directories for the runner app.
 /// Must be called after WebView2 processes are killed, otherwise files are locked.
 /// This forces the WebView2 runtime to re-fetch all JavaScript modules on next

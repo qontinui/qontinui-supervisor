@@ -15,6 +15,8 @@ use crate::process::manager;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState};
 use std::sync::Arc;
+#[cfg(windows)]
+use tracing::warn;
 
 #[derive(Deserialize)]
 pub struct AddRunnerRequest {
@@ -201,6 +203,22 @@ pub async fn remove_runner(
 
     let path = settings::settings_path(&state.config);
     settings::remove_runner(&path, &id);
+
+    // Best-effort: remove the runner's isolated WebView2 data folder so its
+    // localStorage, cookies, and caches don't accumulate on disk. Primary
+    // runners are never reached here (the is_primary check above returns
+    // early), so this always targets a non-primary folder.
+    #[cfg(windows)]
+    {
+        if let Err(e) =
+            crate::process::windows::remove_webview2_user_data_folder(&id, false).await
+        {
+            warn!(
+                "Failed to remove WebView2 data folder for runner '{}': {}",
+                id, e
+            );
+        }
+    }
 
     state
         .logs
