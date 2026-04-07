@@ -11,7 +11,8 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
     clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
-    kill_webview2_processes, remove_webview2_user_data_folder, webview2_user_data_folder,
+    kill_webview2_processes, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
+    webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -543,6 +544,16 @@ pub async fn stop_runner_by_id(
                 warn!(
                     "Failed to remove WebView2 data folder for test runner '{}': {}",
                     runner_id, e
+                );
+            }
+            // And the per-instance app data dirs (dev-logs, restate journal,
+            // macros, prompts, playwright, contexts) — keyed off the config
+            // name because that's what the runner received as
+            // QONTINUI_INSTANCE_NAME.
+            if let Err(e) = remove_runner_app_data_dirs(&runner_name, false).await {
+                warn!(
+                    "Failed to remove per-instance app data for test runner '{}': {}",
+                    runner_name, e
                 );
             }
         }

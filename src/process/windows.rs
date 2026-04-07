@@ -250,6 +250,95 @@ pub async fn remove_webview2_user_data_folder(
     }
 }
 
+/// Remove per-instance app-data directories for a non-primary runner.
+///
+/// The runner's `crate::instance::scope_path()` helper writes per-runner
+/// dev logs, macros, prompts, playwright tests, contexts, and Restate journals
+/// under an `instance-<sanitized_name>` subdirectory of several base locations.
+/// When a temp runner is deleted we clean these up so disk usage doesn't grow
+/// unbounded.
+///
+/// `runner_name` must be the `managed.config.name` value that the supervisor
+/// passed to the runner as `QONTINUI_INSTANCE_NAME` — not the runner's id.
+///
+/// Refuses to touch anything for primary runners as a safety check.
+pub async fn remove_runner_app_data_dirs(
+    runner_name: &str,
+    is_primary: bool,
+) -> anyhow::Result<u32> {
+    if is_primary {
+        anyhow::bail!("refusing to remove the primary runner's app data dirs");
+    }
+
+    // Mirror runner's sanitize() in src-tauri/src/instance.rs.
+    let safe_name: String = runner_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let subdir = format!("instance-{}", safe_name);
+
+    let local_app_data = std::env::var("LOCALAPPDATA").ok().map(std::path::PathBuf::from);
+    let roaming_app_data = std::env::var("APPDATA").ok().map(std::path::PathBuf::from);
+
+    // Each runner path helper applies scope_path at a slightly different
+    // nesting level. Enumerate every known landing spot so all per-instance
+    // state gets cleaned up.
+    let candidates: Vec<std::path::PathBuf> = [
+        // dev-logs: base is `.../qontinui-runner/dev-logs`, so the instance
+        // dir lands inside dev-logs (see src/paths.rs::get_dev_logs_dir).
+        local_app_data
+            .as_ref()
+            .map(|p| p.join("qontinui-runner").join("dev-logs").join(&subdir)),
+        // macros, ai_workflows: base is `.../qontinui-runner`.
+        local_app_data
+            .as_ref()
+            .map(|p| p.join("qontinui-runner").join(&subdir)),
+        // prompts, playwright, contexts: base is `.../com.qontinui.runner`.
+        local_app_data
+            .as_ref()
+            .map(|p| p.join("com.qontinui.runner").join(&subdir)),
+        roaming_app_data
+            .as_ref()
+            .map(|p| p.join("com.qontinui.runner").join(&subdir)),
+        // Restate journal: base is dirs::data_dir()/qontinui-runner/restate/data.
+        roaming_app_data
+            .as_ref()
+            .map(|p| p.join("qontinui-runner").join("restate").join("data").join(&subdir)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut removed = 0u32;
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {
+                info!(
+                    "Removed per-instance app data for runner '{}' at {:?}",
+                    runner_name, path
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to remove per-instance app data at {:?}: {}",
+                    path, e
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Clear WebView2 browser cache directories for the runner app.
 /// Must be called after WebView2 processes are killed, otherwise files are locked.
 /// This forces the WebView2 runtime to re-fetch all JavaScript modules on next

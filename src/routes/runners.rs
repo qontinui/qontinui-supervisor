@@ -218,6 +218,20 @@ pub async fn remove_runner(
                 id, e
             );
         }
+
+        // Also remove per-instance app data dirs (dev-logs, restate journal,
+        // macros, prompts, playwright, contexts) that the runner writes under
+        // an `instance-<name>` subdirectory. The runner sees the env var
+        // `QONTINUI_INSTANCE_NAME = <managed.config.name>`, so cleanup keys
+        // off the name, not the id.
+        if let Err(e) =
+            crate::process::windows::remove_runner_app_data_dirs(&name, false).await
+        {
+            warn!(
+                "Failed to remove per-instance app data for runner '{}': {}",
+                name, e
+            );
+        }
     }
 
     state
