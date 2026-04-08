@@ -201,21 +201,28 @@ impl SupervisorConfig {
     }
 
     /// Path to the runner executable (for exe mode).
-    /// Cargo builds into the workspace root's target directory (parent of src-tauri),
-    /// not the package directory's target.
+    ///
+    /// Cargo builds into the workspace root's target directory (parent of
+    /// src-tauri), not the package directory's target. `build_monitor::run_cargo_build`
+    /// runs `cargo build --bin qontinui-runner` (no `--release` flag), so the
+    /// fresh artifact lives under `target/debug/`, not `target/release/`.
+    /// Pointing this at release caused `spawn-test {rebuild:true}` to rebuild
+    /// debug and then silently launch a stale release binary.
     pub fn runner_exe_path(&self) -> PathBuf {
         self.runner_npm_dir()
             .join("target")
-            .join("release")
+            .join("debug")
             .join("qontinui-runner.exe")
     }
 
     /// Path to a copied runner executable for non-primary runners.
     /// This avoids locking the main build artifact so dev-mode rebuilds succeed.
+    /// Lives alongside the source exe under `target/debug/` so it picks up the
+    /// same incremental build outputs (DLLs, PDBs, etc.) as the original.
     pub fn runner_exe_copy_path(&self, runner_id: &str) -> PathBuf {
         self.runner_npm_dir()
             .join("target")
-            .join("release")
+            .join("debug")
             .join(format!("qontinui-runner-{}.exe", runner_id))
     }
 
@@ -374,8 +381,8 @@ mod tests {
         let config = SupervisorConfig::from_args(args);
         let exe_path = config.runner_exe_path();
         assert!(
-            exe_path.ends_with("target/release/qontinui-runner.exe")
-                || exe_path.ends_with("target\\release\\qontinui-runner.exe")
+            exe_path.ends_with("target/debug/qontinui-runner.exe")
+                || exe_path.ends_with("target\\debug\\qontinui-runner.exe")
         );
     }
 
