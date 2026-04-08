@@ -216,6 +216,7 @@ pub fn build_router(state: SharedState) -> Router {
             "/runners/spawn-test",
             post(crate::routes::runners::spawn_test),
         )
+        .route("/builds", get(crate::routes::runners::list_builds))
         .route(
             "/runners/{id}",
             delete(crate::routes::runners::remove_runner),

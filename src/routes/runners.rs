@@ -3,6 +3,7 @@
 //! New endpoints for managing multiple runner instances independently.
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
@@ -515,6 +516,15 @@ pub struct SpawnTestRequest {
     /// Only used when `wait` is true. Default: 120 seconds.
     #[serde(default = "default_wait_timeout")]
     pub wait_timeout_secs: u64,
+    /// Optional hint identifying who requested this build (e.g. an agent name).
+    /// Recorded with the active build info for `GET /builds` visibility.
+    #[serde(default)]
+    pub requester_id: Option<String>,
+    /// Maximum seconds to wait in the build queue before giving up with 504.
+    /// Only meaningful when `rebuild: true` and all slots are busy.
+    /// `None` means wait indefinitely (the default).
+    #[serde(default)]
+    pub queue_timeout_secs: Option<u64>,
 }
 
 fn default_wait_timeout() -> u64 {
@@ -527,68 +537,147 @@ fn default_wait_timeout() -> u64 {
 /// starts it, and returns the connection details. The runner is not protected
 /// and not persisted to settings — it gets cleaned up on primary restart or
 /// explicit stop.
+///
+/// ## Queue behavior when `rebuild: true`
+///
+/// The supervisor runs a fixed pool of N parallel cargo builds (default 3).
+/// When all slots are busy and a caller sets `rebuild: true`:
+///
+/// - **Default (blocking):** The HTTP request is held open until a slot frees,
+///   then the build and spawn proceed. Pass `queue_timeout_secs` to bound the wait.
+/// - **`X-Queue-Mode: no-wait` header:** Returns immediately with 503 and a body
+///   describing current build slot activity and the caller's queue position.
 pub async fn spawn_test(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<SpawnTestRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    // Find next available port by checking existing runners
-    let used_ports: Vec<u16> = {
-        let runners = state.runners.read().await;
-        runners.values().map(|r| r.config.port).collect()
-    };
+    let no_wait = headers
+        .get("X-Queue-Mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("no-wait"))
+        .unwrap_or(false);
 
-    let port = (9877..=9899)
-        .find(|p| !used_ports.contains(p))
-        .ok_or_else(|| {
-            SupervisorError::Validation(
-                "No available ports in range 9877-9899. Stop some test runners first.".to_string(),
-            )
-        })?;
+    // Atomically reserve a free port AND insert a placeholder ManagedRunner
+    // into the registry under a single write lock. Without this, two
+    // concurrent `spawn-test` calls with `rebuild: true` would both scan the
+    // port set (under read lock) before either insertion happened, and both
+    // would pick the same free port — the second spawn would then collide.
+    //
+    // We insert the ManagedRunner before the (potentially long) build so
+    // subsequent scanners see the reservation. If the build fails, the
+    // placeholder is removed.
+    let (id, port) = {
+        let mut runners = state.runners.write().await;
+        let used_ports: std::collections::HashSet<u16> =
+            runners.values().map(|r| r.config.port).collect();
+        let port = (9877..=9899)
+            .find(|p| !used_ports.contains(p))
+            .ok_or_else(|| {
+                SupervisorError::Validation(
+                    "No available ports in range 9877-9899. Stop some test runners first."
+                        .to_string(),
+                )
+            })?;
+        let id = format!("test-{}", uuid_simple());
+        let name = format!("test-{}", port);
+        let runner_config = RunnerConfig {
+            id: id.clone(),
+            name,
+            port,
+            is_primary: false,
+            protected: true,
+        };
+        runners.insert(id.clone(), Arc::new(ManagedRunner::new(runner_config, false)));
+        (id, port)
+    };
 
     // Rebuild if requested
     if body.rebuild {
+        // If caller opted out of waiting AND all slots are currently busy,
+        // return 503 with queue info instead of blocking.
+        if no_wait && state.build_pool.permits.available_permits() == 0 {
+            let snap = state.build_pool.snapshot().await;
+            let active: Vec<serde_json::Value> = snap
+                .iter()
+                .filter_map(|(id, _td, info)| {
+                    info.as_ref().map(|i| {
+                        json!({
+                            "slot": id,
+                            "started_at": i.started_at.to_rfc3339(),
+                            "elapsed_secs": (chrono::Utc::now() - i.started_at).num_seconds().max(0),
+                            "requester_id": i.requester_id,
+                            "rebuild_kind": i.rebuild_kind,
+                        })
+                    })
+                })
+                .collect();
+            let queued = state
+                .build_pool
+                .queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed);
+            return Err(SupervisorError::BuildPoolFull {
+                queue_position: queued + 1,
+                active_builds: active,
+            });
+        }
+
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 LogLevel::Info,
                 format!(
-                    "Rebuilding runner before spawning test runner on port {}",
-                    port
+                    "Rebuilding runner before spawning test runner on port {} (requester={:?})",
+                    port, body.requester_id
                 ),
             )
             .await;
-        crate::build_monitor::run_cargo_build(&state).await?;
+
+        // Run the build, optionally bounded by a queue timeout.
+        // On any failure (build error, timeout, etc.), remove the placeholder
+        // we reserved above so the port doesn't leak.
+        let build_fut = crate::build_monitor::run_cargo_build_with_requester(
+            &state,
+            body.requester_id.clone(),
+        );
+        let build_result = match body.queue_timeout_secs {
+            Some(secs) => {
+                let timeout = std::time::Duration::from_secs(secs);
+                match tokio::time::timeout(timeout, build_fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(SupervisorError::Timeout(format!(
+                        "Build queue timeout: waited {}s for a build slot",
+                        secs
+                    ))),
+                }
+            }
+            None => build_fut.await,
+        };
+        if let Err(e) = build_result {
+            // Release the placeholder port reservation.
+            let mut runners = state.runners.write().await;
+            runners.remove(&id);
+            return Err(e);
+        }
     }
 
-    // Check that the exe exists
-    let exe_path = state.config.runner_exe_path();
-    if !exe_path.exists() {
-        return Err(SupervisorError::Process(format!(
-            "Runner binary not found at {:?}. Use rebuild: true to build it first.",
-            exe_path
-        )));
+    // Check that a runner binary exists in some build slot (or at the legacy path).
+    // Without this check, a fresh supervisor would succeed the request only to
+    // fail inside `start_runner_by_id` with a less helpful error. If the check
+    // fails, remove the placeholder we reserved above so the port frees up.
+    if manager::resolve_source_exe(&state).await.is_err() {
+        let mut runners = state.runners.write().await;
+        runners.remove(&id);
+        return Err(SupervisorError::Process(
+            "Runner binary not found in any build slot. Use rebuild: true to build it first.".to_string()
+        ));
     }
 
-    let id = format!("test-{}", uuid_simple());
     let name = format!("test-{}", port);
 
-    let runner_config = RunnerConfig {
-        id: id.clone(),
-        name: name.clone(),
-        port,
-        is_primary: false,
-        protected: true,
-    };
-
-    // Insert into state (not persisted — ephemeral)
-    let managed = Arc::new(ManagedRunner::new(runner_config, false));
-    {
-        let mut runners = state.runners.write().await;
-        runners.insert(id.clone(), managed);
-    }
-
-    // Start the runner
+    // Start the runner (the placeholder ManagedRunner is already in the registry
+    // under `id` from the atomic port-reservation block above).
     if let Err(e) = manager::start_runner_by_id(&state, &id).await {
         // Clean up on failure
         let mut runners = state.runners.write().await;
@@ -703,6 +792,55 @@ pub async fn spawn_test(
             format!("Test runner spawned on port {}", port)
         }
     })))
+}
+
+// --- Build pool visibility ---
+
+/// GET /builds — snapshot of the parallel build pool.
+///
+/// Returns the pool size, the state of each slot, and the number of callers
+/// currently waiting in the queue. Agents use this to decide whether a
+/// rebuild request will be quick or will have to wait.
+pub async fn list_builds(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let snap = state.build_pool.snapshot().await;
+    let now = chrono::Utc::now();
+    let slots: Vec<serde_json::Value> = snap
+        .into_iter()
+        .map(|(id, target_dir, info)| match info {
+            Some(i) => {
+                let elapsed = (now - i.started_at).num_seconds().max(0);
+                json!({
+                    "id": id,
+                    "target_dir": target_dir.to_string_lossy(),
+                    "state": "building",
+                    "started_at": i.started_at.to_rfc3339(),
+                    "elapsed_secs": elapsed,
+                    "requester_id": i.requester_id,
+                    "rebuild_kind": i.rebuild_kind,
+                })
+            }
+            None => json!({
+                "id": id,
+                "target_dir": target_dir.to_string_lossy(),
+                "state": "idle",
+            }),
+        })
+        .collect();
+    let queued = state
+        .build_pool
+        .queue_depth
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let last_successful = *state.build_pool.last_successful_slot.read().await;
+    let available = state.build_pool.permits.available_permits();
+    Json(json!({
+        "pool_size": state.build_pool.slots.len(),
+        "available_permits": available,
+        "queued": queued,
+        "last_successful_slot": last_successful,
+        "slots": slots,
+    }))
 }
 
 // --- Helpers ---

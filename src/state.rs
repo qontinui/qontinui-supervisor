@@ -9,9 +9,11 @@ use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use tokio::process::Child;
-use tokio::sync::{broadcast, watch, Notify, RwLock};
+use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
 
 pub type SharedState = Arc<SupervisorState>;
 
@@ -57,6 +59,8 @@ pub struct SupervisorState {
     pub runner: RwLock<RunnerState>,
     pub watchdog: RwLock<WatchdogState>,
     pub build: RwLock<BuildState>,
+    /// Parallel cargo build slot pool. Semaphore permits + per-slot target dirs.
+    pub build_pool: BuildPool,
     pub ai: RwLock<AiState>,
     pub code_activity: RwLock<CodeActivityState>,
     pub expo: RwLock<ExpoState>,
@@ -98,11 +102,122 @@ pub struct WatchdogState {
 }
 
 pub struct BuildState {
+    /// True when at least one build slot is busy.
+    ///
+    /// Maintained by `run_cargo_build`: set to true whenever a permit is
+    /// acquired (first slot goes busy), cleared when the last active slot
+    /// releases its permit. Existing readers (health endpoint, smart rebuild,
+    /// overnight watchdog, process manager) observe this as a coarse
+    /// "is the supervisor currently compiling anything" signal.
     pub build_in_progress: bool,
     pub build_error_detected: bool,
     pub last_build_error: Option<String>,
     pub last_build_at: Option<DateTime<Utc>>,
     pub last_build_stderr: Option<String>,
+}
+
+/// Metadata for an active build on a specific slot.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildInfo {
+    pub started_at: DateTime<Utc>,
+    pub requester_id: Option<String>,
+    /// What kind of rebuild: "dev" or "exe" (custom-protocol/embedded frontend).
+    pub rebuild_kind: String,
+}
+
+/// One slot in the parallel build pool.
+///
+/// Each slot has its own `CARGO_TARGET_DIR` so concurrent `cargo build`s do
+/// not clobber each other's `target/`. The `busy` field is guarded by its
+/// own lock so the slot state can be inspected without holding the larger
+/// `SupervisorState::build` lock.
+pub struct BuildSlot {
+    pub id: usize,
+    pub target_dir: PathBuf,
+    pub busy: RwLock<Option<BuildInfo>>,
+}
+
+/// Pool of parallel build slots.
+///
+/// Acquisition protocol:
+/// 1. Wait on `permits.acquire_owned().await` (blocks until a slot is free).
+/// 2. Scan `slots` for the first one whose `busy.is_none()`, flip it to `Some(..)`.
+/// 3. Run cargo build with `CARGO_TARGET_DIR = slot.target_dir`.
+/// 4. On completion, flip `slot.busy = None`; the permit is dropped automatically.
+///
+/// `npm_lock` serializes frontend (`npm run build`) invocations: the Tauri
+/// binary embeds a single `dist/` directory via `rust-embed`, and two
+/// concurrent npm builds would corrupt it. The lock is held only for the npm
+/// step (~12s), not the whole cargo build (~3min), so it's a much smaller
+/// serialization point than the legacy global build flag.
+pub struct BuildPool {
+    pub slots: Vec<Arc<BuildSlot>>,
+    pub permits: Arc<Semaphore>,
+    pub npm_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Number of callers currently waiting on `permits.acquire_owned()`.
+    /// Incremented by `spawn-test` handler before awaiting, decremented after
+    /// acquiring or timing out.
+    pub queue_depth: Arc<AtomicUsize>,
+    /// The slot id whose target dir holds the most recently successfully built
+    /// binary. Used by `spawn-test {rebuild: false}` to locate the exe to copy.
+    /// `None` at startup until the first successful build.
+    pub last_successful_slot: RwLock<Option<usize>>,
+}
+
+impl BuildPool {
+    pub fn new(config: &SupervisorConfig) -> Self {
+        let pool_size = config.build_pool.pool_size.max(1);
+        let mut slots = Vec::with_capacity(pool_size);
+        for id in 0..pool_size {
+            let target_dir = config.runner_slot_target_dir(id);
+            // Create the dir eagerly so cargo doesn't race on it.
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                tracing::warn!(
+                    "Failed to create build slot target dir {:?}: {}",
+                    target_dir,
+                    e
+                );
+            }
+            slots.push(Arc::new(BuildSlot {
+                id,
+                target_dir,
+                busy: RwLock::new(None),
+            }));
+        }
+        Self {
+            slots,
+            permits: Arc::new(Semaphore::new(pool_size)),
+            npm_lock: Arc::new(tokio::sync::Mutex::new(())),
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            last_successful_slot: RwLock::new(None),
+        }
+    }
+
+    /// Scan slots and return a snapshot of (slot_id, Option<BuildInfo>) pairs
+    /// for the `GET /builds` endpoint.
+    pub async fn snapshot(&self) -> Vec<(usize, PathBuf, Option<BuildInfo>)> {
+        let mut out = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let info = slot.busy.read().await.clone();
+            out.push((slot.id, slot.target_dir.clone(), info));
+        }
+        out
+    }
+
+    /// Claim the first idle slot, marking it busy with the given metadata.
+    /// Assumes the caller has already acquired a permit, so at least one slot
+    /// is idle.
+    pub async fn claim_idle_slot(&self, info: BuildInfo) -> Arc<BuildSlot> {
+        for slot in &self.slots {
+            let mut busy = slot.busy.write().await;
+            if busy.is_none() {
+                *busy = Some(info.clone());
+                return slot.clone();
+            }
+        }
+        // Unreachable: semaphore guarantees an idle slot exists.
+        panic!("claim_idle_slot called with no idle slots; semaphore invariant violated");
+    }
 }
 
 pub struct AiState {
@@ -169,12 +284,15 @@ impl SupervisorState {
             runners_map.insert(rc.id.clone(), managed);
         }
 
+        let build_pool = BuildPool::new(&config);
+
         Self {
             config,
             runners: RwLock::new(runners_map),
             runner: RwLock::new(RunnerState::new()),
             watchdog: RwLock::new(WatchdogState::new(watchdog_enabled)),
             build: RwLock::new(BuildState::new()),
+            build_pool,
             ai: RwLock::new(AiState::new(auto_debug)),
             code_activity: RwLock::new(CodeActivityState::new()),
             expo: RwLock::new(ExpoState::new(expo_port)),
@@ -428,6 +546,7 @@ mod tests {
             expo_dir: None,
             expo_port: EXPO_PORT,
             runners: vec![RunnerConfig::default_primary()],
+            build_pool: crate::config::BuildPoolConfig { pool_size: 1 },
         }
     }
 

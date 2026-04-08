@@ -13,8 +13,20 @@ pub enum SupervisorError {
     #[error("Runner not found: {0}")]
     RunnerNotFound(String),
 
+    /// Legacy variant — retained for call sites in `process/manager.rs` and
+    /// `routes/runner.rs` that report "build currently in progress". With the
+    /// parallel build pool, this is derived from "any slot busy".
     #[error("Build in progress")]
     BuildInProgress,
+
+    /// All build pool slots are busy AND the caller opted out of waiting via
+    /// `X-Queue-Mode: no-wait`. Body carries queue position and active build
+    /// slot info for the caller to decide whether to retry or skip.
+    #[error("Build pool full: all slots busy")]
+    BuildPoolFull {
+        queue_position: usize,
+        active_builds: Vec<serde_json::Value>,
+    },
 
     #[error("Build failed: {0}")]
     BuildFailed(String),
@@ -46,11 +58,28 @@ pub enum SupervisorError {
 
 impl IntoResponse for SupervisorError {
     fn into_response(self) -> Response {
+        match &self {
+            SupervisorError::BuildPoolFull {
+                queue_position,
+                active_builds,
+            } => {
+                let body = serde_json::json!({
+                    "error": "build_pool_full",
+                    "message": self.to_string(),
+                    "queue_position": queue_position,
+                    "active_builds": active_builds,
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+            }
+            _ => {}
+        }
+
         let status = match &self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
+            SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::WorkflowLoopAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::WorkflowLoopNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,

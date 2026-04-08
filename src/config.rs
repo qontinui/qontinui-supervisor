@@ -59,6 +59,31 @@ pub struct SupervisorConfig {
     pub expo_port: u16,
     /// Runner configurations. If empty at startup, a default primary runner is created.
     pub runners: Vec<RunnerConfig>,
+    /// Parallel cargo build pool configuration.
+    pub build_pool: BuildPoolConfig,
+}
+
+/// Configuration for the parallel cargo build pool.
+///
+/// Each slot gets its own `CARGO_TARGET_DIR` so concurrent `cargo build`s do not
+/// contend on a shared `target/`. Source tree is shared (live working tree);
+/// callers accept the same source-mutation race that single-build today already has.
+#[derive(Debug, Clone)]
+pub struct BuildPoolConfig {
+    /// Number of concurrent cargo builds allowed. Default: 3.
+    /// Override via env var `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`.
+    pub pool_size: usize,
+}
+
+impl Default for BuildPoolConfig {
+    fn default() -> Self {
+        let pool_size = std::env::var("QONTINUI_SUPERVISOR_BUILD_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3);
+        Self { pool_size }
+    }
 }
 
 /// Configuration for a single managed runner instance.
@@ -197,7 +222,27 @@ impl SupervisorConfig {
             expo_port: EXPO_PORT,
             // Default: single primary runner; settings may override later
             runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig::default(),
         }
+    }
+
+    /// Target directory for a given build slot.
+    ///
+    /// Each slot gets its own `target-pool/slot-{k}/` under the runner npm dir
+    /// (workspace root). Cargo respects `CARGO_TARGET_DIR` and writes all
+    /// artifacts here, so slots never contend on the same `target/`.
+    pub fn runner_slot_target_dir(&self, slot_id: usize) -> PathBuf {
+        self.runner_npm_dir()
+            .join("target-pool")
+            .join(format!("slot-{}", slot_id))
+    }
+
+    /// Path to the runner executable inside a specific slot's target dir.
+    /// Used by the binary copy step after a per-slot cargo build completes.
+    pub fn runner_exe_path_for_slot(&self, slot_id: usize) -> PathBuf {
+        self.runner_slot_target_dir(slot_id)
+            .join("debug")
+            .join("qontinui-runner.exe")
     }
 
     /// Path to the runner executable (for exe mode).

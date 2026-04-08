@@ -11,7 +11,8 @@ use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::windows::cleanup_orphaned_build_processes;
-use crate::state::SharedState;
+use crate::state::{BuildInfo, BuildSlot, SharedState};
+use std::sync::Arc;
 
 static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
@@ -26,13 +27,49 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 /// Run `cargo build` for the runner project.
+///
+/// Claims a slot from the build pool (blocking on the semaphore if all slots
+/// are busy), sets `CARGO_TARGET_DIR` to the slot's isolated target dir, and
+/// runs cargo. Concurrent calls execute in parallel up to `pool_size`.
+///
+/// `requester_id` is an optional hint (e.g. an agent name) stored with the
+/// active build for visibility via `GET /builds`.
 pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError> {
-    // Atomically check and mark build started (single write lock avoids TOCTOU race)
+    run_cargo_build_with_requester(state, None).await
+}
+
+/// Same as `run_cargo_build` but records a requester_id for queue visibility.
+pub async fn run_cargo_build_with_requester(
+    state: &SharedState,
+    requester_id: Option<String>,
+) -> Result<(), SupervisorError> {
+    // Acquire a permit from the build pool. Blocks until a slot is free.
+    // Queue depth counter lets `GET /builds` report how many callers are waiting.
+    state
+        .build_pool
+        .queue_depth
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let permit_result = state.build_pool.permits.clone().acquire_owned().await;
+    state
+        .build_pool
+        .queue_depth
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let _permit = permit_result.map_err(|_| {
+        SupervisorError::Other("Build pool semaphore closed".to_string())
+    })?;
+
+    // Claim a slot and mark it busy with our BuildInfo.
+    let info = BuildInfo {
+        started_at: chrono::Utc::now(),
+        requester_id,
+        rebuild_kind: if state.config.dev_mode { "dev".to_string() } else { "exe".to_string() },
+    };
+    let slot = state.build_pool.claim_idle_slot(info).await;
+
+    // Update legacy build flag for external consumers (health API, smart rebuild,
+    // overnight watchdog). Flag is true whenever any slot is busy.
     {
         let mut build = state.build.write().await;
-        if build.build_in_progress {
-            return Err(SupervisorError::BuildInProgress);
-        }
         build.build_in_progress = true;
         build.build_error_detected = false;
         build.last_build_error = None;
@@ -43,9 +80,19 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 
     state
         .logs
-        .emit(LogSource::Build, LogLevel::Info, "Starting cargo build...")
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "Starting cargo build on slot {} (target: {:?})",
+                slot.id, slot.target_dir
+            ),
+        )
         .await;
-    info!("Starting cargo build in {:?}", state.config.project_dir);
+    info!(
+        "Starting cargo build on slot {} in {:?} (CARGO_TARGET_DIR={:?})",
+        slot.id, state.config.project_dir, slot.target_dir
+    );
 
     state
         .diagnostics
@@ -61,16 +108,30 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
     cleanup_orphaned_build_processes().await;
 
     // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit)
-    wait_for_exe_unlocked(state).await;
+    wait_for_exe_unlocked_for_slot(state, &slot).await;
 
     let build_start = std::time::Instant::now();
-    let result = run_build_inner(state).await;
+    let result = run_build_inner(state, &slot).await;
     let duration_secs = build_start.elapsed().as_secs_f64();
 
-    // Mark build complete
+    // Release the slot (mark busy = None).
+    {
+        let mut busy = slot.busy.write().await;
+        *busy = None;
+    }
+
+    // If this build succeeded, record the slot as the most recent successful one.
+    // Readers of `rebuild: false` use this to locate the exe to copy.
+    if result.is_ok() {
+        let mut last = state.build_pool.last_successful_slot.write().await;
+        *last = Some(slot.id);
+    }
+
+    // Recompute legacy build_in_progress flag: true iff any slot is still busy.
+    let any_busy = any_slot_busy(state).await;
     {
         let mut build = state.build.write().await;
-        build.build_in_progress = false;
+        build.build_in_progress = any_busy;
         if let Err(ref e) = result {
             build.build_error_detected = true;
             build.last_build_error = Some(e.to_string());
@@ -89,13 +150,32 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 
     state.notify_health_change();
 
+    // Permit drops here, releasing the slot for the next waiter.
+    drop(_permit);
+
     result
 }
 
-async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
+/// Scan slots and return true if any has `busy.is_some()`.
+async fn any_slot_busy(state: &SharedState) -> bool {
+    for slot in &state.build_pool.slots {
+        if slot.busy.read().await.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+async fn run_build_inner(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
     // In exe mode the frontend is embedded in the binary via tauri_build, so we
     // must run `npm run build` first to produce a fresh dist/ before cargo build.
     // In dev mode Vite serves the frontend live, so this step is skipped.
+    //
+    // Frontend builds are serialized across slots via `build_pool.npm_lock`:
+    // Tauri's `rust-embed` pulls from a single `dist/` directory, so two
+    // concurrent npm builds would corrupt the output. The lock is held ONLY
+    // for the npm invocation (~12s), not the whole cargo build (~180s), so
+    // this is a much smaller serialization point than the legacy global flag.
     if !state.config.dev_mode {
         let npm_dir = state.config.runner_npm_dir();
         state
@@ -103,10 +183,21 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
             .emit(
                 LogSource::Build,
                 LogLevel::Info,
-                "Building frontend (npm run build)...",
+                format!("Slot {}: waiting for frontend build lock...", slot.id),
             )
             .await;
-        info!("Building frontend in {:?}", npm_dir);
+
+        let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!("Slot {}: building frontend (npm run build)...", slot.id),
+            )
+            .await;
+        info!("Slot {}: building frontend in {:?}", slot.id, npm_dir);
 
         #[cfg(windows)]
         let npm_result = {
@@ -134,22 +225,27 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
 
         match npm_result {
             Ok(output) if output.status.success() => {
-                info!("Frontend build succeeded");
+                info!("Slot {}: frontend build succeeded", slot.id);
                 state
                     .logs
-                    .emit(LogSource::Build, LogLevel::Info, "Frontend build succeeded")
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Info,
+                        format!("Slot {}: frontend build succeeded", slot.id),
+                    )
                     .await;
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Frontend build failed: {}", stderr);
+                warn!("Slot {}: frontend build failed: {}", slot.id, stderr);
                 state
                     .logs
                     .emit(
                         LogSource::Build,
                         LogLevel::Warn,
                         format!(
-                            "Frontend build failed: {}",
+                            "Slot {}: frontend build failed: {}",
+                            slot.id,
                             stderr.chars().take(500).collect::<String>()
                         ),
                     )
@@ -157,9 +253,10 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
                 // Continue with cargo build — the old dist/ may still be usable
             }
             Err(e) => {
-                warn!("Failed to spawn frontend build: {}", e);
+                warn!("Slot {}: failed to spawn frontend build: {}", slot.id, e);
             }
         }
+        // npm_guard drops here, releasing the frontend build lock before cargo starts.
     }
 
     #[cfg(windows)]
@@ -185,6 +282,9 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
         };
         cmd.args(&args)
             .current_dir(&state.config.project_dir)
+            // Redirect cargo output to this slot's isolated target dir so
+            // concurrent builds on other slots don't contend on the same target/.
+            .env("CARGO_TARGET_DIR", &slot.target_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
@@ -208,6 +308,7 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
         };
         cmd.args(&args)
             .current_dir(&state.config.project_dir)
+            .env("CARGO_TARGET_DIR", &slot.target_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.spawn()
@@ -316,10 +417,12 @@ async fn run_build_inner(state: &SharedState) -> Result<(), SupervisorError> {
     }
 }
 
-/// Wait for the runner exe to be writable (unlocked) before building.
-/// On Windows, the OS can hold file locks briefly after a process is killed.
-async fn wait_for_exe_unlocked(state: &SharedState) {
-    let exe_path = state.config.runner_exe_path();
+/// Wait for the runner exe in a specific slot's target dir to be writable
+/// (unlocked) before building. On Windows, the OS can hold file locks briefly
+/// after a process is killed.
+async fn wait_for_exe_unlocked_for_slot(state: &SharedState, slot: &Arc<BuildSlot>) {
+    let _ = state; // kept in signature for logging consistency
+    let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
     if !exe_path.exists() {
         return;
     }

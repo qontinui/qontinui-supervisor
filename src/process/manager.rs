@@ -27,6 +27,44 @@ pub fn is_temp_runner(runner_id: &str) -> bool {
     runner_id.starts_with("test-")
 }
 
+/// Locate the most recent successfully-built runner exe across the build pool.
+///
+/// Preference order:
+/// 1. The exe in the slot recorded as `last_successful_slot` (fresh build).
+/// 2. Any slot whose exe exists on disk (e.g. after a supervisor restart).
+/// 3. The legacy `runner_exe_path()` (default `target/debug/`) for builds
+///    that predate the build pool.
+pub async fn resolve_source_exe(
+    state: &SharedState,
+) -> Result<std::path::PathBuf, SupervisorError> {
+    // Preference 1: last successful slot.
+    if let Some(slot_id) = *state.build_pool.last_successful_slot.read().await {
+        let p = state.config.runner_exe_path_for_slot(slot_id);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // Preference 2: scan all slots for any existing exe (supervisor restart case).
+    for slot in &state.build_pool.slots {
+        let p = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // Preference 3: legacy path for pre-pool builds.
+    let legacy = state.config.runner_exe_path();
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+
+    Err(SupervisorError::Process(format!(
+        "Runner exe not found in any build slot or at legacy path {:?}. Run a build first.",
+        legacy
+    )))
+}
+
 // =============================================================================
 // Startup Cleanup
 // =============================================================================
@@ -90,13 +128,11 @@ pub async fn start_runner_by_id(
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
 
-    // Check if build is in progress
-    {
-        let build = state.build.read().await;
-        if build.build_in_progress {
-            return Err(SupervisorError::BuildInProgress);
-        }
-    }
+    // With the parallel build pool, a concurrent build on one slot does not
+    // prevent us from starting a runner from a previously-built exe in
+    // another slot (or the legacy target path). `resolve_source_exe` inside
+    // `start_exe_mode_for_runner` returns an explicit error if no binary is
+    // available anywhere. No coarse `build_in_progress` check here.
 
     {
         let runner = managed.runner.read().await;
@@ -199,14 +235,12 @@ async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
 ) -> Result<tokio::process::Child, SupervisorError> {
-    let source_exe = state.config.runner_exe_path();
-
-    if !source_exe.exists() {
-        return Err(SupervisorError::Process(format!(
-            "Runner exe not found at {:?}. Run a build first.",
-            source_exe
-        )));
-    }
+    // Locate the source exe. With the parallel build pool, each slot builds
+    // into its own `target-pool/slot-{k}/debug/`. Prefer the slot that produced
+    // the most recent successful build; fall back to the legacy single-target
+    // path for cases where no parallel build has run yet (e.g. pre-pool-era
+    // builds or manual `cargo build` invocations).
+    let source_exe = resolve_source_exe(state).await?;
 
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.
