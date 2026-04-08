@@ -67,11 +67,24 @@ cargo clippy -- -D warnings    # Lint
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/runners` | List all runners with status (observe-only for user runners) |
-| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{"rebuild": bool}`. Returns `{id, port, api_url, ui_bridge_url}`. Auto-cleaned up on stop. |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?}`. When `rebuild: true` and all build pool slots are busy, blocks by default until a slot frees (bounded by `queue_timeout_secs` if set). Pass header `X-Queue-Mode: no-wait` to return 503 with queue info instead of blocking. Returns `{id, port, api_url, ui_bridge_url}`. Auto-cleaned up on stop. |
 | POST | `/runners/{id}/start` | Start a temp runner (rejects non-temp) |
 | POST | `/runners/{id}/stop` | Stop a temp runner (rejects non-temp) |
 | POST | `/runners/{id}/restart` | Restart a temp runner (rejects non-temp) |
 | GET/POST | `/runners/{id}/ui-bridge/{*path}` | Proxy UI Bridge requests to a specific runner |
+| GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), and `last_successful_slot`. Agents should hit this before `spawn-test` to decide whether to wait or bail. |
+
+### Parallel Build Pool
+
+The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, override via env `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is still serialized behind a dedicated mutex since Tauri embeds a single `dist/` — but the lock is held only during the ~12s npm invocation, not the full ~3min cargo build.
+
+**spawn-test queue behavior:**
+- **Default (blocking):** If all slots are busy, the HTTP request holds open until a slot frees. Optional `queue_timeout_secs` bounds the wait and returns 504 on timeout.
+- **`X-Queue-Mode: no-wait` header:** Returns immediately with **503 Service Unavailable** and body `{error: "build_pool_full", queue_position, active_builds: [{slot, started_at, elapsed_secs, requester_id, rebuild_kind}, ...]}`.
+
+**Legacy 409 `BuildInProgress`** is still returned by a few unrelated code paths (reset endpoint, smart rebuild coordination) but `spawn-test` itself no longer produces it.
+
+**`rebuild: false`** resolves the exe in preference order: (1) last successful slot's `target-pool/slot-{k}/debug/qontinui-runner.exe`, (2) any slot whose exe exists on disk, (3) legacy `target/debug/qontinui-runner.exe` for pre-pool builds.
 
 ### Logs
 
