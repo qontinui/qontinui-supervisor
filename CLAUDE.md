@@ -86,6 +86,36 @@ The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, ov
 
 **`rebuild: false`** resolves the exe in preference order: (1) last successful slot's `target-pool/slot-{k}/debug/qontinui-runner.exe`, (2) any slot whose exe exists on disk, (3) legacy `target/debug/qontinui-runner.exe` for pre-pool builds.
 
+### CRITICAL: Manually Building the Runner Binary
+
+**Strongly prefer letting the supervisor build** (via `POST /runners/spawn-test {rebuild: true}` for temp runners, or by triggering an auto-rebuild). The supervisor handles the frontend build, feature flags, slot selection, and deploy copy correctly. Manual `cargo build` invocations are easy to get wrong and have historically caused broken webviews and stale-exe loops.
+
+If you **must** build manually, the command MUST match what the supervisor runs — otherwise the produced exe will either (a) crash on startup, (b) load from a dead vite dev URL showing `ERR_CONNECTION_REFUSED`, or (c) never be picked up by the supervisor on restart.
+
+**Correct manual build command (exe mode, what users actually run):**
+
+```bash
+cd qontinui-runner
+# 1. Rebuild the frontend so dist/ is fresh — Tauri embeds this at cargo build time.
+npm run build
+# 2. Build the runner exe INTO a supervisor build-pool slot (so the supervisor
+#    will pick it up on the next restart). Pick the slot reported as
+#    last_successful_slot by GET /builds, or slot 0 if unsure.
+cd src-tauri
+CARGO_TARGET_DIR=../target-pool/slot-0 \
+    cargo build --bin qontinui-runner --features custom-protocol
+```
+
+**Why `--features custom-protocol` is mandatory for exe mode:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. If vite isn't running on 1420 (the normal case for users) the webview shows `ERR_CONNECTION_REFUSED`. The feature is defined in `qontinui-runner/src-tauri/Cargo.toml` as `custom-protocol = ["tauri/custom-protocol"]`.
+
+**Why you must build into a slot dir, not the default `target/`:** the supervisor's `resolve_source_exe` (`qontinui-supervisor/src/process/manager.rs`) picks the source exe from `last_successful_slot` first, then scans other slots, and only falls back to `target/debug/qontinui-runner.exe` last. On every runner start it *copies* that source over `target/debug/qontinui-runner-{id}.exe` — so if you manually overwrite the per-runner copy path, the supervisor will silently overwrite it again with the stale slot exe on the next restart. Put the fresh build in the slot dir and the supervisor will deploy it for you.
+
+**Quick deploy of an exe you already built elsewhere:** copy it to *all* of `target-pool/slot-{0,1,2}/debug/qontinui-runner.exe` so that whichever slot is selected picks up the fixed binary.
+
+**When building dev mode** (the supervisor was started with `-d --dev-mode`, expecting a live vite dev server): omit `--features custom-protocol`. This is the only case where the bare `cargo build --bin qontinui-runner` is correct.
+
+**Supervisor source of truth:** the exact args are assembled in `qontinui-supervisor/src/build_monitor.rs::run_build_inner` (look for the `if state.config.dev_mode { ... } else { ..., "--features", "custom-protocol" }` branch). If this doc ever drifts from that code, that file wins.
+
 ### Logs
 
 | Method | Path | Description |
@@ -278,6 +308,84 @@ When `--smart-rebuild` is enabled, the supervisor monitors source files and rebu
 3. If build fails → spawn Claude CLI to fix errors (up to 5 attempts per cycle)
 4. If all fix attempts in a cycle fail → wait 10min cooldown → retry
 5. On success → restart stopped temp runners
+
+## Test Runner Binary Paths
+
+### Target directories by spawn mode
+
+| Directory | Purpose | Who writes it |
+|-----------|---------|---------------|
+| `target-pool/slot-{0,1,2}/debug/` | Supervisor parallel build pool (default 3 slots). Each `spawn-test {rebuild: true}` claims a slot and sets `CARGO_TARGET_DIR` to the slot dir. This is where the supervisor looks first when resolving the exe. | Supervisor via `run_cargo_build` |
+| `target/debug/` | Legacy / manual `cargo build` output. The supervisor falls back here only if no slot exe exists (preference 3 in `resolve_source_exe`). Pre-pool builds and manual `cargo build` land here. | Manual `cargo build`, `cargo check` |
+| `target/release/` | `cargo build --release` output. The supervisor never builds release mode and never looks here. Exists only if you ran a release build manually. | Manual only |
+
+The directories listed in the user's question as `target/rebuild/debug/`, `target/test-build/debug/`, `target/test-runner/debug/`, and `target-tmp/debug/` are **not used by the current supervisor**. The supervisor exclusively uses the `target-pool/slot-{k}/` dirs (configurable pool size via `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`, default 3). If any of those other directories exist on disk, they are artifacts of older supervisor versions and can be safely deleted.
+
+### Exe resolution order (when `rebuild: false`)
+
+`resolve_source_exe()` in `src/process/manager.rs` picks the binary in this order:
+
+1. `target-pool/slot-{last_successful_slot}/debug/qontinui-runner.exe` -- the most recently successful build slot
+2. Any `target-pool/slot-{k}/debug/qontinui-runner.exe` that exists on disk (covers supervisor restart where `last_successful_slot` is lost)
+3. `target/debug/qontinui-runner.exe` -- legacy fallback for pre-pool or manual builds
+
+Every runner start (temp or user) copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process.
+
+### Forcing a fresh build without spawn-test
+
+To rebuild without spawning a test runner, use the supervisor's build endpoint indirectly through `spawn-test` with immediate cleanup, or build manually:
+
+```bash
+# Option 1: Let the supervisor build into the pool (recommended)
+# This handles npm run build, --features custom-protocol, and slot selection.
+curl -X POST http://localhost:9875/runners/spawn-test \
+  -H 'Content-Type: application/json' \
+  -d '{"rebuild": true, "wait": false}'
+# Then stop the test runner immediately:
+# curl -X POST http://localhost:9875/runners/{id}/stop
+
+# Option 2: Manual build into a specific pool slot
+cd qontinui-runner
+npm run build
+cd src-tauri
+CARGO_TARGET_DIR=../target-pool/slot-0 cargo build --bin qontinui-runner --features custom-protocol
+```
+
+There is no standalone "rebuild only" endpoint; `spawn-test` is the only HTTP trigger for a build.
+
+### Checking binary modtime before trusting a test run
+
+The `spawn-test` response includes `binary_mtime` and `binary_size_bytes` fields (RFC 3339 timestamp and byte count). Always check these before trusting a test run:
+
+```bash
+# From the spawn-test response JSON:
+# "binary_mtime": "2026-04-09T14:30:00Z"
+# "binary_size_bytes": 52428800
+
+# Or stat the exe directly to verify:
+stat target-pool/slot-0/debug/qontinui-runner.exe
+# Compare the modification time against your last code change.
+# If the exe predates your changes, it's stale — rebuild with {rebuild: true}.
+```
+
+You can also hit `GET /builds` to see `last_successful_slot` and each slot's `last_completed_at` timestamp to determine which slot has the freshest binary.
+
+### spawn-test {rebuild: true} behavior
+
+**Synchronous.** The HTTP request blocks for the entire build+spawn cycle:
+
+1. **Port reservation** -- atomically claims a free port (9877-9899) and inserts a placeholder into the registry (prevents double-allocation races).
+2. **Build** -- acquires a build pool permit (blocks if all slots busy), runs `npm run build` (serialized across slots via `npm_lock`), then `cargo build --bin qontinui-runner --features custom-protocol` with `CARGO_TARGET_DIR` set to the slot dir.
+3. **Spawn** -- copies the built exe to `target/debug/qontinui-runner-{id}.exe` and launches the process.
+4. **Optional wait** -- if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
+
+**Timeouts:**
+- **Build timeout:** 10 minutes (`BUILD_TIMEOUT_SECS = 600`). If cargo exceeds this, the build process is killed and the request returns an error.
+- **Queue timeout:** configurable via `queue_timeout_secs` in the request body. If set and all pool slots are busy, the request returns 504 after the specified seconds. If unset, blocks indefinitely until a slot frees.
+- **Wait timeout:** configurable via `wait_timeout_secs` (default 120s). Only applies when `wait: true`. The request still returns successfully even if the runner doesn't become healthy -- the `status` field will say `"timeout"` instead of `"healthy"`.
+- **No-wait mode:** pass `X-Queue-Mode: no-wait` header to get an immediate 503 with queue info instead of blocking when all slots are busy.
+
+If the build fails, the placeholder port reservation is cleaned up and the error is returned. No runner is spawned.
 
 ## Auto-Debug Flow
 
