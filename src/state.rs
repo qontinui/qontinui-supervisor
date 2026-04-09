@@ -125,6 +125,70 @@ pub struct BuildInfo {
     pub rebuild_kind: String,
 }
 
+/// Cap on the per-slot rolling duration window.
+pub const RECENT_BUILD_SAMPLE_COUNT: usize = 10;
+
+/// Per-slot build duration history. In-memory only; resets on supervisor
+/// restart. Used by `GET /builds` and the 503 `build_pool_full` response to
+/// estimate wait times for callers.
+#[derive(Debug, Clone)]
+pub struct SlotHistory {
+    pub recent_durations_secs: VecDeque<f64>,
+    pub total_builds: u64,
+    pub successful_builds: u64,
+    pub last_completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+impl Default for SlotHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SlotHistory {
+    pub fn new() -> Self {
+        Self {
+            recent_durations_secs: VecDeque::with_capacity(RECENT_BUILD_SAMPLE_COUNT),
+            total_builds: 0,
+            successful_builds: 0,
+            last_completed_at: None,
+            last_error: None,
+        }
+    }
+
+    pub fn record(&mut self, duration_secs: f64, success: bool, error: Option<String>) {
+        if self.recent_durations_secs.len() >= RECENT_BUILD_SAMPLE_COUNT {
+            self.recent_durations_secs.pop_front();
+        }
+        self.recent_durations_secs.push_back(duration_secs);
+        self.total_builds += 1;
+        if success {
+            self.successful_builds += 1;
+        } else {
+            self.last_error = error;
+        }
+        self.last_completed_at = Some(Utc::now());
+    }
+
+    pub fn avg_duration_secs(&self) -> Option<f64> {
+        if self.recent_durations_secs.is_empty() {
+            return None;
+        }
+        let sum: f64 = self.recent_durations_secs.iter().sum();
+        Some(sum / self.recent_durations_secs.len() as f64)
+    }
+
+    pub fn p50_duration_secs(&self) -> Option<f64> {
+        if self.recent_durations_secs.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.recent_durations_secs.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(sorted[sorted.len() / 2])
+    }
+}
+
 /// One slot in the parallel build pool.
 ///
 /// Each slot has its own `CARGO_TARGET_DIR` so concurrent `cargo build`s do
@@ -135,6 +199,9 @@ pub struct BuildSlot {
     pub id: usize,
     pub target_dir: PathBuf,
     pub busy: RwLock<Option<BuildInfo>>,
+    /// Rolling per-slot build duration history. Separate lock from `busy` so
+    /// `list_builds` can `try_read` it without blocking in-progress builds.
+    pub history: RwLock<SlotHistory>,
 }
 
 /// Pool of parallel build slots.
@@ -182,6 +249,7 @@ impl BuildPool {
                 id,
                 target_dir,
                 busy: RwLock::new(None),
+                history: RwLock::new(SlotHistory::new()),
             }));
         }
         Self {
@@ -547,6 +615,7 @@ mod tests {
             expo_port: EXPO_PORT,
             runners: vec![RunnerConfig::default_primary()],
             build_pool: crate::config::BuildPoolConfig { pool_size: 1 },
+            no_prewarm: false,
         }
     }
 
@@ -830,6 +899,47 @@ mod tests {
         let state = SupervisorState::new(config);
         // Should not panic even with no subscribers
         state.notify_health_change();
+    }
+
+    // --- SlotHistory tests ---
+
+    #[test]
+    fn test_slot_history_new_empty() {
+        let h = SlotHistory::new();
+        assert_eq!(h.total_builds, 0);
+        assert!(h.avg_duration_secs().is_none());
+        assert!(h.p50_duration_secs().is_none());
+    }
+
+    #[test]
+    fn test_slot_history_record_and_avg() {
+        let mut h = SlotHistory::new();
+        h.record(10.0, true, None);
+        h.record(20.0, true, None);
+        h.record(30.0, false, Some("boom".into()));
+        assert_eq!(h.total_builds, 3);
+        assert_eq!(h.successful_builds, 2);
+        assert!((h.avg_duration_secs().unwrap() - 20.0).abs() < 1e-9);
+        assert_eq!(h.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn test_slot_history_window_evicts() {
+        let mut h = SlotHistory::new();
+        for i in 0..(RECENT_BUILD_SAMPLE_COUNT + 3) {
+            h.record(i as f64, true, None);
+        }
+        assert_eq!(h.recent_durations_secs.len(), RECENT_BUILD_SAMPLE_COUNT);
+        assert_eq!(h.recent_durations_secs.front().copied(), Some(3.0));
+    }
+
+    #[test]
+    fn test_slot_history_p50() {
+        let mut h = SlotHistory::new();
+        h.record(5.0, true, None);
+        h.record(1.0, true, None);
+        h.record(9.0, true, None);
+        assert_eq!(h.p50_duration_secs(), Some(5.0));
     }
 
     #[tokio::test]

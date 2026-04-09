@@ -598,20 +598,40 @@ pub async fn spawn_test(
         // return 503 with queue info instead of blocking.
         if no_wait && state.build_pool.permits.available_permits() == 0 {
             let snap = state.build_pool.snapshot().await;
+            let now = chrono::Utc::now();
+            let mut min_elapsed_secs: Option<f64> = None;
             let active: Vec<serde_json::Value> = snap
                 .iter()
                 .filter_map(|(id, _td, info)| {
                     info.as_ref().map(|i| {
+                        let elapsed = (now - i.started_at).num_seconds().max(0) as f64;
+                        min_elapsed_secs = Some(match min_elapsed_secs {
+                            Some(cur) => cur.min(elapsed),
+                            None => elapsed,
+                        });
                         json!({
                             "slot": id,
                             "started_at": i.started_at.to_rfc3339(),
-                            "elapsed_secs": (chrono::Utc::now() - i.started_at).num_seconds().max(0),
+                            "elapsed_secs": elapsed as i64,
                             "requester_id": i.requester_id,
                             "rebuild_kind": i.rebuild_kind,
                         })
                     })
                 })
                 .collect();
+            // Compute estimated_wait_secs from slot history.
+            let mut sum: f64 = 0.0;
+            let mut count: usize = 0;
+            for slot in &state.build_pool.slots {
+                let h = slot.history.read().await;
+                for d in &h.recent_durations_secs {
+                    sum += *d;
+                    count += 1;
+                }
+            }
+            let avg = if count > 0 { Some(sum / count as f64) } else { None };
+            let estimated_wait_secs = avg.map(|a| (a - min_elapsed_secs.unwrap_or(0.0)).max(0.0));
+
             let queued = state
                 .build_pool
                 .queue_depth
@@ -619,6 +639,7 @@ pub async fn spawn_test(
             return Err(SupervisorError::BuildPoolFull {
                 queue_position: queued + 1,
                 active_builds: active,
+                estimated_wait_secs,
             });
         }
 
@@ -804,30 +825,65 @@ pub async fn spawn_test(
 pub async fn list_builds(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
-    let snap = state.build_pool.snapshot().await;
     let now = chrono::Utc::now();
-    let slots: Vec<serde_json::Value> = snap
-        .into_iter()
-        .map(|(id, target_dir, info)| match info {
+    let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(state.build_pool.slots.len());
+    let mut global_sum: f64 = 0.0;
+    let mut global_count: usize = 0;
+
+    for slot in &state.build_pool.slots {
+        let info_opt = match slot.busy.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => slot.busy.read().await.clone(),
+        };
+        let history_snapshot = match slot.history.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => slot.history.read().await.clone(),
+        };
+        for d in &history_snapshot.recent_durations_secs {
+            global_sum += *d;
+            global_count += 1;
+        }
+
+        let history_json = json!({
+            "recent_samples": history_snapshot.recent_durations_secs.len(),
+            "total_builds": history_snapshot.total_builds,
+            "successful_builds": history_snapshot.successful_builds,
+            "avg_duration_secs": history_snapshot.avg_duration_secs(),
+            "p50_duration_secs": history_snapshot.p50_duration_secs(),
+            "last_completed_at": history_snapshot.last_completed_at.map(|t| t.to_rfc3339()),
+            "last_error": history_snapshot.last_error,
+        });
+
+        let slot_json = match info_opt {
             Some(i) => {
                 let elapsed = (now - i.started_at).num_seconds().max(0);
                 json!({
-                    "id": id,
-                    "target_dir": target_dir.to_string_lossy(),
+                    "id": slot.id,
+                    "target_dir": slot.target_dir.to_string_lossy(),
                     "state": "building",
                     "started_at": i.started_at.to_rfc3339(),
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "history": history_json,
                 })
             }
             None => json!({
-                "id": id,
-                "target_dir": target_dir.to_string_lossy(),
+                "id": slot.id,
+                "target_dir": slot.target_dir.to_string_lossy(),
                 "state": "idle",
+                "history": history_json,
             }),
-        })
-        .collect();
+        };
+        slots_json.push(slot_json);
+    }
+
+    let avg_build_duration_secs: Option<f64> = if global_count > 0 {
+        Some(global_sum / global_count as f64)
+    } else {
+        None
+    };
+
     let queued = state
         .build_pool
         .queue_depth
@@ -839,7 +895,8 @@ pub async fn list_builds(
         "available_permits": available,
         "queued": queued,
         "last_successful_slot": last_successful,
-        "slots": slots,
+        "avg_build_duration_secs": avg_build_duration_secs,
+        "slots": slots_json,
     }))
 }
 

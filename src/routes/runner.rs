@@ -129,11 +129,60 @@ pub async fn control_watchdog(
     Ok(Json(response))
 }
 
-/// POST /build/reset — clear a stuck build_in_progress flag.
+/// POST /build/reset — force-release every build slot and clear the legacy flag.
+///
+/// Under the parallel build pool a "stuck build" is most likely a `slot.busy`
+/// leak: the `SlotGuard` RAII type in `build_monitor.rs` now prevents this
+/// going forward, but this endpoint remains as a forensic / recovery tool.
+///
+/// We intentionally do NOT force-release semaphore permits. `Semaphore` has
+/// no public API for that, and `add_permits` would break the invariant
+/// `permits.available + permits.held == pool_size`. If a permit is genuinely
+/// stuck (which would require a tokio bug), the only safe recovery is a
+/// supervisor restart.
 pub async fn reset_build(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let was_stuck = {
+    let now = chrono::Utc::now();
+    let mut slots_cleared = Vec::with_capacity(state.build_pool.slots.len());
+    let mut cleared_count = 0usize;
+
+    for slot in &state.build_pool.slots {
+        let mut busy = slot.busy.write().await;
+        if let Some(prior) = busy.take() {
+            cleared_count += 1;
+            let elapsed_secs = (now - prior.started_at).num_seconds().max(0);
+            tracing::warn!(
+                "Forcibly cleared stuck build slot {}: requester_id={:?}, rebuild_kind={}, elapsed_secs={}",
+                slot.id, prior.requester_id, prior.rebuild_kind, elapsed_secs
+            );
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    format!(
+                        "Build reset: forcibly cleared slot {} (requester_id={:?}, elapsed_secs={})",
+                        slot.id, prior.requester_id, elapsed_secs
+                    ),
+                )
+                .await;
+            slots_cleared.push(serde_json::json!({
+                "id": slot.id,
+                "was_busy": true,
+                "prior_requester_id": prior.requester_id,
+                "rebuild_kind": prior.rebuild_kind,
+                "elapsed_secs": elapsed_secs,
+            }));
+        } else {
+            slots_cleared.push(serde_json::json!({
+                "id": slot.id,
+                "was_busy": false,
+            }));
+        }
+    }
+
+    let legacy_flag_was_set = {
         let mut build = state.build.write().await;
         let was = build.build_in_progress;
         build.build_in_progress = false;
@@ -142,10 +191,12 @@ pub async fn reset_build(
 
     state.notify_health_change();
 
-    let message = if was_stuck {
-        "Build flag was stuck, now cleared"
+    let message = if cleared_count > 0 {
+        format!("Cleared {} stuck slot{}", cleared_count, if cleared_count == 1 { "" } else { "s" })
+    } else if legacy_flag_was_set {
+        "No slots busy; cleared stale legacy build flag".to_string()
     } else {
-        "Build flag was not stuck (already false)"
+        "No stuck slots; legacy flag already clear".to_string()
     };
 
     state
@@ -159,8 +210,9 @@ pub async fn reset_build(
 
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "was_stuck": was_stuck,
-        "message": message
+        "slots_cleared": slots_cleared,
+        "legacy_flag_was_set": legacy_flag_was_set,
+        "message": message,
     })))
 }
 

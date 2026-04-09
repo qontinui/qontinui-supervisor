@@ -26,6 +26,10 @@ pub enum SupervisorError {
     BuildPoolFull {
         queue_position: usize,
         active_builds: Vec<serde_json::Value>,
+        /// Rough hint for how many seconds the caller should wait before
+        /// retrying. Computed as `avg_build_duration - min(elapsed)` over
+        /// active slots. `None` when no history exists yet.
+        estimated_wait_secs: Option<f64>,
     },
 
     #[error("Build failed: {0}")]
@@ -62,13 +66,19 @@ impl IntoResponse for SupervisorError {
             SupervisorError::BuildPoolFull {
                 queue_position,
                 active_builds,
+                estimated_wait_secs,
             } => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "error": "build_pool_full",
                     "message": self.to_string(),
                     "queue_position": queue_position,
                     "active_builds": active_builds,
                 });
+                if let Some(w) = estimated_wait_secs {
+                    body.as_object_mut()
+                        .unwrap()
+                        .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
+                }
                 return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
             }
             _ => {}

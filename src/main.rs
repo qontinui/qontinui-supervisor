@@ -223,6 +223,15 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Supervisor listening on http://0.0.0.0:{}", port);
 
+    // Pre-warm build slots in the background so the first real build per slot
+    // benefits from warm incremental artifacts. Best-effort and time-boxed.
+    {
+        let state_for_prewarm = state.clone();
+        tokio::spawn(async move {
+            build_monitor::prewarm_build_slots(state_for_prewarm).await;
+        });
+    }
+
     // Serve with graceful shutdown (no global timeout — eval benchmarks can run for hours)
     let serve_future =
         axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(state.clone()));

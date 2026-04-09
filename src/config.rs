@@ -41,6 +41,11 @@ pub struct CliArgs {
     /// Enable smart rebuild (auto-detect source changes, rebuild, fix with AI)
     #[arg(long = "smart-rebuild")]
     pub smart_rebuild: bool,
+
+    /// Disable post-startup build slot pre-warming (`cargo check` per slot).
+    /// Also honored via env var `QONTINUI_SUPERVISOR_NO_PREWARM=1`.
+    #[arg(long = "no-prewarm")]
+    pub no_prewarm: bool,
 }
 
 #[allow(dead_code)]
@@ -61,6 +66,8 @@ pub struct SupervisorConfig {
     pub runners: Vec<RunnerConfig>,
     /// Parallel cargo build pool configuration.
     pub build_pool: BuildPoolConfig,
+    /// When true, skip the post-startup `cargo check` pre-warm of build slots.
+    pub no_prewarm: bool,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -207,6 +214,12 @@ impl SupervisorConfig {
 
         let cli_args = std::env::args().collect();
 
+        let no_prewarm = args.no_prewarm
+            || std::env::var("QONTINUI_SUPERVISOR_NO_PREWARM")
+                .ok()
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
         SupervisorConfig {
             project_dir: args.project_dir,
             dev_mode: args.dev_mode,
@@ -223,6 +236,7 @@ impl SupervisorConfig {
             // Default: single primary runner; settings may override later
             runners: vec![RunnerConfig::default_primary()],
             build_pool: BuildPoolConfig::default(),
+            no_prewarm,
         }
     }
 
@@ -380,6 +394,7 @@ mod tests {
             auto_debug: false,
             expo_dir: None,
             smart_rebuild: false,
+            no_prewarm: false,
         }
     }
 
