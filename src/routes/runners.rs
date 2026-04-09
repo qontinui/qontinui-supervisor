@@ -16,6 +16,7 @@ use crate::process::manager;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState};
 use std::sync::Arc;
+use tracing::info;
 #[cfg(windows)]
 use tracing::warn;
 
@@ -247,6 +248,103 @@ pub async fn remove_runner(
     Ok(Json(json!({
         "status": "removed",
         "message": format!("Runner '{}' removed", name)
+    })))
+}
+
+/// POST /runners/purge-stale — remove all stopped test runners from the registry.
+///
+/// Test runners that crash without an explicit stop call (or whose stop response
+/// was lost) accumulate in the in-memory registry and block port allocation.
+/// This endpoint finds every `test-*` runner that is not currently running and
+/// removes it, freeing its port for reuse. Also kills any orphaned process still
+/// bound to the port.
+pub async fn purge_stale(
+    State(state): State<SharedState>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    let runners = state.get_all_runners().await;
+    let mut purged: Vec<serde_json::Value> = Vec::new();
+
+    for managed in &runners {
+        if !manager::is_temp_runner(&managed.config.id) {
+            continue;
+        }
+        let is_running = {
+            let runner = managed.runner.read().await;
+            runner.running
+        };
+        if is_running {
+            // Try to detect zombie: process is gone but state says running.
+            // If nothing is actually listening on the port, treat it as stale.
+            let port_alive =
+                crate::process::port::is_port_in_use(managed.config.port);
+            if port_alive {
+                continue; // genuinely running, skip
+            }
+            // Port is free but state says running — it crashed. Fix state.
+            {
+                let mut runner = managed.runner.write().await;
+                runner.running = false;
+                runner.pid = None;
+            }
+        }
+
+        let id = managed.config.id.clone();
+        let name = managed.config.name.clone();
+        let port = managed.config.port;
+
+        // Best-effort kill anything still on the port
+        let _ = crate::process::windows::kill_by_port(port).await;
+
+        // Remove from registry
+        {
+            let mut runners_map = state.runners.write().await;
+            runners_map.remove(&id);
+        }
+
+        // Best-effort cleanup of on-disk data
+        #[cfg(windows)]
+        {
+            if let Err(e) =
+                crate::process::windows::remove_webview2_user_data_folder(&id, false).await
+            {
+                warn!(
+                    "purge-stale: failed to remove WebView2 data for '{}': {}",
+                    id, e
+                );
+            }
+            if let Err(e) =
+                crate::process::windows::remove_runner_app_data_dirs(&name, false).await
+            {
+                warn!(
+                    "purge-stale: failed to remove app data for '{}': {}",
+                    name, e
+                );
+            }
+        }
+
+        info!("purge-stale: removed test runner '{}' (port {})", name, port);
+        purged.push(json!({
+            "id": id,
+            "name": name,
+            "port": port,
+        }));
+    }
+
+    let count = purged.len();
+    if count > 0 {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!("Purged {} stale test runner(s)", count),
+            )
+            .await;
+    }
+
+    Ok(Json(json!({
+        "purged": count,
+        "runners": purged,
     })))
 }
 
@@ -797,7 +895,14 @@ pub async fn spawn_test(
         }
     }
 
-    Ok(Json(json!({
+    // Resolve the source exe to report its metadata so callers can detect
+    // stale binaries ("this binary is older than my last commit").
+    let exe_meta = crate::process::manager::resolve_source_exe(&state)
+        .await
+        .ok()
+        .and_then(|p| crate::process::manager::binary_meta(&p));
+
+    let mut resp = json!({
         "id": id,
         "name": name,
         "port": port,
@@ -812,7 +917,13 @@ pub async fn spawn_test(
         } else {
             format!("Test runner spawned on port {}", port)
         }
-    })))
+    });
+    if let Some(meta) = exe_meta {
+        resp["binary_mtime"] = json!(meta.binary_mtime);
+        resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
+    }
+
+    Ok(Json(resp))
 }
 
 // --- Build pool visibility ---

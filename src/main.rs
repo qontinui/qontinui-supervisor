@@ -187,6 +187,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background reaper: periodically purge stale/crashed test runners so they
+    // don't exhaust the port range (9877-9899). Runs every 5 minutes.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            process::manager::reap_stale_test_runners(state_clone).await;
+        });
+    }
+
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
     let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;

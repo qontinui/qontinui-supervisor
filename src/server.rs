@@ -218,6 +218,10 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .route("/builds", get(crate::routes::runners::list_builds))
         .route(
+            "/runners/purge-stale",
+            post(crate::routes::runners::purge_stale),
+        )
+        .route(
             "/runners/{id}",
             delete(crate::routes::runners::remove_runner),
         )

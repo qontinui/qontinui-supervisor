@@ -27,6 +27,25 @@ pub fn is_temp_runner(runner_id: &str) -> bool {
     runner_id.starts_with("test-")
 }
 
+/// Binary metadata for diagnostics — lets callers detect stale binaries.
+#[derive(Clone, serde::Serialize)]
+pub struct BinaryMeta {
+    pub binary_mtime: String,
+    pub binary_size_bytes: u64,
+}
+
+/// Read mtime + size of a binary file.
+pub fn binary_meta(path: &std::path::Path) -> Option<BinaryMeta> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
+    let mtime_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Some(BinaryMeta {
+        binary_mtime: mtime_str,
+        binary_size_bytes: meta.len(),
+    })
+}
+
 /// Locate the most recent successfully-built runner exe across the build pool.
 ///
 /// Preference order:
@@ -69,16 +88,22 @@ pub async fn resolve_source_exe(
 // Startup Cleanup
 // =============================================================================
 
-/// Kill any orphaned temp runner processes from previous supervisor sessions.
+/// Kill any orphaned temp runner processes AND remove stale registry entries
+/// from previous supervisor sessions.
 /// Only cleans up temp runner ports — user runners are never touched.
 pub async fn cleanup_orphaned_runners(state: &SharedState) {
     let runners = state.get_all_runners().await;
 
-    // Only clean up temp runner ports
+    // Collect temp runner ports (to kill processes) and stale IDs (to remove from registry).
     let mut ports: Vec<u16> = Vec::new();
+    let mut stale_ids: Vec<String> = Vec::new();
     for r in &runners {
         if is_temp_runner(&r.config.id) {
             ports.push(r.config.port);
+            // On startup, ALL pre-existing test runners are stale — they're
+            // leftovers from a previous supervisor session.  Remove them from
+            // the registry after killing their processes.
+            stale_ids.push(r.config.id.clone());
         } else {
             // Mark non-temp runners as running if something is on their port,
             // so the supervisor tracks their health without managing them.
@@ -101,6 +126,18 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
         }
     }
 
+    // Remove stale test runner entries from the in-memory registry.
+    if !stale_ids.is_empty() {
+        let mut runners_map = state.runners.write().await;
+        for id in &stale_ids {
+            runners_map.remove(id);
+        }
+        info!(
+            "Purged {} stale test runner entries from registry on startup",
+            stale_ids.len()
+        );
+    }
+
     if killed_any {
         tokio::time::sleep(Duration::from_secs(1)).await;
         state
@@ -111,6 +148,83 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
                 "Cleaned up orphaned temp runner processes",
             )
             .await;
+    }
+}
+
+// =============================================================================
+// Periodic Stale Test Runner Reaper
+// =============================================================================
+
+/// Background task that periodically detects and removes stopped/crashed test
+/// runners from the in-memory registry. Runs every 5 minutes.
+///
+/// A test runner is considered stale if:
+///   - Its `running` flag is false, OR
+///   - Its `running` flag is true but nothing is listening on its port (crash).
+pub async fn reap_stale_test_runners(state: SharedState) {
+    const INTERVAL: Duration = Duration::from_secs(5 * 60);
+    // Wait a bit on startup to let normal init complete
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    loop {
+        tokio::time::sleep(INTERVAL).await;
+        let runners = state.get_all_runners().await;
+        let mut reaped = 0u32;
+
+        for managed in &runners {
+            if !is_temp_runner(&managed.config.id) {
+                continue;
+            }
+            let is_running = {
+                let runner = managed.runner.read().await;
+                runner.running
+            };
+            if is_running {
+                if crate::process::port::is_port_in_use(managed.config.port) {
+                    continue; // genuinely alive
+                }
+                // Port free but state says running — crashed
+                {
+                    let mut runner = managed.runner.write().await;
+                    runner.running = false;
+                    runner.pid = None;
+                }
+            }
+
+            let id = managed.config.id.clone();
+            let name = managed.config.name.clone();
+            let port = managed.config.port;
+
+            let _ = kill_by_port(port).await;
+
+            {
+                let mut runners_map = state.runners.write().await;
+                runners_map.remove(&id);
+            }
+
+            #[cfg(windows)]
+            {
+                let _ = remove_webview2_user_data_folder(&id, false).await;
+                let _ = remove_runner_app_data_dirs(&name, false).await;
+            }
+
+            info!(
+                "reaper: removed stale test runner '{}' (port {})",
+                name, port
+            );
+            reaped += 1;
+        }
+
+        if reaped > 0 {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!("Reaper: purged {} stale test runner(s)", reaped),
+                )
+                .await;
+        }
     }
 }
 
