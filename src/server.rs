@@ -246,6 +246,14 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::runners::protect_runner),
         )
         .route(
+            "/runners/{id}/logs",
+            get(crate::routes::runners::runner_log_history),
+        )
+        .route(
+            "/runners/{id}/logs/stream",
+            get(crate::routes::runners::runner_log_stream),
+        )
+        .route(
             "/runners/{id}/ui-bridge/{*path}",
             get(crate::routes::runners::proxy_ui_bridge)
                 .post(crate::routes::runners::proxy_ui_bridge),

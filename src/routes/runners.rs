@@ -9,6 +9,12 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use axum::extract::Query;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use std::convert::Infallible;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+
 use crate::config::RunnerConfig;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1009,6 +1015,82 @@ pub async fn list_builds(
         "avg_build_duration_secs": avg_build_duration_secs,
         "slots": slots_json,
     }))
+}
+
+// --- Per-runner log endpoints ---
+
+#[derive(Deserialize)]
+pub struct RunnerLogQuery {
+    #[serde(default = "default_runner_log_limit")]
+    pub limit: usize,
+    /// Optional level filter: "info", "warn", "error", "debug".
+    pub level: Option<String>,
+}
+
+fn default_runner_log_limit() -> usize {
+    100
+}
+
+/// GET /runners/{id}/logs — return recent log entries for a specific runner.
+pub async fn runner_log_history(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Query(query): Query<RunnerLogQuery>,
+) -> Result<Json<serde_json::Value>, SupervisorError> {
+    let managed = state
+        .get_runner(&id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
+
+    let entries = managed.logs.history().await;
+    let limit = query.limit.min(500);
+
+    let entries: Vec<_> = entries
+        .into_iter()
+        .rev()
+        .filter(|e| {
+            if let Some(ref level) = query.level {
+                let entry_level = serde_json::to_string(&e.level).unwrap_or_default();
+                // entry_level is quoted, e.g. "\"error\"", so strip quotes
+                let entry_level = entry_level.trim_matches('"');
+                entry_level == level
+            } else {
+                true
+            }
+        })
+        .take(limit)
+        .collect();
+
+    let count = entries.len();
+    Ok(Json(json!({
+        "runner_id": id,
+        "entries": entries,
+        "count": count,
+    })))
+}
+
+/// GET /runners/{id}/logs/stream — SSE stream of real-time log events for a specific runner.
+pub async fn runner_log_stream(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, SupervisorError> {
+    let managed = state
+        .get_runner(&id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
+
+    let rx = managed.logs.subscribe();
+    let stream = BroadcastStream::new(rx);
+
+    let event_stream = stream.filter_map(|result| match result {
+        Ok(entry) => {
+            let data = serde_json::to_string(&entry).unwrap_or_default();
+            Some(Ok(Event::default().event("log").data(data)))
+        }
+        Err(_) => None,
+    });
+
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
 // --- Helpers ---
