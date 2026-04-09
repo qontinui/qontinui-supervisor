@@ -118,6 +118,33 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
 // Per-Runner Process Management (multi-runner)
 // =============================================================================
 
+/// Forward test auto-login credentials to a spawned non-primary runner.
+///
+/// Only active when the supervisor is running in `dev_mode` AND the supervisor
+/// process itself has `QONTINUI_TEST_LOGIN_EMAIL` + `QONTINUI_TEST_LOGIN_PASSWORD`
+/// set in its environment. These are forwarded to the child as
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` / `QONTINUI_TEST_AUTO_LOGIN_PASSWORD` which
+/// the runner's Tauri backend exposes via the `get_test_auto_login` command so
+/// the React AuthProvider can auto-authenticate temp test runners for UI Bridge
+/// inspection of authenticated pages.
+///
+/// SECURITY: Never forwarded to primary runners and never forwarded in
+/// non-dev-mode builds. Credentials live only in the supervisor operator's env.
+fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
+    if !state.config.dev_mode {
+        return;
+    }
+    if let (Ok(email), Ok(password)) = (
+        std::env::var("QONTINUI_TEST_LOGIN_EMAIL"),
+        std::env::var("QONTINUI_TEST_LOGIN_PASSWORD"),
+    ) {
+        if !email.is_empty() && !password.is_empty() {
+            cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
+            cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
+        }
+    }
+}
+
 /// Start a specific runner by ID.
 pub async fn start_runner_by_id(
     state: &SharedState,
@@ -288,6 +315,7 @@ async fn start_exe_mode_for_runner(
             if let Some(primary) = state.get_primary().await {
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
             }
+            forward_test_auto_login_env(&mut cmd, state);
         }
 
         // Per-runner WebView2 data dir — non-primary runners get isolated
@@ -335,6 +363,7 @@ async fn start_exe_mode_for_runner(
             if let Some(primary) = state.get_primary().await {
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
             }
+            forward_test_auto_login_env(&mut cmd, state);
             // Per-runner WebView2 data dir (see Windows branch for rationale).
             // On non-Windows the variable is ignored by other webview backends,
             // so this is harmless but keeps behavior consistent.
