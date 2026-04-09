@@ -83,6 +83,10 @@ pub struct WatchdogHealth {
 #[derive(Serialize)]
 pub struct BuildHealth {
     pub in_progress: bool,
+    /// Number of build pool slots currently available for new builds.
+    /// 0 means the pool is saturated; >0 means new `spawn-test {rebuild: true}`
+    /// calls will begin immediately without queuing.
+    pub available_slots: usize,
     pub error_detected: bool,
     pub last_error: Option<String>,
     pub last_build_at: Option<String>,
@@ -269,6 +273,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         watchdog: watchdog_health,
         build: BuildHealth {
             in_progress: build.build_in_progress,
+            available_slots: state.build_pool.permits.available_permits(),
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
@@ -397,6 +402,7 @@ pub async fn health_stream(
                 },
                 build: BuildHealth {
                     in_progress: build.build_in_progress,
+                    available_slots: state.build_pool.permits.available_permits(),
                     error_detected: build.build_error_detected,
                     last_error: build.last_build_error.clone(),
                     last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
@@ -521,6 +527,7 @@ mod tests {
             },
             build: BuildHealth {
                 in_progress: false,
+                available_slots: 0,
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,

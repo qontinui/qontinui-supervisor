@@ -130,12 +130,13 @@ pub fn spawn_source_watcher(state: SharedState) -> tokio::task::JoinHandle<()> {
                 continue;
             }
 
-            // Guard: no build in progress
-            {
-                let build = state.build.read().await;
-                if build.build_in_progress {
-                    continue;
-                }
+            // Guard: at least one build slot must be free. Under the parallel
+            // build pool, `build_in_progress` is true whenever ANY slot is busy —
+            // but other slots may still be idle. Using `available_permits` lets
+            // smart rebuild opportunistically use an idle slot rather than deferring
+            // until the entire pool is free.
+            if state.build_pool.permits.available_permits() == 0 {
+                continue;
             }
 
             // Guard: no workflow loop running
