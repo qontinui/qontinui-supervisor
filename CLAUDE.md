@@ -6,7 +6,7 @@ Rust-based build server and health monitor for qontinui-runner. Provides cargo b
 
 The supervisor **only** manages the lifecycle of temp/test runners (`test-*` IDs). All other runners (primary, secondary, discovered) are **user-managed** — the supervisor never starts, stops, restarts, or kills them. Users start runners manually and close them by closing the window.
 
-- **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. These are headless (no window) and used for testing code changes.
+- **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. These run with a **visible Tauri window** and an isolated WebView2 profile (via `WEBVIEW2_USER_DATA_FOLDER` → `data_directory()` in the runner's `.setup()`). The UI Bridge is fully functional on temp runners — use it for end-to-end testing.
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor tracks their health but takes no lifecycle action.
 
 ## Architecture
