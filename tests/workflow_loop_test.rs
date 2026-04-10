@@ -215,9 +215,12 @@ fn test_build_fix_prompt_with_context() {
 
 #[test]
 fn test_build_fix_prompt_multiple_fixes() {
+    // Use non-workflow-structural fix types so they aren't filtered out
+    // by the categorized prompt path. "context_addition" is WorkflowStructural
+    // and gets excluded from the Claude prompt (deferred for rebuild instead).
     let fixes = vec![
         json!({"fix_type": "selector_fix", "fix_description": "Fix 1"}),
-        json!({"fix_type": "context_addition", "fix_description": "Fix 2"}),
+        json!({"fix_type": "code_fix", "fix_description": "Fix 2"}),
     ];
 
     let prompt = build_fix_prompt(&fixes, None);
