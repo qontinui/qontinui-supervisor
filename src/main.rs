@@ -196,6 +196,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background reaper: periodically clear build slots that have been "busy"
+    // for longer than max_build_age_secs (default 15 minutes). This catches
+    // slots leaked by crashed cargo builds or supervisor panics where the
+    // SlotGuard RAII type didn't run its Drop. Without this, the pool fills
+    // with phantom "building" entries that block spawn-test indefinitely.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            reap_stuck_build_slots(state_clone).await;
+        });
+    }
+
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
     let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
@@ -261,6 +273,55 @@ async fn main() -> anyhow::Result<()> {
     let _ = process::manager::stop_all_temp_runners(&state).await;
 
     Ok(())
+}
+
+/// Maximum seconds a build slot may be "busy" before the reaper clears it.
+/// Normal builds take 3-8 minutes; 15 minutes is a generous ceiling.
+const MAX_BUILD_AGE_SECS: i64 = 15 * 60;
+
+/// Periodically scan build slots and clear any that have been "busy" for
+/// longer than [`MAX_BUILD_AGE_SECS`]. Runs every 2 minutes. This catches
+/// leaked slots from crashed cargo builds or supervisor panics where the
+/// `SlotGuard` RAII type didn't execute its `Drop`.
+async fn reap_stuck_build_slots(state: state::SharedState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+    interval.tick().await; // skip the immediate first tick
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+
+        for slot in &state.build_pool.slots {
+            if let Ok(mut busy) = slot.busy.try_write() {
+                if let Some(ref info) = *busy {
+                    let elapsed = (now - info.started_at).num_seconds().max(0);
+                    if elapsed > MAX_BUILD_AGE_SECS {
+                        warn!(
+                            "Build slot {} stuck for {}s (max {}s) — auto-clearing. \
+                             requester_id={:?}, rebuild_kind={}",
+                            slot.id,
+                            elapsed,
+                            MAX_BUILD_AGE_SECS,
+                            info.requester_id,
+                            info.rebuild_kind
+                        );
+                        state
+                            .logs
+                            .emit(
+                                log_capture::LogSource::Supervisor,
+                                log_capture::LogLevel::Warn,
+                                format!(
+                                    "Auto-cleared stuck build slot {} after {}s (limit {}s)",
+                                    slot.id, elapsed, MAX_BUILD_AGE_SECS
+                                ),
+                            )
+                            .await;
+                        *busy = None;
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn shutdown_signal(state: Arc<SupervisorState>) {
