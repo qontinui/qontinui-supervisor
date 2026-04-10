@@ -28,6 +28,9 @@ pub struct ManagedRunner {
     /// Runtime-mutable protection flag. When true, this runner cannot be stopped
     /// or restarted by smart rebuild, watchdog, AI sessions, or workflow loop.
     pub protected: RwLock<bool>,
+    /// When this entry was inserted into the registry. Used by the reaper to
+    /// avoid removing runners that were just created but haven't started yet.
+    pub created_at: std::time::Instant,
 }
 
 impl ManagedRunner {
@@ -41,6 +44,7 @@ impl ManagedRunner {
             health_cache_notify: Notify::new(),
             logs: LogState::new(),
             protected: RwLock::new(protected),
+            created_at: std::time::Instant::now(),
         }
     }
 

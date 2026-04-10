@@ -175,6 +175,12 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if !is_temp_runner(&managed.config.id) {
                 continue;
             }
+            // Skip runners created less than 2 minutes ago — they may still
+            // be in the build+start pipeline (spawn_test inserts a placeholder
+            // with running=false before the build completes).
+            if managed.created_at.elapsed() < Duration::from_secs(120) {
+                continue;
+            }
             let is_running = {
                 let runner = managed.runner.read().await;
                 runner.running
