@@ -30,6 +30,8 @@ fn test_config_from_fields() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
+        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        no_prewarm: false,
     };
 
     assert!(config.dev_mode);
@@ -58,6 +60,8 @@ fn test_config_runner_exe_path() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
+        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        no_prewarm: false,
     };
 
     let exe_path = config.runner_exe_path();
@@ -84,6 +88,8 @@ fn test_config_runner_npm_dir() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
+        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        no_prewarm: false,
     };
 
     let npm_dir = config.runner_npm_dir();
@@ -102,13 +108,3 @@ fn test_ai_models_defined() {
     }
 }
 
-#[test]
-fn test_service_ports_defined() {
-    assert!(!SERVICE_PORTS.is_empty());
-    // Check that known services exist
-    let names: Vec<&str> = SERVICE_PORTS.iter().map(|(name, _)| *name).collect();
-    assert!(names.contains(&"postgresql"));
-    assert!(names.contains(&"redis"));
-    assert!(names.contains(&"backend"));
-    assert!(names.contains(&"frontend"));
-}

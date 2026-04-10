@@ -77,6 +77,8 @@ fn test_settings_path() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
+        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        no_prewarm: false,
     };
 
     let path = settings_path(&config);

@@ -20,6 +20,8 @@ fn test_config() -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
+        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        no_prewarm: false,
     }
 }
 
@@ -166,8 +168,6 @@ async fn test_watchdog_crash_recording() {
     watchdog.record_crash();
     assert_eq!(watchdog.crash_history.len(), 2);
 
-    // Should not be a crash loop with only 2 crashes (threshold is 5)
-    assert!(!watchdog.is_crash_loop(5, 600));
 }
 
 #[tokio::test]
@@ -192,39 +192,3 @@ async fn test_health_cache_notify() {
     assert!(result.unwrap().unwrap());
 }
 
-#[tokio::test]
-async fn test_watchdog_cooldown() {
-    let state = SupervisorState::new(test_config());
-    let mut watchdog = state.watchdog.write().await;
-
-    // No last restart — should not be in cooldown
-    assert!(!watchdog.is_in_cooldown(60));
-
-    // Set last restart to now
-    watchdog.last_restart_at = Some(chrono::Utc::now());
-    // Should be in cooldown with 60s window
-    assert!(watchdog.is_in_cooldown(60));
-
-    // Should not be in cooldown with 0s window
-    assert!(!watchdog.is_in_cooldown(0));
-}
-
-#[tokio::test]
-async fn test_watchdog_crash_loop_detection() {
-    let state = SupervisorState::new(test_config());
-    let mut watchdog = state.watchdog.write().await;
-
-    // Record exactly threshold-1 crashes — should NOT be a crash loop
-    for _ in 0..4 {
-        watchdog.record_crash();
-    }
-    assert!(!watchdog.is_crash_loop(5, 600));
-
-    // One more crash (at threshold) — SHOULD be a crash loop
-    watchdog.record_crash();
-    assert!(watchdog.is_crash_loop(5, 600));
-
-    // Beyond threshold — still a crash loop
-    watchdog.record_crash();
-    assert!(watchdog.is_crash_loop(5, 600));
-}

@@ -1093,6 +1093,59 @@ pub async fn runner_log_stream(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
+/// DELETE /builds/caches — clean all build slot caches.
+///
+/// Runs `cargo clean` against each slot's CARGO_TARGET_DIR. Requires no
+/// builds to be in progress (otherwise the clean would corrupt a running build).
+pub async fn clear_build_caches(
+    State(state): State<SharedState>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    // Refuse if any slot is busy
+    if state.build_pool.permits.available_permits() < state.build_pool.slots.len() {
+        return Err(SupervisorError::BuildInProgress);
+    }
+
+    let mut results = Vec::new();
+    for slot in &state.build_pool.slots {
+        let target_dir = &slot.target_dir;
+        // Run cargo clean --target-dir <slot.target_dir> from the project dir
+        let status = tokio::process::Command::new("cargo")
+            .args(["clean", "--target-dir"])
+            .arg(target_dir)
+            .current_dir(&state.config.project_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .await;
+
+        let success = status.map(|s| s.success()).unwrap_or(false);
+        results.push(json!({
+            "slot": slot.id,
+            "target_dir": target_dir.to_string_lossy(),
+            "cleaned": success,
+        }));
+
+        if success {
+            state
+                .logs
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Info,
+                    format!("Cleaned build cache for slot {} ({:?})", slot.id, target_dir),
+                )
+                .await;
+        }
+    }
+
+    // Also clear last_successful_slot since the binaries are gone
+    *state.build_pool.last_successful_slot.write().await = None;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "slots": results,
+    })))
+}
+
 // --- Helpers ---
 
 /// Simple unique ID generator (timestamp + incrementing counter).
