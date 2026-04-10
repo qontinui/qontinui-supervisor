@@ -62,26 +62,24 @@ pub enum SupervisorError {
 
 impl IntoResponse for SupervisorError {
     fn into_response(self) -> Response {
-        match &self {
-            SupervisorError::BuildPoolFull {
-                queue_position,
-                active_builds,
-                estimated_wait_secs,
-            } => {
-                let mut body = serde_json::json!({
-                    "error": "build_pool_full",
-                    "message": self.to_string(),
-                    "queue_position": queue_position,
-                    "active_builds": active_builds,
-                });
-                if let Some(w) = estimated_wait_secs {
-                    body.as_object_mut()
-                        .unwrap()
-                        .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
-                }
-                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+        if let SupervisorError::BuildPoolFull {
+            queue_position,
+            active_builds,
+            estimated_wait_secs,
+        } = &self
+        {
+            let mut body = serde_json::json!({
+                "error": "build_pool_full",
+                "message": self.to_string(),
+                "queue_position": queue_position,
+                "active_builds": active_builds,
+            });
+            if let Some(w) = estimated_wait_secs {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
             }
-            _ => {}
+            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
         }
 
         let status = match &self {
