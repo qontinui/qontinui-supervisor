@@ -242,6 +242,22 @@ pub async fn remove_runner(
         }
     }
 
+    // Clean up the per-runner exe copy for temp runners to prevent disk bloat.
+    if manager::is_temp_runner(&id) {
+        let exe_copy = state.config.runner_exe_copy_path(&id);
+        if exe_copy.exists() {
+            if let Err(e) = std::fs::remove_file(&exe_copy) {
+                warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
+            } else {
+                info!("Removed runner exe copy {:?}", exe_copy);
+            }
+        }
+        let pdb_copy = exe_copy.with_extension("pdb");
+        if pdb_copy.exists() {
+            let _ = std::fs::remove_file(&pdb_copy);
+        }
+    }
+
     state
         .logs
         .emit(
@@ -326,6 +342,20 @@ pub async fn purge_stale(
                     name, e
                 );
             }
+        }
+
+        // Clean up the per-runner exe copy to prevent disk bloat.
+        let exe_copy = state.config.runner_exe_copy_path(&id);
+        if exe_copy.exists() {
+            if let Err(e) = std::fs::remove_file(&exe_copy) {
+                warn!("purge-stale: failed to remove exe copy {:?}: {}", exe_copy, e);
+            } else {
+                info!("purge-stale: removed exe copy {:?}", exe_copy);
+            }
+        }
+        let pdb_copy = exe_copy.with_extension("pdb");
+        if pdb_copy.exists() {
+            let _ = std::fs::remove_file(&pdb_copy);
         }
 
         info!("purge-stale: removed test runner '{}' (port {})", name, port);

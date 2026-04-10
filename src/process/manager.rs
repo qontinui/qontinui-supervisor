@@ -740,6 +740,23 @@ pub async fn stop_runner_by_id(
                 );
             }
         }
+
+        // Clean up the per-runner exe copy to prevent disk bloat.
+        // Each copy is ~200MB + ~1.3GB PDB; without cleanup, orphaned copies
+        // accumulated to ~200GB in a recent audit.
+        let exe_copy = state.config.runner_exe_copy_path(&runner_id);
+        if exe_copy.exists() {
+            if let Err(e) = std::fs::remove_file(&exe_copy) {
+                warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
+            } else {
+                info!("Removed runner exe copy {:?}", exe_copy);
+            }
+        }
+        // Also try to remove the PDB file (same name but .pdb extension)
+        let pdb_copy = exe_copy.with_extension("pdb");
+        if pdb_copy.exists() {
+            let _ = std::fs::remove_file(&pdb_copy);
+        }
     }
 
     state.notify_health_change();
