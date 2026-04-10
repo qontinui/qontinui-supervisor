@@ -1138,17 +1138,28 @@ pub async fn clear_build_caches(
     let mut results = Vec::new();
     for slot in &state.build_pool.slots {
         let target_dir = &slot.target_dir;
-        // Run cargo clean --target-dir <slot.target_dir> from the project dir
-        let status = tokio::process::Command::new("cargo")
-            .args(["clean", "--target-dir"])
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args(["clean", "--target-dir"])
             .arg(target_dir)
             .current_dir(&state.config.project_dir)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .status()
-            .await;
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = cmd.output().await;
 
-        let success = status.map(|s| s.success()).unwrap_or(false);
+        let success = output.as_ref().map(|o| o.status.success()).unwrap_or(false);
+        if !success {
+            let stderr = output
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or_default();
+            tracing::warn!("cargo clean for slot {} failed: {}", slot.id, stderr);
+        }
         results.push(json!({
             "slot": slot.id,
             "target_dir": target_dir.to_string_lossy(),
