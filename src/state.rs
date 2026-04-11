@@ -86,6 +86,9 @@ pub struct SupervisorState {
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
     pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    /// Runtime-configurable auto-login credentials for temp test runners.
+    /// Set via `POST /test-login` and read by `forward_test_auto_login_env`.
+    pub test_auto_login: RwLock<Option<(String, String)>>,
 }
 
 pub struct RunnerState {
@@ -384,6 +387,7 @@ impl SupervisorState {
             health_cache_notify: Notify::new(),
             http_client,
             db: None,
+            test_auto_login: RwLock::new(None),
         }
     }
 

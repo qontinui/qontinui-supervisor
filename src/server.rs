@@ -216,6 +216,12 @@ pub fn build_router(state: SharedState) -> Router {
             "/runners/spawn-test",
             post(crate::routes::runners::spawn_test),
         )
+        .route(
+            "/test-login",
+            post(crate::routes::runners::set_test_login)
+                .get(crate::routes::runners::get_test_login)
+                .delete(crate::routes::runners::clear_test_login),
+        )
         .route("/builds", get(crate::routes::runners::list_builds))
         .route(
             "/builds/caches",

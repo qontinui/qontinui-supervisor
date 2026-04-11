@@ -1201,3 +1201,43 @@ fn uuid_simple() -> String {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:x}-{:x}", ts, seq)
 }
+
+// ---------------------------------------------------------------------------
+// Test auto-login credentials API
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SetTestLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+/// POST /test-login — Set auto-login credentials for future temp runner spawns.
+pub async fn set_test_login(
+    State(state): State<SharedState>,
+    Json(body): Json<SetTestLoginRequest>,
+) -> impl IntoResponse {
+    if body.email.is_empty() || body.password.is_empty() {
+        return Json(json!({"success": false, "error": "email and password required"}));
+    }
+    *state.test_auto_login.write().await = Some((body.email, body.password));
+    info!("Test auto-login credentials configured for future temp runners");
+    Json(json!({"success": true, "message": "Auto-login credentials set for temp runners"}))
+}
+
+/// GET /test-login — Check if auto-login credentials are configured.
+pub async fn get_test_login(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let configured = state.test_auto_login.read().await.is_some();
+    Json(json!({"configured": configured}))
+}
+
+/// DELETE /test-login — Clear auto-login credentials.
+pub async fn clear_test_login(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    *state.test_auto_login.write().await = None;
+    info!("Test auto-login credentials cleared");
+    Json(json!({"success": true, "message": "Auto-login credentials cleared"}))
+}
