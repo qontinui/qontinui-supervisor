@@ -1,0 +1,118 @@
+{
+  "version": "1.0.0",
+  "description": "Runner Monitor page — shows detailed health of the primary runner (JSON health response), list of running task runs with actions (stop, view output, view reflection), and a result panel for displaying action output.",
+  "groups": [
+    {
+      "id": "runner-health-card",
+      "name": "Runner Health Card",
+      "description": "Top card showing the primary runner's health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "health-card-exists",
+          "description": "A 'Runner Health' card is present showing the runner's health status",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Runner Health" }, "label": "Runner Health card" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "health-status-badge",
+          "description": "A status badge shows one of: Healthy (green), Unknown (gray), Unreachable (red). Badge text matches the actual runner API response.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": ".badge" }, "label": "Health status badge" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "health-refresh-button",
+          "description": "A Refresh button is present that fetches the latest health data from the runner API",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Refresh" }, "label": "Refresh button" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "running-task-runs",
+      "name": "Running Task Runs",
+      "description": "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "task-runs-card-exists",
+          "description": "A 'Running Task Runs' card is present showing the count of active tasks",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Running Task Runs" }, "label": "Task runs card" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "task-run-count-badge",
+          "description": "The card header shows a badge with the number of running task runs",
+          "category": "data-display",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": ".badge" }, "label": "Task run count badge" },
+          "assertionType": "semantic",
+          "precondition": "At least one task run is active",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "task-run-actions",
+          "description": "Each task run row has action buttons: Stop (stops the task), View Output (fetches and displays task output), View Reflection (shows reflection results). Buttons show busy state while executing.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Task run action buttons" },
+          "assertionType": "behavior",
+          "precondition": "At least one task run is displayed",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "result-panel",
+      "name": "Result Panel",
+      "description": "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "result-panel-display",
+          "description": "After clicking an action button (View Output, View Reflection), the result panel shows the action name as title and the response as pre-formatted monospace text",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": "pre" }, "label": "Result panel" },
+          "assertionType": "behavior",
+          "precondition": "An action has been executed via one of the task run buttons",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "RunnerMonitor",
+    "pageUrl": "/runner-monitor",
+    "tags": ["supervisor", "runner", "health", "task-runs", "monitoring"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "runner-monitor-default",
+        "name": "Runner Monitor Default View",
+        "description": "Shows health card and task runs table",
+        "elements": [
+          { "textContains": "Runner Health" }
+        ],
+        "isInitial": true,
+        "transitions": []
+      }
+    ]
+  }
+}

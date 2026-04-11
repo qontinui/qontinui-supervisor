@@ -1,0 +1,333 @@
+{
+  "version": "1.0.0",
+  "description": "Supervisor Dashboard — primary control surface for dev infrastructure. Shows real-time health of all services (runner, backend, frontend, PostgreSQL, Redis, MinIO, Expo), provides start/stop/restart controls, AI debug panel with live SSE output, runner instance management, workflow loop status, cascade detection events, and a log viewer with source/level filtering.",
+  "groups": [
+    {
+      "id": "dashboard-layout",
+      "name": "Page Layout & Navigation",
+      "description": "The dashboard has a fixed 220px sidebar with navigation links and a main content area. The sidebar contains the Qontinui logo, nav links to all pages, and the supervisor port badge.",
+      "category": "layout",
+      "assertions": [
+        {
+          "id": "sidebar-exists",
+          "description": "A sidebar navigation panel is present on the left side of the page",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": ".sidebar" }, "label": "Sidebar navigation" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "sidebar-nav-links",
+          "description": "Sidebar contains navigation links: Dashboard, Runner Monitor, Workflow Loop, Velocity, Evaluation",
+          "category": "navigation",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": ".sidebar-nav" }, "label": "Sidebar nav links" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "main-content-area",
+          "description": "The main content area renders to the right of the sidebar and contains the service table and control panels",
+          "category": "layout",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": ".main-content" }, "label": "Main content area" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "page-header",
+          "description": "The page header shows 'Supervisor Dashboard' as the title with a brief description",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": ".page-title" }, "label": "Page title" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "service-table",
+      "name": "Service Health Table",
+      "description": "The service table is the primary dashboard element. Each row shows a service name, port, real-time status (UP/DOWN/ERR/OFF), and action buttons. Status is indicated by color-coded dots with animated pulse for connecting states. Services include: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "service-table-exists",
+          "description": "A service table with columns for Name, Port, Status, and Actions is present on the dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": ".table-container" }, "label": "Service table" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "service-rows-present",
+          "description": "The table shows at least the core services: Runner and PostgreSQL should always appear",
+          "category": "data-display",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": "table tbody tr" }, "label": "Service rows" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "status-dot-colors",
+          "description": "Status dots use color coding: green (UP/healthy), red (DOWN/error), amber/orange (warning/connecting), gray (OFF/disabled). Each dot has a text label badge next to it.",
+          "category": "design",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": ".status-dot" }, "label": "Status dots" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "service-action-buttons",
+          "description": "Each service row has action buttons (Start, Stop, Restart, AI Fix) that are contextually enabled/disabled based on service state. DOWN services show 'AI Fix' button.",
+          "category": "interaction",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": "table tbody tr" }, "label": "Service action buttons" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "error-row-expansion",
+          "description": "Service rows with errors can be expanded to show stderr/stdout output. Clicking the row or an expand control reveals the error details below the row.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": "table tbody" }, "label": "Error row expansion" },
+          "assertionType": "behavior",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "bulk-actions",
+      "name": "Bulk Action Controls",
+      "description": "Below the service table, bulk action buttons provide one-click operations: Docker (start containers), Start All, Stop All, Clean, Fresh (clean + migrate + start), Migrate. Each shows a confirmation dialog before executing.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "bulk-buttons-present",
+          "description": "Bulk action buttons are visible below the service table: at minimum Start All, Stop All, Clean, Fresh, Migrate",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Start All" }, "label": "Start All button" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "bulk-action-confirmation",
+          "description": "Clicking a destructive bulk action (Stop All, Clean, Fresh) shows a confirmation dialog before executing. The dialog has Confirm and Cancel buttons.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Stop All" }, "label": "Stop All button" },
+          "assertionType": "behavior",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ai-debug-panel",
+      "name": "AI Debug Session Panel",
+      "description": "When an AI debug session is running, a collapsible panel appears showing live SSE output from the AI provider (Claude/Gemini). The panel has a provider/model selector dropdown, Stop button, expand/collapse toggle, and auto-scrolling monospace output limited to 200 lines.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "ai-provider-selector",
+          "description": "An AI provider/model selector dropdown is present, showing the current provider (e.g., 'Claude Opus 4.6'). Disabled while AI is running.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "selector": ".provider-select" }, "label": "AI provider selector" },
+          "assertionType": "exists",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "ai-session-running-indicator",
+          "description": "When AI debug is running, a panel appears with a pulsing accent-colored dot, the text 'AI debug running (provider/model)', line count, and a Stop button (danger variant). The panel has an indigo-tinted border and background.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "AI debug" }, "label": "AI session panel" },
+          "assertionType": "semantic",
+          "precondition": "An AI debug session is active",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "ai-session-output",
+          "description": "AI session output is displayed in a monospace font, auto-scrolling container (max 200 lines). Each line is rendered as a separate div. The output can be collapsed/expanded.",
+          "category": "data-display",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "AI debug" }, "label": "AI output area" },
+          "assertionType": "semantic",
+          "precondition": "An AI debug session has produced output",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "runner-instances-panel",
+      "name": "Runner Instances Panel",
+      "description": "Shows all runner instances (temp and user-managed) with their status, port, PID, and action controls. Temp runners (test-* IDs) can be stopped. User runners are observe-only.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "runner-list-present",
+          "description": "A runner instances section is visible, showing at minimum the primary runner with its port (9876) and running status",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Runner" }, "label": "Runner instances section" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "runner-status-display",
+          "description": "Each runner shows: name/ID, port number, running state (with status dot), PID when running, and whether it's protected. Temp runners show Stop button; user runners show observe-only label.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Runner" }, "label": "Runner status display" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "build-pool-status",
+      "name": "Build Pool Status",
+      "description": "Shows the supervisor's parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "build-pool-visible",
+          "description": "Build pool status is displayed showing pool size, available permits, and per-slot state (idle or building with elapsed_secs)",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Build" }, "label": "Build pool section" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "log-viewer",
+      "name": "Log Viewer Panel",
+      "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build, AI) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "log-viewer-exists",
+          "description": "A log viewer section is present, showing recent log entries in monospace font with timestamps, source badges, and level indicators",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Log" }, "label": "Log viewer" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "log-filter-controls",
+          "description": "Log viewer has filter controls for source (Supervisor, Runner, Build, AI) and level (INFO, WARN, ERROR), plus a pause/resume toggle",
+          "category": "interaction",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Log" }, "label": "Log filter controls" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "dashboard-design",
+      "name": "Dashboard Visual Design",
+      "description": "The dashboard uses a dark theme with CSS custom properties for consistent styling. Background is dark (--bg-primary), text is light (--text-primary), accent color is indigo (--accent). Cards have subtle borders and rounded corners. Status colors: green for success, red for danger, amber for warning.",
+      "category": "design",
+      "assertions": [
+        {
+          "id": "dark-theme-background",
+          "description": "The page background uses the dark theme (--bg-primary, approximately #0f1117 or similar dark color). Text is light (--text-primary, approximately #e5e7eb or white).",
+          "category": "design",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": "body" }, "label": "Page body" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "card-styling",
+          "description": "Cards use --bg-secondary background with 1px --border borders, 6px border-radius, and subtle box shadows. Card headers have bold text at 0.9rem.",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "selector": ".card" }, "label": "Card elements" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        },
+        {
+          "id": "text-legibility",
+          "description": "All text content is legible against its background. Primary text uses --text-primary (light), secondary text uses --text-secondary, muted text uses --text-muted. No text should be invisible or near-invisible.",
+          "category": "design",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "selector": "body" }, "label": "All text" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "cascade-panel",
+      "name": "Cascade Detection Panel",
+      "description": "Displays real-time cascade detection events from SSE stream. Shows needle searches across backends with confidence scores, duration, and results. Collapsible with event history limited to 100 entries.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "cascade-panel-collapsible",
+          "description": "The cascade panel is present and can be expanded/collapsed. Shows event count when collapsed.",
+          "category": "interaction",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Cascade" }, "label": "Cascade panel" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "workflow-loop-panel",
+      "name": "Workflow Loop Status Panel",
+      "description": "Shows current workflow loop status if active: phase (idle/running_workflow/reflecting/implementing_fixes), iteration count, exit strategy, and between-iteration action. Links to the full Workflow Loop page.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "workflow-loop-status",
+          "description": "Workflow loop section displays current phase, iteration progress, and a link to the detailed Workflow Loop page. When no loop is active, shows 'idle' or no section.",
+          "category": "data-display",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Workflow" }, "label": "Workflow loop status" },
+          "assertionType": "semantic",
+          "source": "ai-generated", "reviewed": false, "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "Dashboard",
+    "pageUrl": "/",
+    "tags": ["supervisor", "dashboard", "health", "services", "ai-debug", "runners", "logs"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "dashboard-default",
+        "name": "Dashboard Default View",
+        "description": "Main dashboard with service table, bulk actions, and sub-panels visible",
+        "elements": [
+          { "textContains": "Supervisor Dashboard" }
+        ],
+        "isInitial": true,
+        "transitions": []
+      }
+    ]
+  }
+}

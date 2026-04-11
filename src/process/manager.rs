@@ -248,12 +248,20 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 /// the React AuthProvider can auto-authenticate temp test runners for UI Bridge
 /// inspection of authenticated pages.
 ///
-/// SECURITY: Never forwarded to primary runners and never forwarded in
-/// non-dev-mode builds. Credentials live only in the supervisor operator's env.
+/// SECURITY: Never forwarded to primary runners. Credentials come from either
+/// env vars or the runtime `test_auto_login` field (set via POST /test-login).
+/// Forwarded to temp/test runners regardless of dev_mode since temp runners
+/// are ephemeral and isolated by design.
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
-    if !state.config.dev_mode {
-        return;
+    // Priority 1: runtime-configured credentials (set via API)
+    if let Ok(guard) = state.test_auto_login.try_read() {
+        if let Some((ref email, ref password)) = *guard {
+            cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
+            cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
+            return;
+        }
     }
+    // Priority 2: env vars from supervisor process
     if let (Ok(email), Ok(password)) = (
         std::env::var("QONTINUI_TEST_LOGIN_EMAIL"),
         std::env::var("QONTINUI_TEST_LOGIN_PASSWORD"),
