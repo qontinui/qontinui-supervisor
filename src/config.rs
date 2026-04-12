@@ -285,12 +285,23 @@ impl SupervisorConfig {
             .join(format!("qontinui-runner-{}.exe", runner_id))
     }
 
-    /// Path to the runner npm project root (parent of src-tauri)
+    /// Path to the runner npm project root (parent of src-tauri).
+    ///
+    /// Always returns an absolute path. When the supervisor was
+    /// launched with a relative `--project-dir` (e.g. `../qontinui-runner/src-tauri`),
+    /// the parent resolves to `../qontinui-runner` — still relative. If that
+    /// relative path is later passed to cargo via `CARGO_TARGET_DIR`, cargo
+    /// resolves it from its own CWD (`src-tauri`), producing a double-nested
+    /// path like `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
+    /// `canonicalize()` call prevents this by expanding to an absolute path
+    /// at the first call site.
     pub fn runner_npm_dir(&self) -> PathBuf {
-        self.project_dir
+        let npm = self
+            .project_dir
             .parent()
             .unwrap_or(&self.project_dir)
-            .to_path_buf()
+            .to_path_buf();
+        npm.canonicalize().unwrap_or(npm)
     }
 }
 
