@@ -175,6 +175,18 @@ pub fn build_router(state: SharedState) -> Router {
             "/workflow-loop/checkpoints/{task_run_id}",
             get(crate::routes::workflow_loop::get_checkpoints),
         )
+        .route(
+            "/workflow-loop/breakpoints/{task_run_id}",
+            get(crate::routes::workflow_loop::get_breakpoints),
+        )
+        .route(
+            "/workflow-loop/breakpoints/{task_run_id}/{snapshot_id}",
+            get(crate::routes::workflow_loop::get_breakpoint_detail),
+        )
+        .route(
+            "/workflow-loop/breakpoints/{task_run_id}/{snapshot_id}/resume",
+            post(crate::routes::workflow_loop::resume_breakpoint),
+        )
         // Cascade detection events
         .route("/cascade/events", get(crate::routes::cascade::events))
         .route("/cascade/stream", get(crate::routes::cascade::stream))

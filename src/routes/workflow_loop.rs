@@ -349,3 +349,100 @@ pub async fn get_checkpoints(
         .map_err(|e| SupervisorError::Other(format!("Failed to parse checkpoints: {}", e)))?;
     Ok(Json(body))
 }
+
+/// GET /workflow-loop/breakpoints/:task_run_id
+pub async fn get_breakpoints(
+    State(state): State<SharedState>,
+    Path(task_run_id): Path<String>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    if !task_run_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(SupervisorError::Other(
+            "Invalid task_run_id format".to_string(),
+        ));
+    }
+
+    let url = format!(
+        "http://127.0.0.1:9876/task-runs/{}/breakpoints",
+        task_run_id
+    );
+    let resp = state
+        .http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to fetch breakpoints: {}", e)))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to parse breakpoints: {}", e)))?;
+    Ok(Json(body))
+}
+
+/// GET /workflow-loop/breakpoints/:task_run_id/:snapshot_id
+pub async fn get_breakpoint_detail(
+    State(state): State<SharedState>,
+    Path((task_run_id, snapshot_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    for id in [&task_run_id, &snapshot_id] {
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(SupervisorError::Other(
+                "Invalid ID format".to_string(),
+            ));
+        }
+    }
+
+    let url = format!(
+        "http://127.0.0.1:9876/task-runs/{}/breakpoints/{}",
+        task_run_id, snapshot_id
+    );
+    let resp = state
+        .http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to fetch breakpoint: {}", e)))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to parse breakpoint: {}", e)))?;
+    Ok(Json(body))
+}
+
+/// POST /workflow-loop/breakpoints/:task_run_id/:snapshot_id/resume
+pub async fn resume_breakpoint(
+    State(state): State<SharedState>,
+    Path((task_run_id, snapshot_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    for id in [&task_run_id, &snapshot_id] {
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(SupervisorError::Other(
+                "Invalid ID format".to_string(),
+            ));
+        }
+    }
+
+    let url = format!(
+        "http://127.0.0.1:9876/task-runs/{}/breakpoints/{}/resume",
+        task_run_id, snapshot_id
+    );
+    let resp = state
+        .http_client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to resume breakpoint: {}", e)))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| SupervisorError::Other(format!("Failed to parse resume response: {}", e)))?;
+    Ok(Json(body))
+}
