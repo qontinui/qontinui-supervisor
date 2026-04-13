@@ -10,9 +10,8 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
-    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree,
-    kill_webview2_processes, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
-    webview2_user_data_folder,
+    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree, kill_webview2_processes,
+    remove_runner_app_data_dirs, remove_webview2_user_data_folder, webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -495,9 +494,7 @@ async fn start_exe_mode_for_runner(
             // Per-runner WebView2 data dir (see Windows branch for rationale).
             // On non-Windows the variable is ignored by other webview backends,
             // so this is harmless but keeps behavior consistent.
-            if let Some(webview_dir) =
-                webview2_user_data_folder(&managed.config.id, false)
-            {
+            if let Some(webview_dir) = webview2_user_data_folder(&managed.config.id, false) {
                 let _ = std::fs::create_dir_all(&webview_dir);
                 cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
             }

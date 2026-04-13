@@ -79,15 +79,18 @@ pub async fn run_cargo_build_with_requester(
         .build_pool
         .queue_depth
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let _permit = permit_result.map_err(|_| {
-        SupervisorError::Other("Build pool semaphore closed".to_string())
-    })?;
+    let _permit = permit_result
+        .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
     // Claim a slot and mark it busy with our BuildInfo.
     let info = BuildInfo {
         started_at: chrono::Utc::now(),
         requester_id,
-        rebuild_kind: if state.config.dev_mode { "dev".to_string() } else { "exe".to_string() },
+        rebuild_kind: if state.config.dev_mode {
+            "dev".to_string()
+        } else {
+            "exe".to_string()
+        },
     };
     let slot = state.build_pool.claim_idle_slot(info).await;
     // RAII guard: clears `slot.busy = None` on every exit path (happy path,
@@ -204,7 +207,10 @@ async fn any_slot_busy(state: &SharedState) -> bool {
     false
 }
 
-async fn run_build_inner(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
+async fn run_build_inner(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+) -> Result<(), SupervisorError> {
     // In exe mode the frontend is embedded in the binary via tauri_build, so we
     // must run `npm run build` first to produce a fresh dist/ before cargo build.
     // In dev mode Vite serves the frontend live, so this step is skipped.
@@ -553,7 +559,11 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
             warn!("Prewarm of slot {} failed: {}", slot.id, e);
             state
                 .logs
-                .emit(LogSource::Build, LogLevel::Warn, format!("Prewarm of slot {} failed: {}", slot.id, e))
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Warn,
+                    format!("Prewarm of slot {} failed: {}", slot.id, e),
+                )
                 .await;
         }
     }
@@ -565,16 +575,25 @@ async fn prewarm_single_slot(
     slot: &Arc<BuildSlot>,
 ) -> Result<(), SupervisorError> {
     // Acquire a permit so concurrent spawn-test calls see this slot as busy.
-    state.build_pool.queue_depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .build_pool
+        .queue_depth
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let permit_result = state.build_pool.permits.clone().acquire_owned().await;
-    state.build_pool.queue_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .build_pool
+        .queue_depth
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let _permit = permit_result
         .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
     // Re-check after acquiring: another caller may have populated this slot.
     let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
     if exe_path.exists() {
-        info!("Slot {} populated while waiting for permit, skipping prewarm", slot.id);
+        info!(
+            "Slot {} populated while waiting for permit, skipping prewarm",
+            slot.id
+        );
         return Ok(());
     }
 
@@ -592,15 +611,31 @@ async fn prewarm_single_slot(
     }
     let _slot_guard = SlotGuard { slot: slot.clone() };
 
-    info!("Prewarming build slot {} (target: {:?})...", slot.id, slot.target_dir);
-    state.logs.emit(LogSource::Build, LogLevel::Info, format!("Prewarming slot {}...", slot.id)).await;
+    info!(
+        "Prewarming build slot {} (target: {:?})...",
+        slot.id, slot.target_dir
+    );
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!("Prewarming slot {}...", slot.id),
+        )
+        .await;
 
     let start = std::time::Instant::now();
 
     let args: Vec<&str> = if state.config.dev_mode {
         vec!["check", "--bin", "qontinui-runner"]
     } else {
-        vec!["check", "--bin", "qontinui-runner", "--features", "custom-protocol"]
+        vec![
+            "check",
+            "--bin",
+            "qontinui-runner",
+            "--features",
+            "custom-protocol",
+        ]
     };
 
     #[cfg(windows)]
@@ -628,8 +663,9 @@ async fn prewarm_single_slot(
             .spawn()
     };
 
-    let mut child = child_result
-        .map_err(|e| SupervisorError::Process(format!("Failed to spawn prewarm cargo check: {}", e)))?;
+    let mut child = child_result.map_err(|e| {
+        SupervisorError::Process(format!("Failed to spawn prewarm cargo check: {}", e))
+    })?;
 
     // Stream stderr to logs
     if let Some(stderr) = child.stderr.take() {
@@ -641,7 +677,11 @@ async fn prewarm_single_slot(
             while let Ok(Some(line)) = lines.next_line().await {
                 state_clone
                     .logs
-                    .emit(LogSource::Build, LogLevel::Info, format!("[prewarm slot {}] {}", slot_id, line))
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Info,
+                        format!("[prewarm slot {}] {}", slot_id, line),
+                    )
                     .await;
             }
         });
@@ -651,7 +691,14 @@ async fn prewarm_single_slot(
         Ok(Ok(status)) if status.success() => {
             let ms = start.elapsed().as_millis();
             info!("Prewarmed slot {} in {}ms", slot.id, ms);
-            state.logs.emit(LogSource::Build, LogLevel::Info, format!("Prewarmed slot {} in {}ms", slot.id, ms)).await;
+            state
+                .logs
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Info,
+                    format!("Prewarmed slot {} in {}ms", slot.id, ms),
+                )
+                .await;
             // Set last_successful_slot only if no real build has run yet.
             let mut last = state.build_pool.last_successful_slot.write().await;
             if last.is_none() {
@@ -660,14 +707,29 @@ async fn prewarm_single_slot(
             Ok(())
         }
         Ok(Ok(status)) => {
-            warn!("Prewarm cargo check for slot {} exited with {}", slot.id, status);
-            Err(SupervisorError::BuildFailed(format!("Prewarm exited with {}", status)))
+            warn!(
+                "Prewarm cargo check for slot {} exited with {}",
+                slot.id, status
+            );
+            Err(SupervisorError::BuildFailed(format!(
+                "Prewarm exited with {}",
+                status
+            )))
         }
-        Ok(Err(e)) => Err(SupervisorError::Process(format!("Prewarm process error: {}", e))),
+        Ok(Err(e)) => Err(SupervisorError::Process(format!(
+            "Prewarm process error: {}",
+            e
+        ))),
         Err(_) => {
-            warn!("Prewarm of slot {} timed out after {}s, killing", slot.id, PREWARM_TIMEOUT_SECS);
+            warn!(
+                "Prewarm of slot {} timed out after {}s, killing",
+                slot.id, PREWARM_TIMEOUT_SECS
+            );
             let _ = child.kill().await;
-            Err(SupervisorError::Timeout(format!("Prewarm timed out after {}s", PREWARM_TIMEOUT_SECS)))
+            Err(SupervisorError::Timeout(format!(
+                "Prewarm timed out after {}s",
+                PREWARM_TIMEOUT_SECS
+            )))
         }
     }
 }

@@ -218,8 +218,7 @@ pub async fn remove_runner(
     // early), so this always targets a non-primary folder.
     #[cfg(windows)]
     {
-        if let Err(e) =
-            crate::process::windows::remove_webview2_user_data_folder(&id, false).await
+        if let Err(e) = crate::process::windows::remove_webview2_user_data_folder(&id, false).await
         {
             warn!(
                 "Failed to remove WebView2 data folder for runner '{}': {}",
@@ -232,9 +231,7 @@ pub async fn remove_runner(
         // an `instance-<name>` subdirectory. The runner sees the env var
         // `QONTINUI_INSTANCE_NAME = <managed.config.name>`, so cleanup keys
         // off the name, not the id.
-        if let Err(e) =
-            crate::process::windows::remove_runner_app_data_dirs(&name, false).await
-        {
+        if let Err(e) = crate::process::windows::remove_runner_app_data_dirs(&name, false).await {
             warn!(
                 "Failed to remove per-instance app data for runner '{}': {}",
                 name, e
@@ -297,8 +294,7 @@ pub async fn purge_stale(
         if is_running {
             // Try to detect zombie: process is gone but state says running.
             // If nothing is actually listening on the port, treat it as stale.
-            let port_alive =
-                crate::process::port::is_port_in_use(managed.config.port);
+            let port_alive = crate::process::port::is_port_in_use(managed.config.port);
             if port_alive {
                 continue; // genuinely running, skip
             }
@@ -334,8 +330,7 @@ pub async fn purge_stale(
                     id, e
                 );
             }
-            if let Err(e) =
-                crate::process::windows::remove_runner_app_data_dirs(&name, false).await
+            if let Err(e) = crate::process::windows::remove_runner_app_data_dirs(&name, false).await
             {
                 warn!(
                     "purge-stale: failed to remove app data for '{}': {}",
@@ -348,7 +343,10 @@ pub async fn purge_stale(
         let exe_copy = state.config.runner_exe_copy_path(&id);
         if exe_copy.exists() {
             if let Err(e) = std::fs::remove_file(&exe_copy) {
-                warn!("purge-stale: failed to remove exe copy {:?}: {}", exe_copy, e);
+                warn!(
+                    "purge-stale: failed to remove exe copy {:?}: {}",
+                    exe_copy, e
+                );
             } else {
                 info!("purge-stale: removed exe copy {:?}", exe_copy);
             }
@@ -358,7 +356,10 @@ pub async fn purge_stale(
             let _ = std::fs::remove_file(&pdb_copy);
         }
 
-        info!("purge-stale: removed test runner '{}' (port {})", name, port);
+        info!(
+            "purge-stale: removed test runner '{}' (port {})",
+            name, port
+        );
         purged.push(json!({
             "id": id,
             "name": name,
@@ -722,7 +723,10 @@ pub async fn spawn_test(
             is_primary: false,
             protected: true,
         };
-        runners.insert(id.clone(), Arc::new(ManagedRunner::new(runner_config, false)));
+        runners.insert(
+            id.clone(),
+            Arc::new(ManagedRunner::new(runner_config, false)),
+        );
         (id, port)
     };
 
@@ -763,7 +767,11 @@ pub async fn spawn_test(
                     count += 1;
                 }
             }
-            let avg = if count > 0 { Some(sum / count as f64) } else { None };
+            let avg = if count > 0 {
+                Some(sum / count as f64)
+            } else {
+                None
+            };
             let estimated_wait_secs = avg.map(|a| (a - min_elapsed_secs.unwrap_or(0.0)).max(0.0));
 
             let queued = state
@@ -792,10 +800,8 @@ pub async fn spawn_test(
         // Run the build, optionally bounded by a queue timeout.
         // On any failure (build error, timeout, etc.), remove the placeholder
         // we reserved above so the port doesn't leak.
-        let build_fut = crate::build_monitor::run_cargo_build_with_requester(
-            &state,
-            body.requester_id.clone(),
-        );
+        let build_fut =
+            crate::build_monitor::run_cargo_build_with_requester(&state, body.requester_id.clone());
         let build_result = match body.queue_timeout_secs {
             Some(secs) => {
                 let timeout = std::time::Duration::from_secs(secs);
@@ -825,7 +831,8 @@ pub async fn spawn_test(
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(SupervisorError::Process(
-            "Runner binary not found in any build slot. Use rebuild: true to build it first.".to_string()
+            "Runner binary not found in any build slot. Use rebuild: true to build it first."
+                .to_string(),
         ));
     }
 
@@ -911,10 +918,8 @@ pub async fn spawn_test(
                         .await;
 
                     // Clear localStorage for this port to avoid stale tab state
-                    let clear_url = format!(
-                        "http://localhost:{}/ui-bridge/control/clear-storage",
-                        port
-                    );
+                    let clear_url =
+                        format!("http://localhost:{}/ui-bridge/control/clear-storage", port);
                     if let Err(e) = client
                         .post(&clear_url)
                         .json(&serde_json::json!({}))
@@ -969,9 +974,7 @@ pub async fn spawn_test(
 /// Returns the pool size, the state of each slot, and the number of callers
 /// currently waiting in the queue. Agents use this to decide whether a
 /// rebuild request will be quick or will have to wait.
-pub async fn list_builds(
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
+pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse {
     let now = chrono::Utc::now();
     let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(state.build_pool.slots.len());
     let mut global_sum: f64 = 0.0;
@@ -1172,7 +1175,10 @@ pub async fn clear_build_caches(
                 .emit(
                     LogSource::Build,
                     LogLevel::Info,
-                    format!("Cleaned build cache for slot {} ({:?})", slot.id, target_dir),
+                    format!(
+                        "Cleaned build cache for slot {} ({:?})",
+                        slot.id, target_dir
+                    ),
                 )
                 .await;
         }
@@ -1226,17 +1232,13 @@ pub async fn set_test_login(
 }
 
 /// GET /test-login — Check if auto-login credentials are configured.
-pub async fn get_test_login(
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
+pub async fn get_test_login(State(state): State<SharedState>) -> impl IntoResponse {
     let configured = state.test_auto_login.read().await.is_some();
     Json(json!({"configured": configured}))
 }
 
 /// DELETE /test-login — Clear auto-login credentials.
-pub async fn clear_test_login(
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
+pub async fn clear_test_login(State(state): State<SharedState>) -> impl IntoResponse {
     *state.test_auto_login.write().await = None;
     info!("Test auto-login credentials cleared");
     Json(json!({"success": true, "message": "Auto-login credentials cleared"}))

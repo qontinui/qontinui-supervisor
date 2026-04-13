@@ -59,10 +59,7 @@ async fn check_runner_health(state: &SharedState, managed: &Arc<ManagedRunner>) 
             wd.restart_attempts > 0
         };
         if needs_reset {
-            info!(
-                "Watchdog: runner '{}' recovered",
-                runner_name
-            );
+            info!("Watchdog: runner '{}' recovered", runner_name);
             state
                 .logs
                 .emit(

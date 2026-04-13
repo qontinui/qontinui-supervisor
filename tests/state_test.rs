@@ -167,7 +167,6 @@ async fn test_watchdog_crash_recording() {
 
     watchdog.record_crash();
     assert_eq!(watchdog.crash_history.len(), 2);
-
 }
 
 #[tokio::test]
@@ -191,4 +190,3 @@ async fn test_health_cache_notify() {
     assert!(result.is_ok());
     assert!(result.unwrap().unwrap());
 }
-

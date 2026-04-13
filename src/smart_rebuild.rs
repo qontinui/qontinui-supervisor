@@ -435,7 +435,10 @@ async fn run_smart_rebuild(state: &SharedState) {
         }
 
         if !start_errors.is_empty() {
-            let reason = format!("Failed to restart temp runners: {}", start_errors.join("; "));
+            let reason = format!(
+                "Failed to restart temp runners: {}",
+                start_errors.join("; ")
+            );
             error!("Smart rebuild: {}", reason);
             set_failed(state, reason.clone()).await;
             state

@@ -447,7 +447,6 @@ impl WatchdogState {
     pub fn record_crash(&mut self) {
         self.crash_history.push(Utc::now());
     }
-
 }
 
 impl Default for BuildState {

@@ -107,4 +107,3 @@ fn test_ai_models_defined() {
         assert!(!display_name.is_empty());
     }
 }
-

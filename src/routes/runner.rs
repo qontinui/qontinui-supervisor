@@ -192,7 +192,11 @@ pub async fn reset_build(
     state.notify_health_change();
 
     let message = if cleared_count > 0 {
-        format!("Cleared {} stuck slot{}", cleared_count, if cleared_count == 1 { "" } else { "s" })
+        format!(
+            "Cleared {} stuck slot{}",
+            cleared_count,
+            if cleared_count == 1 { "" } else { "s" }
+        )
     } else if legacy_flag_was_set {
         "No slots busy; cleared stale legacy build flag".to_string()
     } else {

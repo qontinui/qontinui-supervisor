@@ -357,10 +357,11 @@ pub async fn get_breakpoints(
 ) -> Result<impl IntoResponse, SupervisorError> {
     if !task_run_id
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(SupervisorError::Other(
-            "Invalid task_run_id format".to_string(),
+        return Err(SupervisorError::Validation(
+            "task_run_id must contain only alphanumeric characters, dashes, and underscores"
+                .to_string(),
         ));
     }
 
@@ -389,10 +390,11 @@ pub async fn get_breakpoint_detail(
     for id in [&task_run_id, &snapshot_id] {
         if !id
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            return Err(SupervisorError::Other(
-                "Invalid ID format".to_string(),
+            return Err(SupervisorError::Validation(
+                "IDs must contain only alphanumeric characters, dashes, and underscores"
+                    .to_string(),
             ));
         }
     }
@@ -422,10 +424,11 @@ pub async fn resume_breakpoint(
     for id in [&task_run_id, &snapshot_id] {
         if !id
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            return Err(SupervisorError::Other(
-                "Invalid ID format".to_string(),
+            return Err(SupervisorError::Validation(
+                "IDs must contain only alphanumeric characters, dashes, and underscores"
+                    .to_string(),
             ));
         }
     }

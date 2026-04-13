@@ -237,7 +237,10 @@ pub async fn remove_webview2_user_data_folder(
     }
     match tokio::fs::remove_dir_all(&folder).await {
         Ok(()) => {
-            info!("Removed WebView2 data folder for runner '{}' at {:?}", runner_id, folder);
+            info!(
+                "Removed WebView2 data folder for runner '{}' at {:?}",
+                runner_id, folder
+            );
             Ok(true)
         }
         Err(e) => {
@@ -283,7 +286,9 @@ pub async fn remove_runner_app_data_dirs(
         .collect();
     let subdir = format!("instance-{}", safe_name);
 
-    let local_app_data = std::env::var("LOCALAPPDATA").ok().map(std::path::PathBuf::from);
+    let local_app_data = std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(std::path::PathBuf::from);
     let roaming_app_data = std::env::var("APPDATA").ok().map(std::path::PathBuf::from);
 
     // Each runner path helper applies scope_path at a slightly different
@@ -307,9 +312,12 @@ pub async fn remove_runner_app_data_dirs(
             .as_ref()
             .map(|p| p.join("com.qontinui.runner").join(&subdir)),
         // Restate journal: base is dirs::data_dir()/qontinui-runner/restate/data.
-        roaming_app_data
-            .as_ref()
-            .map(|p| p.join("qontinui-runner").join("restate").join("data").join(&subdir)),
+        roaming_app_data.as_ref().map(|p| {
+            p.join("qontinui-runner")
+                .join("restate")
+                .join("data")
+                .join(&subdir)
+        }),
     ]
     .into_iter()
     .flatten()

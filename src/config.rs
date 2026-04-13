@@ -200,7 +200,6 @@ pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[
     ("gemini", "pro", "gemini-3-pro-preview", "Gemini 3 Pro"),
 ];
 
-
 impl SupervisorConfig {
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;

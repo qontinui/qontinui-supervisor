@@ -100,7 +100,11 @@ async fn test_concurrent_slot_acquisition() {
     }
 
     // All 3 slot ids must be unique
-    assert_eq!(slot_ids.len(), 3, "expected 3 unique slot ids, got {slot_ids:?}");
+    assert_eq!(
+        slot_ids.len(),
+        3,
+        "expected 3 unique slot ids, got {slot_ids:?}"
+    );
 
     // All permits free
     assert_eq!(state.build_pool.permits.available_permits(), 3);
@@ -132,13 +136,34 @@ async fn test_no_wait_exhaustion() {
     let state = Arc::new(SupervisorState::new(pool_test_config(3)));
 
     // Hold all 3 permits
-    let p1 = state.build_pool.permits.clone().acquire_owned().await.unwrap();
-    let p2 = state.build_pool.permits.clone().acquire_owned().await.unwrap();
-    let p3 = state.build_pool.permits.clone().acquire_owned().await.unwrap();
+    let p1 = state
+        .build_pool
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let p2 = state
+        .build_pool
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let p3 = state
+        .build_pool
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
 
     // Non-blocking try should fail
     let try_result = Semaphore::try_acquire_owned(state.build_pool.permits.clone());
-    assert!(try_result.is_err(), "try_acquire should fail when exhausted");
+    assert!(
+        try_result.is_err(),
+        "try_acquire should fail when exhausted"
+    );
 
     assert_eq!(state.build_pool.permits.available_permits(), 0);
 
