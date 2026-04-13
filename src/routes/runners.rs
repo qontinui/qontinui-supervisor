@@ -666,6 +666,21 @@ fn default_wait_timeout() -> u64 {
     120
 }
 
+#[derive(Deserialize)]
+pub struct SpawnNamedRequest {
+    pub name: String,
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub rebuild: bool,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default = "default_wait_timeout")]
+    pub wait_timeout_secs: u64,
+    pub requester_id: Option<String>,
+    #[serde(default)]
+    pub protected: bool,
+}
+
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
 ///
 /// Automatically picks a free port (9877-9899), creates a temporary runner,
@@ -957,6 +972,311 @@ pub async fn spawn_test(
             format!("Test runner spawned on port {} but did not become healthy within {}s", port, body.wait_timeout_secs)
         } else {
             format!("Test runner spawned on port {}", port)
+        }
+    });
+    if let Some(meta) = exe_meta {
+        resp["binary_mtime"] = json!(meta.binary_mtime);
+        resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
+    }
+
+    Ok(Json(resp))
+}
+
+// --- Spawn named runner ---
+
+/// POST /runners/spawn-named — spawn a persistent named runner on the next available port.
+///
+/// Like `spawn-test` but the runner is NOT ephemeral — it is persisted to settings
+/// and is NOT auto-cleaned by the reaper. The ID uses a `named-` prefix instead of
+/// `test-`, so `is_temp_runner()` returns false.
+pub async fn spawn_named(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<SpawnNamedRequest>,
+) -> Result<impl IntoResponse, SupervisorError> {
+    // Validate name
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(SupervisorError::Validation(
+            "Runner name must not be empty".to_string(),
+        ));
+    }
+    if name == "primary" {
+        return Err(SupervisorError::Validation(
+            "Runner name 'primary' is reserved".to_string(),
+        ));
+    }
+    if name.starts_with("test-") {
+        return Err(SupervisorError::Validation(
+            "Runner name must not start with 'test-'".to_string(),
+        ));
+    }
+
+    let no_wait = headers
+        .get("X-Queue-Mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("no-wait"))
+        .unwrap_or(false);
+
+    // Atomically reserve a free port AND insert a placeholder ManagedRunner.
+    let (id, port) = {
+        let mut runners = state.runners.write().await;
+        let used_ports: std::collections::HashSet<u16> =
+            runners.values().map(|r| r.config.port).collect();
+        let port = match body.port {
+            Some(p) => {
+                if used_ports.contains(&p) {
+                    return Err(SupervisorError::Validation(format!(
+                        "Port {} is already in use",
+                        p
+                    )));
+                }
+                p
+            }
+            None => (9877..=9899)
+                .find(|p| !used_ports.contains(p))
+                .ok_or_else(|| {
+                    SupervisorError::Validation(
+                        "No available ports in range 9877-9899. Stop some runners first."
+                            .to_string(),
+                    )
+                })?,
+        };
+        let id = format!("named-{}-{}", port, uuid_simple());
+        let runner_config = RunnerConfig {
+            id: id.clone(),
+            name: name.clone(),
+            port,
+            is_primary: false,
+            protected: body.protected,
+        };
+        runners.insert(
+            id.clone(),
+            Arc::new(ManagedRunner::new(runner_config, false)),
+        );
+        (id, port)
+    };
+
+    // Rebuild if requested
+    if body.rebuild {
+        if no_wait && state.build_pool.permits.available_permits() == 0 {
+            // Clean up placeholder before returning error
+            let mut runners = state.runners.write().await;
+            runners.remove(&id);
+
+            let snap = state.build_pool.snapshot().await;
+            let now = chrono::Utc::now();
+            let mut min_elapsed_secs: Option<f64> = None;
+            let active: Vec<serde_json::Value> = snap
+                .iter()
+                .filter_map(|(slot_id, _td, info)| {
+                    info.as_ref().map(|i| {
+                        let elapsed = (now - i.started_at).num_seconds().max(0) as f64;
+                        min_elapsed_secs = Some(match min_elapsed_secs {
+                            Some(cur) => cur.min(elapsed),
+                            None => elapsed,
+                        });
+                        json!({
+                            "slot": slot_id,
+                            "started_at": i.started_at.to_rfc3339(),
+                            "elapsed_secs": elapsed as i64,
+                            "requester_id": i.requester_id,
+                            "rebuild_kind": i.rebuild_kind,
+                        })
+                    })
+                })
+                .collect();
+            let mut sum: f64 = 0.0;
+            let mut count: usize = 0;
+            for slot in &state.build_pool.slots {
+                let h = slot.history.read().await;
+                for d in &h.recent_durations_secs {
+                    sum += *d;
+                    count += 1;
+                }
+            }
+            let avg = if count > 0 {
+                Some(sum / count as f64)
+            } else {
+                None
+            };
+            let estimated_wait_secs = avg.map(|a| (a - min_elapsed_secs.unwrap_or(0.0)).max(0.0));
+            let queued = state
+                .build_pool
+                .queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed);
+            return Err(SupervisorError::BuildPoolFull {
+                queue_position: queued + 1,
+                active_builds: active,
+                estimated_wait_secs,
+            });
+        }
+
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "Rebuilding runner before spawning named runner '{}' on port {} (requester={:?})",
+                    name, port, body.requester_id
+                ),
+            )
+            .await;
+
+        let build_result =
+            crate::build_monitor::run_cargo_build_with_requester(&state, body.requester_id.clone())
+                .await;
+        if let Err(e) = build_result {
+            let mut runners = state.runners.write().await;
+            runners.remove(&id);
+            return Err(e);
+        }
+    }
+
+    // Check that a runner binary exists
+    if manager::resolve_source_exe(&state).await.is_err() {
+        let mut runners = state.runners.write().await;
+        runners.remove(&id);
+        return Err(SupervisorError::Process(
+            "Runner binary not found in any build slot. Use rebuild: true to build it first."
+                .to_string(),
+        ));
+    }
+
+    // Start the runner
+    if let Err(e) = manager::start_runner_by_id(&state, &id).await {
+        let mut runners = state.runners.write().await;
+        runners.remove(&id);
+        return Err(e);
+    }
+
+    // Persist to settings (named runners survive restarts)
+    let settings_path = settings::settings_path(&state.config);
+    settings::add_runner(
+        &settings_path,
+        &RunnerConfig {
+            id: id.clone(),
+            name: name.clone(),
+            port,
+            is_primary: false,
+            protected: body.protected,
+        },
+    );
+
+    // If protected, persist the protection flag via settings
+    if body.protected {
+        let mut settings = settings::load_settings(&settings_path);
+        if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
+            cfg.protected = true;
+            let _ = settings::try_save_settings(&settings_path, &settings);
+        }
+        // Update runtime protection flag
+        if let Some(managed) = state.get_runner(&id).await {
+            let mut protected = managed.protected.write().await;
+            *protected = true;
+        }
+    }
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "Spawned named runner '{}' on port {} (id: {})",
+                name, port, id
+            ),
+        )
+        .await;
+
+    state.notify_health_change();
+
+    // If wait=true, poll the runner's health endpoint until it responds or times out
+    let mut healthy = false;
+    let mut wait_ms: u64 = 0;
+    if body.wait {
+        let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        let health_url = format!("http://localhost:{}/health", port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "Waiting up to {}s for named runner '{}' to become healthy...",
+                    body.wait_timeout_secs, name
+                ),
+            )
+            .await;
+
+        loop {
+            if start.elapsed() >= timeout {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Named runner '{}' did not become healthy within {}s",
+                            name, body.wait_timeout_secs
+                        ),
+                    )
+                    .await;
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    healthy = true;
+                    wait_ms = start.elapsed().as_millis() as u64;
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Info,
+                            format!(
+                                "Named runner '{}' is healthy (took {}ms)",
+                                name, wait_ms
+                            ),
+                        )
+                        .await;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // Resolve the source exe to report its metadata
+    let exe_meta = crate::process::manager::resolve_source_exe(&state)
+        .await
+        .ok()
+        .and_then(|p| crate::process::manager::binary_meta(&p));
+
+    let mut resp = json!({
+        "id": id,
+        "name": name,
+        "port": port,
+        "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
+        "wait_ms": wait_ms,
+        "api_url": format!("http://localhost:{}", port),
+        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "message": if body.wait && healthy {
+            format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
+        } else if body.wait {
+            format!("Named runner '{}' spawned on port {} but did not become healthy within {}s", name, port, body.wait_timeout_secs)
+        } else {
+            format!("Named runner '{}' spawned on port {}", name, port)
         }
     });
     if let Some(meta) = exe_meta {

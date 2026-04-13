@@ -229,6 +229,10 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::runners::spawn_test),
         )
         .route(
+            "/runners/spawn-named",
+            post(crate::routes::runners::spawn_named),
+        )
+        .route(
             "/test-login",
             post(crate::routes::runners::set_test_login)
                 .get(crate::routes::runners::get_test_login)

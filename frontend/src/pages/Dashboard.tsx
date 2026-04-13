@@ -756,6 +756,8 @@ function RunnerInstancesPanel() {
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
   const [newPort, setNewPort] = useState('');
+  const [rebuild, setRebuild] = useState(true);
+  const [isProtected, setIsProtected] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -786,30 +788,33 @@ function RunnerInstancesPanel() {
 
   const handleSpawn = async () => {
     const name = newName.trim();
-    const port = parseInt(newPort);
-    if (!name || !port || port < 1024) {
-      addToast('Enter a valid name and port (>= 1024)', 'error');
+    if (!name) {
+      addToast('Enter a valid instance name', 'error');
+      return;
+    }
+    const portNum = newPort.trim() ? parseInt(newPort) : undefined;
+    if (portNum !== undefined && (isNaN(portNum) || portNum < 1024)) {
+      addToast('Port must be >= 1024', 'error');
       return;
     }
     setBusy('spawn');
     try {
-      // Spawn via runner API (creates process), then register with supervisor
-      await api.spawnInstance(name, port);
-      addToast(`Instance "${name}" spawned on port ${port}`, 'info');
+      const result = await api.spawnNamedRunner({
+        name,
+        port: portNum,
+        rebuild,
+        wait: true,
+        protected: isProtected,
+        requester_id: 'dashboard',
+      });
+      addToast(`Runner "${result.name}" spawned on port ${result.port}`, 'info');
       setNewName('');
       setNewPort('');
+      setRebuild(true);
+      setIsProtected(false);
       setShowAdd(false);
     } catch (e) {
-      // Fallback: just add to supervisor config
-      try {
-        await api.addRunner(name, port);
-        addToast(`Runner "${name}" added (start it manually)`, 'info');
-        setNewName('');
-        setNewPort('');
-        setShowAdd(false);
-      } catch (e2) {
-        addToast(`Failed: ${e2 instanceof Error ? e2.message : 'unknown'}`, 'error');
-      }
+      addToast(`Spawn failed: ${e instanceof Error ? e.message : 'unknown'}`, 'error');
     }
     setBusy(null);
     refresh();
@@ -831,12 +836,12 @@ function RunnerInstancesPanel() {
       </div>
 
       {showAdd && (
-        <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.5rem', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
           <input
             type="text"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
-            placeholder="Name"
+            placeholder="Instance Name"
             style={{
               padding: '0.2rem 0.4rem',
               fontSize: '0.75rem',
@@ -851,7 +856,7 @@ function RunnerInstancesPanel() {
             type="number"
             value={newPort}
             onChange={(e) => setNewPort(e.target.value)}
-            placeholder="Port"
+            placeholder="Port (auto)"
             style={{
               padding: '0.2rem 0.4rem',
               fontSize: '0.75rem',
@@ -859,16 +864,34 @@ function RunnerInstancesPanel() {
               border: '1px solid var(--border)',
               borderRadius: 3,
               color: 'var(--text)',
-              width: 70,
+              width: 80,
             }}
           />
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={rebuild}
+              onChange={(e) => setRebuild(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            Rebuild
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={isProtected}
+              onChange={(e) => setIsProtected(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            Protected
+          </label>
           <button
             className="btn"
             style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
             disabled={busy !== null}
             onClick={handleSpawn}
           >
-            {busy === 'spawn' ? 'Spawning...' : 'Spawn'}
+            {busy === 'spawn' ? (rebuild ? 'Building & Spawning...' : 'Spawning...') : 'Spawn'}
           </button>
         </div>
       )}

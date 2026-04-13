@@ -648,6 +648,27 @@ export const api = {
         body: JSON.stringify({ name, port }),
       },
     ),
+  spawnNamedRunner: (opts: {
+    name: string;
+    port?: number;
+    rebuild?: boolean;
+    wait?: boolean;
+    protected?: boolean;
+    requester_id?: string;
+  }) =>
+    fetchJson<{
+      id: string;
+      name: string;
+      port: number;
+      status: string;
+      api_url: string;
+      ui_bridge_url: string;
+      binary_mtime?: string;
+    }>('/runners/spawn-named', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    }),
   runnerFixAndRebuild: (prompt: string) =>
     fetchJson<unknown>('/runner/fix-and-rebuild', {
       method: 'POST',
