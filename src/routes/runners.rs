@@ -1244,10 +1244,7 @@ pub async fn spawn_named(
                         .emit(
                             LogSource::Supervisor,
                             LogLevel::Info,
-                            format!(
-                                "Named runner '{}' is healthy (took {}ms)",
-                                name, wait_ms
-                            ),
+                            format!("Named runner '{}' is healthy (took {}ms)", name, wait_ms),
                         )
                         .await;
                     break;
