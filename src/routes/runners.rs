@@ -660,6 +660,28 @@ pub struct SpawnTestRequest {
     /// `None` means wait indefinitely (the default).
     #[serde(default)]
     pub queue_timeout_secs: Option<u64>,
+    /// Optional post-spawn health probe window in milliseconds.
+    ///
+    /// After the child process is spawned, the supervisor polls
+    /// `GET http://localhost:{port}/health` every 200ms until it succeeds or
+    /// this many milliseconds elapse. Defaults to 6000 (6 seconds).
+    ///
+    /// Set to `0` to skip the probe entirely (legacy behavior — return
+    /// immediately after spawn without verifying the child bound its API
+    /// port).
+    ///
+    /// Outcomes:
+    /// - Probe succeeds: response includes `health_probe_ms` (elapsed ms).
+    /// - Probe times out and child is alive: returns HTTP 502
+    ///   `runner_started_but_unresponsive` and stops/cleans the runner.
+    /// - Probe times out and child has died: returns HTTP 500
+    ///   `runner_died_during_startup` and stops/cleans the runner.
+    #[serde(default = "default_health_probe_timeout")]
+    pub health_probe_timeout_ms: u64,
+}
+
+fn default_health_probe_timeout() -> u64 {
+    6000
 }
 
 fn default_wait_timeout() -> u64 {
@@ -876,6 +898,78 @@ pub async fn spawn_test(
 
     state.notify_health_change();
 
+    // --- Post-spawn health probe ---
+    //
+    // Quick verification that the child actually bound its API port. The child
+    // process may stay alive (e.g. a lifecycle task keeps ticking) even when
+    // axum failed to bind — without this probe, callers would poll /health for
+    // minutes before realizing the runner is dead.
+    //
+    // - `health_probe_timeout_ms == 0` skips the probe entirely (escape hatch).
+    // - On success: continue to the existing flow with `health_probe_ms` in the
+    //   response body.
+    // - On timeout + child alive: return 502 `runner_started_but_unresponsive`,
+    //   stop the runner, and let the next spawn try fresh.
+    // - On timeout + child dead: return 500 `runner_died_during_startup`, stop,
+    //   and clean up.
+    let mut health_probe_ms: Option<u64> = None;
+    if body.health_probe_timeout_ms > 0 {
+        match probe_runner_health(&state, &id, port, body.health_probe_timeout_ms).await {
+            ProbeOutcome::Healthy { elapsed_ms } => {
+                health_probe_ms = Some(elapsed_ms);
+            }
+            ProbeOutcome::Failed {
+                elapsed_ms,
+                child_alive,
+                pid,
+                recent_logs,
+            } => {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Test runner '{}' failed health probe after {}ms (alive={}); stopping.",
+                            name, elapsed_ms, child_alive
+                        ),
+                    )
+                    .await;
+
+                // Stop & clean up so we don't leak a zombie.
+                let _ = manager::stop_runner_by_id(&state, &id).await;
+                {
+                    let mut runners = state.runners.write().await;
+                    runners.remove(&id);
+                }
+                state.notify_health_change();
+
+                let (status, error_kind) = if child_alive {
+                    (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "runner_started_but_unresponsive",
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "runner_died_during_startup",
+                    )
+                };
+
+                let body = json!({
+                    "error": error_kind,
+                    "id": id,
+                    "pid": pid,
+                    "port": port,
+                    "elapsed_ms": elapsed_ms,
+                    "recent_logs": recent_logs,
+                });
+
+                return Ok((status, Json(body)).into_response());
+            }
+        }
+    }
+
     // If wait=true, poll the runner's health endpoint until it responds or times out
     let mut healthy = false;
     let mut wait_ms: u64 = 0;
@@ -978,8 +1072,116 @@ pub async fn spawn_test(
         resp["binary_mtime"] = json!(meta.binary_mtime);
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
     }
+    if let Some(ms) = health_probe_ms {
+        resp["health_probe_ms"] = json!(ms);
+    }
 
-    Ok(Json(resp))
+    Ok(Json(resp).into_response())
+}
+
+/// Outcome of the post-spawn health probe.
+enum ProbeOutcome {
+    Healthy {
+        elapsed_ms: u64,
+    },
+    Failed {
+        elapsed_ms: u64,
+        child_alive: bool,
+        pid: Option<u32>,
+        recent_logs: Vec<String>,
+    },
+}
+
+/// Poll `GET http://localhost:{port}/health` every 200ms until it succeeds or
+/// `timeout_ms` elapses. On failure, also reports whether the child process
+/// is still alive and snapshots the last 20 log lines from the runner's
+/// per-runner buffer.
+async fn probe_runner_health(
+    state: &SharedState,
+    runner_id: &str,
+    port: u16,
+    timeout_ms: u64,
+) -> ProbeOutcome {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let interval = std::time::Duration::from_millis(200);
+    let start = std::time::Instant::now();
+    let url = format!("http://localhost:{}/health", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .unwrap_or_default();
+
+    loop {
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return ProbeOutcome::Healthy {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            break;
+        }
+        tokio::time::sleep(interval).await;
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // Determine if the child process is still alive and capture its pid.
+    // try_wait() returns Ok(Some(_)) if the child has exited, Ok(None) if
+    // still running, Err(_) on a system error (treated as "unknown — assume
+    // dead" so we report the more honest 500).
+    let (child_alive, pid) = if let Some(managed) = state.get_runner(runner_id).await {
+        let mut runner = managed.runner.write().await;
+        let pid = runner.pid;
+        let alive = match runner.process.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        };
+        (alive, pid)
+    } else {
+        (false, None)
+    };
+
+    let recent_logs = recent_runner_log_lines(state, runner_id, 20).await;
+
+    ProbeOutcome::Failed {
+        elapsed_ms,
+        child_alive,
+        pid,
+        recent_logs,
+    }
+}
+
+/// Snapshot the last `limit` log lines from a runner's per-runner log buffer.
+/// Each line is rendered as `"<level> <message>"` to keep the JSON payload
+/// compact (the existing `/runners/{id}/logs` endpoint returns full
+/// `LogEntry` records — for a 502/500 diagnostic body we just want
+/// human-readable tail lines).
+async fn recent_runner_log_lines(
+    state: &SharedState,
+    runner_id: &str,
+    limit: usize,
+) -> Vec<String> {
+    let Some(managed) = state.get_runner(runner_id).await else {
+        return Vec::new();
+    };
+    let entries = managed.logs.history().await;
+    let total = entries.len();
+    let start = total.saturating_sub(limit);
+    entries[start..]
+        .iter()
+        .map(|e| {
+            let level = match e.level {
+                LogLevel::Info => "info",
+                LogLevel::Warn => "warn",
+                LogLevel::Error => "error",
+                LogLevel::Debug => "debug",
+            };
+            format!("{} {}", level, e.message)
+        })
+        .collect()
 }
 
 // --- Spawn named runner ---
