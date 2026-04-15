@@ -38,10 +38,6 @@ pub struct CliArgs {
     #[arg(long = "expo-dir")]
     pub expo_dir: Option<PathBuf>,
 
-    /// Enable smart rebuild (auto-detect source changes, rebuild, fix with AI)
-    #[arg(long = "smart-rebuild")]
-    pub smart_rebuild: bool,
-
     /// Disable post-startup build slot pre-warming (`cargo check` per slot).
     /// Also honored via env var `QONTINUI_SUPERVISOR_NO_PREWARM=1`.
     #[arg(long = "no-prewarm")]
@@ -55,7 +51,6 @@ pub struct SupervisorConfig {
     pub watchdog_enabled_at_start: bool,
     pub auto_start: bool,
     pub auto_debug: bool,
-    pub smart_rebuild: bool,
     pub log_file: Option<PathBuf>,
     pub port: u16,
     pub dev_logs_dir: PathBuf,
@@ -132,9 +127,6 @@ pub const RUNNER_API_PORT: u16 = DEFAULT_RUNNER_API_PORT;
 pub const RUNNER_VITE_PORT: u16 = 1420;
 pub const EXPO_PORT: u16 = 8081;
 
-// Watchdog constants
-pub const WATCHDOG_CHECK_INTERVAL_SECS: u64 = 10;
-
 // Process constants
 pub const GRACEFUL_KILL_TIMEOUT_SECS: u64 = 5;
 pub const BUILD_TIMEOUT_SECS: u64 = 600; // 10 minutes
@@ -142,45 +134,8 @@ pub const BUILD_TIMEOUT_SECS: u64 = 600; // 10 minutes
 pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;
 pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
 
-// Build monitor constants
-pub const BUILD_MONITOR_WINDOW_SECS: u64 = 60;
-
 // Log constants
 pub const LOG_BUFFER_SIZE: usize = 500;
-
-// AI debug constants
-pub const AI_DEBUG_COOLDOWN_SECS: i64 = 300; // 5 minutes between sessions
-pub const AI_OUTPUT_BUFFER_SIZE: usize = 2000;
-
-// Code activity constants
-pub const CODE_QUIET_PERIOD_SECS: i64 = 300; // 5 minutes
-pub const CODE_CHECK_RETRY_INTERVAL_SECS: u64 = 30;
-
-// Smart rebuild constants
-pub const SMART_REBUILD_CHECK_INTERVAL_SECS: u64 = 10;
-pub const SMART_REBUILD_QUIET_PERIOD_SECS: i64 = 600; // 10 minutes of inactivity before rebuild
-/// Max AI fix attempts per rebuild cycle. After this, the cycle fails and waits
-/// for the retry cooldown before starting a new cycle. Effectively unlimited
-/// over time since failed cycles automatically retry.
-pub const SMART_REBUILD_MAX_FIX_ATTEMPTS: u32 = 5;
-pub const SMART_REBUILD_FIX_TIMEOUT_SECS: u64 = 300;
-/// Cooldown between retry cycles when a smart rebuild fails entirely.
-/// Prevents hammering the build immediately after all fix attempts in a cycle fail.
-pub const SMART_REBUILD_RETRY_COOLDOWN_SECS: i64 = 600; // 10 minutes
-
-// Overnight watchdog constants
-pub const OVERNIGHT_CHECK_INTERVAL_SECS: u64 = 180; // 3 minutes
-pub const OVERNIGHT_START_HOUR: u32 = 23; // 11 PM local
-pub const OVERNIGHT_END_HOUR: u32 = 6; // 6 AM local
-pub const OVERNIGHT_MAX_CONSECUTIVE_FAILURES: u32 = 3; // ~9min before restart
-pub const OVERNIGHT_SNAPSHOT_TIMEOUT_SECS: u64 = 15;
-
-// Workflow loop constants
-pub const WORKFLOW_LOOP_POLL_INTERVAL_SECS: u64 = 5;
-pub const WORKFLOW_LOOP_MAX_ITERATIONS_DEFAULT: u32 = 5;
-pub const WORKFLOW_LOOP_RUNNER_HEALTH_TIMEOUT_SECS: u64 = 120;
-pub const WORKFLOW_LOOP_RUNNER_HEALTH_POLL_SECS: u64 = 2;
-pub const WORKFLOW_LOOP_FIX_TIMEOUT_SECS: u64 = 600;
 
 // AI model definitions: (provider, key, model_id, display_name)
 pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[
@@ -199,6 +154,15 @@ pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[
     ),
     ("gemini", "pro", "gemini-3-pro-preview", "Gemini 3 Pro"),
 ];
+
+/// Resolve the full model ID string from a (provider, key) pair.
+/// Returns `None` if the combination is not found in `AI_MODELS`.
+pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
+    AI_MODELS
+        .iter()
+        .find(|(p, k, _, _)| *p == provider && *k == model_key)
+        .map(|(_, _, model_id, _)| model_id.to_string())
+}
 
 impl SupervisorConfig {
     pub fn from_args(args: CliArgs) -> Self {
@@ -225,7 +189,6 @@ impl SupervisorConfig {
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
             auto_debug: args.auto_debug,
-            smart_rebuild: args.smart_rebuild,
             log_file: args.log_file,
             port: args.port,
             dev_logs_dir,
@@ -337,11 +300,6 @@ mod tests {
         assert_eq!(BUILD_TIMEOUT_SECS, 600);
     }
 
-    #[test]
-    fn test_ai_debug_cooldown_is_5_minutes() {
-        assert_eq!(AI_DEBUG_COOLDOWN_SECS, 300);
-    }
-
     // --- AI_MODELS tests ---
 
     #[test]
@@ -403,7 +361,6 @@ mod tests {
             port: DEFAULT_SUPERVISOR_PORT,
             auto_debug: false,
             expo_dir: None,
-            smart_rebuild: false,
             no_prewarm: false,
         }
     }

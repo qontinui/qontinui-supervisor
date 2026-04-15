@@ -58,19 +58,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/supervisor/restart",
             post(crate::routes::runner::supervisor_restart),
         )
-        // AI debug
-        .route("/ai/debug", post(crate::routes::ai::debug))
-        .route("/ai/auto-debug", post(crate::routes::ai::auto_debug))
-        .route("/ai/status", get(crate::routes::ai::status))
-        .route("/ai/stop", post(crate::routes::ai::stop))
+        // AI provider/model management
         .route("/ai/provider", get(crate::routes::ai::get_provider))
         .route("/ai/provider", post(crate::routes::ai::set_provider))
         .route("/ai/models", get(crate::routes::ai::models))
-        .route("/ai/output/stream", get(crate::routes::ai::output_stream))
-        // Claude backward-compat aliases
-        .route("/claude/debug", post(crate::routes::ai::debug))
-        .route("/claude/status", get(crate::routes::ai::status))
-        .route("/claude/stop", post(crate::routes::ai::stop))
         // Dev-start orchestration removed — frontend/backend are managed by the runner directly
         // Supervisor Bridge (command relay for supervisor's own dashboard UI)
         .route(
@@ -142,54 +133,6 @@ pub fn build_router(state: SharedState) -> Router {
         )
         // WebSocket
         .route("/ws", get(crate::routes::ws::ws_handler))
-        // Workflow loop
-        .route(
-            "/workflow-loop/start",
-            post(crate::routes::workflow_loop::start),
-        )
-        .route(
-            "/workflow-loop/stop",
-            post(crate::routes::workflow_loop::stop),
-        )
-        .route(
-            "/workflow-loop/status",
-            get(crate::routes::workflow_loop::status),
-        )
-        .route(
-            "/workflow-loop/history",
-            get(crate::routes::workflow_loop::history),
-        )
-        .route(
-            "/workflow-loop/loops",
-            get(crate::routes::workflow_loop::list_loops),
-        )
-        .route(
-            "/workflow-loop/stream",
-            get(crate::routes::workflow_loop::stream),
-        )
-        .route(
-            "/workflow-loop/signal-restart",
-            post(crate::routes::workflow_loop::signal_restart),
-        )
-        .route(
-            "/workflow-loop/checkpoints/{task_run_id}",
-            get(crate::routes::workflow_loop::get_checkpoints),
-        )
-        .route(
-            "/workflow-loop/breakpoints/{task_run_id}",
-            get(crate::routes::workflow_loop::get_breakpoints),
-        )
-        .route(
-            "/workflow-loop/breakpoints/{task_run_id}/{snapshot_id}",
-            get(crate::routes::workflow_loop::get_breakpoint_detail),
-        )
-        .route(
-            "/workflow-loop/breakpoints/{task_run_id}/{snapshot_id}/resume",
-            post(crate::routes::workflow_loop::resume_breakpoint),
-        )
-        // Cascade detection events
-        .route("/cascade/events", get(crate::routes::cascade::events))
-        .route("/cascade/stream", get(crate::routes::cascade::stream))
         // Diagnostics
         .route(
             "/diagnostics",
@@ -198,23 +141,6 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/diagnostics/clear",
             post(crate::routes::diagnostics::clear_diagnostics),
-        )
-        // Smart rebuild
-        .route(
-            "/smart-rebuild/status",
-            get(crate::routes::smart_rebuild::status),
-        )
-        .route(
-            "/smart-rebuild/enable",
-            post(crate::routes::smart_rebuild::enable),
-        )
-        .route(
-            "/smart-rebuild/trigger",
-            post(crate::routes::smart_rebuild::trigger),
-        )
-        .route(
-            "/smart-rebuild/stop",
-            post(crate::routes::smart_rebuild::stop),
         )
         // Expo
         .route("/expo/start", post(crate::routes::expo::start))

@@ -8,7 +8,6 @@ const DIAGNOSTICS_BUFFER_SIZE: usize = 200;
 #[serde(rename_all = "snake_case")]
 pub enum RestartSource {
     Manual,
-    WorkflowLoop,
     Watchdog,
 }
 
@@ -23,7 +22,6 @@ impl std::fmt::Display for RestartSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Manual => write!(f, "manual request"),
-            Self::WorkflowLoop => write!(f, "workflow loop"),
             Self::Watchdog => write!(f, "watchdog"),
         }
     }
@@ -32,37 +30,6 @@ impl std::fmt::Display for RestartSource {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum DiagnosticEventKind {
-    // Loop lifecycle
-    LoopStarted {
-        workflow_id: String,
-        max_iterations: u32,
-        exit_strategy: String,
-        between_iterations: String,
-    },
-    LoopCompleted {
-        iterations_completed: u32,
-        reason: String,
-    },
-    LoopStopped {
-        iteration: u32,
-    },
-    LoopError {
-        iteration: u32,
-        error: String,
-    },
-
-    // Per-iteration
-    IterationStarted {
-        iteration: u32,
-        max_iterations: u32,
-    },
-    IterationCompleted {
-        iteration: u32,
-        duration_secs: f64,
-        exit_check_result: bool,
-        exit_check_reason: String,
-    },
-
     // Runner restarts
     RestartStarted {
         source: RestartSource,
@@ -85,45 +52,6 @@ pub enum DiagnosticEventKind {
         duration_secs: f64,
         success: bool,
         error: Option<String>,
-    },
-
-    // Pipeline phases
-    PipelinePhaseStarted {
-        iteration: u32,
-        phase: String,
-    },
-    PipelinePhaseCompleted {
-        iteration: u32,
-        phase: String,
-        duration_secs: f64,
-    },
-    FixesImplemented {
-        iteration: u32,
-        fix_count: u32,
-        duration_secs: f64,
-    },
-    RebuildTriggered {
-        iteration: u32,
-        reason: String,
-    },
-
-    // Smart rebuild
-    SmartRebuildStarted {
-        trigger: String,
-    },
-    SmartRebuildBuildFailed {
-        attempt: u32,
-        error: String,
-    },
-    SmartRebuildAiFix {
-        attempt: u32,
-    },
-    SmartRebuildCompleted {
-        total_attempts: u32,
-        duration_secs: f64,
-    },
-    SmartRebuildFailed {
-        reason: String,
     },
 }
 
@@ -184,14 +112,6 @@ impl Default for DiagnosticsState {
 impl DiagnosticEvent {
     fn filter_category(&self) -> &'static str {
         match &self.kind {
-            DiagnosticEventKind::LoopStarted { .. }
-            | DiagnosticEventKind::LoopCompleted { .. }
-            | DiagnosticEventKind::LoopStopped { .. }
-            | DiagnosticEventKind::LoopError { .. } => "loop",
-
-            DiagnosticEventKind::IterationStarted { .. }
-            | DiagnosticEventKind::IterationCompleted { .. } => "iteration",
-
             DiagnosticEventKind::RestartStarted { .. }
             | DiagnosticEventKind::RestartCompleted { .. }
             | DiagnosticEventKind::RestartFailed { .. } => "restart",
@@ -199,17 +119,6 @@ impl DiagnosticEvent {
             DiagnosticEventKind::BuildStarted | DiagnosticEventKind::BuildCompleted { .. } => {
                 "build"
             }
-
-            DiagnosticEventKind::PipelinePhaseStarted { .. }
-            | DiagnosticEventKind::PipelinePhaseCompleted { .. }
-            | DiagnosticEventKind::FixesImplemented { .. }
-            | DiagnosticEventKind::RebuildTriggered { .. } => "pipeline",
-
-            DiagnosticEventKind::SmartRebuildStarted { .. }
-            | DiagnosticEventKind::SmartRebuildBuildFailed { .. }
-            | DiagnosticEventKind::SmartRebuildAiFix { .. }
-            | DiagnosticEventKind::SmartRebuildCompleted { .. }
-            | DiagnosticEventKind::SmartRebuildFailed { .. } => "smart_rebuild",
         }
     }
 }

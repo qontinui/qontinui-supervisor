@@ -432,7 +432,6 @@ pub async fn restart_runner(
     Json(body): Json<RestartRunnerRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
     let source = match body.source.as_str() {
-        "workflow_loop" => crate::diagnostics::RestartSource::WorkflowLoop,
         "watchdog" => crate::diagnostics::RestartSource::Watchdog,
         _ => crate::diagnostics::RestartSource::Manual,
     };

@@ -8,7 +8,6 @@ import Evaluation from './pages/Evaluation';
 import EvalRunDetail from './pages/EvalRunDetail';
 import VelocityTest from './pages/VelocityTest';
 import VelocityImprovement from './pages/VelocityImprovement';
-import WorkflowLoop from './pages/WorkflowLoop';
 import RunnerMonitor from './pages/RunnerMonitor';
 import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';
 
@@ -50,11 +49,6 @@ export default function App() {
             </NavLink>
           </li>
           <li>
-            <NavLink to="/workflow-loop" className={({ isActive }) => (isActive ? 'active' : '')}>
-              Workflow Loop
-            </NavLink>
-          </li>
-          <li>
             <NavLink to="/evaluation" className={({ isActive }) => (isActive ? 'active' : '')}>
               Evaluation
             </NavLink>
@@ -83,7 +77,6 @@ export default function App() {
           <Route path="/velocity/compare" element={<VelocityCompare />} />
           <Route path="/velocity/trace" element={<VelocityTrace />} />
           <Route path="/runner-monitor" element={<RunnerMonitor />} />
-          <Route path="/workflow-loop" element={<WorkflowLoop />} />
           <Route path="/evaluation" element={<Evaluation />} />
           <Route path="/evaluation/run/:id" element={<EvalRunDetail />} />
           <Route path="/velocity-tests" element={<VelocityTest />} />

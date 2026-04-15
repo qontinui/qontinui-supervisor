@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::{BUILD_MONITOR_WINDOW_SECS, BUILD_TIMEOUT_SECS};
+use crate::config::BUILD_TIMEOUT_SECS;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -732,52 +732,4 @@ async fn prewarm_single_slot(
             )))
         }
     }
-}
-
-/// Monitor runner output for build errors during the first N seconds after startup.
-/// Called as a background task when the runner starts.
-pub fn spawn_build_error_monitor(state: SharedState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut rx = state.logs.subscribe();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(BUILD_MONITOR_WINDOW_SECS);
-
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-
-            let remaining = deadline - tokio::time::Instant::now();
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(entry)) => {
-                    if entry.source == crate::log_capture::LogSource::Runner {
-                        let is_error = BUILD_ERROR_PATTERNS
-                            .iter()
-                            .any(|p| p.is_match(&entry.message));
-                        if is_error {
-                            warn!("Build error detected in runner output: {}", entry.message);
-                            {
-                                let mut build = state.build.write().await;
-                                build.build_error_detected = true;
-                                build.last_build_error = Some(entry.message.clone());
-                            }
-                            state.notify_health_change();
-                            crate::ai_debug::schedule_debug(
-                                &state,
-                                "Build error detected in runner output",
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Channel lagged, continue
-                }
-                Err(_) => {
-                    // Timeout reached
-                    break;
-                }
-            }
-        }
-    })
 }

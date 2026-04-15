@@ -51,7 +51,6 @@ async fn test_state_creation() {
 
     // AI starts with defaults
     let ai = state.ai.read().await;
-    assert!(!ai.running);
     assert_eq!(ai.provider, "claude");
     assert_eq!(ai.model, "opus");
     assert!(!ai.auto_debug_enabled);
@@ -138,35 +137,6 @@ async fn test_cached_port_health_update() {
         assert!(cached.runner_responding);
         assert!(cached.vite_port_open);
     }
-}
-
-#[tokio::test]
-async fn test_ai_output_buffer() {
-    let state = SupervisorState::new(test_config());
-    let mut ai = state.ai.write().await;
-
-    ai.push_output("stdout", "test line 1".to_string());
-    ai.push_output("stderr", "test error".to_string());
-
-    assert_eq!(ai.output_buffer.len(), 2);
-    assert_eq!(ai.output_buffer[0].stream, "stdout");
-    assert_eq!(ai.output_buffer[0].line, "test line 1");
-    assert_eq!(ai.output_buffer[1].stream, "stderr");
-    assert_eq!(ai.output_buffer[1].line, "test error");
-}
-
-#[tokio::test]
-async fn test_watchdog_crash_recording() {
-    let state = SupervisorState::new(test_config());
-    let mut watchdog = state.watchdog.write().await;
-
-    assert!(watchdog.crash_history.is_empty());
-
-    watchdog.record_crash();
-    assert_eq!(watchdog.crash_history.len(), 1);
-
-    watchdog.record_crash();
-    assert_eq!(watchdog.crash_history.len(), 2);
 }
 
 #[tokio::test]

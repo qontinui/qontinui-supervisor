@@ -16,8 +16,6 @@ Standalone Axum HTTP server:
 - **Cargo build** without restarting any runner
 - **Health monitoring** (observe-only) for all runners
 - **Log capture** with SSE streaming and circular buffer
-- **AI auto-debug** spawns Claude/Gemini to diagnose build failures
-- **Code activity detection** defers debug sessions when files are being edited or external Claude is running
 - **Expo process management** start/stop/monitor Expo/React Native dev server
 - **Workflow loop** orchestrates repeated workflow execution with exit strategies
 - **UI Bridge proxy** transparent proxy to runner's UI Bridge SDK endpoints (control + SDK modes)
@@ -34,9 +32,6 @@ cargo clippy -- -D warnings    # Lint
 # Start with watchdog (recommended)
 ./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w
 
-# Start with auto-debug enabled
-./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w --auto-debug
-
 # Start with Expo dev server management
 ./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri -w --expo-dir ../qontinui-mobile
 ```
@@ -47,7 +42,6 @@ cargo clippy -- -D warnings    # Lint
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
 | `-w, --watchdog` | Enable health monitoring (observe-only, no restarts) |
-| `--auto-debug` | Enable AI auto-debug on startup |
 | `--expo-dir` | Path to Expo/React Native project directory |
 | `-l, --log-file` | Log file for runner output |
 | `--port` | Supervisor HTTP port (default: 9875) |
@@ -59,7 +53,7 @@ cargo clippy -- -D warnings    # Lint
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | React SPA dashboard |
-| GET | `/health` | Comprehensive status (runners, build, AI, code activity, expo) |
+| GET | `/health` | Comprehensive status (runners, build, code activity, expo) |
 | POST | `/supervisor/restart` | Self-restart supervisor (runners are left running) |
 
 ### Temp Runner Management (test-* only)
@@ -124,22 +118,6 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 | GET | `/logs/stream` | SSE stream of real-time log events |
 | GET | `/logs/file/{type}` | Read `.dev-logs/` files |
 | GET | `/logs/files` | List available log files |
-
-### AI Debug
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/ai/debug` | Manually trigger debug session. Body: `{"prompt": "..."}` |
-| POST | `/ai/auto-debug` | Enable/disable auto-debug. Body: `{"enabled": bool}` |
-| GET | `/ai/status` | AI session status + output tail |
-| POST | `/ai/stop` | Kill running AI session |
-| GET | `/ai/provider` | Current provider + model |
-| POST | `/ai/provider` | Set provider/model. Body: `{"provider": "claude", "model": "opus"}` |
-| GET | `/ai/models` | Available providers and models |
-| GET | `/ai/output/stream` | SSE stream of AI output |
-| POST | `/claude/debug` | Alias for `/ai/debug` |
-| GET | `/claude/status` | Alias for `/ai/status` |
-| POST | `/claude/stop` | Alias for `/ai/stop` |
 
 ### Expo
 
@@ -253,10 +231,8 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 **Features:**
 - Real-time service table: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog with status dots and action buttons
 - Dev-start controls: start/stop/restart individual services, bulk actions (Docker, Start All, Stop All, Clean, Fresh, Migrate)
-- AI debug panel with live SSE streaming, provider/model selector
 - Log viewer with source/level filtering, pause/resume, auto-scroll
 - Workflow loop status panel with iteration tracking
-- AI Fix buttons for down services (auto-sends context to debug agent)
 - Confirmation dialogs for destructive actions
 
 **Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite. Production build output in `dist/` is embedded into the binary via `rust-embed`. Falls back to legacy `static/dashboard.html` if the SPA dist is missing.
@@ -264,19 +240,8 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 **Data flow:**
 - SSE `GET /health/stream` for real-time health data (replaces polling)
 - SSE `GET /logs/stream` for real-time log entries
-- SSE `GET /ai/output/stream` for AI output
 - SSE `GET /workflow-loop/stream` for workflow loop status
 - Fetches `GET /dev-start/status` for service port availability
-- Fetches `GET /ai/models` once on init for provider/model select
-
-## AI Providers
-
-| Provider | Key | Model ID | Display Name |
-|----------|-----|----------|--------------|
-| claude | opus | claude-opus-4-6 | Claude Opus 4.6 |
-| claude | sonnet | claude-sonnet-4-5-20250929 | Claude Sonnet 4.5 |
-| gemini | flash | gemini-3-flash-preview | Gemini 3 Flash |
-| gemini | pro | gemini-3-pro-preview | Gemini 3 Pro |
 
 ## Key Constants
 
@@ -291,10 +256,6 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 | Restart cooldown | 60s |
 | Build timeout | 5min |
 | Log buffer | 500 entries |
-| AI debug cooldown | 5min |
-| AI output buffer | 2000 entries |
-| Code quiet period | 5min |
-| Code check interval | 30s |
 | Smart rebuild quiet period | 10min |
 | Smart rebuild fix attempts/cycle | 5 |
 | Smart rebuild retry cooldown | 10min |
@@ -386,16 +347,6 @@ You can also hit `GET /builds` to see `last_successful_slot` and each slot's `la
 - **No-wait mode:** pass `X-Queue-Mode: no-wait` header to get an immediate 503 with queue info instead of blocking when all slots are busy.
 
 If the build fails, the placeholder port reservation is cleaned up and the error is returned. No runner is spawned.
-
-## Auto-Debug Flow
-
-1. Build monitor detects build error in runner output → calls `schedule_debug()`
-2. `schedule_debug()` checks code activity:
-   - If code being edited or external Claude session → defers to `pending_debug`
-   - Otherwise → spawns AI debug session immediately
-3. Code activity monitor (every 30s) checks for deferred debug
-4. Debug prompt includes: runner logs, build errors, git changes, running tasks
-5. Claude uses `--print` mode; Gemini uses piped stdin via PowerShell script
 
 ## Code Standards
 

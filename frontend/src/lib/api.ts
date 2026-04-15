@@ -122,12 +122,6 @@ export interface HealthResponse {
     ai_model: string;
     auto_debug_enabled: boolean;
   };
-  code_activity: {
-    code_being_edited: boolean;
-    external_claude_session: boolean;
-    pending_debug: boolean;
-    pending_debug_reason?: string;
-  };
   expo: {
     running: boolean;
     pid?: number;
@@ -149,34 +143,11 @@ export interface DevStartResponse {
   exit_code: number | null;
 }
 
-export interface AiDebugResponse {
-  status: string;
-  message: string;
-}
-
 export interface LogFileResponse {
   file: string;
   type: string;
   content: string;
   lines: number;
-}
-
-export interface AiProviderResponse {
-  provider: string;
-  model: string;
-  model_id: string;
-  display_name: string;
-}
-
-export interface AiModelInfo {
-  provider: string;
-  key: string;
-  model_id: string;
-  display_name: string;
-}
-
-export interface AiModelsResponse {
-  models: AiModelInfo[];
 }
 
 export interface LogEntry {
@@ -675,23 +646,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt }),
     }),
-
-  // AI Debug
-  aiDebug: (prompt: string) =>
-    fetchJson<AiDebugResponse>('/ai/debug', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-    }),
-  aiStop: () => fetchJson<AiDebugResponse>('/ai/stop', { method: 'POST' }),
-  aiProvider: () => fetchJson<AiProviderResponse>('/ai/provider'),
-  aiSetProvider: (provider: string, model: string) =>
-    fetchJson<AiProviderResponse>('/ai/provider', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, model }),
-    }),
-  aiModels: () => fetchJson<AiModelsResponse>('/ai/models'),
 
   // Logs
   logFile: (type: string, tailLines?: number) =>

@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::ai_debug::resolve_model_id;
+use crate::config::resolve_model_id;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::state::SharedState;
 use crate::velocity_tests::db::VelocityTestDb;

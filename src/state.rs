@@ -1,17 +1,15 @@
-use crate::config::{RunnerConfig, SupervisorConfig, AI_OUTPUT_BUFFER_SIZE};
+use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
 use crate::routes::supervisor_bridge::CommandRelay;
-use crate::smart_rebuild::SmartRebuildState;
 use crate::velocity_improvement::VelocityImprovementState;
-use crate::workflow_loop::WorkflowLoopState;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
 
@@ -66,15 +64,11 @@ pub struct SupervisorState {
     /// Parallel cargo build slot pool. Semaphore permits + per-slot target dirs.
     pub build_pool: BuildPool,
     pub ai: RwLock<AiState>,
-    pub code_activity: RwLock<CodeActivityState>,
     pub expo: RwLock<ExpoState>,
-    pub overnight_watchdog: RwLock<OvernightWatchdogState>,
-    pub workflow_loop: RwLock<WorkflowLoopState>,
     pub diagnostics: RwLock<DiagnosticsState>,
     pub evaluation: RwLock<EvaluationState>,
     pub velocity_tests: RwLock<VelocityTestState>,
     pub velocity_improvement: RwLock<VelocityImprovementState>,
-    pub smart_rebuild: RwLock<SmartRebuildState>,
     pub command_relay: Arc<CommandRelay>,
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
@@ -85,7 +79,6 @@ pub struct SupervisorState {
     pub cached_runner_health: RwLock<Vec<CachedRunnerHealth>>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
-    pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
     /// Runtime-configurable auto-login credentials for temp test runners.
     /// Set via `POST /test-login` and read by `forward_test_auto_login_env`.
     pub test_auto_login: RwLock<Option<(String, String)>>,
@@ -296,38 +289,9 @@ impl BuildPool {
 }
 
 pub struct AiState {
-    pub process: Option<Child>,
-    pub running: bool,
     pub provider: String,
     pub model: String,
     pub auto_debug_enabled: bool,
-    pub last_debug_at: Option<DateTime<Utc>>,
-    pub session_started_at: Option<DateTime<Utc>>,
-    pub output_buffer: VecDeque<AiOutputEntry>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AiOutputEntry {
-    pub timestamp: DateTime<Utc>,
-    pub stream: String, // "stdout" or "stderr"
-    pub line: String,
-}
-
-pub struct CodeActivityState {
-    pub last_code_change_at: Option<DateTime<Utc>>,
-    pub code_being_edited: bool,
-    pub external_claude_session: bool,
-    pub pending_debug: bool,
-    pub pending_debug_reason: Option<String>,
-}
-
-pub struct OvernightWatchdogState {
-    pub active: bool,
-    pub last_check_at: Option<DateTime<Utc>>,
-    pub last_successful_check_at: Option<DateTime<Utc>>,
-    pub consecutive_failures: u32,
-    pub last_failure_reason: Option<String>,
-    pub last_action_taken: Option<String>,
 }
 
 pub struct ExpoState {
@@ -342,7 +306,6 @@ impl SupervisorState {
     pub fn new(config: SupervisorConfig) -> Self {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
-        let smart_rebuild_enabled = config.smart_rebuild;
         let expo_port = config.expo_port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -369,15 +332,11 @@ impl SupervisorState {
             build: RwLock::new(BuildState::new()),
             build_pool,
             ai: RwLock::new(AiState::new(auto_debug)),
-            code_activity: RwLock::new(CodeActivityState::new()),
             expo: RwLock::new(ExpoState::new(expo_port)),
-            overnight_watchdog: RwLock::new(OvernightWatchdogState::new()),
-            workflow_loop: RwLock::new(WorkflowLoopState::new()),
             diagnostics: RwLock::new(DiagnosticsState::new()),
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
-            smart_rebuild: RwLock::new(SmartRebuildState::new(smart_rebuild_enabled)),
             command_relay: CommandRelay::new(),
             logs: LogState::new(),
             health_tx,
@@ -386,7 +345,6 @@ impl SupervisorState {
             cached_runner_health: RwLock::new(Vec::new()),
             health_cache_notify: Notify::new(),
             http_client,
-            db: None,
             test_auto_login: RwLock::new(None),
         }
     }
@@ -444,9 +402,6 @@ impl WatchdogState {
         }
     }
 
-    pub fn record_crash(&mut self) {
-        self.crash_history.push(Utc::now());
-    }
 }
 
 impl Default for BuildState {
@@ -470,63 +425,10 @@ impl BuildState {
 impl AiState {
     pub fn new(auto_debug_enabled: bool) -> Self {
         Self {
-            process: None,
-            running: false,
             provider: "claude".to_string(),
             model: "opus".to_string(),
             auto_debug_enabled,
-            last_debug_at: None,
-            session_started_at: None,
-            output_buffer: VecDeque::with_capacity(AI_OUTPUT_BUFFER_SIZE),
         }
-    }
-
-    pub fn push_output(&mut self, stream: &str, line: String) {
-        if self.output_buffer.len() >= AI_OUTPUT_BUFFER_SIZE {
-            self.output_buffer.pop_front();
-        }
-        self.output_buffer.push_back(AiOutputEntry {
-            timestamp: Utc::now(),
-            stream: stream.to_string(),
-            line,
-        });
-    }
-}
-
-impl Default for CodeActivityState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CodeActivityState {
-    pub fn new() -> Self {
-        Self {
-            last_code_change_at: None,
-            code_being_edited: false,
-            external_claude_session: false,
-            pending_debug: false,
-            pending_debug_reason: None,
-        }
-    }
-}
-
-impl OvernightWatchdogState {
-    pub fn new() -> Self {
-        Self {
-            active: false,
-            last_check_at: None,
-            last_successful_check_at: None,
-            consecutive_failures: 0,
-            last_failure_reason: None,
-            last_action_taken: None,
-        }
-    }
-}
-
-impl Default for OvernightWatchdogState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -601,9 +503,7 @@ impl Default for VelocityTestState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        RunnerConfig, SupervisorConfig, AI_OUTPUT_BUFFER_SIZE, DEFAULT_SUPERVISOR_PORT, EXPO_PORT,
-    };
+    use crate::config::{RunnerConfig, SupervisorConfig, DEFAULT_SUPERVISOR_PORT, EXPO_PORT};
     use std::path::PathBuf;
 
     fn make_test_config() -> SupervisorConfig {
@@ -613,7 +513,6 @@ mod tests {
             watchdog_enabled_at_start: false,
             auto_start: false,
             auto_debug: false,
-            smart_rebuild: false,
             log_file: None,
             port: DEFAULT_SUPERVISOR_PORT,
             dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),
@@ -667,16 +566,6 @@ mod tests {
         assert!(!state.enabled);
     }
 
-    #[test]
-    fn test_watchdog_record_crash_adds_to_history() {
-        let mut state = WatchdogState::new(true);
-        assert_eq!(state.crash_history.len(), 0);
-        state.record_crash();
-        assert_eq!(state.crash_history.len(), 1);
-        state.record_crash();
-        assert_eq!(state.crash_history.len(), 2);
-    }
-
     // --- BuildState tests ---
 
     #[test]
@@ -704,73 +593,15 @@ mod tests {
     #[test]
     fn test_ai_state_new_with_auto_debug_enabled() {
         let state = AiState::new(true);
-        assert!(!state.running);
-        assert!(state.process.is_none());
         assert_eq!(state.provider, "claude");
         assert_eq!(state.model, "opus");
         assert!(state.auto_debug_enabled);
-        assert!(state.last_debug_at.is_none());
-        assert!(state.session_started_at.is_none());
-        assert!(state.output_buffer.is_empty());
     }
 
     #[test]
     fn test_ai_state_new_with_auto_debug_disabled() {
         let state = AiState::new(false);
         assert!(!state.auto_debug_enabled);
-    }
-
-    #[test]
-    fn test_ai_state_push_output_adds_entries() {
-        let mut state = AiState::new(false);
-        state.push_output("stdout", "Hello world".to_string());
-        assert_eq!(state.output_buffer.len(), 1);
-        assert_eq!(state.output_buffer[0].stream, "stdout");
-        assert_eq!(state.output_buffer[0].line, "Hello world");
-    }
-
-    #[test]
-    fn test_ai_state_push_output_respects_buffer_limit() {
-        let mut state = AiState::new(false);
-        // Fill the buffer to capacity
-        for i in 0..AI_OUTPUT_BUFFER_SIZE {
-            state.push_output("stdout", format!("line {}", i));
-        }
-        assert_eq!(state.output_buffer.len(), AI_OUTPUT_BUFFER_SIZE);
-
-        // Push one more — should evict the oldest
-        state.push_output("stdout", "overflow line".to_string());
-        assert_eq!(state.output_buffer.len(), AI_OUTPUT_BUFFER_SIZE);
-        // The oldest ("line 0") should be gone; the front is now "line 1"
-        assert_eq!(state.output_buffer.front().unwrap().line, "line 1");
-        assert_eq!(state.output_buffer.back().unwrap().line, "overflow line");
-    }
-
-    #[test]
-    fn test_ai_state_push_output_stderr() {
-        let mut state = AiState::new(false);
-        state.push_output("stderr", "error message".to_string());
-        assert_eq!(state.output_buffer[0].stream, "stderr");
-    }
-
-    // --- CodeActivityState tests ---
-
-    #[test]
-    fn test_code_activity_state_new_defaults() {
-        let state = CodeActivityState::new();
-        assert!(state.last_code_change_at.is_none());
-        assert!(!state.code_being_edited);
-        assert!(!state.external_claude_session);
-        assert!(!state.pending_debug);
-        assert!(state.pending_debug_reason.is_none());
-    }
-
-    #[test]
-    fn test_code_activity_state_default_matches_new() {
-        let from_new = CodeActivityState::new();
-        let from_default = CodeActivityState::default();
-        assert_eq!(from_new.code_being_edited, from_default.code_being_edited);
-        assert_eq!(from_new.pending_debug, from_default.pending_debug);
     }
 
     // --- ExpoState tests ---

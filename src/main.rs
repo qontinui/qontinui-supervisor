@@ -1,28 +1,20 @@
-mod ai_debug;
 mod build_monitor;
-mod code_activity;
 mod config;
-mod database;
 mod diagnostics;
-mod discovery;
 mod error;
 mod evaluation;
 mod expo;
 mod health_cache;
 mod log_capture;
-mod overnight_watchdog;
 mod process;
 mod routes;
 mod server;
 mod settings;
-mod smart_rebuild;
 mod state;
 mod velocity;
 mod velocity_improvement;
 mod velocity_layer;
 mod velocity_tests;
-mod watchdog;
-mod workflow_loop;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -71,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Watchdog: {}", args.watchdog);
     info!("Auto-start: {}", args.auto_start || args.watchdog);
     info!("Auto-debug: {}", args.auto_debug);
-    info!("Smart rebuild: {}", args.smart_rebuild);
     if let Some(ref expo_dir) = args.expo_dir {
         info!("Expo dir: {:?}", expo_dir);
     }
@@ -108,18 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let port = config.port;
     let _auto_start = config.auto_start;
 
-    let mut supervisor_state = SupervisorState::new(config);
-
-    // Initialize persistent SQLite database for workflow loop history
-    match database::init_db() {
-        Ok(conn) => {
-            info!("Supervisor database initialized successfully");
-            supervisor_state.db = Some(Arc::new(std::sync::Mutex::new(conn)));
-        }
-        Err(e) => {
-            warn!("Failed to initialize supervisor database: {} — workflow loop history will not be persisted", e);
-        }
-    }
+    let supervisor_state = SupervisorState::new(config);
 
     let state = Arc::new(supervisor_state);
 
@@ -156,18 +136,6 @@ async fn main() -> anyhow::Result<()> {
     // Spawn health cache refresher (caches expensive port checks every 2s)
     let _health_cache_handle = health_cache::spawn_health_cache_refresher(state.clone());
 
-    // Spawn watchdog background task
-    let _watchdog_handle = watchdog::spawn_watchdog(state.clone());
-
-    // Spawn code activity monitor
-    let _code_activity_handle = code_activity::spawn_code_activity_monitor(state.clone());
-
-    // Spawn overnight watchdog (UI Bridge health checks during 11pm-6am)
-    let _overnight_handle = overnight_watchdog::spawn_overnight_watchdog(state.clone());
-
-    // Spawn smart rebuild source watcher
-    let _smart_rebuild_handle = smart_rebuild::spawn_source_watcher(state.clone());
-
     // Clean up any orphaned temp runner processes from previous sessions
     // and detect already-running user runners for health tracking.
     // The supervisor does NOT auto-start any runners — users start their own.
@@ -178,14 +146,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Discover runner instances from the primary runner
-    // (waits for primary to be healthy before querying)
-    {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            discovery::discover_runner_instances(&state_clone).await;
-        });
-    }
 
     // Background reaper: periodically purge stale/crashed test runners so they
     // don't exhaust the port range (9877-9899). Runs every 5 minutes.

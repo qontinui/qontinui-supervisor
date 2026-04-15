@@ -1,5 +1,4 @@
 pub mod ai;
-pub mod cascade;
 pub mod dashboard;
 pub mod diagnostics;
 pub mod evaluation;
@@ -10,11 +9,9 @@ pub mod logs;
 pub mod runner;
 pub mod runner_monitor;
 pub mod runners;
-pub mod smart_rebuild;
 pub mod supervisor_bridge;
 pub mod ui_bridge;
 pub mod velocity;
 pub mod velocity_improvement;
 pub mod velocity_tests;
-pub mod workflow_loop;
 pub mod ws;

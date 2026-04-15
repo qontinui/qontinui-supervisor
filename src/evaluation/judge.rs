@@ -2,7 +2,7 @@ use std::process::Stdio;
 use tracing::{info, warn};
 
 use super::{ScoreResponse, TestPrompt};
-use crate::ai_debug::resolve_model_id;
+use crate::config::resolve_model_id;
 use crate::state::SharedState;
 
 /// System prompt for the scoring judge — keeps Claude focused on JSON output.

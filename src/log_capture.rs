@@ -23,11 +23,7 @@ pub enum LogSource {
     Runner,
     Supervisor,
     Build,
-    Watchdog,
-    OvernightWatchdog,
     Expo,
-    WorkflowLoop,
-    SmartRebuild,
 }
 
 #[derive(Debug, Clone, Serialize)]

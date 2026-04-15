@@ -19,10 +19,7 @@ pub struct HealthResponse {
     pub ports: PortsHealth,
     pub watchdog: WatchdogHealth,
     pub build: BuildHealth,
-    pub ai: AiHealth,
-    pub code_activity: CodeActivityHealth,
     pub expo: ExpoHealth,
-    pub overnight_watchdog: OvernightWatchdogHealth,
     pub supervisor: SupervisorInfo,
     /// Multi-runner status array (includes all managed runners).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -92,30 +89,6 @@ pub struct BuildHealth {
     pub last_build_at: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct AiHealth {
-    pub ai_running: bool,
-    pub ai_provider: String,
-    pub ai_model: String,
-    pub auto_debug_enabled: bool,
-}
-
-#[derive(Serialize)]
-pub struct CodeActivityHealth {
-    pub code_being_edited: bool,
-    pub external_claude_session: bool,
-    pub pending_debug: bool,
-    pub pending_debug_reason: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct OvernightWatchdogHealth {
-    pub active: bool,
-    pub last_check_at: Option<String>,
-    pub consecutive_failures: u32,
-    pub last_failure_reason: Option<String>,
-    pub last_action_taken: Option<String>,
-}
 
 #[derive(Serialize)]
 pub struct SupervisorInfo {
@@ -176,10 +149,7 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let runner = state.runner.read().await;
     let build = state.build.read().await;
-    let ai = state.ai.read().await;
-    let ca = state.code_activity.read().await;
     let expo = state.expo.read().await;
-    let ow = state.overnight_watchdog.read().await;
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
     let cached = state.cached_health.read().await;
@@ -278,30 +248,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
         },
-        ai: AiHealth {
-            ai_running: ai.running,
-            ai_provider: ai.provider.clone(),
-            ai_model: ai.model.clone(),
-            auto_debug_enabled: ai.auto_debug_enabled,
-        },
-        code_activity: CodeActivityHealth {
-            code_being_edited: ca.code_being_edited,
-            external_claude_session: ca.external_claude_session,
-            pending_debug: ca.pending_debug,
-            pending_debug_reason: ca.pending_debug_reason.clone(),
-        },
         expo: ExpoHealth {
             running: expo.running,
             pid: expo.pid,
             port: expo.port,
             configured: state.config.expo_dir.is_some(),
-        },
-        overnight_watchdog: OvernightWatchdogHealth {
-            active: ow.active,
-            last_check_at: ow.last_check_at.map(|t| t.to_rfc3339()),
-            consecutive_failures: ow.consecutive_failures,
-            last_failure_reason: ow.last_failure_reason.clone(),
-            last_action_taken: ow.last_action_taken.clone(),
         },
         supervisor: SupervisorInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -327,10 +278,7 @@ pub async fn health_stream(
             let runner = state.runner.try_read();
             let watchdog = state.watchdog.try_read();
             let build = state.build.try_read();
-            let ai = state.ai.try_read();
-            let ca = state.code_activity.try_read();
             let expo = state.expo.try_read();
-            let ow = state.overnight_watchdog.try_read();
             let cached = state.cached_health.try_read();
 
             // If any lock is contended, skip this tick
@@ -343,16 +291,7 @@ pub async fn health_stream(
             let Ok(build) = build else {
                 return Ok(Event::default().comment("keepalive"));
             };
-            let Ok(ai) = ai else {
-                return Ok(Event::default().comment("keepalive"));
-            };
-            let Ok(ca) = ca else {
-                return Ok(Event::default().comment("keepalive"));
-            };
             let Ok(expo) = expo else {
-                return Ok(Event::default().comment("keepalive"));
-            };
-            let Ok(ow) = ow else {
                 return Ok(Event::default().comment("keepalive"));
             };
             let Ok(cached) = cached else {
@@ -407,30 +346,11 @@ pub async fn health_stream(
                     last_error: build.last_build_error.clone(),
                     last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
                 },
-                ai: AiHealth {
-                    ai_running: ai.running,
-                    ai_provider: ai.provider.clone(),
-                    ai_model: ai.model.clone(),
-                    auto_debug_enabled: ai.auto_debug_enabled,
-                },
-                code_activity: CodeActivityHealth {
-                    code_being_edited: ca.code_being_edited,
-                    external_claude_session: ca.external_claude_session,
-                    pending_debug: ca.pending_debug,
-                    pending_debug_reason: ca.pending_debug_reason.clone(),
-                },
-                expo: ExpoHealth {
+                        expo: ExpoHealth {
                     running: expo.running,
                     pid: expo.pid,
                     port: expo.port,
                     configured: state.config.expo_dir.is_some(),
-                },
-                overnight_watchdog: OvernightWatchdogHealth {
-                    active: ow.active,
-                    last_check_at: ow.last_check_at.map(|t| t.to_rfc3339()),
-                    consecutive_failures: ow.consecutive_failures,
-                    last_failure_reason: ow.last_failure_reason.clone(),
-                    last_action_taken: ow.last_action_taken.clone(),
                 },
                 supervisor: SupervisorInfo {
                     version: env!("CARGO_PKG_VERSION").to_string(),
@@ -532,30 +452,11 @@ mod tests {
                 last_error: None,
                 last_build_at: None,
             },
-            ai: AiHealth {
-                ai_running: false,
-                ai_provider: "claude".to_string(),
-                ai_model: "opus".to_string(),
-                auto_debug_enabled: false,
-            },
-            code_activity: CodeActivityHealth {
-                code_being_edited: false,
-                external_claude_session: false,
-                pending_debug: false,
-                pending_debug_reason: None,
-            },
-            expo: ExpoHealth {
+                expo: ExpoHealth {
                 running: false,
                 pid: None,
                 port: 8081,
                 configured: false,
-            },
-            overnight_watchdog: OvernightWatchdogHealth {
-                active: false,
-                last_check_at: None,
-                consecutive_failures: 0,
-                last_failure_reason: None,
-                last_action_taken: None,
             },
             supervisor: SupervisorInfo {
                 version: "0.1.0".to_string(),
