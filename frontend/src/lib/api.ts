@@ -112,15 +112,10 @@ export interface HealthResponse {
   };
   build: {
     in_progress: boolean;
+    available_slots: number;
     error_detected: boolean;
     last_error?: string;
     last_build_at?: string;
-  };
-  ai: {
-    ai_running: boolean;
-    ai_provider: string;
-    ai_model: string;
-    auto_debug_enabled: boolean;
   };
   expo: {
     running: boolean;
@@ -133,6 +128,16 @@ export interface HealthResponse {
     dev_mode: boolean;
     project_dir: string;
   };
+  runners?: {
+    id: string;
+    name: string;
+    port: number;
+    is_primary: boolean;
+    running: boolean;
+    pid?: number;
+    started_at?: string;
+    api_responding: boolean;
+  }[];
 }
 
 export interface DevStartResponse {

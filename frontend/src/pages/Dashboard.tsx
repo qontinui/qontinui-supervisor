@@ -1,235 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { api, HealthResponse, DevStartResponse, WorkflowLoopStatus } from '../lib/api';
+import { api, HealthResponse, DevStartResponse } from '../lib/api';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { ToastContainer, addToast } from '../components/Toast';
 import { ConfirmDialog, confirm } from '../components/ConfirmDialog';
 import { SmallBtn } from '../components/SmallBtn';
 import { StatusDot } from '../components/StatusDot';
 import { useSSE } from '../hooks/useSSE';
-
-// ─── AI Session Panel ────────────────────────────────────────────────────────
-
-type AiPanelState = 'idle' | 'running' | 'completed';
-
-function AiSessionPanel({
-  provider,
-  model,
-  onStop,
-  onDone,
-}: {
-  provider: string;
-  model: string;
-  onStop: () => Promise<void>;
-  onDone: () => void;
-}) {
-  const [lines, setLines] = useState<string[]>([]);
-  const [phase, setPhase] = useState<AiPanelState>('running');
-  const [stopping, setStopping] = useState(false);
-  const [expanded, setExpanded] = useState(true);
-  const outputRef = useRef<HTMLDivElement>(null);
-  const lastEventRef = useRef(Date.now());
-
-  // SSE for AI output with auto-reconnect
-  useSSE<{ stream: string; line: string }[]>(
-    '/ai/output/stream',
-    'ai_output',
-    (entries) => {
-      lastEventRef.current = Date.now();
-      const newLines = entries.map((e) => e.line);
-      if (newLines.length > 0) {
-        setLines((prev) => {
-          const combined = [...prev, ...newLines];
-          return combined.length > 200 ? combined.slice(-200) : combined;
-        });
-      }
-    },
-    phase === 'running',
-  );
-
-  // Check for completion: if no ai_output events for 5s, do a single health check
-  useEffect(() => {
-    if (phase !== 'running') return;
-    const checkDone = setInterval(async () => {
-      if (Date.now() - lastEventRef.current > 5000) {
-        try {
-          const h = await api.health();
-          if (!h.ai.ai_running) {
-            setPhase('completed');
-          }
-        } catch {
-          /* ignore */
-        }
-      }
-    }, 5000);
-    return () => clearInterval(checkDone);
-  }, [phase]);
-
-  // Auto-scroll output
-  useEffect(() => {
-    if (outputRef.current && expanded) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight;
-    }
-  }, [lines, expanded]);
-
-  const handleStop = async () => {
-    setStopping(true);
-    await onStop();
-    setStopping(false);
-    setPhase('completed');
-  };
-
-  const borderColor = phase === 'completed' ? 'rgba(34,197,94,0.3)' : 'rgba(99,102,241,0.3)';
-  const bgColor = phase === 'completed' ? 'rgba(34,197,94,0.06)' : 'rgba(99,102,241,0.06)';
-
-  return (
-    <div
-      style={{
-        marginBottom: '1rem',
-        border: `1px solid ${borderColor}`,
-        borderRadius: 6,
-        background: bgColor,
-        overflow: 'hidden',
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.75rem',
-          padding: '0.5rem 1rem',
-          fontSize: '0.8rem',
-        }}
-      >
-        {phase === 'running' && (
-          <span
-            style={{
-              display: 'inline-block',
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: 'var(--accent)',
-              animation: 'pulse 1.5s ease-in-out infinite',
-              flexShrink: 0,
-            }}
-          />
-        )}
-        {phase === 'completed' && (
-          <span
-            style={{
-              display: 'inline-block',
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: 'var(--success)',
-              flexShrink: 0,
-            }}
-          />
-        )}
-        <span style={{ flex: 1 }}>
-          {phase === 'running' ? `AI debug running (${provider}/${model})` : 'AI debug completed'}
-          {lines.length > 0 && <span className="text-muted"> — {lines.length} lines</span>}
-        </span>
-        <button
-          onClick={() => setExpanded((v) => !v)}
-          style={{
-            background: 'none',
-            border: 'none',
-            color: 'var(--text-muted)',
-            cursor: 'pointer',
-            fontSize: '0.75rem',
-            padding: '0 4px',
-          }}
-        >
-          {expanded ? 'collapse' : 'expand'}
-        </button>
-        {phase === 'running' && (
-          <SmallBtn
-            label="Stop"
-            activeLabel="Stopping…"
-            onClick={handleStop}
-            busy={stopping ? 'stop' : null}
-            busyKey="stop"
-            variant="danger"
-          />
-        )}
-        {phase === 'completed' && (
-          <SmallBtn label="Dismiss" activeLabel="" onClick={onDone} busy={null} />
-        )}
-      </div>
-
-      {expanded && lines.length > 0 && (
-        <div
-          ref={outputRef}
-          style={{
-            maxHeight: 200,
-            overflowY: 'auto',
-            padding: '0.4rem 1rem',
-            borderTop: `1px solid ${borderColor}`,
-            fontFamily: 'var(--font-mono)',
-            fontSize: '0.7rem',
-            lineHeight: 1.5,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-          }}
-        >
-          {lines.map((line, i) => (
-            <div key={`${i}-${line.slice(0, 40)}`}>{line}</div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── AI Provider Selector ────────────────────────────────────────────────────
-
-function AiProviderSelector({ current }: { current: HealthResponse['ai'] }) {
-  const [models, setModels] = useState<AiModelInfo[]>([]);
-  const [changing, setChanging] = useState(false);
-
-  useEffect(() => {
-    api
-      .aiModels()
-      .then((r) => setModels(r.models))
-      .catch(() => {});
-  }, []);
-
-  const handleChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const [provider, model] = e.target.value.split('/');
-    if (!provider || !model) return;
-    setChanging(true);
-    try {
-      await api.aiSetProvider(provider, model);
-      addToast(`Switched to ${provider}/${model}`, 'success');
-    } catch {
-      addToast('Failed to change AI provider', 'error');
-    }
-    setChanging(false);
-  };
-
-  const currentValue = `${current.ai_provider}/${current.ai_model}`;
-
-  return (
-    <select
-      className="provider-select"
-      value={currentValue}
-      onChange={handleChange}
-      disabled={changing || current.ai_running}
-      title={current.ai_running ? 'Cannot change while AI is running' : 'Select AI provider/model'}
-    >
-      {models.length === 0 && (
-        <option value={currentValue}>
-          {current.ai_provider}/{current.ai_model}
-        </option>
-      )}
-      {models.map((m) => (
-        <option key={`${m.provider}/${m.key}`} value={`${m.provider}/${m.key}`}>
-          {m.display_name}
-        </option>
-      ))}
-    </select>
-  );
-}
 
 // ─── Log Viewer ──────────────────────────────────────────────────────────────
 
@@ -346,151 +122,6 @@ function LogViewer() {
               {l.source}] {l.message}
             </div>
           ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Workflow Loop Panel ─────────────────────────────────────────────────────
-
-function WorkflowLoopPanel() {
-  const [status, setStatus] = useState<WorkflowLoopStatus | null>(null);
-  const [expanded, setExpanded] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  // Fetch status on mount and when expanded
-  useEffect(() => {
-    api
-      .wlStatus()
-      .then(setStatus)
-      .catch(() => {});
-  }, []);
-
-  // Subscribe to SSE when loop is running
-  useSSE<WorkflowLoopStatus>(
-    '/workflow-loop/stream',
-    'status',
-    (s) => setStatus(s),
-    !!status?.running,
-  );
-
-  const handleStop = async () => {
-    setBusy(true);
-    try {
-      await api.wlStop();
-      addToast('Workflow loop stopping...', 'info');
-      setTimeout(
-        () =>
-          api
-            .wlStatus()
-            .then(setStatus)
-            .catch(() => {}),
-        1500,
-      );
-    } catch {
-      addToast('Failed to stop workflow loop', 'error');
-    }
-    setBusy(false);
-  };
-
-  if (!status) return null;
-
-  const running = status.running;
-  const phase = status.phase || 'idle';
-
-  return (
-    <div className="card" style={{ marginBottom: '1rem' }}>
-      <div className="card-header" style={{ marginBottom: expanded ? '0.5rem' : 0 }}>
-        <span className="card-title">
-          Workflow Loop
-          {running && (
-            <span
-              style={{
-                display: 'inline-block',
-                width: 6,
-                height: 6,
-                borderRadius: '50%',
-                background: 'var(--success)',
-                marginLeft: 8,
-                animation: 'pulse 1.5s ease-in-out infinite',
-              }}
-            />
-          )}
-        </span>
-        <div className="flex gap-2 items-center">
-          {running && (
-            <>
-              <span className="wl-phase">{phase}</span>
-              <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-                iter {status.current_iteration}/{status.config?.max_iterations ?? '?'}
-              </span>
-              <SmallBtn
-                label="Stop"
-                activeLabel="Stopping…"
-                onClick={handleStop}
-                busy={busy ? 'stop' : null}
-                busyKey="stop"
-                variant="danger"
-              />
-            </>
-          )}
-          {!running && (
-            <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-              idle
-            </span>
-          )}
-          <button
-            onClick={() => setExpanded((v) => !v)}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--text-muted)',
-              cursor: 'pointer',
-              fontSize: '0.75rem',
-              padding: '0 4px',
-            }}
-          >
-            {expanded ? 'collapse' : 'expand'}
-          </button>
-        </div>
-      </div>
-      {expanded && (
-        <div style={{ fontSize: '0.8rem' }}>
-          <table style={{ width: '100%' }}>
-            <tbody>
-              <tr>
-                <td className="text-muted" style={{ width: 140 }}>
-                  Status
-                </td>
-                <td>{running ? <span className="text-success">Running</span> : 'Idle'}</td>
-              </tr>
-              <tr>
-                <td className="text-muted">Phase</td>
-                <td>{phase}</td>
-              </tr>
-              <tr>
-                <td className="text-muted">Iteration</td>
-                <td>
-                  {status.current_iteration} / {status.config?.max_iterations ?? '—'}
-                </td>
-              </tr>
-              {status.error && (
-                <tr>
-                  <td className="text-muted">Error</td>
-                  <td className="text-danger">{status.error}</td>
-                </tr>
-              )}
-              {status.config?.workflow_id && (
-                <tr>
-                  <td className="text-muted">Workflow</td>
-                  <td className="text-mono" style={{ fontSize: '0.7rem' }}>
-                    {status.config.workflow_id}
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
         </div>
       )}
     </div>
@@ -808,9 +439,8 @@ function DashboardInner() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [errors, setErrors] = useState<Map<string, ServiceError>>(new Map());
   const mountedRef = useRef(true);
-  const actionGuardRef = useRef(false); // Race condition guard
+  const actionGuardRef = useRef(false);
 
-  // One-time fetch for service port status and expo
   const refreshPorts = useCallback(async () => {
     const [devStatus, expo] = await Promise.allSettled([api.devStartStatus(), api.expoStatus()]);
     if (!mountedRef.current) return;
@@ -821,7 +451,6 @@ function DashboardInner() {
     }));
   }, []);
 
-  // Full refresh (health + ports)
   const refresh = useCallback(async () => {
     const [health, devStatus, expo] = await Promise.allSettled([
       api.health(),
@@ -837,8 +466,6 @@ function DashboardInner() {
     setLastRefresh(new Date());
   }, []);
 
-
-  // Initial fetch
   useEffect(() => {
     mountedRef.current = true;
     refresh();
@@ -847,30 +474,18 @@ function DashboardInner() {
     };
   }, [refresh]);
 
-  // Subscribe to health SSE — replaces polling
   useSSE<HealthResponse>('/health/stream', 'health', (health) => {
     if (!mountedRef.current) return;
     setData((prev) => ({ ...prev, health }));
     setLastRefresh(new Date());
   });
 
-  // Show AI panel when a session starts
-  const ai = data.health?.ai;
-  useEffect(() => {
-    if (ai?.ai_running) {
-      setShowAiPanel(true);
-    }
-  }, [ai?.ai_running]);
-
-  // Run an action, detect failures, record errors, show toasts
   const doAction = useCallback(
     (key: string, service: string, fn: () => Promise<unknown>) => {
       return async () => {
-        // Race condition guard
         if (actionGuardRef.current) return;
         actionGuardRef.current = true;
 
-        // Confirm destructive actions
         if (DESTRUCTIVE_ACTIONS.has(key)) {
           const ok = await confirm(
             `Confirm: ${key}`,
@@ -932,7 +547,227 @@ function DashboardInner() {
     [refreshPorts],
   );
 
+  const h = data.health;
+  const statusColor =
+    h?.status === 'healthy'
+      ? 'var(--success)'
+      : h?.status === 'degraded'
+        ? 'var(--warning, orange)'
+        : h?.status === 'building'
+          ? 'var(--accent)'
+          : 'var(--danger, red)';
 
+  return (
+    <div>
+      {/* Overall status bar */}
+      {h && (
+        <div
+          className="card"
+          style={{
+            marginBottom: '1rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '1rem',
+            padding: '0.6rem 1rem',
+          }}
+        >
+          <StatusDot up={h.status === 'healthy'} />
+          <span style={{ fontWeight: 600, textTransform: 'capitalize', color: statusColor }}>
+            {h.status}
+          </span>
+          <span className="text-muted" style={{ fontSize: '0.75rem' }}>
+            Runner: {h.runner.running ? 'running' : 'stopped'}
+            {h.runner.api_responding ? ' (API ok)' : ''}
+            {' | '}Mode: {h.runner.mode}
+            {' | '}Build: {h.build.in_progress ? 'in progress' : 'idle'}
+          </span>
+          {lastRefresh && (
+            <span className="text-muted" style={{ fontSize: '0.7rem', marginLeft: 'auto' }}>
+              updated {lastRefresh.toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Runner Instances — primary user action */}
+      <RunnerInstancesPanel />
+
+      {/* Service health table */}
+      {data.services.length > 0 && (
+        <div className="card" style={{ marginBottom: '1rem' }}>
+          <div className="card-header" style={{ marginBottom: '0.5rem' }}>
+            <span className="card-title">Services</span>
+          </div>
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Service</th>
+                  <th style={{ width: 60 }}>Port</th>
+                  <th style={{ width: 70 }}>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.services.map((svc) => (
+                  <tr key={svc.name}>
+                    <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{svc.name}</td>
+                    <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{svc.port}</td>
+                    <td>
+                      <StatusDot up={svc.available} />
+                      <span
+                        className={svc.available ? 'text-success' : 'text-danger'}
+                        style={{ fontSize: '0.7rem' }}
+                      >
+                        {svc.available ? 'UP' : 'DOWN'}
+                      </span>
+                    </td>
+                    <td>
+                      <div className="flex gap-2">
+                        {SERVICE_LOG_MAP[svc.name] && (
+                          <SmallBtn
+                            label="Logs"
+                            activeLabel="Loading..."
+                            onClick={async () => {
+                              try {
+                                const log = await api.logFile(SERVICE_LOG_MAP[svc.name], 100);
+                                addToast(`${svc.name}: ${log.lines} lines`, 'info');
+                              } catch {
+                                addToast(`${svc.name}: failed to fetch logs`, 'error');
+                              }
+                            }}
+                            busy={null}
+                          />
+                        )}
+                        <SmallBtn
+                          label="Start"
+                          activeLabel="Starting..."
+                          onClick={doAction(
+                            `${svc.name.toLowerCase()}-start`,
+                            svc.name,
+                            () => api.devStartAction(`${svc.name.toLowerCase()}-start`),
+                          )}
+                          busy={busy}
+                          busyKey={`${svc.name.toLowerCase()}-start`}
+                        />
+                        <SmallBtn
+                          label="Stop"
+                          activeLabel="Stopping..."
+                          onClick={doAction(
+                            `${svc.name.toLowerCase()}-stop`,
+                            svc.name,
+                            () => api.devStartAction(`${svc.name.toLowerCase()}-stop`),
+                          )}
+                          busy={busy}
+                          busyKey={`${svc.name.toLowerCase()}-stop`}
+                          variant="danger"
+                        />
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {errors.size > 0 && (
+            <div style={{ marginTop: '0.5rem' }}>
+              {Array.from(errors.values()).map((err) => (
+                <div
+                  key={err.service}
+                  style={{
+                    padding: '0.4rem 0.6rem',
+                    fontSize: '0.75rem',
+                    background: 'rgba(239,68,68,0.08)',
+                    borderRadius: 4,
+                    marginBottom: '0.25rem',
+                  }}
+                >
+                  <strong className="text-danger">{err.service} — {err.action} failed</strong>
+                  {err.stderr && (
+                    <pre
+                      style={{
+                        margin: '0.25rem 0 0',
+                        fontSize: '0.7rem',
+                        whiteSpace: 'pre-wrap',
+                        color: 'var(--text-muted)',
+                      }}
+                    >
+                      {err.stderr}
+                    </pre>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Expo status */}
+      {data.expo && (data.expo as Record<string, unknown>).configured && (
+        <div className="card" style={{ marginBottom: '1rem' }}>
+          <div className="card-header" style={{ marginBottom: '0.5rem' }}>
+            <span className="card-title">Expo</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}>
+            <StatusDot up={!!data.expo.running} />
+            <span>{data.expo.running ? 'Running' : 'Stopped'}</span>
+            {data.expo.port && (
+              <span className="text-muted" style={{ fontSize: '0.75rem' }}>
+                port {String(data.expo.port)}
+              </span>
+            )}
+            <div className="flex gap-2" style={{ marginLeft: 'auto' }}>
+              <SmallBtn
+                label="Start"
+                activeLabel="Starting..."
+                onClick={doAction('expo-start', 'Expo', () => api.expoStart())}
+                busy={busy}
+                busyKey="expo-start"
+              />
+              <SmallBtn
+                label="Stop"
+                activeLabel="Stopping..."
+                onClick={doAction('expo-stop', 'Expo', () => api.expoStop())}
+                busy={busy}
+                busyKey="expo-stop"
+                variant="danger"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Build info */}
+      {h && h.build.error_detected && (
+        <div
+          className="card"
+          style={{
+            marginBottom: '1rem',
+            border: '1px solid rgba(239,68,68,0.3)',
+            background: 'rgba(239,68,68,0.06)',
+          }}
+        >
+          <div className="card-header" style={{ marginBottom: '0.25rem' }}>
+            <span className="card-title text-danger">Build Error</span>
+          </div>
+          <pre
+            style={{
+              fontSize: '0.7rem',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              margin: 0,
+              color: 'var(--text-muted)',
+            }}
+          >
+            {h.build.last_error || 'Unknown build error'}
+          </pre>
+        </div>
+      )}
+
+      {/* Logs */}
+      <LogViewer />
+    </div>
+  );
 }
 
 // ─── Exported with Error Boundary ────────────────────────────────────────────

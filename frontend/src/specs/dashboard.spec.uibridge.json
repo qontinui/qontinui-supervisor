@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Supervisor Dashboard — primary control surface for dev infrastructure. Shows real-time health of all services (runner, backend, frontend, PostgreSQL, Redis, MinIO, Expo), provides start/stop/restart controls, AI debug panel with live SSE output, runner instance management, workflow loop status, cascade detection events, and a log viewer with source/level filtering.",
+  "description": "Supervisor Dashboard — primary control surface for dev infrastructure. Shows real-time health of all services (runner, backend, frontend, PostgreSQL, Redis, MinIO, Expo), provides start/stop/restart controls, runner instance management, build pool status, and a log viewer with source/level filtering.",
   "groups": [
     {
       "id": "dashboard-layout",
@@ -19,7 +19,7 @@
         },
         {
           "id": "sidebar-nav-links",
-          "description": "Sidebar contains navigation links: Dashboard, Runner Monitor, Workflow Loop, Velocity, Evaluation",
+          "description": "Sidebar contains navigation links: Dashboard, Runner Monitor, Velocity, Evaluation",
           "category": "navigation",
           "severity": "critical",
           "target": { "type": "search", "criteria": { "selector": ".sidebar-nav" }, "label": "Sidebar nav links" },
@@ -82,7 +82,7 @@
         },
         {
           "id": "service-action-buttons",
-          "description": "Each service row has action buttons (Start, Stop, Restart, AI Fix) that are contextually enabled/disabled based on service state. DOWN services show 'AI Fix' button.",
+          "description": "Each service row has action buttons (Start, Stop, Restart) that are contextually enabled/disabled based on service state.",
           "category": "interaction",
           "severity": "warning",
           "target": { "type": "search", "criteria": { "selector": "table tbody tr" }, "label": "Service action buttons" },
@@ -123,44 +123,6 @@
           "severity": "warning",
           "target": { "type": "search", "criteria": { "role": "button", "textContains": "Stop All" }, "label": "Stop All button" },
           "assertionType": "behavior",
-          "source": "ai-generated", "reviewed": false, "enabled": true
-        }
-      ],
-      "source": "ai-generated"
-    },
-    {
-      "id": "ai-debug-panel",
-      "name": "AI Debug Session Panel",
-      "description": "When an AI debug session is running, a collapsible panel appears showing live SSE output from the AI provider (Claude/Gemini). The panel has a provider/model selector dropdown, Stop button, expand/collapse toggle, and auto-scrolling monospace output limited to 200 lines.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "ai-provider-selector",
-          "description": "An AI provider/model selector dropdown is present, showing the current provider (e.g., 'Claude Opus 4.6'). Disabled while AI is running.",
-          "category": "element-presence",
-          "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": ".provider-select" }, "label": "AI provider selector" },
-          "assertionType": "exists",
-          "source": "ai-generated", "reviewed": false, "enabled": true
-        },
-        {
-          "id": "ai-session-running-indicator",
-          "description": "When AI debug is running, a panel appears with a pulsing accent-colored dot, the text 'AI debug running (provider/model)', line count, and a Stop button (danger variant). The panel has an indigo-tinted border and background.",
-          "category": "behavior",
-          "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "AI debug" }, "label": "AI session panel" },
-          "assertionType": "semantic",
-          "precondition": "An AI debug session is active",
-          "source": "ai-generated", "reviewed": false, "enabled": true
-        },
-        {
-          "id": "ai-session-output",
-          "description": "AI session output is displayed in a monospace font, auto-scrolling container (max 200 lines). Each line is rendered as a separate div. The output can be collapsed/expanded.",
-          "category": "data-display",
-          "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "AI debug" }, "label": "AI output area" },
-          "assertionType": "semantic",
-          "precondition": "An AI debug session has produced output",
           "source": "ai-generated", "reviewed": false, "enabled": true
         }
       ],
@@ -214,7 +176,7 @@
     {
       "id": "log-viewer",
       "name": "Log Viewer Panel",
-      "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build, AI) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
+      "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
       "category": "data-display",
       "assertions": [
         {
@@ -228,7 +190,7 @@
         },
         {
           "id": "log-filter-controls",
-          "description": "Log viewer has filter controls for source (Supervisor, Runner, Build, AI) and level (INFO, WARN, ERROR), plus a pause/resume toggle",
+          "description": "Log viewer has filter controls for source (Supervisor, Runner, Build) and level (INFO, WARN, ERROR), plus a pause/resume toggle",
           "category": "interaction",
           "severity": "info",
           "target": { "type": "search", "criteria": { "textContains": "Log" }, "label": "Log filter controls" },
@@ -273,48 +235,12 @@
         }
       ],
       "source": "ai-generated"
-    },
-    {
-      "id": "cascade-panel",
-      "name": "Cascade Detection Panel",
-      "description": "Displays real-time cascade detection events from SSE stream. Shows needle searches across backends with confidence scores, duration, and results. Collapsible with event history limited to 100 entries.",
-      "category": "data-display",
-      "assertions": [
-        {
-          "id": "cascade-panel-collapsible",
-          "description": "The cascade panel is present and can be expanded/collapsed. Shows event count when collapsed.",
-          "category": "interaction",
-          "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Cascade" }, "label": "Cascade panel" },
-          "assertionType": "semantic",
-          "source": "ai-generated", "reviewed": false, "enabled": true
-        }
-      ],
-      "source": "ai-generated"
-    },
-    {
-      "id": "workflow-loop-panel",
-      "name": "Workflow Loop Status Panel",
-      "description": "Shows current workflow loop status if active: phase (idle/running_workflow/reflecting/implementing_fixes), iteration count, exit strategy, and between-iteration action. Links to the full Workflow Loop page.",
-      "category": "data-display",
-      "assertions": [
-        {
-          "id": "workflow-loop-status",
-          "description": "Workflow loop section displays current phase, iteration progress, and a link to the detailed Workflow Loop page. When no loop is active, shows 'idle' or no section.",
-          "category": "data-display",
-          "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Workflow" }, "label": "Workflow loop status" },
-          "assertionType": "semantic",
-          "source": "ai-generated", "reviewed": false, "enabled": true
-        }
-      ],
-      "source": "ai-generated"
     }
   ],
   "metadata": {
     "component": "Dashboard",
     "pageUrl": "/",
-    "tags": ["supervisor", "dashboard", "health", "services", "ai-debug", "runners", "logs"]
+    "tags": ["supervisor", "dashboard", "health", "services", "runners", "logs", "build-pool"]
   },
   "stateMachine": {
     "states": [

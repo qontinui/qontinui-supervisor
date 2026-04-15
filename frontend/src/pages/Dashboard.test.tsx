@@ -1,13 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
 
 // Mock the api module
 vi.mock('../lib/api', () => {
   const healthResponse = {
-    status: 'ok',
+    status: 'healthy',
     runner: {
       running: true,
       pid: 1234,
@@ -25,18 +24,8 @@ vi.mock('../lib/api', () => {
     },
     build: {
       in_progress: false,
+      available_slots: 3,
       error_detected: false,
-    },
-    ai: {
-      ai_running: false,
-      ai_provider: 'claude',
-      ai_model: 'opus',
-      auto_debug_enabled: false,
-    },
-    code_activity: {
-      code_being_edited: false,
-      external_claude_session: false,
-      pending_debug: false,
     },
     expo: {
       running: false,
@@ -57,13 +46,9 @@ vi.mock('../lib/api', () => {
         services: [
           { name: 'backend', port: 8000, available: true },
           { name: 'frontend', port: 3001, available: true },
-          { name: 'postgresql', port: 5432, available: true },
-          { name: 'redis', port: 6379, available: true },
-          { name: 'minio', port: 9000, available: false },
-          { name: 'vite', port: 1420, available: true },
         ],
       }),
-      expoStatus: vi.fn().mockResolvedValue({ running: false }),
+      expoStatus: vi.fn().mockResolvedValue({ running: false, configured: true }),
       devStartAction: vi.fn().mockResolvedValue({
         status: 'ok',
         flag: 'backend',
@@ -71,21 +56,13 @@ vi.mock('../lib/api', () => {
         stderr: '',
         exit_code: 0,
       }),
-      runnerRestart: vi.fn().mockResolvedValue({ status: 'ok' }),
-      runnerStop: vi.fn().mockResolvedValue({ status: 'ok' }),
-      aiModels: vi.fn().mockResolvedValue({ models: [] }),
-      aiStop: vi.fn().mockResolvedValue({ status: 'ok' }),
-      aiDebug: vi.fn().mockResolvedValue({ status: 'ok', message: 'started' }),
       logFile: vi.fn().mockResolvedValue({ content: '', lines: 0 }),
-      wlStatus: vi.fn().mockResolvedValue({ running: false, phase: 'idle', current_iteration: 0 }),
-      wlStop: vi.fn().mockResolvedValue({}),
       expoStart: vi.fn().mockResolvedValue({}),
       expoStop: vi.fn().mockResolvedValue({}),
+      listRunners: vi.fn().mockResolvedValue([]),
     },
     HealthResponse: {},
     DevStartResponse: {},
-    AiModelInfo: {},
-    WorkflowLoopStatus: {},
   };
 });
 
@@ -131,87 +108,24 @@ function renderDashboard() {
 }
 
 describe('Dashboard', () => {
-  it("renders the page header with 'Dashboard'", async () => {
+  it('renders the Runner Instances panel', async () => {
     renderDashboard();
-
-    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument();
+    expect(await screen.findByText('Runner Instances')).toBeInTheDocument();
   });
 
-  it('renders the service table with expected service rows', async () => {
+  it('renders the Logs panel', async () => {
     renderDashboard();
-
-    // Wait for data to load
-    const table = await screen.findByRole('table');
-    expect(table).toBeInTheDocument();
-
-    // Check that all expected service names appear in the table
-    const expectedServices = [
-      'Runner',
-      'Backend',
-      'Frontend',
-      'PostgreSQL',
-      'Redis',
-      'MinIO',
-      'Vite',
-      'Expo',
-      'Watchdog',
-    ];
-
-    for (const service of expectedServices) {
-      expect(within(table).getByText(service)).toBeInTheDocument();
-    }
+    expect(await screen.findByText('Logs')).toBeInTheDocument();
   });
 
-  it('renders table column headers', async () => {
+  it('shows health status from the health endpoint', async () => {
     renderDashboard();
-
-    const table = await screen.findByRole('table');
-    expect(within(table).getByText('Service')).toBeInTheDocument();
-    expect(within(table).getByText('Port')).toBeInTheDocument();
-    expect(within(table).getByText('Status')).toBeInTheDocument();
-    expect(within(table).getByText('Actions')).toBeInTheDocument();
+    // The status bar should show "healthy"
+    expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
   });
 
-  it('shows Start/Restart button for Backend that calls the api', async () => {
-    const { api } = await import('../lib/api');
-    const user = userEvent.setup();
+  it('shows runner mode in the status bar', async () => {
     renderDashboard();
-
-    // Wait for the table to render, then find the Backend row
-    const table = await screen.findByRole('table');
-    const backendRow = within(table).getByText('Backend').closest('tr')!;
-    const backendRestartBtn = within(backendRow).getByRole('button', {
-      name: /Restart/,
-    });
-
-    await user.click(backendRestartBtn);
-
-    expect(api.devStartAction).toHaveBeenCalledWith('backend');
-  });
-
-  it('shows Rebuild button for Runner that calls runnerRestart with true', async () => {
-    const { api } = await import('../lib/api');
-    const user = userEvent.setup();
-    renderDashboard();
-
-    const table = await screen.findByRole('table');
-    const runnerRow = within(table).getByText('Runner').closest('tr')!;
-    const rebuildBtn = within(runnerRow).getByRole('button', {
-      name: 'Rebuild',
-    });
-
-    await user.click(rebuildBtn);
-
-    expect(api.runnerRestart).toHaveBeenCalledWith(true);
-  });
-
-  it('renders the Bulk Actions section', async () => {
-    renderDashboard();
-
-    expect(await screen.findByText('Bulk Actions')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Docker' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Start All' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Clean' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Migrate' })).toBeInTheDocument();
+    expect(await screen.findByText(/Mode: dev/)).toBeInTheDocument();
   });
 });
