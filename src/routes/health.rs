@@ -77,6 +77,20 @@ pub struct WatchdogHealth {
     pub crash_count: usize,
 }
 
+impl WatchdogHealth {
+    /// Return a static "disabled" value. The watchdog module has been removed;
+    /// this keeps the JSON shape stable for API consumers.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            restart_attempts: 0,
+            last_restart_at: None,
+            disabled_reason: Some("watchdog module removed".to_string()),
+            crash_count: 0,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct BuildHealth {
     pub in_progress: bool,
@@ -129,13 +143,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 pid: r.pid,
                 started_at: None, // Not cached — use GET /runners for full detail
                 api_responding: r.api_responding,
-                watchdog_status: WatchdogHealth {
-                    enabled: false,
-                    restart_attempts: 0,
-                    last_restart_at: None,
-                    disabled_reason: None,
-                    crash_count: 0,
-                },
+                watchdog_status: WatchdogHealth::disabled(),
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -161,24 +169,12 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let overall_status =
         determine_overall_status(runner.running, api_responding, build.build_in_progress);
 
-    // Build multi-runner status array and capture primary watchdog for backward compat
+    // Build multi-runner status array (watchdog module removed — use static disabled value)
     let managed_runners = state.get_all_runners().await;
     let mut runners_health = Vec::new();
-    let mut primary_watchdog = None;
     for managed in &managed_runners {
         let mr = managed.runner.read().await;
-        let mw = managed.watchdog.read().await;
         let mc = managed.cached_health.read().await;
-        let wd_health = WatchdogHealth {
-            enabled: mw.enabled,
-            restart_attempts: mw.restart_attempts,
-            last_restart_at: mw.last_restart_at.map(|t| t.to_rfc3339()),
-            disabled_reason: mw.disabled_reason.clone(),
-            crash_count: mw.crash_history.len(),
-        };
-        if managed.config.is_primary {
-            primary_watchdog = Some(wd_health.clone());
-        }
         runners_health.push(RunnerInstanceHealth {
             id: managed.config.id.clone(),
             name: managed.config.name.clone(),
@@ -188,30 +184,9 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pid: mr.pid,
             started_at: mr.started_at.map(|t| t.to_rfc3339()),
             api_responding: mc.runner_responding,
-            watchdog_status: wd_health,
+            watchdog_status: WatchdogHealth::disabled(),
         });
     }
-
-    // Use primary runner's watchdog for backward compat, fallback to legacy state
-    let watchdog_health = primary_watchdog.unwrap_or_else(|| {
-        let watchdog = state.watchdog.try_read();
-        match watchdog {
-            Ok(wd) => WatchdogHealth {
-                enabled: wd.enabled,
-                restart_attempts: wd.restart_attempts,
-                last_restart_at: wd.last_restart_at.map(|t| t.to_rfc3339()),
-                disabled_reason: wd.disabled_reason.clone(),
-                crash_count: wd.crash_history.len(),
-            },
-            Err(_) => WatchdogHealth {
-                enabled: false,
-                restart_attempts: 0,
-                last_restart_at: None,
-                disabled_reason: None,
-                crash_count: 0,
-            },
-        }
-    });
 
     HealthResponse {
         status: overall_status.to_string(),
@@ -240,7 +215,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
                 None
             },
         },
-        watchdog: watchdog_health,
+        watchdog: WatchdogHealth::disabled(),
         build: BuildHealth {
             in_progress: build.build_in_progress,
             available_slots: state.build_pool.permits.available_permits(),
@@ -276,16 +251,12 @@ pub async fn health_stream(
         let health = {
             // Sync-safe: use try_read on each lock to avoid blocking the stream
             let runner = state.runner.try_read();
-            let watchdog = state.watchdog.try_read();
             let build = state.build.try_read();
             let expo = state.expo.try_read();
             let cached = state.cached_health.try_read();
 
             // If any lock is contended, skip this tick
             let Ok(runner) = runner else {
-                return Ok(Event::default().comment("keepalive"));
-            };
-            let Ok(watchdog) = watchdog else {
                 return Ok(Event::default().comment("keepalive"));
             };
             let Ok(build) = build else {
@@ -332,13 +303,7 @@ pub async fn health_stream(
                         None
                     },
                 },
-                watchdog: WatchdogHealth {
-                    enabled: watchdog.enabled,
-                    restart_attempts: watchdog.restart_attempts,
-                    last_restart_at: watchdog.last_restart_at.map(|t| t.to_rfc3339()),
-                    disabled_reason: watchdog.disabled_reason.clone(),
-                    crash_count: watchdog.crash_history.len(),
-                },
+                watchdog: WatchdogHealth::disabled(),
                 build: BuildHealth {
                     in_progress: build.build_in_progress,
                     available_slots: state.build_pool.permits.available_permits(),
