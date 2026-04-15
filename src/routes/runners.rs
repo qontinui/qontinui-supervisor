@@ -922,10 +922,15 @@ pub async fn spawn_test(
     // - On timeout + child dead: return 500 `runner_died_during_startup`, stop,
     //   and clean up.
     let mut health_probe_ms: Option<u64> = None;
+    let mut probed_git_sha: Option<String> = None;
     if body.health_probe_timeout_ms > 0 {
         match probe_runner_health(&state, &id, port, body.health_probe_timeout_ms).await {
-            ProbeOutcome::Healthy { elapsed_ms } => {
+            ProbeOutcome::Healthy {
+                elapsed_ms,
+                git_sha,
+            } => {
                 health_probe_ms = Some(elapsed_ms);
+                probed_git_sha = git_sha;
             }
             ProbeOutcome::Failed {
                 elapsed_ms,
@@ -1090,6 +1095,9 @@ pub async fn spawn_test(
     if let Some(ms) = health_probe_ms {
         resp["health_probe_ms"] = json!(ms);
     }
+    if let Some(sha) = probed_git_sha {
+        resp["git_sha"] = json!(sha);
+    }
 
     Ok(Json(resp).into_response())
 }
@@ -1098,6 +1106,10 @@ pub async fn spawn_test(
 enum ProbeOutcome {
     Healthy {
         elapsed_ms: u64,
+        /// Git SHA embedded in the runner binary (from build.rs). `None` if
+        /// the runner didn't include it in its /health response (old binary,
+        /// or unparseable body).
+        git_sha: Option<String>,
     },
     Failed {
         elapsed_ms: u64,
@@ -1129,8 +1141,22 @@ async fn probe_runner_health(
     loop {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
+                // Extract gitSha from the /health body while we have it
+                // (best-effort; an old runner won't include the field).
+                let git_sha = resp
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                    .and_then(|v| {
+                        v.get("data")
+                            .and_then(|d| d.get("gitSha"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    });
                 return ProbeOutcome::Healthy {
                     elapsed_ms: start.elapsed().as_millis() as u64,
+                    git_sha,
                 };
             }
         }

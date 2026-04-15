@@ -401,7 +401,6 @@ impl WatchdogState {
             disabled_reason: None,
         }
     }
-
 }
 
 impl Default for BuildState {

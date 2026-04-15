@@ -103,7 +103,6 @@ pub struct BuildHealth {
     pub last_build_at: Option<String>,
 }
 
-
 #[derive(Serialize)]
 pub struct SupervisorInfo {
     pub version: String,
@@ -122,6 +121,8 @@ pub fn determine_overall_status(
         "healthy"
     } else if runner_running && !api_responding {
         "degraded"
+    } else if api_responding {
+        "external"
     } else if build_in_progress {
         "building"
     } else {
@@ -311,7 +312,7 @@ pub async fn health_stream(
                     last_error: build.last_build_error.clone(),
                     last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
                 },
-                        expo: ExpoHealth {
+                expo: ExpoHealth {
                     running: expo.running,
                     pid: expo.pid,
                     port: expo.port,
@@ -376,10 +377,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stopped_when_runner_not_running_and_api_responding() {
-        // Edge case: api_responding but runner not running (stale port?)
-        // runner.running is false, so falls through to build/stopped checks
-        assert_eq!(determine_overall_status(false, true, false), "stopped");
+    fn test_external_when_runner_not_tracked_but_api_responding() {
+        // User-started (or otherwise externally-managed) runner: supervisor
+        // didn't spawn it so `running` is false, but its API is reachable.
+        assert_eq!(determine_overall_status(false, true, false), "external");
+        assert_eq!(determine_overall_status(false, true, true), "external");
     }
 
     #[test]
@@ -417,7 +419,7 @@ mod tests {
                 last_error: None,
                 last_build_at: None,
             },
-                expo: ExpoHealth {
+            expo: ExpoHealth {
                 running: false,
                 pid: None,
                 port: 8081,

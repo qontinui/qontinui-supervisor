@@ -146,7 +146,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-
     // Background reaper: periodically purge stale/crashed test runners so they
     // don't exhaust the port range (9877-9899). Runs every 5 minutes.
     {
