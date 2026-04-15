@@ -79,6 +79,14 @@ pub async fn list_runners(
         // OR its API is responding (e.g. spawned externally by the runner's instance manager).
         let effectively_running = runner.running || cached.runner_responding;
 
+        // Expose the per-runner log/event URLs so callers don't have to
+        // reverse-engineer them from the server routes — the per-runner
+        // `logs` endpoint is the only place that captures the runner's own
+        // stdout/stderr (unlike /logs/history, which is the supervisor's
+        // own buffer and does not include runner logs).
+        let logs_url = format!("/runners/{}/logs", managed.config.id);
+        let logs_stream_url = format!("/runners/{}/logs/stream", managed.config.id);
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
@@ -89,6 +97,8 @@ pub async fn list_runners(
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
             "api_responding": cached.runner_responding,
+            "logs_url": logs_url,
+            "logs_stream_url": logs_stream_url,
             "watchdog": {
                 "enabled": watchdog.enabled,
                 "restart_attempts": watchdog.restart_attempts,
@@ -1060,6 +1070,12 @@ pub async fn spawn_test(
         "wait_ms": wait_ms,
         "api_url": format!("http://localhost:{}", port),
         "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        // Per-runner log endpoints — these capture the runner's own
+        // stdout/stderr. /logs/history on the supervisor has the
+        // supervisor's own buffer and does NOT include runner logs, so
+        // agents testing runner internals should hit these instead.
+        "logs_url": format!("/runners/{}/logs", id),
+        "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
         } else if body.wait {
@@ -1470,6 +1486,8 @@ pub async fn spawn_named(
         "wait_ms": wait_ms,
         "api_url": format!("http://localhost:{}", port),
         "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "logs_url": format!("/runners/{}/logs", id),
+        "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {
