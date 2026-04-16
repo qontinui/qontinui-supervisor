@@ -749,7 +749,14 @@ pub async fn spawn_test(
     // We insert the ManagedRunner before the (potentially long) build so
     // subsequent scanners see the reservation. If the build fails, the
     // placeholder is removed.
-    let (id, port) = {
+    //
+    // We also keep an Arc to the ManagedRunner for the rest of this handler
+    // so the eventual start call uses it directly, bypassing an id-based
+    // registry lookup. Without that, a transient "Runner not found" 404 is
+    // possible when a concurrent path (reaper, stop_all, failed probe on a
+    // sibling spawn) removes our id between insertion and start. Smoke tests
+    // hit this ~1 in 10 times under load.
+    let (id, port, managed) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -770,15 +777,13 @@ pub async fn spawn_test(
             is_primary: false,
             protected: true,
         };
-        runners.insert(
-            id.clone(),
-            Arc::new(ManagedRunner::new_with_log_dir(
-                runner_config,
-                false,
-                state.config.log_dir.as_deref(),
-            )),
-        );
-        (id, port)
+        let managed = Arc::new(ManagedRunner::new_with_log_dir(
+            runner_config,
+            false,
+            state.config.log_dir.as_deref(),
+        ));
+        runners.insert(id.clone(), managed.clone());
+        (id, port, managed)
     };
 
     // Rebuild if requested
@@ -889,9 +894,13 @@ pub async fn spawn_test(
 
     let name = format!("test-{}", port);
 
-    // Start the runner (the placeholder ManagedRunner is already in the registry
-    // under `id` from the atomic port-reservation block above).
-    if let Err(e) = manager::start_runner_by_id(&state, &id).await {
+    // Start the runner using the Arc captured at insertion time. This avoids
+    // the id-based lookup in `start_runner_by_id` which can race with
+    // concurrent paths that remove the id from the registry (e.g. a sibling
+    // spawn's failed health probe, stop_all_temp_runners, the reaper).
+    // `start_managed_runner` also re-inserts the Arc if the id went missing,
+    // so the subsequent health probe and /runners lookups still work.
+    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
         // Clean up on failure
         let mut runners = state.runners.write().await;
         runners.remove(&id);
@@ -1267,7 +1276,10 @@ pub async fn spawn_named(
         .unwrap_or(false);
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner.
-    let (id, port) = {
+    // Keep an Arc to the ManagedRunner so the later start uses it directly,
+    // bypassing the id-based registry lookup. See the matching note in
+    // `spawn_test` for why this matters.
+    let (id, port, managed) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -1298,15 +1310,13 @@ pub async fn spawn_named(
             is_primary: false,
             protected: body.protected,
         };
-        runners.insert(
-            id.clone(),
-            Arc::new(ManagedRunner::new_with_log_dir(
-                runner_config,
-                false,
-                state.config.log_dir.as_deref(),
-            )),
-        );
-        (id, port)
+        let managed = Arc::new(ManagedRunner::new_with_log_dir(
+            runner_config,
+            false,
+            state.config.log_dir.as_deref(),
+        ));
+        runners.insert(id.clone(), managed.clone());
+        (id, port, managed)
     };
 
     // Rebuild if requested
@@ -1396,8 +1406,10 @@ pub async fn spawn_named(
         ));
     }
 
-    // Start the runner
-    if let Err(e) = manager::start_runner_by_id(&state, &id).await {
+    // Start the runner using the Arc captured at insertion time (race-free
+    // — no re-lookup of `id` which could fail transiently under concurrent
+    // load).
+    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);

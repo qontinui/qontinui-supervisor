@@ -273,6 +273,12 @@ fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
 }
 
 /// Start a specific runner by ID.
+///
+/// Thin wrapper around [`start_managed_runner`] that first resolves the id in
+/// the registry. Prefer `start_managed_runner` when the caller already holds
+/// an `Arc<ManagedRunner>` — that path is race-free, whereas id-based lookup
+/// can fail if a concurrent remove (reaper, stop, failed probe) fires between
+/// insertion and start.
 pub async fn start_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -281,12 +287,41 @@ pub async fn start_runner_by_id(
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+    start_managed_runner(state, &managed).await
+}
 
+/// Start a runner given a direct `Arc<ManagedRunner>` reference.
+///
+/// Used by `spawn_test` / `spawn_named` to avoid a re-lookup race: the
+/// registry insertion and the start must use the same ManagedRunner, even if
+/// another task concurrently removes the id from the map. If the id is
+/// missing from the registry when we start (which shouldn't normally happen,
+/// but has been observed as a transient 404 under load), we re-insert the Arc
+/// so downstream health / monitoring can find it by id.
+pub async fn start_managed_runner(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+) -> Result<(), SupervisorError> {
     // With the parallel build pool, a concurrent build on one slot does not
     // prevent us from starting a runner from a previously-built exe in
     // another slot (or the legacy target path). `resolve_source_exe` inside
     // `start_exe_mode_for_runner` returns an explicit error if no binary is
     // available anywhere. No coarse `build_in_progress` check here.
+
+    let runner_id = managed.config.id.clone();
+
+    // Defensive re-insertion: if something removed our id between placeholder
+    // insertion and start, put it back. This fixes the ~1-in-10 spawn-test
+    // 404 "Runner not found" race observed in smoke tests. Using `entry` +
+    // `or_insert` instead of unconditional insert preserves any other Arc
+    // that may have replaced ours (so we don't clobber a different managed
+    // runner sharing the same id, which would itself indicate a bug).
+    {
+        let mut runners = state.runners.write().await;
+        runners
+            .entry(runner_id.clone())
+            .or_insert_with(|| managed.clone());
+    }
 
     {
         let runner = managed.runner.read().await;
@@ -321,9 +356,9 @@ pub async fn start_runner_by_id(
     // Non-primary runners always use exe mode — only one Vite instance can run at a time,
     // and discovered runners share the compiled binary from the primary's build.
     let mut child = if is_primary && state.config.dev_mode {
-        start_dev_mode_for_runner(state, &managed).await?
+        start_dev_mode_for_runner(state, managed).await?
     } else {
-        start_exe_mode_for_runner(state, &managed).await?
+        start_exe_mode_for_runner(state, managed).await?
     };
 
     let pid = child.id();
@@ -376,9 +411,8 @@ pub async fn start_runner_by_id(
     // Spawn a task to monitor the process exit
     let state_clone = state.clone();
     let managed_clone = managed.clone();
-    let runner_id_owned = runner_id.to_string();
     tokio::spawn(async move {
-        monitor_runner_process_exit(state_clone, managed_clone, runner_id_owned).await;
+        monitor_runner_process_exit(state_clone, managed_clone, runner_id).await;
     });
 
     Ok(())
