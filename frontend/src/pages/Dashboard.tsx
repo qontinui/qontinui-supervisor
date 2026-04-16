@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { api, HealthResponse, DevStartResponse } from '../lib/api';
+import { api, HealthResponse, DevStartResponse, ExpoStatus } from '../lib/api';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { ToastContainer, addToast } from '../components/Toast';
 import { ConfirmDialog, confirm } from '../components/ConfirmDialog';
@@ -175,7 +175,7 @@ type ActionState = string | null;
 interface StatusData {
   health: HealthResponse | null;
   services: { name: string; port: number; available: boolean }[];
-  expo: Record<string, unknown> | null;
+  expo: ExpoStatus | null;
 }
 
 // ─── Runner Instances Panel ──────────────────────────────────────────────────
@@ -772,17 +772,17 @@ function DashboardInner() {
       )}
 
       {/* Expo status */}
-      {data.expo && (data.expo as Record<string, unknown>).configured && (
+      {data.expo?.configured && (
         <div className="card" style={{ marginBottom: '1rem' }}>
           <div className="card-header" style={{ marginBottom: '0.5rem' }}>
             <span className="card-title">Expo</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}>
-            <StatusDot up={!!data.expo.running} />
+            <StatusDot up={data.expo.running} />
             <span>{data.expo.running ? 'Running' : 'Stopped'}</span>
-            {data.expo.port && (
+            {data.expo.port > 0 && (
               <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-                port {String(data.expo.port)}
+                port {data.expo.port}
               </span>
             )}
             <div className="flex gap-2" style={{ marginLeft: 'auto' }}>

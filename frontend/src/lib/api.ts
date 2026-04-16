@@ -155,6 +155,14 @@ export interface LogFileResponse {
   lines: number;
 }
 
+export interface ExpoStatus {
+  running: boolean;
+  pid: number | null;
+  port: number;
+  started_at: string | null;
+  configured: boolean;
+}
+
 export interface LogEntry {
   timestamp: string;
   level: string;
@@ -684,5 +692,5 @@ export const api = {
   // Expo
   expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
   expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
-  expoStatus: () => fetchJson<Record<string, unknown>>('/expo/status'),
+  expoStatus: () => fetchJson<ExpoStatus>('/expo/status'),
 };
