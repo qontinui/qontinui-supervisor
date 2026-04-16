@@ -1,13 +1,82 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
 use crate::config::LOG_BUFFER_SIZE;
+
+/// Append-only file writer shared across log readers. Uses a std::sync::Mutex
+/// because `write_all` is a blocking syscall — we only hold it long enough to
+/// write a single already-formatted line. No rotation: file grows unbounded.
+pub type FileWriter = Arc<StdMutex<File>>;
+
+/// Open (or create) a log file in append mode. Parent directory is created
+/// if missing. Returns `None` on any IO error after logging a warning, so a
+/// bad log path never prevents supervisor startup.
+pub fn open_append_log(path: &Path) -> Option<FileWriter> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!("Failed to create log directory {}: {}", parent.display(), e);
+                return None;
+            }
+        }
+    }
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => Some(Arc::new(StdMutex::new(f))),
+        Err(e) => {
+            warn!("Failed to open log file {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// Format a log entry as a single line for the persistent log file.
+/// Keeps the in-memory format identical to the existing SSE/buffer view
+/// so operators can grep both sources the same way.
+fn format_entry_line(entry: &LogEntry) -> String {
+    let source = match entry.source {
+        LogSource::Runner => "runner",
+        LogSource::Supervisor => "supervisor",
+        LogSource::Build => "build",
+        LogSource::Expo => "expo",
+    };
+    let level = match entry.level {
+        LogLevel::Info => "INFO",
+        LogLevel::Warn => "WARN",
+        LogLevel::Error => "ERROR",
+        LogLevel::Debug => "DEBUG",
+    };
+    format!(
+        "{} [{}] [{}] {}\n",
+        entry
+            .timestamp
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        source,
+        level,
+        entry.message
+    )
+}
+
+/// Append one entry to the file, swallowing IO errors (persistent logging
+/// must never crash the supervisor). Errors are warned once per call.
+fn write_entry_to_file(writer: &FileWriter, entry: &LogEntry) {
+    let line = format_entry_line(entry);
+    if let Ok(mut f) = writer.lock() {
+        if let Err(e) = f.write_all(line.as_bytes()) {
+            // Don't use warn!/tracing here — it could recurse back into the
+            // supervisor's own log buffer. Use eprintln which is unobserved.
+            eprintln!("log_capture: failed to append to log file: {}", e);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
@@ -38,6 +107,10 @@ pub enum LogLevel {
 pub struct LogState {
     buffer: Arc<RwLock<VecDeque<LogEntry>>>,
     sender: broadcast::Sender<LogEntry>,
+    /// Optional append-only file writer. When set, every entry pushed to the
+    /// in-memory buffer is also written here. Arc<Mutex<File>> so clones of
+    /// this writer can be handed to spawn_*_reader helpers.
+    file_writer: std::sync::RwLock<Option<FileWriter>>,
 }
 
 impl Default for LogState {
@@ -52,7 +125,24 @@ impl LogState {
         Self {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
             sender,
+            file_writer: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach (or replace) the persistent log file writer. Every subsequent
+    /// `push`/`emit` call appends the entry to this file. Passing `None`
+    /// detaches the writer — buffered entries are NOT retroactively flushed.
+    pub fn set_file_writer(&self, writer: Option<FileWriter>) {
+        if let Ok(mut guard) = self.file_writer.write() {
+            *guard = writer;
+        }
+    }
+
+    /// Snapshot the current file writer (cheap Arc clone). Used by
+    /// `spawn_*_reader` helpers so each reader can write directly without
+    /// holding an RwLock on every line.
+    fn current_writer(&self) -> Option<FileWriter> {
+        self.file_writer.read().ok().and_then(|g| g.clone())
     }
 
     pub async fn push(&self, entry: LogEntry) {
@@ -62,6 +152,11 @@ impl LogState {
         }
         buf.push_back(entry.clone());
         drop(buf);
+
+        // Persist before broadcasting so a crashing receiver can't drop the line.
+        if let Some(w) = self.current_writer() {
+            write_entry_to_file(&w, &entry);
+        }
 
         let _ = self.sender.send(entry);
     }
@@ -89,6 +184,7 @@ impl LogState {
 pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
+    let file_writer = logs.current_writer();
 
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
@@ -113,6 +209,10 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
                         buf.push_back(entry.clone());
                     }
 
+                    if let Some(ref w) = file_writer {
+                        write_entry_to_file(w, &entry);
+                    }
+
                     let _ = sender.send(entry);
                 }
                 Ok(None) => {
@@ -135,6 +235,7 @@ pub fn spawn_stderr_reader(
 ) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
+    let file_writer = logs.current_writer();
 
     tokio::spawn(async move {
         let reader = BufReader::new(stderr);
@@ -163,6 +264,10 @@ pub fn spawn_stderr_reader(
                         buf.push_back(entry.clone());
                     }
 
+                    if let Some(ref w) = file_writer {
+                        write_entry_to_file(w, &entry);
+                    }
+
                     let _ = sender.send(entry);
                 }
                 Ok(None) => {
@@ -189,6 +294,7 @@ pub fn spawn_reader_with_source(
 ) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
+    let file_writer = logs.current_writer();
     let source_name = format!("{:?}", source).to_lowercase();
 
     tokio::spawn(async move {
@@ -218,6 +324,10 @@ pub fn spawn_reader_with_source(
                             buf.pop_front();
                         }
                         buf.push_back(entry.clone());
+                    }
+
+                    if let Some(ref w) = file_writer {
+                        write_entry_to_file(w, &entry);
                     }
 
                     let _ = sender.send(entry);

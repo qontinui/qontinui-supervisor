@@ -156,7 +156,6 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
 }
 
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {
-    let runner = state.runner.read().await;
     let build = state.build.read().await;
     let expo = state.expo.read().await;
 
@@ -167,8 +166,20 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let vite_in_use = cached.vite_port_open;
     drop(cached);
 
+    // Use primary ManagedRunner state (not the legacy state.runner which is never
+    // updated for user-managed runners, causing "stopped" even when the runner is UP).
+    let (primary_running, primary_pid, primary_started_at) =
+        if let Some(primary) = state.get_primary().await {
+            let pr = primary.runner.read().await;
+            (pr.running, pr.pid, pr.started_at)
+        } else {
+            // Fallback to legacy state.runner if no managed primary exists
+            let runner = state.runner.read().await;
+            (runner.running, runner.pid, runner.started_at)
+        };
+
     let overall_status =
-        determine_overall_status(runner.running, api_responding, build.build_in_progress);
+        determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
     // Build multi-runner status array (watchdog module removed — use static disabled value)
     let managed_runners = state.get_all_runners().await;
@@ -192,9 +203,9 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     HealthResponse {
         status: overall_status.to_string(),
         runner: RunnerHealth {
-            running: runner.running,
-            pid: runner.pid,
-            started_at: runner.started_at.map(|t| t.to_rfc3339()),
+            running: primary_running,
+            pid: primary_pid,
+            started_at: primary_started_at.map(|t| t.to_rfc3339()),
             api_responding,
             mode: if state.config.dev_mode {
                 "dev".to_string()
@@ -251,15 +262,12 @@ pub async fn health_stream(
         let state = state.clone();
         let health = {
             // Sync-safe: use try_read on each lock to avoid blocking the stream
-            let runner = state.runner.try_read();
             let build = state.build.try_read();
             let expo = state.expo.try_read();
             let cached = state.cached_health.try_read();
+            let runner_snapshots = state.cached_runner_health.try_read();
 
             // If any lock is contended, skip this tick
-            let Ok(runner) = runner else {
-                return Ok(Event::default().comment("keepalive"));
-            };
             let Ok(build) = build else {
                 return Ok(Event::default().comment("keepalive"));
             };
@@ -274,15 +282,32 @@ pub async fn health_stream(
             let api_in_use = cached.runner_port_open;
             let vite_in_use = cached.vite_port_open;
 
+            // Use the primary runner from cached snapshots (not the legacy
+            // state.runner which is never updated for user-managed runners).
+            let primary_snapshot = runner_snapshots
+                .as_ref()
+                .ok()
+                .and_then(|snaps| snaps.iter().find(|r| r.is_primary));
+            let (primary_running, primary_pid) = match primary_snapshot {
+                Some(p) => (p.running, p.pid),
+                None => {
+                    // Fallback to legacy state.runner
+                    match state.runner.try_read() {
+                        Ok(r) => (r.running, r.pid),
+                        Err(_) => (false, None),
+                    }
+                }
+            };
+
             let overall_status =
-                determine_overall_status(runner.running, api_responding, build.build_in_progress);
+                determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
             HealthResponse {
                 status: overall_status.to_string(),
                 runner: RunnerHealth {
-                    running: runner.running,
-                    pid: runner.pid,
-                    started_at: runner.started_at.map(|t| t.to_rfc3339()),
+                    running: primary_running,
+                    pid: primary_pid,
+                    started_at: None, // Not available from cached snapshot
                     api_responding,
                     mode: if state.config.dev_mode {
                         "dev".to_string()

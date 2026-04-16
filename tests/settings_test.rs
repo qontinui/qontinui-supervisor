@@ -71,6 +71,7 @@ fn test_settings_path() {
         auto_debug: false,
         smart_rebuild: false,
         log_file: None,
+        log_dir: None,
         port: 9875,
         dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),
         cli_args: vec![],

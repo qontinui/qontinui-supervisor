@@ -52,9 +52,43 @@ cargo clippy -- -D warnings    # Lint
 | `-w, --watchdog` | Enable health monitoring (observe-only, implies `--auto-start`) |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--expo-dir` | Path to Expo/React Native project directory |
-| `-l, --log-file` | Log file for runner output |
+| `-l, --log-file` | Append the in-memory log buffer to this file (persistent supervisor log, no rotation). Overrides `<log-dir>/supervisor.log`. |
+| `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. No rotation. |
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
+
+## Persistent Logs
+
+The supervisor keeps only the last 500 log entries (~30 min of activity) in its in-memory circular buffer, which is not enough to diagnose a crash-loop after the fact. Pass `--log-dir` (or `--log-file`) to tee every entry into an append-only file on disk.
+
+**Recommended defaults:**
+
+- Windows: `%LOCALAPPDATA%\qontinui-supervisor\logs\` (e.g. `C:\Users\<you>\AppData\Local\qontinui-supervisor\logs`)
+- Linux: `~/.local/state/qontinui-supervisor/logs/`
+- macOS: `~/Library/Logs/qontinui-supervisor/`
+
+**Usage:**
+
+```bash
+# Windows (PowerShell)
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri --log-dir $env:LOCALAPPDATA\qontinui-supervisor\logs
+
+# Linux/macOS
+./target/debug/qontinui-supervisor -p ../qontinui-runner/src-tauri --log-dir ~/.local/state/qontinui-supervisor/logs
+```
+
+**Files written:**
+
+- `<log-dir>/supervisor.log` — every entry that also goes through the in-memory buffer (supervisor events, build output, expo, runner log lines routed through `state.logs.emit`).
+- `<log-dir>/<runner-id>.log` — one file per managed runner, capturing that runner's stdout+stderr tee'd from `spawn_stdout_reader`/`spawn_stderr_reader`. Per-runner files are opened on `ManagedRunner::new_with_log_dir` (at startup, on `POST /runners`, or when a `test-*`/`named-*` runner is spawned).
+
+**Format:** `<rfc3339-millis> [source] [LEVEL] <message>` — one line per entry, same content as the in-memory SSE stream.
+
+**Precedence:** `--log-file <PATH>` overrides the default `<log-dir>/supervisor.log` location but does NOT affect per-runner files; for per-runner files you must set `--log-dir`.
+
+**No rotation.** Files grow unbounded — rotate externally (logrotate, PowerShell scheduled task, etc.) if size becomes an issue. Supervisor reopens files with `O_APPEND` semantics, so rotating out-of-process with `copytruncate`-style tools is safe; rename+signal style rotation will keep writing to the moved file and you must restart the supervisor.
+
+**Best-effort:** a missing/unwritable log path logs a warning once and continues — persistent logging never blocks supervisor startup.
 
 ## API Endpoints
 

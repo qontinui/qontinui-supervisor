@@ -32,15 +32,37 @@ pub struct ManagedRunner {
 }
 
 impl ManagedRunner {
+    #[allow(dead_code)]
     pub fn new(config: RunnerConfig, watchdog_enabled: bool) -> Self {
+        Self::new_with_log_dir(config, watchdog_enabled, None)
+    }
+
+    /// Construct a ManagedRunner and, when `log_dir` is set, attach a
+    /// per-runner persistent log file at `<log_dir>/<runner_id>.log`.
+    /// Every stdout/stderr line captured by `spawn_stdout_reader` /
+    /// `spawn_stderr_reader` is tee'd to this file in append mode. If the
+    /// file can't be opened, the runner still starts — persistent logging
+    /// is strictly best-effort.
+    pub fn new_with_log_dir(
+        config: RunnerConfig,
+        watchdog_enabled: bool,
+        log_dir: Option<&std::path::Path>,
+    ) -> Self {
         let protected = config.protected;
+        let logs = LogState::new();
+        if let Some(dir) = log_dir {
+            let path = dir.join(format!("{}.log", config.id));
+            if let Some(writer) = crate::log_capture::open_append_log(&path) {
+                logs.set_file_writer(Some(writer));
+            }
+        }
         Self {
             config,
             runner: RwLock::new(RunnerState::new()),
             watchdog: RwLock::new(WatchdogState::new(watchdog_enabled)),
             cached_health: RwLock::new(CachedPortHealth::default()),
             health_cache_notify: Notify::new(),
-            logs: LogState::new(),
+            logs,
             protected: RwLock::new(protected),
             created_at: std::time::Instant::now(),
         }
@@ -315,10 +337,17 @@ impl SupervisorState {
             .build()
             .expect("Failed to create HTTP client");
 
-        // Build multi-runner map from config
+        // Build multi-runner map from config. Thread the optional log dir
+        // through so each ManagedRunner's LogState gets a per-runner append
+        // file at <log_dir>/<runner_id>.log.
+        let log_dir = config.log_dir.as_deref();
         let mut runners_map = HashMap::new();
         for rc in &config.runners {
-            let managed = Arc::new(ManagedRunner::new(rc.clone(), watchdog_enabled));
+            let managed = Arc::new(ManagedRunner::new_with_log_dir(
+                rc.clone(),
+                watchdog_enabled,
+                log_dir,
+            ));
             runners_map.insert(rc.id.clone(), managed);
         }
 
@@ -513,6 +542,7 @@ mod tests {
             auto_start: false,
             auto_debug: false,
             log_file: None,
+            log_dir: None,
             port: DEFAULT_SUPERVISOR_PORT,
             dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),
             cli_args: vec![],

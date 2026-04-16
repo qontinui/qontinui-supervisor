@@ -4,8 +4,14 @@ use tracing::debug;
 
 use crate::config::RUNNER_VITE_PORT;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::manager::is_temp_runner;
 use crate::process::port;
 use crate::state::SupervisorState;
+
+/// Returns true if this runner is a named runner managed by the supervisor.
+fn is_named_runner(runner_id: &str) -> bool {
+    runner_id.starts_with("named-")
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CachedPortHealth {
@@ -68,6 +74,22 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     runner_responding,
                     vite_port_open,
                 };
+
+                // For user-managed runners (not temp, not named), the supervisor only
+                // observes. The `running` flag is initialized once at startup from
+                // port-in-use and would otherwise go stale. Sync it to the observed
+                // API responsiveness so the header status reflects reality.
+                let runner_id = &managed.config.id;
+                let is_supervisor_managed = is_temp_runner(runner_id) || is_named_runner(runner_id);
+                if !is_supervisor_managed {
+                    let mut runner_state = managed.runner.write().await;
+                    if runner_state.running != runner_responding {
+                        runner_state.running = runner_responding;
+                        if !runner_responding {
+                            runner_state.pid = None;
+                        }
+                    }
+                }
 
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;

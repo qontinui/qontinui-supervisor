@@ -22,9 +22,20 @@ pub struct CliArgs {
     #[arg(short = 'a', long = "auto-start")]
     pub auto_start: bool,
 
-    /// Log file for runner output
+    /// Persistent log file for the supervisor's in-memory log buffer (append mode).
+    /// Every log entry that currently lives in the 500-entry ring buffer is also
+    /// written here so a crash-loop can be diagnosed from historical logs.
+    /// If unset but `--log-dir` is set, defaults to `<log-dir>/supervisor.log`.
+    /// No rotation — the file grows unbounded; rotate it externally if needed.
     #[arg(short = 'l', long = "log-file")]
     pub log_file: Option<PathBuf>,
+
+    /// Directory for persistent log files. When set, the supervisor writes
+    /// `<log-dir>/supervisor.log` (unless `--log-file` overrides) plus one
+    /// `<log-dir>/<runner-id>.log` per managed runner containing its tee'd
+    /// stdout/stderr. Directory is created if it does not exist. No rotation.
+    #[arg(long = "log-dir")]
+    pub log_dir: Option<PathBuf>,
 
     /// Supervisor HTTP port
     #[arg(long = "port", default_value_t = DEFAULT_SUPERVISOR_PORT)]
@@ -52,6 +63,9 @@ pub struct SupervisorConfig {
     pub auto_start: bool,
     pub auto_debug: bool,
     pub log_file: Option<PathBuf>,
+    /// Directory for persistent log files (supervisor.log + per-runner logs).
+    /// None disables persistent file logging.
+    pub log_dir: Option<PathBuf>,
     pub port: u16,
     pub dev_logs_dir: PathBuf,
     pub cli_args: Vec<String>,
@@ -183,13 +197,23 @@ impl SupervisorConfig {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
 
+        // Resolve effective supervisor log file:
+        //   1. explicit --log-file
+        //   2. --log-dir/supervisor.log
+        //   3. None (no persistent logging)
+        let log_file = args
+            .log_file
+            .clone()
+            .or_else(|| args.log_dir.as_ref().map(|d| d.join("supervisor.log")));
+
         SupervisorConfig {
             project_dir: args.project_dir,
             dev_mode: args.dev_mode,
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
             auto_debug: args.auto_debug,
-            log_file: args.log_file,
+            log_file,
+            log_dir: args.log_dir,
             port: args.port,
             dev_logs_dir,
             cli_args,
@@ -358,6 +382,7 @@ mod tests {
             watchdog,
             auto_start,
             log_file: None,
+            log_dir: None,
             port: DEFAULT_SUPERVISOR_PORT,
             auto_debug: false,
             expo_dir: None,

@@ -101,6 +101,21 @@ async fn main() -> anyhow::Result<()> {
 
     let supervisor_state = SupervisorState::new(config);
 
+    // Attach persistent log file writer for supervisor-wide logs (if configured).
+    // Done before Arc-wrapping so any startup emits are captured. Per-runner
+    // log files are attached inside SupervisorState::new / ManagedRunner::new.
+    if let Some(ref path) = supervisor_state.config.log_file {
+        if let Some(writer) = log_capture::open_append_log(path) {
+            supervisor_state.logs.set_file_writer(Some(writer));
+            info!("Supervisor log file: {}", path.display());
+        } else {
+            warn!(
+                "Supervisor log file could not be opened at {} — continuing without persistent logging",
+                path.display()
+            );
+        }
+    }
+
     let state = Arc::new(supervisor_state);
 
     // Load persistent settings and apply to state

@@ -148,9 +148,10 @@ pub async fn add_runner(
     };
 
     // Check for port conflicts and insert under a single write lock to avoid TOCTOU race.
-    let managed = Arc::new(ManagedRunner::new(
+    let managed = Arc::new(ManagedRunner::new_with_log_dir(
         runner_config.clone(),
         state.config.watchdog_enabled_at_start,
+        state.config.log_dir.as_deref(),
     ));
     {
         let mut runners = state.runners.write().await;
@@ -771,7 +772,11 @@ pub async fn spawn_test(
         };
         runners.insert(
             id.clone(),
-            Arc::new(ManagedRunner::new(runner_config, false)),
+            Arc::new(ManagedRunner::new_with_log_dir(
+                runner_config,
+                false,
+                state.config.log_dir.as_deref(),
+            )),
         );
         (id, port)
     };
@@ -1295,7 +1300,11 @@ pub async fn spawn_named(
         };
         runners.insert(
             id.clone(),
-            Arc::new(ManagedRunner::new(runner_config, false)),
+            Arc::new(ManagedRunner::new_with_log_dir(
+                runner_config,
+                false,
+                state.config.log_dir.as_deref(),
+            )),
         );
         (id, port)
     };
