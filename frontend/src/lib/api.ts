@@ -613,6 +613,12 @@ export const api = {
     fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/start`, { method: 'POST' }),
   stopRunner: (id: string) =>
     fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  restartRunnerById: (id: string, rebuild: boolean) =>
+    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/restart`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rebuild, source: 'manual' }),
+    }),
   removeRunner: (id: string) =>
     fetchJson<unknown>(`/runners/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   spawnInstance: (name: string, port: number) =>

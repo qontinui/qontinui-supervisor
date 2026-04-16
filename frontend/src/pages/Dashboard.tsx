@@ -261,7 +261,9 @@ function RunnerInstancesPanel() {
     refresh();
   };
 
-  const nonPrimary = runners.filter((r) => !r.is_primary);
+  // Primary is rendered alongside secondary runners so users can Restart/Rebuild
+  // it from the dashboard. Stop/Remove remain hidden for primary (user-managed).
+  const visibleRunners = runners;
 
   return (
     <div className="card" style={{ marginBottom: '1rem' }}>
@@ -337,13 +339,13 @@ function RunnerInstancesPanel() {
         </div>
       )}
 
-      {nonPrimary.length === 0 && !showAdd && (
+      {visibleRunners.length === 0 && !showAdd && (
         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', padding: '0.25rem 0' }}>
-          No secondary instances. Click "+ New" to spawn one.
+          No runners registered. Click "+ New" to spawn one.
         </div>
       )}
 
-      {nonPrimary.length > 0 && (
+      {visibleRunners.length > 0 && (
         <div className="table-container">
           <table>
             <thead>
@@ -355,12 +357,33 @@ function RunnerInstancesPanel() {
               </tr>
             </thead>
             <tbody>
-              {nonPrimary.map((r) => {
+              {visibleRunners.map((r) => {
                 const isUp = r.running || r.api_responding;
+                const isPrimary = r.is_primary;
+                // Primary uses the legacy single-runner endpoint; secondary
+                // runners use the per-id endpoint.
+                const doRestart = (rebuild: boolean) =>
+                  isPrimary ? api.runnerRestart(rebuild) : api.restartRunnerById(r.id, rebuild);
                 return (
                 <tr key={r.id}>
                   <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
                     <span>{r.name}</span>
+                    {isPrimary && (
+                      <span
+                        style={{
+                          marginLeft: '0.4rem',
+                          padding: '0 0.3rem',
+                          fontSize: '0.6rem',
+                          background: 'var(--bg-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 3,
+                          color: 'var(--text-muted)',
+                          textTransform: 'uppercase',
+                        }}
+                      >
+                        Primary
+                      </span>
+                    )}
                   </td>
                   <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
                   <td>
@@ -374,7 +397,7 @@ function RunnerInstancesPanel() {
                   </td>
                   <td>
                     <div className="flex gap-2">
-                      {!isUp && (
+                      {!isUp && !isPrimary && (
                         <button
                           className="btn"
                           style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
@@ -384,7 +407,7 @@ function RunnerInstancesPanel() {
                           {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
                         </button>
                       )}
-                      {isUp && (
+                      {isUp && !isPrimary && (
                         <button
                           className="btn"
                           style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
@@ -394,7 +417,47 @@ function RunnerInstancesPanel() {
                           {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
                         </button>
                       )}
-                      {!isUp && (
+                      {isUp && (
+                        <button
+                          className="btn"
+                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+                          disabled={busy !== null}
+                          onClick={() =>
+                            doAction(`Restart ${r.name}`, async () => {
+                              if (isPrimary) {
+                                await confirm(
+                                  'Restart primary runner',
+                                  `Restart "${r.name}"? Any active work in the runner window will be lost.`,
+                                );
+                              }
+                              await doRestart(false);
+                            })
+                          }
+                          title="Stop and start the runner using the existing binary"
+                        >
+                          {busy === `Restart ${r.name}` ? 'Restarting...' : 'Restart'}
+                        </button>
+                      )}
+                      <button
+                        className="btn"
+                        style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+                        disabled={busy !== null}
+                        onClick={() =>
+                          doAction(`Rebuild ${r.name}`, async () => {
+                            if (isPrimary) {
+                              await confirm(
+                                'Rebuild primary runner',
+                                `Rebuild and restart "${r.name}"? This takes 1-3 minutes and any active work in the runner window will be lost.`,
+                              );
+                            }
+                            await doRestart(true);
+                          })
+                        }
+                        title="Rebuild the runner binary, then restart (blocks until build finishes)"
+                      >
+                        {busy === `Rebuild ${r.name}` ? 'Rebuilding...' : 'Rebuild'}
+                      </button>
+                      {!isUp && !isPrimary && (
                         <button
                           className="btn"
                           style={{
@@ -551,11 +614,13 @@ function DashboardInner() {
   const statusColor =
     h?.status === 'healthy'
       ? 'var(--success)'
-      : h?.status === 'degraded'
-        ? 'var(--warning, orange)'
-        : h?.status === 'building'
-          ? 'var(--accent)'
-          : 'var(--danger, red)';
+      : h?.status === 'external'
+        ? 'var(--success)'
+        : h?.status === 'degraded'
+          ? 'var(--warning, orange)'
+          : h?.status === 'building'
+            ? 'var(--accent)'
+            : 'var(--danger, red)';
 
   return (
     <div>
@@ -571,13 +636,17 @@ function DashboardInner() {
             padding: '0.6rem 1rem',
           }}
         >
-          <StatusDot up={h.status === 'healthy'} />
+          <StatusDot up={h.status === 'healthy' || h.status === 'external'} />
           <span style={{ fontWeight: 600, textTransform: 'capitalize', color: statusColor }}>
             {h.status}
           </span>
           <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-            Runner: {h.runner.running ? 'running' : 'stopped'}
-            {h.runner.api_responding ? ' (API ok)' : ''}
+            Runner: {h.runner.running
+              ? 'running'
+              : h.runner.api_responding
+                ? 'external (not supervised)'
+                : 'stopped'}
+            {h.runner.api_responding && h.runner.running ? ' (API ok)' : ''}
             {' | '}Mode: {h.runner.mode}
             {' | '}Build: {h.build.in_progress ? 'in progress' : 'idle'}
           </span>
