@@ -2,6 +2,7 @@ use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
+use crate::process::stopped_cache::StoppedRunnerSnapshot;
 use crate::routes::supervisor_bridge::CommandRelay;
 use crate::velocity_improvement::VelocityImprovementState;
 use chrono::{DateTime, Utc};
@@ -104,6 +105,11 @@ pub struct SupervisorState {
     /// Runtime-configurable auto-login credentials for temp test runners.
     /// Set via `POST /test-login` and read by `forward_test_auto_login_env`.
     pub test_auto_login: RwLock<Option<(String, String)>>,
+    /// Post-mortem log cache for runners removed from the active registry.
+    /// Keyed by runner id. Bounded at 100 entries / 10 min TTL (see
+    /// `process::stopped_cache`). Queryable via
+    /// `GET /runners/{id}/logs?include_stopped=true`.
+    pub stopped_runners: Arc<RwLock<HashMap<String, StoppedRunnerSnapshot>>>,
 }
 
 pub struct RunnerState {
@@ -375,6 +381,7 @@ impl SupervisorState {
             health_cache_notify: Notify::new(),
             http_client,
             test_auto_login: RwLock::new(None),
+            stopped_runners: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

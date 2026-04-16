@@ -215,6 +215,20 @@ pub async fn remove_runner(
 
     let name = managed.config.name.clone();
 
+    // Preserve logs in the stopped-runners cache before dropping the
+    // ManagedRunner so post-mortem debugging still works via
+    // `?include_stopped=true` on the logs endpoint.
+    {
+        let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+            managed.as_ref(),
+            None,
+            crate::process::stopped_cache::StopReason::GracefulStop,
+        )
+        .await;
+        let mut cache = state.stopped_runners.write().await;
+        crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
+    }
+
     {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
@@ -323,6 +337,19 @@ pub async fn purge_stale(
 
         // Best-effort kill anything still on the port
         let _ = crate::process::windows::kill_by_port(port).await;
+
+        // Preserve logs for post-mortem. purge-stale only targets test runners
+        // whose process is already dead, so mark them `Crashed`.
+        {
+            let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                managed.as_ref(),
+                None,
+                crate::process::stopped_cache::StopReason::Crashed,
+            )
+            .await;
+            let mut cache = state.stopped_runners.write().await;
+            crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
+        }
 
         // Remove from registry
         {
@@ -963,6 +990,21 @@ pub async fn spawn_test(
                         ),
                     )
                     .await;
+
+                // Snapshot for post-mortem BEFORE removal. stop_runner_by_id
+                // will also snapshot (as GracefulStop) for test- runners, but
+                // we overwrite with Crashed here since a health-probe failure
+                // is the more accurate reason.
+                if let Some(managed) = state.get_runner(&id).await {
+                    let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                        managed.as_ref(),
+                        None,
+                        crate::process::stopped_cache::StopReason::Crashed,
+                    )
+                    .await;
+                    let mut cache = state.stopped_runners.write().await;
+                    crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
+                }
 
                 // Stop & clean up so we don't leak a zombie.
                 let _ = manager::stop_runner_by_id(&state, &id).await;
@@ -1641,6 +1683,11 @@ pub struct RunnerLogQuery {
     pub limit: usize,
     /// Optional level filter: "info", "warn", "error", "debug".
     pub level: Option<String>,
+    /// When true, if the live runner lookup misses, fall back to the
+    /// stopped-runners post-mortem cache. Accepts both `include_stopped` and
+    /// the camelCase `includeStopped` spelling for convenience.
+    #[serde(default, alias = "includeStopped")]
+    pub include_stopped: bool,
 }
 
 fn default_runner_log_limit() -> usize {
@@ -1648,41 +1695,71 @@ fn default_runner_log_limit() -> usize {
 }
 
 /// GET /runners/{id}/logs — return recent log entries for a specific runner.
+///
+/// With `?include_stopped=true`, falls back to the post-mortem snapshot cache
+/// if the runner has been removed from the active registry. The post-mortem
+/// response includes extra `stopped_at` / `exit_reason` fields so callers can
+/// distinguish live logs from cached ones.
 pub async fn runner_log_history(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Query(query): Query<RunnerLogQuery>,
 ) -> Result<Json<serde_json::Value>, SupervisorError> {
-    let managed = state
-        .get_runner(&id)
-        .await
-        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
-
-    let entries = managed.logs.history().await;
     let limit = query.limit.min(500);
 
-    let entries: Vec<_> = entries
-        .into_iter()
-        .rev()
-        .filter(|e| {
-            if let Some(ref level) = query.level {
-                let entry_level = serde_json::to_string(&e.level).unwrap_or_default();
-                // entry_level is quoted, e.g. "\"error\"", so strip quotes
-                let entry_level = entry_level.trim_matches('"');
-                entry_level == level
-            } else {
-                true
-            }
-        })
-        .take(limit)
-        .collect();
+    // Live path: runner is still in the registry.
+    if let Some(managed) = state.get_runner(&id).await {
+        let entries = managed.logs.history().await;
+        let entries: Vec<_> = entries
+            .into_iter()
+            .rev()
+            .filter(|e| level_matches(&query.level, e))
+            .take(limit)
+            .collect();
+        let count = entries.len();
+        return Ok(Json(json!({
+            "runner_id": id,
+            "entries": entries,
+            "count": count,
+        })));
+    }
 
-    let count = entries.len();
-    Ok(Json(json!({
-        "runner_id": id,
-        "entries": entries,
-        "count": count,
-    })))
+    // Stopped path: only consulted when explicitly opted in.
+    if query.include_stopped {
+        let cache = state.stopped_runners.read().await;
+        if let Some(snapshot) = cache.get(&id) {
+            let entries: Vec<_> = snapshot
+                .last_log_lines
+                .iter()
+                .rev()
+                .filter(|e| level_matches(&query.level, e))
+                .take(limit)
+                .cloned()
+                .collect();
+            let count = entries.len();
+            return Ok(Json(json!({
+                "runner_id": id,
+                "entries": entries,
+                "count": count,
+                "stopped_at": snapshot.stopped_at.to_rfc3339(),
+                "exit_reason": snapshot.exit_reason,
+                "exit_code": snapshot.exit_code,
+            })));
+        }
+    }
+
+    Err(SupervisorError::RunnerNotFound(id))
+}
+
+fn level_matches(filter: &Option<String>, entry: &crate::log_capture::LogEntry) -> bool {
+    match filter {
+        Some(level) => {
+            let entry_level = serde_json::to_string(&entry.level).unwrap_or_default();
+            let entry_level = entry_level.trim_matches('"');
+            entry_level == level
+        }
+        None => true,
+    }
 }
 
 /// GET /runners/{id}/logs/stream — SSE stream of real-time log events for a specific runner.

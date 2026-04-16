@@ -202,6 +202,20 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 
             let _ = kill_by_port(port).await;
 
+            // Preserve the runner's logs in the stopped-runners cache before
+            // dropping its ManagedRunner so post-mortem debugging still works
+            // via `GET /runners/{id}/logs?include_stopped=true`.
+            let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                managed,
+                None,
+                crate::process::stopped_cache::StopReason::Reaped,
+            )
+            .await;
+            {
+                let mut cache = state.stopped_runners.write().await;
+                crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
+            }
+
             {
                 let mut runners_map = state.runners.write().await;
                 runners_map.remove(&id);
@@ -750,6 +764,19 @@ pub async fn stop_runner_by_id(
     // prefixed with "test-" and are not persisted to settings.
     let runner_id = managed.config.id.clone();
     if runner_id.starts_with("test-") {
+        // Snapshot logs to the stopped-runners cache before dropping the
+        // ManagedRunner so post-mortem debugging still works.
+        let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+            managed.as_ref(),
+            None,
+            crate::process::stopped_cache::StopReason::GracefulStop,
+        )
+        .await;
+        {
+            let mut cache = state.stopped_runners.write().await;
+            crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
+        }
+
         let mut runners = state.runners.write().await;
         if runners.remove(&runner_id).is_some() {
             info!(
