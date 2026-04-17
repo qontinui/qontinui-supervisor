@@ -48,6 +48,10 @@ pub struct StoppedRunnerSnapshot {
     pub exit_reason: StopReason,
     pub stopped_at: DateTime<Utc>,
     pub last_log_lines: Vec<LogEntry>,
+    /// Joined panic / backtrace lines detected in stderr before the runner
+    /// exited. `None` if no panic was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panic_stack: Option<String>,
 }
 
 /// Insert a snapshot, then evict expired entries and trim to the size cap.
@@ -88,6 +92,7 @@ pub async fn snapshot_from_managed(
     let all = managed.logs.history().await;
     let start = all.len().saturating_sub(STOPPED_CACHE_LOG_CAP);
     let last_log_lines = all[start..].to_vec();
+    let panic_stack = managed.logs.panic_buffer().snapshot_joined();
     StoppedRunnerSnapshot {
         id: managed.config.id.clone(),
         name: managed.config.name.clone(),
@@ -96,5 +101,6 @@ pub async fn snapshot_from_managed(
         exit_reason,
         stopped_at: Utc::now(),
         last_log_lines,
+        panic_stack,
     }
 }

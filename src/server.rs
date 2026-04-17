@@ -198,6 +198,10 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::runners::protect_runner),
         )
         .route(
+            "/runners/{id}/crash-dump",
+            get(crate::routes::runners::runner_crash_dump),
+        )
+        .route(
             "/runners/{id}/logs",
             get(crate::routes::runners::runner_log_history),
         )

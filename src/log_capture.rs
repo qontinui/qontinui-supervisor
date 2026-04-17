@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -104,6 +105,78 @@ pub enum LogLevel {
     Debug,
 }
 
+/// Maximum number of panic-related stderr lines retained per runner.
+const PANIC_WINDOW_CAP: usize = 50;
+
+/// Sliding window that accumulates panic-related stderr lines. Thread-safe
+/// via `std::sync::Mutex` (held only long enough to push/drain a line).
+#[derive(Clone)]
+pub struct PanicBuffer {
+    inner: Arc<StdMutex<VecDeque<String>>>,
+}
+
+impl Default for PanicBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PanicBuffer {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(VecDeque::with_capacity(PANIC_WINDOW_CAP))),
+        }
+    }
+
+    /// Push a line into the sliding window. Evicts the oldest line when full.
+    pub fn push(&self, line: String) {
+        if let Ok(mut buf) = self.inner.lock() {
+            if buf.len() >= PANIC_WINDOW_CAP {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
+    }
+
+    /// Drain the buffer and join all lines into a single string. Returns
+    /// `None` if the buffer is empty.
+    #[allow(dead_code)]
+    pub fn drain_joined(&self) -> Option<String> {
+        if let Ok(mut buf) = self.inner.lock() {
+            if buf.is_empty() {
+                return None;
+            }
+            let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+            buf.clear();
+            Some(joined)
+        } else {
+            None
+        }
+    }
+
+    /// Snapshot the buffer without draining it.
+    pub fn snapshot_joined(&self) -> Option<String> {
+        if let Ok(buf) = self.inner.lock() {
+            if buf.is_empty() {
+                return None;
+            }
+            Some(buf.iter().cloned().collect::<Vec<_>>().join("\n"))
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns true if the line looks like part of a Rust panic / backtrace.
+fn is_panic_line(line: &str) -> bool {
+    thread_local! {
+        static PANIC_RE: Regex = Regex::new(
+            r"thread '.*' panicked at|RUST_BACKTRACE|stack backtrace:|^\s+\d+:.*<.*as|note: run with"
+        ).unwrap();
+    }
+    PANIC_RE.with(|re| re.is_match(line))
+}
+
 pub struct LogState {
     buffer: Arc<RwLock<VecDeque<LogEntry>>>,
     sender: broadcast::Sender<LogEntry>,
@@ -111,6 +184,10 @@ pub struct LogState {
     /// in-memory buffer is also written here. Arc<Mutex<File>> so clones of
     /// this writer can be handed to spawn_*_reader helpers.
     file_writer: std::sync::RwLock<Option<FileWriter>>,
+    /// Sliding window of panic-related stderr lines. Populated by
+    /// `spawn_stderr_reader`; flushed to `StoppedRunnerSnapshot::panic_stack`
+    /// when the runner exits.
+    panic_buffer: PanicBuffer,
 }
 
 impl Default for LogState {
@@ -126,7 +203,13 @@ impl LogState {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(log_buffer_size()))),
             sender,
             file_writer: std::sync::RwLock::new(None),
+            panic_buffer: PanicBuffer::new(),
         }
+    }
+
+    /// Access the panic buffer for this log state.
+    pub fn panic_buffer(&self) -> &PanicBuffer {
+        &self.panic_buffer
     }
 
     /// Attach (or replace) the persistent log file writer. Every subsequent
@@ -229,6 +312,10 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
 }
 
 /// Spawn a background task for stderr, tagging lines as errors.
+///
+/// Also detects Rust panic / backtrace lines and accumulates them in the
+/// per-runner [`PanicBuffer`] so they can be preserved in the stopped-runner
+/// cache for the `/runners/{id}/crash-dump` endpoint.
 pub fn spawn_stderr_reader(
     stderr: tokio::process::ChildStderr,
     logs: &LogState,
@@ -236,14 +323,27 @@ pub fn spawn_stderr_reader(
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
     let file_writer = logs.current_writer();
+    let panic_buf = logs.panic_buffer.clone();
 
     tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
+        // Once a panic header is seen, capture all subsequent lines until
+        // the stream closes (backtraces can be many lines long). This avoids
+        // missing late backtrace frames.
+        let mut in_panic = false;
 
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
+                    // Panic detection: accumulate into the sliding window.
+                    if !in_panic && is_panic_line(&line) {
+                        in_panic = true;
+                    }
+                    if in_panic {
+                        panic_buf.push(line.clone());
+                    }
+
                     let level = if line.contains("WARN") || line.contains("warn") {
                         LogLevel::Warn
                     } else {

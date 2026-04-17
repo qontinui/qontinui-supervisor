@@ -1762,6 +1762,28 @@ fn level_matches(filter: &Option<String>, entry: &crate::log_capture::LogEntry) 
     }
 }
 
+/// GET /runners/{id}/crash-dump — return the panic stack trace from the
+/// stopped-runner post-mortem cache. Returns 404 if the runner was never
+/// cached or no panic was detected in its stderr.
+pub async fn runner_crash_dump(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, SupervisorError> {
+    let cache = state.stopped_runners.read().await;
+    if let Some(snapshot) = cache.get(&id) {
+        if let Some(ref panic_stack) = snapshot.panic_stack {
+            return Ok(Json(json!({
+                "runner_id": id,
+                "panic_stack": panic_stack,
+                "stopped_at": snapshot.stopped_at.to_rfc3339(),
+                "exit_reason": snapshot.exit_reason,
+                "exit_code": snapshot.exit_code,
+            })));
+        }
+    }
+    Err(SupervisorError::RunnerNotFound(id))
+}
+
 /// GET /runners/{id}/logs/stream — SSE stream of real-time log events for a specific runner.
 pub async fn runner_log_stream(
     State(state): State<SharedState>,
