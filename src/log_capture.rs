@@ -10,7 +10,7 @@ use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
-use crate::config::LOG_BUFFER_SIZE;
+use crate::config::log_buffer_size;
 
 /// Append-only file writer shared across log readers. Uses a std::sync::Mutex
 /// because `write_all` is a blocking syscall — we only hold it long enough to
@@ -123,7 +123,7 @@ impl LogState {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(256);
         Self {
-            buffer: Arc::new(RwLock::new(VecDeque::with_capacity(LOG_BUFFER_SIZE))),
+            buffer: Arc::new(RwLock::new(VecDeque::with_capacity(log_buffer_size()))),
             sender,
             file_writer: std::sync::RwLock::new(None),
         }
@@ -147,7 +147,7 @@ impl LogState {
 
     pub async fn push(&self, entry: LogEntry) {
         let mut buf = self.buffer.write().await;
-        if buf.len() >= LOG_BUFFER_SIZE {
+        if buf.len() >= log_buffer_size() {
             buf.pop_front();
         }
         buf.push_back(entry.clone());
@@ -203,7 +203,7 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
 
                     {
                         let mut buf = buffer.write().await;
-                        if buf.len() >= LOG_BUFFER_SIZE {
+                        if buf.len() >= log_buffer_size() {
                             buf.pop_front();
                         }
                         buf.push_back(entry.clone());
@@ -258,7 +258,7 @@ pub fn spawn_stderr_reader(
 
                     {
                         let mut buf = buffer.write().await;
-                        if buf.len() >= LOG_BUFFER_SIZE {
+                        if buf.len() >= log_buffer_size() {
                             buf.pop_front();
                         }
                         buf.push_back(entry.clone());
@@ -320,7 +320,7 @@ pub fn spawn_reader_with_source(
 
                     {
                         let mut buf = buffer.write().await;
-                        if buf.len() >= LOG_BUFFER_SIZE {
+                        if buf.len() >= log_buffer_size() {
                             buf.pop_front();
                         }
                         buf.push_back(entry.clone());

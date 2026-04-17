@@ -59,7 +59,7 @@ cargo clippy -- -D warnings    # Lint
 
 ## Persistent Logs
 
-The supervisor keeps only the last 500 log entries (~30 min of activity) in its in-memory circular buffer, which is not enough to diagnose a crash-loop after the fact. Pass `--log-dir` (or `--log-file`) to tee every entry into an append-only file on disk.
+The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, ~30 min of activity at default) in its in-memory circular buffer, which is not enough to diagnose a crash-loop after the fact. Pass `--log-dir` (or `--log-file`) to tee every entry into an append-only file on disk.
 
 **Recommended defaults:**
 
@@ -350,7 +350,7 @@ If the build fails, the placeholder port reservation is cleaned up and the error
 | Build timeout | 10min (600s) |
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |
-| Log buffer | 500 entries |
+| Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
 | Temp runner port range | 9877-9899 |
 

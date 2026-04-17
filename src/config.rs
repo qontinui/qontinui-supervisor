@@ -23,7 +23,8 @@ pub struct CliArgs {
     pub auto_start: bool,
 
     /// Persistent log file for the supervisor's in-memory log buffer (append mode).
-    /// Every log entry that currently lives in the 500-entry ring buffer is also
+    /// Every log entry that currently lives in the ring buffer (default 500, override
+    /// via `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`) is also
     /// written here so a crash-loop can be diagnosed from historical logs.
     /// If unset but `--log-dir` is set, defaults to `<log-dir>/supervisor.log`.
     /// No rotation — the file grows unbounded; rotate it externally if needed.
@@ -149,7 +150,21 @@ pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;
 pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
 
 // Log constants
-pub const LOG_BUFFER_SIZE: usize = 500;
+const DEFAULT_LOG_BUFFER_SIZE: usize = 500;
+
+/// Resolved log buffer size, read from `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`
+/// env var at first access. Clamped to [100, 10000], defaults to 500.
+pub fn log_buffer_size() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(100, 10000))
+            .unwrap_or(DEFAULT_LOG_BUFFER_SIZE)
+    })
+}
 
 // AI model definitions: (provider, key, model_id, display_name)
 pub const AI_MODELS: &[(&str, &str, &str, &str)] = &[
