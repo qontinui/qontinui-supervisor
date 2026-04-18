@@ -296,14 +296,46 @@ impl SupervisorConfig {
     /// path like `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
     /// `canonicalize()` call prevents this by expanding to an absolute path
     /// at the first call site.
+    ///
+    /// On Windows, `std::fs::canonicalize` returns verbatim paths with the
+    /// `\\?\` UNC prefix. Third-party build scripts (notably `libusb1-sys`)
+    /// panic when that prefix appears in `CARGO_TARGET_DIR`. Strip it so
+    /// the returned path is a plain absolute Windows path.
     pub fn runner_npm_dir(&self) -> PathBuf {
         let npm = self
             .project_dir
             .parent()
             .unwrap_or(&self.project_dir)
             .to_path_buf();
-        npm.canonicalize().unwrap_or(npm)
+        let canonical = npm.canonicalize().unwrap_or(npm);
+        strip_verbatim_prefix(canonical)
     }
+}
+
+/// Strip Windows' `\\?\` verbatim prefix from a path when it represents a
+/// simple absolute path (drive-letter root, no reserved characters). Returns
+/// the input unchanged on non-Windows platforms or when the prefix is
+/// genuinely needed (UNC paths, long paths where short form would collide).
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    const VERBATIM: &str = r"\\?\";
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+    match path.to_str() {
+        // UNC (`\\?\UNC\server\share\...`) MUST keep the prefix — stripping
+        // it yields `UNC\...` which isn't a valid path.
+        Some(s) if s.starts_with(VERBATIM_UNC) => path,
+        Some(s) => match s.strip_prefix(VERBATIM) {
+            Some(stripped) => PathBuf::from(stripped),
+            None => path,
+        },
+        None => path,
+    }
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 #[cfg(test)]
@@ -379,6 +411,30 @@ mod tests {
         for (_, _, model_id, _) in AI_MODELS {
             assert!(!model_id.is_empty(), "Model ID should not be empty");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_strip_verbatim_prefix_plain_drive_path() {
+        let p = PathBuf::from(r"\\?\D:\qontinui-root\qontinui-runner");
+        assert_eq!(
+            strip_verbatim_prefix(p),
+            PathBuf::from(r"D:\qontinui-root\qontinui-runner"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_strip_verbatim_prefix_preserves_unc() {
+        let p = PathBuf::from(r"\\?\UNC\server\share\dir");
+        assert_eq!(strip_verbatim_prefix(p.clone()), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_strip_verbatim_prefix_no_prefix_unchanged() {
+        let p = PathBuf::from(r"D:\some\path");
+        assert_eq!(strip_verbatim_prefix(p.clone()), p);
     }
 
     #[test]
