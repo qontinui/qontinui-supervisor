@@ -115,6 +115,18 @@ pub struct RunnerConfig {
     /// API calls with `force: true` can override protection.
     #[serde(default = "default_true")]
     pub protected: bool,
+    #[serde(default)]
+    pub server_mode: bool,
+    #[serde(default)]
+    pub restate_ingress_port: Option<u16>,
+    #[serde(default)]
+    pub restate_admin_port: Option<u16>,
+    #[serde(default)]
+    pub restate_service_port: Option<u16>,
+    #[serde(default)]
+    pub external_restate_admin_url: Option<String>,
+    #[serde(default)]
+    pub external_restate_ingress_url: Option<String>,
 }
 
 impl RunnerConfig {
@@ -126,6 +138,12 @@ impl RunnerConfig {
             port: DEFAULT_RUNNER_API_PORT,
             is_primary: true,
             protected: true,
+            server_mode: false,
+            restate_ingress_port: None,
+            restate_admin_port: None,
+            restate_service_port: None,
+            external_restate_admin_url: None,
+            external_restate_ingress_url: None,
         }
     }
 }

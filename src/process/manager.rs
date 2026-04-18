@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::{GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_VITE_PORT};
+use crate::config::{RunnerConfig, GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_VITE_PORT};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -265,6 +265,28 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 /// env vars or the runtime `test_auto_login` field (set via POST /test-login).
 /// Forwarded to temp/test runners regardless of dev_mode since temp runners
 /// are ephemeral and isolated by design.
+pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
+    if !config.server_mode {
+        return;
+    }
+    if let Some(p) = config.restate_ingress_port {
+        cmd.env("QONTINUI_RESTATE_INGRESS_PORT", p.to_string());
+    }
+    if let Some(p) = config.restate_admin_port {
+        cmd.env("QONTINUI_RESTATE_ADMIN_PORT", p.to_string());
+    }
+    if let Some(p) = config.restate_service_port {
+        cmd.env("QONTINUI_RESTATE_SERVICE_PORT", p.to_string());
+    }
+    if let Some(ref u) = config.external_restate_admin_url {
+        cmd.env("QONTINUI_RESTATE_EXTERNAL_ADMIN_URL", u);
+    }
+    if let Some(ref u) = config.external_restate_ingress_url {
+        cmd.env("QONTINUI_RESTATE_EXTERNAL_INGRESS_URL", u);
+    }
+    cmd.env("QONTINUI_SERVER_MODE", "1");
+}
+
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
     // Priority 1: runtime-configured credentials (set via API)
     if let Ok(guard) = state.test_auto_login.try_read() {
@@ -519,6 +541,8 @@ async fn start_exe_mode_for_runner(
             }
         }
 
+        forward_restate_env(&mut cmd, &managed.config);
+
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
     };
@@ -547,6 +571,8 @@ async fn start_exe_mode_for_runner(
                 cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
             }
         }
+
+        forward_restate_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
@@ -1053,6 +1079,8 @@ async fn start_dev_mode_for_runner(
             }
         }
 
+        forward_restate_env(&mut cmd, &managed.config);
+
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
     };
@@ -1073,6 +1101,8 @@ async fn start_dev_mode_for_runner(
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
             }
         }
+
+        forward_restate_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?

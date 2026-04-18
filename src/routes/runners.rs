@@ -30,6 +30,18 @@ use tracing::warn;
 pub struct AddRunnerRequest {
     pub name: String,
     pub port: u16,
+    #[serde(default)]
+    pub server_mode: Option<bool>,
+    #[serde(default)]
+    pub restate_ingress_port: Option<u16>,
+    #[serde(default)]
+    pub restate_admin_port: Option<u16>,
+    #[serde(default)]
+    pub restate_service_port: Option<u16>,
+    #[serde(default)]
+    pub external_restate_admin_url: Option<String>,
+    #[serde(default)]
+    pub external_restate_ingress_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -139,21 +151,12 @@ pub async fn add_runner(
     // Generate a unique ID
     let id = format!("runner-{}", uuid_simple());
 
-    let runner_config = RunnerConfig {
-        id: id.clone(),
-        name: name.clone(),
-        port: body.port,
-        is_primary: false,
-        protected: true,
-    };
+    let server_mode = body.server_mode.unwrap_or(false);
 
-    // Check for port conflicts and insert under a single write lock to avoid TOCTOU race.
-    let managed = Arc::new(ManagedRunner::new_with_log_dir(
-        runner_config.clone(),
-        state.config.watchdog_enabled_at_start,
-        state.config.log_dir.as_deref(),
-    ));
-    {
+    // Check for port conflicts, allocate the Restate triple (when server_mode),
+    // build the RunnerConfig, and insert — all under a single write lock so
+    // allocation is race-free against concurrent registrations.
+    let runner_config = {
         let mut runners = state.runners.write().await;
         for existing in runners.values() {
             if existing.config.port == body.port {
@@ -163,8 +166,44 @@ pub async fn add_runner(
                 )));
             }
         }
+
+        // Snapshot existing configs so the Restate allocator can see current
+        // assignments under this same write lock.
+        let existing_configs: Vec<RunnerConfig> =
+            runners.values().map(|r| r.config.clone()).collect();
+        let resolved = crate::process::restate_port::resolve_ports(
+            &existing_configs,
+            server_mode,
+            body.restate_ingress_port,
+            body.restate_admin_port,
+            body.restate_service_port,
+            body.external_restate_admin_url.clone(),
+            body.external_restate_ingress_url.clone(),
+        )
+        .map_err(SupervisorError::Validation)?;
+
+        let runner_config = RunnerConfig {
+            id: id.clone(),
+            name: name.clone(),
+            port: body.port,
+            is_primary: false,
+            protected: true,
+            server_mode,
+            restate_ingress_port: resolved.ingress_port,
+            restate_admin_port: resolved.admin_port,
+            restate_service_port: resolved.service_port,
+            external_restate_admin_url: resolved.external_admin_url,
+            external_restate_ingress_url: resolved.external_ingress_url,
+        };
+
+        let managed = Arc::new(ManagedRunner::new_with_log_dir(
+            runner_config.clone(),
+            state.config.watchdog_enabled_at_start,
+            state.config.log_dir.as_deref(),
+        ));
         runners.insert(id.clone(), managed);
-    }
+        runner_config
+    };
 
     // Persist to settings
     let path = settings::settings_path(&state.config);
@@ -715,6 +754,18 @@ pub struct SpawnTestRequest {
     ///   `runner_died_during_startup` and stops/cleans the runner.
     #[serde(default = "default_health_probe_timeout")]
     pub health_probe_timeout_ms: u64,
+    #[serde(default)]
+    pub server_mode: Option<bool>,
+    #[serde(default)]
+    pub restate_ingress_port: Option<u16>,
+    #[serde(default)]
+    pub restate_admin_port: Option<u16>,
+    #[serde(default)]
+    pub restate_service_port: Option<u16>,
+    #[serde(default)]
+    pub external_restate_admin_url: Option<String>,
+    #[serde(default)]
+    pub external_restate_ingress_url: Option<String>,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -738,6 +789,18 @@ pub struct SpawnNamedRequest {
     pub requester_id: Option<String>,
     #[serde(default)]
     pub protected: bool,
+    #[serde(default)]
+    pub server_mode: Option<bool>,
+    #[serde(default)]
+    pub restate_ingress_port: Option<u16>,
+    #[serde(default)]
+    pub restate_admin_port: Option<u16>,
+    #[serde(default)]
+    pub restate_service_port: Option<u16>,
+    #[serde(default)]
+    pub external_restate_admin_url: Option<String>,
+    #[serde(default)]
+    pub external_restate_ingress_url: Option<String>,
 }
 
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
@@ -797,12 +860,33 @@ pub async fn spawn_test(
             })?;
         let id = format!("test-{}", uuid_simple());
         let name = format!("test-{}", port);
+
+        let server_mode = body.server_mode.unwrap_or(false);
+        let existing_configs: Vec<RunnerConfig> =
+            runners.values().map(|r| r.config.clone()).collect();
+        let resolved = crate::process::restate_port::resolve_ports(
+            &existing_configs,
+            server_mode,
+            body.restate_ingress_port,
+            body.restate_admin_port,
+            body.restate_service_port,
+            body.external_restate_admin_url.clone(),
+            body.external_restate_ingress_url.clone(),
+        )
+        .map_err(SupervisorError::Validation)?;
+
         let runner_config = RunnerConfig {
             id: id.clone(),
             name,
             port,
             is_primary: false,
             protected: true,
+            server_mode,
+            restate_ingress_port: resolved.ingress_port,
+            restate_admin_port: resolved.admin_port,
+            restate_service_port: resolved.service_port,
+            external_restate_admin_url: resolved.external_admin_url,
+            external_restate_ingress_url: resolved.external_ingress_url,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -1389,12 +1473,33 @@ pub async fn spawn_named(
                 })?,
         };
         let id = format!("named-{}-{}", port, uuid_simple());
+
+        let server_mode = body.server_mode.unwrap_or(false);
+        let existing_configs: Vec<RunnerConfig> =
+            runners.values().map(|r| r.config.clone()).collect();
+        let resolved = crate::process::restate_port::resolve_ports(
+            &existing_configs,
+            server_mode,
+            body.restate_ingress_port,
+            body.restate_admin_port,
+            body.restate_service_port,
+            body.external_restate_admin_url.clone(),
+            body.external_restate_ingress_url.clone(),
+        )
+        .map_err(SupervisorError::Validation)?;
+
         let runner_config = RunnerConfig {
             id: id.clone(),
             name: name.clone(),
             port,
             is_primary: false,
             protected: body.protected,
+            server_mode,
+            restate_ingress_port: resolved.ingress_port,
+            restate_admin_port: resolved.admin_port,
+            restate_service_port: resolved.service_port,
+            external_restate_admin_url: resolved.external_admin_url,
+            external_restate_ingress_url: resolved.external_ingress_url,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -1503,16 +1608,7 @@ pub async fn spawn_named(
 
     // Persist to settings (named runners survive restarts)
     let settings_path = settings::settings_path(&state.config);
-    settings::add_runner(
-        &settings_path,
-        &RunnerConfig {
-            id: id.clone(),
-            name: name.clone(),
-            port,
-            is_primary: false,
-            protected: body.protected,
-        },
-    );
+    settings::add_runner(&settings_path, &managed.config);
 
     // If protected, persist the protection flag via settings
     if body.protected {
