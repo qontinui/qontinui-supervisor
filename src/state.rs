@@ -153,6 +153,15 @@ pub struct BuildInfo {
     pub rebuild_kind: String,
 }
 
+// State of the frontend (`npm run build`) for a specific slot.
+//
+// `BuildSlot::frontend_stale` = true means the most recent attempt to rebuild
+// the frontend for this slot failed (e.g. tsc errors). The cargo build still
+// proceeded, but it re-used whatever `dist/` happened to be on disk from a
+// previous successful frontend build. Callers of `spawn-test {rebuild: true}`
+// surface this so they don't debug a binary that embeds a stale UI. Cleared
+// on the next successful `npm run build` for this slot.
+
 /// Cap on the per-slot rolling duration window.
 pub const RECENT_BUILD_SAMPLE_COUNT: usize = 10;
 
@@ -230,6 +239,15 @@ pub struct BuildSlot {
     /// Rolling per-slot build duration history. Separate lock from `busy` so
     /// `list_builds` can `try_read` it without blocking in-progress builds.
     pub history: RwLock<SlotHistory>,
+    /// True when the most recent `npm run build` for this slot failed but the
+    /// cargo build proceeded anyway using a stale `dist/` snapshot. Cleared on
+    /// the next successful npm build.
+    ///
+    /// This is a failure-propagation surface — set in `run_build_inner` after
+    /// a non-zero npm exit or spawn failure, cleared after a zero-exit npm
+    /// build. Independent from the `busy`/`history` locks so readers can check
+    /// it cheaply without blocking in-progress builds.
+    pub frontend_stale: RwLock<bool>,
 }
 
 /// Pool of parallel build slots.
@@ -278,6 +296,7 @@ impl BuildPool {
                 target_dir,
                 busy: RwLock::new(None),
                 history: RwLock::new(SlotHistory::new()),
+                frontend_stale: RwLock::new(false),
             }));
         }
         Self {
@@ -298,6 +317,19 @@ impl BuildPool {
             out.push((slot.id, slot.target_dir.clone(), info));
         }
         out
+    }
+
+    /// Returns true when at least one slot has its `frontend_stale` flag set —
+    /// i.e. its most recent `npm run build` failed but a cargo build proceeded
+    /// anyway using a pre-existing `dist/`. Surfaced in `GET /builds` and
+    /// `GET /health` so callers can notice a potentially-stale UI.
+    pub async fn any_slot_has_stale_frontend(&self) -> bool {
+        for slot in &self.slots {
+            if *slot.frontend_stale.read().await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Claim the first idle slot, marking it busy with the given metadata.

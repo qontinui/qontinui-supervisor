@@ -1122,6 +1122,12 @@ pub async fn spawn_test(
         .ok()
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
+    // Determine if the slot we used for the binary has a stale frontend
+    // baked in. We consult `last_successful_slot` (the slot whose exe the
+    // spawn-start path copies) — if that slot's `frontend_stale` is true, the
+    // caller's runner is running with a potentially-old UI.
+    let (frontend_stale, stale_slot_id) = resolve_frontend_stale_for_spawn(&state).await;
+
     let mut resp = json!({
         "id": id,
         "name": name,
@@ -1155,7 +1161,45 @@ pub async fn spawn_test(
         resp["git_sha"] = json!(sha);
     }
 
+    // If the runner's binary came from a slot with a stale frontend, surface
+    // a loud top-level warning + header so calling agents see it immediately.
+    if frontend_stale {
+        let stale_msg = match stale_slot_id {
+            Some(sid) => format!(
+                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                sid
+            ),
+            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        };
+        resp["warnings"] = json!([stale_msg]);
+        resp["frontend_stale"] = json!(true);
+
+        let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+        return Ok(response);
+    }
+
     Ok(Json(resp).into_response())
+}
+
+/// Inspect the build pool and return `(frontend_stale, slot_id)` describing
+/// the slot whose binary a caller of `spawn-test` / `spawn-named` will pick
+/// up. Prefers `last_successful_slot`; if that isn't set, reports true if
+/// any slot is stale (conservative — we can't pinpoint which slot's exe the
+/// resolver will choose from disk).
+async fn resolve_frontend_stale_for_spawn(state: &SharedState) -> (bool, Option<usize>) {
+    let last_successful = *state.build_pool.last_successful_slot.read().await;
+    if let Some(sid) = last_successful {
+        if let Some(slot) = state.build_pool.slots.iter().find(|s| s.id == sid) {
+            let stale = *slot.frontend_stale.read().await;
+            return (stale, Some(sid));
+        }
+    }
+    // Fall back to "any slot stale" — conservative but honest.
+    let any = state.build_pool.any_slot_has_stale_frontend().await;
+    (any, None)
 }
 
 /// Outcome of the post-spawn health probe.
@@ -1566,6 +1610,8 @@ pub async fn spawn_named(
         .ok()
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
+    let (frontend_stale, stale_slot_id) = resolve_frontend_stale_for_spawn(&state).await;
+
     let mut resp = json!({
         "id": id,
         "name": name,
@@ -1589,7 +1635,25 @@ pub async fn spawn_named(
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
     }
 
-    Ok(Json(resp))
+    if frontend_stale {
+        let stale_msg = match stale_slot_id {
+            Some(sid) => format!(
+                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                sid
+            ),
+            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        };
+        resp["warnings"] = json!([stale_msg]);
+        resp["frontend_stale"] = json!(true);
+
+        let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+        return Ok(response);
+    }
+
+    Ok(Json(resp).into_response())
 }
 
 // --- Build pool visibility ---
@@ -1605,6 +1669,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
     let mut global_sum: f64 = 0.0;
     let mut global_count: usize = 0;
 
+    let mut any_slot_has_stale_frontend = false;
     for slot in &state.build_pool.slots {
         let info_opt = match slot.busy.try_read() {
             Ok(g) => g.clone(),
@@ -1614,6 +1679,13 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             Ok(g) => g.clone(),
             Err(_) => slot.history.read().await.clone(),
         };
+        let frontend_stale = match slot.frontend_stale.try_read() {
+            Ok(g) => *g,
+            Err(_) => *slot.frontend_stale.read().await,
+        };
+        if frontend_stale {
+            any_slot_has_stale_frontend = true;
+        }
         for d in &history_snapshot.recent_durations_secs {
             global_sum += *d;
             global_count += 1;
@@ -1640,6 +1712,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "frontend_stale": frontend_stale,
                     "history": history_json,
                 })
             }
@@ -1647,6 +1720,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                 "id": slot.id,
                 "target_dir": slot.target_dir.to_string_lossy(),
                 "state": "idle",
+                "frontend_stale": frontend_stale,
                 "history": history_json,
             }),
         };
@@ -1671,6 +1745,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "queued": queued,
         "last_successful_slot": last_successful,
         "avg_build_duration_secs": avg_build_duration_secs,
+        "any_slot_has_stale_frontend": any_slot_has_stale_frontend,
         "slots": slots_json,
     }))
 }

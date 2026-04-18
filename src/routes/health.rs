@@ -101,6 +101,11 @@ pub struct BuildHealth {
     pub error_detected: bool,
     pub last_error: Option<String>,
     pub last_build_at: Option<String>,
+    /// True when at least one build slot embeds a stale frontend because its
+    /// most recent `npm run build` failed but a cargo build proceeded using a
+    /// prior `dist/` snapshot. Clears when a subsequent npm build on that
+    /// slot succeeds.
+    pub frontend_stale_any: bool,
 }
 
 #[derive(Serialize)]
@@ -158,6 +163,7 @@ pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let build = state.build.read().await;
     let expo = state.expo.read().await;
+    let frontend_stale_any = state.build_pool.any_slot_has_stale_frontend().await;
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
     let cached = state.cached_health.read().await;
@@ -234,6 +240,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            frontend_stale_any,
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -302,6 +309,16 @@ pub async fn health_stream(
             let overall_status =
                 determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
+            // Sync-safe scan: use try_read on each slot's frontend_stale flag.
+            // If any slot's lock is contended, skip reporting staleness for
+            // that slot on this tick — the flag is a UX nudge, not a hard
+            // invariant, and it's fine to miss one tick.
+            let frontend_stale_any = state
+                .build_pool
+                .slots
+                .iter()
+                .any(|s| s.frontend_stale.try_read().map(|g| *g).unwrap_or(false));
+
             HealthResponse {
                 status: overall_status.to_string(),
                 runner: RunnerHealth {
@@ -336,6 +353,7 @@ pub async fn health_stream(
                     error_detected: build.build_error_detected,
                     last_error: build.last_build_error.clone(),
                     last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+                    frontend_stale_any,
                 },
                 expo: ExpoHealth {
                     running: expo.running,
@@ -443,6 +461,7 @@ mod tests {
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,
+                frontend_stale_any: false,
             },
             expo: ExpoHealth {
                 running: false,

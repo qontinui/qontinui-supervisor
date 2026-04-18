@@ -278,26 +278,67 @@ async fn run_build_inner(
                         format!("Slot {}: frontend build succeeded", slot.id),
                     )
                     .await;
+                // Clear any prior "stale frontend" marker — the dist/ snapshot
+                // cargo is about to consume is known-fresh.
+                *slot.frontend_stale.write().await = false;
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Slot {}: frontend build failed: {}", slot.id, stderr);
+                let truncated: String = stderr.chars().take(500).collect();
+                error!(
+                    "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. stderr: {}",
+                    slot.id, truncated
+                );
                 state
                     .logs
                     .emit(
                         LogSource::Build,
-                        LogLevel::Warn,
+                        LogLevel::Error,
                         format!(
-                            "Slot {}: frontend build failed: {}",
-                            slot.id,
-                            stderr.chars().take(500).collect::<String>()
+                            "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. stderr: {}",
+                            slot.id, truncated
                         ),
                     )
                     .await;
+                // Mark the slot as embedding a stale frontend until the next
+                // successful npm build clears it.
+                *slot.frontend_stale.write().await = true;
+                // Record the npm failure reason in the slot's rolling history
+                // so `GET /builds` can show it even though the cargo build may
+                // ultimately succeed.
+                {
+                    let mut history = slot.history.write().await;
+                    history.last_error = Some(format!(
+                        "frontend_stale: npm run build failed: {}",
+                        truncated
+                    ));
+                }
                 // Continue with cargo build — the old dist/ may still be usable
             }
             Err(e) => {
-                warn!("Slot {}: failed to spawn frontend build: {}", slot.id, e);
+                error!(
+                    "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. spawn error: {}",
+                    slot.id, e
+                );
+                state
+                    .logs
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Error,
+                        format!(
+                            "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. spawn error: {}",
+                            slot.id, e
+                        ),
+                    )
+                    .await;
+                *slot.frontend_stale.write().await = true;
+                {
+                    let mut history = slot.history.write().await;
+                    history.last_error = Some(format!(
+                        "frontend_stale: npm run build failed to spawn: {}",
+                        e
+                    ));
+                }
             }
         }
         // npm_guard drops here, releasing the frontend build lock before cargo starts.
