@@ -468,6 +468,24 @@ export interface VelocityImprovementHistory {
   iterations: VelocityImprovementIteration[];
 }
 
+// Web Fleet types — mirrors the qontinui-web `RunnerResponse` schema at
+// `qontinui-web/backend/app/schemas/runner_fleet.py`. Read-only; the Fleet tab
+// proxies `GET /api/v1/runners` via supervisor's `/web-fleet` endpoint.
+export interface WebFleetRunner {
+  id: string;
+  user_id: string;
+  name: string;
+  hostname: string;
+  port: number;
+  capabilities: string[];
+  server_mode: boolean;
+  restate_enabled: boolean;
+  restate_healthy: boolean;
+  last_heartbeat: string | null;
+  status: string;
+  created_at: string;
+}
+
 // Runner Monitor types
 export interface RunnerTaskRun {
   id: string;
@@ -688,6 +706,46 @@ export const api = {
     fetchJson<Record<string, unknown>>(`/runner-api/task-runs/${encodeURIComponent(id)}/stop`, {
       method: 'POST',
     }),
+
+  // Web Fleet — proxies to {backend_url}/api/v1/runners with a user-supplied JWT.
+  // Supervisor does not hold credentials; caller supplies them per-request.
+  // On error, surfaces the backend's body so the user sees the real reason
+  // (e.g. "401 invalid signature", "404 user not found") rather than just the
+  // HTTP status line.
+  webFleet: async (backendUrl: string, jwt: string): Promise<WebFleetRunner[]> => {
+    const res = await fetch(
+      `/web-fleet?backend_url=${encodeURIComponent(backendUrl)}`,
+      { headers: { Authorization: `Bearer ${jwt}` } },
+    );
+    const text = await res.text();
+    if (!res.ok) {
+      // Try to extract `error` from JSON body; fall back to plain text or
+      // finally the status line.
+      let detail = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+          detail = String((parsed as { error: unknown }).error);
+        } else if (parsed && typeof parsed === 'object' && 'detail' in parsed) {
+          detail = String((parsed as { detail: unknown }).detail);
+        }
+      } catch {
+        // not JSON, use text as-is
+      }
+      throw new Error(
+        `${res.status} ${res.statusText}${detail ? `: ${detail.slice(0, 500)}` : ''}`,
+      );
+    }
+    try {
+      return JSON.parse(text) as WebFleetRunner[];
+    } catch (e) {
+      throw new Error(
+        `Failed to parse JSON from /web-fleet: ${
+          e instanceof Error ? e.message : String(e)
+        }. Response body: ${text.slice(0, 200)}`,
+      );
+    }
+  },
 
   // Expo
   expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),

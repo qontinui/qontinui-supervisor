@@ -131,6 +131,8 @@ pub fn build_router(state: SharedState) -> Router {
             "/runner-api/{*path}",
             get(crate::routes::runner_monitor::proxy).post(crate::routes::runner_monitor::proxy),
         )
+        // Web Fleet proxy (forwards to the user-supplied qontinui-web backend)
+        .route("/web-fleet", get(crate::routes::web_fleet::list_web_fleet))
         // WebSocket
         .route("/ws", get(crate::routes::ws::ws_handler))
         // Diagnostics

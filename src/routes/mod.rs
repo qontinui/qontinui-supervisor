@@ -14,4 +14,5 @@ pub mod ui_bridge;
 pub mod velocity;
 pub mod velocity_improvement;
 pub mod velocity_tests;
+pub mod web_fleet;
 pub mod ws;
