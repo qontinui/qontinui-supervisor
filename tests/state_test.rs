@@ -12,7 +12,6 @@ fn test_config() -> SupervisorConfig {
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,
-        smart_rebuild: false,
         log_file: None,
         log_dir: None,
         port: 9875,
