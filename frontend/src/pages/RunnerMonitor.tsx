@@ -1,7 +1,57 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { api, RunnerTaskRun } from '../lib/api';
+import { api, RunnerTaskRun, UiErrorSummary, RunnerDerivedStatus } from '../lib/api';
+import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
 
 type ActionState = string | null;
+
+/// Best-effort extraction of the runner's reported ui_error from an arbitrary
+/// /health response. Tolerates older runners (no field) and mistyped payloads
+/// by returning `null` whenever any required field is missing.
+function extractUiError(health: Record<string, unknown> | null): UiErrorSummary | null {
+  if (!health || typeof health !== 'object') return null;
+  const raw = (health as { ui_error?: unknown }).ui_error;
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const message = typeof obj.message === 'string' ? obj.message : null;
+  const firstSeen = typeof obj.first_seen === 'string' ? obj.first_seen : null;
+  const reportedAt = typeof obj.reported_at === 'string' ? obj.reported_at : null;
+  const count = typeof obj.count === 'number' ? obj.count : null;
+  if (message === null || firstSeen === null || reportedAt === null || count === null) {
+    return null;
+  }
+  return {
+    message,
+    first_seen: firstSeen,
+    reported_at: reportedAt,
+    count,
+    digest: typeof obj.digest === 'string' ? obj.digest : null,
+    stack: typeof obj.stack === 'string' ? obj.stack : null,
+    component_stack: typeof obj.component_stack === 'string' ? obj.component_stack : null,
+  };
+}
+
+/// Derive a RunnerDerivedStatus for display from the runner's own /health
+/// response. Prefers the runner's `derived_status` string if present
+/// (Phase 3J.1); otherwise infers from `ui_error` and top-level `status`.
+function deriveStatus(
+  health: Record<string, unknown> | null,
+  fetchErrored: boolean,
+): RunnerDerivedStatus {
+  if (fetchErrored) return { kind: 'offline' };
+  if (!health) return { kind: 'offline' };
+  const uiError = extractUiError(health);
+  if (uiError) return { kind: 'errored', reason: uiError.message };
+  const derived = (health as { derived_status?: unknown }).derived_status;
+  if (typeof derived === 'string') {
+    const lower = derived.toLowerCase();
+    if (lower === 'healthy') return { kind: 'healthy' };
+    if (lower === 'errored') return { kind: 'errored', reason: 'runner reported errored' };
+  }
+  const status = (health as { status?: unknown }).status;
+  if (status === 'starting') return { kind: 'starting' };
+  if (status === 'ok') return { kind: 'healthy' };
+  return { kind: 'healthy' };
+}
 
 export default function RunnerMonitor() {
   const [runnerHealth, setRunnerHealth] = useState<Record<string, unknown> | null>(null);
@@ -84,16 +134,19 @@ export default function RunnerMonitor() {
         <div className="card">
           <div className="card-header">
             <span className="card-title">Runner Health</span>
-            <div className="flex gap-2" style={{ alignItems: 'center' }}>
-              <span
-                className={`badge ${isHealthy ? 'badge-success' : runnerHealth === null && !healthError ? 'badge-warning' : 'badge-danger'}`}
-              >
-                {isHealthy
-                  ? 'Healthy'
-                  : runnerHealth === null && !healthError
-                    ? 'Unknown'
-                    : 'Unreachable'}
-              </span>
+            <div
+              className="flex gap-2"
+              style={{ alignItems: 'center', flexWrap: 'wrap' }}
+            >
+              {runnerHealth === null && !healthError ? (
+                <span className="badge badge-warning">Unknown</span>
+              ) : (
+                <RunnerStatusBadge
+                  derivedStatus={deriveStatus(runnerHealth, !!healthError)}
+                  uiError={extractUiError(runnerHealth)}
+                  fallbackUp={isHealthy}
+                />
+              )}
               <button
                 className="btn"
                 style={{ fontSize: '0.75rem', padding: '2px 8px' }}

@@ -1,10 +1,18 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { api, HealthResponse, DevStartResponse, ExpoStatus } from '../lib/api';
+import {
+  api,
+  HealthResponse,
+  DevStartResponse,
+  ExpoStatus,
+  RunnerDerivedStatus,
+  UiErrorSummary,
+} from '../lib/api';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { ToastContainer, addToast } from '../components/Toast';
 import { ConfirmDialog, confirm } from '../components/ConfirmDialog';
 import { SmallBtn } from '../components/SmallBtn';
 import { StatusDot } from '../components/StatusDot';
+import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
 import { useSSE } from '../hooks/useSSE';
 
 // ─── Log Viewer ──────────────────────────────────────────────────────────────
@@ -189,6 +197,11 @@ interface RunnerInstance {
   running: boolean;
   pid: number | null;
   api_responding: boolean;
+  // Phase 3J.3: supervisor-derived status + runner-reported ui_error.
+  // Optional so the panel keeps rendering during lock-contention gaps in the
+  // health cache (the supervisor returns `null` in that case).
+  derived_status?: RunnerDerivedStatus;
+  ui_error?: UiErrorSummary | null;
 }
 
 function RunnerInstancesPanel() {
@@ -387,13 +400,15 @@ function RunnerInstancesPanel() {
                   </td>
                   <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
                   <td>
-                    <StatusDot up={isUp} />
-                    <span
-                      className={isUp ? 'text-success' : 'text-danger'}
-                      style={{ fontSize: '0.7rem' }}
-                    >
-                      {isUp ? 'UP' : 'DOWN'}
-                    </span>
+                    <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                      <StatusDot up={isUp} />
+                      <RunnerStatusBadge
+                        derivedStatus={r.derived_status}
+                        uiError={r.ui_error}
+                        fallbackUp={isUp}
+                        style={{ fontSize: '0.7rem' }}
+                      />
+                    </div>
                   </td>
                   <td>
                     <div className="flex gap-2">

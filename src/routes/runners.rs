@@ -79,6 +79,11 @@ pub async fn list_runners(
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, SupervisorError> {
     let runners = state.get_all_runners().await;
+    // Snapshot of ui_error + derived_status lives on the health cache, which
+    // the background refresher updates every ~2s by GETting /health on each
+    // runner. We index into it by id rather than re-issuing HTTP here so the
+    // listing stays cheap (~100µs) regardless of fleet size.
+    let cached_snapshots = state.cached_runner_health.read().await;
     let mut result = Vec::new();
 
     for managed in &runners {
@@ -99,6 +104,12 @@ pub async fn list_runners(
         let logs_url = format!("/runners/{}/logs", managed.config.id);
         let logs_stream_url = format!("/runners/{}/logs/stream", managed.config.id);
 
+        let snapshot = cached_snapshots.iter().find(|c| c.id == managed.config.id);
+        let ui_error = snapshot.and_then(|c| c.ui_error.clone());
+        let derived_status = snapshot
+            .map(|c| c.derived_status.clone())
+            .unwrap_or_default();
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
@@ -111,6 +122,8 @@ pub async fn list_runners(
             "api_responding": cached.runner_responding,
             "logs_url": logs_url,
             "logs_stream_url": logs_stream_url,
+            "ui_error": ui_error,
+            "derived_status": derived_status,
             "watchdog": {
                 "enabled": watchdog.enabled,
                 "restart_attempts": watchdog.restart_attempts,
@@ -120,6 +133,7 @@ pub async fn list_runners(
             }
         }));
     }
+    drop(cached_snapshots);
 
     Ok(Json(json!(result)))
 }

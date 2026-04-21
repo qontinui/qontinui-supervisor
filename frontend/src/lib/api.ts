@@ -90,6 +90,46 @@ interface IngestResult {
   files_processed: { file: string; new_spans: number; errors: number }[];
 }
 
+/// UI-level error surfaced by a runner's /health endpoint. Populated by the
+/// runner's React error boundary and passed through by the supervisor's
+/// background health refresher. See qontinui-supervisor/src/health_cache.rs
+/// (`UiErrorSummary`) for the source of truth.
+export interface UiErrorSummary {
+  message: string;
+  digest?: string | null;
+  stack?: string | null;
+  component_stack?: string | null;
+  first_seen: string;
+  reported_at: string;
+  count: number;
+}
+
+/// Supervisor-derived status for a runner. Serialized via serde's `tag=kind`
+/// so variants with payloads (degraded/errored) carry `reason` as a sibling
+/// field.
+export type RunnerDerivedStatus =
+  | { kind: 'healthy' }
+  | { kind: 'degraded'; reason: string }
+  | { kind: 'errored'; reason: string }
+  | { kind: 'offline' }
+  | { kind: 'starting' };
+
+/// One runner's entry as surfaced by the supervisor `/health` endpoint's
+/// `runners[]` array and by `/runners`. Mirrors
+/// `qontinui-supervisor::routes::health::RunnerInstanceHealth`.
+export interface RunnerInstanceHealth {
+  id: string;
+  name: string;
+  port: number;
+  is_primary: boolean;
+  running: boolean;
+  pid?: number;
+  started_at?: string;
+  api_responding: boolean;
+  ui_error?: UiErrorSummary | null;
+  derived_status: RunnerDerivedStatus;
+}
+
 export interface HealthResponse {
   status: string;
   runner: {
@@ -128,16 +168,7 @@ export interface HealthResponse {
     dev_mode: boolean;
     project_dir: string;
   };
-  runners?: {
-    id: string;
-    name: string;
-    port: number;
-    is_primary: boolean;
-    running: boolean;
-    pid?: number;
-    started_at?: string;
-    api_responding: boolean;
-  }[];
+  runners?: RunnerInstanceHealth[];
 }
 
 export interface DevStartResponse {
@@ -621,6 +652,10 @@ export const api = {
         is_primary: boolean;
         protected: boolean;
         running: boolean;
+        pid?: number;
+        api_responding?: boolean;
+        ui_error?: UiErrorSummary | null;
+        derived_status?: RunnerDerivedStatus;
       }[]
     >('/runners'),
   protectRunner: (id: string, isProtected: boolean) =>

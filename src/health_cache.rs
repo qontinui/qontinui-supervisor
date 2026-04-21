@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::debug;
 
@@ -11,6 +15,55 @@ use crate::state::SupervisorState;
 /// Returns true if this runner is a named runner managed by the supervisor.
 fn is_named_runner(runner_id: &str) -> bool {
     runner_id.starts_with("named-")
+}
+
+/// Derived health classification for a runner surfaced to dashboard consumers.
+///
+/// This is the supervisor-side view: it reflects both process liveness (is the
+/// OS process + port alive?) and application-level signals from the runner's
+/// own `/health` body (e.g. `ui_error`, `derived_status`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RunnerStatus {
+    Healthy,
+    Degraded {
+        reason: String,
+    },
+    Errored {
+        reason: String,
+    },
+    #[default]
+    Offline,
+    Starting,
+}
+
+/// Snapshot of a UI-level runtime error reported by the runner's `/health`
+/// endpoint. Mirrors the `ui_error` object the runner emits when its React
+/// error boundary catches a crash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiErrorSummary {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_stack: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub reported_at: DateTime<Utc>,
+    pub count: u32,
+}
+
+/// Raw /health response body shape we care about. Uses `serde(default)` so
+/// older runners (without `ui_error` / `derived_status`) still parse cleanly.
+#[derive(Debug, Deserialize)]
+struct RunnerHealthBody {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    derived_status: Option<String>,
+    #[serde(default)]
+    ui_error: Option<UiErrorSummary>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -31,6 +84,101 @@ pub struct CachedRunnerHealth {
     pub running: bool,
     pub pid: Option<u32>,
     pub api_responding: bool,
+    /// Most recent UI-level error reported by the runner's `/health` body.
+    /// `None` when the runner reports no error or when the field is missing
+    /// (older runners predating Phase 3J.1).
+    pub ui_error: Option<UiErrorSummary>,
+    /// Supervisor-derived status. Combines runner process state with the
+    /// runner's own `derived_status` + `ui_error` signals.
+    pub derived_status: RunnerStatus,
+}
+
+/// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
+/// if truncation occurred. Uses char boundaries, not byte boundaries, so it is
+/// safe on multi-byte UTF-8 input.
+fn truncate_reason(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Fetch `{runner_url}/health` with a 3-second timeout and parse the
+/// runner's self-reported UI error + derived status. Returns `None` if the
+/// endpoint is unreachable, the body fails to parse, or the request times
+/// out — callers treat that as "no signal" and fall back to port-level state.
+async fn fetch_runner_health_body(port: u16) -> Option<RunnerHealthBody> {
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(3))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<RunnerHealthBody>().await.ok()
+}
+
+/// Derive the supervisor's view of a runner's status from the signals we have.
+///
+/// Rules (in order):
+/// 1. /health unreachable → `Offline` (if supervisor thinks process is dead)
+///    or `Starting` (process exists but /health isn't responding yet).
+/// 2. /health reachable with a `ui_error` → `Errored { reason }` where reason
+///    is the ui_error message truncated to 200 chars.
+/// 3. /health reachable, runner body reports `derived_status: "errored"` → `Errored`.
+/// 4. /health reachable, no ui_error, running=true → `Healthy`.
+/// 5. Everything else → `Offline`.
+fn derive_runner_status(
+    running: bool,
+    api_responding: bool,
+    body: Option<&RunnerHealthBody>,
+) -> RunnerStatus {
+    if !api_responding {
+        // Process may be alive (e.g. Tauri window launched, HTTP server still
+        // warming) but /health doesn't respond yet. Treat that as Starting so
+        // operators see a blue "spinning up" indicator instead of red.
+        if running {
+            return RunnerStatus::Starting;
+        }
+        return RunnerStatus::Offline;
+    }
+
+    if let Some(body) = body {
+        if let Some(ui_err) = body.ui_error.as_ref() {
+            return RunnerStatus::Errored {
+                reason: truncate_reason(&ui_err.message, 200),
+            };
+        }
+        // Honour runner's own self-classification if present. The runner's
+        // derived_status is an application-layer signal; only "errored"
+        // escalates past Healthy here since we already handle ui_error above.
+        if let Some(ds) = body.derived_status.as_deref() {
+            if ds.eq_ignore_ascii_case("errored") {
+                return RunnerStatus::Errored {
+                    reason: "runner reported derived_status=errored".to_string(),
+                };
+            }
+        }
+        // Runner reports `status: "starting"` during boot (legacy field kept
+        // for backward compat with older runners). Surface that so the
+        // dashboard can show a blue badge instead of green-too-soon.
+        if body.status.as_deref() == Some("starting") {
+            return RunnerStatus::Starting;
+        }
+    }
+
+    if running {
+        RunnerStatus::Healthy
+    } else {
+        // /health is responding but supervisor state says not running. This is
+        // the "external runner" case (user-started). Treat as healthy since
+        // the runner is clearly up and serving requests.
+        RunnerStatus::Healthy
+    }
 }
 
 pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task::JoinHandle<()> {
@@ -91,8 +239,26 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     }
                 }
 
+                // If the runner's TCP port is responsive, GET its /health to
+                // extract the application-layer signals (ui_error,
+                // derived_status) added in Phase 3J.1. Older runners that
+                // don't emit these fields will still parse cleanly thanks to
+                // `serde(default)` on RunnerHealthBody — `ui_error` stays
+                // None and `derived_status` is inferred from process state.
+                let health_body = if runner_responding {
+                    fetch_runner_health_body(runner_port).await
+                } else {
+                    None
+                };
+                let ui_error = health_body.as_ref().and_then(|b| b.ui_error.clone());
+
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;
+                let derived_status = derive_runner_status(
+                    runner_state.running,
+                    runner_responding,
+                    health_body.as_ref(),
+                );
                 runner_snapshots.push(CachedRunnerHealth {
                     id: managed.config.id.clone(),
                     name: managed.config.name.clone(),
@@ -101,6 +267,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     running: runner_state.running,
                     pid: runner_state.pid,
                     api_responding: runner_responding,
+                    ui_error,
+                    derived_status,
                 });
                 drop(runner_state);
 
@@ -207,5 +375,128 @@ mod tests {
         assert!(health.runner_port_open);
         assert!(health.runner_responding);
         assert!(health.vite_port_open);
+    }
+
+    #[test]
+    fn test_derive_runner_status_offline_when_api_down_and_not_running() {
+        let status = derive_runner_status(false, false, None);
+        assert!(matches!(status, RunnerStatus::Offline));
+    }
+
+    #[test]
+    fn test_derive_runner_status_starting_when_process_alive_but_api_down() {
+        // Process exists but /health isn't responding yet — the spec says to
+        // treat this as Starting, not Offline.
+        let status = derive_runner_status(true, false, None);
+        assert!(matches!(status, RunnerStatus::Starting));
+    }
+
+    #[test]
+    fn test_derive_runner_status_healthy_when_api_responding_no_body() {
+        // /health reachable but body wasn't parseable (older runner or
+        // network hiccup). Fall through to Healthy when supervisor tracks
+        // the process as running.
+        let status = derive_runner_status(true, true, None);
+        assert!(matches!(status, RunnerStatus::Healthy));
+    }
+
+    #[test]
+    fn test_derive_runner_status_errored_when_ui_error_present() {
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("errored".to_string()),
+            ui_error: Some(UiErrorSummary {
+                message: "ReferenceError: foo is not defined".to_string(),
+                digest: None,
+                stack: None,
+                component_stack: None,
+                first_seen: Utc::now(),
+                reported_at: Utc::now(),
+                count: 1,
+            }),
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        match status {
+            RunnerStatus::Errored { reason } => {
+                assert!(reason.contains("ReferenceError"));
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_derive_runner_status_starting_when_body_reports_starting() {
+        // Older runners use top-level status="starting" during boot. Respect
+        // that so the dashboard shows a blue badge, not green.
+        let body = RunnerHealthBody {
+            status: Some("starting".to_string()),
+            derived_status: None,
+            ui_error: None,
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        assert!(matches!(status, RunnerStatus::Starting));
+    }
+
+    #[test]
+    fn test_derive_runner_status_errored_from_derived_status_field() {
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("ERRORED".to_string()), // case-insensitive
+            ui_error: None,
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        assert!(matches!(status, RunnerStatus::Errored { .. }));
+    }
+
+    #[test]
+    fn test_truncate_reason_preserves_short_input() {
+        assert_eq!(truncate_reason("hello", 200), "hello");
+    }
+
+    #[test]
+    fn test_truncate_reason_clips_long_input() {
+        let long = "x".repeat(500);
+        let out = truncate_reason(&long, 200);
+        assert_eq!(out.chars().count(), 200);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn test_runner_health_body_parses_older_runner_without_new_fields() {
+        // Older runners only emit `status`. The new fields must parse as
+        // `None`, not error the whole response out.
+        let json = r#"{"status":"ok"}"#;
+        let body: RunnerHealthBody = serde_json::from_str(json).expect("should parse");
+        assert_eq!(body.status.as_deref(), Some("ok"));
+        assert!(body.derived_status.is_none());
+        assert!(body.ui_error.is_none());
+    }
+
+    #[test]
+    fn test_runner_health_body_parses_full_payload() {
+        let json = r#"{
+            "status": "ok",
+            "derived_status": "errored",
+            "ui_error": {
+                "message": "boom",
+                "stack": null,
+                "component_stack": null,
+                "digest": null,
+                "first_seen": "2026-04-21T00:00:00Z",
+                "reported_at": "2026-04-21T00:00:05Z",
+                "count": 3
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(json).expect("should parse");
+        assert_eq!(body.derived_status.as_deref(), Some("errored"));
+        let ui_err = body.ui_error.expect("ui_error should be present");
+        assert_eq!(ui_err.message, "boom");
+        assert_eq!(ui_err.count, 3);
+    }
+
+    #[test]
+    fn test_runner_status_default_is_offline() {
+        let s: RunnerStatus = Default::default();
+        assert!(matches!(s, RunnerStatus::Offline));
     }
 }

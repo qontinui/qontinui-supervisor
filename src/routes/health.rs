@@ -9,7 +9,7 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 
 use crate::config::{RUNNER_API_PORT, RUNNER_VITE_PORT};
-use crate::health_cache::CachedRunnerHealth;
+use crate::health_cache::{CachedRunnerHealth, RunnerStatus, UiErrorSummary};
 use crate::state::SharedState;
 
 #[derive(Serialize)]
@@ -37,6 +37,15 @@ pub struct RunnerInstanceHealth {
     pub started_at: Option<String>,
     pub api_responding: bool,
     pub watchdog_status: WatchdogHealth,
+    /// UI-level error reported by the runner's /health endpoint (Phase 3J.1).
+    /// `None` when the runner reports no error or when the runner is too old
+    /// to include the `ui_error` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_error: Option<UiErrorSummary>,
+    /// Supervisor-derived status (healthy / degraded / errored / offline /
+    /// starting). Combines process liveness with the runner's self-reported
+    /// `ui_error` + `derived_status`.
+    pub derived_status: RunnerStatus,
 }
 
 #[derive(Serialize)]
@@ -150,6 +159,8 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 started_at: None, // Not cached — use GET /runners for full detail
                 api_responding: r.api_responding,
                 watchdog_status: WatchdogHealth::disabled(),
+                ui_error: r.ui_error.clone(),
+                derived_status: r.derived_status.clone(),
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -187,12 +198,18 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
-    // Build multi-runner status array (watchdog module removed — use static disabled value)
+    // Build multi-runner status array (watchdog module removed — use static disabled value).
+    //
+    // ui_error + derived_status come from the background health-cache refresher
+    // (which GETs each runner's /health every 2s). We index into that snapshot
+    // by runner id to avoid issuing another round of HTTP calls on the hot path.
     let managed_runners = state.get_all_runners().await;
+    let cached_snapshots = state.cached_runner_health.read().await;
     let mut runners_health = Vec::new();
     for managed in &managed_runners {
         let mr = managed.runner.read().await;
         let mc = managed.cached_health.read().await;
+        let cached = cached_snapshots.iter().find(|c| c.id == managed.config.id);
         runners_health.push(RunnerInstanceHealth {
             id: managed.config.id.clone(),
             name: managed.config.name.clone(),
@@ -203,8 +220,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             started_at: mr.started_at.map(|t| t.to_rfc3339()),
             api_responding: mc.runner_responding,
             watchdog_status: WatchdogHealth::disabled(),
+            ui_error: cached.and_then(|c| c.ui_error.clone()),
+            derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
         });
     }
+    drop(cached_snapshots);
 
     HealthResponse {
         status: overall_status.to_string(),
