@@ -265,6 +265,19 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 /// env vars or the runtime `test_auto_login` field (set via POST /test-login).
 /// Forwarded to temp/test runners regardless of dev_mode since temp runners
 /// are ephemeral and isolated by design.
+/// Apply the caller-supplied `extra_env` map to the spawn command.
+///
+/// Called last (after `forward_restate_env` and the hardcoded env chain) so
+/// callers can override anything the supervisor set — including
+/// `QONTINUI_SERVER_MODE`, `QONTINUI_API_URL`, etc. The main consumer is
+/// `POST /runners/spawn-test` with a body like
+/// `{"extra_env": {"QONTINUI_SCRIPTED_OUTPUT": "1"}}`.
+pub fn forward_extra_env(cmd: &mut Command, config: &RunnerConfig) {
+    for (k, v) in &config.extra_env {
+        cmd.env(k, v);
+    }
+}
+
 pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
     if !config.server_mode {
         return;
@@ -542,6 +555,7 @@ async fn start_exe_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        forward_extra_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
@@ -573,6 +587,7 @@ async fn start_exe_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        forward_extra_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
@@ -1080,6 +1095,7 @@ async fn start_dev_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        forward_extra_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
@@ -1103,6 +1119,7 @@ async fn start_dev_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        forward_extra_env(&mut cmd, &managed.config);
 
         cmd.spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?

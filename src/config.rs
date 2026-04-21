@@ -127,6 +127,18 @@ pub struct RunnerConfig {
     pub external_restate_admin_url: Option<String>,
     #[serde(default)]
     pub external_restate_ingress_url: Option<String>,
+    /// Additional environment variables forwarded to the runner child process
+    /// on spawn (both exe and dev-mode paths). Useful for test runners that
+    /// need a feature flag like `QONTINUI_SCRIPTED_OUTPUT=1` without requiring
+    /// a supervisor restart.
+    ///
+    /// Applied after all hardcoded envs, so callers can override e.g.
+    /// `QONTINUI_API_URL` if they need to point a temp runner at a different
+    /// backend. Not persisted across supervisor restarts for temp runners
+    /// (they're ephemeral); for named runners it IS persisted via the
+    /// settings file.
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
 }
 
 impl RunnerConfig {
@@ -144,6 +156,7 @@ impl RunnerConfig {
             restate_service_port: None,
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
+            extra_env: std::collections::HashMap::new(),
         }
     }
 }

@@ -194,6 +194,7 @@ pub async fn add_runner(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
+            extra_env: Default::default(),
         };
 
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
@@ -766,6 +767,16 @@ pub struct SpawnTestRequest {
     pub external_restate_admin_url: Option<String>,
     #[serde(default)]
     pub external_restate_ingress_url: Option<String>,
+    /// Additional environment variables forwarded to the spawned test runner.
+    /// Applied after the supervisor's hardcoded envs so callers can override
+    /// (e.g. pointing `QONTINUI_API_URL` at a fake backend) or inject
+    /// feature flags like `QONTINUI_SCRIPTED_OUTPUT=1` without requiring
+    /// the supervisor itself to have the var in its environment.
+    ///
+    /// Temp runners are ephemeral — this is not persisted across supervisor
+    /// restarts.
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -887,6 +898,7 @@ pub async fn spawn_test(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
+            extra_env: body.extra_env.clone(),
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -1500,6 +1512,7 @@ pub async fn spawn_named(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
+            extra_env: Default::default(),
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
