@@ -526,6 +526,13 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
 
     Json(serde_json::json!({
         "success": true,
+        "uiBridge": {
+            "appId": "qontinui-supervisor-dashboard",
+            "appName": "Qontinui Supervisor",
+            "appType": "dashboard",
+            "framework": "react",
+            "capabilities": ["control"],
+        },
         "data": {
             "connected_tabs": connected_tabs,
             "tab_count": tab_count,
