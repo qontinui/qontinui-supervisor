@@ -16,7 +16,12 @@ export default function App() {
   return (
     <UIBridgeProvider features={{ control: true }}>
     <AutoRegisterProvider>
-    <CommandRelayListener basePath="/supervisor-bridge" />
+    <CommandRelayListener
+      basePath="/supervisor-bridge"
+      appId="qontinui-supervisor-dashboard"
+      appName="Qontinui Supervisor"
+      appType="dashboard"
+    />
     <div className="layout">
       <aside className="sidebar">
         <div className="sidebar-logo">Supervisor</div>
