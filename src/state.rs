@@ -590,6 +590,7 @@ mod tests {
             runners: vec![RunnerConfig::default_primary()],
             build_pool: crate::config::BuildPoolConfig { pool_size: 1 },
             no_prewarm: false,
+            no_webview: true,
         }
     }
 

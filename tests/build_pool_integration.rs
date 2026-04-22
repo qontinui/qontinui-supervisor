@@ -30,6 +30,7 @@ fn pool_test_config(pool_size: usize) -> SupervisorConfig {
         runners: vec![RunnerConfig::default_primary()],
         build_pool: BuildPoolConfig { pool_size },
         no_prewarm: false,
+        no_webview: true,
     }
 }
 

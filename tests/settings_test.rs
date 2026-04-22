@@ -79,6 +79,7 @@ fn test_settings_path() {
         runners: vec![RunnerConfig::default_primary()],
         build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
+        no_webview: true,
     };
 
     let path = settings_path(&config);

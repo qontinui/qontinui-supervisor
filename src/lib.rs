@@ -18,3 +18,5 @@ pub mod velocity;
 pub mod velocity_improvement;
 pub mod velocity_layer;
 pub mod velocity_tests;
+#[cfg(windows)]
+pub mod webview;

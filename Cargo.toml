@@ -40,3 +40,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+# Minimal embedded WebView2 window for the ambient dashboard tab. Same versions
+# as Tauri 2.5 transitively pins in the runner (see qontinui-runner/Cargo.lock).
+# Windows-only: the supervisor never targets anything else.
+wry = "0.54"
+tao = "0.34"

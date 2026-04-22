@@ -32,6 +32,7 @@ fn test_config_from_fields() {
         runners: vec![RunnerConfig::default_primary()],
         build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
+        no_webview: true,
     };
 
     assert!(config.dev_mode);
@@ -62,6 +63,7 @@ fn test_config_runner_exe_path() {
         runners: vec![RunnerConfig::default_primary()],
         build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
+        no_webview: true,
     };
 
     let exe_path = config.runner_exe_path();
@@ -90,6 +92,7 @@ fn test_config_runner_npm_dir() {
         runners: vec![RunnerConfig::default_primary()],
         build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
+        no_webview: true,
     };
 
     let npm_dir = config.runner_npm_dir();

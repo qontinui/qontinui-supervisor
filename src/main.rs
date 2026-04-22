@@ -15,6 +15,8 @@ mod velocity;
 mod velocity_improvement;
 mod velocity_layer;
 mod velocity_tests;
+#[cfg(windows)]
+mod webview;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -217,6 +219,26 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     info!("Supervisor listening on http://0.0.0.0:{}", port);
+
+    // Spawn the ambient dashboard WebView2 window (item B of the post-3J UI
+    // Bridge improvements plan). Runs on its own dedicated OS thread so it
+    // can own the Win32 message pump without fighting the tokio runtime.
+    // The webview loads the supervisor's own React SPA, which then
+    // auto-registers with supervisor-bridge/* via CommandRelayListener —
+    // making `supervisor-bridge/health` report `responsive: true` without
+    // requiring a human-opened browser tab.
+    //
+    // Deliberately spawned AFTER the listener bind above so the initial page
+    // load hits a live HTTP server instead of a connection-refused error
+    // that some WebView2 versions latch onto permanently.
+    #[cfg(windows)]
+    {
+        if state.config.no_webview {
+            info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW / --dev-mode)");
+        } else {
+            webview::spawn_webview_thread(format!("http://127.0.0.1:{}/", port));
+        }
+    }
 
     // Pre-warm build slots in the background so the first real build per slot
     // benefits from warm incremental artifacts. Best-effort and time-boxed.

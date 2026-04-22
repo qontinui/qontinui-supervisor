@@ -54,6 +54,23 @@ pub struct CliArgs {
     /// Also honored via env var `QONTINUI_SUPERVISOR_NO_PREWARM=1`.
     #[arg(long = "no-prewarm")]
     pub no_prewarm: bool,
+
+    /// Disable the ambient dashboard WebView2 window that auto-registers with
+    /// `supervisor-bridge/*` for UI automation (item B of the post-3J UI Bridge
+    /// improvements plan).
+    ///
+    /// By default the supervisor spawns a small minimized WebView2 window on
+    /// startup pointing at its own dashboard at `http://127.0.0.1:{port}/`.
+    /// The React SPA's `CommandRelayListener` then keeps the supervisor-bridge
+    /// heartbeat alive without requiring a human-opened browser tab, so
+    /// `responsive: true` is reachable in headless dev loops.
+    ///
+    /// Use this flag (or the env var `QONTINUI_SUPERVISOR_NO_WEBVIEW=1`) to
+    /// skip the window — e.g. on a CI box with no desktop, or when running
+    /// the supervisor in `--dev-mode` alongside your own browser tab.
+    /// Dev-mode also disables the webview automatically.
+    #[arg(long = "no-webview")]
+    pub no_webview: bool,
 }
 
 #[allow(dead_code)]
@@ -78,6 +95,9 @@ pub struct SupervisorConfig {
     pub build_pool: BuildPoolConfig,
     /// When true, skip the post-startup `cargo check` pre-warm of build slots.
     pub no_prewarm: bool,
+    /// When true, skip the ambient dashboard WebView2 window (item B of the
+    /// post-3J UI Bridge improvements plan). See [`CliArgs::no_webview`].
+    pub no_webview: bool,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -243,6 +263,15 @@ impl SupervisorConfig {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
 
+        // Dev mode spawns its own browser via Vite; the user already has a tab.
+        // Also honor the env var for headless CI boxes.
+        let no_webview = args.no_webview
+            || args.dev_mode
+            || std::env::var("QONTINUI_SUPERVISOR_NO_WEBVIEW")
+                .ok()
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
         // Resolve effective supervisor log file:
         //   1. explicit --log-file
         //   2. --log-dir/supervisor.log
@@ -269,6 +298,7 @@ impl SupervisorConfig {
             runners: vec![RunnerConfig::default_primary()],
             build_pool: BuildPoolConfig::default(),
             no_prewarm,
+            no_webview,
         }
     }
 
@@ -489,6 +519,7 @@ mod tests {
             auto_debug: false,
             expo_dir: None,
             no_prewarm: false,
+            no_webview: false,
         }
     }
 
