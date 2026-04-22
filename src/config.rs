@@ -194,7 +194,15 @@ pub const RUNNER_VITE_PORT: u16 = 1420;
 pub const EXPO_PORT: u16 = 8081;
 
 // Process constants
-pub const GRACEFUL_KILL_TIMEOUT_SECS: u64 = 5;
+/// How long to wait for a runner to exit on its own after we POST the
+/// graceful close-request endpoint, before falling through to child.kill().
+/// Gives the runner's WindowEvent::CloseRequested handler time to run
+/// teardown hooks (e.g. UsbTransport::release_all releasing adb forwards).
+pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
+/// Per-request timeout for the graceful close POST itself. Short because
+/// the endpoint returns as soon as the event is queued — if it hangs, the
+/// runner is already unhealthy and we want to fall through to kill quickly.
+pub const RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS: u64 = 500;
 pub const BUILD_TIMEOUT_SECS: u64 = 600; // 10 minutes
 #[allow(dead_code)]
 pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;

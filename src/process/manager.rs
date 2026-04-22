@@ -2,9 +2,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::config::{RunnerConfig, GRACEFUL_KILL_TIMEOUT_SECS, RUNNER_VITE_PORT};
+use crate::config::{
+    RunnerConfig, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
+    RUNNER_VITE_PORT,
+};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -666,6 +669,64 @@ async fn monitor_runner_process_exit(
     }
 }
 
+/// POST to the runner's UI Bridge close-request endpoint so that
+/// Tauri's WindowEvent::CloseRequested fires on the runner side and its
+/// graceful teardown hooks run (e.g. UsbTransport::release_all, which
+/// removes adb forwards). Best-effort: any error — including a hung
+/// endpoint — is swallowed at debug level, and the caller falls through
+/// to child.kill() after the wait window elapses.
+async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str) {
+    let url = format!(
+        "http://127.0.0.1:{}/ui-bridge/control/page/close-request",
+        port
+    );
+    let result = state
+        .http_client
+        .post(&url)
+        .timeout(Duration::from_millis(
+            RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS,
+        ))
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            let msg = format!(
+                "Requested graceful stop for runner '{}' via close-request (port {})",
+                runner_name, port
+            );
+            info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+        }
+        Ok(resp) => {
+            let msg = format!(
+                "Graceful close-request for runner '{}' (port {}) returned {} — falling through to kill",
+                runner_name,
+                port,
+                resp.status()
+            );
+            debug!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+                .await;
+        }
+        Err(e) => {
+            let msg = format!(
+                "Graceful close-request for runner '{}' (port {}) failed: {} — falling through to kill",
+                runner_name, port, e
+            );
+            debug!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+                .await;
+        }
+    }
+}
+
 /// Stop a specific runner by ID. Kills by PID (not by process name).
 pub async fn stop_runner_by_id(
     state: &SharedState,
@@ -694,35 +755,63 @@ pub async fn stop_runner_by_id(
         )
         .await;
 
-    // 1. Kill the child process by PID
-    let child = {
-        let mut runner = managed.runner.write().await;
-        runner.process.take()
-    };
-
+    // The Child handle is owned by the `monitor_runner_process_exit` task that
+    // was spawned when the runner started — it calls `runner.process.take()`
+    // immediately so it can await `child.wait()` without holding the lock. So
+    // by the time we get here, `managed.runner.process` is always None, and
+    // we have to work via (a) the graceful HTTP close endpoint, (b) the stored
+    // PID, and (c) the `running` flag that the monitor task flips to false
+    // when the process exits.
     let pid_to_kill = {
         let runner = managed.runner.read().await;
         runner.pid
     };
 
-    if let Some(mut child) = child {
-        info!("Killing runner '{}' child process", runner_name);
-        let _ = child.kill().await;
+    // 1. Graceful-first: ask the runner to close itself via the same endpoint
+    //    the UI uses, so WindowEvent::CloseRequested fires and its teardown
+    //    hooks run (notably UsbTransport::release_all, which removes adb
+    //    forwards — see qontinui-runner §1.6a). Best-effort: on any failure
+    //    we fall through to the PID kill below.
+    request_graceful_stop(state, port, &runner_name).await;
 
-        let wait_result = tokio::time::timeout(
-            Duration::from_secs(GRACEFUL_KILL_TIMEOUT_SECS),
-            child.wait(),
-        )
-        .await;
-
-        match wait_result {
-            Ok(Ok(_)) => info!("Runner '{}' process exited gracefully", runner_name),
-            Ok(Err(e)) => warn!("Error waiting for runner '{}': {}", runner_name, e),
-            Err(_) => warn!("Runner '{}' did not exit within timeout", runner_name),
+    // 2. Poll the monitor's `running` flag for up to
+    //    RUNNER_GRACEFUL_STOP_TIMEOUT_MS. When the runner exits, the monitor
+    //    task sets running=false — that's our signal that graceful worked.
+    let graceful_deadline =
+        std::time::Instant::now() + Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS);
+    let mut exited_gracefully = false;
+    while std::time::Instant::now() < graceful_deadline {
+        if !managed.runner.read().await.running {
+            let msg = format!(
+                "Runner '{}' exited gracefully after close-request",
+                runner_name
+            );
+            info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            exited_gracefully = true;
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // 2. If we have a PID, try to kill it directly (may have been a grandchild)
+    if !exited_gracefully {
+        let msg = format!(
+            "Graceful stop timed out for runner '{}' after {}ms, falling through to taskkill",
+            runner_name, RUNNER_GRACEFUL_STOP_TIMEOUT_MS
+        );
+        info!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Info, msg)
+            .await;
+    }
+
+    // 3. Kill by PID. This is a no-op if the process already exited gracefully
+    //    (taskkill reports "PID not found" at debug level) and the primary
+    //    mechanism otherwise.
     if let Some(pid) = pid_to_kill {
         let _ = kill_by_pid(pid).await;
     }
