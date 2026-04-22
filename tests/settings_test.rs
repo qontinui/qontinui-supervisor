@@ -65,7 +65,6 @@ fn test_settings_path() {
 
     let config = SupervisorConfig {
         project_dir: PathBuf::from("/tmp/project/src-tauri"),
-        dev_mode: false,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,

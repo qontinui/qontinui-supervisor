@@ -61,7 +61,6 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
     info!("Project dir: {:?}", args.project_dir);
-    info!("Dev mode: {}", args.dev_mode);
     info!("Watchdog: {}", args.watchdog);
     info!("Auto-start: {}", args.auto_start || args.watchdog);
     info!("Auto-debug: {}", args.auto_debug);
@@ -234,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         if state.config.no_webview {
-            info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW / --dev-mode)");
+            info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW)");
         } else {
             webview::spawn_webview_thread(format!("http://127.0.0.1:{}/", port));
         }

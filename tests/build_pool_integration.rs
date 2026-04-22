@@ -16,7 +16,6 @@ use qontinui_supervisor::state::{BuildInfo, SupervisorState};
 fn pool_test_config(pool_size: usize) -> SupervisorConfig {
     SupervisorConfig {
         project_dir: PathBuf::from("/tmp/test/src-tauri"),
-        dev_mode: true,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,

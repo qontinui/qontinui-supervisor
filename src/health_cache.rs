@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::debug;
 
-use crate::config::RUNNER_VITE_PORT;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::is_temp_runner;
 use crate::process::port;
@@ -70,7 +69,6 @@ struct RunnerHealthBody {
 pub struct CachedPortHealth {
     pub runner_port_open: bool,
     pub runner_responding: bool,
-    pub vite_port_open: bool,
 }
 
 /// Cached per-runner health snapshot, built by the background refresher.
@@ -197,7 +195,6 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 
             // Refresh health for all managed runners
             let runners = state.get_all_runners().await;
-            let dev_mode = state.config.dev_mode;
 
             // Primary runner's health also goes into the legacy cached_health
             let mut primary_health = CachedPortHealth::default();
@@ -210,17 +207,9 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let runner_port_open = port::is_port_in_use(runner_port);
                 let runner_responding = port::is_runner_responding(runner_port).await;
 
-                // For primary in dev mode, also check Vite port
-                let vite_port_open = if is_primary && dev_mode {
-                    port::is_port_in_use(RUNNER_VITE_PORT)
-                } else {
-                    false
-                };
-
                 let new_health = CachedPortHealth {
                     runner_port_open,
                     runner_responding,
-                    vite_port_open,
                 };
 
                 // For user-managed runners (not temp, not named), the supervisor only
@@ -285,12 +274,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
             // If no runners exist, check legacy ports
             if runners.is_empty() {
                 let runner_port = crate::config::RUNNER_API_PORT;
-                let vite_port = RUNNER_VITE_PORT;
 
                 primary_health = CachedPortHealth {
                     runner_port_open: port::is_port_in_use(runner_port),
                     runner_responding: port::is_runner_responding(runner_port).await,
-                    vite_port_open: port::is_port_in_use(vite_port),
                 };
             }
 
@@ -313,10 +300,9 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         LogSource::Supervisor,
                         LogLevel::Debug,
                         format!(
-                            "Health cache: runner_port={}, api_responding={}, vite={} (runners: {})",
+                            "Health cache: runner_port={}, api_responding={} (runners: {})",
                             primary_health.runner_port_open,
                             primary_health.runner_responding,
-                            primary_health.vite_port_open,
                             runners.len()
                         ),
                     )
@@ -336,7 +322,6 @@ mod tests {
         let health = CachedPortHealth::default();
         assert!(!health.runner_port_open);
         assert!(!health.runner_responding);
-        assert!(!health.vite_port_open);
     }
 
     #[test]
@@ -344,12 +329,10 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
-            vite_port_open: false,
         };
         let cloned = health.clone();
         assert!(cloned.runner_port_open);
         assert!(cloned.runner_responding);
-        assert!(!cloned.vite_port_open);
     }
 
     #[test]
@@ -357,12 +340,10 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: false,
-            vite_port_open: true,
         };
         let debug_str = format!("{:?}", health);
         assert!(debug_str.contains("runner_port_open: true"));
         assert!(debug_str.contains("runner_responding: false"));
-        assert!(debug_str.contains("vite_port_open: true"));
     }
 
     #[test]
@@ -370,11 +351,9 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
-            vite_port_open: true,
         };
         assert!(health.runner_port_open);
         assert!(health.runner_responding);
-        assert!(health.vite_port_open);
     }
 
     #[test]

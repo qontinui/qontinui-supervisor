@@ -137,11 +137,9 @@ export interface HealthResponse {
     pid?: number;
     started_at?: string;
     api_responding: boolean;
-    mode: string;
   };
   ports: {
     api_port: { port: number; in_use: boolean };
-    vite_port?: { port: number; in_use: boolean };
   };
   watchdog: {
     enabled: boolean;
@@ -165,7 +163,6 @@ export interface HealthResponse {
   };
   supervisor: {
     version: string;
-    dev_mode: boolean;
     project_dir: string;
   };
   runners?: RunnerInstanceHealth[];

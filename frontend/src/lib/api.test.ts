@@ -33,7 +33,7 @@ describe('api.health()', () => {
   it('calls GET /health and returns parsed JSON', async () => {
     const healthData = {
       status: 'ok',
-      runner: { running: true, api_responding: true, mode: 'dev' },
+      runner: { running: true, api_responding: true },
       watchdog: { enabled: true, restart_attempts: 0, crash_count: 0 },
       build: { in_progress: false, error_detected: false },
       ai: {
@@ -49,7 +49,7 @@ describe('api.health()', () => {
       },
       expo: { running: false, port: 8081, configured: false },
       ports: { api_port: { port: 9876, in_use: true } },
-      supervisor: { version: '0.1.0', dev_mode: true, project_dir: '/test' },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
     };
 
     mockFetchOk(healthData);

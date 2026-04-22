@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 
-use crate::config::{RUNNER_API_PORT, RUNNER_VITE_PORT};
+use crate::config::RUNNER_API_PORT;
 use crate::health_cache::{CachedRunnerHealth, RunnerStatus, UiErrorSummary};
 use crate::state::SharedState;
 
@@ -62,13 +62,11 @@ pub struct RunnerHealth {
     pub pid: Option<u32>,
     pub started_at: Option<String>,
     pub api_responding: bool,
-    pub mode: String,
 }
 
 #[derive(Serialize)]
 pub struct PortsHealth {
     pub api_port: PortStatus,
-    pub vite_port: Option<PortStatus>,
 }
 
 #[derive(Serialize)]
@@ -120,7 +118,6 @@ pub struct BuildHealth {
 #[derive(Serialize)]
 pub struct SupervisorInfo {
     pub version: String,
-    pub dev_mode: bool,
     pub project_dir: String,
 }
 
@@ -180,7 +177,6 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let cached = state.cached_health.read().await;
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
-    let vite_in_use = cached.vite_port_open;
     drop(cached);
 
     // Use primary ManagedRunner state (not the legacy state.runner which is never
@@ -233,24 +229,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pid: primary_pid,
             started_at: primary_started_at.map(|t| t.to_rfc3339()),
             api_responding,
-            mode: if state.config.dev_mode {
-                "dev".to_string()
-            } else {
-                "exe".to_string()
-            },
         },
         ports: PortsHealth {
             api_port: PortStatus {
                 port: RUNNER_API_PORT,
                 in_use: api_in_use,
-            },
-            vite_port: if state.config.dev_mode {
-                Some(PortStatus {
-                    port: RUNNER_VITE_PORT,
-                    in_use: vite_in_use,
-                })
-            } else {
-                None
             },
         },
         watchdog: WatchdogHealth::disabled(),
@@ -270,7 +253,6 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         },
         supervisor: SupervisorInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            dev_mode: state.config.dev_mode,
             project_dir: state.config.project_dir.display().to_string(),
         },
         runners: runners_health,
@@ -307,7 +289,6 @@ pub async fn health_stream(
 
             let api_responding = cached.runner_responding;
             let api_in_use = cached.runner_port_open;
-            let vite_in_use = cached.vite_port_open;
 
             // Use the primary runner from cached snapshots (not the legacy
             // state.runner which is never updated for user-managed runners).
@@ -346,24 +327,11 @@ pub async fn health_stream(
                     pid: primary_pid,
                     started_at: None, // Not available from cached snapshot
                     api_responding,
-                    mode: if state.config.dev_mode {
-                        "dev".to_string()
-                    } else {
-                        "exe".to_string()
-                    },
                 },
                 ports: PortsHealth {
                     api_port: PortStatus {
                         port: RUNNER_API_PORT,
                         in_use: api_in_use,
-                    },
-                    vite_port: if state.config.dev_mode {
-                        Some(PortStatus {
-                            port: RUNNER_VITE_PORT,
-                            in_use: vite_in_use,
-                        })
-                    } else {
-                        None
                     },
                 },
                 watchdog: WatchdogHealth::disabled(),
@@ -383,7 +351,6 @@ pub async fn health_stream(
                 },
                 supervisor: SupervisorInfo {
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    dev_mode: state.config.dev_mode,
                     project_dir: state.config.project_dir.display().to_string(),
                 },
                 // Read cached runner snapshots (built by background health refresher)
@@ -456,17 +423,12 @@ mod tests {
                 pid: Some(1234),
                 started_at: None,
                 api_responding: true,
-                mode: "dev".to_string(),
             },
             ports: PortsHealth {
                 api_port: PortStatus {
                     port: 9876,
                     in_use: true,
                 },
-                vite_port: Some(PortStatus {
-                    port: 1420,
-                    in_use: true,
-                }),
             },
             watchdog: WatchdogHealth {
                 enabled: true,
@@ -491,7 +453,6 @@ mod tests {
             },
             supervisor: SupervisorInfo {
                 version: "0.1.0".to_string(),
-                dev_mode: true,
                 project_dir: "/tmp/test".to_string(),
             },
             runners: Vec::new(),
@@ -502,7 +463,6 @@ mod tests {
         assert!(json.contains("\"running\":true"));
         assert!(json.contains("\"pid\":1234"));
         assert!(json.contains("\"api_responding\":true"));
-        assert!(json.contains("\"mode\":\"dev\""));
     }
 
     #[test]

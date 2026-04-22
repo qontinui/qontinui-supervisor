@@ -86,11 +86,7 @@ pub async fn run_cargo_build_with_requester(
     let info = BuildInfo {
         started_at: chrono::Utc::now(),
         requester_id,
-        rebuild_kind: if state.config.dev_mode {
-            "dev".to_string()
-        } else {
-            "exe".to_string()
-        },
+        rebuild_kind: "exe".to_string(),
     };
     let slot = state.build_pool.claim_idle_slot(info).await;
     // RAII guard: clears `slot.busy = None` on every exit path (happy path,
@@ -211,16 +207,15 @@ async fn run_build_inner(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
 ) -> Result<(), SupervisorError> {
-    // In exe mode the frontend is embedded in the binary via tauri_build, so we
-    // must run `npm run build` first to produce a fresh dist/ before cargo build.
-    // In dev mode Vite serves the frontend live, so this step is skipped.
+    // The frontend is embedded in the binary via tauri_build, so we must run
+    // `npm run build` first to produce a fresh dist/ before cargo build.
     //
     // Frontend builds are serialized across slots via `build_pool.npm_lock`:
     // Tauri's `rust-embed` pulls from a single `dist/` directory, so two
     // concurrent npm builds would corrupt the output. The lock is held ONLY
     // for the npm invocation (~12s), not the whole cargo build (~180s), so
     // this is a much smaller serialization point than the legacy global flag.
-    if !state.config.dev_mode {
+    {
         let npm_dir = state.config.runner_npm_dir();
         state
             .logs
@@ -344,28 +339,24 @@ async fn run_build_inner(
         // npm_guard drops here, releasing the frontend build lock before cargo starts.
     }
 
+    // Always pass --features custom-protocol so Tauri embeds the frontend from
+    // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
+    // from devUrl (localhost:1420), which isn't running.
+    const CARGO_BUILD_ARGS: &[&str] = &[
+        "build",
+        "--bin",
+        "qontinui-runner",
+        "--features",
+        "custom-protocol",
+    ];
+
     #[cfg(windows)]
     let mut child = {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         let mut cmd = Command::new("cargo");
-        // In exe mode, pass --features custom-protocol so Tauri embeds the frontend
-        // from dist/ instead of trying to connect to the Vite dev server (devUrl).
-        // The tauri crate sets cfg(dev) = !custom_protocol, so without this feature
-        // the binary loads from localhost:1420 which doesn't exist in exe mode.
-        let args: Vec<&str> = if state.config.dev_mode {
-            vec!["build", "--bin", "qontinui-runner"]
-        } else {
-            vec![
-                "build",
-                "--bin",
-                "qontinui-runner",
-                "--features",
-                "custom-protocol",
-            ]
-        };
-        cmd.args(&args)
+        cmd.args(CARGO_BUILD_ARGS)
             .current_dir(&state.config.project_dir)
             // Redirect cargo output to this slot's isolated target dir so
             // concurrent builds on other slots don't contend on the same target/.
@@ -380,18 +371,7 @@ async fn run_build_inner(
     #[cfg(not(windows))]
     let mut child = {
         let mut cmd = Command::new("cargo");
-        let args: Vec<&str> = if state.config.dev_mode {
-            vec!["build", "--bin", "qontinui-runner"]
-        } else {
-            vec![
-                "build",
-                "--bin",
-                "qontinui-runner",
-                "--features",
-                "custom-protocol",
-            ]
-        };
-        cmd.args(&args)
+        cmd.args(CARGO_BUILD_ARGS)
             .current_dir(&state.config.project_dir)
             .env("CARGO_TARGET_DIR", &slot.target_dir)
             .stdout(Stdio::piped())
@@ -576,12 +556,8 @@ const PREWARM_TIMEOUT_SECS: u64 = 60;
 /// Pre-warm each build slot's incremental cache by running `cargo check`.
 ///
 /// Spawned as `tokio::spawn` after the HTTP server binds so it doesn't delay
-/// startup. Skipped in dev mode and when `--no-prewarm` is set.
+/// startup. Skipped when `--no-prewarm` is set.
 pub async fn prewarm_build_slots(state: crate::state::SharedState) {
-    if state.config.dev_mode {
-        info!("Dev mode: skipping build slot pre-warm");
-        return;
-    }
     if state.config.no_prewarm {
         info!("Build slot pre-warm disabled via --no-prewarm / QONTINUI_SUPERVISOR_NO_PREWARM");
         return;
@@ -667,17 +643,13 @@ async fn prewarm_single_slot(
 
     let start = std::time::Instant::now();
 
-    let args: Vec<&str> = if state.config.dev_mode {
-        vec!["check", "--bin", "qontinui-runner"]
-    } else {
-        vec![
-            "check",
-            "--bin",
-            "qontinui-runner",
-            "--features",
-            "custom-protocol",
-        ]
-    };
+    let args: Vec<&str> = vec![
+        "check",
+        "--bin",
+        "qontinui-runner",
+        "--features",
+        "custom-protocol",
+    ];
 
     #[cfg(windows)]
     let child_result = {

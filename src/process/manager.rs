@@ -6,15 +6,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{
     RunnerConfig, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
-    RUNNER_VITE_PORT,
 };
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
-    clear_webview2_cache, kill_by_pid, kill_by_port, kill_by_port_tree, kill_webview2_processes,
-    remove_runner_app_data_dirs, remove_webview2_user_data_folder, webview2_user_data_folder,
+    kill_by_pid, kill_by_port, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
+    webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -256,18 +255,22 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 
 /// Forward test auto-login credentials to a spawned non-primary runner.
 ///
-/// Only active when the supervisor is running in `dev_mode` AND the supervisor
-/// process itself has `QONTINUI_TEST_LOGIN_EMAIL` + `QONTINUI_TEST_LOGIN_PASSWORD`
-/// set in its environment. These are forwarded to the child as
-/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` / `QONTINUI_TEST_AUTO_LOGIN_PASSWORD` which
-/// the runner's Tauri backend exposes via the `get_test_auto_login` command so
-/// the React AuthProvider can auto-authenticate temp test runners for UI Bridge
-/// inspection of authenticated pages.
+/// Sets `QONTINUI_TEST_AUTO_LOGIN_EMAIL` / `QONTINUI_TEST_AUTO_LOGIN_PASSWORD`
+/// on the child, which the runner's Tauri backend exposes via
+/// `get_test_auto_login` so the React AuthProvider can auto-authenticate
+/// temp/named runners for UI Bridge inspection of authenticated pages.
 ///
-/// SECURITY: Never forwarded to primary runners. Credentials come from either
-/// env vars or the runtime `test_auto_login` field (set via POST /test-login).
-/// Forwarded to temp/test runners regardless of dev_mode since temp runners
-/// are ephemeral and isolated by design.
+/// Resolution order (first hit wins):
+///   1. Runtime-configured creds via `POST /test-login`
+///   2. Supervisor process env vars: `QONTINUI_TEST_LOGIN_EMAIL` + `QONTINUI_TEST_LOGIN_PASSWORD`
+///   3. The runner's own `.env` file: `VITE_DEV_EMAIL` + `VITE_DEV_PASSWORD`
+///      — resolved from `<project_dir>/../.env`. This is the same account the
+///      runner frontend is baked against, so non-primary runners reliably
+///      auto-login with zero extra supervisor setup.
+///
+/// SECURITY: Never forwarded to primary runners. The supervisor is a
+/// development-only tool; these credentials are dev-account only and never
+/// reach a production binary.
 /// Apply the caller-supplied `extra_env` map to the spawn command.
 ///
 /// Called last (after `forward_restate_env` and the hardcoded env chain) so
@@ -320,8 +323,42 @@ fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
         if !email.is_empty() && !password.is_empty() {
             cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
             cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
+            return;
         }
     }
+    // Priority 3: the runner's own `.env` file. Same account the baked
+    // VITE_DEV_EMAIL/PASSWORD point at, so temp/named runners pick up the
+    // live dev credentials without extra supervisor setup.
+    if let Some((email, password)) = read_runner_env_creds(&state.config.project_dir) {
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
+    }
+}
+
+/// Read `VITE_DEV_EMAIL` / `VITE_DEV_PASSWORD` from the runner's `.env` file.
+/// `project_dir` points at `<runner>/src-tauri`; `.env` lives at its parent.
+/// Returns `None` if the file is missing, unreadable, or either key is absent.
+fn read_runner_env_creds(project_dir: &std::path::Path) -> Option<(String, String)> {
+    let env_path = project_dir.parent()?.join(".env");
+    let content = std::fs::read_to_string(env_path).ok()?;
+    let mut email: Option<String> = None;
+    let mut password: Option<String> = None;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim().trim_matches(|c| c == '"' || c == '\'')),
+            None => continue,
+        };
+        match key {
+            "VITE_DEV_EMAIL" if !value.is_empty() => email = Some(value.to_string()),
+            "VITE_DEV_PASSWORD" if !value.is_empty() => password = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some((email?, password?))
 }
 
 /// Start a specific runner by ID.
@@ -391,27 +428,11 @@ pub async fn start_managed_runner(
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            format!(
-                "Starting runner '{}' (port {}) in {} mode",
-                runner_name,
-                port,
-                if is_primary && state.config.dev_mode {
-                    "dev"
-                } else {
-                    "exe"
-                }
-            ),
+            format!("Starting runner '{}' (port {})", runner_name, port),
         )
         .await;
 
-    // Primary in dev mode uses `npm run tauri dev` (Vite + Tauri).
-    // Non-primary runners always use exe mode — only one Vite instance can run at a time,
-    // and discovered runners share the compiled binary from the primary's build.
-    let mut child = if is_primary && state.config.dev_mode {
-        start_dev_mode_for_runner(state, managed).await?
-    } else {
-        start_exe_mode_for_runner(state, managed).await?
-    };
+    let mut child = start_exe_mode_for_runner(state, managed).await?;
 
     let pid = child.id();
     info!(
@@ -826,39 +847,6 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(port).await;
     }
 
-    // For primary in dev mode, always force-kill the Vite process tree.
-    // Use tree-kill (/T) to kill the entire cmd→npm→tauri→node chain, since
-    // the grandchild node.exe (Vite) often survives parent kills despite
-    // CREATE_NEW_PROCESS_GROUP. Without tree-kill, the old Vite process keeps
-    // running with stale in-memory module transforms after code changes.
-    if is_primary && state.config.dev_mode {
-        let _ = kill_by_port_tree(RUNNER_VITE_PORT).await;
-        let vite_free = wait_for_port_free(RUNNER_VITE_PORT, 5).await;
-        if !vite_free {
-            warn!(
-                "Vite port {} still in use after tree-kill, retrying with port kill",
-                RUNNER_VITE_PORT
-            );
-            let _ = kill_by_port(RUNNER_VITE_PORT).await;
-            let vite_free_retry = wait_for_port_free(RUNNER_VITE_PORT, 10).await;
-            if !vite_free_retry {
-                error!(
-                    "Vite port {} still in use after two kill attempts",
-                    RUNNER_VITE_PORT
-                );
-            }
-        }
-
-        // Kill WebView2 processes and clear their cache so the webview
-        // fetches fresh JavaScript modules on next startup. WebView2 on
-        // Windows aggressively caches ES modules (ignoring no-store) and
-        // the cached bytecode survives process restarts via the EBWebView
-        // profile directory.
-        let _ = kill_webview2_processes().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let _ = clear_webview2_cache().await;
-    }
-
     // 4. Update per-runner state
     {
         let mut runner = managed.runner.write().await;
@@ -1144,78 +1132,6 @@ pub async fn restart_all(
 // =============================================================================
 // Legacy single-runner functions (backward compat — delegate to primary runner)
 // =============================================================================
-
-/// Start a runner in dev mode (`npm run tauri dev`), which launches both
-/// the Vite dev server and the Tauri/Rust backend.
-/// Works for both primary and discovered runners.
-async fn start_dev_mode_for_runner(
-    state: &SharedState,
-    managed: &ManagedRunner,
-) -> Result<tokio::process::Child, SupervisorError> {
-    let npm_dir = state.config.runner_npm_dir();
-    let port = managed.config.port;
-
-    info!(
-        "Starting runner '{}' in dev mode from {:?} (port {})",
-        managed.config.name, npm_dir, port
-    );
-
-    #[cfg(windows)]
-    let child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "npm.cmd run tauri dev -- --no-watch"])
-            .current_dir(&npm_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", port.to_string());
-
-        // Non-primary runners get instance env vars so they skip scheduler
-        // and can proxy process commands to the primary
-        if !managed.config.is_primary {
-            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            if let Some(primary) = state.get_primary().await {
-                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
-            }
-        }
-
-        forward_restate_env(&mut cmd, &managed.config);
-        forward_extra_env(&mut cmd, &managed.config);
-
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
-    };
-
-    #[cfg(not(windows))]
-    let child = {
-        let mut cmd = Command::new("npx");
-        cmd.args(["tauri", "dev", "--no-watch"])
-            .current_dir(&npm_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", port.to_string());
-
-        if !managed.config.is_primary {
-            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            if let Some(primary) = state.get_primary().await {
-                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
-            }
-        }
-
-        forward_restate_env(&mut cmd, &managed.config);
-        forward_extra_env(&mut cmd, &managed.config);
-
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn dev mode: {}", e)))?
-    };
-
-    Ok(child)
-}
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
 /// Legacy stop — targets the primary runner. Allowed for manual use.

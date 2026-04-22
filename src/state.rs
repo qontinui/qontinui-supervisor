@@ -576,7 +576,6 @@ mod tests {
     fn make_test_config() -> SupervisorConfig {
         SupervisorConfig {
             project_dir: PathBuf::from("/tmp/test/src-tauri"),
-            dev_mode: true,
             watchdog_enabled_at_start: false,
             auto_start: false,
             auto_debug: false,
@@ -734,7 +733,6 @@ mod tests {
     async fn test_supervisor_state_construction() {
         let config = make_test_config();
         let state = SupervisorState::new(config);
-        assert!(state.config.dev_mode);
         assert_eq!(state.config.port, DEFAULT_SUPERVISOR_PORT);
     }
 
@@ -788,7 +786,6 @@ mod tests {
         let cached = state.cached_health.try_read().unwrap();
         assert!(!cached.runner_port_open);
         assert!(!cached.runner_responding);
-        assert!(!cached.vite_port_open);
     }
 
     #[tokio::test]

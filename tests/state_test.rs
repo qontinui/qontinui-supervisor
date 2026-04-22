@@ -8,7 +8,6 @@ use qontinui_supervisor::state::SupervisorState;
 fn test_config() -> SupervisorConfig {
     SupervisorConfig {
         project_dir: PathBuf::from("/tmp/test/src-tauri"),
-        dev_mode: true,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,
@@ -94,7 +93,6 @@ async fn test_cached_health_default() {
 
     assert!(!cached.runner_port_open);
     assert!(!cached.runner_responding);
-    assert!(!cached.vite_port_open);
 }
 
 #[test]
@@ -102,13 +100,11 @@ fn test_cached_port_health_clone() {
     let health = CachedPortHealth {
         runner_port_open: true,
         runner_responding: true,
-        vite_port_open: false,
     };
 
     let cloned = health.clone();
     assert!(cloned.runner_port_open);
     assert!(cloned.runner_responding);
-    assert!(!cloned.vite_port_open);
 }
 
 #[tokio::test]
@@ -127,7 +123,6 @@ async fn test_cached_port_health_update() {
         *cached = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
-            vite_port_open: true,
         };
     }
 
@@ -136,7 +131,6 @@ async fn test_cached_port_health_update() {
         let cached = state.cached_health.read().await;
         assert!(cached.runner_port_open);
         assert!(cached.runner_responding);
-        assert!(cached.vite_port_open);
     }
 }
 

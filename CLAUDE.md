@@ -48,7 +48,6 @@ cargo clippy -- -D warnings    # Lint
 | Flag | Description |
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
-| `-d, --dev-mode` | Run via `npm run tauri dev` instead of compiled exe |
 | `-w, --watchdog` | Enable health monitoring (observe-only, implies `--auto-start`) |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--expo-dir` | Path to Expo/React Native project directory |
@@ -295,11 +294,9 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
     cargo build --bin qontinui-runner --features custom-protocol
 ```
 
-**Why `--features custom-protocol` is mandatory for exe mode:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. If vite isn't running on 1420 the webview shows `ERR_CONNECTION_REFUSED`.
+**Why `--features custom-protocol` is mandatory:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. No Vite dev server is running, so the webview would show `ERR_CONNECTION_REFUSED`.
 
 **Why you must build into a slot dir:** the supervisor's `resolve_source_exe` picks the source exe from `last_successful_slot` first, then scans other slots, and only falls back to `target/debug/qontinui-runner.exe` last. On every runner start it copies the source over `target/debug/qontinui-runner-{id}.exe` — so building into the default `target/` means the supervisor may overwrite it with a stale slot exe.
-
-**When building dev mode** (supervisor started with `-d --dev-mode`): omit `--features custom-protocol`.
 
 **Supervisor source of truth:** the exact args are assembled in `src/build_monitor.rs::run_build_inner`. If this doc drifts from that code, that file wins.
 
@@ -346,7 +343,6 @@ If the build fails, the placeholder port reservation is cleaned up and the error
 | Supervisor port | 9875 |
 | Runner API port | 9876 |
 | Expo port | 8081 |
-| Runner Vite port | 1420 |
 | Build timeout | 10min (600s) |
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |

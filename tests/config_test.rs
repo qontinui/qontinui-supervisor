@@ -8,17 +8,11 @@ fn test_default_ports() {
 }
 
 #[test]
-fn test_runner_vite_port() {
-    assert_eq!(RUNNER_VITE_PORT, 1420);
-}
-
-#[test]
 fn test_config_from_fields() {
     use std::path::PathBuf;
 
     let config = SupervisorConfig {
         project_dir: PathBuf::from("/tmp/runner/src-tauri"),
-        dev_mode: true,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,
@@ -35,7 +29,6 @@ fn test_config_from_fields() {
         no_webview: true,
     };
 
-    assert!(config.dev_mode);
     assert!(!config.watchdog_enabled_at_start);
     assert!(!config.auto_start);
     assert_eq!(config.port, 9875);
@@ -49,7 +42,6 @@ fn test_config_runner_exe_path() {
 
     let config = SupervisorConfig {
         project_dir: PathBuf::from("/tmp/runner/src-tauri"),
-        dev_mode: false,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,
@@ -78,7 +70,6 @@ fn test_config_runner_npm_dir() {
 
     let config = SupervisorConfig {
         project_dir: PathBuf::from("/tmp/runner/src-tauri"),
-        dev_mode: true,
         watchdog_enabled_at_start: false,
         auto_start: false,
         auto_debug: false,

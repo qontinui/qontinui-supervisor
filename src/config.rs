@@ -10,10 +10,6 @@ pub struct CliArgs {
     #[arg(short = 'p', long = "project-dir")]
     pub project_dir: PathBuf,
 
-    /// Run 'npm run tauri dev' instead of compiled exe
-    #[arg(short = 'd', long = "dev-mode")]
-    pub dev_mode: bool,
-
     /// Enable watchdog (implies auto-start)
     #[arg(short = 'w', long = "watchdog")]
     pub watchdog: bool,
@@ -66,9 +62,8 @@ pub struct CliArgs {
     /// `responsive: true` is reachable in headless dev loops.
     ///
     /// Use this flag (or the env var `QONTINUI_SUPERVISOR_NO_WEBVIEW=1`) to
-    /// skip the window — e.g. on a CI box with no desktop, or when running
-    /// the supervisor in `--dev-mode` alongside your own browser tab.
-    /// Dev-mode also disables the webview automatically.
+    /// skip the window — e.g. on a CI box with no desktop, or when you prefer
+    /// to drive the dashboard from your own browser tab.
     #[arg(long = "no-webview")]
     pub no_webview: bool,
 }
@@ -76,7 +71,6 @@ pub struct CliArgs {
 #[allow(dead_code)]
 pub struct SupervisorConfig {
     pub project_dir: PathBuf,
-    pub dev_mode: bool,
     pub watchdog_enabled_at_start: bool,
     pub auto_start: bool,
     pub auto_debug: bool,
@@ -190,7 +184,6 @@ pub const DEFAULT_SUPERVISOR_PORT: u16 = 9875;
 pub const DEFAULT_RUNNER_API_PORT: u16 = 9876;
 /// Backward compat alias
 pub const RUNNER_API_PORT: u16 = DEFAULT_RUNNER_API_PORT;
-pub const RUNNER_VITE_PORT: u16 = 1420;
 pub const EXPO_PORT: u16 = 8081;
 
 // Process constants
@@ -271,10 +264,8 @@ impl SupervisorConfig {
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
 
-        // Dev mode spawns its own browser via Vite; the user already has a tab.
-        // Also honor the env var for headless CI boxes.
+        // Honor the env var for headless CI boxes.
         let no_webview = args.no_webview
-            || args.dev_mode
             || std::env::var("QONTINUI_SUPERVISOR_NO_WEBVIEW")
                 .ok()
                 .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
@@ -291,7 +282,6 @@ impl SupervisorConfig {
 
         SupervisorConfig {
             project_dir: args.project_dir,
-            dev_mode: args.dev_mode,
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
             auto_debug: args.auto_debug,
@@ -424,11 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_vite_port() {
-        assert_eq!(RUNNER_VITE_PORT, 1420);
-    }
-
-    #[test]
     fn test_expo_port() {
         assert_eq!(EXPO_PORT, 8081);
     }
@@ -518,7 +503,6 @@ mod tests {
     fn make_test_args(watchdog: bool, auto_start: bool) -> CliArgs {
         CliArgs {
             project_dir: PathBuf::from("/tmp/qontinui-runner/src-tauri"),
-            dev_mode: true,
             watchdog,
             auto_start,
             log_file: None,
@@ -539,7 +523,6 @@ mod tests {
             config.project_dir,
             PathBuf::from("/tmp/qontinui-runner/src-tauri")
         );
-        assert!(config.dev_mode);
         assert!(!config.watchdog_enabled_at_start);
         assert!(!config.auto_start);
         assert!(!config.auto_debug);

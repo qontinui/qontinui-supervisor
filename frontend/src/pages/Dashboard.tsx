@@ -662,7 +662,6 @@ function DashboardInner() {
                 ? 'external (not supervised)'
                 : 'stopped'}
             {h.runner.api_responding && h.runner.running ? ' (API ok)' : ''}
-            {' | '}Mode: {h.runner.mode}
             {' | '}Build: {h.build.in_progress ? 'in progress' : 'idle'}
           </span>
           {lastRefresh && (

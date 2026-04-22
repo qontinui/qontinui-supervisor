@@ -11,11 +11,9 @@ vi.mock('../lib/api', () => {
       running: true,
       pid: 1234,
       api_responding: true,
-      mode: 'dev',
     },
     ports: {
       api_port: { port: 9876, in_use: true },
-      vite_port: { port: 1420, in_use: true },
     },
     watchdog: {
       enabled: true,
@@ -34,7 +32,6 @@ vi.mock('../lib/api', () => {
     },
     supervisor: {
       version: '0.1.0',
-      dev_mode: true,
       project_dir: '/test',
     },
   };
