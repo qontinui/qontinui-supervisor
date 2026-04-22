@@ -261,12 +261,17 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 /// temp/named runners for UI Bridge inspection of authenticated pages.
 ///
 /// Resolution order (first hit wins):
-///   1. Runtime-configured creds via `POST /test-login`
-///   2. Supervisor process env vars: `QONTINUI_TEST_LOGIN_EMAIL` + `QONTINUI_TEST_LOGIN_PASSWORD`
-///   3. The runner's own `.env` file: `VITE_DEV_EMAIL` + `VITE_DEV_PASSWORD`
+///   1. Runtime-configured creds via `POST /test-login` — explicit opt-in.
+///   2. The runner's own `.env` file: `VITE_DEV_EMAIL` + `VITE_DEV_PASSWORD`
 ///      — resolved from `<project_dir>/../.env`. This is the same account the
 ///      runner frontend is baked against, so non-primary runners reliably
-///      auto-login with zero extra supervisor setup.
+///      auto-login with zero extra supervisor setup. `.env` wins over
+///      ambient shell env vars because stale shell vars (e.g. leftover from
+///      an earlier test session) otherwise silently override the
+///      project-intended account.
+///   3. Supervisor process env vars: `QONTINUI_TEST_LOGIN_EMAIL` +
+///      `QONTINUI_TEST_LOGIN_PASSWORD` — last-resort fallback, e.g. for
+///      CI where no `.env` is checked out.
 ///
 /// SECURITY: Never forwarded to primary runners. The supervisor is a
 /// development-only tool; these credentials are dev-account only and never
@@ -307,7 +312,7 @@ pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
 }
 
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
-    // Priority 1: runtime-configured credentials (set via API)
+    // Priority 1: runtime-configured credentials (set via POST /test-login).
     if let Ok(guard) = state.test_auto_login.try_read() {
         if let Some((ref email, ref password)) = *guard {
             cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
@@ -315,7 +320,17 @@ fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
             return;
         }
     }
-    // Priority 2: env vars from supervisor process
+    // Priority 2: the runner's own `.env` file. Same account the baked
+    // VITE_DEV_EMAIL/PASSWORD point at, so temp/named runners pick up the
+    // live dev credentials without extra supervisor setup. Wins over loose
+    // shell env vars because project-intent > ambient-shell.
+    if let Some((email, password)) = read_runner_env_creds(&state.config.project_dir) {
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
+        cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
+        return;
+    }
+    // Priority 3: supervisor process env vars. Last-resort fallback for
+    // environments where `.env` isn't checked out (CI).
     if let (Ok(email), Ok(password)) = (
         std::env::var("QONTINUI_TEST_LOGIN_EMAIL"),
         std::env::var("QONTINUI_TEST_LOGIN_PASSWORD"),
@@ -323,15 +338,7 @@ fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
         if !email.is_empty() && !password.is_empty() {
             cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
             cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-            return;
         }
-    }
-    // Priority 3: the runner's own `.env` file. Same account the baked
-    // VITE_DEV_EMAIL/PASSWORD point at, so temp/named runners pick up the
-    // live dev credentials without extra supervisor setup.
-    if let Some((email, password)) = read_runner_env_creds(&state.config.project_dir) {
-        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-        cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
     }
 }
 
@@ -1128,10 +1135,6 @@ pub async fn restart_all(
 
     Ok(())
 }
-
-// =============================================================================
-// Legacy single-runner functions (backward compat — delegate to primary runner)
-// =============================================================================
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
 /// Legacy stop — targets the primary runner. Allowed for manual use.
