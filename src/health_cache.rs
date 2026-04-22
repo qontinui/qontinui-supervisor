@@ -347,9 +347,9 @@ mod tests {
             vite_port_open: false,
         };
         let cloned = health.clone();
-        assert_eq!(cloned.runner_port_open, true);
-        assert_eq!(cloned.runner_responding, true);
-        assert_eq!(cloned.vite_port_open, false);
+        assert!(cloned.runner_port_open);
+        assert!(cloned.runner_responding);
+        assert!(!cloned.vite_port_open);
     }
 
     #[test]
