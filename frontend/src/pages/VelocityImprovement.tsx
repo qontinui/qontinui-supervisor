@@ -357,7 +357,7 @@ export default function VelocityImprovement() {
         <div className="card" style={{ padding: 20, marginBottom: 24 }}>
           <h3 style={{ margin: '0 0 12px', fontSize: '1rem' }}>Score Trend</h3>
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, height: 80 }}>
-            {iterations.map((iter, i) => {
+            {iterations.map((iter) => {
               const score = iter.overall_score ?? 0;
               const height = Math.max(4, (score / 100) * 72);
               return (

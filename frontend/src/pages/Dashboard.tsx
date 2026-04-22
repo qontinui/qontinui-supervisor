@@ -157,21 +157,6 @@ const DESTRUCTIVE_ACTIONS = new Set([
   'Stop Docker',
 ]);
 
-interface ActionDef {
-  key: string;
-  display: string;
-  activeLabel: string;
-  service: string;
-  fn: () => Promise<unknown>;
-}
-
-interface RowDef {
-  name: string;
-  port: string;
-  up: boolean;
-  actions?: ActionDef[];
-}
-
 interface ServiceError {
   service: string;
   stderr: string;
