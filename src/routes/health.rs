@@ -9,7 +9,7 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
 
 use crate::config::RUNNER_API_PORT;
-use crate::health_cache::{CachedRunnerHealth, RunnerStatus, UiErrorSummary};
+use crate::health_cache::{CachedRunnerHealth, RecentCrashSummary, RunnerStatus, UiErrorSummary};
 use crate::state::SharedState;
 
 #[derive(Serialize)]
@@ -42,9 +42,16 @@ pub struct RunnerInstanceHealth {
     /// to include the `ui_error` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_error: Option<UiErrorSummary>,
+    /// Most recent Rust crash dump surfaced by the runner's /health endpoint.
+    /// `None` when the runner has no fresh dump on disk or predates the
+    /// crash-dump scanner (post-3J follow-up). Distinct from `ui_error`:
+    /// non-unwinding panics abort the process before the React boundary sees
+    /// them, so this is the only signal for that class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_crash: Option<RecentCrashSummary>,
     /// Supervisor-derived status (healthy / degraded / errored / offline /
     /// starting). Combines process liveness with the runner's self-reported
-    /// `ui_error` + `derived_status`.
+    /// `ui_error` + `derived_status` + `recent_crash`.
     pub derived_status: RunnerStatus,
 }
 
@@ -157,6 +164,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 api_responding: r.api_responding,
                 watchdog_status: WatchdogHealth::disabled(),
                 ui_error: r.ui_error.clone(),
+                recent_crash: r.recent_crash.clone(),
                 derived_status: r.derived_status.clone(),
             })
             .collect(),
@@ -217,6 +225,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             api_responding: mc.runner_responding,
             watchdog_status: WatchdogHealth::disabled(),
             ui_error: cached.and_then(|c| c.ui_error.clone()),
+            recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
         });
     }

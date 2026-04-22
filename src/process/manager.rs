@@ -106,15 +106,26 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
             // the registry after killing their processes.
             stale_ids.push(r.config.id.clone());
         } else {
-            // Mark non-temp runners as running if something is on their port,
-            // so the supervisor tracks their health without managing them.
-            if crate::process::port::is_port_in_use(r.config.port) {
+            // Mark non-temp runners as running if the HTTP /health endpoint
+            // responds, so the supervisor tracks their health without managing
+            // them. We probe HTTP rather than just TCP here because a stale
+            // socket left behind by a just-killed runner can make the TCP
+            // check return true for several seconds — that false positive
+            // used to leave the primary stuck as `running=true, pid=null`
+            // and prevented manual restart from being triggered on boot.
+            if crate::process::port::is_runner_responding(r.config.port).await {
                 info!(
                     "Runner '{}' (port {}) already running — tracking health only",
                     r.config.name, r.config.port
                 );
                 let mut runner = r.runner.write().await;
                 runner.running = true;
+            } else if crate::process::port::is_port_in_use(r.config.port) {
+                warn!(
+                    "Runner '{}' port {} is occupied but /health is not responding — \
+                     treating as offline (likely a stale socket from a just-killed process)",
+                    r.config.name, r.config.port
+                );
             }
         }
     }

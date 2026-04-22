@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { RunnerDerivedStatus, UiErrorSummary } from '../lib/api';
+import type { RecentCrashSummary, RunnerDerivedStatus, UiErrorSummary } from '../lib/api';
 
 interface RunnerStatusBadgeProps {
   /// Derived status published by the supervisor. Optional so callers reading
@@ -8,6 +8,11 @@ interface RunnerStatusBadgeProps {
   /// UI-level error reported by the runner, if any. When present, the badge
   /// becomes clickable and exposes a details panel.
   uiError?: UiErrorSummary | null;
+  /// Most recent Rust crash dump surfaced by the runner, if any. When present,
+  /// the badge becomes clickable and exposes a panic details panel. Distinct
+  /// from `uiError`: non-unwinding Rust panics abort the process before the
+  /// React boundary sees them, so this is the only signal for that class.
+  recentCrash?: RecentCrashSummary | null;
   /// Optional extra inline style for the badge wrapper (e.g. smaller font).
   style?: React.CSSProperties;
   /// If the runner does not expose a derived_status (older supervisor build
@@ -69,48 +74,67 @@ function buildTooltip(uiError: UiErrorSummary): string {
   return `${uiError.message}\n(reported at ${formatTimestamp(uiError.reported_at)}, count=${uiError.count})`;
 }
 
-/// Status badge for a single runner. Clicking the badge when a ui_error is
-/// attached toggles an inline details panel (no modal); otherwise the badge
-/// is inert.
+/// Tooltip for a recent Rust crash dump. Uses the panic message when present,
+/// otherwise a generic placeholder — mirrors the supervisor-side fallback in
+/// `derive_runner_status`.
+function buildCrashTooltip(crash: RecentCrashSummary): string {
+  const msg = crash.panicMessage ?? 'runner restarted after Rust panic';
+  const loc = crash.panicLocation ? ` @ ${crash.panicLocation}` : '';
+  return `${msg}${loc}\n(dump at ${formatTimestamp(crash.reportedAt)})`;
+}
+
+/// Status badge for a single runner. Clicking the badge when a ui_error or
+/// recent_crash is attached toggles an inline details panel (no modal);
+/// otherwise the badge is inert. When both are present, both panels stack.
 export function RunnerStatusBadge({
   derivedStatus,
   uiError,
+  recentCrash,
   style,
   fallbackUp,
 }: RunnerStatusBadgeProps) {
   const [expanded, setExpanded] = useState(false);
   const { label, badgeClass } = statusDisplay(derivedStatus, fallbackUp);
-  const hasError = uiError != null;
-  const tooltip = hasError ? buildTooltip(uiError) : undefined;
+  const hasUiError = uiError != null;
+  const hasCrash = recentCrash != null;
+  const clickable = hasUiError || hasCrash;
+  // Prefer the ui_error tooltip since it's usually the more actionable signal;
+  // fall back to the crash tooltip when no ui_error is present.
+  const tooltip = hasUiError
+    ? buildTooltip(uiError)
+    : hasCrash
+      ? buildCrashTooltip(recentCrash)
+      : undefined;
 
   const toggle = () => {
-    if (hasError) setExpanded((v) => !v);
+    if (clickable) setExpanded((v) => !v);
   };
 
   return (
     <>
       <span
-        className={`badge ${badgeClass}${hasError ? ' badge-clickable' : ''}`}
+        className={`badge ${badgeClass}${clickable ? ' badge-clickable' : ''}`}
         style={style}
         title={tooltip}
-        role={hasError ? 'button' : undefined}
-        tabIndex={hasError ? 0 : undefined}
+        role={clickable ? 'button' : undefined}
+        tabIndex={clickable ? 0 : undefined}
         onClick={toggle}
         onKeyDown={(e) => {
-          if (hasError && (e.key === 'Enter' || e.key === ' ')) {
+          if (clickable && (e.key === 'Enter' || e.key === ' ')) {
             e.preventDefault();
             toggle();
           }
         }}
       >
         {label}
-        {hasError && (
+        {clickable && (
           <span style={{ marginLeft: '0.3rem', opacity: 0.7, fontSize: '0.65rem' }}>
             {expanded ? '▾' : '▸'}
           </span>
         )}
       </span>
-      {expanded && hasError && <UiErrorPanel uiError={uiError} />}
+      {expanded && hasUiError && <UiErrorPanel uiError={uiError} />}
+      {expanded && hasCrash && <RecentCrashPanel crash={recentCrash} />}
     </>
   );
 }
@@ -203,6 +227,62 @@ function UiErrorPanel({ uiError }: UiErrorPanelProps) {
           </pre>
         </details>
       )}
+    </div>
+  );
+}
+
+interface RecentCrashPanelProps {
+  crash: RecentCrashSummary;
+}
+
+/// Inline details panel for a recent Rust crash dump. Rendered next to the
+/// badge, separate from UiErrorPanel so both can stack when both signals are
+/// present on the same runner.
+function RecentCrashPanel({ crash }: RecentCrashPanelProps) {
+  return (
+    <div
+      style={{
+        flexBasis: '100%',
+        marginTop: '0.5rem',
+        padding: '0.6rem 0.75rem',
+        background: 'rgba(239,68,68,0.08)',
+        border: '1px solid rgba(239,68,68,0.3)',
+        borderRadius: 4,
+        fontSize: '0.75rem',
+      }}
+    >
+      <div style={{ marginBottom: '0.4rem' }}>
+        <strong className="text-danger">Rust Crash:</strong>{' '}
+        <span style={{ fontFamily: 'var(--font-mono)' }}>
+          {crash.panicMessage ?? 'runner restarted after Rust panic (no message captured)'}
+        </span>
+      </div>
+      <div
+        className="text-muted"
+        style={{ fontSize: '0.7rem', marginBottom: '0.4rem', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}
+      >
+        <span>
+          <strong>Reported:</strong> {formatTimestamp(crash.reportedAt)}
+        </span>
+        {crash.panicLocation && (
+          <span>
+            <strong>Location:</strong>{' '}
+            <span style={{ fontFamily: 'var(--font-mono)' }}>{crash.panicLocation}</span>
+          </span>
+        )}
+        {crash.thread && (
+          <span>
+            <strong>Thread:</strong>{' '}
+            <span style={{ fontFamily: 'var(--font-mono)' }}>{crash.thread}</span>
+          </span>
+        )}
+      </div>
+      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+        <strong>Dump file:</strong>{' '}
+        <span style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
+          {crash.filePath}
+        </span>
+      </div>
     </div>
   );
 }

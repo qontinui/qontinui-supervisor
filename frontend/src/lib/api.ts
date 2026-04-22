@@ -104,6 +104,21 @@ export interface UiErrorSummary {
   count: number;
 }
 
+/// Most recent Rust crash dump surfaced by a runner's /health endpoint.
+/// The field names are camelCase because the runner serializes
+/// `RecentCrash` with `serde(rename_all = "camelCase")`; the supervisor passes
+/// the payload through verbatim. Non-unwinding panics abort the process
+/// before the React error boundary sees them, so a restarted runner only
+/// looks "errored" via this object. See qontinui-supervisor/src/health_cache.rs
+/// (`RecentCrashSummary`) for the source of truth.
+export interface RecentCrashSummary {
+  filePath: string;
+  reportedAt: string;
+  panicLocation?: string | null;
+  panicMessage?: string | null;
+  thread?: string | null;
+}
+
 /// Supervisor-derived status for a runner. Serialized via serde's `tag=kind`
 /// so variants with payloads (degraded/errored) carry `reason` as a sibling
 /// field.
@@ -127,6 +142,7 @@ export interface RunnerInstanceHealth {
   started_at?: string;
   api_responding: boolean;
   ui_error?: UiErrorSummary | null;
+  recent_crash?: RecentCrashSummary | null;
   derived_status: RunnerDerivedStatus;
 }
 
@@ -511,6 +527,26 @@ export interface WebFleetRunner {
   restate_healthy: boolean;
   last_heartbeat: string | null;
   status: string;
+  // Phase 3J.5 + post-3J follow-up heartbeat extensions. All optional — the
+  // web backend leaves them null until the runner heartbeats in with the
+  // extended shape. Snake-case on the wire (matches the Python schema).
+  derived_status?: string | null;
+  ui_error?: {
+    message: string;
+    stack?: string | null;
+    component_stack?: string | null;
+    digest?: string | null;
+    first_seen: string;
+    reported_at: string;
+    count: number;
+  } | null;
+  recent_crash?: {
+    file_path: string;
+    reported_at: string;
+    panic_location?: string | null;
+    panic_message?: string | null;
+    thread?: string | null;
+  } | null;
   created_at: string;
 }
 
@@ -652,6 +688,7 @@ export const api = {
         pid?: number;
         api_responding?: boolean;
         ui_error?: UiErrorSummary | null;
+        recent_crash?: RecentCrashSummary | null;
         derived_status?: RunnerDerivedStatus;
       }[]
     >('/runners'),

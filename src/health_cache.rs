@@ -53,8 +53,28 @@ pub struct UiErrorSummary {
     pub count: u32,
 }
 
+/// Snapshot of the most recent Rust crash dump the runner found on startup.
+/// Mirrors the runner's `RecentCrash` (camelCase on the wire) so
+/// `fetch_runner_health_body` can deserialize the field directly. Non-unwinding
+/// panics abort the process across the WebView2 FFI boundary and bypass the
+/// React error boundary entirely, so this is the only way fleet consumers see
+/// that a runner was just force-restarted after a Rust crash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentCrashSummary {
+    pub file_path: String,
+    pub reported_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+}
+
 /// Raw /health response body shape we care about. Uses `serde(default)` so
-/// older runners (without `ui_error` / `derived_status`) still parse cleanly.
+/// older runners (without `ui_error` / `derived_status` / `recent_crash`) still
+/// parse cleanly.
 #[derive(Debug, Deserialize)]
 struct RunnerHealthBody {
     #[serde(default)]
@@ -63,6 +83,8 @@ struct RunnerHealthBody {
     derived_status: Option<String>,
     #[serde(default)]
     ui_error: Option<UiErrorSummary>,
+    #[serde(default)]
+    recent_crash: Option<RecentCrashSummary>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,8 +108,12 @@ pub struct CachedRunnerHealth {
     /// `None` when the runner reports no error or when the field is missing
     /// (older runners predating Phase 3J.1).
     pub ui_error: Option<UiErrorSummary>,
+    /// Most recent Rust crash dump surfaced by the runner's `/health` body.
+    /// `None` when no fresh dump is on disk or the runner predates the
+    /// crash-dump scanner (post-3J follow-up).
+    pub recent_crash: Option<RecentCrashSummary>,
     /// Supervisor-derived status. Combines runner process state with the
-    /// runner's own `derived_status` + `ui_error` signals.
+    /// runner's own `derived_status` + `ui_error` + `recent_crash` signals.
     pub derived_status: RunnerStatus,
 }
 
@@ -127,9 +153,13 @@ async fn fetch_runner_health_body(port: u16) -> Option<RunnerHealthBody> {
 ///    or `Starting` (process exists but /health isn't responding yet).
 /// 2. /health reachable with a `ui_error` → `Errored { reason }` where reason
 ///    is the ui_error message truncated to 200 chars.
-/// 3. /health reachable, runner body reports `derived_status: "errored"` → `Errored`.
-/// 4. /health reachable, no ui_error, running=true → `Healthy`.
-/// 5. Everything else → `Offline`.
+/// 3. /health reachable with a `recent_crash` → `Errored { reason }` using
+///    the crash's `panicMessage` (or a generic fallback if the message was
+///    not captured). Non-unwinding Rust panics abort the process before the
+///    React boundary sees them, so this is the only signal for that class.
+/// 4. /health reachable, runner body reports `derived_status: "errored"` → `Errored`.
+/// 5. /health reachable, no error signals, running=true → `Healthy`.
+/// 6. Everything else → `Offline`.
 fn derive_runner_status(
     running: bool,
     api_responding: bool,
@@ -151,9 +181,20 @@ fn derive_runner_status(
                 reason: truncate_reason(&ui_err.message, 200),
             };
         }
+        if let Some(crash) = body.recent_crash.as_ref() {
+            let reason = crash
+                .panic_message
+                .as_deref()
+                .map(|m| truncate_reason(m, 200))
+                .unwrap_or_else(|| {
+                    "runner restarted after Rust panic (no message captured)".to_string()
+                });
+            return RunnerStatus::Errored { reason };
+        }
         // Honour runner's own self-classification if present. The runner's
         // derived_status is an application-layer signal; only "errored"
-        // escalates past Healthy here since we already handle ui_error above.
+        // escalates past Healthy here since we already handle ui_error +
+        // recent_crash above.
         if let Some(ds) = body.derived_status.as_deref() {
             if ds.eq_ignore_ascii_case("errored") {
                 return RunnerStatus::Errored {
@@ -230,16 +271,18 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 
                 // If the runner's TCP port is responsive, GET its /health to
                 // extract the application-layer signals (ui_error,
-                // derived_status) added in Phase 3J.1. Older runners that
-                // don't emit these fields will still parse cleanly thanks to
-                // `serde(default)` on RunnerHealthBody — `ui_error` stays
-                // None and `derived_status` is inferred from process state.
+                // derived_status, recent_crash). Older runners that don't
+                // emit these fields still parse cleanly thanks to
+                // `serde(default)` on RunnerHealthBody — the missing fields
+                // stay `None` and `derived_status` is inferred from process
+                // state.
                 let health_body = if runner_responding {
                     fetch_runner_health_body(runner_port).await
                 } else {
                     None
                 };
                 let ui_error = health_body.as_ref().and_then(|b| b.ui_error.clone());
+                let recent_crash = health_body.as_ref().and_then(|b| b.recent_crash.clone());
 
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;
@@ -257,6 +300,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     pid: runner_state.pid,
                     api_responding: runner_responding,
                     ui_error,
+                    recent_crash,
                     derived_status,
                 });
                 drop(runner_state);
@@ -393,6 +437,7 @@ mod tests {
                 reported_at: Utc::now(),
                 count: 1,
             }),
+            recent_crash: None,
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
@@ -411,6 +456,7 @@ mod tests {
             status: Some("starting".to_string()),
             derived_status: None,
             ui_error: None,
+            recent_crash: None,
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Starting));
@@ -422,9 +468,111 @@ mod tests {
             status: Some("ok".to_string()),
             derived_status: Some("ERRORED".to_string()), // case-insensitive
             ui_error: None,
+            recent_crash: None,
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Errored { .. }));
+    }
+
+    #[test]
+    fn test_derive_runner_status_errored_when_recent_crash_present() {
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("errored".to_string()),
+            ui_error: None,
+            recent_crash: Some(RecentCrashSummary {
+                file_path: r"D:\.dev-logs\crash_1.txt".to_string(),
+                reported_at: Utc::now(),
+                panic_location: Some("src-tauri/src/foo.rs:42:9".to_string()),
+                panic_message: Some("no reactor running".to_string()),
+                thread: Some("main".to_string()),
+            }),
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        match status {
+            RunnerStatus::Errored { reason } => {
+                assert!(reason.contains("no reactor running"));
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_derive_runner_status_errored_when_crash_has_no_message() {
+        // Truncated dumps can miss the `=== PANIC MESSAGE ===` section. The
+        // badge should still flip to errored with a placeholder reason so
+        // operators see *something*.
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("errored".to_string()),
+            ui_error: None,
+            recent_crash: Some(RecentCrashSummary {
+                file_path: r"D:\.dev-logs\crash_partial.txt".to_string(),
+                reported_at: Utc::now(),
+                panic_location: None,
+                panic_message: None,
+                thread: None,
+            }),
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        match status {
+            RunnerStatus::Errored { reason } => {
+                assert!(reason.contains("Rust panic"), "got: {reason}");
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_derive_runner_status_ui_error_wins_over_recent_crash() {
+        // A live UI error is more actionable than a historical crash dump:
+        // if both are present, surface the UI error reason in the badge.
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("errored".to_string()),
+            ui_error: Some(UiErrorSummary {
+                message: "live ui error".to_string(),
+                digest: None,
+                stack: None,
+                component_stack: None,
+                first_seen: Utc::now(),
+                reported_at: Utc::now(),
+                count: 1,
+            }),
+            recent_crash: Some(RecentCrashSummary {
+                file_path: r"D:\.dev-logs\crash_1.txt".to_string(),
+                reported_at: Utc::now(),
+                panic_location: None,
+                panic_message: Some("stale crash".to_string()),
+                thread: None,
+            }),
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        match status {
+            RunnerStatus::Errored { reason } => assert!(reason.contains("live ui error")),
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runner_health_body_parses_recent_crash_camel_case() {
+        // The runner serializes RecentCrash with serde(rename_all="camelCase").
+        // Deserializer must match that shape.
+        let json = r#"{
+            "status": "ok",
+            "derived_status": "errored",
+            "recent_crash": {
+                "filePath": "D:/.dev-logs/crash_1.txt",
+                "reportedAt": "2026-04-22T10:15:30Z",
+                "panicLocation": "src-tauri/src/foo.rs:42:9",
+                "panicMessage": "boom",
+                "thread": "main"
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(json).expect("should parse");
+        let crash = body.recent_crash.expect("recent_crash present");
+        assert_eq!(crash.panic_message.as_deref(), Some("boom"));
+        assert_eq!(crash.thread.as_deref(), Some("main"));
     }
 
     #[test]
@@ -449,6 +597,7 @@ mod tests {
         assert_eq!(body.status.as_deref(), Some("ok"));
         assert!(body.derived_status.is_none());
         assert!(body.ui_error.is_none());
+        assert!(body.recent_crash.is_none());
     }
 
     #[test]

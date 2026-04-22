@@ -106,6 +106,7 @@ pub async fn list_runners(
 
         let snapshot = cached_snapshots.iter().find(|c| c.id == managed.config.id);
         let ui_error = snapshot.and_then(|c| c.ui_error.clone());
+        let recent_crash = snapshot.and_then(|c| c.recent_crash.clone());
         let derived_status = snapshot
             .map(|c| c.derived_status.clone())
             .unwrap_or_default();
@@ -123,6 +124,7 @@ pub async fn list_runners(
             "logs_url": logs_url,
             "logs_stream_url": logs_stream_url,
             "ui_error": ui_error,
+            "recent_crash": recent_crash,
             "derived_status": derived_status,
             "watchdog": {
                 "enabled": watchdog.enabled,

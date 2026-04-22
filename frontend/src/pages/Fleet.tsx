@@ -256,7 +256,27 @@ export default function Fleet() {
                       {r.hostname}:{r.port}
                     </td>
                     <td>
-                      <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                      <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status}</span>
+                        {r.ui_error && (
+                          <span
+                            className="badge badge-danger"
+                            style={{ fontSize: '0.7rem' }}
+                            title={`UI error: ${r.ui_error.message}`}
+                          >
+                            ui error
+                          </span>
+                        )}
+                        {r.recent_crash && (
+                          <span
+                            className="badge badge-danger"
+                            style={{ fontSize: '0.7rem' }}
+                            title={`Rust crash: ${r.recent_crash.panic_message ?? 'runner restarted after Rust panic'}${r.recent_crash.panic_location ? ` @ ${r.recent_crash.panic_location}` : ''}`}
+                          >
+                            rust crash
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td>{relativeTime(r.last_heartbeat)}</td>
                     <td>

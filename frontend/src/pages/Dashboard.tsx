@@ -4,6 +4,7 @@ import {
   HealthResponse,
   DevStartResponse,
   ExpoStatus,
+  RecentCrashSummary,
   RunnerDerivedStatus,
   UiErrorSummary,
 } from '../lib/api';
@@ -198,10 +199,13 @@ interface RunnerInstance {
   pid: number | null;
   api_responding: boolean;
   // Phase 3J.3: supervisor-derived status + runner-reported ui_error.
-  // Optional so the panel keeps rendering during lock-contention gaps in the
-  // health cache (the supervisor returns `null` in that case).
+  // Post-3J follow-up adds `recent_crash` for Rust panics the React boundary
+  // cannot see. All three are optional so the panel keeps rendering during
+  // lock-contention gaps in the health cache (the supervisor returns `null`
+  // in that case).
   derived_status?: RunnerDerivedStatus;
   ui_error?: UiErrorSummary | null;
+  recent_crash?: RecentCrashSummary | null;
 }
 
 function RunnerInstancesPanel() {
@@ -405,6 +409,7 @@ function RunnerInstancesPanel() {
                       <RunnerStatusBadge
                         derivedStatus={r.derived_status}
                         uiError={r.ui_error}
+                        recentCrash={r.recent_crash}
                         fallbackUp={isUp}
                         style={{ fontSize: '0.7rem' }}
                       />

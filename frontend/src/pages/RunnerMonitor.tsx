@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { api, RunnerTaskRun, UiErrorSummary, RunnerDerivedStatus } from '../lib/api';
+import { api, RecentCrashSummary, RunnerTaskRun, UiErrorSummary, RunnerDerivedStatus } from '../lib/api';
 import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
 
 type ActionState = string | null;
@@ -30,9 +30,31 @@ function extractUiError(health: Record<string, unknown> | null): UiErrorSummary 
   };
 }
 
+/// Best-effort extraction of the runner's `recent_crash` object. The runner
+/// serializes it with camelCase keys (via `serde(rename_all="camelCase")`), so
+/// the field names on the wire differ from `ui_error`. Returns null when the
+/// runner hasn't seen a crash dump or when required fields are missing.
+function extractRecentCrash(health: Record<string, unknown> | null): RecentCrashSummary | null {
+  if (!health || typeof health !== 'object') return null;
+  const raw = (health as { recent_crash?: unknown }).recent_crash;
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const filePath = typeof obj.filePath === 'string' ? obj.filePath : null;
+  const reportedAt = typeof obj.reportedAt === 'string' ? obj.reportedAt : null;
+  if (filePath === null || reportedAt === null) return null;
+  return {
+    filePath,
+    reportedAt,
+    panicLocation: typeof obj.panicLocation === 'string' ? obj.panicLocation : null,
+    panicMessage: typeof obj.panicMessage === 'string' ? obj.panicMessage : null,
+    thread: typeof obj.thread === 'string' ? obj.thread : null,
+  };
+}
+
 /// Derive a RunnerDerivedStatus for display from the runner's own /health
 /// response. Prefers the runner's `derived_status` string if present
-/// (Phase 3J.1); otherwise infers from `ui_error` and top-level `status`.
+/// (Phase 3J.1); otherwise infers from `ui_error` / `recent_crash` /
+/// top-level `status`.
 function deriveStatus(
   health: Record<string, unknown> | null,
   fetchErrored: boolean,
@@ -41,6 +63,13 @@ function deriveStatus(
   if (!health) return { kind: 'offline' };
   const uiError = extractUiError(health);
   if (uiError) return { kind: 'errored', reason: uiError.message };
+  const crash = extractRecentCrash(health);
+  if (crash) {
+    return {
+      kind: 'errored',
+      reason: crash.panicMessage ?? 'runner restarted after Rust panic',
+    };
+  }
   const derived = (health as { derived_status?: unknown }).derived_status;
   if (typeof derived === 'string') {
     const lower = derived.toLowerCase();
@@ -144,6 +173,7 @@ export default function RunnerMonitor() {
                 <RunnerStatusBadge
                   derivedStatus={deriveStatus(runnerHealth, !!healthError)}
                   uiError={extractUiError(runnerHealth)}
+                  recentCrash={extractRecentCrash(runnerHealth)}
                   fallbackUp={isHealthy}
                 />
               )}
