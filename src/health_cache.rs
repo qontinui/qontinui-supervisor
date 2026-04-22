@@ -192,13 +192,20 @@ fn derive_runner_status(
             return RunnerStatus::Errored { reason };
         }
         // Honour runner's own self-classification if present. The runner's
-        // derived_status is an application-layer signal; only "errored"
-        // escalates past Healthy here since we already handle ui_error +
-        // recent_crash above.
+        // derived_status is an application-layer signal; we already handled
+        // ui_error + recent_crash above, so here we surface `errored` (as a
+        // belt-and-braces signal) and `degraded` (subsystem outage — e.g.
+        // embedding service unreachable — where the runner is still
+        // functional but operating in reduced capacity).
         if let Some(ds) = body.derived_status.as_deref() {
             if ds.eq_ignore_ascii_case("errored") {
                 return RunnerStatus::Errored {
                     reason: "runner reported derived_status=errored".to_string(),
+                };
+            }
+            if ds.eq_ignore_ascii_case("degraded") {
+                return RunnerStatus::Degraded {
+                    reason: "runner reported derived_status=degraded".to_string(),
                 };
             }
         }
@@ -472,6 +479,23 @@ mod tests {
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Errored { .. }));
+    }
+
+    #[test]
+    fn test_derive_runner_status_degraded_from_derived_status_field() {
+        let body = RunnerHealthBody {
+            status: Some("ok".to_string()),
+            derived_status: Some("Degraded".to_string()), // case-insensitive
+            ui_error: None,
+            recent_crash: None,
+        };
+        let status = derive_runner_status(true, true, Some(&body));
+        match status {
+            RunnerStatus::Degraded { reason } => {
+                assert!(reason.contains("degraded"));
+            }
+            other => panic!("expected Degraded, got {:?}", other),
+        }
     }
 
     #[test]
