@@ -43,8 +43,6 @@
 //! gymnastics are required. The thread is never `join`ed — it terminates
 //! with the process.
 
-#![cfg(windows)]
-
 use std::thread;
 
 use tao::dpi::{LogicalPosition, LogicalSize};
