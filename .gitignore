@@ -1,4 +1,6 @@
 /target
+/target-test
+/target-pool
 Cargo.lock
 *.exe
 *.pdb
