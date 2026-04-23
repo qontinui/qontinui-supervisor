@@ -361,8 +361,38 @@ pub async fn remove_runner(
 pub async fn purge_stale(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    let purged_triples = purge_stale_test_runners_core(&state).await;
+    let count = purged_triples.len();
+    let purged: Vec<serde_json::Value> = purged_triples
+        .iter()
+        .map(|(id, name, port)| json!({ "id": id, "name": name, "port": port }))
+        .collect();
+
+    if count > 0 {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!("Purged {} stale test runner(s)", count),
+            )
+            .await;
+    }
+
+    Ok(Json(json!({
+        "purged": count,
+        "runners": purged,
+    })))
+}
+
+/// Shared implementation behind `POST /runners/purge-stale` and the periodic
+/// `reap_stale_test_runners` background task in `main.rs`. Returns the
+/// `(id, name, port)` of every test runner that was evicted — placeholders
+/// whose process never became responsive, plus zombies where the process died
+/// but the in-memory registry still said "running".
+pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, String, u16)> {
     let runners = state.get_all_runners().await;
-    let mut purged: Vec<serde_json::Value> = Vec::new();
+    let mut purged: Vec<(String, String, u16)> = Vec::new();
 
     for managed in &runners {
         if !manager::is_temp_runner(&managed.config.id) {
@@ -454,29 +484,10 @@ pub async fn purge_stale(
             "purge-stale: removed test runner '{}' (port {})",
             name, port
         );
-        purged.push(json!({
-            "id": id,
-            "name": name,
-            "port": port,
-        }));
+        purged.push((id, name, port));
     }
 
-    let count = purged.len();
-    if count > 0 {
-        state
-            .logs
-            .emit(
-                LogSource::Supervisor,
-                LogLevel::Info,
-                format!("Purged {} stale test runner(s)", count),
-            )
-            .await;
-    }
-
-    Ok(Json(json!({
-        "purged": count,
-        "runners": purged,
-    })))
+    purged
 }
 
 /// POST /runners/{id}/start — start a specific runner.

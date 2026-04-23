@@ -240,6 +240,37 @@ pub async fn fix_and_rebuild(
     })))
 }
 
+/// Trigger a graceful shutdown of the supervisor.
+///
+/// Unlike `Stop-Process -Force` (which uses `TerminateProcess` on Windows and
+/// can't be caught), this endpoint routes through the same drain that
+/// `Ctrl+C` uses: axum finishes in-flight requests before the process exits,
+/// so callers waiting on a long `spawn-test` build see a proper response (or
+/// a 503 if they hit us after the drain started) instead of an empty body.
+///
+/// Returns immediately so the HTTP response completes before the drain window.
+pub async fn supervisor_shutdown(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            "HTTP shutdown requested — initiating graceful drain",
+        )
+        .await;
+
+    // The shutdown_signal task in main.rs races ctrl_c against shutdown_tx;
+    // a single broadcast here unblocks the drain. Drop the result (no
+    // subscribers is not an error — means the shutdown_signal future already
+    // fired, e.g. concurrent ctrl_c).
+    let _ = state.shutdown_tx.send(());
+
+    Json(serde_json::json!({
+        "status": "shutting_down",
+        "message": "Supervisor graceful shutdown initiated"
+    }))
+}
+
 /// Self-restart the supervisor process with the same CLI args.
 pub async fn supervisor_restart(
     State(state): State<SharedState>,

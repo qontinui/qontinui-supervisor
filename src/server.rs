@@ -58,6 +58,11 @@ pub fn build_router(state: SharedState) -> Router {
             "/supervisor/restart",
             post(crate::routes::runner::supervisor_restart),
         )
+        // Supervisor graceful shutdown (scriptable alternative to Stop-Process -Force).
+        .route(
+            "/supervisor/shutdown",
+            post(crate::routes::runner::supervisor_shutdown),
+        )
         // AI provider/model management
         .route("/ai/provider", get(crate::routes::ai::get_provider))
         .route("/ai/provider", post(crate::routes::ai::set_provider))

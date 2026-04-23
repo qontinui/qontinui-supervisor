@@ -183,6 +183,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Also periodically sweep stale test-runner placeholders. `spawn-test`
+    // reserves a placeholder before the build finishes; when the build fails
+    // or the user aborts the supervisor mid-spawn, the placeholder never
+    // reaches `running = true` and lingers in the registry, consuming a port
+    // slot. The same `purge_stale_test_runners_core` helper that backs
+    // `POST /runners/purge-stale` is called here on a 5-minute cadence so the
+    // registry drains without operator intervention.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            reap_stale_test_runners(state_clone).await;
+        });
+    }
+
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
     let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
@@ -319,25 +333,79 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
     }
 }
 
+/// Interval at which the stale-test-runner sweeper runs. 5 minutes is a
+/// balance between responsiveness (port slots aren't tied up long) and cost
+/// (the sweep walks the registry + probes ports).
+const STALE_TEST_RUNNER_SWEEP_SECS: u64 = 5 * 60;
+
+/// Periodically run `purge_stale_test_runners_core` to drain placeholders
+/// left behind by failed or interrupted `spawn-test` calls. Best-effort —
+/// errors are swallowed; the next tick retries.
+async fn reap_stale_test_runners(state: state::SharedState) {
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(STALE_TEST_RUNNER_SWEEP_SECS));
+    interval.tick().await; // skip immediate first tick
+
+    loop {
+        interval.tick().await;
+        let purged = crate::routes::runners::purge_stale_test_runners_core(&state).await;
+        if !purged.is_empty() {
+            info!(
+                "reap_stale_test_runners: swept {} stale placeholder(s): {:?}",
+                purged.len(),
+                purged
+                    .iter()
+                    .map(|(id, _, port)| format!("{} ({})", id, port))
+                    .collect::<Vec<_>>()
+            );
+            state
+                .logs
+                .emit(
+                    log_capture::LogSource::Supervisor,
+                    log_capture::LogLevel::Info,
+                    format!(
+                        "Periodic sweep purged {} stale test-runner placeholder(s)",
+                        purged.len()
+                    ),
+                )
+                .await;
+        }
+    }
+}
+
 async fn shutdown_signal(state: Arc<SupervisorState>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to install Ctrl+C handler");
     };
+    // Allow an HTTP-initiated shutdown by racing the ctrl_c future against a
+    // broadcast receiver on `shutdown_tx`. `POST /supervisor/shutdown` sends to
+    // this channel so scripted callers can trigger a graceful drain instead of
+    // resorting to `Stop-Process -Force` (which kills mid-request and leaves
+    // in-flight `spawn-test` callers with an empty response body).
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    let http_trigger = async {
+        let _ = shutdown_rx.recv().await;
+    };
 
-    ctrl_c.await;
-    info!("Received shutdown signal");
+    let reason = tokio::select! {
+        _ = ctrl_c => "ctrl_c",
+        _ = http_trigger => "http_endpoint",
+    };
+    info!("Received shutdown signal ({})", reason);
     state
         .logs
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            "Shutdown signal received",
+            format!("Shutdown signal received ({})", reason),
         )
         .await;
 
-    // Notify all WS/SSE clients to close cleanly (prevents zombie sockets)
+    // Notify all WS/SSE clients to close cleanly (prevents zombie sockets).
+    // Safe to re-send even when the HTTP endpoint already did: broadcast::send
+    // is idempotent for subscribers that already drained the prior message.
     let _ = state.shutdown_tx.send(());
 
     // Give clients a moment to receive the shutdown message and close
