@@ -113,6 +113,17 @@ pub fn build_router(state: SharedState) -> Router {
             "/supervisor-bridge/control/page/refresh",
             post(crate::routes::supervisor_bridge::page_refresh),
         )
+        // F2 — Network stub registry (mirrors runner's /control/network/stubs*)
+        .route(
+            "/supervisor-bridge/control/network/stubs",
+            post(crate::routes::supervisor_bridge::register_network_stub)
+                .get(crate::routes::supervisor_bridge::list_network_stubs)
+                .delete(crate::routes::supervisor_bridge::clear_network_stubs),
+        )
+        .route(
+            "/supervisor-bridge/control/network/stubs/{id}",
+            delete(crate::routes::supervisor_bridge::delete_network_stub),
+        )
         .route(
             "/supervisor-bridge/health",
             get(crate::routes::supervisor_bridge::bridge_health),

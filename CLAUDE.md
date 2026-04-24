@@ -230,14 +230,18 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | POST | `/supervisor-bridge/commands` | Submit a command response |
 | POST | `/supervisor-bridge/heartbeat` | Dashboard heartbeat |
 | GET | `/supervisor-bridge/health` | Bridge health status |
-| GET | `/supervisor-bridge/control/snapshot` | Full snapshot of dashboard UI |
+| GET | `/supervisor-bridge/control/snapshot` | Full snapshot of dashboard UI. Includes `registration: {totalRegistered, everHadRegistrations, byRoute}` so callers can distinguish "no elements on this page" from "this app has no bridge coverage". |
 | GET | `/supervisor-bridge/control/elements` | List dashboard UI elements |
 | POST | `/supervisor-bridge/control/element/{id}/action` | Execute action on dashboard element |
 | POST | `/supervisor-bridge/control/discover` | Trigger element discovery |
 | GET | `/supervisor-bridge/control/console-errors` | Get console errors from dashboard |
 | POST | `/supervisor-bridge/control/page/evaluate` | Evaluate JS in dashboard webview |
-| POST | `/supervisor-bridge/control/page/navigate` | Navigate dashboard page |
+| POST | `/supervisor-bridge/control/page/navigate` | Navigate dashboard page. Body: `{url, mode?: "soft"\|"hard"}`. Default `"hard"` (full webview reload); `"soft"` uses `history.pushState` + synthetic `popstate` so injected globals (fetch patches, test state) survive. |
 | POST | `/supervisor-bridge/control/page/refresh` | Refresh dashboard page |
+| POST | `/supervisor-bridge/control/network/stubs` | Register a fetch stub. Body: `{urlPattern, method?, response: {status?, headers?, body\|bodyJson}, times?: 1\|"always"}`. Returns `{id}`. Stubs persist across soft navigations, cleared on hard reload. |
+| GET | `/supervisor-bridge/control/network/stubs` | List active stubs with hit counts + remaining matches |
+| DELETE | `/supervisor-bridge/control/network/stubs/{id}` | Remove one stub by id |
+| DELETE | `/supervisor-bridge/control/network/stubs` | Clear all stubs. Returns `{cleared: <count>}` |
 
 ### Diagnostics
 

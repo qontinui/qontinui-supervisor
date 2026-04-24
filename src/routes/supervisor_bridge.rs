@@ -227,6 +227,11 @@ pub struct EvaluateBody {
 #[derive(Deserialize)]
 pub struct NavigateBody {
     url: String,
+    /// Optional navigation mode (F1): `"hard"` (default, full reload) or
+    /// `"soft"` (SPA-friendly `pushState` + synthetic events). Any other
+    /// value is rejected with a 400.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -473,13 +478,234 @@ pub async fn page_evaluate(
 }
 
 /// POST /supervisor-bridge/control/page/navigate
+///
+/// Accepts an optional `mode` field (`"hard"` | `"soft"`). Default `"hard"`
+/// preserves pre-F1 behaviour (full webview reload). `"soft"` performs a
+/// `history.pushState` + synthetic `popstate`/`ui-bridge:navigate` event pair
+/// so SPA routers pick up the change without wiping injected window state.
+/// Any other value is rejected with 400.
 pub async fn page_navigate(
     State(state): State<SharedState>,
     Json(body): Json<NavigateBody>,
 ) -> impl IntoResponse {
+    let mode = match body.mode.as_deref() {
+        None | Some("hard") => "hard",
+        Some("soft") => "soft",
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("invalid mode `{}` (expected \"hard\" or \"soft\")", other),
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let payload = serde_json::json!({
+        "url": body.url,
+        "mode": mode,
+    });
+
     match state
         .command_relay
-        .queue_command("pageNavigate", serde_json::json!({"url": body.url}))
+        .queue_command("pageNavigate", payload)
+        .await
+    {
+        Ok(mut data) => {
+            // Defensive: guarantee the audit fields are present even if the
+            // browser-side handler omits them.
+            if let Some(obj) = data.as_object_mut() {
+                obj.entry("mode".to_string())
+                    .or_insert_with(|| serde_json::Value::String(mode.to_string()));
+                obj.entry("hard".to_string())
+                    .or_insert_with(|| serde_json::Value::Bool(mode == "hard"));
+            }
+            success_response(data).into_response()
+        }
+        Err((status, json)) => (status, json).into_response(),
+    }
+}
+
+// ============================================================================
+// F2 — Network stub registry
+// ============================================================================
+//
+// Four endpoints mirror the runner's
+// `/ui-bridge/control/network/stubs[/id]` shape. Validation runs locally
+// so we can return structured 400s without paying the browser IPC round-
+// trip; the SDK-side `validateStubRequest` in
+// `packages/ui-bridge/src/network/stubs.ts` is the source of truth for
+// semantics and this layer must stay in lockstep with it.
+
+fn is_valid_stub_method(m: &str) -> bool {
+    matches!(m, "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "*")
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StubResponseBody {
+    #[serde(default)]
+    pub status: Option<i64>,
+    // `headers` is only inspected via the raw JSON that's forwarded to the
+    // SDK, but we accept it here for shape validation and to let the test
+    // module assert the camelCase / snake_case contract.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub headers: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub body_json: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StubRequestBody {
+    pub url_pattern: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    pub response: Option<StubResponseBody>,
+    #[serde(default)]
+    pub times: Option<serde_json::Value>,
+}
+
+impl StubRequestBody {
+    pub fn validate(&self) -> Result<(), String> {
+        let pattern = self
+            .url_pattern
+            .as_deref()
+            .ok_or("urlPattern is required")?;
+        if pattern.is_empty() {
+            return Err("urlPattern must be non-empty".into());
+        }
+        if let Some(m) = self.method.as_deref() {
+            if !is_valid_stub_method(m) {
+                return Err(format!(
+                    "method must be one of GET|POST|PUT|DELETE|PATCH|*, got \"{}\"",
+                    m
+                ));
+            }
+        }
+        let response = self.response.as_ref().ok_or("response is required")?;
+        if let Some(status) = response.status {
+            if !(100..=599).contains(&status) {
+                return Err(format!("status must be in 100-599, got {}", status));
+            }
+        }
+        match (response.body.is_some(), response.body_json.is_some()) {
+            (false, false) => {
+                return Err("exactly one of response.body or response.bodyJson is required".into())
+            }
+            (true, true) => {
+                return Err("response.body and response.bodyJson are mutually exclusive".into())
+            }
+            _ => {}
+        }
+        if let Some(times) = &self.times {
+            let ok = match times {
+                serde_json::Value::String(s) => s == "always",
+                serde_json::Value::Number(n) => n.as_i64().is_some_and(|i| i >= 1),
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "times must be \"always\" or a positive integer, got {}",
+                    times
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// POST /supervisor-bridge/control/network/stubs
+pub async fn register_network_stub(
+    State(state): State<SharedState>,
+    Json(raw): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let req: StubRequestBody = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("invalid stub body: {}", e),
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = req.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .command_relay
+        .queue_command("registerNetworkStub", raw)
+        .await
+    {
+        Ok(data) => success_response(data).into_response(),
+        Err((status, json)) => (status, json).into_response(),
+    }
+}
+
+/// GET /supervisor-bridge/control/network/stubs
+pub async fn list_network_stubs(State(state): State<SharedState>) -> impl IntoResponse {
+    match state
+        .command_relay
+        .queue_command("listNetworkStubs", serde_json::json!({}))
+        .await
+    {
+        Ok(data) => success_response(data).into_response(),
+        Err((status, json)) => (status, json).into_response(),
+    }
+}
+
+/// DELETE /supervisor-bridge/control/network/stubs/:id
+pub async fn delete_network_stub(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .command_relay
+        .queue_command("deleteNetworkStub", serde_json::json!({ "id": id }))
+        .await
+    {
+        Ok(data) => {
+            if data.get("code").and_then(|c| c.as_str()) == Some("NOT_FOUND") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("stub {} not found", id),
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    })),
+                )
+                    .into_response();
+            }
+            success_response(data).into_response()
+        }
+        Err((status, json)) => (status, json).into_response(),
+    }
+}
+
+/// DELETE /supervisor-bridge/control/network/stubs
+pub async fn clear_network_stubs(State(state): State<SharedState>) -> impl IntoResponse {
+    match state
+        .command_relay
+        .queue_command("clearNetworkStubs", serde_json::json!({}))
         .await
     {
         Ok(data) => success_response(data).into_response(),
@@ -542,4 +768,148 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
         },
         "timestamp": chrono::Utc::now().timestamp_millis(),
     }))
+}
+
+#[cfg(test)]
+mod page_navigate_mode_tests {
+    //! F1: back-compat + new-mode unit tests for `NavigateBody` deserialization.
+    //!
+    //! The full handler touches `SharedState` so end-to-end testing lives in
+    //! integration tests. These tests exercise the JSON shape + mode
+    //! normalization semantics used by the handler.
+
+    use super::NavigateBody;
+
+    fn parse(body: &str) -> NavigateBody {
+        serde_json::from_str(body).expect("NavigateBody should deserialize")
+    }
+
+    #[test]
+    fn legacy_body_without_mode_parses() {
+        let b = parse(r#"{"url":"/fleet"}"#);
+        assert_eq!(b.url, "/fleet");
+        assert_eq!(b.mode, None);
+    }
+
+    #[test]
+    fn body_with_soft_mode_parses() {
+        let b = parse(r#"{"url":"/fleet","mode":"soft"}"#);
+        assert_eq!(b.url, "/fleet");
+        assert_eq!(b.mode.as_deref(), Some("soft"));
+    }
+
+    #[test]
+    fn body_with_hard_mode_parses() {
+        let b = parse(r#"{"url":"/fleet","mode":"hard"}"#);
+        assert_eq!(b.mode.as_deref(), Some("hard"));
+    }
+
+    #[test]
+    fn body_with_unknown_mode_still_deserializes() {
+        // The router-layer validation in `page_navigate` rejects unknown
+        // modes with a 400; the struct itself accepts any string so we can
+        // surface a clean error message instead of a serde rejection.
+        let b = parse(r#"{"url":"/fleet","mode":"spa"}"#);
+        assert_eq!(b.mode.as_deref(), Some("spa"));
+    }
+}
+
+#[cfg(test)]
+mod stub_request_tests {
+    //! F2: deserialization + validation tests for `StubRequestBody` /
+    //! `StubResponseBody`. Mirrors the runner-side
+    //! `stubs::stub_request_tests` so the two layers can't drift.
+
+    use super::{StubRequestBody, StubResponseBody};
+
+    fn parse(body: &str) -> StubRequestBody {
+        serde_json::from_str(body).expect("StubRequestBody must deserialize")
+    }
+
+    #[test]
+    fn minimal_valid_body() {
+        parse(r#"{"urlPattern":"/foo","response":{"body":"hi"}}"#)
+            .validate()
+            .expect("valid");
+    }
+
+    #[test]
+    fn body_json_camel_case_wire_key() {
+        let req = parse(r#"{"urlPattern":"/foo","response":{"bodyJson":{"a":1}}}"#);
+        let resp: &StubResponseBody = req.response.as_ref().expect("response");
+        assert!(resp.body_json.is_some());
+        assert!(resp.body.is_none());
+        req.validate().expect("valid");
+    }
+
+    #[test]
+    fn missing_url_pattern() {
+        let req = parse(r#"{"response":{"body":"x"}}"#);
+        assert!(req.validate().unwrap_err().contains("urlPattern"));
+    }
+
+    #[test]
+    fn unknown_method() {
+        let req = parse(r#"{"urlPattern":"/f","method":"HEAD","response":{"body":"x"}}"#);
+        assert!(req.validate().unwrap_err().contains("method"));
+    }
+
+    #[test]
+    fn wildcard_method_accepted() {
+        parse(r#"{"urlPattern":"/f","method":"*","response":{"body":"x"}}"#)
+            .validate()
+            .expect("valid");
+    }
+
+    #[test]
+    fn both_bodies_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","response":{"body":"x","bodyJson":{"a":1}}}"#);
+        assert!(req.validate().unwrap_err().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn neither_body_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","response":{}}"#);
+        assert!(req.validate().unwrap_err().contains("bodyJson"));
+    }
+
+    #[test]
+    fn status_out_of_range() {
+        let req = parse(r#"{"urlPattern":"/f","response":{"body":"x","status":42}}"#);
+        assert!(req.validate().unwrap_err().contains("100-599"));
+    }
+
+    #[test]
+    fn times_always_accepted() {
+        parse(r#"{"urlPattern":"/f","response":{"body":"x"},"times":"always"}"#)
+            .validate()
+            .expect("valid");
+    }
+
+    #[test]
+    fn times_positive_int_accepted() {
+        parse(r#"{"urlPattern":"/f","response":{"body":"x"},"times":5}"#)
+            .validate()
+            .expect("valid");
+    }
+
+    #[test]
+    fn times_zero_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","response":{"body":"x"},"times":0}"#);
+        assert!(req.validate().unwrap_err().contains("positive integer"));
+    }
+
+    #[test]
+    fn times_unknown_string_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","response":{"body":"x"},"times":"once"}"#);
+        assert!(req.validate().unwrap_err().contains("always"));
+    }
+
+    #[test]
+    fn response_headers_survive_roundtrip() {
+        let req = parse(r#"{"urlPattern":"/f","response":{"body":"x","headers":{"x-a":"1"}}}"#);
+        req.validate().expect("valid");
+        let headers = req.response.unwrap().headers.unwrap();
+        assert_eq!(headers.get("x-a").unwrap().as_str(), Some("1"));
+    }
 }
