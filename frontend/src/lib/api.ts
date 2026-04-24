@@ -119,6 +119,56 @@ export interface RecentCrashSummary {
   thread?: string | null;
 }
 
+/// Phase 2c (Item 9) stale-binary summary. Surfaced on `/runners` and
+/// `/runners/{id}/logs` responses when a pool slot holds a binary that's
+/// more than 30 seconds newer than the copy the running runner was started
+/// from. `null`/absent is the normal state — the running binary is as fresh
+/// as or newer than any available slot binary. The dashboard renders this as
+/// a yellow "stale binary" badge next to the runner name, with a click-through
+/// to restart the runner (picking up the newer build). See
+/// `qontinui-supervisor::process::manager::StaleBinary` for the Rust source
+/// of truth; field names are snake_case on the wire (default serde).
+export interface StaleBinarySummary {
+  /// Unix millis of the copy the supervisor made at start time
+  /// (`target/debug/qontinui-runner-<id>.exe`).
+  running_mtime_ms: number;
+  /// Unix millis of the newest `target-pool/slot-*/debug/qontinui-runner.exe`.
+  slot_mtime_ms: number;
+  /// Which slot (0, 1, 2, ...) holds the newer build.
+  slot_id: number;
+  /// `slot_mtime - running_mtime` in whole seconds. Always > 30 when surfaced.
+  age_delta_secs: number;
+}
+
+/// Phase 2b startup-panic telemetry. Parsed from the runner's
+/// `runner-panic.log` when the supervisor observes a non-zero exit AND a
+/// fresh panic file is on disk (see
+/// `qontinui-supervisor::process::panic_log::RecentPanic`). Distinct from
+/// `RecentCrashSummary`, which is the on-runtime WebView2 crash dump polled
+/// via /health. Field names are snake_case on the wire (default serde).
+export interface RecentPanicSummary {
+  /// RFC3339 timestamp the panic was written at.
+  timestamp: string;
+  /// Panic payload (first arg to `panic!()` or the implicit
+  /// assert/unwrap message).
+  payload: string;
+  /// `file.rs:line:col` where the panic fired, if known.
+  location?: string | null;
+  /// Thread name, or null if the thread was unnamed.
+  thread?: string | null;
+  /// First 15 frames of the backtrace, joined with `\n`.
+  backtrace_preview?: string | null;
+  /// Runner id taken from the panic-log header.
+  runner_id?: string | null;
+  /// Runner PID at the time of the panic.
+  pid?: number | null;
+  /// Runner binary version that panicked.
+  version?: string | null;
+  /// Absolute path to the source file on disk — useful when diagnosing
+  /// from the supervisor CLI.
+  file_path: string;
+}
+
 /// Supervisor-derived status for a runner. Serialized via serde's `tag=kind`
 /// so variants with payloads (degraded/errored) carry `reason` as a sibling
 /// field.
@@ -689,6 +739,8 @@ export const api = {
         api_responding?: boolean;
         ui_error?: UiErrorSummary | null;
         recent_crash?: RecentCrashSummary | null;
+        recent_panic?: RecentPanicSummary | null;
+        stale_binary?: StaleBinarySummary | null;
         derived_status?: RunnerDerivedStatus;
       }[]
     >('/runners'),

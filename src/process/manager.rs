@@ -47,6 +47,116 @@ pub fn binary_meta(path: &std::path::Path) -> Option<BinaryMeta> {
     })
 }
 
+// =============================================================================
+// Stale-binary detection (Phase 2c — Item 9)
+// =============================================================================
+
+/// Minimum `slot_mtime - running_mtime` gap (in seconds) before we surface a
+/// `stale_binary` entry. Tuned to absorb filesystem mtime resolution jitter
+/// and near-simultaneous builds that racily complete around a running-runner
+/// start. Anything finer than ~30s is not actionable ("rebuild now to pick it
+/// up") because a user-issued restart at t=0 routinely reads a slot binary
+/// stamped t+2s from the same cargo invocation. 30s keeps the badge meaningful.
+pub const STALE_BINARY_THRESHOLD_SECS: i64 = 30;
+
+/// Per-runner "newer build available" summary surfaced on `/runners` and
+/// `/runners/{id}/logs`. `None` is the normal case (running binary is newer
+/// than or equal to the newest slot, within the 30s jitter threshold).
+#[derive(Clone, serde::Serialize)]
+pub struct StaleBinary {
+    /// Unix millis of the copy the supervisor made at start time
+    /// (`target/debug/qontinui-runner-<id>.exe`).
+    pub running_mtime_ms: i64,
+    /// Unix millis of the newest `target-pool/slot-*/debug/qontinui-runner.exe`.
+    pub slot_mtime_ms: i64,
+    /// Which slot holds the newer build.
+    pub slot_id: u8,
+    /// `slot_mtime - running_mtime` in whole seconds. Always positive when
+    /// surfaced — the field is `None` when the running binary is newer.
+    pub age_delta_secs: i64,
+}
+
+/// Stat the supervisor's per-runner exe copy and return its mtime.
+///
+/// Returns `None` when the copy does not exist yet (runner never started under
+/// this supervisor, or the path resolver failed to copy). The live path is
+/// `target/debug/qontinui-runner-<id>.exe` — the same path set up by
+/// `start_exe_mode_for_runner` before spawning the child.
+pub fn running_binary_mtime(state: &SharedState, runner_id: &str) -> Option<std::time::SystemTime> {
+    let path = state.config.runner_exe_copy_path(runner_id);
+    std::fs::metadata(&path).ok()?.modified().ok()
+}
+
+/// Scan every `target-pool/slot-*/debug/qontinui-runner.exe` and return the
+/// `(slot_id, mtime)` of the newest. Returns `None` when the pool has never
+/// produced a binary yet.
+pub async fn newest_slot_binary_mtime(state: &SharedState) -> Option<(u8, std::time::SystemTime)> {
+    let mut best: Option<(u8, std::time::SystemTime)> = None;
+    for slot in &state.build_pool.slots {
+        let path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let slot_id_u8: u8 = slot.id.min(u8::MAX as usize) as u8;
+        best = match best {
+            Some((_, current)) if current >= mtime => best,
+            _ => Some((slot_id_u8, mtime)),
+        };
+    }
+    best
+}
+
+/// Convert a `SystemTime` to unix millis, saturating at i64 bounds. Values
+/// predating the epoch return a negative ms count (shouldn't happen for
+/// filesystem mtimes on sane clocks, but defined for test-fixture ergonomics).
+fn system_time_to_unix_millis(t: std::time::SystemTime) -> i64 {
+    match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// Compute a `StaleBinary` record from the raw mtimes. Pure function — the
+/// actual `SystemTime` lookups live in `running_binary_mtime` /
+/// `newest_slot_binary_mtime` so this is trivially testable.
+///
+/// Returns `Some` only when the newest slot binary is strictly newer than the
+/// running copy by more than `STALE_BINARY_THRESHOLD_SECS`. Equal or
+/// within-threshold deltas yield `None` (normal state — restart is a no-op
+/// from a binary-freshness perspective).
+pub fn compute_stale_binary(
+    running: Option<std::time::SystemTime>,
+    newest_slot: Option<(u8, std::time::SystemTime)>,
+) -> Option<StaleBinary> {
+    let running = running?;
+    let (slot_id, slot_mtime) = newest_slot?;
+    // Compute the delta in whole seconds. `duration_since` errors when the
+    // left side predates the right (i.e. running > slot) — that's the "not
+    // stale" case. Ignore it and return `None`.
+    let delta_secs = slot_mtime.duration_since(running).ok()?.as_secs() as i64;
+    if delta_secs <= STALE_BINARY_THRESHOLD_SECS {
+        return None;
+    }
+    Some(StaleBinary {
+        running_mtime_ms: system_time_to_unix_millis(running),
+        slot_mtime_ms: system_time_to_unix_millis(slot_mtime),
+        slot_id,
+        age_delta_secs: delta_secs,
+    })
+}
+
+/// Convenience wrapper: look up the runner's running copy + newest slot and
+/// call `compute_stale_binary`. Returns `None` on any I/O miss — callers
+/// treat the field as strictly informational.
+pub async fn stale_binary_for_runner(state: &SharedState, runner_id: &str) -> Option<StaleBinary> {
+    let running = running_binary_mtime(state, runner_id);
+    let newest_slot = newest_slot_binary_mtime(state).await;
+    compute_stale_binary(running, newest_slot)
+}
+
 /// Locate the most recent successfully-built runner exe across the build pool.
 ///
 /// Preference order:
@@ -300,6 +410,35 @@ pub fn forward_extra_env(cmd: &mut Command, config: &RunnerConfig) {
     }
 }
 
+/// Decide and set `QONTINUI_RUNNER_LOG_DIR` for the spawned runner, plus
+/// `QONTINUI_RUNNER_ID` so the runner's panic hook can tag its output.
+///
+/// Resolution:
+/// * If `config.log_dir` is set on the supervisor (`--log-dir <dir>`), use
+///   `<log-dir>/runner-<id>/`. The per-runner subdir avoids clobbering a
+///   sibling runner's `runner-panic.log` when several test runners panic
+///   in quick succession.
+/// * Otherwise the runner's default path is fine — we still set
+///   `QONTINUI_RUNNER_ID` so any diagnostic tooling can correlate.
+///
+/// Returns the path the supervisor should check for `runner-panic.log`
+/// when the process exits, or `None` when we deferred to the default.
+fn forward_panic_log_env(
+    cmd: &mut Command,
+    state: &crate::state::SharedState,
+    runner_id: &str,
+) -> Option<std::path::PathBuf> {
+    cmd.env("QONTINUI_RUNNER_ID", runner_id);
+    if let Some(log_dir) = state.config.log_dir.as_ref() {
+        let per_runner = log_dir.join(format!("runner-{}", runner_id));
+        let _ = std::fs::create_dir_all(&per_runner);
+        cmd.env("QONTINUI_RUNNER_LOG_DIR", &per_runner);
+        Some(per_runner)
+    } else {
+        None
+    }
+}
+
 pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
     if !config.server_mode {
         return;
@@ -450,13 +589,29 @@ pub async fn start_managed_runner(
         )
         .await;
 
-    let mut child = start_exe_mode_for_runner(state, managed).await?;
+    let SpawnResult {
+        mut child,
+        panic_log_dir,
+    } = start_exe_mode_for_runner(state, managed).await?;
 
     let pid = child.id();
     info!(
         "Runner '{}' started with PID {:?} on port {}",
         runner_name, pid, port
     );
+
+    // Remember the panic log dir so `monitor_runner_process_exit` can find
+    // the file after a non-zero exit. Also clear any stale `recent_panic`
+    // left over from a previous boot of this runner id — a clean start
+    // should not continue surfacing an old panic in the runner list.
+    {
+        let mut slot = managed.panic_log_dir.write().await;
+        *slot = panic_log_dir.clone();
+    }
+    {
+        let mut slot = managed.recent_panic.write().await;
+        *slot = None;
+    }
 
     // Capture stdout/stderr to the managed runner's logs
     if let Some(stdout) = child.stdout.take() {
@@ -519,11 +674,20 @@ pub async fn start_managed_runner(
     Ok(())
 }
 
+/// Result of spawning a runner in exe mode.
+struct SpawnResult {
+    child: tokio::process::Child,
+    /// Directory the supervisor told the runner to write its panic log to
+    /// via `QONTINUI_RUNNER_LOG_DIR`. `None` when the supervisor deferred
+    /// to the runner's default path (no `--log-dir` configured).
+    panic_log_dir: Option<std::path::PathBuf>,
+}
+
 /// Start exe mode for a specific runner with port/name env vars.
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
-) -> Result<tokio::process::Child, SupervisorError> {
+) -> Result<SpawnResult, SupervisorError> {
     // Locate the source exe. With the parallel build pool, each slot builds
     // into its own `target-pool/slot-{k}/debug/`. Prefer the slot that produced
     // the most recent successful build; fall back to the legacy single-target
@@ -556,7 +720,7 @@ async fn start_exe_mode_for_runner(
     );
 
     #[cfg(windows)]
-    let child = {
+    let (child, panic_log_dir) = {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -607,14 +771,20 @@ async fn start_exe_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        // Startup-panic telemetry: tell the runner where to drop
+        // `runner-panic.log` so `monitor_runner_process_exit` can pick it up.
+        let panic_log_dir = forward_panic_log_env(&mut cmd, state, &managed.config.id);
         forward_extra_env(&mut cmd, &managed.config);
 
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
+        (
+            cmd.spawn()
+                .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?,
+            panic_log_dir,
+        )
     };
 
     #[cfg(not(windows))]
-    let child = {
+    let (child, panic_log_dir) = {
         let mut cmd = Command::new(&exe_path);
         cmd.current_dir(&state.config.project_dir)
             .stdout(Stdio::piped())
@@ -639,13 +809,20 @@ async fn start_exe_mode_for_runner(
         }
 
         forward_restate_env(&mut cmd, &managed.config);
+        let panic_log_dir = forward_panic_log_env(&mut cmd, state, &managed.config.id);
         forward_extra_env(&mut cmd, &managed.config);
 
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?
+        (
+            cmd.spawn()
+                .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?,
+            panic_log_dir,
+        )
     };
 
-    Ok(child)
+    Ok(SpawnResult {
+        child,
+        panic_log_dir,
+    })
 }
 
 /// Default deadline for a newly-spawned runner to bind its HTTP API
@@ -804,6 +981,15 @@ async fn monitor_runner_process_exit(
             .emit(LogSource::Supervisor, LogLevel::Info, &msg)
             .await;
         info!("{}", msg);
+
+        // If the process died non-zero, look for a startup-panic log. A
+        // panic that fires during early init (DB connect, Tauri builder,
+        // axum router construction) doesn't flow through stderr in a
+        // shape our buffered reader can latch onto, so this file is the
+        // only place the panic payload actually lives.
+        if !status.success() {
+            check_and_record_panic_log(&state, &managed, &runner_name).await;
+        }
     } else {
         let msg = format!("Runner '{}' process terminated unexpectedly", runner_name);
         state
@@ -811,7 +997,66 @@ async fn monitor_runner_process_exit(
             .emit(LogSource::Supervisor, LogLevel::Warn, &msg)
             .await;
         warn!("{}", msg);
+        // Also check on unexpected termination — the child is gone either
+        // way, and if a panic log exists within the freshness window it's
+        // almost certainly the cause.
+        check_and_record_panic_log(&state, &managed, &runner_name).await;
     }
+}
+
+/// Look for `<panic_log_dir>/runner-panic.log`; if it exists and its
+/// timestamp is within [`PANIC_LOG_FRESHNESS_SECS`] of now, parse it and
+/// stash it on the managed runner so `GET /runners` can surface it. Also
+/// emit a tagged `[runner-panic]` ERROR into the supervisor log buffer.
+///
+/// All errors are swallowed at debug level — panic telemetry is strictly
+/// best-effort and must never interfere with normal process-exit handling.
+async fn check_and_record_panic_log(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_name: &str,
+) {
+    let dir_opt = managed.panic_log_dir.read().await.clone();
+    let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
+
+    let Some(parsed) = crate::process::panic_log::parse_panic_file(&path) else {
+        debug!(
+            "No panic log found for runner '{}' at {:?}",
+            runner_name, path
+        );
+        return;
+    };
+
+    // Freshness gate — a stale file from a previous boot shouldn't be
+    // attributed to the exit we just observed.
+    let now = chrono::Utc::now();
+    if !crate::process::panic_log::is_fresh(&parsed, now) {
+        debug!(
+            "Panic log at {:?} is stale (timestamp {} vs now {}) — ignoring",
+            path, parsed.timestamp, now
+        );
+        return;
+    }
+
+    let location_str = parsed.location.as_deref().unwrap_or("<unknown>");
+    let payload_preview: String = parsed.payload.chars().take(500).collect();
+    let backtrace_preview = parsed.backtrace_preview.as_deref().unwrap_or("");
+    let msg = format!(
+        "[runner-panic] Runner '{}' panicked during startup at {}:\n{}\n{}",
+        runner_name, location_str, payload_preview, backtrace_preview,
+    );
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Error, msg.clone())
+        .await;
+    error!("{}", msg);
+
+    // Stash on the managed runner for JSON surfacing. The reaper may
+    // later drop the runner from the registry — that's fine, callers
+    // passing `?include_stopped=true` to the logs endpoint see the
+    // panic via the stopped-cache snapshot once we extend that path.
+    let mut slot = managed.recent_panic.write().await;
+    *slot = Some(parsed);
 }
 
 /// POST to the runner's UI Bridge close-request endpoint so that
@@ -1278,4 +1523,92 @@ pub async fn restart_runner(
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
     restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// A slot freshly built 5 minutes after the running copy is "stale".
+    #[test]
+    fn stale_binary_detection_slot_much_newer() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running + Duration::from_secs(300); // +5 min
+        let out = compute_stale_binary(Some(running), Some((0, slot)))
+            .expect("5-minute gap should be surfaced");
+        assert_eq!(out.slot_id, 0);
+        assert_eq!(out.age_delta_secs, 300);
+        assert_eq!(out.running_mtime_ms, 1_700_000_000 * 1000);
+        assert_eq!(out.slot_mtime_ms, (1_700_000_000 + 300) * 1000);
+    }
+
+    /// A slot 10 seconds newer is within jitter — no badge.
+    #[test]
+    fn stale_binary_detection_within_threshold() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running + Duration::from_secs(10);
+        assert!(compute_stale_binary(Some(running), Some((0, slot))).is_none());
+    }
+
+    /// A slot exactly at the threshold (30s) does not trigger — strict `>`.
+    #[test]
+    fn stale_binary_detection_at_exact_threshold() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running + Duration::from_secs(STALE_BINARY_THRESHOLD_SECS as u64);
+        assert!(
+            compute_stale_binary(Some(running), Some((0, slot))).is_none(),
+            "delta == threshold must not surface a stale_binary entry"
+        );
+    }
+
+    /// One second over the threshold DOES trigger.
+    #[test]
+    fn stale_binary_detection_just_over_threshold() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running + Duration::from_secs(STALE_BINARY_THRESHOLD_SECS as u64 + 1);
+        let out = compute_stale_binary(Some(running), Some((0, slot)))
+            .expect("threshold + 1s should surface a stale_binary entry");
+        assert_eq!(out.age_delta_secs, STALE_BINARY_THRESHOLD_SECS + 1);
+    }
+
+    /// A slot older than the running copy means the running copy is the
+    /// freshest binary on disk — normal state, no badge.
+    #[test]
+    fn stale_binary_detection_running_newer() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running - Duration::from_secs(120);
+        assert!(compute_stale_binary(Some(running), Some((0, slot))).is_none());
+    }
+
+    /// Identical mtimes — no divergence, no badge.
+    #[test]
+    fn stale_binary_detection_equal() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(compute_stale_binary(Some(running), Some((1, running))).is_none());
+    }
+
+    /// Missing running-copy mtime (first start, fs stat failed, etc.) — the
+    /// feature silently skips.
+    #[test]
+    fn stale_binary_detection_missing_running_mtime() {
+        let slot = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(compute_stale_binary(None, Some((0, slot))).is_none());
+    }
+
+    /// No slot has ever produced a binary — nothing to compare against.
+    #[test]
+    fn stale_binary_detection_no_slot_binary() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(compute_stale_binary(Some(running), None).is_none());
+    }
+
+    /// Slot id is preserved through the struct (not always 0).
+    #[test]
+    fn stale_binary_detection_preserves_slot_id() {
+        let running = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slot = running + Duration::from_secs(600);
+        let out = compute_stale_binary(Some(running), Some((2, slot))).expect("stale");
+        assert_eq!(out.slot_id, 2);
+    }
 }

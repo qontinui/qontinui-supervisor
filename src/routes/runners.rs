@@ -111,6 +111,24 @@ pub async fn list_runners(
             .map(|c| c.derived_status.clone())
             .unwrap_or_default();
 
+        // Phase 2b: startup-panic telemetry. `recent_panic` is the structured
+        // parse of the runner's `runner-panic.log`, populated by
+        // `monitor_runner_process_exit` when the runner exits non-zero and a
+        // fresh panic log is on disk. Distinct from `recent_crash` (which is
+        // the on-runtime WebView2 crash dump surfaced by the runner's own
+        // /health endpoint). The dashboard renders this as a red "Panic"
+        // badge on the runner row.
+        let recent_panic = managed.recent_panic.read().await.clone();
+
+        // Phase 2c (Item 9): stale-binary detection. `None` is the normal case
+        // (running binary is newer than or equal to the newest slot within a
+        // 30s jitter threshold). `Some` means a fresher build is sitting in a
+        // pool slot — the dashboard surfaces this as a yellow "stale binary"
+        // badge prompting the user to restart. File-stat only, swallows I/O
+        // errors — this is strictly informational and must never block the
+        // listing.
+        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config.id).await;
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
@@ -125,6 +143,8 @@ pub async fn list_runners(
             "logs_stream_url": logs_stream_url,
             "ui_error": ui_error,
             "recent_crash": recent_crash,
+            "recent_panic": recent_panic,
+            "stale_binary": stale_binary,
             "derived_status": derived_status,
             "watchdog": {
                 "enabled": watchdog.enabled,
@@ -1101,6 +1121,7 @@ pub async fn spawn_test(
                 child_alive,
                 pid,
                 recent_logs,
+                recent_panic,
             } => {
                 state
                     .logs
@@ -1156,6 +1177,12 @@ pub async fn spawn_test(
                     "port": port,
                     "elapsed_ms": elapsed_ms,
                     "recent_logs": recent_logs,
+                    // Phase 2b: structured startup panic from
+                    // `runner-panic.log`, when the runner died during
+                    // startup via a Rust panic (e.g. axum router build,
+                    // DB connect, Tauri builder). `null` if the child is
+                    // hung-but-alive or exited for a non-panic reason.
+                    "recent_panic": recent_panic,
                 });
 
                 return Ok((status, Json(body)).into_response());
@@ -1339,6 +1366,13 @@ enum ProbeOutcome {
         child_alive: bool,
         pid: Option<u32>,
         recent_logs: Vec<String>,
+        /// Parsed startup panic from `runner-panic.log` when the runner
+        /// died during startup. `None` if no panic log was found (child
+        /// is hung but alive, or exited for a non-panic reason). Boxed
+        /// to keep the enum discriminant size balanced — the parsed
+        /// struct holds the full panic payload + backtrace preview and
+        /// is much larger than the `Healthy` variant.
+        recent_panic: Box<Option<crate::process::panic_log::RecentPanic>>,
     },
 }
 
@@ -1410,11 +1444,40 @@ async fn probe_runner_health(
 
     let recent_logs = recent_runner_log_lines(state, runner_id, 20).await;
 
+    // Check for a startup panic log. The runner's panic hook writes it
+    // synchronously on the panicking thread, so if early init panicked
+    // before the health endpoint bound, this file should exist by the
+    // time we give up polling.
+    let recent_panic = if let Some(managed) = state.get_runner(runner_id).await {
+        let dir_opt = managed.panic_log_dir.read().await.clone();
+        let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
+        let parsed = crate::process::panic_log::parse_panic_file(&path);
+        if let Some(p) = parsed.as_ref() {
+            // Freshness: a panic log from a prior boot of a re-used runner
+            // id would lie here. Match the same 60s window the exit-
+            // monitor uses.
+            if !crate::process::panic_log::is_fresh(p, chrono::Utc::now()) {
+                None
+            } else {
+                // Stash on the managed runner so subsequent callers of
+                // GET /runners see the same record.
+                let mut slot = managed.recent_panic.write().await;
+                *slot = Some(p.clone());
+                Some(p.clone())
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     ProbeOutcome::Failed {
         elapsed_ms,
         child_alive,
         pid,
         recent_logs,
+        recent_panic: Box::new(recent_panic),
     }
 }
 
@@ -1928,10 +1991,20 @@ pub async fn runner_log_history(
             .take(limit)
             .collect();
         let count = entries.len();
+        // Phase 2b: include the structured startup panic record when
+        // we have one. Optional field — existing consumers that didn't
+        // opt in continue to see the same shape.
+        let recent_panic = managed.recent_panic.read().await.clone();
+        // Phase 2c (Item 9): mirror `stale_binary` from the `/runners` listing
+        // so single-runner-drill-down callers (dashboard log pane, CLI) see
+        // the same freshness signal without issuing a second request.
+        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config.id).await;
         return Ok(Json(json!({
             "runner_id": id,
             "entries": entries,
             "count": count,
+            "recent_panic": recent_panic,
+            "stale_binary": stale_binary,
         })));
     }
 
@@ -1955,6 +2028,7 @@ pub async fn runner_log_history(
                 "stopped_at": snapshot.stopped_at.to_rfc3339(),
                 "exit_reason": snapshot.exit_reason,
                 "exit_code": snapshot.exit_code,
+                "recent_panic": snapshot.recent_panic,
             })));
         }
     }

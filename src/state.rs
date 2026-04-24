@@ -2,6 +2,7 @@ use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
+use crate::process::panic_log::RecentPanic;
 use crate::process::stopped_cache::StoppedRunnerSnapshot;
 use crate::routes::supervisor_bridge::CommandRelay;
 use crate::velocity_improvement::VelocityImprovementState;
@@ -30,6 +31,15 @@ pub struct ManagedRunner {
     /// When this entry was inserted into the registry. Used by the reaper to
     /// avoid removing runners that were just created but haven't started yet.
     pub created_at: std::time::Instant,
+    /// Most recent startup panic detected for this runner. Populated by
+    /// `monitor_runner_process_exit` when the process exits non-zero AND a
+    /// fresh `runner-panic.log` is on disk. Read by `GET /runners`,
+    /// `GET /runners/{id}/logs`, and the spawn-test 500/502 response.
+    pub recent_panic: RwLock<Option<RecentPanic>>,
+    /// Filesystem path where the runner was told to write its panic log.
+    /// Set at spawn time via `QONTINUI_RUNNER_LOG_DIR`. `None` when the
+    /// runner is using its default path (which the supervisor falls back to).
+    pub panic_log_dir: RwLock<Option<PathBuf>>,
 }
 
 impl ManagedRunner {
@@ -66,6 +76,8 @@ impl ManagedRunner {
             logs,
             protected: RwLock::new(protected),
             created_at: std::time::Instant::now(),
+            recent_panic: RwLock::new(None),
+            panic_log_dir: RwLock::new(None),
         }
     }
 

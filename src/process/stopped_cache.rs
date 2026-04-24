@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::log_capture::LogEntry;
+use crate::process::panic_log::RecentPanic;
 
 /// Maximum entries retained in the stopped-runner cache.
 pub const STOPPED_CACHE_MAX_ENTRIES: usize = 100;
@@ -52,6 +53,12 @@ pub struct StoppedRunnerSnapshot {
     /// exited. `None` if no panic was detected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panic_stack: Option<String>,
+    /// Structured startup-panic record parsed from the runner's
+    /// `runner-panic.log`. Populated when `monitor_runner_process_exit`
+    /// detected a panic file within the freshness window; `None` if the
+    /// runner exited cleanly or the file was missing/stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_panic: Option<RecentPanic>,
 }
 
 /// Insert a snapshot, then evict expired entries and trim to the size cap.
@@ -93,6 +100,7 @@ pub async fn snapshot_from_managed(
     let start = all.len().saturating_sub(STOPPED_CACHE_LOG_CAP);
     let last_log_lines = all[start..].to_vec();
     let panic_stack = managed.logs.panic_buffer().snapshot_joined();
+    let recent_panic = managed.recent_panic.read().await.clone();
     StoppedRunnerSnapshot {
         id: managed.config.id.clone(),
         name: managed.config.name.clone(),
@@ -102,5 +110,6 @@ pub async fn snapshot_from_managed(
         stopped_at: Utc::now(),
         last_log_lines,
         panic_stack,
+        recent_panic,
     }
 }
