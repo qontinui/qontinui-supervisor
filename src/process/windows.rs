@@ -4,10 +4,12 @@ use tracing::{debug, info, warn};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Kill processes listening on a specific port using netstat + taskkill.
-pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
-    // Find PIDs using the port via netstat
-    let output = Command::new("cmd")
+/// Return every distinct PID found LISTENING on `port`. Empty vec when the
+/// port is idle or netstat fails for any reason — callers treat an empty
+/// result as "nothing to do here". Shared by `find_pid_on_port` (first
+/// result) and `kill_by_port` (kill all results).
+async fn find_pids_on_port(port: u16) -> Vec<u32> {
+    let Ok(output) = Command::new("cmd")
         .args([
             "/C",
             &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
@@ -16,34 +18,38 @@ pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await?;
+        .await
+    else {
+        return Vec::new();
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut killed_any = false;
-
+    let mut pids = Vec::new();
     for line in stdout.lines() {
-        // netstat output format: TCP    0.0.0.0:9876    0.0.0.0:0    LISTENING    12345
+        // netstat -ano row: TCP    0.0.0.0:9876    0.0.0.0:0    LISTENING    12345
         let parts: Vec<&str> = line.split_whitespace().collect();
         if let Some(pid_str) = parts.last() {
             if let Ok(pid) = pid_str.parse::<u32>() {
-                if pid > 0 {
-                    info!("Killing PID {} on port {}", pid, port);
-                    let kill_output = Command::new("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .output()
-                        .await?;
-
-                    if kill_output.status.success() {
-                        killed_any = true;
-                    }
+                if pid > 0 && !pids.contains(&pid) {
+                    pids.push(pid);
                 }
             }
         }
     }
+    pids
+}
 
+/// Kill every process listening on a specific port. Returns true if at
+/// least one kill succeeded. Never errors on netstat failure — it just
+/// finds nothing to kill and returns Ok(false).
+pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
+    let mut killed_any = false;
+    for pid in find_pids_on_port(port).await {
+        info!("Killing PID {} on port {}", pid, port);
+        if kill_by_pid(pid).await.unwrap_or(false) {
+            killed_any = true;
+        }
+    }
     Ok(killed_any)
 }
 
@@ -91,36 +97,12 @@ pub async fn cleanup_orphaned_build_processes() {
 }
 
 /// Return the PID of the first process found LISTENING on `port`, or `None`
-/// if the port is idle. Uses the same `netstat -ano | findstr LISTENING`
-/// parse as `kill_by_port` but does not kill anything. Used by the health
-/// cache to recover a runner's PID after a supervisor restart re-discovers
-/// it (the supervisor lost the PID when it shut down; the process is still
-/// the same one bound to the port).
+/// if the port is idle. Used by the health cache to recover a runner's PID
+/// after a supervisor restart re-discovers it (the supervisor lost the PID
+/// when it shut down; the process is still the same one bound to the
+/// port).
 pub async fn find_pid_on_port(port: u16) -> Option<u32> {
-    let output = Command::new("cmd")
-        .args([
-            "/C",
-            &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(pid_str) = parts.last() {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                if pid > 0 {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
+    find_pids_on_port(port).await.into_iter().next()
 }
 
 /// Kill a process by its PID using taskkill.
