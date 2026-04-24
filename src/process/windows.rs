@@ -90,6 +90,39 @@ pub async fn cleanup_orphaned_build_processes() {
     }
 }
 
+/// Return the PID of the first process found LISTENING on `port`, or `None`
+/// if the port is idle. Uses the same `netstat -ano | findstr LISTENING`
+/// parse as `kill_by_port` but does not kill anything. Used by the health
+/// cache to recover a runner's PID after a supervisor restart re-discovers
+/// it (the supervisor lost the PID when it shut down; the process is still
+/// the same one bound to the port).
+pub async fn find_pid_on_port(port: u16) -> Option<u32> {
+    let output = Command::new("cmd")
+        .args([
+            "/C",
+            &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(pid_str) = parts.last() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid > 0 {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Kill a process by its PID using taskkill.
 pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
     let output = Command::new("taskkill")

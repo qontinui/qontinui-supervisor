@@ -92,14 +92,21 @@ pub struct WatchdogHealth {
 }
 
 impl WatchdogHealth {
-    /// Return a static "disabled" value. The watchdog module has been removed;
-    /// this keeps the JSON shape stable for API consumers.
+    /// Return a static "disabled" value for the ambient auto-restart
+    /// watchdog. That module was removed; the supervisor no longer tries to
+    /// resurrect a runner that has gone unhealthy. A separate first-healthy
+    /// watchdog (see `process::manager::watch_first_healthy`) runs per spawn
+    /// and kills children that never bind their HTTP API — it does not
+    /// surface here because it's ephemeral per-start, not ambient.
+    /// This keeps the JSON shape stable for API consumers.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
             restart_attempts: 0,
             last_restart_at: None,
-            disabled_reason: Some("watchdog module removed".to_string()),
+            disabled_reason: Some(
+                "no ambient auto-restart (first-healthy watchdog runs per spawn)".to_string(),
+            ),
             crash_count: 0,
         }
     }
@@ -202,7 +209,9 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
-    // Build multi-runner status array (watchdog module removed — use static disabled value).
+    // Build multi-runner status array. The `watchdog_status` field reports the
+    // ambient auto-restart watchdog, which was removed; the first-healthy
+    // watchdog in `process::manager` is per-spawn and not surfaced here.
     //
     // ui_error + derived_status come from the background health-cache refresher
     // (which GETs each runner's /health every 2s). We index into that snapshot

@@ -267,11 +267,29 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let runner_id = &managed.config.id;
                 let is_supervisor_managed = is_temp_runner(runner_id) || is_named_runner(runner_id);
                 if !is_supervisor_managed {
-                    let mut runner_state = managed.runner.write().await;
-                    if runner_state.running != runner_responding {
-                        runner_state.running = runner_responding;
-                        if !runner_responding {
-                            runner_state.pid = None;
+                    let needs_pid_recovery = {
+                        let mut runner_state = managed.runner.write().await;
+                        if runner_state.running != runner_responding {
+                            runner_state.running = runner_responding;
+                            if !runner_responding {
+                                runner_state.pid = None;
+                            }
+                        }
+                        runner_responding && runner_state.pid.is_none()
+                    };
+                    // Recover the PID for a re-discovered runner after a
+                    // supervisor restart: the process is still the one
+                    // listening on the port, so netstat tells us which PID
+                    // to track. Netstat is ~100ms on Windows, so guard on
+                    // `pid.is_none()` to keep this out of the steady state.
+                    if needs_pid_recovery {
+                        if let Some(pid) =
+                            crate::process::windows::find_pid_on_port(runner_port).await
+                        {
+                            let mut runner_state = managed.runner.write().await;
+                            if runner_state.pid.is_none() {
+                                runner_state.pid = Some(pid);
+                            }
                         }
                     }
                 }
