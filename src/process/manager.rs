@@ -506,6 +506,16 @@ pub async fn start_managed_runner(
         monitor_runner_process_exit(state_clone, managed_clone, runner_id).await;
     });
 
+    // Spawn the first-healthy watchdog so a child that spawns but never
+    // binds its HTTP API is killed instead of lingering as a zombie.
+    if let Some(pid_val) = pid {
+        let state_clone = state.clone();
+        let managed_clone = managed.clone();
+        tokio::spawn(async move {
+            watch_first_healthy(state_clone, managed_clone, pid_val).await;
+        });
+    }
+
     Ok(())
 }
 
@@ -636,6 +646,102 @@ async fn start_exe_mode_for_runner(
     };
 
     Ok(child)
+}
+
+/// Default deadline for a newly-spawned runner to bind its HTTP API
+/// before the supervisor declares the spawn a failure and kills the PID.
+/// Override via `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`.
+const DEFAULT_FIRST_HEALTHY_TIMEOUT_SECS: u64 = 90;
+const FIRST_HEALTHY_POLL_INTERVAL_SECS: u64 = 3;
+
+fn first_healthy_timeout_secs() -> u64 {
+    std::env::var("QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FIRST_HEALTHY_TIMEOUT_SECS)
+}
+
+/// Watchdog for a newly-spawned runner. If its HTTP API doesn't respond
+/// within `first_healthy_timeout_secs()`, the process is considered
+/// wedged (alive but hung during startup — e.g. stuck on a DDL, on
+/// WebView2 init, or inside a subprocess spawn) and the PID is killed.
+/// `monitor_runner_process_exit` observes the resulting exit and cleans
+/// up runner state naturally.
+///
+/// Scope: runs once per supervisor-initiated start. Does not auto-restart
+/// and does not touch runners started outside the supervisor.
+async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pid: u32) {
+    let timeout_secs = first_healthy_timeout_secs();
+    let runner_name = managed.config.name.clone();
+    let port = managed.config.port;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let poll = Duration::from_secs(FIRST_HEALTHY_POLL_INTERVAL_SECS);
+
+    loop {
+        // Exit quietly if the process was already reaped by the exit
+        // monitor — another start attempt or a crash beat us to it.
+        let still_tracked = {
+            let runner = managed.runner.read().await;
+            runner.pid == Some(pid) && runner.running
+        };
+        if !still_tracked {
+            debug!(
+                "First-healthy watchdog for runner '{}' (PID {}) exiting — process no longer tracked",
+                runner_name, pid
+            );
+            return;
+        }
+
+        if crate::process::port::is_runner_responding(port).await {
+            info!(
+                "Runner '{}' (PID {}) HTTP API responsive — first-healthy watchdog clear",
+                runner_name, pid
+            );
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!(
+                        "Runner '{}' healthy within first-healthy budget",
+                        runner_name
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let msg = format!(
+                "Runner '{}' (PID {}) did not bind HTTP API within {}s — killing wedged process",
+                runner_name, pid, timeout_secs
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                .await;
+
+            match crate::process::windows::kill_by_pid(pid).await {
+                Ok(true) => info!(
+                    "First-healthy watchdog killed wedged runner '{}' PID {}",
+                    runner_name, pid
+                ),
+                Ok(false) => warn!(
+                    "First-healthy watchdog: PID {} for runner '{}' no longer present",
+                    pid, runner_name
+                ),
+                Err(e) => error!(
+                    "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
+                    pid, runner_name, e
+                ),
+            }
+            return;
+        }
+
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Monitor a specific runner's process for exit.
