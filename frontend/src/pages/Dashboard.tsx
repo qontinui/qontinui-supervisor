@@ -589,9 +589,10 @@ function RunnerRow({
     label: `Remove ${r.name}`,
     actions: ['click'],
   });
-  // Protect toggle — not rendered in the current UI as a dedicated button,
-  // but still registered for callers of `POST /.../protect`. The default
-  // handler is supplied by the parent so the action has something to call.
+  // Protect toggle — rendered as a dedicated button below for non-primary
+  // runners. Primary runners hide the button (they're inherently protected),
+  // but the hook still registers so the `toggle` custom action stays
+  // dispatchable (no-op for primaries because `onProtect` never fires).
   const { ref: protectBtnRef } = useUIElement({
     id: `runner-${r.id}-protect`,
     type: 'button',
@@ -605,9 +606,6 @@ function RunnerRow({
       },
     },
   });
-  // Reference the protect ref so lint doesn't warn; it's intentionally not
-  // attached to a rendered element today.
-  void protectBtnRef;
 
   return (
     <tr>
@@ -700,6 +698,33 @@ function RunnerRow({
           >
             {busy === `Rebuild ${r.name}` ? 'Rebuilding...' : 'Rebuild'}
           </button>
+          {!isPrimary && (
+            <button
+              ref={protectBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{
+                padding: '0.15rem 0.4rem',
+                fontSize: '0.7rem',
+                color: r.protected ? 'var(--success, #2e7d32)' : 'var(--warning, #c77700)',
+                borderColor: r.protected ? 'var(--success, #2e7d32)' : 'var(--warning, #c77700)',
+              }}
+              disabled={busy !== null}
+              onClick={onProtect}
+              title={
+                r.protected
+                  ? 'Unprotect this runner (allow supervisor reaper to stop it)'
+                  : 'Protect this runner (supervisor reaper will leave it alone)'
+              }
+            >
+              {busy === `Protect ${r.name}`
+                ? r.protected
+                  ? 'Unprotecting...'
+                  : 'Protecting...'
+                : r.protected
+                  ? 'Unprotect'
+                  : 'Protect'}
+            </button>
+          )}
           {!isUp && !isPrimary && (
             <button
               ref={removeBtnRef as React.RefCallback<HTMLButtonElement>}

@@ -124,6 +124,11 @@ pub fn build_router(state: SharedState) -> Router {
             "/supervisor-bridge/control/network/stubs/{id}",
             delete(crate::routes::supervisor_bridge::delete_network_stub),
         )
+        // N3 — Non-consuming stub verification
+        .route(
+            "/supervisor-bridge/control/network/verify-stub",
+            post(crate::routes::supervisor_bridge::verify_network_stub),
+        )
         .route(
             "/supervisor-bridge/health",
             get(crate::routes::supervisor_bridge::bridge_health),

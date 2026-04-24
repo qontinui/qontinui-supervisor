@@ -713,6 +713,83 @@ pub async fn clear_network_stubs(State(state): State<SharedState>) -> impl IntoR
     }
 }
 
+// ============================================================================
+// N3 — Non-consuming stub verification
+// ============================================================================
+
+/// Request body for `POST /supervisor-bridge/control/network/verify-stub`.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyStubBody {
+    pub url_pattern: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+impl VerifyStubBody {
+    pub fn validate(&self) -> Result<(), String> {
+        let pattern = self
+            .url_pattern
+            .as_deref()
+            .ok_or("urlPattern is required")?;
+        if pattern.is_empty() {
+            return Err("urlPattern must be non-empty".into());
+        }
+        if let Some(m) = self.method.as_deref() {
+            if !is_valid_stub_method(m) {
+                return Err(format!(
+                    "method must be one of GET|POST|PUT|DELETE|PATCH|*, got \"{}\"",
+                    m
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// POST /supervisor-bridge/control/network/verify-stub — non-consuming
+/// stub probe. See the runner-side `ui_bridge_verify_network_stub_handler`
+/// for the full contract. Kept in lockstep with the runner endpoint so
+/// dashboard tests don't need a second parallel story.
+pub async fn verify_network_stub(
+    State(state): State<SharedState>,
+    Json(raw): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let req: VerifyStubBody = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("invalid verify-stub body: {}", e),
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = req.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .command_relay
+        .queue_command("verifyNetworkStub", raw)
+        .await
+    {
+        Ok(data) => success_response(data).into_response(),
+        Err((status, json)) => (status, json).into_response(),
+    }
+}
+
 /// POST /supervisor-bridge/control/page/refresh
 pub async fn page_refresh(State(state): State<SharedState>) -> impl IntoResponse {
     match state
@@ -911,5 +988,62 @@ mod stub_request_tests {
         req.validate().expect("valid");
         let headers = req.response.unwrap().headers.unwrap();
         assert_eq!(headers.get("x-a").unwrap().as_str(), Some("1"));
+    }
+}
+
+#[cfg(test)]
+mod verify_stub_body_tests {
+    //! N3: deserialization + validation tests for `VerifyStubBody`.
+    //! Mirrors the runner-side `verify_stub_request_tests`.
+
+    use super::VerifyStubBody;
+
+    fn parse(body: &str) -> VerifyStubBody {
+        serde_json::from_str(body).expect("VerifyStubBody must deserialize")
+    }
+
+    #[test]
+    fn minimal_valid_body() {
+        let req = parse(r#"{"urlPattern":"/foo"}"#);
+        req.validate().expect("valid");
+        assert_eq!(req.url_pattern.as_deref(), Some("/foo"));
+        assert!(req.method.is_none());
+    }
+
+    #[test]
+    fn camel_case_wire_key() {
+        let req = parse(r#"{"urlPattern":"/foo","method":"POST"}"#);
+        assert_eq!(req.url_pattern.as_deref(), Some("/foo"));
+        assert_eq!(req.method.as_deref(), Some("POST"));
+    }
+
+    #[test]
+    fn missing_url_pattern_rejected() {
+        let req = parse(r#"{"method":"GET"}"#);
+        assert!(req.validate().unwrap_err().contains("urlPattern"));
+    }
+
+    #[test]
+    fn empty_url_pattern_rejected() {
+        let req = parse(r#"{"urlPattern":""}"#);
+        assert!(req.validate().unwrap_err().contains("non-empty"));
+    }
+
+    #[test]
+    fn unknown_method_rejected() {
+        let req = parse(r#"{"urlPattern":"/f","method":"HEAD"}"#);
+        assert!(req.validate().unwrap_err().contains("method"));
+    }
+
+    #[test]
+    fn wildcard_method_accepted() {
+        let req = parse(r#"{"urlPattern":"/f","method":"*"}"#);
+        req.validate().expect("valid");
+    }
+
+    #[test]
+    fn absent_method_accepted() {
+        let req = parse(r#"{"urlPattern":"/f"}"#);
+        req.validate().expect("valid");
     }
 }
