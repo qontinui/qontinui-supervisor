@@ -10,6 +10,8 @@ The supervisor manages lifecycle for **temp runners** (`test-*`) and **named run
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor observes health only.
 
+**First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not auto-restart, does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0).
+
 ## Architecture
 
 Standalone Axum HTTP server:
@@ -353,6 +355,7 @@ If the build fails, the placeholder port reservation is cleaned up and the error
 | Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
 | Temp runner port range | 9877-9899 |
+| First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
 
 ## Code Standards
 
