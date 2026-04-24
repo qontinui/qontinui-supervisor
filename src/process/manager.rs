@@ -839,6 +839,44 @@ fn first_healthy_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_FIRST_HEALTHY_TIMEOUT_SECS)
 }
 
+/// Outcome of one poll tick of the first-healthy watchdog. Extracted as a
+/// pure decision so the priority rules can be asserted by unit tests
+/// without spinning up a process, HTTP server, or SharedState.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstHealthyDecision {
+    /// Exit quietly — the exit monitor already reaped the process.
+    Abandon,
+    /// HTTP /health responded; record success and exit.
+    Healthy,
+    /// Deadline passed and still no /health response; kill the PID.
+    Kill,
+    /// None of the above; sleep one poll interval and retry.
+    Wait,
+}
+
+/// Decide what the watchdog should do this tick. Priority is intentional:
+///   1. Abandon — process is gone, nothing we should do to it.
+///   2. Healthy — responding wins even if the deadline just passed
+///      (avoids a pointless kill on a runner that made it just in time).
+///   3. Kill — deadline passed and still unresponsive.
+///   4. Wait — not yet past deadline, keep polling.
+fn decide_first_healthy(
+    still_tracked: bool,
+    api_responding: bool,
+    deadline_passed: bool,
+) -> FirstHealthyDecision {
+    if !still_tracked {
+        return FirstHealthyDecision::Abandon;
+    }
+    if api_responding {
+        return FirstHealthyDecision::Healthy;
+    }
+    if deadline_passed {
+        return FirstHealthyDecision::Kill;
+    }
+    FirstHealthyDecision::Wait
+}
+
 /// Watchdog for a newly-spawned runner. If its HTTP API doesn't respond
 /// within `first_healthy_timeout_secs()`, the process is considered
 /// wedged (alive but hung during startup — e.g. stuck on a DDL, on
@@ -856,68 +894,74 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
     let poll = Duration::from_secs(FIRST_HEALTHY_POLL_INTERVAL_SECS);
 
     loop {
-        // Exit quietly if the process was already reaped by the exit
-        // monitor — another start attempt or a crash beat us to it.
         let still_tracked = {
             let runner = managed.runner.read().await;
             runner.pid == Some(pid) && runner.running
         };
-        if !still_tracked {
-            debug!(
-                "First-healthy watchdog for runner '{}' (PID {}) exiting — process no longer tracked",
-                runner_name, pid
-            );
-            return;
-        }
+        let api_responding = if still_tracked {
+            crate::process::port::is_runner_responding(port).await
+        } else {
+            false
+        };
+        let deadline_passed = tokio::time::Instant::now() >= deadline;
 
-        if crate::process::port::is_runner_responding(port).await {
-            info!(
-                "Runner '{}' (PID {}) HTTP API responsive — first-healthy watchdog clear",
-                runner_name, pid
-            );
-            state
-                .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Info,
-                    format!(
-                        "Runner '{}' healthy within first-healthy budget",
-                        runner_name
-                    ),
-                )
-                .await;
-            return;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            let msg = format!(
-                "Runner '{}' (PID {}) did not bind HTTP API within {}s — killing wedged process",
-                runner_name, pid, timeout_secs
-            );
-            error!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Error, msg)
-                .await;
-
-            match crate::process::windows::kill_by_pid(pid).await {
-                Ok(true) => info!(
-                    "First-healthy watchdog killed wedged runner '{}' PID {}",
+        match decide_first_healthy(still_tracked, api_responding, deadline_passed) {
+            FirstHealthyDecision::Abandon => {
+                debug!(
+                    "First-healthy watchdog for runner '{}' (PID {}) exiting — process no longer tracked",
                     runner_name, pid
-                ),
-                Ok(false) => warn!(
-                    "First-healthy watchdog: PID {} for runner '{}' no longer present",
-                    pid, runner_name
-                ),
-                Err(e) => error!(
-                    "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
-                    pid, runner_name, e
-                ),
+                );
+                return;
             }
-            return;
-        }
+            FirstHealthyDecision::Healthy => {
+                info!(
+                    "Runner '{}' (PID {}) HTTP API responsive — first-healthy watchdog clear",
+                    runner_name, pid
+                );
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "Runner '{}' healthy within first-healthy budget",
+                            runner_name
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            FirstHealthyDecision::Kill => {
+                let msg = format!(
+                    "Runner '{}' (PID {}) did not bind HTTP API within {}s — killing wedged process",
+                    runner_name, pid, timeout_secs
+                );
+                error!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                    .await;
 
-        tokio::time::sleep(poll).await;
+                match crate::process::windows::kill_by_pid(pid).await {
+                    Ok(true) => info!(
+                        "First-healthy watchdog killed wedged runner '{}' PID {}",
+                        runner_name, pid
+                    ),
+                    Ok(false) => warn!(
+                        "First-healthy watchdog: PID {} for runner '{}' no longer present",
+                        pid, runner_name
+                    ),
+                    Err(e) => error!(
+                        "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
+                        pid, runner_name, e
+                    ),
+                }
+                return;
+            }
+            FirstHealthyDecision::Wait => {
+                tokio::time::sleep(poll).await;
+            }
+        }
     }
 }
 
@@ -1610,5 +1654,58 @@ mod tests {
         let slot = running + Duration::from_secs(600);
         let out = compute_stale_binary(Some(running), Some((2, slot))).expect("stale");
         assert_eq!(out.slot_id, 2);
+    }
+
+    // =========================================================================
+    // First-healthy watchdog decision tests
+    // =========================================================================
+
+    /// Process gone — exit quietly regardless of other flags.
+    #[test]
+    fn first_healthy_abandon_when_untracked() {
+        assert_eq!(
+            decide_first_healthy(false, false, false),
+            FirstHealthyDecision::Abandon
+        );
+        // Even if the port is "responding" and the deadline passed, an
+        // untracked PID is not ours to act on.
+        assert_eq!(
+            decide_first_healthy(false, true, true),
+            FirstHealthyDecision::Abandon
+        );
+    }
+
+    /// HTTP /health responded — healthy outcome, even if the deadline just
+    /// elapsed on the same tick.
+    #[test]
+    fn first_healthy_healthy_wins_over_kill() {
+        assert_eq!(
+            decide_first_healthy(true, true, false),
+            FirstHealthyDecision::Healthy
+        );
+        // Edge case the priority rule exists for: responsive AND past
+        // deadline on the same poll. We do NOT kill — the runner made it.
+        assert_eq!(
+            decide_first_healthy(true, true, true),
+            FirstHealthyDecision::Healthy
+        );
+    }
+
+    /// Tracked, not responding, deadline passed — kill path.
+    #[test]
+    fn first_healthy_kill_when_deadline_passed_and_unresponsive() {
+        assert_eq!(
+            decide_first_healthy(true, false, true),
+            FirstHealthyDecision::Kill
+        );
+    }
+
+    /// Tracked, not responding, still within budget — keep waiting.
+    #[test]
+    fn first_healthy_wait_while_within_budget() {
+        assert_eq!(
+            decide_first_healthy(true, false, false),
+            FirstHealthyDecision::Wait
+        );
     }
 }
