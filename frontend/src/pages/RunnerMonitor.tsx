@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useUIElement } from '@qontinui/ui-bridge/react';
 import { api, RecentCrashSummary, RunnerTaskRun, UiErrorSummary, RunnerDerivedStatus } from '../lib/api';
 import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
 
@@ -82,6 +83,82 @@ function deriveStatus(
   return { kind: 'healthy' };
 }
 
+// ─── Task-run row ───────────────────────────────────────────────────────────
+// Extracted so useUIElement per-row can use a stable ID derived from the task
+// run's own id (not an array index). Each row exposes a dedicated "Stop Task"
+// UI Bridge button with id `runner-monitor-stop-task-<taskId>`.
+
+interface TaskRunRowProps {
+  run: RunnerTaskRun;
+  busy: string | null;
+  onWorkflowState: () => void;
+  onAiOutput: () => void;
+  onStop: () => void;
+}
+
+function TaskRunRow({ run, busy, onWorkflowState, onAiOutput, onStop }: TaskRunRowProps) {
+  const { ref: stopTaskRef } = useUIElement({
+    id: `runner-monitor-stop-task-${run.id}`,
+    type: 'button',
+    label: `Stop task ${run.id}`,
+    actions: ['click'],
+  });
+
+  return (
+    <div
+      style={{
+        marginTop: '0.75rem',
+        padding: '0.75rem',
+        background: 'var(--bg-tertiary, #1a1a2e)',
+        borderRadius: '6px',
+      }}
+    >
+      <div
+        className="flex justify-between"
+        style={{ alignItems: 'center', marginBottom: '0.5rem' }}
+      >
+        <span className="text-mono" style={{ fontSize: '0.85rem' }}>
+          <strong>{run.id}</strong>
+          <span className="text-muted" style={{ marginLeft: '0.75rem' }}>
+            {run.status}
+          </span>
+        </span>
+      </div>
+      {run.prompt && (
+        <div
+          className="text-muted"
+          style={{
+            fontSize: '0.8rem',
+            marginBottom: '0.5rem',
+            maxHeight: '3em',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          }}
+        >
+          {String(run.prompt).slice(0, 200)}
+        </div>
+      )}
+      <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+        <button className="btn" disabled={busy !== null} onClick={onWorkflowState}>
+          {busy === `Workflow State (${run.id})` ? 'Loading...' : 'Workflow State'}
+        </button>
+        <button className="btn" disabled={busy !== null} onClick={onAiOutput}>
+          {busy === `AI Output (${run.id})` ? 'Loading...' : 'AI Output'}
+        </button>
+        <button
+          ref={stopTaskRef as React.RefCallback<HTMLButtonElement>}
+          className="btn"
+          disabled={busy !== null}
+          style={{ color: 'var(--danger, #ef4444)' }}
+          onClick={onStop}
+        >
+          {busy === `Stop (${run.id})` ? 'Stopping...' : 'Stop'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function RunnerMonitor() {
   const [runnerHealth, setRunnerHealth] = useState<Record<string, unknown> | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
@@ -151,6 +228,15 @@ export default function RunnerMonitor() {
 
   const isHealthy = runnerHealth !== null && !healthError;
 
+  // Register the "Check" refresh-health button with UI Bridge so automation
+  // can re-fetch runner health without DOM scraping.
+  const { ref: refreshHealthRef } = useUIElement({
+    id: 'runner-monitor-refresh-health',
+    type: 'button',
+    label: 'Refresh runner health',
+    actions: ['click'],
+  });
+
   return (
     <div>
       <div className="page-header">
@@ -178,6 +264,7 @@ export default function RunnerMonitor() {
                 />
               )}
               <button
+                ref={refreshHealthRef as React.RefCallback<HTMLButtonElement>}
                 className="btn"
                 style={{ fontSize: '0.75rem', padding: '2px 8px' }}
                 disabled={busy !== null}
@@ -239,67 +326,18 @@ export default function RunnerMonitor() {
             </div>
           )}
           {taskRuns.map((run) => (
-            <div
+            <TaskRunRow
               key={run.id}
-              style={{
-                marginTop: '0.75rem',
-                padding: '0.75rem',
-                background: 'var(--bg-tertiary, #1a1a2e)',
-                borderRadius: '6px',
-              }}
-            >
-              <div
-                className="flex justify-between"
-                style={{ alignItems: 'center', marginBottom: '0.5rem' }}
-              >
-                <span className="text-mono" style={{ fontSize: '0.85rem' }}>
-                  <strong>{run.id}</strong>
-                  <span className="text-muted" style={{ marginLeft: '0.75rem' }}>
-                    {run.status}
-                  </span>
-                </span>
-              </div>
-              {run.prompt && (
-                <div
-                  className="text-muted"
-                  style={{
-                    fontSize: '0.8rem',
-                    marginBottom: '0.5rem',
-                    maxHeight: '3em',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  {String(run.prompt).slice(0, 200)}
-                </div>
+              run={run}
+              busy={busy}
+              onWorkflowState={wrapAction(`Workflow State (${run.id})`, () =>
+                api.runnerWorkflowState(run.id),
               )}
-              <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                <button
-                  className="btn"
-                  disabled={busy !== null}
-                  onClick={wrapAction(`Workflow State (${run.id})`, () =>
-                    api.runnerWorkflowState(run.id),
-                  )}
-                >
-                  {busy === `Workflow State (${run.id})` ? 'Loading...' : 'Workflow State'}
-                </button>
-                <button
-                  className="btn"
-                  disabled={busy !== null}
-                  onClick={wrapAction(`AI Output (${run.id})`, () => api.runnerTaskOutput(run.id))}
-                >
-                  {busy === `AI Output (${run.id})` ? 'Loading...' : 'AI Output'}
-                </button>
-                <button
-                  className="btn"
-                  disabled={busy !== null}
-                  style={{ color: 'var(--danger, #ef4444)' }}
-                  onClick={wrapAction(`Stop (${run.id})`, () => api.runnerStopTask(run.id))}
-                >
-                  {busy === `Stop (${run.id})` ? 'Stopping...' : 'Stop'}
-                </button>
-              </div>
-            </div>
+              onAiOutput={wrapAction(`AI Output (${run.id})`, () =>
+                api.runnerTaskOutput(run.id),
+              )}
+              onStop={wrapAction(`Stop (${run.id})`, () => api.runnerStopTask(run.id))}
+            />
           ))}
         </div>
       </div>

@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
+import { useUIElement } from '@qontinui/ui-bridge/react';
 import { api, WebFleetRunner } from '../lib/api';
 
 // LocalStorage keys — the supervisor dashboard persists the user's backend URL
@@ -66,6 +67,275 @@ function formatTs(iso: string): string {
   return d.toLocaleString();
 }
 
+// ─── Fleet row (per-runner) ──────────────────────────────────────────────────
+// Extracted as a component so we can call useUIElement per-row with stable
+// IDs derived from the runner's id (not an array index). Each row exposes
+// two optional badges — ui-error and rust-crash — whose click `toggle`s the
+// expanded detail panel below the row.
+
+interface FleetRowProps {
+  runner: WebFleetRunner;
+  expanded: boolean;
+  toggle: () => void;
+}
+
+function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
+  const hasError = r.ui_error != null || r.recent_crash != null;
+  const rowToggle = () => hasError && toggle();
+
+  // Register per-row UI Bridge elements for the two error badges so automation
+  // can flip the detail panel without DOM scraping. Both hooks always run (IDs
+  // are stable per runner id); they no-op for rows without an error by
+  // returning a ref that's attached to nothing.
+  const { ref: uiErrorBadgeRef, trigger: triggerUiError } = useUIElement({
+    id: `fleet-row-ui-error-${r.id}`,
+    type: 'button',
+    label: `UI error badge for ${r.name}`,
+    actions: ['click'],
+    customActions: {
+      toggle: {
+        id: 'toggle',
+        description: 'Toggle the expanded ui_error detail panel',
+        handler: () => toggle(),
+      },
+    },
+  });
+  const { ref: rustCrashBadgeRef, trigger: triggerRustCrash } = useUIElement({
+    id: `fleet-row-rust-crash-${r.id}`,
+    type: 'button',
+    label: `Rust crash badge for ${r.name}`,
+    actions: ['click'],
+    customActions: {
+      toggle: {
+        id: 'toggle',
+        description: 'Toggle the expanded rust-crash detail panel',
+        handler: () => toggle(),
+      },
+    },
+  });
+  // Keep unused-var lint quiet — triggers are exposed for consumers who want
+  // to fire the custom action from inside the component (we don't here).
+  void triggerUiError;
+  void triggerRustCrash;
+
+  return (
+    <Fragment>
+      <tr>
+        <td>
+          <strong>{r.name}</strong>
+          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+            {r.id}
+          </div>
+        </td>
+        <td className="text-mono">
+          {r.hostname}:{r.port}
+        </td>
+        <td>
+          <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+            <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status}</span>
+            {r.ui_error && (
+              <span
+                ref={uiErrorBadgeRef as React.RefCallback<HTMLSpanElement>}
+                data-ui-bridge-value={String(expanded)}
+                className="badge badge-danger badge-clickable"
+                style={{ fontSize: '0.7rem' }}
+                title={`UI error: ${r.ui_error.message}`}
+                role="button"
+                tabIndex={0}
+                onClick={rowToggle}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    rowToggle();
+                  }
+                }}
+              >
+                ui error
+                <span style={{ marginLeft: '0.25rem', opacity: 0.7, fontSize: '0.65rem' }}>
+                  {expanded ? '▾' : '▸'}
+                </span>
+              </span>
+            )}
+            {r.recent_crash && (
+              <span
+                ref={rustCrashBadgeRef as React.RefCallback<HTMLSpanElement>}
+                data-ui-bridge-value={String(expanded)}
+                className="badge badge-danger badge-clickable"
+                style={{ fontSize: '0.7rem' }}
+                title={`Rust crash: ${r.recent_crash.panic_message ?? 'runner restarted after Rust panic'}${r.recent_crash.panic_location ? ` @ ${r.recent_crash.panic_location}` : ''}`}
+                role="button"
+                tabIndex={0}
+                onClick={rowToggle}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    rowToggle();
+                  }
+                }}
+              >
+                rust crash
+                <span style={{ marginLeft: '0.25rem', opacity: 0.7, fontSize: '0.65rem' }}>
+                  {expanded ? '▾' : '▸'}
+                </span>
+              </span>
+            )}
+          </div>
+        </td>
+        <td>{relativeTime(r.last_heartbeat)}</td>
+        <td>
+          <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+            {r.capabilities.length === 0 ? (
+              <span className="text-muted">—</span>
+            ) : (
+              r.capabilities.map((cap) => (
+                <span
+                  key={cap}
+                  className="badge"
+                  style={{
+                    background: 'var(--bg-tertiary)',
+                    color: 'var(--text-secondary)',
+                    fontSize: '0.7rem',
+                  }}
+                >
+                  {cap}
+                </span>
+              ))
+            )}
+          </div>
+        </td>
+        <td>
+          <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+            {r.server_mode && (
+              <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
+                server
+              </span>
+            )}
+            {r.restate_enabled && (
+              <span
+                className={`badge ${r.restate_healthy ? 'badge-success' : 'badge-warning'}`}
+                style={{ fontSize: '0.7rem' }}
+              >
+                restate{r.restate_healthy ? '' : ' (unhealthy)'}
+              </span>
+            )}
+            {!r.server_mode && !r.restate_enabled && (
+              <span className="text-muted">—</span>
+            )}
+          </div>
+        </td>
+      </tr>
+      {expanded && hasError && (
+        <tr>
+          <td colSpan={6} style={{ padding: 0 }}>
+            <div
+              style={{
+                margin: '0.25rem 0.5rem 0.5rem 0.5rem',
+                padding: '0.6rem 0.75rem',
+                background: 'rgba(239,68,68,0.08)',
+                border: '1px solid rgba(239,68,68,0.3)',
+                borderRadius: 4,
+                fontSize: '0.75rem',
+              }}
+            >
+              {r.ui_error && (
+                <div style={{ marginBottom: r.recent_crash ? '0.6rem' : 0 }}>
+                  <div style={{ marginBottom: '0.4rem' }}>
+                    <strong className="text-danger">UI Error:</strong>{' '}
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>
+                      {r.ui_error.message}
+                    </span>
+                  </div>
+                  <div
+                    className="text-muted"
+                    style={{
+                      fontSize: '0.7rem',
+                      display: 'flex',
+                      gap: '1rem',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <span>
+                      <strong>First seen:</strong> {formatTs(r.ui_error.first_seen)}
+                    </span>
+                    <span>
+                      <strong>Last reported:</strong>{' '}
+                      {formatTs(r.ui_error.reported_at)}
+                    </span>
+                    <span>
+                      <strong>Count:</strong> {r.ui_error.count}
+                    </span>
+                    {r.ui_error.digest && (
+                      <span>
+                        <strong>Digest:</strong>{' '}
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>
+                          {r.ui_error.digest}
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {r.recent_crash && (
+                <div>
+                  <div style={{ marginBottom: '0.4rem' }}>
+                    <strong className="text-danger">Rust Crash:</strong>{' '}
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>
+                      {r.recent_crash.panic_message ??
+                        'runner restarted after Rust panic (no message captured)'}
+                    </span>
+                  </div>
+                  <div
+                    className="text-muted"
+                    style={{
+                      fontSize: '0.7rem',
+                      display: 'flex',
+                      gap: '1rem',
+                      flexWrap: 'wrap',
+                      marginBottom: '0.4rem',
+                    }}
+                  >
+                    <span>
+                      <strong>Reported:</strong>{' '}
+                      {formatTs(r.recent_crash.reported_at)}
+                    </span>
+                    {r.recent_crash.panic_location && (
+                      <span>
+                        <strong>Location:</strong>{' '}
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>
+                          {r.recent_crash.panic_location}
+                        </span>
+                      </span>
+                    )}
+                    {r.recent_crash.thread && (
+                      <span>
+                        <strong>Thread:</strong>{' '}
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>
+                          {r.recent_crash.thread}
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                    <strong>Dump file:</strong>{' '}
+                    <span
+                      style={{
+                        fontFamily: 'var(--font-mono)',
+                        wordBreak: 'break-all',
+                      }}
+                    >
+                      {r.recent_crash.file_path}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </Fragment>
+  );
+}
+
 export default function Fleet() {
   const [backendUrl, setBackendUrl] = useState<string>(() => loadFromStorage(LS_BACKEND_URL_KEY));
   const [jwt, setJwt] = useState<string>(() => loadFromStorage(LS_JWT_KEY));
@@ -120,6 +390,32 @@ export default function Fleet() {
 
   const configured = backendUrl.trim() !== '' && jwt.trim() !== '';
 
+  // Register the primary dashboard controls (refresh / clear / backend URL /
+  // JWT input) with UI Bridge so automation can drive them without DOM
+  // scraping. IDs are stable — no array index, no derived data.
+  const { ref: refreshBtnRef } = useUIElement({
+    id: 'fleet-refresh',
+    type: 'button',
+    label: 'Refresh fleet list',
+    actions: ['click'],
+  });
+  const { ref: clearBtnRef } = useUIElement({
+    id: 'fleet-clear',
+    type: 'button',
+    label: 'Clear backend URL and JWT',
+    actions: ['click'],
+  });
+  const { ref: backendUrlRef } = useUIElement({
+    id: 'fleet-backend-url',
+    type: 'input',
+    label: 'Backend URL input',
+  });
+  const { ref: jwtRef } = useUIElement({
+    id: 'fleet-jwt',
+    type: 'input',
+    label: 'JWT password input',
+  });
+
   return (
     <div>
       <div className="page-header">
@@ -152,6 +448,7 @@ export default function Fleet() {
           <label className="text-muted" style={{ fontSize: '0.75rem' }}>
             Backend URL
             <input
+              ref={backendUrlRef as React.RefCallback<HTMLInputElement>}
               type="text"
               className="log-filter"
               style={{ display: 'block', width: '100%', marginTop: '0.2rem', padding: '0.4rem' }}
@@ -165,6 +462,7 @@ export default function Fleet() {
           <label className="text-muted" style={{ fontSize: '0.75rem' }}>
             JWT (user access token)
             <input
+              ref={jwtRef as React.RefCallback<HTMLInputElement>}
               type="password"
               className="log-filter"
               style={{
@@ -183,6 +481,7 @@ export default function Fleet() {
           </label>
           <div className="flex gap-2" style={{ marginTop: '0.5rem' }}>
             <button
+              ref={refreshBtnRef as React.RefCallback<HTMLButtonElement>}
               className="btn btn-primary"
               disabled={loading || !configured}
               onClick={refresh}
@@ -190,6 +489,7 @@ export default function Fleet() {
               {loading ? 'Refreshing…' : 'Refresh'}
             </button>
             <button
+              ref={clearBtnRef as React.RefCallback<HTMLButtonElement>}
               className="btn"
               disabled={loading}
               onClick={() => {
@@ -267,223 +567,14 @@ export default function Fleet() {
                 </tr>
               </thead>
               <tbody>
-                {runners.map((r) => {
-                  const hasError = r.ui_error != null || r.recent_crash != null;
-                  const expanded = expandedIds.has(r.id);
-                  const toggle = () => hasError && toggleExpanded(r.id);
-                  return (
-                  <Fragment key={r.id}>
-                  <tr>
-                    <td>
-                      <strong>{r.name}</strong>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {r.id}
-                      </div>
-                    </td>
-                    <td className="text-mono">
-                      {r.hostname}:{r.port}
-                    </td>
-                    <td>
-                      <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                        <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status}</span>
-                        {r.ui_error && (
-                          <span
-                            className="badge badge-danger badge-clickable"
-                            style={{ fontSize: '0.7rem' }}
-                            title={`UI error: ${r.ui_error.message}`}
-                            role="button"
-                            tabIndex={0}
-                            onClick={toggle}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                toggle();
-                              }
-                            }}
-                          >
-                            ui error
-                            <span style={{ marginLeft: '0.25rem', opacity: 0.7, fontSize: '0.65rem' }}>
-                              {expanded ? '▾' : '▸'}
-                            </span>
-                          </span>
-                        )}
-                        {r.recent_crash && (
-                          <span
-                            className="badge badge-danger badge-clickable"
-                            style={{ fontSize: '0.7rem' }}
-                            title={`Rust crash: ${r.recent_crash.panic_message ?? 'runner restarted after Rust panic'}${r.recent_crash.panic_location ? ` @ ${r.recent_crash.panic_location}` : ''}`}
-                            role="button"
-                            tabIndex={0}
-                            onClick={toggle}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                toggle();
-                              }
-                            }}
-                          >
-                            rust crash
-                            <span style={{ marginLeft: '0.25rem', opacity: 0.7, fontSize: '0.65rem' }}>
-                              {expanded ? '▾' : '▸'}
-                            </span>
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                    <td>{relativeTime(r.last_heartbeat)}</td>
-                    <td>
-                      <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                        {r.capabilities.length === 0 ? (
-                          <span className="text-muted">—</span>
-                        ) : (
-                          r.capabilities.map((cap) => (
-                            <span
-                              key={cap}
-                              className="badge"
-                              style={{
-                                background: 'var(--bg-tertiary)',
-                                color: 'var(--text-secondary)',
-                                fontSize: '0.7rem',
-                              }}
-                            >
-                              {cap}
-                            </span>
-                          ))
-                        )}
-                      </div>
-                    </td>
-                    <td>
-                      <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                        {r.server_mode && (
-                          <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
-                            server
-                          </span>
-                        )}
-                        {r.restate_enabled && (
-                          <span
-                            className={`badge ${r.restate_healthy ? 'badge-success' : 'badge-warning'}`}
-                            style={{ fontSize: '0.7rem' }}
-                          >
-                            restate{r.restate_healthy ? '' : ' (unhealthy)'}
-                          </span>
-                        )}
-                        {!r.server_mode && !r.restate_enabled && (
-                          <span className="text-muted">—</span>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                  {expanded && hasError && (
-                    <tr>
-                      <td colSpan={6} style={{ padding: 0 }}>
-                        <div
-                          style={{
-                            margin: '0.25rem 0.5rem 0.5rem 0.5rem',
-                            padding: '0.6rem 0.75rem',
-                            background: 'rgba(239,68,68,0.08)',
-                            border: '1px solid rgba(239,68,68,0.3)',
-                            borderRadius: 4,
-                            fontSize: '0.75rem',
-                          }}
-                        >
-                          {r.ui_error && (
-                            <div style={{ marginBottom: r.recent_crash ? '0.6rem' : 0 }}>
-                              <div style={{ marginBottom: '0.4rem' }}>
-                                <strong className="text-danger">UI Error:</strong>{' '}
-                                <span style={{ fontFamily: 'var(--font-mono)' }}>
-                                  {r.ui_error.message}
-                                </span>
-                              </div>
-                              <div
-                                className="text-muted"
-                                style={{
-                                  fontSize: '0.7rem',
-                                  display: 'flex',
-                                  gap: '1rem',
-                                  flexWrap: 'wrap',
-                                }}
-                              >
-                                <span>
-                                  <strong>First seen:</strong> {formatTs(r.ui_error.first_seen)}
-                                </span>
-                                <span>
-                                  <strong>Last reported:</strong>{' '}
-                                  {formatTs(r.ui_error.reported_at)}
-                                </span>
-                                <span>
-                                  <strong>Count:</strong> {r.ui_error.count}
-                                </span>
-                                {r.ui_error.digest && (
-                                  <span>
-                                    <strong>Digest:</strong>{' '}
-                                    <span style={{ fontFamily: 'var(--font-mono)' }}>
-                                      {r.ui_error.digest}
-                                    </span>
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          )}
-                          {r.recent_crash && (
-                            <div>
-                              <div style={{ marginBottom: '0.4rem' }}>
-                                <strong className="text-danger">Rust Crash:</strong>{' '}
-                                <span style={{ fontFamily: 'var(--font-mono)' }}>
-                                  {r.recent_crash.panic_message ??
-                                    'runner restarted after Rust panic (no message captured)'}
-                                </span>
-                              </div>
-                              <div
-                                className="text-muted"
-                                style={{
-                                  fontSize: '0.7rem',
-                                  display: 'flex',
-                                  gap: '1rem',
-                                  flexWrap: 'wrap',
-                                  marginBottom: '0.4rem',
-                                }}
-                              >
-                                <span>
-                                  <strong>Reported:</strong>{' '}
-                                  {formatTs(r.recent_crash.reported_at)}
-                                </span>
-                                {r.recent_crash.panic_location && (
-                                  <span>
-                                    <strong>Location:</strong>{' '}
-                                    <span style={{ fontFamily: 'var(--font-mono)' }}>
-                                      {r.recent_crash.panic_location}
-                                    </span>
-                                  </span>
-                                )}
-                                {r.recent_crash.thread && (
-                                  <span>
-                                    <strong>Thread:</strong>{' '}
-                                    <span style={{ fontFamily: 'var(--font-mono)' }}>
-                                      {r.recent_crash.thread}
-                                    </span>
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                                <strong>Dump file:</strong>{' '}
-                                <span
-                                  style={{
-                                    fontFamily: 'var(--font-mono)',
-                                    wordBreak: 'break-all',
-                                  }}
-                                >
-                                  {r.recent_crash.file_path}
-                                </span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                  </Fragment>
-                  );
-                })}
+                {runners.map((r) => (
+                  <FleetRow
+                    key={r.id}
+                    runner={r}
+                    expanded={expandedIds.has(r.id)}
+                    toggle={() => toggleExpanded(r.id)}
+                  />
+                ))}
               </tbody>
             </table>
           </div>

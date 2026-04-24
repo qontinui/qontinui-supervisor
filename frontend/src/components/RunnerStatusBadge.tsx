@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
+import { useUIElement } from '@qontinui/ui-bridge/react';
 import type { RecentCrashSummary, RunnerDerivedStatus, UiErrorSummary } from '../lib/api';
 
 interface RunnerStatusBadgeProps {
@@ -18,6 +19,14 @@ interface RunnerStatusBadgeProps {
   /// If the runner does not expose a derived_status (older supervisor build
   /// or degraded cache), fall back to this up/down boolean.
   fallbackUp?: boolean;
+  /// Optional UI Bridge element id. When set, the badge is registered as a
+  /// UI Bridge button and its `toggle` custom action flips the expanded
+  /// detail panel — equivalent to a mouse click. Stable ids let automation
+  /// reach the badge without DOM scraping.
+  elementId?: string;
+  /// Optional display label for the UI Bridge registration (ignored when
+  /// `elementId` is not set). Defaults to "Runner status badge".
+  elementLabel?: string;
 }
 
 interface StatusDisplay {
@@ -92,6 +101,8 @@ export function RunnerStatusBadge({
   recentCrash,
   style,
   fallbackUp,
+  elementId,
+  elementLabel,
 }: RunnerStatusBadgeProps) {
   const [expanded, setExpanded] = useState(false);
   const { label, badgeClass } = statusDisplay(derivedStatus, fallbackUp);
@@ -110,9 +121,38 @@ export function RunnerStatusBadge({
     if (clickable) setExpanded((v) => !v);
   };
 
+  // Optional UI Bridge registration. The hook is always called (React hook
+  // rules), but we pass a stable throwaway id when `elementId` isn't set —
+  // registration still happens, but callers who don't opt in also don't rely
+  // on it. Using a stable sentinel avoids re-register churn.
+  const { ref: badgeRef } = useUIElement({
+    id: elementId ?? '__runner-status-badge-unregistered__',
+    type: 'button',
+    label: elementLabel ?? 'Runner status badge',
+    actions: ['click'],
+    customActions: {
+      toggle: {
+        id: 'toggle',
+        description: 'Toggle the runner status badge expanded detail panel',
+        handler: () => {
+          if (clickable) setExpanded((v) => !v);
+        },
+      },
+    },
+    // Skip auto-registration when no elementId was provided — the default
+    // unregistered badge shouldn't pollute the registry.
+    autoRegister: elementId !== undefined,
+  });
+
   return (
     <>
       <span
+        ref={
+          elementId !== undefined
+            ? (badgeRef as React.RefCallback<HTMLSpanElement>)
+            : undefined
+        }
+        data-ui-bridge-value={String(expanded)}
         className={`badge ${badgeClass}${clickable ? ' badge-clickable' : ''}`}
         style={style}
         title={tooltip}

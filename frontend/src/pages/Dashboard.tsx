@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useUIElement } from '@qontinui/ui-bridge/react';
 import {
   api,
   HealthResponse,
   DevStartResponse,
   ExpoStatus,
   RecentCrashSummary,
+  RecentPanicSummary,
   RunnerDerivedStatus,
+  StaleBinarySummary,
   UiErrorSummary,
 } from '../lib/api';
 import { ErrorBoundary } from '../components/ErrorBoundary';
@@ -33,6 +36,35 @@ function LogViewer() {
   const viewerRef = useRef<HTMLDivElement>(null);
   const pausedRef = useRef(false);
   pausedRef.current = paused;
+
+  // UI Bridge: logs pause/resume toggle, clear, and source filter. The
+  // pause/resume button swaps its label at runtime, so expose a `toggle`
+  // custom action instead of a raw click (the generic click still works if
+  // the caller prefers it).
+  const { ref: logsPauseRef } = useUIElement({
+    id: 'logs-pause-toggle',
+    type: 'button',
+    label: 'Pause or resume the log stream',
+    actions: ['click'],
+    customActions: {
+      toggle: {
+        id: 'toggle',
+        description: 'Flip paused state for the log stream',
+        handler: () => setPaused((v) => !v),
+      },
+    },
+  });
+  const { ref: logsClearRef } = useUIElement({
+    id: 'logs-clear',
+    type: 'button',
+    label: 'Clear captured log lines',
+    actions: ['click'],
+  });
+  const { ref: logsSourceFilterRef } = useUIElement({
+    id: 'logs-source-filter',
+    type: 'select',
+    label: 'Log source / level filter',
+  });
 
   useSSE<LogLine>(
     '/logs/stream',
@@ -81,6 +113,7 @@ function LogViewer() {
           {expanded && (
             <>
               <select
+                ref={logsSourceFilterRef as React.RefCallback<HTMLSelectElement>}
                 className="log-filter"
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
@@ -94,13 +127,23 @@ function LogViewer() {
                 <option value="error">Errors only</option>
                 <option value="warn">Warnings only</option>
               </select>
-              <SmallBtn
-                label={paused ? 'Resume' : 'Pause'}
-                activeLabel=""
+              <button
+                ref={logsPauseRef as React.RefCallback<HTMLButtonElement>}
+                className="btn"
+                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                data-ui-bridge-value={String(paused)}
                 onClick={() => setPaused((v) => !v)}
-                busy={null}
-              />
-              <SmallBtn label="Clear" activeLabel="" onClick={() => setLines([])} busy={null} />
+              >
+                {paused ? 'Resume' : 'Pause'}
+              </button>
+              <button
+                ref={logsClearRef as React.RefCallback<HTMLButtonElement>}
+                className="btn"
+                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                onClick={() => setLines([])}
+              >
+                Clear
+              </button>
             </>
           )}
           <button
@@ -191,6 +234,492 @@ interface RunnerInstance {
   derived_status?: RunnerDerivedStatus;
   ui_error?: UiErrorSummary | null;
   recent_crash?: RecentCrashSummary | null;
+  // Phase 2b: structured startup-panic record parsed from the runner's
+  // `runner-panic.log`. Populated when the supervisor observed a non-zero
+  // exit AND a fresh panic file was on disk. Distinct from `recent_crash`,
+  // which is the on-runtime WebView2 crash dump. Rendered as a red "Panic"
+  // badge next to the status dot — click opens a modal with the full
+  // payload + backtrace preview.
+  recent_panic?: RecentPanicSummary | null;
+  // Phase 2c (Item 9): a pool slot has a binary more than 30 seconds newer
+  // than the copy the running runner was started from. Rendered as a yellow
+  // "stale binary" pill — clicking it opens a confirmation dialog that
+  // restarts the runner (picking up the newer build).
+  stale_binary?: StaleBinarySummary | null;
+}
+
+// ─── Startup-panic badge + modal (Phase 2b) ─────────────────────────────
+// Surfaces `recent_panic` on a runner row as a red "Panic" pill. Clicking
+// the pill opens a modal with the full panic payload + backtrace preview.
+//
+// Nomenclature: `recent_panic` is the *startup* panic record parsed from
+// `runner-panic.log` by `qontinui-supervisor::process::panic_log`. It is
+// distinct from `recent_crash` (the runtime WebView2 crash dump polled by
+// /health). Both can be present on the same runner — they capture
+// orthogonal failure classes and render as separate badges.
+
+function PanicBadge({ panic, runnerName }: { panic: RecentPanicSummary; runnerName: string }) {
+  const [modalOpen, setModalOpen] = useState(false);
+  const tooltipPreview = `${panic.payload}${
+    panic.location ? `\n@ ${panic.location}` : ''
+  }`.slice(0, 500);
+
+  return (
+    <>
+      <button
+        type="button"
+        className="btn"
+        aria-label={`Runner ${runnerName} panicked during startup — click for details`}
+        title={tooltipPreview}
+        onClick={(e) => {
+          e.stopPropagation();
+          setModalOpen(true);
+        }}
+        style={{
+          padding: '0 0.4rem',
+          fontSize: '0.65rem',
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em',
+          background: 'var(--danger, #dc2626)',
+          color: 'white',
+          border: '1px solid var(--danger, #dc2626)',
+          borderRadius: 10,
+          cursor: 'pointer',
+          lineHeight: '1.4',
+        }}
+        data-testid={`runner-panic-badge-${runnerName}`}
+      >
+        Panic
+      </button>
+      {modalOpen && <PanicModal panic={panic} runnerName={runnerName} onClose={() => setModalOpen(false)} />}
+    </>
+  );
+}
+
+function PanicModal({
+  panic,
+  runnerName,
+  onClose,
+}: {
+  panic: RecentPanicSummary;
+  runnerName: string;
+  onClose: () => void;
+}) {
+  // Close on Escape — keyboard accessibility + matches the ConfirmDialog
+  // UX elsewhere in this page.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Startup panic for ${runnerName}`}
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: 'var(--bg-primary, #fff)',
+          color: 'var(--text, #111)',
+          border: '1px solid var(--border, #ccc)',
+          borderRadius: 6,
+          padding: '1rem 1.25rem',
+          maxWidth: 'min(900px, 90vw)',
+          maxHeight: '85vh',
+          overflow: 'auto',
+          fontSize: '0.8rem',
+          fontFamily: 'var(--font-mono)',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'flex-start',
+            marginBottom: '0.75rem',
+            fontFamily: 'var(--font-sans)',
+          }}
+        >
+          <div>
+            <div style={{ fontWeight: 600, fontSize: '1rem' }}>
+              Startup panic — {runnerName}
+            </div>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              {new Date(panic.timestamp).toLocaleString()}
+              {panic.pid != null && ` · PID ${panic.pid}`}
+              {panic.version && ` · v${panic.version}`}
+              {panic.thread && ` · thread ${panic.thread}`}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn"
+            aria-label="Close panic details"
+            style={{ padding: '0.1rem 0.5rem', fontSize: '0.8rem' }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {panic.location && (
+          <div style={{ marginBottom: '0.5rem' }}>
+            <strong style={{ fontFamily: 'var(--font-sans)' }}>Location:</strong>{' '}
+            <code>{panic.location}</code>
+          </div>
+        )}
+
+        <div style={{ marginBottom: '0.75rem' }}>
+          <div style={{ fontWeight: 600, marginBottom: '0.25rem', fontFamily: 'var(--font-sans)' }}>
+            Payload
+          </div>
+          <pre
+            style={{
+              background: 'var(--bg-secondary, #f5f5f5)',
+              padding: '0.5rem',
+              borderRadius: 4,
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'break-word',
+              margin: 0,
+            }}
+          >
+            {panic.payload || '(empty)'}
+          </pre>
+        </div>
+
+        {panic.backtrace_preview && (
+          <div>
+            <div
+              style={{
+                fontWeight: 600,
+                marginBottom: '0.25rem',
+                fontFamily: 'var(--font-sans)',
+              }}
+            >
+              Backtrace (first 15 frames)
+            </div>
+            <pre
+              style={{
+                background: 'var(--bg-secondary, #f5f5f5)',
+                padding: '0.5rem',
+                borderRadius: 4,
+                whiteSpace: 'pre',
+                overflow: 'auto',
+                margin: 0,
+                fontSize: '0.75rem',
+              }}
+            >
+              {panic.backtrace_preview}
+            </pre>
+          </div>
+        )}
+
+        <div
+          style={{
+            marginTop: '0.75rem',
+            fontSize: '0.7rem',
+            color: 'var(--text-muted)',
+            fontFamily: 'var(--font-sans)',
+          }}
+        >
+          Source: <code>{panic.file_path}</code>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Stale-binary badge (Phase 2c — Item 9) ─────────────────────────────
+// Renders a yellow pill when a pool slot holds a binary that's more than 30s
+// newer than the copy the running runner was started from. Clicking opens a
+// confirmation dialog that restarts the runner (rebuild:false) so it picks
+// up the newer binary. Supervisor is the source of truth for the 30s
+// threshold — see `STALE_BINARY_THRESHOLD_SECS` in
+// `qontinui-supervisor/src/process/manager.rs`.
+
+/// Format a seconds delta as a short relative-time string ("42s ago", "5m ago",
+/// "2h ago"). Intentionally coarse — the badge is a hint, not a log line.
+function formatRelativeAgeSecs(secs: number): string {
+  const abs = Math.abs(Math.floor(secs));
+  if (abs < 60) return `${abs}s`;
+  if (abs < 3600) return `${Math.floor(abs / 60)}m`;
+  if (abs < 86400) return `${Math.floor(abs / 3600)}h`;
+  return `${Math.floor(abs / 86400)}d`;
+}
+
+function StaleBinaryBadge({
+  stale,
+  runnerName,
+  onRestart,
+  disabled,
+}: {
+  stale: StaleBinarySummary;
+  runnerName: string;
+  onRestart: () => void;
+  disabled: boolean;
+}) {
+  // Compute relative ages from the serialized millis. `now` is captured once
+  // per render, which is good enough for a hint — the outer panel refreshes
+  // every 5s via its polling loop.
+  const now = Date.now();
+  const runningAgeSecs = Math.max(0, Math.floor((now - stale.running_mtime_ms) / 1000));
+  const slotAgeSecs = Math.max(0, Math.floor((now - stale.slot_mtime_ms) / 1000));
+  const tooltip =
+    `Running binary built ${formatRelativeAgeSecs(runningAgeSecs)} ago. ` +
+    `Slot-${stale.slot_id} has a newer build from ${formatRelativeAgeSecs(slotAgeSecs)} ago. ` +
+    `Restart to pick it up.`;
+
+  const handleClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (disabled) return;
+    const ok = await confirm(
+      'Restart with newer binary',
+      `Restart with the newer binary now? This restarts "${runnerName}" (~5s downtime).`,
+    );
+    if (ok) onRestart();
+  };
+
+  return (
+    <button
+      type="button"
+      className="btn"
+      aria-label={`Runner ${runnerName} has a newer binary available in slot ${stale.slot_id} — click to restart`}
+      title={tooltip}
+      disabled={disabled}
+      onClick={handleClick}
+      style={{
+        padding: '0 0.4rem',
+        fontSize: '0.65rem',
+        fontWeight: 600,
+        textTransform: 'uppercase',
+        letterSpacing: '0.03em',
+        // Yellow/amber — informational, distinct from red "panic" and
+        // neutral status badges.
+        background: 'var(--warning, #eab308)',
+        color: '#1f2937',
+        border: '1px solid var(--warning, #eab308)',
+        borderRadius: 10,
+        cursor: disabled ? 'default' : 'pointer',
+        lineHeight: '1.4',
+        opacity: disabled ? 0.6 : 1,
+      }}
+      data-testid={`runner-stale-binary-badge-${runnerName}`}
+    >
+      stale binary
+    </button>
+  );
+}
+
+// ─── Runner row (per-runner in the Runner Instances panel) ──────────────────
+// Extracted so we can call useUIElement per-row with stable IDs derived from
+// the runner's id (not an array index). Registered actions: start, stop,
+// restart, rebuild, remove, protect. Not every action button is rendered on
+// every row (e.g. Remove only shows when the runner is down + non-primary),
+// but the hook registration runs unconditionally so IDs are stable.
+
+interface RunnerRowProps {
+  runner: RunnerInstance;
+  busy: string | null;
+  onStart: () => void;
+  onStop: () => void;
+  onRestart: () => void;
+  onRebuild: () => void;
+  onRemove: () => void;
+  onProtect?: () => void;
+}
+
+function RunnerRow({
+  runner: r,
+  busy,
+  onStart,
+  onStop,
+  onRestart,
+  onRebuild,
+  onRemove,
+  onProtect,
+}: RunnerRowProps) {
+  const isUp = r.running || r.api_responding;
+  const isPrimary = r.is_primary;
+
+  // Register per-row action buttons with UI Bridge. Keep IDs stable per
+  // runner id (matches the F5 spec: `runner-<id>-<action>`).
+  const { ref: startBtnRef } = useUIElement({
+    id: `runner-${r.id}-start`,
+    type: 'button',
+    label: `Start ${r.name}`,
+    actions: ['click'],
+  });
+  const { ref: stopBtnRef } = useUIElement({
+    id: `runner-${r.id}-stop`,
+    type: 'button',
+    label: `Stop ${r.name}`,
+    actions: ['click'],
+  });
+  const { ref: restartBtnRef } = useUIElement({
+    id: `runner-${r.id}-restart`,
+    type: 'button',
+    label: `Restart ${r.name}`,
+    actions: ['click'],
+  });
+  const { ref: rebuildBtnRef } = useUIElement({
+    id: `runner-${r.id}-rebuild`,
+    type: 'button',
+    label: `Rebuild ${r.name}`,
+    actions: ['click'],
+  });
+  const { ref: removeBtnRef } = useUIElement({
+    id: `runner-${r.id}-remove`,
+    type: 'button',
+    label: `Remove ${r.name}`,
+    actions: ['click'],
+  });
+  // Protect toggle — not rendered in the current UI as a dedicated button,
+  // but still registered for callers of `POST /.../protect`. The default
+  // handler is supplied by the parent so the action has something to call.
+  const { ref: protectBtnRef } = useUIElement({
+    id: `runner-${r.id}-protect`,
+    type: 'button',
+    label: `Protect ${r.name}`,
+    actions: ['click'],
+    customActions: {
+      toggle: {
+        id: 'toggle',
+        description: 'Toggle protection on this runner',
+        handler: () => onProtect?.(),
+      },
+    },
+  });
+  // Reference the protect ref so lint doesn't warn; it's intentionally not
+  // attached to a rendered element today.
+  void protectBtnRef;
+
+  return (
+    <tr>
+      <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
+        <span>{r.name}</span>
+        {isPrimary && (
+          <span
+            style={{
+              marginLeft: '0.4rem',
+              padding: '0 0.3rem',
+              fontSize: '0.6rem',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 3,
+              color: 'var(--text-muted)',
+              textTransform: 'uppercase',
+            }}
+          >
+            Primary
+          </span>
+        )}
+      </td>
+      <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
+      <td>
+        <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <StatusDot up={isUp} />
+          <RunnerStatusBadge
+            derivedStatus={r.derived_status}
+            uiError={r.ui_error}
+            recentCrash={r.recent_crash}
+            fallbackUp={isUp}
+            style={{ fontSize: '0.7rem' }}
+            elementId={`runner-${r.id}-status-badge`}
+            elementLabel={`Runner status badge for ${r.name}`}
+          />
+          {r.recent_panic && <PanicBadge panic={r.recent_panic} runnerName={r.name} />}
+          {r.stale_binary && (
+            <StaleBinaryBadge
+              stale={r.stale_binary}
+              runnerName={r.name}
+              onRestart={onRestart}
+              disabled={busy !== null}
+            />
+          )}
+        </div>
+      </td>
+      <td>
+        <div className="flex gap-2">
+          {!isUp && !isPrimary && (
+            <button
+              ref={startBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+              disabled={busy !== null}
+              onClick={onStart}
+            >
+              {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
+            </button>
+          )}
+          {isUp && !isPrimary && (
+            <button
+              ref={stopBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+              disabled={busy !== null}
+              onClick={onStop}
+            >
+              {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
+            </button>
+          )}
+          {isUp && (
+            <button
+              ref={restartBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+              disabled={busy !== null}
+              onClick={onRestart}
+              title="Stop and start the runner using the existing binary"
+            >
+              {busy === `Restart ${r.name}` ? 'Restarting...' : 'Restart'}
+            </button>
+          )}
+          <button
+            ref={rebuildBtnRef as React.RefCallback<HTMLButtonElement>}
+            className="btn"
+            style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+            disabled={busy !== null}
+            onClick={onRebuild}
+            title="Rebuild the runner binary, then restart (blocks until build finishes)"
+          >
+            {busy === `Rebuild ${r.name}` ? 'Rebuilding...' : 'Rebuild'}
+          </button>
+          {!isUp && !isPrimary && (
+            <button
+              ref={removeBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{
+                padding: '0.15rem 0.4rem',
+                fontSize: '0.7rem',
+                color: 'var(--danger)',
+                borderColor: 'var(--danger)',
+              }}
+              disabled={busy !== null}
+              onClick={onRemove}
+            >
+              Remove
+            </button>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 function RunnerInstancesPanel() {
@@ -201,6 +730,15 @@ function RunnerInstancesPanel() {
   const [newPort, setNewPort] = useState('');
   const [rebuild, setRebuild] = useState(true);
   const [isProtected, setIsProtected] = useState(false);
+
+  // Register the Spawn submit button so automation can dispatch a new runner
+  // without DOM scraping the spawn form.
+  const { ref: spawnSubmitRef } = useUIElement({
+    id: 'runner-spawn-submit',
+    type: 'button',
+    label: 'Spawn a new named runner',
+    actions: ['click'],
+  });
 
   const refresh = useCallback(async () => {
     try {
@@ -331,6 +869,7 @@ function RunnerInstancesPanel() {
             Protected
           </label>
           <button
+            ref={spawnSubmitRef as React.RefCallback<HTMLButtonElement>}
             className="btn"
             style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
             disabled={busy !== null}
@@ -360,131 +899,52 @@ function RunnerInstancesPanel() {
             </thead>
             <tbody>
               {visibleRunners.map((r) => {
-                const isUp = r.running || r.api_responding;
                 const isPrimary = r.is_primary;
                 // Primary uses the legacy single-runner endpoint; secondary
                 // runners use the per-id endpoint.
                 const doRestart = (rebuild: boolean) =>
                   isPrimary ? api.runnerRestart(rebuild) : api.restartRunnerById(r.id, rebuild);
                 return (
-                <tr key={r.id}>
-                  <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>
-                    <span>{r.name}</span>
-                    {isPrimary && (
-                      <span
-                        style={{
-                          marginLeft: '0.4rem',
-                          padding: '0 0.3rem',
-                          fontSize: '0.6rem',
-                          background: 'var(--bg-secondary)',
-                          border: '1px solid var(--border)',
-                          borderRadius: 3,
-                          color: 'var(--text-muted)',
-                          textTransform: 'uppercase',
-                        }}
-                      >
-                        Primary
-                      </span>
-                    )}
-                  </td>
-                  <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
-                  <td>
-                    <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-                      <StatusDot up={isUp} />
-                      <RunnerStatusBadge
-                        derivedStatus={r.derived_status}
-                        uiError={r.ui_error}
-                        recentCrash={r.recent_crash}
-                        fallbackUp={isUp}
-                        style={{ fontSize: '0.7rem' }}
-                      />
-                    </div>
-                  </td>
-                  <td>
-                    <div className="flex gap-2">
-                      {!isUp && !isPrimary && (
-                        <button
-                          className="btn"
-                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-                          disabled={busy !== null}
-                          onClick={() => doAction(`Start ${r.name}`, () => api.startRunner(r.id))}
-                        >
-                          {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
-                        </button>
-                      )}
-                      {isUp && !isPrimary && (
-                        <button
-                          className="btn"
-                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-                          disabled={busy !== null}
-                          onClick={() => doAction(`Stop ${r.name}`, () => api.stopRunner(r.id))}
-                        >
-                          {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
-                        </button>
-                      )}
-                      {isUp && (
-                        <button
-                          className="btn"
-                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-                          disabled={busy !== null}
-                          onClick={() =>
-                            doAction(`Restart ${r.name}`, async () => {
-                              if (isPrimary) {
-                                await confirm(
-                                  'Restart primary runner',
-                                  `Restart "${r.name}"? Any active work in the runner window will be lost.`,
-                                );
-                              }
-                              await doRestart(false);
-                            })
-                          }
-                          title="Stop and start the runner using the existing binary"
-                        >
-                          {busy === `Restart ${r.name}` ? 'Restarting...' : 'Restart'}
-                        </button>
-                      )}
-                      <button
-                        className="btn"
-                        style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-                        disabled={busy !== null}
-                        onClick={() =>
-                          doAction(`Rebuild ${r.name}`, async () => {
-                            if (isPrimary) {
-                              await confirm(
-                                'Rebuild primary runner',
-                                `Rebuild and restart "${r.name}"? This takes 1-3 minutes and any active work in the runner window will be lost.`,
-                              );
-                            }
-                            await doRestart(true);
-                          })
+                  <RunnerRow
+                    key={r.id}
+                    runner={r}
+                    busy={busy}
+                    onStart={() => doAction(`Start ${r.name}`, () => api.startRunner(r.id))}
+                    onStop={() => doAction(`Stop ${r.name}`, () => api.stopRunner(r.id))}
+                    onRestart={() =>
+                      doAction(`Restart ${r.name}`, async () => {
+                        if (isPrimary) {
+                          await confirm(
+                            'Restart primary runner',
+                            `Restart "${r.name}"? Any active work in the runner window will be lost.`,
+                          );
                         }
-                        title="Rebuild the runner binary, then restart (blocks until build finishes)"
-                      >
-                        {busy === `Rebuild ${r.name}` ? 'Rebuilding...' : 'Rebuild'}
-                      </button>
-                      {!isUp && !isPrimary && (
-                        <button
-                          className="btn"
-                          style={{
-                            padding: '0.15rem 0.4rem',
-                            fontSize: '0.7rem',
-                            color: 'var(--danger)',
-                            borderColor: 'var(--danger)',
-                          }}
-                          disabled={busy !== null}
-                          onClick={() =>
-                            doAction(`Remove ${r.name}`, async () => {
-                              await confirm('Remove runner', `Remove "${r.name}" from the supervisor?`);
-                              await api.removeRunner(r.id);
-                            })
-                          }
-                        >
-                          Remove
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
+                        await doRestart(false);
+                      })
+                    }
+                    onRebuild={() =>
+                      doAction(`Rebuild ${r.name}`, async () => {
+                        if (isPrimary) {
+                          await confirm(
+                            'Rebuild primary runner',
+                            `Rebuild and restart "${r.name}"? This takes 1-3 minutes and any active work in the runner window will be lost.`,
+                          );
+                        }
+                        await doRestart(true);
+                      })
+                    }
+                    onRemove={() =>
+                      doAction(`Remove ${r.name}`, async () => {
+                        await confirm('Remove runner', `Remove "${r.name}" from the supervisor?`);
+                        await api.removeRunner(r.id);
+                      })
+                    }
+                    onProtect={() =>
+                      doAction(`Protect ${r.name}`, () =>
+                        api.protectRunner(r.id, !r.protected),
+                      )
+                    }
+                  />
                 );
               })}
             </tbody>
