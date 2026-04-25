@@ -1,4 +1,4 @@
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -67,6 +67,15 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/ai/provider", get(crate::routes::ai::get_provider))
         .route("/ai/provider", post(crate::routes::ai::set_provider))
         .route("/ai/models", get(crate::routes::ai::models))
+        // Spawn-monitor placement: where temp runner windows land
+        .route(
+            "/spawn-monitors",
+            get(crate::routes::monitors::list_spawn_monitors),
+        )
+        .route(
+            "/spawn-monitors",
+            put(crate::routes::monitors::put_spawn_monitors),
+        )
         // Dev-start orchestration removed — frontend/backend are managed by the runner directly
         // Supervisor Bridge (command relay for supervisor's own dashboard UI)
         .route(

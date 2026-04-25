@@ -872,4 +872,27 @@ export const api = {
   expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
   expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
   expoStatus: () => fetchJson<ExpoStatus>('/expo/status'),
+
+  // Spawn-monitor placement
+  getSpawnMonitors: () => fetchJson<SpawnMonitorsResponse>('/spawn-monitors'),
+  putSpawnMonitors: (monitors: MonitorConfig[]) =>
+    fetchJson<SpawnMonitorsResponse>('/spawn-monitors', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ monitors }),
+    }),
 };
+
+export interface MonitorConfig {
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  enabled: boolean;
+}
+
+export interface SpawnMonitorsResponse {
+  monitors: MonitorConfig[];
+  next_index: number;
+}

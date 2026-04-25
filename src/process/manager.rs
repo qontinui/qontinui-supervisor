@@ -461,6 +461,29 @@ pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
     cmd.env("QONTINUI_SERVER_MODE", "1");
 }
 
+/// Pick the next enabled monitor (round-robin) and push its rect as
+/// QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT. The runner reads these at window-build
+/// time. No-op if no monitors are configured or all are disabled, in which
+/// case the runner falls back to its existing behavior (maximized for primary,
+/// `(100,100)` for secondaries).
+async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, runner_name: &str) {
+    if let Some(monitor) = state.pick_next_monitor().await {
+        tracing::info!(
+            "Placing runner '{}' on monitor '{}' at ({},{}) {}x{}",
+            runner_name,
+            monitor.label,
+            monitor.x,
+            monitor.y,
+            monitor.width,
+            monitor.height
+        );
+        cmd.env("QONTINUI_WINDOW_X", monitor.x.to_string());
+        cmd.env("QONTINUI_WINDOW_Y", monitor.y.to_string());
+        cmd.env("QONTINUI_WINDOW_WIDTH", monitor.width.to_string());
+        cmd.env("QONTINUI_WINDOW_HEIGHT", monitor.height.to_string());
+    }
+}
+
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
     // Priority 1: runtime-configured credentials (set via POST /test-login).
     if let Ok(guard) = state.test_auto_login.try_read() {
@@ -775,6 +798,7 @@ async fn start_exe_mode_for_runner(
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
             }
             forward_test_auto_login_env(&mut cmd, state);
+            forward_window_position_env(&mut cmd, state, &managed.config.name).await;
         }
 
         // Per-runner WebView2 data dir — non-primary runners get isolated
@@ -832,6 +856,7 @@ async fn start_exe_mode_for_runner(
                 cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
             }
             forward_test_auto_login_env(&mut cmd, state);
+            forward_window_position_env(&mut cmd, state, &managed.config.name).await;
             // Per-runner WebView2 data dir (see Windows branch for rationale).
             // On non-Windows the variable is ignored by other webview backends,
             // so this is harmless but keeps behavior consistent.

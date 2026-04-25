@@ -130,6 +130,13 @@ pub struct SupervisorState {
     /// `process::stopped_cache`). Queryable via
     /// `GET /runners/{id}/logs?include_stopped=true`.
     pub stopped_runners: Arc<RwLock<HashMap<String, StoppedRunnerSnapshot>>>,
+    /// Monitor placement targets for spawned temp runners. Loaded from
+    /// `supervisor-settings.json` on startup, mutated by the dashboard via
+    /// `PUT /spawn-monitors`. Round-robin pick uses `next_monitor_index`.
+    pub spawn_monitors: RwLock<Vec<crate::settings::MonitorConfig>>,
+    /// Round-robin counter for choosing which enabled monitor a new temp
+    /// runner should land on. Wraps modulo enabled-count at pick time.
+    pub next_monitor_index: AtomicUsize,
 }
 
 pub struct RunnerState {
@@ -434,7 +441,23 @@ impl SupervisorState {
             http_client,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
+            spawn_monitors: RwLock::new(Vec::new()),
+            next_monitor_index: AtomicUsize::new(0),
         }
+    }
+
+    /// Pick the next enabled monitor in round-robin order. Returns `None`
+    /// if no monitors are configured or all are disabled.
+    pub async fn pick_next_monitor(&self) -> Option<crate::settings::MonitorConfig> {
+        use std::sync::atomic::Ordering;
+        let monitors = self.spawn_monitors.read().await;
+        let enabled: Vec<&crate::settings::MonitorConfig> =
+            monitors.iter().filter(|m| m.enabled).collect();
+        if enabled.is_empty() {
+            return None;
+        }
+        let idx = self.next_monitor_index.fetch_add(1, Ordering::Relaxed) % enabled.len();
+        Some(enabled[idx].clone())
     }
 
     pub fn notify_health_change(&self) {
