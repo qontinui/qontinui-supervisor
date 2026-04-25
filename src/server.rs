@@ -76,6 +76,10 @@ pub fn build_router(state: SharedState) -> Router {
             "/spawn-monitors",
             put(crate::routes::monitors::put_spawn_monitors),
         )
+        .route(
+            "/spawn-monitors/detected",
+            get(crate::routes::monitors::get_detected_monitors),
+        )
         // Dev-start orchestration removed — frontend/backend are managed by the runner directly
         // Supervisor Bridge (command relay for supervisor's own dashboard UI)
         .route(

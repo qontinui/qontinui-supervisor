@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 
 interface ConfirmState {
   title: string;
@@ -24,17 +25,25 @@ export function ConfirmDialog() {
   }, []);
 
   if (!state) return null;
+  if (typeof document === 'undefined') return null;
 
   const answer = (ok: boolean) => {
     state.resolve(ok);
     setState(null);
   };
 
-  return (
+  const dialog = (
     <div className="confirm-overlay" onClick={() => answer(false)}>
-      <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
-        <h3>{state.title}</h3>
-        <p>{state.message}</p>
+      <div
+        className="confirm-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby="confirm-dialog-message"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="confirm-dialog-title">{state.title}</h3>
+        <p id="confirm-dialog-message">{state.message}</p>
         <div className="confirm-actions">
           <button className="btn" onClick={() => answer(false)}>
             Cancel
@@ -50,4 +59,6 @@ export function ConfirmDialog() {
       </div>
     </div>
   );
+
+  return createPortal(dialog, document.body);
 }

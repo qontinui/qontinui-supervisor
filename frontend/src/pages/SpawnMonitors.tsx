@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api, MonitorConfig } from '../lib/api';
+import { api, DetectedMonitor, MonitorConfig } from '../lib/api';
 
 interface DraftMonitor extends MonitorConfig {
   // Stable per-row id so React keys survive label edits and reorders.
@@ -56,6 +56,8 @@ export default function SpawnMonitors() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [detected, setDetected] = useState<DetectedMonitor[] | null>(null);
+  const [detecting, setDetecting] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
@@ -102,6 +104,65 @@ export default function SpawnMonitors() {
     }
   };
 
+  const detect = async () => {
+    setDetecting(true);
+    setError(null);
+    try {
+      const res = await api.getDetectedMonitors();
+      setDetected(res.monitors);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetecting(false);
+    }
+  };
+
+  const dismissDetected = () => setDetected(null);
+
+  const applyDetected = async () => {
+    if (!detected) return;
+    // Preserve existing enabled flags by label match. New labels default to
+    // enabled=true for non-primary, enabled=false for primary (most common
+    // user pattern: spawn windows onto secondaries).
+    const currentByLabel = new Map<string, MonitorConfig>(
+      drafts.map((d) => [d.label, fromDraft(d)]),
+    );
+    const next: MonitorConfig[] = detected.map((m) => {
+      const prev = currentByLabel.get(m.label);
+      const enabled = prev ? prev.enabled : !m.is_primary;
+      return {
+        label: m.label,
+        x: m.x,
+        y: m.y,
+        width: m.width,
+        height: m.height,
+        enabled,
+      };
+    });
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await api.putSpawnMonitors(next);
+      setDrafts(res.monitors.map(toDraft));
+      setNextIndex(res.next_index);
+      setSavedAt(Date.now());
+      setDetected(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // True when a detected entry has a label match with identical x/y/w/h in the
+  // current persisted-but-not-yet-edited drafts.
+  const detectedMatchesCurrent = (m: DetectedMonitor): boolean => {
+    const cur = drafts.find((d) => d.label === m.label);
+    if (!cur) return false;
+    const c = fromDraft(cur);
+    return c.x === m.x && c.y === m.y && c.width === m.width && c.height === m.height;
+  };
+
   const enabledCount = drafts.filter((d) => d.enabled).length;
   const enabledLabels = drafts
     .filter((d) => d.enabled)
@@ -113,6 +174,14 @@ export default function SpawnMonitors() {
       <div className="page-header">
         <div className="page-title">Spawn Monitors</div>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button
+            className="btn"
+            onClick={detect}
+            disabled={loading || saving || detecting}
+            title="Query the OS for the current monitor layout"
+          >
+            {detecting ? 'Detecting…' : 'Detect Monitors'}
+          </button>
           <button className="btn" onClick={refresh} disabled={loading || saving}>
             Reload
           </button>
@@ -161,6 +230,104 @@ export default function SpawnMonitors() {
           </div>
         )}
       </div>
+
+      {detected !== null && (
+        <div className="card mb-2">
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '0.5rem',
+            }}
+          >
+            <div className="card-title">Detected monitors</div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                className="btn btn-primary"
+                onClick={applyDetected}
+                disabled={saving || detected.length === 0}
+              >
+                Apply detected layout
+              </button>
+              <button className="btn" onClick={dismissDetected} disabled={saving}>
+                Dismiss
+              </button>
+            </div>
+          </div>
+          {detected.length === 0 ? (
+            <div className="text-muted">
+              Monitor detection is only supported on Windows. Edit values manually below.
+            </div>
+          ) : (
+            <table style={{ width: '100%', fontSize: '0.85rem', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', color: 'var(--text-secondary)' }}>
+                  <th style={{ padding: '0.25rem 0.5rem' }}> </th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>Label</th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>X</th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>Y</th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>Width</th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>Height</th>
+                  <th style={{ padding: '0.25rem 0.5rem' }}>Primary</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detected.map((m, i) => {
+                  const matches = detectedMatchesCurrent(m);
+                  return (
+                    <tr
+                      key={`${m.label}-${i}`}
+                      style={{ borderTop: '1px solid var(--border)' }}
+                    >
+                      <td
+                        style={{
+                          padding: '0.25rem 0.5rem',
+                          color: matches ? 'var(--text-success, #4caf50)' : 'var(--warning, #e0b341)',
+                          fontWeight: 'bold',
+                        }}
+                        title={matches ? 'Matches current config' : 'Would change on apply'}
+                      >
+                        {matches ? '✓' : '→'}
+                      </td>
+                      <td className="text-mono" style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.label}
+                      </td>
+                      <td className="text-mono" style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.x}
+                      </td>
+                      <td className="text-mono" style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.y}
+                      </td>
+                      <td className="text-mono" style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.width}
+                      </td>
+                      <td className="text-mono" style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.height}
+                      </td>
+                      <td style={{ padding: '0.25rem 0.5rem' }}>
+                        {m.is_primary ? (
+                          <span
+                            style={{
+                              fontSize: '0.7rem',
+                              padding: '0.1rem 0.4rem',
+                              borderRadius: 4,
+                              background: 'var(--bg-tertiary)',
+                              color: 'var(--text-secondary)',
+                            }}
+                          >
+                            primary
+                          </span>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {loading && <div className="text-muted">Loading…</div>}
 

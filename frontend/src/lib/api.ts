@@ -884,6 +884,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ monitors }),
     }),
+  getDetectedMonitors: () =>
+    fetchJson<{ monitors: DetectedMonitor[] }>('/spawn-monitors/detected'),
 };
 
 export interface MonitorConfig {
@@ -898,4 +900,13 @@ export interface MonitorConfig {
 export interface SpawnMonitorsResponse {
   monitors: MonitorConfig[];
   next_index: number;
+}
+
+export interface DetectedMonitor {
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  is_primary: boolean;
 }
