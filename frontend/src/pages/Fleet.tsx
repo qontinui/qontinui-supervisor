@@ -457,6 +457,9 @@ export default function Fleet() {
               onChange={(e) => setBackendUrl(e.target.value)}
               spellCheck={false}
               autoComplete="off"
+              data-form-type="other"
+              data-1p-ignore
+              data-lpignore="true"
             />
           </label>
           <label className="text-muted" style={{ fontSize: '0.75rem' }}>
@@ -476,7 +479,11 @@ export default function Fleet() {
               value={jwt}
               onChange={(e) => setJwt(e.target.value)}
               spellCheck={false}
-              autoComplete="off"
+              autoComplete="new-password"
+              data-form-type="other"
+              data-1p-ignore
+              data-lpignore="true"
+              name="jwt-token"
             />
           </label>
           <div className="flex gap-2" style={{ marginTop: '0.5rem' }}>
