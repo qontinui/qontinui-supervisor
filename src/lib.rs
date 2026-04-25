@@ -11,6 +11,7 @@ pub mod health_cache;
 pub mod log_capture;
 pub mod process;
 pub mod routes;
+pub mod sdk_features;
 pub mod server;
 pub mod settings;
 pub mod state;

@@ -23,6 +23,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::sdk_features::{SDK_FEATURES, SDK_FEATURE_DOC_URL};
 use crate::state::SharedState;
 
 // ============================================================================
@@ -827,6 +828,11 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
         .min();
     drop(heartbeats);
 
+    // SDK feature inventory baked at compile time. Surfaced top-level
+    // (sibling to `data` and `uiBridge`) so test drivers can probe a single
+    // endpoint to discover the bundled `@qontinui/ui-bridge` capabilities
+    // without parsing the dashboard-shaped `data` envelope. Mirrors the
+    // top-level placement on `GET /health`. See `crate::sdk_features`.
     Json(serde_json::json!({
         "success": true,
         "uiBridge": {
@@ -843,6 +849,8 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
             "responsive": responsive,
             "last_heartbeat_ms_ago": last_heartbeat_ms_ago,
         },
+        "sdkFeatures": SDK_FEATURES,
+        "sdkFeaturesDocUrl": SDK_FEATURE_DOC_URL,
         "timestamp": chrono::Utc::now().timestamp_millis(),
     }))
 }

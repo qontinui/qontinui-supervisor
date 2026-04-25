@@ -10,6 +10,7 @@ use tokio_stream::StreamExt;
 
 use crate::config::RUNNER_API_PORT;
 use crate::health_cache::{CachedRunnerHealth, RecentCrashSummary, RunnerStatus, UiErrorSummary};
+use crate::sdk_features::{SDK_FEATURES, SDK_FEATURE_DOC_URL};
 use crate::state::SharedState;
 
 #[derive(Serialize)]
@@ -24,6 +25,16 @@ pub struct HealthResponse {
     /// Multi-runner status array (includes all managed runners).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runners: Vec<RunnerInstanceHealth>,
+    /// SDK feature inventory baked at compile time. Lets test drivers tell
+    /// in one round-trip whether the running supervisor binary's bundled
+    /// `@qontinui/ui-bridge` SDK includes a feature they need; an absent
+    /// entry means the binary predates that feature's SDK release.
+    /// See `crate::sdk_features` for the source of truth.
+    #[serde(rename = "sdkFeatures")]
+    pub sdk_features: Vec<&'static str>,
+    /// Documentation URL describing what each `sdkFeatures` entry means.
+    #[serde(rename = "sdkFeaturesDocUrl")]
+    pub sdk_features_doc_url: &'static str,
 }
 
 #[derive(Serialize, Clone)]
@@ -274,6 +285,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             project_dir: state.config.project_dir.display().to_string(),
         },
         runners: runners_health,
+        sdk_features: SDK_FEATURES.to_vec(),
+        sdk_features_doc_url: SDK_FEATURE_DOC_URL,
     }
 }
 
@@ -373,6 +386,8 @@ pub async fn health_stream(
                 },
                 // Read cached runner snapshots (built by background health refresher)
                 runners: build_sse_runners(&state),
+                sdk_features: SDK_FEATURES.to_vec(),
+                sdk_features_doc_url: SDK_FEATURE_DOC_URL,
             }
         };
 
@@ -474,6 +489,8 @@ mod tests {
                 project_dir: "/tmp/test".to_string(),
             },
             runners: Vec::new(),
+            sdk_features: SDK_FEATURES.to_vec(),
+            sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         };
 
         let json = serde_json::to_string(&response).expect("should serialize");
@@ -481,6 +498,9 @@ mod tests {
         assert!(json.contains("\"running\":true"));
         assert!(json.contains("\"pid\":1234"));
         assert!(json.contains("\"api_responding\":true"));
+        assert!(json.contains("\"sdkFeatures\":["));
+        assert!(json.contains("\"softNavigate\""));
+        assert!(json.contains("\"sdkFeaturesDocUrl\":\"https://"));
     }
 
     #[test]

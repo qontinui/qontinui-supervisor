@@ -8,6 +8,7 @@ mod health_cache;
 mod log_capture;
 mod process;
 mod routes;
+mod sdk_features;
 mod server;
 mod settings;
 mod state;
