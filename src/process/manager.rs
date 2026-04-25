@@ -613,6 +613,39 @@ pub async fn start_managed_runner(
         *slot = None;
     }
 
+    // Open the per-spawn early-death log file BEFORE attaching readers.
+    // `spawn_stdout_reader` / `spawn_stderr_reader` snapshot the writer at
+    // spawn time, so this must precede them. If the file can't be opened
+    // (out of disk space, perms, etc.) the runner still starts — early-log
+    // capture is strictly best-effort. Drops any path stored from a prior
+    // start of this runner id.
+    let early_log_path = crate::process::early_log::early_log_dir()
+        .map(|dir| crate::process::early_log::early_log_path_for(&dir, &runner_id));
+    if let Some(ref path) = early_log_path {
+        match crate::process::early_log::EarlyLogWriter::open(path) {
+            Some(writer) => {
+                managed.logs.set_early_log_writer(Some(writer));
+                let mut slot = managed.early_log_path.write().await;
+                *slot = Some(path.clone());
+                debug!(
+                    "Early-log capture enabled for runner '{}' at {:?}",
+                    runner_name, path
+                );
+            }
+            None => {
+                // Couldn't open the file — clear any prior path so we don't
+                // surface a stale value via the API.
+                managed.logs.set_early_log_writer(None);
+                let mut slot = managed.early_log_path.write().await;
+                *slot = None;
+            }
+        }
+    } else {
+        managed.logs.set_early_log_writer(None);
+        let mut slot = managed.early_log_path.write().await;
+        *slot = None;
+    }
+
     // Capture stdout/stderr to the managed runner's logs
     if let Some(stdout) = child.stdout.take() {
         crate::log_capture::spawn_stdout_reader(stdout, &managed.logs);

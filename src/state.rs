@@ -40,6 +40,13 @@ pub struct ManagedRunner {
     /// Set at spawn time via `QONTINUI_RUNNER_LOG_DIR`. `None` when the
     /// runner is using its default path (which the supervisor falls back to).
     pub panic_log_dir: RwLock<Option<PathBuf>>,
+    /// Path to the per-spawn early-death log file (if one was opened).
+    /// Surfaced via the spawn-test 500/502 error response (`early_log_path`)
+    /// and `GET /runners/{id}/logs` while the runner is alive. `None` if the
+    /// supervisor failed to open the file or if this runner was constructed
+    /// outside the spawn flow (primary, user-imported registry entry, etc.).
+    /// See `crate::process::early_log` for the lifecycle.
+    pub early_log_path: RwLock<Option<PathBuf>>,
 }
 
 impl ManagedRunner {
@@ -78,6 +85,7 @@ impl ManagedRunner {
             created_at: std::time::Instant::now(),
             recent_panic: RwLock::new(None),
             panic_log_dir: RwLock::new(None),
+            early_log_path: RwLock::new(None),
         }
     }
 

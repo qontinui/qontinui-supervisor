@@ -531,7 +531,28 @@ pub async fn stop_runner(
 ) -> Result<impl IntoResponse, SupervisorError> {
     let _force = body.map(|b| b.force).unwrap_or(false);
 
+    // Capture the early-log path BEFORE stopping — for test-* runners the
+    // stop also removes them from the registry, after which we can no longer
+    // look up the path. We delete the file AFTER stop succeeds because the
+    // stop is the explicit "user is done diagnosing" signal.
+    let early_log_path = if let Some(managed) = state.get_runner(&id).await {
+        managed.early_log_path.read().await.clone()
+    } else {
+        None
+    };
+
     manager::stop_runner_by_id(&state, &id).await?;
+
+    // Explicit user-facing /stop is the only path that deletes the
+    // early-log file. The spawn-test failed-probe cleanup path also calls
+    // stop_runner_by_id, but it does NOT route through here — it goes
+    // directly through the manager — so the early-log file is preserved
+    // there (which is what we want for post-mortem debugging). Files for
+    // runners that died on their own and were reaped also persist. Best
+    // effort: missing-file errors are silently swallowed by delete_early_log.
+    if let Some(path) = early_log_path {
+        crate::process::early_log::delete_early_log(&path);
+    }
 
     Ok(Json(json!({
         "status": "stopped",
@@ -1135,6 +1156,22 @@ pub async fn spawn_test(
                     )
                     .await;
 
+                // Capture the per-spawn early-log path BEFORE cleanup so we
+                // can surface it in the error response. The file itself is
+                // explicitly preserved across this cleanup path (it's the
+                // whole point of the early-death capture) — only the
+                // explicit user-facing /stop endpoint deletes it.
+                let early_log_path = if let Some(managed) = state.get_runner(&id).await {
+                    managed
+                        .early_log_path
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+
                 // Snapshot for post-mortem BEFORE removal. stop_runner_by_id
                 // will also snapshot (as GracefulStop) for test- runners, but
                 // we overwrite with Crashed here since a health-probe failure
@@ -1183,6 +1220,12 @@ pub async fn spawn_test(
                     // DB connect, Tauri builder). `null` if the child is
                     // hung-but-alive or exited for a non-panic reason.
                     "recent_panic": recent_panic,
+                    // Per-spawn captured stdout/stderr file. Survives
+                    // cleanup of the dead runner — read this path on disk
+                    // for the full child output when `recent_logs` is
+                    // truncated. `null` if the supervisor failed to open
+                    // the file (rare; out-of-disk, perms).
+                    "early_log_path": early_log_path,
                 });
 
                 return Ok((status, Json(body)).into_response());
@@ -1999,12 +2042,22 @@ pub async fn runner_log_history(
         // so single-runner-drill-down callers (dashboard log pane, CLI) see
         // the same freshness signal without issuing a second request.
         let stale_binary = manager::stale_binary_for_runner(&state, &managed.config.id).await;
+        // Per-spawn early-death log file path, when the runner was started
+        // by the supervisor (any spawn flow). `null` for primary runners or
+        // runners imported into the registry without a managed start.
+        let early_log_path = managed
+            .early_log_path
+            .read()
+            .await
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         return Ok(Json(json!({
             "runner_id": id,
             "entries": entries,
             "count": count,
             "recent_panic": recent_panic,
             "stale_binary": stale_binary,
+            "early_log_path": early_log_path,
         })));
     }
 

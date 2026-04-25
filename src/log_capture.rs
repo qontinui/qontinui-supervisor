@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
 use crate::config::log_buffer_size;
+use crate::process::early_log::EarlyLogWriter;
 
 /// Append-only file writer shared across log readers. Uses a std::sync::Mutex
 /// because `write_all` is a blocking syscall — we only hold it long enough to
@@ -184,6 +185,14 @@ pub struct LogState {
     /// in-memory buffer is also written here. Arc<Mutex<File>> so clones of
     /// this writer can be handed to spawn_*_reader helpers.
     file_writer: std::sync::RwLock<Option<FileWriter>>,
+    /// Optional per-spawn early-death log writer. Independent from
+    /// `file_writer`: this one only captures the runner's own stdout/stderr
+    /// (via `spawn_stdout_reader` / `spawn_stderr_reader`) into a per-spawn
+    /// file under `<TEMP_DIR>/qontinui-supervisor-spawn-logs/`. Its purpose is
+    /// to survive cleanup of a runner that died mid-startup so post-mortem
+    /// debugging is always possible. Supervisor-emitted entries (from
+    /// `LogState::emit`) are NOT mirrored here — only the child's I/O.
+    early_log_writer: std::sync::RwLock<Option<EarlyLogWriter>>,
     /// Sliding window of panic-related stderr lines. Populated by
     /// `spawn_stderr_reader`; flushed to `StoppedRunnerSnapshot::panic_stack`
     /// when the runner exits.
@@ -203,6 +212,7 @@ impl LogState {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(log_buffer_size()))),
             sender,
             file_writer: std::sync::RwLock::new(None),
+            early_log_writer: std::sync::RwLock::new(None),
             panic_buffer: PanicBuffer::new(),
         }
     }
@@ -226,6 +236,29 @@ impl LogState {
     /// holding an RwLock on every line.
     fn current_writer(&self) -> Option<FileWriter> {
         self.file_writer.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Attach (or replace) the per-spawn early-death log writer. Subsequent
+    /// `spawn_stdout_reader` / `spawn_stderr_reader` invocations will tee
+    /// their lines to this writer in addition to the in-memory buffer and
+    /// the persistent file writer (if any).
+    ///
+    /// Pass `None` to detach. Detaching does not close the file — readers
+    /// that already captured a snapshot of the writer keep writing to it
+    /// until they shut down. This is intentional: detach is meant for the
+    /// "runner exited cleanly, drop the diagnostic file" path, not for
+    /// suppressing late writes.
+    pub fn set_early_log_writer(&self, writer: Option<EarlyLogWriter>) {
+        if let Ok(mut guard) = self.early_log_writer.write() {
+            *guard = writer;
+        }
+    }
+
+    /// Snapshot the current early-log writer. Like [`current_writer`], this
+    /// is called once per `spawn_*_reader` start so each reader can write
+    /// directly without re-locking on every line.
+    fn current_early_writer(&self) -> Option<EarlyLogWriter> {
+        self.early_log_writer.read().ok().and_then(|g| g.clone())
     }
 
     pub async fn push(&self, entry: LogEntry) {
@@ -268,6 +301,7 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
     let file_writer = logs.current_writer();
+    let early_writer = logs.current_early_writer();
 
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
@@ -294,6 +328,10 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
 
                     if let Some(ref w) = file_writer {
                         write_entry_to_file(w, &entry);
+                    }
+
+                    if let Some(ref w) = early_writer {
+                        w.write_line(entry.level.clone(), &entry.message);
                     }
 
                     let _ = sender.send(entry);
@@ -323,6 +361,7 @@ pub fn spawn_stderr_reader(
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
     let file_writer = logs.current_writer();
+    let early_writer = logs.current_early_writer();
     let panic_buf = logs.panic_buffer.clone();
 
     tokio::spawn(async move {
@@ -366,6 +405,10 @@ pub fn spawn_stderr_reader(
 
                     if let Some(ref w) = file_writer {
                         write_entry_to_file(w, &entry);
+                    }
+
+                    if let Some(ref w) = early_writer {
+                        w.write_line(entry.level.clone(), &entry.message);
                     }
 
                     let _ = sender.send(entry);

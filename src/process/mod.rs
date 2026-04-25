@@ -1,3 +1,4 @@
+pub mod early_log;
 pub mod manager;
 pub mod panic_log;
 pub mod port;
