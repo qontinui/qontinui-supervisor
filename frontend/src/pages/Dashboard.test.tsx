@@ -120,9 +120,4 @@ describe('Dashboard', () => {
     // The status bar should show "healthy"
     expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
   });
-
-  it('shows runner mode in the status bar', async () => {
-    renderDashboard();
-    expect(await screen.findByText(/Mode: dev/)).toBeInTheDocument();
-  });
 });

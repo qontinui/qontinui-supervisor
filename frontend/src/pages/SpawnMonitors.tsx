@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { api, MonitorConfig } from '../lib/api';
 
 interface DraftMonitor extends MonitorConfig {
+  // Stable per-row id so React keys survive label edits and reorders.
+  _rid: string;
   // numeric fields edited as strings while typing so users can type "-" or
   // clear the field without the value snapping to 0.
   xText: string;
@@ -10,9 +12,16 @@ interface DraftMonitor extends MonitorConfig {
   heightText: string;
 }
 
+let RID_SEQ = 0;
+function nextRid(): string {
+  RID_SEQ += 1;
+  return `m${RID_SEQ}`;
+}
+
 function toDraft(m: MonitorConfig): DraftMonitor {
   return {
     ...m,
+    _rid: nextRid(),
     xText: String(m.x),
     yText: String(m.y),
     widthText: String(m.width),
@@ -158,7 +167,7 @@ export default function SpawnMonitors() {
       <div className="card-grid">
         {drafts.map((d, i) => (
           <MonitorCard
-            key={i}
+            key={d._rid}
             draft={d}
             onChange={(patch) => update(i, patch)}
             onRemove={() => remove(i)}

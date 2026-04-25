@@ -16,6 +16,7 @@ function mockFetchOk(data: unknown) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
     ok: true,
     status: 200,
+    text: () => Promise.resolve(JSON.stringify(data)),
     json: () => Promise.resolve(data),
   });
 }
@@ -25,6 +26,7 @@ function mockFetchError(status: number, statusText: string) {
     ok: false,
     status,
     statusText,
+    text: () => Promise.resolve(''),
     json: () => Promise.resolve({}),
   });
 }
