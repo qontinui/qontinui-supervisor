@@ -6,7 +6,6 @@ pub mod expo;
 pub mod graphql_proxy;
 pub mod health;
 pub mod logs;
-pub mod monitors;
 pub mod runner;
 pub mod runner_monitor;
 pub mod runners;

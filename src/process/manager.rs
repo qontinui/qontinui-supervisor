@@ -461,27 +461,124 @@ pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
     cmd.env("QONTINUI_SERVER_MODE", "1");
 }
 
-/// Pick the next enabled monitor (round-robin) and push its rect as
+/// Fetch placement for a non-primary runner from the primary runner's
+/// `/spawn-placement/preview` endpoint, then push its rect as
 /// QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT. The runner reads these at window-build
-/// time. No-op if no monitors are configured or all are disabled, in which
-/// case the runner falls back to its existing behavior (maximized for primary,
-/// `(100,100)` for secondaries).
+/// time.
+///
+/// Slot 0 is the primary; slot N for the Nth temp runner currently spawned.
+/// We use `count(test-* runners) + 1` so the first temp runner lands on
+/// slot 1, the second on slot 2, etc. `overflow=wrap` makes the runner
+/// cycle through configured placements when there are more temp runners
+/// than slots.
+///
+/// On any failure (404, 502, network error, timeout) we log and skip —
+/// the runner falls back to its built-in default behavior. Never fails
+/// the spawn.
 async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, runner_name: &str) {
-    if let Some(monitor) = state.pick_next_monitor().await {
-        tracing::info!(
-            "Placing runner '{}' on monitor '{}' at ({},{}) {}x{}",
+    // Count existing test-* runners. The runner we're about to spawn isn't
+    // in `state.runners` yet at the point this is called from
+    // `start_managed_runner`, but if it had been pre-inserted as a
+    // placeholder, we'd want to skip it. Counting all `test-*` IDs and
+    // adding 1 lands on the next free slot.
+    let runners = state.runners.read().await;
+    let temp_count = runners.keys().filter(|id| id.starts_with("test-")).count();
+    drop(runners);
+    let slot = temp_count + 1;
+
+    let url = format!("http://localhost:9876/spawn-placement/preview?slot={slot}&overflow=wrap");
+    let resp = match state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!(
+                "Spawn placement: skipping runner '{}' — request to {} failed: {}",
+                runner_name, url, e
+            );
+            tracing::info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = format!(
+            "Spawn placement: skipping runner '{}' — slot {} returned {}: {}",
             runner_name,
-            monitor.label,
-            monitor.x,
-            monitor.y,
-            monitor.width,
-            monitor.height
+            slot,
+            status,
+            body.chars().take(200).collect::<String>()
         );
-        cmd.env("QONTINUI_WINDOW_X", monitor.x.to_string());
-        cmd.env("QONTINUI_WINDOW_Y", monitor.y.to_string());
-        cmd.env("QONTINUI_WINDOW_WIDTH", monitor.width.to_string());
-        cmd.env("QONTINUI_WINDOW_HEIGHT", monitor.height.to_string());
+        tracing::info!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Info, msg)
+            .await;
+        return;
     }
+
+    #[derive(serde::Deserialize)]
+    struct PlacementPreview {
+        global_x: i32,
+        global_y: i32,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        monitor_label: Option<String>,
+        #[serde(default)]
+        slot_label: Option<String>,
+        #[serde(default)]
+        source: Option<String>,
+    }
+
+    let placement: PlacementPreview = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!(
+                "Spawn placement: skipping runner '{}' — failed to parse response: {}",
+                runner_name, e
+            );
+            tracing::info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            return;
+        }
+    };
+
+    let msg = format!(
+        "Spawn placement: runner '{}' slot={} (label={:?}, monitor={:?}, source={:?}) at ({},{}) {}x{}",
+        runner_name,
+        slot,
+        placement.slot_label,
+        placement.monitor_label,
+        placement.source,
+        placement.global_x,
+        placement.global_y,
+        placement.width,
+        placement.height
+    );
+    tracing::info!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Info, msg)
+        .await;
+
+    cmd.env("QONTINUI_WINDOW_X", placement.global_x.to_string());
+    cmd.env("QONTINUI_WINDOW_Y", placement.global_y.to_string());
+    cmd.env("QONTINUI_WINDOW_WIDTH", placement.width.to_string());
+    cmd.env("QONTINUI_WINDOW_HEIGHT", placement.height.to_string());
 }
 
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {

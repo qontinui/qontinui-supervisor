@@ -213,12 +213,7 @@ Used by the evaluation and velocity systems to select which AI provider and mode
 
 ### Spawn-Monitor Placement
 
-Round-robin monitor placement for spawned non-primary runner windows. Each monitor has `{label, x, y, width, height, enabled}`; enabled monitors are picked in order and exported to the runner via `QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT` at spawn time. Persisted to `supervisor-settings.json`. Falls back to existing behavior (maximized for primary, `(100,100)` for secondaries) when no monitors are enabled.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/spawn-monitors` | Get monitor placement config + next round-robin index |
-| PUT | `/spawn-monitors` | Replace full monitor list (validates label/dims), persists, resets the round-robin counter |
+The supervisor pulls placement config from the primary runner via `GET http://localhost:9876/spawn-placement/preview?slot=N&overflow=wrap` when spawning a temp runner. Configuration lives in the runner's Settings → Runner Instances UI.
 
 ### Proxies
 

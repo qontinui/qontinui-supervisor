@@ -33,7 +33,6 @@ fn test_save_and_load_roundtrip() {
         ai_model: Some("opus".to_string()),
         auto_debug_enabled: Some(true),
         runners: vec![],
-        spawn_monitors: vec![],
     };
 
     save_settings(&path, &settings);

@@ -35,6 +35,15 @@ pub struct HealthResponse {
     /// Documentation URL describing what each `sdkFeatures` entry means.
     #[serde(rename = "sdkFeaturesDocUrl")]
     pub sdk_features_doc_url: &'static str,
+    /// Identifier for the embedded frontend bundle this supervisor is
+    /// currently serving. Stable across the life of the supervisor process,
+    /// changes when the supervisor binary is rebuilt with a fresh
+    /// `dist/index.html` embedded. Connected dashboard tabs read this from
+    /// the SSE stream and compare against the `<meta name="build-id">` that
+    /// was injected at HTML serve time so a rebuild can prompt them to
+    /// refresh.
+    #[serde(rename = "buildId")]
+    pub build_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -287,6 +296,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         runners: runners_health,
         sdk_features: SDK_FEATURES.to_vec(),
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
+        build_id: state.build_id.clone(),
     }
 }
 
@@ -388,6 +398,7 @@ pub async fn health_stream(
                 runners: build_sse_runners(&state),
                 sdk_features: SDK_FEATURES.to_vec(),
                 sdk_features_doc_url: SDK_FEATURE_DOC_URL,
+                build_id: state.build_id.clone(),
             }
         };
 
@@ -491,6 +502,7 @@ mod tests {
             runners: Vec::new(),
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
+            build_id: "2026-04-25T00:00:00+00:00".to_string(),
         };
 
         let json = serde_json::to_string(&response).expect("should serialize");
@@ -501,6 +513,7 @@ mod tests {
         assert!(json.contains("\"sdkFeatures\":["));
         assert!(json.contains("\"softNavigate\""));
         assert!(json.contains("\"sdkFeaturesDocUrl\":\"https://"));
+        assert!(json.contains("\"buildId\":\"2026-04-25T00:00:00+00:00\""));
     }
 
     #[test]

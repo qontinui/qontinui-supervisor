@@ -46,14 +46,13 @@ pub struct GenericResponse {
 async fn persist_ai_settings(state: &SharedState) {
     let ai = state.ai.read().await;
     let path = settings::settings_path(&state.config);
-    // Load existing settings to preserve runner + monitor configs, then update AI fields
+    // Load existing settings to preserve runner configs, then update AI fields
     let existing = settings::load_settings(&path);
     let s = PersistentSettings {
         ai_provider: Some(ai.provider.clone()),
         ai_model: Some(ai.model.clone()),
         auto_debug_enabled: Some(ai.auto_debug_enabled),
         runners: existing.runners,
-        spawn_monitors: existing.spawn_monitors,
     };
     drop(ai);
     settings::save_settings(&path, &s);

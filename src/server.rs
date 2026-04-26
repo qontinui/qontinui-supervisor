@@ -1,4 +1,4 @@
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -24,6 +24,7 @@ pub fn build_router(state: SharedState) -> Router {
     let eval_state = state.clone();
     let vt_state = state.clone();
     let vi_state = state.clone();
+    let spa_state = state.clone();
 
     // Build main stateful routes, then apply state to get Router<()>
     let main_routes = Router::new()
@@ -67,19 +68,6 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/ai/provider", get(crate::routes::ai::get_provider))
         .route("/ai/provider", post(crate::routes::ai::set_provider))
         .route("/ai/models", get(crate::routes::ai::models))
-        // Spawn-monitor placement: where temp runner windows land
-        .route(
-            "/spawn-monitors",
-            get(crate::routes::monitors::list_spawn_monitors),
-        )
-        .route(
-            "/spawn-monitors",
-            put(crate::routes::monitors::put_spawn_monitors),
-        )
-        .route(
-            "/spawn-monitors/detected",
-            get(crate::routes::monitors::get_detected_monitors),
-        )
         // Dev-start orchestration removed — frontend/backend are managed by the runner directly
         // Supervisor Bridge (command relay for supervisor's own dashboard UI)
         .route(
@@ -275,7 +263,7 @@ pub fn build_router(state: SharedState) -> Router {
                 vi_state,
             ),
         )
-        .merge(crate::routes::dashboard::spa_routes())
+        .merge(crate::routes::dashboard::spa_routes(spa_state))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }

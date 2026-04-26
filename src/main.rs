@@ -124,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
     {
         let path = settings::settings_path(&state.config);
         let saved = settings::load_settings(&path);
-        let monitors = saved.spawn_monitors.clone();
         let mut ai = state.ai.write().await;
         if let Some(provider) = saved.ai_provider {
             ai.provider = provider;
@@ -139,14 +138,6 @@ async fn main() -> anyhow::Result<()> {
             "Loaded settings: provider={}, model={}, auto_debug={}",
             ai.provider, ai.model, ai.auto_debug_enabled
         );
-        drop(ai);
-        let enabled_count = monitors.iter().filter(|m| m.enabled).count();
-        info!(
-            "Loaded {} spawn-monitor configs ({} enabled)",
-            monitors.len(),
-            enabled_count
-        );
-        *state.spawn_monitors.write().await = monitors;
     }
 
     // Log startup

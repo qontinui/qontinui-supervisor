@@ -130,19 +130,20 @@ pub struct SupervisorState {
     /// `process::stopped_cache`). Queryable via
     /// `GET /runners/{id}/logs?include_stopped=true`.
     pub stopped_runners: Arc<RwLock<HashMap<String, StoppedRunnerSnapshot>>>,
-    /// Monitor placement targets for spawned temp runners. Loaded from
-    /// `supervisor-settings.json` on startup, mutated by the dashboard via
-    /// `PUT /spawn-monitors`. Round-robin pick uses `next_monitor_index`.
-    pub spawn_monitors: RwLock<Vec<crate::settings::MonitorConfig>>,
-    /// Round-robin counter for choosing which enabled monitor a new temp
-    /// runner should land on. Wraps modulo enabled-count at pick time.
-    pub next_monitor_index: AtomicUsize,
     /// Unique identifier for this supervisor process instance. Generated once
     /// at startup. Returned in heartbeat responses so the dashboard SPA can
     /// detect a supervisor restart and force-reload itself, recovering from
     /// the wedged-tab scenario where the SSE/command channel is dead but the
     /// fetch layer still works.
     pub boot_id: String,
+    /// Identifier for the embedded frontend bundle this supervisor is serving.
+    /// Computed at startup from the mtime of `dist/index.html` (RFC3339
+    /// timestamp), or "unknown" if the file is missing. Surfaced in
+    /// `GET /health`, `GET /health/stream`, and injected as a
+    /// `<meta name="build-id">` tag into the served `index.html`. Connected
+    /// dashboard tabs compare the meta tag value against the SSE stream so a
+    /// supervisor rebuild + restart can prompt the user to refresh.
+    pub build_id: String,
 }
 
 pub struct RunnerState {
@@ -395,6 +396,31 @@ pub struct ExpoState {
     pub port: u16,
 }
 
+/// Compute the supervisor build identifier from the embedded `dist/index.html`.
+///
+/// rust-embed captures the file's mtime at compile time, so this string changes
+/// every time the supervisor's frontend (`npm run build`) + cargo build pair
+/// re-runs. Format: RFC3339 UTC timestamp (`2026-04-25T12:34:56+00:00`). When
+/// the file is missing or rust-embed couldn't capture an mtime on this
+/// platform, fall back to fixed sentinel strings so callers can still
+/// distinguish "no signal" from a real change.
+pub fn compute_build_id() -> String {
+    use crate::routes::dashboard::Assets;
+    match Assets::get("index.html") {
+        Some(file) => match file.metadata.last_modified() {
+            Some(secs) => {
+                // rust-embed-utils returns seconds since UNIX epoch.
+                match chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0) {
+                    Some(dt) => dt.to_rfc3339(),
+                    None => "embed-error".to_string(),
+                }
+            }
+            None => "embed-no-mtime".to_string(),
+        },
+        None => "unknown".to_string(),
+    }
+}
+
 impl SupervisorState {
     pub fn new(config: SupervisorConfig) -> Self {
         let watchdog_enabled = config.watchdog_enabled_at_start;
@@ -447,24 +473,9 @@ impl SupervisorState {
             http_client,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
-            spawn_monitors: RwLock::new(Vec::new()),
-            next_monitor_index: AtomicUsize::new(0),
             boot_id: uuid::Uuid::new_v4().to_string(),
+            build_id: compute_build_id(),
         }
-    }
-
-    /// Pick the next enabled monitor in round-robin order. Returns `None`
-    /// if no monitors are configured or all are disabled.
-    pub async fn pick_next_monitor(&self) -> Option<crate::settings::MonitorConfig> {
-        use std::sync::atomic::Ordering;
-        let monitors = self.spawn_monitors.read().await;
-        let enabled: Vec<&crate::settings::MonitorConfig> =
-            monitors.iter().filter(|m| m.enabled).collect();
-        if enabled.is_empty() {
-            return None;
-        }
-        let idx = self.next_monitor_index.fetch_add(1, Ordering::Relaxed) % enabled.len();
-        Some(enabled[idx].clone())
     }
 
     pub fn notify_health_change(&self) {

@@ -4,57 +4,7 @@ use tracing::warn;
 
 use crate::config::{RunnerConfig, SupervisorConfig};
 
-/// One target rectangle for placing a spawned temp runner's window.
-/// Coordinates are absolute virtual-desktop pixels (Windows convention),
-/// so a left-of-primary monitor uses negative X.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MonitorConfig {
-    pub label: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Default 3-monitor side-spawn layout: left + right enabled, middle disabled.
-/// Assumes 1920x1080 displays with the primary in the middle. Override via the
-/// dashboard if your geometry differs — this is just a starting point.
-fn default_spawn_monitors() -> Vec<MonitorConfig> {
-    vec![
-        MonitorConfig {
-            label: "Left".into(),
-            x: -1920,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            enabled: true,
-        },
-        MonitorConfig {
-            label: "Middle".into(),
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            enabled: false,
-        },
-        MonitorConfig {
-            label: "Right".into(),
-            x: 1920,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            enabled: true,
-        },
-    ]
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct PersistentSettings {
     pub ai_provider: Option<String>,
     pub ai_model: Option<String>,
@@ -62,22 +12,6 @@ pub struct PersistentSettings {
     /// Multi-runner configurations. Empty means use default single primary runner.
     #[serde(default)]
     pub runners: Vec<RunnerConfig>,
-    /// Where to place spawned temp runner windows. Round-robin'd across the
-    /// enabled entries on each `spawn-test`.
-    #[serde(default = "default_spawn_monitors")]
-    pub spawn_monitors: Vec<MonitorConfig>,
-}
-
-impl Default for PersistentSettings {
-    fn default() -> Self {
-        Self {
-            ai_provider: None,
-            ai_model: None,
-            auto_debug_enabled: None,
-            runners: Vec::new(),
-            spawn_monitors: default_spawn_monitors(),
-        }
-    }
 }
 
 pub fn settings_path(config: &SupervisorConfig) -> PathBuf {
@@ -128,12 +62,4 @@ pub fn update_runner(path: &Path, config: &RunnerConfig) {
         *existing = config.clone();
     }
     save_settings(path, &settings);
-}
-
-// --- Monitor config helpers ---
-
-pub fn save_spawn_monitors(path: &Path, monitors: &[MonitorConfig]) -> Result<(), String> {
-    let mut settings = load_settings(path);
-    settings.spawn_monitors = monitors.to_vec();
-    try_save_settings(path, &settings)
 }

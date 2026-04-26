@@ -10,13 +10,13 @@ import VelocityTest from './pages/VelocityTest';
 import VelocityImprovement from './pages/VelocityImprovement';
 import RunnerMonitor from './pages/RunnerMonitor';
 import Fleet from './pages/Fleet';
-import SpawnMonitors from './pages/SpawnMonitors';
 import {
   UIBridgeProvider,
   AutoRegisterProvider,
   CommandRelayListener,
 } from '@qontinui/ui-bridge/react';
 import { BootIdWatcher } from './components/BootIdWatcher';
+import { BuildRefreshBanner } from './components/BuildRefreshBanner';
 
 export default function App() {
   return (
@@ -29,6 +29,7 @@ export default function App() {
           appType="dashboard"
         />
         <BootIdWatcher />
+        <BuildRefreshBanner />
         <div className="layout">
           <aside className="sidebar">
             <div className="sidebar-logo">Supervisor</div>
@@ -73,14 +74,6 @@ export default function App() {
                 </NavLink>
               </li>
               <li>
-                <NavLink
-                  to="/spawn-monitors"
-                  className={({ isActive }) => (isActive ? 'active' : '')}
-                >
-                  Spawn Monitors
-                </NavLink>
-              </li>
-              <li>
                 <NavLink to="/evaluation" className={({ isActive }) => (isActive ? 'active' : '')}>
                   Evaluation
                 </NavLink>
@@ -113,7 +106,6 @@ export default function App() {
               <Route path="/velocity/trace" element={<VelocityTrace />} />
               <Route path="/runner-monitor" element={<RunnerMonitor />} />
               <Route path="/fleet" element={<Fleet />} />
-              <Route path="/spawn-monitors" element={<SpawnMonitors />} />
               <Route path="/evaluation" element={<Evaluation />} />
               <Route path="/evaluation/run/:id" element={<EvalRunDetail />} />
               <Route path="/velocity-tests" element={<VelocityTest />} />

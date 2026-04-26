@@ -30,6 +30,36 @@ use crate::state::SharedState;
 // Command Relay
 // ============================================================================
 
+/// Per-tab metadata reported by the SDK on each heartbeat. Tracks
+/// "what's actually connected right now" so `/supervisor-bridge/health`
+/// can stop pretending the dashboard's compile-time `CommandRelayListener`
+/// props describe a live connection. Every field is optional because
+/// (1) older SDKs (pre this change) send no metadata at all, and
+/// (2) host apps may opt in selectively (e.g. ship only `appName`).
+/// `last_seen` is updated on every heartbeat from the same tab. The map
+/// entry is dropped when the tab's SSE stream tears down (see
+/// `commands_stream` cleanup_stream).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Server-side timestamp (millis since epoch) of the heartbeat that
+    /// most recently updated this entry. Used by `bridge_health` to pick
+    /// the freshest tab when several are connected.
+    pub last_seen_ms: i64,
+}
+
 /// Server-side command relay for the supervisor dashboard.
 pub struct CommandRelay {
     /// Pending commands awaiting browser response: commandId -> sender
@@ -38,6 +68,11 @@ pub struct CommandRelay {
     subscribers: RwLock<HashMap<String, broadcast::Sender<String>>>,
     /// Heartbeat tracking: tabId -> last heartbeat instant
     heartbeats: RwLock<HashMap<String, Instant>>,
+    /// Per-tab heartbeat metadata: tabId -> last reported BridgeMetadata.
+    /// Populated by the heartbeat handler and dropped on SSE disconnect.
+    /// Read by `bridge_health` to surface live identity rather than the
+    /// build-time defaults that used to be hardcoded into the response.
+    metadata: RwLock<HashMap<String, BridgeMetadata>>,
 }
 
 struct PendingCommand {
@@ -58,6 +93,7 @@ impl CommandRelay {
             pending: RwLock::new(HashMap::new()),
             subscribers: RwLock::new(HashMap::new()),
             heartbeats: RwLock::new(HashMap::new()),
+            metadata: RwLock::new(HashMap::new()),
         });
 
         // Spawn a background task to reap stale pending commands (30s TTL)
@@ -205,6 +241,25 @@ pub struct HeartbeatBody {
     #[allow(dead_code)]
     timestamp: Option<i64>,
     tab_id: Option<String>,
+    // ------------------------------------------------------------------
+    // Optional per-tab identity reported by the SDK so health probes can
+    // describe the *actually connected* dashboard instead of build-time
+    // defaults. All fields are optional to stay compatible with older
+    // SDKs that only send `{tabId, timestamp}`. See `BridgeMetadata` for
+    // the storage shape.
+    // ------------------------------------------------------------------
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    app_name: Option<String>,
+    #[serde(default)]
+    app_type: Option<String>,
+    #[serde(default)]
+    framework: Option<String>,
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +369,7 @@ pub async fn commands_stream(
             .write()
             .await
             .remove(&tab_id_cleanup);
+        relay_cleanup.metadata.write().await.remove(&tab_id_cleanup);
         debug!("Supervisor bridge: tab {tab_id_cleanup} disconnected, cleaned up");
         Ok::<_, Infallible>(Event::default().comment("disconnect"))
     });
@@ -367,12 +423,44 @@ pub async fn heartbeat(
 ) -> impl IntoResponse {
     if let Some(Json(body)) = body {
         if let Some(tab_id) = body.tab_id {
+            // Mark the tab as live for `bridge_health`'s `responsive` /
+            // `last_heartbeat_ms_ago` math.
             state
                 .command_relay
                 .heartbeats
                 .write()
                 .await
-                .insert(tab_id, Instant::now());
+                .insert(tab_id.clone(), Instant::now());
+
+            // Record per-tab identity so `bridge_health` can describe the
+            // *actually connected* tab. We always insert an entry on the
+            // first heartbeat (even if every metadata field is None) so
+            // the timestamp is recorded, and we merge subsequent updates
+            // so a heartbeat that omits a field doesn't blow away an
+            // earlier non-None value (cheap protection against intermittent
+            // payload shapes from older or partially-configured SDKs).
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut map = state.command_relay.metadata.write().await;
+            let entry = map.entry(tab_id).or_default();
+            if body.app_id.is_some() {
+                entry.app_id = body.app_id;
+            }
+            if body.app_name.is_some() {
+                entry.app_name = body.app_name;
+            }
+            if body.app_type.is_some() {
+                entry.app_type = body.app_type;
+            }
+            if body.framework.is_some() {
+                entry.framework = body.framework;
+            }
+            if body.capabilities.is_some() {
+                entry.capabilities = body.capabilities;
+            }
+            if body.version.is_some() {
+                entry.version = body.version;
+            }
+            entry.last_seen_ms = now_ms;
         }
     }
     Json(serde_json::json!({"ok": true, "boot_id": state.boot_id}))
@@ -814,6 +902,17 @@ pub async fn page_refresh(State(state): State<SharedState>) -> impl IntoResponse
 // ============================================================================
 
 /// GET /supervisor-bridge/health
+///
+/// `uiBridge` reflects the **most recently heartbeating connected tab's**
+/// reported metadata. When zero tabs are connected, the field is `null`
+/// — we deliberately do not return the build-time `CommandRelayListener`
+/// defaults that used to be hardcoded here, because those describe the
+/// *would-be* connection rather than what's actually live. This lets
+/// callers reliably distinguish "no dashboard connected" from "old SDK
+/// connected without identity". If the latest heartbeat lacks specific
+/// fields (e.g. an older SDK only sends `tabId`), only the fields that
+/// were reported are included; missing fields are omitted rather than
+/// padded with stale defaults.
 pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoResponse {
     let subs = state.command_relay.subscribers.read().await;
     let connected_tabs: Vec<String> = subs.keys().cloned().collect();
@@ -834,6 +933,31 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
         .min();
     drop(heartbeats);
 
+    // Pick the most-recently-heartbeating tab's metadata. If there are
+    // no connected tabs we surface `null` so the caller can't mistake a
+    // stale config blob for an active connection. We also intersect with
+    // `connected_tabs` because `metadata` is dropped on SSE teardown
+    // (see `commands_stream` cleanup_stream) — but a tab that never
+    // sent a heartbeat (e.g. an older SDK build mid-handshake) won't
+    // have a metadata entry even if its SSE channel is open.
+    let metadata_map = state.command_relay.metadata.read().await;
+    let live_metadata: Option<BridgeMetadata> = if tab_count == 0 {
+        None
+    } else {
+        let connected_set: std::collections::HashSet<&String> = connected_tabs.iter().collect();
+        metadata_map
+            .iter()
+            .filter(|(tab_id, _)| connected_set.contains(*tab_id))
+            .max_by_key(|(_, md)| md.last_seen_ms)
+            .map(|(_, md)| md.clone())
+    };
+    drop(metadata_map);
+
+    let ui_bridge = match live_metadata {
+        Some(md) => serde_json::to_value(&md).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+
     // SDK feature inventory baked at compile time. Surfaced top-level
     // (sibling to `data` and `uiBridge`) so test drivers can probe a single
     // endpoint to discover the bundled `@qontinui/ui-bridge` capabilities
@@ -841,13 +965,7 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
     // top-level placement on `GET /health`. See `crate::sdk_features`.
     Json(serde_json::json!({
         "success": true,
-        "uiBridge": {
-            "appId": "qontinui-supervisor-dashboard",
-            "appName": "Qontinui Supervisor",
-            "appType": "dashboard",
-            "framework": "react",
-            "capabilities": ["control"],
-        },
+        "uiBridge": ui_bridge,
         "data": {
             "connected_tabs": connected_tabs,
             "tab_count": tab_count,
@@ -859,6 +977,120 @@ pub async fn bridge_health(State(state): State<SharedState>) -> impl IntoRespons
         "sdkFeaturesDocUrl": SDK_FEATURE_DOC_URL,
         "timestamp": chrono::Utc::now().timestamp_millis(),
     }))
+}
+
+#[cfg(test)]
+mod heartbeat_body_tests {
+    //! Deserialization tests for `HeartbeatBody`. The metadata fields are
+    //! all optional so older SDKs (that send only `{tabId, timestamp}`)
+    //! continue to round-trip cleanly. The fields are documented as
+    //! camelCase on the wire to match the rest of the supervisor-bridge
+    //! API; struct-level `serde(rename_all = "camelCase")` does the work.
+
+    use super::HeartbeatBody;
+
+    fn parse(body: &str) -> HeartbeatBody {
+        serde_json::from_str(body).expect("HeartbeatBody must deserialize")
+    }
+
+    #[test]
+    fn legacy_body_without_metadata_parses() {
+        let b = parse(r#"{"tabId":"t-1","timestamp":1700000000}"#);
+        assert_eq!(b.tab_id.as_deref(), Some("t-1"));
+        assert!(b.app_id.is_none());
+        assert!(b.app_name.is_none());
+        assert!(b.app_type.is_none());
+        assert!(b.framework.is_none());
+        assert!(b.capabilities.is_none());
+        assert!(b.version.is_none());
+    }
+
+    #[test]
+    fn body_with_full_metadata_parses() {
+        let b = parse(
+            r#"{
+                "tabId":"t-2",
+                "appId":"qontinui-supervisor-dashboard",
+                "appName":"Qontinui Supervisor",
+                "appType":"dashboard",
+                "framework":"react",
+                "capabilities":["control","render-log"],
+                "version":"0.3.1"
+            }"#,
+        );
+        assert_eq!(b.app_id.as_deref(), Some("qontinui-supervisor-dashboard"));
+        assert_eq!(b.app_name.as_deref(), Some("Qontinui Supervisor"));
+        assert_eq!(b.app_type.as_deref(), Some("dashboard"));
+        assert_eq!(b.framework.as_deref(), Some("react"));
+        let caps = b.capabilities.expect("capabilities should be present");
+        assert_eq!(caps, vec!["control".to_string(), "render-log".to_string()]);
+        assert_eq!(b.version.as_deref(), Some("0.3.1"));
+    }
+
+    #[test]
+    fn body_with_partial_metadata_parses() {
+        // SDKs may opt in selectively (e.g. only ship `appName`).
+        let b = parse(r#"{"tabId":"t-3","appName":"My Dashboard"}"#);
+        assert_eq!(b.app_name.as_deref(), Some("My Dashboard"));
+        assert!(b.app_id.is_none());
+        assert!(b.framework.is_none());
+    }
+}
+
+#[cfg(test)]
+mod bridge_metadata_tests {
+    //! `BridgeMetadata` serializes to the same camelCase shape that the
+    //! `bridge_health` handler embeds under `uiBridge`. None values are
+    //! omitted (rather than emitted as `null`) so the response only
+    //! describes fields the SDK actually reported — preventing the
+    //! "stale build-time defaults" failure mode the change targets.
+
+    use super::BridgeMetadata;
+
+    #[test]
+    fn empty_metadata_serializes_to_just_last_seen() {
+        let md = BridgeMetadata {
+            last_seen_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&md).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "only lastSeenMs should be present");
+        assert_eq!(
+            obj.get("lastSeenMs").and_then(|x| x.as_i64()),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn populated_metadata_uses_camel_case_keys() {
+        let md = BridgeMetadata {
+            app_id: Some("qontinui-supervisor-dashboard".into()),
+            app_name: Some("Qontinui Supervisor".into()),
+            app_type: Some("dashboard".into()),
+            framework: Some("react".into()),
+            capabilities: Some(vec!["control".into()]),
+            version: Some("0.3.1".into()),
+            last_seen_ms: 42,
+        };
+        let v = serde_json::to_value(&md).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("appId").and_then(|x| x.as_str()),
+            Some("qontinui-supervisor-dashboard")
+        );
+        assert_eq!(
+            obj.get("appName").and_then(|x| x.as_str()),
+            Some("Qontinui Supervisor")
+        );
+        assert_eq!(
+            obj.get("appType").and_then(|x| x.as_str()),
+            Some("dashboard")
+        );
+        assert_eq!(obj.get("framework").and_then(|x| x.as_str()), Some("react"));
+        assert_eq!(obj.get("version").and_then(|x| x.as_str()), Some("0.3.1"));
+        assert_eq!(obj.get("lastSeenMs").and_then(|x| x.as_i64()), Some(42));
+    }
 }
 
 #[cfg(test)]
