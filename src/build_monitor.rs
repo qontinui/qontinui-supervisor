@@ -11,7 +11,7 @@ use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::windows::cleanup_orphaned_build_processes;
-use crate::state::{BuildInfo, BuildSlot, SharedState};
+use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
 
 /// RAII guard that clears a `BuildSlot::busy` field on drop.
@@ -162,6 +162,27 @@ pub async fn run_cargo_build_with_requester(
     if result.is_ok() {
         let mut last = state.build_pool.last_successful_slot.write().await;
         *last = Some(slot.id);
+        drop(last);
+
+        // Capture this exe as the new last-known-good. Survives subsequent
+        // failed builds that overwrite or delete the slot's exe; agents
+        // testing changes can fall back to it via spawn-test {use_lkg: true}
+        // when their own build fails. Failures here are logged but do not
+        // fail the build — LKG is a safety net, not a correctness gate.
+        if let Err(e) = update_lkg_after_success(state, &slot).await {
+            warn!(
+                "Failed to update LKG copy after slot {} build success: {}",
+                slot.id, e
+            );
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    format!("LKG capture failed after slot {} build: {}", slot.id, e),
+                )
+                .await;
+        }
     }
 
     // Recompute legacy build_in_progress flag: true iff any slot is still busy.
@@ -745,4 +766,107 @@ async fn prewarm_single_slot(
             )))
         }
     }
+}
+
+// =============================================================================
+// Last-known-good (LKG) capture
+// =============================================================================
+
+/// Copy the freshly-built slot exe to `target-pool/lkg/qontinui-runner.exe`
+/// and write a `lkg.json` sidecar with `{built_at, source_slot, exe_size}`.
+///
+/// Both writes go through a temp-file + atomic rename so a crash partway
+/// through cannot leave the LKG dir holding a torn binary or a sidecar that
+/// describes a different exe than the one on disk.
+///
+/// Called from the build-success path with the slot whose cargo build just
+/// returned `Ok`. On any failure, the previous LKG (if any) is left intact
+/// — the caller logs the error but the build still counts as succeeded.
+async fn update_lkg_after_success(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+) -> Result<(), SupervisorError> {
+    let source_exe = state.config.runner_exe_path_for_slot(slot.id);
+    if !source_exe.exists() {
+        return Err(SupervisorError::Process(format!(
+            "build succeeded but slot {} exe not found at {:?}",
+            slot.id, source_exe
+        )));
+    }
+
+    let lkg_dir = state.config.lkg_dir();
+    if let Err(e) = std::fs::create_dir_all(&lkg_dir) {
+        return Err(SupervisorError::Process(format!(
+            "failed to create lkg dir {:?}: {}",
+            lkg_dir, e
+        )));
+    }
+
+    let final_exe = state.config.lkg_exe_path();
+    let tmp_exe = lkg_dir.join("qontinui-runner.exe.tmp");
+    // Best-effort cleanup of any leftover tmp file from a previous crash.
+    let _ = std::fs::remove_file(&tmp_exe);
+
+    std::fs::copy(&source_exe, &tmp_exe).map_err(|e| {
+        SupervisorError::Process(format!(
+            "failed to copy {:?} -> {:?}: {}",
+            source_exe, tmp_exe, e
+        ))
+    })?;
+
+    let exe_size = std::fs::metadata(&tmp_exe)
+        .map(|m| m.len())
+        .map_err(|e| SupervisorError::Process(format!("stat {:?}: {}", tmp_exe, e)))?;
+
+    // Atomic replace. On Windows std's rename overwrites only if the dest
+    // doesn't exist; remove first. Failure to remove is fine — rename will
+    // surface the real error.
+    let _ = std::fs::remove_file(&final_exe);
+    std::fs::rename(&tmp_exe, &final_exe).map_err(|e| {
+        SupervisorError::Process(format!(
+            "failed to rename {:?} -> {:?}: {}",
+            tmp_exe, final_exe, e
+        ))
+    })?;
+
+    let info = LkgInfo {
+        built_at: chrono::Utc::now(),
+        source_slot: slot.id,
+        exe_size,
+    };
+
+    let final_meta = state.config.lkg_metadata_path();
+    let tmp_meta = lkg_dir.join("lkg.json.tmp");
+    let _ = std::fs::remove_file(&tmp_meta);
+    let json = serde_json::to_string_pretty(&info)
+        .map_err(|e| SupervisorError::Process(format!("serialize lkg.json: {}", e)))?;
+    std::fs::write(&tmp_meta, json.as_bytes())
+        .map_err(|e| SupervisorError::Process(format!("write {:?}: {}", tmp_meta, e)))?;
+    let _ = std::fs::remove_file(&final_meta);
+    std::fs::rename(&tmp_meta, &final_meta).map_err(|e| {
+        SupervisorError::Process(format!(
+            "failed to rename {:?} -> {:?}: {}",
+            tmp_meta, final_meta, e
+        ))
+    })?;
+
+    info!(
+        "LKG updated from slot {} ({} bytes, built_at {})",
+        info.source_slot, info.exe_size, info.built_at
+    );
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "LKG runner binary updated (slot {}, {} bytes)",
+                info.source_slot, info.exe_size
+            ),
+        )
+        .await;
+
+    let mut lkg_lock = state.build_pool.last_known_good.write().await;
+    *lkg_lock = Some(info);
+    Ok(())
 }

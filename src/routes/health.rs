@@ -147,6 +147,28 @@ pub struct BuildHealth {
     /// prior `dist/` snapshot. Clears when a subsequent npm build on that
     /// slot succeeds.
     pub frontend_stale_any: bool,
+    /// Last-known-good runner binary metadata. `None` until the first
+    /// successful build (or after a fresh checkout where `target-pool/lkg/`
+    /// doesn't exist). Agents deciding whether to fall back to the LKG when
+    /// their own build fails should compare `built_at` (RFC3339) against the
+    /// mtime of every file they've changed. If `built_at` is later than the
+    /// max file mtime, the LKG already contains those changes and is safe to
+    /// run via `POST /runners/spawn-test {use_lkg: true}`. Otherwise the LKG
+    /// predates the changes and would silently run stale code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lkg: Option<LkgHealth>,
+}
+
+#[derive(Serialize)]
+pub struct LkgHealth {
+    /// RFC3339 wall-clock time the LKG build completed. THIS is the value
+    /// agents compare against `mtime(changed files)` to decide LKG safety.
+    pub built_at: String,
+    /// Pool slot the LKG exe was copied from at build time. Informational —
+    /// the LKG file lives at a fixed path independent of slot state.
+    pub source_slot: usize,
+    /// Byte size of the LKG exe. Useful for spotting truncated copies.
+    pub exe_size: u64,
 }
 
 #[derive(Serialize)]
@@ -207,6 +229,17 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let build = state.build.read().await;
     let expo = state.expo.read().await;
     let frontend_stale_any = state.build_pool.any_slot_has_stale_frontend().await;
+    let lkg = state
+        .build_pool
+        .last_known_good
+        .read()
+        .await
+        .as_ref()
+        .map(|info| LkgHealth {
+            built_at: info.built_at.to_rfc3339(),
+            source_slot: info.source_slot,
+            exe_size: info.exe_size,
+        });
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
     let cached = state.cached_health.read().await;
@@ -282,6 +315,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
             frontend_stale_any,
+            lkg,
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -383,6 +417,20 @@ pub async fn health_stream(
                     last_error: build.last_build_error.clone(),
                     last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
                     frontend_stale_any,
+                    // SSE path: try_read on the LKG lock — if contended,
+                    // skip the field this tick (the next tick will catch up).
+                    lkg: state
+                        .build_pool
+                        .last_known_good
+                        .try_read()
+                        .ok()
+                        .and_then(|g| {
+                            g.as_ref().map(|info| LkgHealth {
+                                built_at: info.built_at.to_rfc3339(),
+                                source_slot: info.source_slot,
+                                exe_size: info.exe_size,
+                            })
+                        }),
                 },
                 expo: ExpoHealth {
                     running: expo.running,
@@ -488,6 +536,7 @@ mod tests {
                 last_error: None,
                 last_build_at: None,
                 frontend_stale_any: false,
+                lkg: None,
             },
             expo: ExpoHealth {
                 running: false,

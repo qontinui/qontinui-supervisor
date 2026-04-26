@@ -47,6 +47,15 @@ pub struct ManagedRunner {
     /// outside the spawn flow (primary, user-imported registry entry, etc.).
     /// See `crate::process::early_log` for the lifecycle.
     pub early_log_path: RwLock<Option<PathBuf>>,
+    /// Per-spawn override for the source exe to copy when starting this
+    /// runner. When `Some(path)`, `start_exe_mode_for_runner` skips the
+    /// usual slot-resolution chain and copies this exact path instead.
+    /// Set by `spawn_test` when the caller passes `use_lkg: true` so the
+    /// runner is pinned to the last-known-good binary regardless of slot
+    /// state. Persists across restarts of *this* runner so a crash + manual
+    /// restart still gets the LKG; cleared only by replacing the runner
+    /// (which spawn-test does anyway since each call creates a fresh id).
+    pub source_exe_override: RwLock<Option<PathBuf>>,
 }
 
 impl ManagedRunner {
@@ -86,6 +95,7 @@ impl ManagedRunner {
             recent_panic: RwLock::new(None),
             panic_log_dir: RwLock::new(None),
             early_log_path: RwLock::new(None),
+            source_exe_override: RwLock::new(None),
         }
     }
 
@@ -284,6 +294,30 @@ pub struct BuildSlot {
     pub frontend_stale: RwLock<bool>,
 }
 
+/// Metadata for the last-known-good (LKG) runner binary preserved at
+/// `target-pool/lkg/qontinui-runner.exe`.
+///
+/// The LKG copy is captured after every successful `cargo build` and is
+/// independent of slot state — a subsequent failed build that clobbers a
+/// slot's exe still leaves LKG intact. Callers consult `built_at` to decide
+/// whether their pending changes are reflected in the LKG binary:
+///
+///   if max(mtime of changed files) <= LKG.built_at  ⇒ LKG includes the
+///       changes; safe to spawn with `{rebuild: false, use_lkg: true}`.
+///   if max(mtime of changed files) >  LKG.built_at  ⇒ LKG predates the
+///       changes; the runner would be stale. Rebuild instead.
+///
+/// `built_at` is the wall-clock time the cargo build completed, recorded
+/// just before the exe was copied into the LKG dir. `source_slot` is the
+/// pool slot the build ran on. `exe_size` is the byte size of the LKG exe
+/// — useful for spotting truncated or partial copies after a crash.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LkgInfo {
+    pub built_at: DateTime<Utc>,
+    pub source_slot: usize,
+    pub exe_size: u64,
+}
+
 /// Pool of parallel build slots.
 ///
 /// Acquisition protocol:
@@ -309,6 +343,13 @@ pub struct BuildPool {
     /// binary. Used by `spawn-test {rebuild: false}` to locate the exe to copy.
     /// `None` at startup until the first successful build.
     pub last_successful_slot: RwLock<Option<usize>>,
+    /// Metadata for the preserved last-known-good runner exe at
+    /// `target-pool/lkg/qontinui-runner.exe`. Updated after every successful
+    /// build; read by `spawn_test` when `use_lkg: true`. Hydrated from the
+    /// `lkg.json` sidecar at supervisor startup so the value survives
+    /// restarts. `None` only when no successful build has ever produced an
+    /// LKG (fresh checkout) or the sidecar failed to load.
+    pub last_known_good: RwLock<Option<LkgInfo>>,
 }
 
 impl BuildPool {
@@ -333,12 +374,20 @@ impl BuildPool {
                 frontend_stale: RwLock::new(false),
             }));
         }
+        // Try to hydrate LKG metadata from the on-disk sidecar. We do this
+        // synchronously in `BuildPool::new` (which runs once at startup) so
+        // the field is correctly populated before any HTTP handler can read
+        // it. A missing or unparsable sidecar is non-fatal — the LKG will
+        // simply be considered absent until the next successful build.
+        let lkg = load_lkg_from_disk(config);
+
         Self {
             slots,
             permits: Arc::new(Semaphore::new(pool_size)),
             npm_lock: Arc::new(tokio::sync::Mutex::new(())),
             queue_depth: Arc::new(AtomicUsize::new(0)),
             last_successful_slot: RwLock::new(None),
+            last_known_good: RwLock::new(lkg),
         }
     }
 
@@ -380,6 +429,22 @@ impl BuildPool {
         // Unreachable: semaphore guarantees an idle slot exists.
         panic!("claim_idle_slot called with no idle slots; semaphore invariant violated");
     }
+}
+
+/// Hydrate `LkgInfo` from `target-pool/lkg/lkg.json`. Returns `None` if the
+/// sidecar is missing, unreadable, malformed, or its companion exe doesn't
+/// exist. Called once during `BuildPool::new`. A missing LKG is benign — it
+/// just means the supervisor was started before any successful build, or the
+/// dir was wiped. Build success will rewrite both files.
+fn load_lkg_from_disk(config: &SupervisorConfig) -> Option<LkgInfo> {
+    let exe = config.lkg_exe_path();
+    let meta = config.lkg_metadata_path();
+    if !exe.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&meta).ok()?;
+    let parsed: LkgInfo = serde_json::from_str(&raw).ok()?;
+    Some(parsed)
 }
 
 pub struct AiState {

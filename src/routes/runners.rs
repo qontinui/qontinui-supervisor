@@ -845,6 +845,26 @@ pub struct SpawnTestRequest {
     /// restarts.
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Pin this runner to the last-known-good (LKG) binary instead of the
+    /// freshest slot exe. Use this when your own build failed but you want
+    /// to test a runner whose changes you know are *already in the LKG*.
+    ///
+    /// **Caller's responsibility:** before setting this to `true`, compare
+    /// `mtime(your changed files)` against `lkg.built_at` from `GET /health`.
+    /// If any changed file's mtime is later than `lkg.built_at`, the LKG
+    /// binary does NOT contain your changes — pinning to it would silently
+    /// run stale code. The supervisor does not enforce this comparison.
+    ///
+    /// Mutually meaningful with `rebuild`:
+    /// - `{rebuild: false, use_lkg: true}`: skip the build, use LKG.
+    /// - `{rebuild: true, use_lkg: true}`: build first; if the build
+    ///   succeeds, the new exe becomes the LKG and is what you'll run.
+    ///   If the build fails, the request fails as usual — `use_lkg` is not
+    ///   an automatic build-failure fallback.
+    /// - `{rebuild: false, use_lkg: false}` (default): use the freshest
+    ///   slot exe (`resolve_source_exe` ordering).
+    #[serde(default)]
+    pub use_lkg: bool,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1070,15 +1090,51 @@ pub async fn spawn_test(
         }
     }
 
+    // If the caller asked to pin this runner to the LKG binary, resolve the
+    // path now (before starting) and stash it on the ManagedRunner. The
+    // override takes precedence over the slot-resolution chain inside
+    // `start_exe_mode_for_runner`. The check intentionally happens AFTER any
+    // optional rebuild so a `{rebuild: true, use_lkg: true}` call uses the
+    // freshly-rebuilt binary as its LKG (the rebuild updated LKG on success).
+    if body.use_lkg {
+        match manager::resolve_lkg_exe(&state).await {
+            Ok(lkg_path) => {
+                let mut slot = managed.source_exe_override.write().await;
+                *slot = Some(lkg_path.clone());
+                let lkg_info = state.build_pool.last_known_good.read().await.clone();
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "Pinning test runner '{}' to LKG binary {:?} (built_at={:?}, source_slot={:?})",
+                            id,
+                            lkg_path,
+                            lkg_info.as_ref().map(|i| i.built_at.to_rfc3339()),
+                            lkg_info.as_ref().map(|i| i.source_slot),
+                        ),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                let mut runners = state.runners.write().await;
+                runners.remove(&id);
+                return Err(e);
+            }
+        }
+    }
+
     // Check that a runner binary exists in some build slot (or at the legacy path).
     // Without this check, a fresh supervisor would succeed the request only to
     // fail inside `start_runner_by_id` with a less helpful error. If the check
     // fails, remove the placeholder we reserved above so the port frees up.
-    if manager::resolve_source_exe(&state).await.is_err() {
+    // Skip when use_lkg pinned an override above — we already verified that path.
+    if !body.use_lkg && manager::resolve_source_exe(&state).await.is_err() {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(SupervisorError::Process(
-            "Runner binary not found in any build slot. Use rebuild: true to build it first."
+            "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
         ));
     }
@@ -1309,11 +1365,20 @@ pub async fn spawn_test(
     }
 
     // Resolve the source exe to report its metadata so callers can detect
-    // stale binaries ("this binary is older than my last commit").
-    let exe_meta = crate::process::manager::resolve_source_exe(&state)
-        .await
-        .ok()
-        .and_then(|p| crate::process::manager::binary_meta(&p));
+    // stale binaries ("this binary is older than my last commit"). When the
+    // runner was pinned to LKG, prefer the LKG path's metadata over the
+    // freshest slot's so the response describes what's actually running.
+    let exe_meta = if body.use_lkg {
+        crate::process::manager::resolve_lkg_exe(&state)
+            .await
+            .ok()
+            .and_then(|p| crate::process::manager::binary_meta(&p))
+    } else {
+        crate::process::manager::resolve_source_exe(&state)
+            .await
+            .ok()
+            .and_then(|p| crate::process::manager::binary_meta(&p))
+    };
 
     // Determine if the slot we used for the binary has a stale frontend
     // baked in. We consult `last_successful_slot` (the slot whose exe the
@@ -1352,6 +1417,16 @@ pub async fn spawn_test(
     }
     if let Some(sha) = probed_git_sha {
         resp["git_sha"] = json!(sha);
+    }
+    if body.use_lkg {
+        resp["used_lkg"] = json!(true);
+        if let Some(info) = state.build_pool.last_known_good.read().await.clone() {
+            resp["lkg"] = json!({
+                "built_at": info.built_at.to_rfc3339(),
+                "source_slot": info.source_slot,
+                "exe_size": info.exe_size,
+            });
+        }
     }
 
     // If the runner's binary came from a slot with a stale frontend, surface
@@ -1981,6 +2056,19 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         .load(std::sync::atomic::Ordering::Relaxed);
     let last_successful = *state.build_pool.last_successful_slot.read().await;
     let available = state.build_pool.permits.available_permits();
+    let lkg_json = state
+        .build_pool
+        .last_known_good
+        .read()
+        .await
+        .as_ref()
+        .map(|info| {
+            json!({
+                "built_at": info.built_at.to_rfc3339(),
+                "source_slot": info.source_slot,
+                "exe_size": info.exe_size,
+            })
+        });
     Json(json!({
         "pool_size": state.build_pool.slots.len(),
         "available_permits": available,
@@ -1989,6 +2077,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "avg_build_duration_secs": avg_build_duration_secs,
         "any_slot_has_stale_frontend": any_slot_has_stale_frontend,
         "slots": slots_json,
+        "lkg": lkg_json,
     }))
 }
 

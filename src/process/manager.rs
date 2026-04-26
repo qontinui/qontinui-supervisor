@@ -157,6 +157,30 @@ pub async fn stale_binary_for_runner(state: &SharedState, runner_id: &str) -> Op
     compute_stale_binary(running, newest_slot)
 }
 
+/// Resolve the last-known-good runner exe path.
+///
+/// Returns the path only when both the on-disk LKG exe AND in-memory
+/// `LkgInfo` are present — callers that pin a runner to LKG need the
+/// metadata (notably `built_at`) to make their staleness decision, so a
+/// dangling exe with no sidecar is treated as absent.
+pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, SupervisorError> {
+    let info_present = state.build_pool.last_known_good.read().await.is_some();
+    if !info_present {
+        return Err(SupervisorError::Process(
+            "No last-known-good runner binary recorded yet. Run a build that succeeds first."
+                .to_string(),
+        ));
+    }
+    let p = state.config.lkg_exe_path();
+    if !p.exists() {
+        return Err(SupervisorError::Process(format!(
+            "LKG metadata is set but exe is missing at {:?}. The LKG dir may have been wiped; rebuild to repopulate.",
+            p
+        )));
+    }
+    Ok(p)
+}
+
 /// Locate the most recent successfully-built runner exe across the build pool.
 ///
 /// Preference order:
@@ -841,12 +865,35 @@ async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
 ) -> Result<SpawnResult, SupervisorError> {
-    // Locate the source exe. With the parallel build pool, each slot builds
-    // into its own `target-pool/slot-{k}/debug/`. Prefer the slot that produced
-    // the most recent successful build; fall back to the legacy single-target
-    // path for cases where no parallel build has run yet (e.g. pre-pool-era
-    // builds or manual `cargo build` invocations).
-    let source_exe = resolve_source_exe(state).await?;
+    // Locate the source exe. The per-runner `source_exe_override` takes
+    // precedence — set by `spawn_test` when the caller passes `use_lkg: true`
+    // so the runner is pinned to the last-known-good binary regardless of
+    // current slot state. With no override, fall back to the parallel build
+    // pool: each slot builds into its own `target-pool/slot-{k}/debug/`.
+    // Prefer the slot that produced the most recent successful build; then
+    // any slot with an exe on disk; then the legacy single-target path for
+    // cases where no parallel build has run yet (e.g. pre-pool-era builds
+    // or manual `cargo build` invocations).
+    let source_exe = {
+        let override_path = managed.source_exe_override.read().await.clone();
+        match override_path {
+            Some(p) if p.exists() => {
+                info!(
+                    "Runner '{}' pinned to source exe override {:?}",
+                    managed.config.name, p
+                );
+                p
+            }
+            Some(p) => {
+                warn!(
+                    "Runner '{}' had source_exe_override {:?} but file is missing; falling back to slot resolution",
+                    managed.config.name, p
+                );
+                resolve_source_exe(state).await?
+            }
+            None => resolve_source_exe(state).await?,
+        }
+    };
 
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.

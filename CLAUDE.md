@@ -108,7 +108,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 |--------|------|-------------|
 | GET | `/runners` | List all runners with status |
 | POST | `/runners` | Add a runner config to the registry |
-| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?}`. Returns `{id, port, api_url, ui_bridge_url}`. Auto-cleaned on stop. |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?}`. Returns `{id, port, api_url, ui_bridge_url}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
@@ -328,6 +328,50 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 3. `target/debug/qontinui-runner.exe` — legacy fallback
 
 Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process.
+
+### Last-known-good (LKG) fallback for agents
+
+The supervisor preserves the most recently successfully-built runner exe at `target-pool/lkg/qontinui-runner.exe` after every successful `cargo build`. Slot dirs can be clobbered by a subsequent failed build that overwrites or partially-deletes the slot's exe; the LKG copy is independent and survives those events. A sidecar at `target-pool/lkg/lkg.json` records `{built_at, source_slot, exe_size}` and is hydrated into `state.build_pool.last_known_good` at supervisor startup so it survives restarts.
+
+**When this matters.** Multiple concurrent agents share the build pool. Agent A's broken build can leave the slots in a state where Agent B's `spawn-test {rebuild: false}` would either fail or run a worse binary than the LKG. If Agent B's own changes are *already in the LKG* (because Agent B's edits predate the most recent successful build), Agent B can pin to the LKG instead of waiting for the slots to recover.
+
+**The comparison rule — agents MUST do this themselves; the supervisor does not enforce it.**
+
+1. Read LKG metadata from `GET /health` → `build.lkg.built_at` (RFC3339), or `GET /builds` → `lkg.built_at`. Both surface the same value.
+2. Take the maximum mtime across every file you've changed in the runner workspace (`stat -c %Y` on Linux, `(Get-Item path).LastWriteTime` in PowerShell, etc.).
+3. Compare:
+   - **`max(mtime of changed files) <= lkg.built_at`** → the LKG was built AFTER your changes, so those changes are already compiled into the LKG binary. Safe to spawn with `{rebuild: false, use_lkg: true}`.
+   - **`max(mtime of changed files) > lkg.built_at`** → the LKG predates your changes. Pinning to it would silently run stale code. You must rebuild instead.
+4. If you have NO uncommitted changes, the LKG always covers you (any clean checkout's tracked files have mtimes from the original git checkout, which is older than every build).
+
+**Why timestamps and not git hashes.** With three concurrent agents touching files at different commits, hashes are noisy — what matters is "do the bytes I edited live in this binary." File mtime answers that directly. The risk case (agent edits file at T1, LKG at T0 < T1) is exactly the case where the comparison correctly says "do not use LKG."
+
+**API.**
+
+```bash
+# Inspect LKG state
+curl localhost:9875/health   | jq '.build.lkg'
+curl localhost:9875/builds   | jq '.lkg'
+# → {"built_at": "2026-04-26T15:30:00Z", "source_slot": 1, "exe_size": 253749760}
+# → null if no successful build has happened yet on this checkout
+
+# Spawn a test runner pinned to LKG (no rebuild)
+curl -X POST localhost:9875/runners/spawn-test \
+     -H 'content-type: application/json' \
+     -d '{"rebuild": false, "use_lkg": true, "wait": true}'
+# Response includes: "used_lkg": true, "lkg": {"built_at": ..., "source_slot": ..., "exe_size": ...}
+```
+
+**Interaction with `rebuild`.**
+
+| `rebuild` | `use_lkg` | Behavior |
+|-----------|-----------|----------|
+| `false`   | `false`   | Default. Uses freshest slot exe via `resolve_source_exe`. |
+| `false`   | `true`    | Skip the build, run from `lkg/qontinui-runner.exe`. |
+| `true`    | `false`   | Build, then run the freshest slot exe (which is the just-built one). |
+| `true`    | `true`    | Build, then run from LKG. On build success, LKG is updated first, so this runs your fresh build. On build failure the request fails — `use_lkg` is NOT an automatic build-failure fallback; the agent decides whether to retry without `rebuild`. |
+
+**LKG capture happens after every successful build** in `build_monitor.rs::update_lkg_after_success`. Capture is best-effort — failures are logged but do not fail the build itself. The previous LKG stays intact if the new copy can't be written. Only real `cargo build` success updates LKG; the `cargo check` prewarm path does not.
 
 ### spawn-test / spawn-named `{rebuild: true}` behavior
 

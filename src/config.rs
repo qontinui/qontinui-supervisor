@@ -319,6 +319,27 @@ impl SupervisorConfig {
             .join("qontinui-runner.exe")
     }
 
+    /// Last-known-good directory under the build pool. Holds a copy of the
+    /// most recent successfully built runner exe plus a `lkg.json` sidecar
+    /// describing when it was built and which slot it came from. Survives
+    /// any subsequent failed build that overwrites or deletes a slot's exe.
+    pub fn lkg_dir(&self) -> PathBuf {
+        self.runner_npm_dir().join("target-pool").join("lkg")
+    }
+
+    /// Path to the LKG runner exe. The file is replaced atomically on every
+    /// successful build via copy-to-temp + rename.
+    pub fn lkg_exe_path(&self) -> PathBuf {
+        self.lkg_dir().join("qontinui-runner.exe")
+    }
+
+    /// Path to the LKG metadata sidecar (`built_at`, `source_slot`, `exe_size`).
+    /// Loaded at supervisor startup so the in-memory `last_known_good` field
+    /// survives restarts.
+    pub fn lkg_metadata_path(&self) -> PathBuf {
+        self.lkg_dir().join("lkg.json")
+    }
+
     /// Path to the runner executable (for exe mode).
     ///
     /// Cargo builds into the workspace root's target directory (parent of
