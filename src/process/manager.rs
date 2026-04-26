@@ -952,10 +952,23 @@ async fn start_exe_mode_for_runner(
         // and QONTINUI_PRIMARY_PORT so they can proxy process commands to the primary
         if !managed.config.is_primary {
             cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            // Find the primary runner's port for process log proxying
-            if let Some(primary) = state.get_primary().await {
-                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
-            }
+            // Find the primary runner's port for process log proxying.
+            //
+            // The user-started primary isn't in the supervisor's runners
+            // registry (the supervisor only tracks runners IT spawned),
+            // so `state.get_primary()` returns None on most setups. Fall
+            // back to the conventional default port — the runner's
+            // `process_capture::primary_proxy::is_secondary()` requires
+            // BOTH env vars to be set, so leaving the port unset would
+            // cause every secondary to silently behave as a primary
+            // (re-introducing the wrappers-dir contention this var was
+            // added to fix).
+            let primary_port = state
+                .get_primary()
+                .await
+                .map(|p| p.config.port)
+                .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
+            cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
             forward_test_auto_login_env(&mut cmd, state);
             forward_window_position_env(&mut cmd, state, &managed.config.name).await;
         }
@@ -1011,9 +1024,13 @@ async fn start_exe_mode_for_runner(
 
         if !managed.config.is_primary {
             cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            if let Some(primary) = state.get_primary().await {
-                cmd.env("QONTINUI_PRIMARY_PORT", primary.config.port.to_string());
-            }
+            // See Windows branch above for the fallback rationale.
+            let primary_port = state
+                .get_primary()
+                .await
+                .map(|p| p.config.port)
+                .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
+            cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
             forward_test_auto_login_env(&mut cmd, state);
             forward_window_position_env(&mut cmd, state, &managed.config.name).await;
             // Per-runner WebView2 data dir (see Windows branch for rationale).
