@@ -27,6 +27,9 @@ export default function App() {
           appId="qontinui-supervisor-dashboard"
           appName="Qontinui Supervisor"
           appType="dashboard"
+          framework="react"
+          capabilities={['control']}
+          version={__APP_VERSION__}
         />
         <BootIdWatcher />
         <BuildRefreshBanner />
