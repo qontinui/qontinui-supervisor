@@ -163,6 +163,12 @@ pub async fn stale_binary_for_runner(state: &SharedState, runner_id: &str) -> Op
 /// `LkgInfo` are present — callers that pin a runner to LKG need the
 /// metadata (notably `built_at`) to make their staleness decision, so a
 /// dangling exe with no sidecar is treated as absent.
+///
+/// If the on-disk exe has gone missing while the in-memory `LkgInfo` is
+/// still populated (e.g. the user wiped `target-pool/lkg/` between builds,
+/// or a subsequent rename never landed), the stale `LkgInfo` is cleared
+/// before returning the error so `/health.build.lkg` no longer reports
+/// metadata for an exe that doesn't exist.
 pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, SupervisorError> {
     let info_present = state.build_pool.last_known_good.read().await.is_some();
     if !info_present {
@@ -173,6 +179,10 @@ pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, 
     }
     let p = state.config.lkg_exe_path();
     if !p.exists() {
+        // Drop the stale in-memory entry so /health and /builds stop
+        // reporting metadata for an exe that's no longer on disk.
+        let mut guard = state.build_pool.last_known_good.write().await;
+        *guard = None;
         return Err(SupervisorError::Process(format!(
             "LKG metadata is set but exe is missing at {:?}. The LKG dir may have been wiped; rebuild to repopulate.",
             p
@@ -885,11 +895,16 @@ async fn start_exe_mode_for_runner(
                 p
             }
             Some(p) => {
-                warn!(
-                    "Runner '{}' had source_exe_override {:?} but file is missing; falling back to slot resolution",
+                // Hard-fail: the caller explicitly pinned this runner to a
+                // specific binary (typically the LKG via spawn-test
+                // {use_lkg: true}). Silently falling back to slot resolution
+                // would launch a different binary while the response keeps
+                // claiming `used_lkg: true`, which is exactly the kind of
+                // staleness the LKG path is meant to *prevent*.
+                return Err(SupervisorError::Process(format!(
+                    "Runner '{}' was pinned to source exe override {:?} but the file is missing. The LKG dir may have been wiped between the spawn-time check and process start; rebuild to repopulate.",
                     managed.config.name, p
-                );
-                resolve_source_exe(state).await?
+                )));
             }
             None => resolve_source_exe(state).await?,
         }

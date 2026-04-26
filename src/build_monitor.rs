@@ -803,8 +803,14 @@ async fn update_lkg_after_success(
     }
 
     let final_exe = state.config.lkg_exe_path();
-    let tmp_exe = lkg_dir.join("qontinui-runner.exe.tmp");
-    // Best-effort cleanup of any leftover tmp file from a previous crash.
+    // Per-slot temp filenames so two concurrent successful builds can't
+    // clobber each other's in-flight copies. Without the suffix, slot 0's
+    // remove_file would race slot 1's copy/rename and the final exe could
+    // end up holding one slot's bytes while the sidecar claims the other's.
+    let tmp_exe = lkg_dir.join(format!("qontinui-runner.exe.tmp.{}", slot.id));
+    // Best-effort cleanup of any leftover tmp file from a previous crash on
+    // THIS slot — slot ids are stable across builds so a stale file from
+    // last session is still ours to clean.
     let _ = std::fs::remove_file(&tmp_exe);
 
     std::fs::copy(&source_exe, &tmp_exe).map_err(|e| {
@@ -818,10 +824,11 @@ async fn update_lkg_after_success(
         .map(|m| m.len())
         .map_err(|e| SupervisorError::Process(format!("stat {:?}: {}", tmp_exe, e)))?;
 
-    // Atomic replace. On Windows std's rename overwrites only if the dest
-    // doesn't exist; remove first. Failure to remove is fine — rename will
-    // surface the real error.
-    let _ = std::fs::remove_file(&final_exe);
+    // Atomic replace. Rust 1.65+ implements `std::fs::rename` on Windows via
+    // `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` for same-volume renames, so
+    // dropping the prior remove_file removes the brief window where the LKG
+    // dir held a sidecar but no exe. If the dest is held open by another
+    // process the rename returns the real error.
     std::fs::rename(&tmp_exe, &final_exe).map_err(|e| {
         SupervisorError::Process(format!(
             "failed to rename {:?} -> {:?}: {}",
@@ -836,13 +843,12 @@ async fn update_lkg_after_success(
     };
 
     let final_meta = state.config.lkg_metadata_path();
-    let tmp_meta = lkg_dir.join("lkg.json.tmp");
+    let tmp_meta = lkg_dir.join(format!("lkg.json.tmp.{}", slot.id));
     let _ = std::fs::remove_file(&tmp_meta);
     let json = serde_json::to_string_pretty(&info)
         .map_err(|e| SupervisorError::Process(format!("serialize lkg.json: {}", e)))?;
     std::fs::write(&tmp_meta, json.as_bytes())
         .map_err(|e| SupervisorError::Process(format!("write {:?}: {}", tmp_meta, e)))?;
-    let _ = std::fs::remove_file(&final_meta);
     std::fs::rename(&tmp_meta, &final_meta).map_err(|e| {
         SupervisorError::Process(format!(
             "failed to rename {:?} -> {:?}: {}",
