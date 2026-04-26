@@ -12,6 +12,7 @@ import RunnerMonitor from './pages/RunnerMonitor';
 import Fleet from './pages/Fleet';
 import SpawnMonitors from './pages/SpawnMonitors';
 import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';
+import { BootIdWatcher } from './components/BootIdWatcher';
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
       appName="Qontinui Supervisor"
       appType="dashboard"
     />
+    <BootIdWatcher />
     <div className="layout">
       <aside className="sidebar">
         <div className="sidebar-logo">Supervisor</div>

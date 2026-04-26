@@ -137,6 +137,12 @@ pub struct SupervisorState {
     /// Round-robin counter for choosing which enabled monitor a new temp
     /// runner should land on. Wraps modulo enabled-count at pick time.
     pub next_monitor_index: AtomicUsize,
+    /// Unique identifier for this supervisor process instance. Generated once
+    /// at startup. Returned in heartbeat responses so the dashboard SPA can
+    /// detect a supervisor restart and force-reload itself, recovering from
+    /// the wedged-tab scenario where the SSE/command channel is dead but the
+    /// fetch layer still works.
+    pub boot_id: String,
 }
 
 pub struct RunnerState {
@@ -443,6 +449,7 @@ impl SupervisorState {
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
             spawn_monitors: RwLock::new(Vec::new()),
             next_monitor_index: AtomicUsize::new(0),
+            boot_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 

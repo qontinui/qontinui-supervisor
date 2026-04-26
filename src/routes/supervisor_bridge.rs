@@ -357,19 +357,25 @@ pub async fn command_response(
 // ============================================================================
 
 /// POST /supervisor-bridge/heartbeat
+///
+/// Accepts an optional JSON body so out-of-band clients (e.g. BootIdWatcher)
+/// can probe `boot_id` without a payload. The CommandRelayListener still
+/// sends `{tabId, timestamp, ...}` to keep the per-tab heartbeat map fresh.
 pub async fn heartbeat(
     State(state): State<SharedState>,
-    Json(body): Json<HeartbeatBody>,
+    body: Option<Json<HeartbeatBody>>,
 ) -> impl IntoResponse {
-    if let Some(tab_id) = body.tab_id {
-        state
-            .command_relay
-            .heartbeats
-            .write()
-            .await
-            .insert(tab_id, Instant::now());
+    if let Some(Json(body)) = body {
+        if let Some(tab_id) = body.tab_id {
+            state
+                .command_relay
+                .heartbeats
+                .write()
+                .await
+                .insert(tab_id, Instant::now());
+        }
     }
-    Json(serde_json::json!({"ok": true}))
+    Json(serde_json::json!({"ok": true, "boot_id": state.boot_id}))
 }
 
 // ============================================================================
