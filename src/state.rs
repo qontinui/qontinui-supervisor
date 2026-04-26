@@ -140,11 +140,23 @@ pub struct SupervisorState {
     /// `process::stopped_cache`). Queryable via
     /// `GET /runners/{id}/logs?include_stopped=true`.
     pub stopped_runners: Arc<RwLock<HashMap<String, StoppedRunnerSnapshot>>>,
-    /// Unique identifier for this supervisor process instance. Generated once
-    /// at startup. Returned in heartbeat responses so the dashboard SPA can
-    /// detect a supervisor restart and force-reload itself, recovering from
-    /// the wedged-tab scenario where the SSE/command channel is dead but the
-    /// fetch layer still works.
+    /// Stable identifier for this supervisor *installation* (not this process).
+    /// Persisted to a file under the user's local data directory
+    /// (`%LOCALAPPDATA%\qontinui-supervisor\boot.id` on Windows,
+    /// `~/.local/share/qontinui-supervisor/boot.id` on Linux,
+    /// `~/Library/Application Support/qontinui-supervisor/boot.id` on macOS)
+    /// and re-read on every supervisor startup, so it survives both bare
+    /// restarts and rebuild-then-restart cycles.
+    ///
+    /// Returned in heartbeat responses and surfaced via
+    /// `GET /supervisor-bridge/boot-id`. The dashboard's `BootIdWatcher` polls
+    /// this value and reloads the page when it changes — but because the value
+    /// is now stable across normal restarts, that reload acts as a *fallback*
+    /// for catastrophic situations (the persistence file got deleted or
+    /// corrupted, or the install was wiped) rather than the primary
+    /// "new bundle available" signal. The primary signal for "a fresh frontend
+    /// bundle is now being served" is `build_id` (see below), which the
+    /// `BuildRefreshBanner` watches via `/health/stream`.
     pub boot_id: String,
     /// Identifier for the embedded frontend bundle this supervisor is serving.
     /// Computed at startup from the mtime of `dist/index.html` (RFC3339
@@ -486,6 +498,71 @@ pub fn compute_build_id() -> String {
     }
 }
 
+/// Default platform-appropriate path for the persisted `boot.id` file.
+///
+/// - Windows: `%LOCALAPPDATA%\qontinui-supervisor\boot.id`
+/// - Linux:   `~/.local/share/qontinui-supervisor/boot.id`
+/// - macOS:   `~/Library/Application Support/qontinui-supervisor/boot.id`
+///
+/// Falls back to `./qontinui-supervisor/boot.id` if `dirs::data_local_dir()`
+/// can't determine a home/data dir (extremely rare — e.g. a stripped-down
+/// container with no `HOME` set). The fallback keeps the supervisor running
+/// rather than panicking; persistence may simply not survive a CWD change.
+fn default_boot_id_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qontinui-supervisor")
+        .join("boot.id")
+}
+
+/// Load a previously-persisted `boot_id` from `path`, or generate a fresh
+/// UUID v4 and persist it there. Failure to write the new UUID is non-fatal —
+/// the in-memory UUID is returned and a warning is logged; the next startup
+/// will simply generate a new one. The returned string is always a
+/// well-formed UUID.
+///
+/// This is the testable variant of [`load_or_create_boot_id`]. The public
+/// function calls this with [`default_boot_id_path()`].
+pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        let trimmed = contents.trim();
+        if uuid::Uuid::parse_str(trimmed).is_ok() {
+            return trimmed.to_string();
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "boot.id file exists but does not contain a valid UUID; regenerating"
+        );
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %e,
+                "failed to create boot.id parent directory; boot_id will not persist"
+            );
+            return fresh;
+        }
+    }
+    if let Err(e) = std::fs::write(path, &fresh) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to write boot.id; boot_id will not persist across restarts"
+        );
+    }
+    fresh
+}
+
+/// Resolve the persistent `boot_id` for this supervisor installation.
+/// Reads the persisted UUID from the platform-default path if present,
+/// otherwise generates and persists a fresh one. See
+/// [`SupervisorState::boot_id`] for semantics.
+pub fn load_or_create_boot_id() -> String {
+    load_or_create_boot_id_at(&default_boot_id_path())
+}
+
 impl SupervisorState {
     pub fn new(config: SupervisorConfig) -> Self {
         let watchdog_enabled = config.watchdog_enabled_at_start;
@@ -538,7 +615,7 @@ impl SupervisorState {
             http_client,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
-            boot_id: uuid::Uuid::new_v4().to_string(),
+            boot_id: load_or_create_boot_id(),
             build_id: compute_build_id(),
         }
     }
@@ -979,5 +1056,51 @@ mod tests {
         let state = SupervisorState::new(config);
         let expo = state.expo.try_read().unwrap();
         assert_eq!(expo.port, 9999);
+    }
+
+    // --- boot_id persistence tests ---
+
+    #[test]
+    fn test_load_or_create_boot_id_at_persists_across_calls() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("nested").join("boot.id");
+        // First call: file does not exist, helper must generate + persist.
+        let first = load_or_create_boot_id_at(&path);
+        assert!(
+            uuid::Uuid::parse_str(&first).is_ok(),
+            "first call must return a valid UUID, got {first:?}"
+        );
+        assert!(path.exists(), "first call must create the boot.id file");
+        // Second call: must read the persisted UUID, not generate a fresh one.
+        let second = load_or_create_boot_id_at(&path);
+        assert_eq!(
+            first, second,
+            "second call must return the same UUID as the first"
+        );
+    }
+
+    #[test]
+    fn test_load_or_create_boot_id_at_regenerates_on_invalid_contents() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("boot.id");
+        std::fs::write(&path, "not-a-uuid").expect("seed invalid contents");
+        let id = load_or_create_boot_id_at(&path);
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "invalid contents must be replaced with a valid UUID"
+        );
+        // The file should now contain the freshly-generated UUID.
+        let persisted = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(persisted.trim(), id);
+    }
+
+    #[test]
+    fn test_load_or_create_boot_id_at_tolerates_trailing_whitespace() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("boot.id");
+        let seeded = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&path, format!("{seeded}\n")).expect("seed valid contents");
+        let id = load_or_create_boot_id_at(&path);
+        assert_eq!(id, seeded, "trailing whitespace must be trimmed");
     }
 }
