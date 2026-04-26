@@ -83,6 +83,10 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::supervisor_bridge::heartbeat),
         )
         .route(
+            "/supervisor-bridge/boot-id",
+            get(crate::routes::supervisor_bridge::boot_id),
+        )
+        .route(
             "/supervisor-bridge/control/snapshot",
             get(crate::routes::supervisor_bridge::snapshot),
         )

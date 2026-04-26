@@ -414,56 +414,65 @@ pub async fn command_response(
 
 /// POST /supervisor-bridge/heartbeat
 ///
-/// Accepts an optional JSON body so out-of-band clients (e.g. BootIdWatcher)
-/// can probe `boot_id` without a payload. The CommandRelayListener still
-/// sends `{tabId, timestamp, ...}` to keep the per-tab heartbeat map fresh.
+/// CommandRelayListener (in `@qontinui/ui-bridge`) posts `{tabId, timestamp, ...}`
+/// here every 10s so `bridge_health` can compute `responsive` /
+/// `last_heartbeat_ms_ago`. Body is required — boot-id probing has its own
+/// endpoint at `GET /supervisor-bridge/boot-id` (BootIdWatcher).
 pub async fn heartbeat(
     State(state): State<SharedState>,
-    body: Option<Json<HeartbeatBody>>,
+    Json(body): Json<HeartbeatBody>,
 ) -> impl IntoResponse {
-    if let Some(Json(body)) = body {
-        if let Some(tab_id) = body.tab_id {
-            // Mark the tab as live for `bridge_health`'s `responsive` /
-            // `last_heartbeat_ms_ago` math.
-            state
-                .command_relay
-                .heartbeats
-                .write()
-                .await
-                .insert(tab_id.clone(), Instant::now());
+    if let Some(tab_id) = body.tab_id {
+        // Mark the tab as live for `bridge_health`'s `responsive` /
+        // `last_heartbeat_ms_ago` math.
+        state
+            .command_relay
+            .heartbeats
+            .write()
+            .await
+            .insert(tab_id.clone(), Instant::now());
 
-            // Record per-tab identity so `bridge_health` can describe the
-            // *actually connected* tab. We always insert an entry on the
-            // first heartbeat (even if every metadata field is None) so
-            // the timestamp is recorded, and we merge subsequent updates
-            // so a heartbeat that omits a field doesn't blow away an
-            // earlier non-None value (cheap protection against intermittent
-            // payload shapes from older or partially-configured SDKs).
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let mut map = state.command_relay.metadata.write().await;
-            let entry = map.entry(tab_id).or_default();
-            if body.app_id.is_some() {
-                entry.app_id = body.app_id;
-            }
-            if body.app_name.is_some() {
-                entry.app_name = body.app_name;
-            }
-            if body.app_type.is_some() {
-                entry.app_type = body.app_type;
-            }
-            if body.framework.is_some() {
-                entry.framework = body.framework;
-            }
-            if body.capabilities.is_some() {
-                entry.capabilities = body.capabilities;
-            }
-            if body.version.is_some() {
-                entry.version = body.version;
-            }
-            entry.last_seen_ms = now_ms;
+        // Record per-tab identity so `bridge_health` can describe the
+        // *actually connected* tab. We always insert an entry on the
+        // first heartbeat (even if every metadata field is None) so
+        // the timestamp is recorded, and we merge subsequent updates
+        // so a heartbeat that omits a field doesn't blow away an
+        // earlier non-None value (cheap protection against intermittent
+        // payload shapes from older or partially-configured SDKs).
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut map = state.command_relay.metadata.write().await;
+        let entry = map.entry(tab_id).or_default();
+        if body.app_id.is_some() {
+            entry.app_id = body.app_id;
         }
+        if body.app_name.is_some() {
+            entry.app_name = body.app_name;
+        }
+        if body.app_type.is_some() {
+            entry.app_type = body.app_type;
+        }
+        if body.framework.is_some() {
+            entry.framework = body.framework;
+        }
+        if body.capabilities.is_some() {
+            entry.capabilities = body.capabilities;
+        }
+        if body.version.is_some() {
+            entry.version = body.version;
+        }
+        entry.last_seen_ms = now_ms;
     }
-    Json(serde_json::json!({"ok": true, "boot_id": state.boot_id}))
+    Json(serde_json::json!({"ok": true}))
+}
+
+/// GET /supervisor-bridge/boot-id
+///
+/// Returns the supervisor process's per-startup uuid so out-of-band clients
+/// (BootIdWatcher) can detect a restart and force a hard reload of stale tabs.
+/// Stable for the lifetime of the supervisor process; rotates on every cargo
+/// rebuild + relaunch cycle. No body, no auth, cheap.
+pub async fn boot_id(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(serde_json::json!({"boot_id": state.boot_id}))
 }
 
 // ============================================================================

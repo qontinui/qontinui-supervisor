@@ -110,42 +110,44 @@ function LogViewer() {
       <div className="card-header" style={{ marginBottom: expanded ? '0.5rem' : 0 }}>
         <span className="card-title">Logs</span>
         <div className="flex gap-2 items-center">
-          {expanded && (
-            <>
-              <select
-                ref={logsSourceFilterRef as React.RefCallback<HTMLSelectElement>}
-                className="log-filter"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-              >
-                <option value="all">All sources</option>
-                {sources.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-                <option value="error">Errors only</option>
-                <option value="warn">Warnings only</option>
-              </select>
-              <button
-                ref={logsPauseRef as React.RefCallback<HTMLButtonElement>}
-                className="btn"
-                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
-                data-ui-bridge-value={String(paused)}
-                onClick={() => setPaused((v) => !v)}
-              >
-                {paused ? 'Resume' : 'Pause'}
-              </button>
-              <button
-                ref={logsClearRef as React.RefCallback<HTMLButtonElement>}
-                className="btn"
-                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
-                onClick={() => setLines([])}
-              >
-                Clear
-              </button>
-            </>
-          )}
+          {/* Always mount the toolbar so useUIElement registrations fire on
+              first render, even when the panel is collapsed. display:contents
+              keeps the children flex items of the outer header; display:none
+              hides them without unmounting. */}
+          <div style={{ display: expanded ? 'contents' : 'none' }}>
+            <select
+              ref={logsSourceFilterRef as React.RefCallback<HTMLSelectElement>}
+              className="log-filter"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            >
+              <option value="all">All sources</option>
+              {sources.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+              <option value="error">Errors only</option>
+              <option value="warn">Warnings only</option>
+            </select>
+            <button
+              ref={logsPauseRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+              data-ui-bridge-value={String(paused)}
+              onClick={() => setPaused((v) => !v)}
+            >
+              {paused ? 'Resume' : 'Pause'}
+            </button>
+            <button
+              ref={logsClearRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+              onClick={() => setLines([])}
+            >
+              Clear
+            </button>
+          </div>
           <button
             onClick={() => setExpanded((v) => !v)}
             style={{
@@ -843,67 +845,70 @@ function RunnerInstancesPanel() {
         </button>
       </div>
 
-      {showAdd && (
-        <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+      {/* Always mount the spawn form so useUIElement on the Spawn submit
+          button registers on first render. display:none hides the form when
+          the user hasn't clicked "+ New" yet, but the DOM nodes (and refs)
+          are present so automation can target runner-spawn-submit without
+          first toggling showAdd. */}
+      <div style={{ display: showAdd ? 'flex' : 'none', gap: '0.4rem', marginBottom: showAdd ? '0.5rem' : 0, alignItems: 'center', flexWrap: 'wrap' }}>
+        <input
+          type="text"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="Instance Name"
+          style={{
+            padding: '0.2rem 0.4rem',
+            fontSize: '0.75rem',
+            background: 'var(--bg-secondary)',
+            border: '1px solid var(--border)',
+            borderRadius: 3,
+            color: 'var(--text)',
+            width: 120,
+          }}
+        />
+        <input
+          type="number"
+          value={newPort}
+          onChange={(e) => setNewPort(e.target.value)}
+          placeholder="Port (auto)"
+          style={{
+            padding: '0.2rem 0.4rem',
+            fontSize: '0.75rem',
+            background: 'var(--bg-secondary)',
+            border: '1px solid var(--border)',
+            borderRadius: 3,
+            color: 'var(--text)',
+            width: 80,
+          }}
+        />
+        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
           <input
-            type="text"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            placeholder="Instance Name"
-            style={{
-              padding: '0.2rem 0.4rem',
-              fontSize: '0.75rem',
-              background: 'var(--bg-secondary)',
-              border: '1px solid var(--border)',
-              borderRadius: 3,
-              color: 'var(--text)',
-              width: 120,
-            }}
+            type="checkbox"
+            checked={rebuild}
+            onChange={(e) => setRebuild(e.target.checked)}
+            style={{ margin: 0 }}
           />
+          Rebuild
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
           <input
-            type="number"
-            value={newPort}
-            onChange={(e) => setNewPort(e.target.value)}
-            placeholder="Port (auto)"
-            style={{
-              padding: '0.2rem 0.4rem',
-              fontSize: '0.75rem',
-              background: 'var(--bg-secondary)',
-              border: '1px solid var(--border)',
-              borderRadius: 3,
-              color: 'var(--text)',
-              width: 80,
-            }}
+            type="checkbox"
+            checked={isProtected}
+            onChange={(e) => setIsProtected(e.target.checked)}
+            style={{ margin: 0 }}
           />
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={rebuild}
-              onChange={(e) => setRebuild(e.target.checked)}
-              style={{ margin: 0 }}
-            />
-            Rebuild
-          </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={isProtected}
-              onChange={(e) => setIsProtected(e.target.checked)}
-              style={{ margin: 0 }}
-            />
-            Protected
-          </label>
-          <button
-            ref={spawnSubmitRef as React.RefCallback<HTMLButtonElement>}
-            className="btn"
-            style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
-            disabled={busy !== null}
-            onClick={handleSpawn}
-          >
-            {busy === 'spawn' ? (rebuild ? 'Building & Spawning...' : 'Spawning...') : 'Spawn'}
-          </button>
-        </div>
-      )}
+          Protected
+        </label>
+        <button
+          ref={spawnSubmitRef as React.RefCallback<HTMLButtonElement>}
+          className="btn"
+          style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
+          disabled={busy !== null}
+          onClick={handleSpawn}
+        >
+          {busy === 'spawn' ? (rebuild ? 'Building & Spawning...' : 'Spawning...') : 'Spawn'}
+        </button>
+      </div>
 
       {visibleRunners.length === 0 && !showAdd && (
         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', padding: '0.25rem 0' }}>

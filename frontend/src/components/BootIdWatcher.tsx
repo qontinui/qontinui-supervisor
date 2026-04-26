@@ -1,10 +1,10 @@
 import { useEffect, useRef } from 'react';
 
-const HEARTBEAT_URL = '/supervisor-bridge/heartbeat';
+const BOOT_ID_URL = '/supervisor-bridge/boot-id';
 const POLL_MS = 5000;
 // If boot_id is missing this many polls in a row, log once. Catches the
-// silent-stuck case if the endpoint is downgraded to an older binary that
-// doesn't return boot_id, or if a proxy is rewriting the response body.
+// silent-stuck case where the endpoint is shadowed by a proxy or the
+// response body is being rewritten.
 const MISSING_BOOT_ID_LOG_AFTER = 6;
 
 export function BootIdWatcher() {
@@ -16,7 +16,7 @@ export function BootIdWatcher() {
     const ctrl = new AbortController();
     const probe = async () => {
       try {
-        const r = await fetch(HEARTBEAT_URL, { method: 'POST', signal: ctrl.signal });
+        const r = await fetch(BOOT_ID_URL, { signal: ctrl.signal });
         if (!r.ok) return;
         const body = await r.json();
         const id = body?.boot_id;
@@ -25,7 +25,7 @@ export function BootIdWatcher() {
           if (missingCount.current >= MISSING_BOOT_ID_LOG_AFTER && !loggedMissing.current) {
             loggedMissing.current = true;
             console.warn(
-              '[BootIdWatcher] heartbeat response missing boot_id — auto-reload disabled',
+              '[BootIdWatcher] /boot-id response missing boot_id — auto-reload disabled',
             );
           }
           return;
