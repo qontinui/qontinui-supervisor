@@ -496,31 +496,34 @@ pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
 }
 
 /// Fetch placement for a non-primary runner from the primary runner's
-/// `/spawn-placement/preview` endpoint, then push its rect as
+/// `/spawn-placement/temp` endpoint, then push its rect as
 /// QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT. The runner reads these at window-build
 /// time.
 ///
-/// Slot 0 is the primary; slot N for the Nth temp runner currently spawned.
-/// We use `count(test-* runners) + 1` so the first temp runner lands on
-/// slot 1, the second on slot 2, etc. `overflow=wrap` makes the runner
-/// cycle through configured placements when there are more temp runners
-/// than slots.
+/// The temp placement list is its own 0-indexed array dedicated to temp
+/// runners (the named-instance preview UI flow uses `/spawn-placement/preview`
+/// separately). We use `count(test-* runners)` as the index so the first
+/// temp runner lands on index 0, the second on index 1, etc.
+/// `overflow=wrap` makes the runner cycle through configured placements
+/// when there are more temp runners than entries.
 ///
-/// On any failure (404, 502, network error, timeout) we log and skip —
-/// the runner falls back to its built-in default behavior. Never fails
-/// the spawn.
+/// On any failure (404 — no temp placements configured / index out of
+/// range without wrap, 502, network error, timeout, parse error) we log
+/// and skip — the runner falls back to its built-in default behavior.
+/// Never fails the spawn. We do NOT fall back to the slot endpoint;
+/// the temp list is the dedicated source of truth for temp spawn placement.
 async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, runner_name: &str) {
     // Count existing test-* runners. The runner we're about to spawn isn't
     // in `state.runners` yet at the point this is called from
     // `start_managed_runner`, but if it had been pre-inserted as a
-    // placeholder, we'd want to skip it. Counting all `test-*` IDs and
-    // adding 1 lands on the next free slot.
+    // placeholder, we'd want to skip it. The temp list is 0-indexed, so
+    // the count itself is the next free index.
     let runners = state.runners.read().await;
     let temp_count = runners.keys().filter(|id| id.starts_with("test-")).count();
     drop(runners);
-    let slot = temp_count + 1;
+    let index = temp_count;
 
-    let url = format!("http://localhost:9876/spawn-placement/preview?slot={slot}&overflow=wrap");
+    let url = format!("http://localhost:9876/spawn-placement/temp?index={index}&overflow=wrap");
     let resp = match state
         .http_client
         .get(&url)
@@ -531,7 +534,7 @@ async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, run
         Ok(r) => r,
         Err(e) => {
             let msg = format!(
-                "Spawn placement: skipping runner '{}' — request to {} failed: {}",
+                "Spawn temp placement: skipping runner '{}' — request to {} failed: {}",
                 runner_name, url, e
             );
             tracing::info!("{}", msg);
@@ -547,9 +550,9 @@ async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, run
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let msg = format!(
-            "Spawn placement: skipping runner '{}' — slot {} returned {}: {}",
+            "Spawn temp placement: skipping runner '{}' — index {} returned {}: {}",
             runner_name,
-            slot,
+            index,
             status,
             body.chars().take(200).collect::<String>()
         );
@@ -579,7 +582,7 @@ async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, run
         Ok(p) => p,
         Err(e) => {
             let msg = format!(
-                "Spawn placement: skipping runner '{}' — failed to parse response: {}",
+                "Spawn temp placement: skipping runner '{}' — failed to parse response: {}",
                 runner_name, e
             );
             tracing::info!("{}", msg);
@@ -592,9 +595,9 @@ async fn forward_window_position_env(cmd: &mut Command, state: &SharedState, run
     };
 
     let msg = format!(
-        "Spawn placement: runner '{}' slot={} (label={:?}, monitor={:?}, source={:?}) at ({},{}) {}x{}",
+        "Spawn temp placement: runner '{}' index={} (label={:?}, monitor={:?}, source={:?}) at ({},{}) {}x{}",
         runner_name,
-        slot,
+        index,
         placement.slot_label,
         placement.monitor_label,
         placement.source,
