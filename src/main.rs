@@ -215,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
-    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     let listener = {
         let mut attempts = 0;
         loop {
@@ -247,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    info!("Supervisor listening on http://0.0.0.0:{}", port);
+    info!("Supervisor listening on http://127.0.0.1:{}", port);
 
     // Spawn the ambient dashboard WebView2 window (item B of the post-3J UI
     // Bridge improvements plan). Runs on its own dedicated OS thread so it
