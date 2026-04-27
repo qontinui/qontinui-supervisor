@@ -901,7 +901,14 @@ pub struct SpawnTestRequest {
 }
 
 fn default_health_probe_timeout() -> u64 {
-    6000
+    // 6s was too aggressive: the runner's PG bootstrap (apply_canonical_schema
+    // → ensure_tables → run_migrations) is wrapped in 30s per-stage timeouts
+    // on the runner side. If the supervisor probe gives up at 6s, it kills
+    // a runner that's still legitimately initializing — and we never see the
+    // runner's own diagnostic timeout fire. 60s is enough to let a slow GIN
+    // index build complete on a busy DB AND to surface the runner's own
+    // pg_stat_activity dump if a stage genuinely hangs.
+    60_000
 }
 
 fn default_wait_timeout() -> u64 {
