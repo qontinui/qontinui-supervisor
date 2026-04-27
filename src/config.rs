@@ -196,7 +196,22 @@ pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
 /// the endpoint returns as soon as the event is queued — if it hangs, the
 /// runner is already unhealthy and we want to fall through to kill quickly.
 pub const RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS: u64 = 500;
-pub const BUILD_TIMEOUT_SECS: u64 = 600; // 10 minutes
+const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 1800; // 30 minutes — cold Tauri builds on Windows can run 11+ min
+
+/// Resolved cargo build timeout in seconds, read from
+/// `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` env var at first access.
+/// Clamped to [60, 7200], defaults to 1800 (30 minutes).
+pub fn build_timeout_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var("QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.clamp(60, 7200))
+            .unwrap_or(DEFAULT_BUILD_TIMEOUT_SECS)
+    })
+}
 #[allow(dead_code)]
 pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;
 pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
@@ -442,8 +457,16 @@ mod tests {
     // --- Process constant tests ---
 
     #[test]
-    fn test_build_timeout_is_10_minutes() {
-        assert_eq!(BUILD_TIMEOUT_SECS, 600);
+    fn test_build_timeout_default_is_30_minutes() {
+        assert_eq!(DEFAULT_BUILD_TIMEOUT_SECS, 1800);
+    }
+
+    #[test]
+    fn test_build_timeout_resolves() {
+        // No env override in unit-test env → returns the default.
+        // (Resolved value is memoized; this test still exercises the parse path.)
+        let resolved = build_timeout_secs();
+        assert!((60..=7200).contains(&resolved));
     }
 
     // --- AI_MODELS tests ---

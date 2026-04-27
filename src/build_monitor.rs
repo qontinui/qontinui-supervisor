@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use crate::config::BUILD_TIMEOUT_SECS;
+use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -441,8 +441,8 @@ async fn run_build_inner(
     };
 
     // Wait with timeout
-    let wait_result =
-        tokio::time::timeout(Duration::from_secs(BUILD_TIMEOUT_SECS), child.wait()).await;
+    let timeout_secs = build_timeout_secs();
+    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(status)) => status,
@@ -453,11 +453,11 @@ async fn run_build_inner(
             )));
         }
         Err(_) => {
-            warn!("Build timed out after {}s, killing", BUILD_TIMEOUT_SECS);
+            warn!("Build timed out after {}s, killing", timeout_secs);
             let _ = child.kill().await;
             return Err(SupervisorError::Timeout(format!(
                 "Build timed out after {}s",
-                BUILD_TIMEOUT_SECS
+                timeout_secs
             )));
         }
     };

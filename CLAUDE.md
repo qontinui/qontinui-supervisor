@@ -383,7 +383,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 4. **Optional wait** — if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
 
 **Timeouts:**
-- **Build timeout:** 10 minutes (`BUILD_TIMEOUT_SECS = 600`). If cargo exceeds this, the build process is killed.
+- **Build timeout:** 30 minutes default (override via `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS`, clamped [60, 7200]). If cargo exceeds this, the build process is killed.
 - **Queue timeout:** configurable via `queue_timeout_secs`. Returns 504 after the specified seconds if all slots are busy.
 - **Wait timeout:** configurable via `wait_timeout_secs` (default 120s). Only applies when `wait: true`. Returns successfully even if the runner doesn't become healthy — `status` field will say `"timeout"`.
 - **No-wait mode:** pass `X-Queue-Mode: no-wait` header for immediate 503 with queue info instead of blocking.
@@ -397,7 +397,7 @@ If the build fails, the placeholder port reservation is cleaned up and the error
 | Supervisor port | 9875 |
 | Runner API port | 9876 |
 | Expo port | 8081 |
-| Build timeout | 10min (600s) |
+| Build timeout | 30min (1800s) default, override `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` |
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |
 | Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |
