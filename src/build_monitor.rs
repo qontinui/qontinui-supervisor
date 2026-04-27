@@ -10,7 +10,9 @@ use crate::config::BUILD_TIMEOUT_SECS;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
-use crate::process::windows::cleanup_orphaned_build_processes;
+use crate::process::windows::{
+    cleanup_orphaned_build_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
+};
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
 
@@ -134,11 +136,15 @@ pub async fn run_cargo_build_with_requester(
     // Cleanup orphaned build processes first
     cleanup_orphaned_build_processes().await;
 
-    // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit)
-    wait_for_exe_unlocked_for_slot(state, &slot).await;
-
+    // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit).
+    // If the lock persists, identify the holder and kill orphans / stop registered temp runners.
+    // Returns Err only if the holder is a user-managed primary/named runner; in that case we
+    // skip cargo entirely so we don't masquerade a pre-build conflict as a build failure.
     let build_start = std::time::Instant::now();
-    let result = run_build_inner(state, &slot).await;
+    let result = match free_slot_exe(state, &slot).await {
+        Ok(()) => run_build_inner(state, &slot).await,
+        Err(e) => Err(e),
+    };
     let duration_secs = build_start.elapsed().as_secs_f64();
 
     // Record build duration into this slot's rolling history BEFORE
@@ -506,54 +512,219 @@ async fn run_build_inner(
 /// Wait for the runner exe in a specific slot's target dir to be writable
 /// (unlocked) before building. On Windows, the OS can hold file locks briefly
 /// after a process is killed.
-async fn wait_for_exe_unlocked_for_slot(state: &SharedState, slot: &Arc<BuildSlot>) {
-    let _ = state; // kept in signature for logging consistency
+///
+/// If the lock persists past the brief grace period, identify the holder(s)
+/// and resolve the conflict:
+///
+/// - **Orphan PID** (process exists but no registered runner claims it, or the
+///   matching registry entry has `pid: None`/`running: false`): kill the PID
+///   directly. By construction it's a zombie the supervisor lost track of —
+///   typically a child the supervisor itself spawned that drifted out of the
+///   registry. There is no scenario where leaving a slot binary running
+///   detached from the registry is intentional.
+/// - **Registered temp runner** holding the slot exe: stop it via the
+///   supervisor's normal stop path. Temp runners *should* be running from a
+///   copy in `target/debug/`; finding one running directly from the slot
+///   means `start_managed_runner`'s copy step fell back to `source_exe`,
+///   which is a bug we want to surface.
+/// - **Registered primary or named runner** holding the slot exe: do *not*
+///   auto-kill — that's the user's runner. Log loudly, surface a build
+///   error, and let the operator decide. (This shouldn't happen because
+///   non-temp runners also use copied exes; if it does, Fix B should
+///   prevent it from recurring.)
+async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
     let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
     if !exe_path.exists() {
-        return;
+        return Ok(());
     }
 
-    let max_attempts = 20; // 20 × 500ms = 10s max wait
-    for attempt in 1..=max_attempts {
+    // Short grace window — Windows often releases handles within ~1-2s after
+    // a process exits. Don't escalate to PID enumeration unless we've waited
+    // long enough that the lock is clearly persistent.
+    let grace_attempts = 4; // 4 × 500ms = 2s
+    for attempt in 1..=grace_attempts {
         match std::fs::OpenOptions::new().write(true).open(&exe_path) {
             Ok(_) => {
                 if attempt > 1 {
-                    info!("Runner exe unlocked after {}ms", attempt * 500);
+                    let msg = format!("Slot {} exe unlocked after {}ms", slot.id, attempt * 500);
+                    info!("{}", msg);
+                    state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
                 }
-                return;
+                return Ok(());
             }
-            Err(e) if attempt < max_attempts => {
-                warn!(
-                    "Runner exe still locked (attempt {}/{}): {}",
-                    attempt, max_attempts, e
-                );
+            Err(_) => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            Err(e) => {
-                warn!(
-                    "Runner exe still locked after {}s, proceeding anyway: {}",
-                    max_attempts / 2,
-                    e
-                );
             }
         }
     }
+
+    // Still locked. Enumerate holders and resolve.
+    let holders = find_pids_holding_exe(&exe_path).await;
+    if holders.is_empty() {
+        let msg = format!(
+            "Slot {} exe still locked but no holder PID found via sysinfo — proceeding anyway",
+            slot.id
+        );
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+        return Ok(());
+    }
+
+    let runners = state.get_all_runners().await;
+    for holder_pid in holders {
+        // Find the registered runner (if any) that owns this PID.
+        let mut owner_match: Option<(String, bool, bool)> = None; // (id, is_temp, registry_running)
+        for managed in &runners {
+            let runner = managed.runner.read().await;
+            if runner.pid == Some(holder_pid) && runner.running {
+                let is_temp = crate::process::manager::is_temp_runner(&managed.config.id);
+                owner_match = Some((managed.config.id.clone(), is_temp, true));
+                break;
+            }
+        }
+
+        match owner_match {
+            None => {
+                // Orphan — no registered runner claims this PID, or the entry
+                // that claims it has running=false / pid=None. Either way the
+                // supervisor cannot reach it via its API; kill directly.
+                warn!(
+                    "Slot {} exe held by orphan PID {} (no registered runner claims it). Killing.",
+                    slot.id, holder_pid
+                );
+                state
+                    .logs
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Warn,
+                        format!(
+                            "Slot {} exe locked by orphan PID {} — killing to free build artifact",
+                            slot.id, holder_pid
+                        ),
+                    )
+                    .await;
+                if let Err(e) = kill_by_pid(holder_pid).await {
+                    warn!("kill_by_pid({}) failed: {}", holder_pid, e);
+                }
+            }
+            Some((runner_id, is_temp, _running)) if is_temp => {
+                // Registered temp runner is running directly from the slot exe.
+                // Stop via API (graceful). Indicates Fix B's invariant was
+                // violated — log so it's visible.
+                warn!(
+                    "Slot {} exe held by registered temp runner '{}' (PID {}) — stopping to free build artifact. \
+                     This indicates start_managed_runner fell back to source_exe; investigate.",
+                    slot.id, runner_id, holder_pid
+                );
+                if let Err(e) = crate::process::manager::stop_runner_by_id(state, &runner_id).await
+                {
+                    warn!(
+                        "stop_runner_by_id('{}') failed: {} — escalating to direct kill",
+                        runner_id, e
+                    );
+                    let _ = kill_by_pid(holder_pid).await;
+                }
+            }
+            Some((runner_id, _is_temp, _running)) => {
+                // Registered primary/named runner running from a slot exe.
+                // Refuse to touch it — that's user-managed. Surface a hard
+                // error so the build doesn't silently corrupt their session.
+                let msg = format!(
+                    "Slot {} exe locked by registered non-temp runner '{}' (PID {}). \
+                     Refusing to auto-kill a user-managed runner. \
+                     Stop it via the supervisor API or investigate why it is running directly from the slot binary.",
+                    slot.id, runner_id, holder_pid
+                );
+                error!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Build, LogLevel::Error, &msg)
+                    .await;
+                return Err(SupervisorError::Other(msg));
+            }
+        }
+    }
+
+    // Re-poll after kills so the OS can release the file handle.
+    let post_kill_attempts = 10; // 10 × 500ms = 5s
+    for attempt in 1..=post_kill_attempts {
+        match std::fs::OpenOptions::new().write(true).open(&exe_path) {
+            Ok(_) => {
+                let msg = format!(
+                    "Slot {} exe unlocked {}ms after killing holder(s)",
+                    slot.id,
+                    attempt * 500
+                );
+                info!("{}", msg);
+                state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+                return Ok(());
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    let msg = format!(
+        "Slot {} exe still locked after killing holders — build will likely fail",
+        slot.id
+    );
+    warn!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Build, LogLevel::Warn, &msg)
+        .await;
+    Ok(())
 }
 
-/// Stop non-primary exe-mode runners before a cargo build.
-/// Stop only temp runners that may hold a file lock on the build output binary.
-/// User runners are never stopped — they use copied exes and don't lock the build artifact.
+/// Stop registered runners whose live process is running directly out of a
+/// build-pool slot dir before a cargo build.
+///
+/// In normal operation every runner launches from a copy at
+/// `target/debug/qontinui-runner-{id}.exe`, so this loop is a no-op. When
+/// `start_managed_runner`'s copy step has previously fallen back to
+/// `source_exe` (the slot binary), the resulting runner holds a slot exe
+/// open and would block any cargo build that tries to overwrite it. Catch
+/// that here with a graceful stop. `free_slot_exe` is the second-line
+/// defence: it kicks in if a holder remains after this returns, including
+/// orphan PIDs no registered runner claims.
+///
+/// We stop temp runners eagerly (they're cheap to recreate). For named or
+/// primary runners running from a slot exe we log loudly but do not
+/// auto-stop — the user's session shouldn't disappear from under them; the
+/// build will surface a hard error via `free_slot_exe` so the operator can
+/// resolve it intentionally.
 async fn stop_exe_runners_for_build(state: &SharedState) {
     let runners = state.get_all_runners().await;
     for managed in &runners {
-        if !crate::process::manager::is_temp_runner(&managed.config.id) {
+        let (running, pid) = {
+            let runner = managed.runner.read().await;
+            (runner.running, runner.pid)
+        };
+        if !running {
             continue;
         }
-        let running = managed.runner.read().await.running;
-        if running {
+        let Some(pid) = pid else {
+            continue;
+        };
+
+        // Resolve the live exe path for this PID. If it isn't running out
+        // of the build pool, leave it alone.
+        let exe_path = match resolve_pid_exe_path(pid).await {
+            Some(p) => p,
+            None => continue,
+        };
+        let in_slot = exe_path
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with("slot-"));
+        if !in_slot {
+            continue;
+        }
+
+        if crate::process::manager::is_temp_runner(&managed.config.id) {
             info!(
-                "Stopping temp runner '{}' before build to release exe lock",
-                managed.config.name
+                "Stopping temp runner '{}' (PID {}) running from slot exe {:?} before build",
+                managed.config.name, pid, exe_path
             );
             if let Err(e) =
                 crate::process::manager::stop_runner_by_id(state, &managed.config.id).await
@@ -563,8 +734,26 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
                     managed.config.name, e
                 );
             }
+        } else {
+            warn!(
+                "Registered non-temp runner '{}' (PID {}) is running from slot exe {:?}. \
+                 Refusing to auto-stop a user-managed runner; build will fail with a \
+                 descriptive error. Stop it via the supervisor API or investigate why \
+                 it launched from the slot binary.",
+                managed.config.name, pid, exe_path
+            );
         }
     }
+}
+
+/// Look up the executable path of a live PID. Returns `None` when the
+/// process is gone or sysinfo could not read its image path.
+///
+/// Thin wrapper over `crate::process::windows::pid_exe_path` so callers in
+/// this file can read like `resolve_pid_exe_path(pid)` and the sysinfo
+/// plumbing lives in one place.
+async fn resolve_pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
+    pid_exe_path(pid).await
 }
 
 // =============================================================================

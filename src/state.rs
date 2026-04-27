@@ -2,6 +2,7 @@ use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::LogState;
+use crate::process::job::RunnerJob;
 use crate::process::panic_log::RecentPanic;
 use crate::process::stopped_cache::StoppedRunnerSnapshot;
 use crate::routes::supervisor_bridge::CommandRelay;
@@ -166,6 +167,19 @@ pub struct SupervisorState {
     /// dashboard tabs compare the meta tag value against the SSE stream so a
     /// supervisor rebuild + restart can prompt the user to refresh.
     pub build_id: String,
+    /// Windows JobObject used to enforce kill-on-supervisor-exit semantics
+    /// for spawned runners. Created once at startup; every runner spawned
+    /// via `start_managed_runner` is assigned to it via
+    /// `RunnerJob::assign`. When this `Arc` drops (at supervisor exit) the
+    /// kernel closes the last handle to the job and terminates every
+    /// assigned process — so a force-killed or panicked supervisor cannot
+    /// leave orphan runners holding slot binaries.
+    ///
+    /// `None` when the OS refused to create the job (extremely rare on
+    /// Windows; non-Windows builds always get a no-op stub via
+    /// `process::job`'s cross-platform shim). Spawning continues either
+    /// way — without the safety net, but functional.
+    pub runner_job: Option<Arc<RunnerJob>>,
 }
 
 pub struct RunnerState {
@@ -592,6 +606,28 @@ impl SupervisorState {
 
         let build_pool = BuildPool::new(&config);
 
+        // Create the kill-on-exit JobObject. On Windows this enforces that
+        // every supervisor-spawned runner dies when the supervisor exits
+        // (graceful, panic, force-kill). On non-Windows it's a no-op stub.
+        // Failure to create is logged loudly but never aborts startup —
+        // the supervisor still functions, just without the safety net.
+        let runner_job = match RunnerJob::create() {
+            Ok(j) => {
+                tracing::info!(
+                    "Created kill-on-exit JobObject for spawned runners (KILL_ON_JOB_CLOSE)"
+                );
+                Some(Arc::new(j))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to create runner JobObject — supervisor exit will NOT \
+                     terminate spawned runners; orphans may linger and lock build slots"
+                );
+                None
+            }
+        };
+
         Self {
             config,
             runners: RwLock::new(runners_map),
@@ -617,6 +653,7 @@ impl SupervisorState {
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
             boot_id: load_or_create_boot_id(),
             build_id: compute_build_id(),
+            runner_job,
         }
     }
 

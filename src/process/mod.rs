@@ -1,5 +1,7 @@
 pub mod early_log;
+pub mod job;
 pub mod manager;
+pub mod orphan_scan;
 pub mod panic_log;
 pub mod port;
 pub mod restate_port;

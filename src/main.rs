@@ -153,6 +153,15 @@ async fn main() -> anyhow::Result<()> {
     // Spawn health cache refresher (caches expensive port checks every 2s)
     let _health_cache_handle = health_cache::spawn_health_cache_refresher(state.clone());
 
+    // Layer 3 of the orphan-runner safety net: scan for `qontinui-runner.exe`
+    // processes left over from a prior supervisor instance and either adopt
+    // them back into the registry (if a registered runner config claims their
+    // port) or kill them so the next build can replace the slot binary.
+    //
+    // Awaited (not spawned) so it serializes with the rest of startup — no
+    // prewarm or build can begin while orphans still hold slot binaries.
+    process::orphan_scan::scan_orphans_at_startup(&state).await;
+
     // Clean up any orphaned temp runner processes from previous sessions
     // and detect already-running user runners for health tracking.
     // The supervisor does NOT auto-start any runners — users start their own.

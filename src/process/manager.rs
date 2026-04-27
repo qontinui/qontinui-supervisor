@@ -754,6 +754,44 @@ pub async fn start_managed_runner(
         runner_name, pid, port
     );
 
+    // Assign the spawned process to the supervisor's kill-on-exit JobObject.
+    // When the supervisor process dies (graceful exit, panic, force-kill, or
+    // BSOD), the kernel closes the last handle to the job and terminates
+    // every assigned process per `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    // WebView2 children of the runner are transitively in the job too —
+    // Windows assigns child processes of a job-tracked process to the same
+    // job by default.
+    //
+    // We assign AFTER `cmd.spawn()` because the runner is not started with
+    // `CREATE_SUSPENDED`, so it's already executing. That's fine for
+    // KILL_ON_JOB_CLOSE — the only correctness trap with post-spawn
+    // assignment is BREAKAWAY_OK interactions where a child could escape
+    // before assignment, which we don't rely on here.
+    //
+    // Assignment failure is loud but non-fatal — the runner is functional;
+    // it just won't be auto-killed if the supervisor dies abruptly.
+    if let (Some(job), Some(pid_val)) = (state.runner_job.as_ref(), pid) {
+        if let Err(e) = job.assign(pid_val) {
+            warn!(
+                "Failed to assign runner '{}' (PID {}) to kill-on-exit JobObject: {}. \
+                 Supervisor exit will not terminate this runner.",
+                runner_name, pid_val, e
+            );
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    format!(
+                        "Runner '{}' (PID {}) NOT assigned to kill-on-exit JobObject: {}. \
+                         If the supervisor crashes, this runner may linger as an orphan.",
+                        runner_name, pid_val, e
+                    ),
+                )
+                .await;
+        }
+    }
+
     // Remember the panic log dir so `monitor_runner_process_exit` can find
     // the file after a non-zero exit. Also clear any stale `recent_panic`
     // left over from a previous boot of this runner id — a clean start
@@ -912,20 +950,59 @@ async fn start_exe_mode_for_runner(
 
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.
+    //
+    // The first copy can fail when a previous instance of this runner died
+    // with the supervisor losing its PID — Windows will hold the prior copy
+    // open until the OS releases the handle. Try to remove the stale copy
+    // and retry once. If that still fails, fail the spawn rather than fall
+    // back to running directly from `source_exe` (the slot binary).
+    //
+    // Why we never fall back to source_exe: it leaves a process running
+    // out of `target-pool/slot-{k}/debug/qontinui-runner.exe`, locking the
+    // slot for every future cargo build. If the supervisor then loses the
+    // PID, the slot becomes permanently unbuildable until the OS process
+    // is killed externally — exactly the deadlock this code is meant to
+    // prevent. A clean failure here surfaces the underlying problem
+    // (locked previous copy, disk full, AV) instead of silently producing
+    // a worse failure mode later.
     let exe_path = {
         let copy_path = state.config.runner_exe_copy_path(&managed.config.id);
-        if let Err(e) = std::fs::copy(&source_exe, &copy_path) {
-            warn!(
-                "Failed to copy runner exe for '{}': {} — falling back to original",
-                managed.config.name, e
-            );
-            source_exe
-        } else {
-            info!(
-                "Copied runner exe for '{}' to {:?}",
-                managed.config.name, copy_path
-            );
-            copy_path
+        match std::fs::copy(&source_exe, &copy_path) {
+            Ok(_) => {
+                info!(
+                    "Copied runner exe for '{}' to {:?}",
+                    managed.config.name, copy_path
+                );
+                copy_path
+            }
+            Err(first_err) => {
+                warn!(
+                    "Initial copy of runner exe for '{}' failed: {} — \
+                     attempting to remove stale copy and retry",
+                    managed.config.name, first_err
+                );
+                let _ = std::fs::remove_file(&copy_path);
+                match std::fs::copy(&source_exe, &copy_path) {
+                    Ok(_) => {
+                        info!(
+                            "Copied runner exe for '{}' to {:?} on retry",
+                            managed.config.name, copy_path
+                        );
+                        copy_path
+                    }
+                    Err(retry_err) => {
+                        return Err(SupervisorError::Process(format!(
+                            "Failed to copy runner exe for '{}' from {:?} to {:?}: \
+                             initial error: {}; retry error: {}. \
+                             Refusing to run directly from the build slot — that \
+                             would lock the slot for future builds. Resolve the \
+                             copy-target lock (likely a prior runner instance the \
+                             supervisor lost track of) and retry.",
+                            managed.config.name, source_exe, copy_path, first_err, retry_err
+                        )));
+                    }
+                }
+            }
         }
     };
 
