@@ -1,13 +1,48 @@
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
 use crate::process::manager;
 use crate::state::SharedState;
+
+/// Query string for endpoints that opt-OUT of the post-spawn health wait.
+///
+/// Default is `wait=true` (poll up to 30s for the runner's `/health` to come
+/// up before returning 200). Pass `?wait=false` to get the legacy
+/// fire-and-forget behavior (200 the moment the OS process spawns, even if
+/// it's hung).
+#[derive(Deserialize, Default)]
+pub struct StartWaitQuery {
+    #[serde(default = "default_wait_true")]
+    pub wait: bool,
+}
+
+fn default_wait_true() -> bool {
+    true
+}
+
+/// Build the standard 503 body for a runner that started but didn't bind
+/// its API port within the wait budget. Shared between the legacy
+/// `/runner/restart` and the per-runner `/runners/{id}/start` so both
+/// endpoints expose an identical contract.
+pub(crate) fn unhealthy_after_start_response(
+    runner_id: &str,
+    failure: HealthProbeFailure,
+) -> Response {
+    let body = serde_json::json!({
+        "error": "runner_unhealthy_after_start",
+        "runner_id": runner_id,
+        "elapsed_ms": failure.elapsed_ms,
+        "recent_logs": failure.recent_logs,
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
 
 #[derive(Deserialize)]
 pub struct RestartRequest {
@@ -45,8 +80,9 @@ pub async fn stop_runner(
 
 pub async fn restart_runner(
     State(state): State<SharedState>,
+    Query(wait_q): Query<StartWaitQuery>,
     Json(body): Json<RestartRequest>,
-) -> Result<impl IntoResponse, SupervisorError> {
+) -> Result<Response, SupervisorError> {
     let rebuild = body.rebuild;
 
     state
@@ -60,10 +96,38 @@ pub async fn restart_runner(
 
     manager::restart_runner(&state, rebuild, RestartSource::Manual, body.force).await?;
 
+    // Port-bind verification: the manager call above returns the moment the
+    // OS process is spawned, but the runner may still be pre-bind (or hung).
+    // Poll its `/health` for up to 30s so callers can distinguish a healthy
+    // restart from a wedged one. `wait=false` opts out (legacy behavior).
+    if wait_q.wait {
+        // Look up the primary runner id so the probe targets the right
+        // managed entry. The legacy endpoint always restarts the primary,
+        // so this mirrors `manager::restart_runner`'s lookup.
+        if let Some(primary) = state.get_primary().await {
+            let runner_id = primary.config.id.clone();
+            if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Runner '{}' did not become healthy {}ms after restart",
+                            runner_id, failure.elapsed_ms
+                        ),
+                    )
+                    .await;
+                return Ok(unhealthy_after_start_response(&runner_id, failure));
+            }
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "status": "restarted",
         "message": format!("Runner restarted successfully{}", if rebuild { " (with rebuild)" } else { "" })
-    })))
+    }))
+    .into_response())
 }
 
 pub async fn control_watchdog(
@@ -248,7 +312,12 @@ pub async fn fix_and_rebuild(
 /// so callers waiting on a long `spawn-test` build see a proper response (or
 /// a 503 if they hit us after the drain started) instead of an empty body.
 ///
-/// Returns immediately so the HTTP response completes before the drain window.
+/// Fire-and-return: the shutdown signal is dispatched on a `tokio::spawn`ed
+/// task so the HTTP response can return in well under 100ms. Without this
+/// handoff, the handler awaited the broadcast send acknowledgement before
+/// responding, which routinely added ~2s to the round-trip while subscribers
+/// drained their channels. The actual shutdown drain still happens — it just
+/// runs after the response goes out.
 pub async fn supervisor_shutdown(State(state): State<SharedState>) -> Json<serde_json::Value> {
     state
         .logs
@@ -262,8 +331,13 @@ pub async fn supervisor_shutdown(State(state): State<SharedState>) -> Json<serde
     // The shutdown_signal task in main.rs races ctrl_c against shutdown_tx;
     // `signal_shutdown` flips the latched flag *and* broadcasts so any
     // handler that subscribes after this point still observes shutdown
-    // (broadcast channels don't replay missed messages).
-    state.signal_shutdown();
+    // (broadcast channels don't replay missed messages). Fire it from a
+    // spawned task so this handler can return immediately — the response
+    // must complete before the drain window closes our listener.
+    let state_for_signal = state.clone();
+    tokio::spawn(async move {
+        state_for_signal.signal_shutdown();
+    });
 
     Json(serde_json::json!({
         "status": "shutting_down",

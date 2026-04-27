@@ -771,24 +771,37 @@ pub async fn start_managed_runner(
     // Assignment failure is loud but non-fatal — the runner is functional;
     // it just won't be auto-killed if the supervisor dies abruptly.
     if let (Some(job), Some(pid_val)) = (state.runner_job.as_ref(), pid) {
-        if let Err(e) = job.assign(pid_val) {
-            warn!(
-                "Failed to assign runner '{}' (PID {}) to kill-on-exit JobObject: {}. \
-                 Supervisor exit will not terminate this runner.",
-                runner_name, pid_val, e
-            );
-            state
-                .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Warn,
-                    format!(
-                        "Runner '{}' (PID {}) NOT assigned to kill-on-exit JobObject: {}. \
-                         If the supervisor crashes, this runner may linger as an orphan.",
-                        runner_name, pid_val, e
-                    ),
-                )
-                .await;
+        match job.assign(pid_val) {
+            Ok(()) => {
+                let msg = format!(
+                    "Assigned runner '{}' (PID {}) to kill-on-exit JobObject",
+                    runner_name, pid_val
+                );
+                info!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to assign runner '{}' (PID {}) to kill-on-exit JobObject: {}. \
+                     Supervisor exit will not terminate this runner.",
+                    runner_name, pid_val, e
+                );
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Runner '{}' (PID {}) NOT assigned to kill-on-exit JobObject: {}. \
+                             If the supervisor crashes, this runner may linger as an orphan.",
+                            runner_name, pid_val, e
+                        ),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -1512,6 +1525,36 @@ pub async fn stop_runner_by_id(
         runner.pid
     };
 
+    // Orphan-PID recovery: if the registry lost track of the PID (None) but
+    // the runner's configured port is in use by some process, that process is
+    // the de-facto runner — likely a zombie from a prior supervisor instance
+    // that the current supervisor adopted partially. Kill it up-front so the
+    // graceful path below has a free port to verify, instead of returning
+    // success while the OS process keeps running.
+    if pid_to_kill.is_none() {
+        if let Some(orphan_pid) = crate::process::windows::find_pid_on_port(port).await {
+            let msg = format!(
+                "Recovered orphan PID {} on port {} for runner '{}'; killing",
+                orphan_pid, port, runner_name
+            );
+            info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            let _ = kill_by_pid(orphan_pid).await;
+            // Be explicit about the resulting registry state. The PID was
+            // already None, but flip running=false so callers that race a
+            // health probe see the post-kill view immediately rather than the
+            // stale "running=true, pid=None" tuple.
+            {
+                let mut runner = managed.runner.write().await;
+                runner.pid = None;
+                runner.running = false;
+            }
+        }
+    }
+
     // 1. Graceful-first: ask the runner to close itself via the same endpoint
     //    the UI uses, so WindowEvent::CloseRequested fires and its teardown
     //    hooks run (notably UsbTransport::release_all, which removes adb
@@ -1571,6 +1614,27 @@ pub async fn stop_runner_by_id(
         let _ = kill_by_port(port).await;
     }
 
+    // Snapshot the runner's state for post-mortem cache BEFORE clearing
+    // `started_at` below. The crash-summary endpoint reports
+    // `duration_alive_ms` computed from `started_at`/`stopped_at`, so the
+    // snapshot must capture the value before the per-runner reset wipes it.
+    // (For non-test runners we still capture so future post-mortem queries
+    // can see the most recent stop event; the cache is bounded so this is
+    // cheap.)
+    let runner_id = managed.config.id.clone();
+    let pre_clear_snapshot = if runner_id.starts_with("test-") {
+        Some(
+            crate::process::stopped_cache::snapshot_from_managed(
+                managed.as_ref(),
+                None,
+                crate::process::stopped_cache::StopReason::GracefulStop,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     // 4. Update per-runner state
     {
         let mut runner = managed.runner.write().await;
@@ -1604,17 +1668,8 @@ pub async fn stop_runner_by_id(
     // Auto-remove ephemeral test runners (spawned via /runners/spawn-test)
     // from the runners map so they don't accumulate over time. These have IDs
     // prefixed with "test-" and are not persisted to settings.
-    let runner_id = managed.config.id.clone();
     if runner_id.starts_with("test-") {
-        // Snapshot logs to the stopped-runners cache before dropping the
-        // ManagedRunner so post-mortem debugging still works.
-        let snapshot = crate::process::stopped_cache::snapshot_from_managed(
-            managed.as_ref(),
-            None,
-            crate::process::stopped_cache::StopReason::GracefulStop,
-        )
-        .await;
-        {
+        if let Some(snapshot) = pre_clear_snapshot {
             let mut cache = state.stopped_runners.write().await;
             crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
         }

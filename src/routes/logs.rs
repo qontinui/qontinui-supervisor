@@ -1,4 +1,4 @@
-use crate::state::SharedState;
+use crate::state::{SharedState, SseConnectionGuard};
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -46,7 +46,14 @@ pub async fn log_stream(
     let rx = state.logs.subscribe();
     let stream = BroadcastStream::new(rx);
 
-    let event_stream = stream.filter_map(|result| {
+    // Track this connection in `state.active_sse_connections`. Captured
+    // by-move into the per-event closure below so it lives exactly as long
+    // as the stream — drop happens when axum tears down the response.
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
+    let event_stream = stream.filter_map(move |result| {
+        // Hold the guard for every yielded event so the stream owns it.
+        let _hold = &conn_guard;
         match result {
             Ok(entry) => {
                 let data = serde_json::to_string(&entry).unwrap_or_default();

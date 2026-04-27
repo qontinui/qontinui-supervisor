@@ -4,6 +4,7 @@ use axum::Json;
 use futures::stream::Stream;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
@@ -11,7 +12,7 @@ use tokio_stream::StreamExt;
 use crate::config::RUNNER_API_PORT;
 use crate::health_cache::{CachedRunnerHealth, RecentCrashSummary, RunnerStatus, UiErrorSummary};
 use crate::sdk_features::{SDK_FEATURES, SDK_FEATURE_DOC_URL};
-use crate::state::SharedState;
+use crate::state::{SharedState, SseConnectionGuard};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -44,6 +45,16 @@ pub struct HealthResponse {
     /// refresh.
     #[serde(rename = "buildId")]
     pub build_id: String,
+    /// Live count of in-flight SSE connections across every long-lived
+    /// streaming endpoint (`/health/stream`, `/logs/stream`,
+    /// `/expo/logs/stream`, `/runners/{id}/logs/stream`,
+    /// `/supervisor-bridge/commands/stream`). Each handler holds an
+    /// [`crate::state::SseConnectionGuard`] for the lifetime of its
+    /// response stream; the count drops to 0 when the graceful-shutdown
+    /// drain has released every active subscriber. Surfaced for ops
+    /// visibility — verifying the drain works no longer requires
+    /// hand-opening a stream and triggering shutdown.
+    pub sse_active_connections: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -331,6 +342,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         sdk_features: SDK_FEATURES.to_vec(),
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         build_id: state.build_id.clone(),
+        sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
     }
 }
 
@@ -354,7 +366,15 @@ pub async fn health_stream(
     let shutdown_state = state.clone();
     let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
 
+    // Tracks this connection in `state.active_sse_connections`. Captured
+    // by-move into the per-tick closure below so it lives exactly as long as
+    // the stream — drop happens when axum tears down the response (client
+    // disconnect, take_until on shutdown_signal, server drain).
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
     let stream = interval.map(move |_| {
+        // Hold the guard for every yielded event so the stream owns it.
+        let _hold = &conn_guard;
         let state = state.clone();
         let health = {
             // Sync-safe: use try_read on each lock to avoid blocking the stream
@@ -459,6 +479,7 @@ pub async fn health_stream(
                 sdk_features: SDK_FEATURES.to_vec(),
                 sdk_features_doc_url: SDK_FEATURE_DOC_URL,
                 build_id: state.build_id.clone(),
+                sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
             }
         };
 
@@ -566,6 +587,7 @@ mod tests {
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
             build_id: "2026-04-25T00:00:00+00:00".to_string(),
+            sse_active_connections: 0,
         };
 
         let json = serde_json::to_string(&response).expect("should serialize");

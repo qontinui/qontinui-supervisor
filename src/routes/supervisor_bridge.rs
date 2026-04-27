@@ -24,7 +24,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::sdk_features::{SDK_FEATURES, SDK_FEATURE_DOC_URL};
-use crate::state::SharedState;
+use crate::state::{SharedState, SseConnectionGuard};
 
 // ============================================================================
 // Command Relay
@@ -345,6 +345,12 @@ pub async fn commands_stream(
 
     debug!("Supervisor bridge: tab {tab_id} connected to command stream");
 
+    // Track this connection in `state.active_sse_connections`. Captured
+    // by-move into the per-event closure below so it lives exactly as long
+    // as the stream — drop happens when axum tears down the response
+    // (client disconnect, take_until on shutdown_signal, server drain).
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
     // Initial connected event
     let connected_msg = serde_json::json!({"type": "connected", "tabId": tab_id}).to_string();
     let initial =
@@ -352,11 +358,17 @@ pub async fn commands_stream(
             async move { Ok::<_, Infallible>(Event::default().data(connected_msg)) },
         );
 
-    // Command events from the broadcast channel
-    let command_stream = BroadcastStream::new(rx).filter_map(|result| async {
-        match result {
-            Ok(msg) => Some(Ok(Event::default().data(msg))),
-            Err(_) => None, // Skip lagged messages
+    // Command events from the broadcast channel. The connection guard is
+    // captured here so it lives for the lifetime of the broadcast subscription
+    // (the longest-lived of the chained sub-streams). When the stream is
+    // dropped, the closure drops, and the guard decrements the counter.
+    let command_stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let _hold = &conn_guard;
+        async move {
+            match result {
+                Ok(msg) => Some(Ok(Event::default().data(msg))),
+                Err(_) => None, // Skip lagged messages
+            }
         }
     });
 

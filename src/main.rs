@@ -120,6 +120,12 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(supervisor_state);
 
+    // Drain any messages captured during synchronous SupervisorState::new
+    // construction (e.g. JobObject creation success/failure) into the
+    // dashboard log stream. Done after Arc-wrapping so the messages flow
+    // through the same persistent file writer attached above.
+    state.flush_pending_startup_logs().await;
+
     // Load persistent settings and apply to state
     {
         let path = settings::settings_path(&state.config);

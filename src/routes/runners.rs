@@ -20,7 +20,7 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::settings;
-use crate::state::{ManagedRunner, SharedState};
+use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
 use std::sync::Arc;
 use tracing::info;
 #[cfg(windows)]
@@ -511,16 +511,49 @@ pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, 
 }
 
 /// POST /runners/{id}/start — start a specific runner.
+///
+/// **Port-bind verification.** After the OS process spawns successfully,
+/// this endpoint polls the runner's `/health` for up to 30s (500ms cadence)
+/// before returning 200. If the runner stays alive but never binds the API
+/// port within the budget, the response is **503** with body
+/// `{error: "runner_unhealthy_after_start", elapsed_ms, recent_logs}`.
+///
+/// Pass `?wait=false` to opt out and get the legacy fire-and-forget 200
+/// response the moment the process spawns (for callers that do their own
+/// readiness probing).
 pub async fn start_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, SupervisorError> {
+    Query(wait_q): Query<crate::routes::runner::StartWaitQuery>,
+) -> Result<axum::response::Response, SupervisorError> {
     manager::start_runner_by_id(&state, &id).await?;
+
+    if wait_q.wait {
+        if let Err(failure) =
+            crate::process::health_probe::wait_for_runner_healthy_default(&state, &id).await
+        {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    format!(
+                        "Runner '{}' did not become healthy {}ms after start",
+                        id, failure.elapsed_ms
+                    ),
+                )
+                .await;
+            return Ok(crate::routes::runner::unhealthy_after_start_response(
+                &id, failure,
+            ));
+        }
+    }
 
     Ok(Json(json!({
         "status": "started",
         "message": format!("Runner '{}' started", id)
-    })))
+    }))
+    .into_response())
 }
 
 /// POST /runners/{id}/stop — stop a specific runner.
@@ -2211,6 +2244,277 @@ pub async fn runner_crash_dump(
     Err(SupervisorError::RunnerNotFound(id))
 }
 
+/// Maximum bytes returned in the `content` field of `GET /runners/{id}/early-log`.
+///
+/// Early-log files are hard-capped at [`crate::process::early_log::EARLY_LOG_BYTE_CAP`]
+/// (256 KiB) at write time, so a clean file will never exceed this. The cap
+/// here is defense-in-depth: if an external tool grew the file or a future
+/// change raises the writer cap, we still bound the response body.
+const EARLY_LOG_RESPONSE_BYTE_CAP: usize = 1024 * 1024;
+
+/// GET /runners/{id}/early-log — return the full per-spawn early-death log
+/// for a runner.
+///
+/// **Why this exists.** The spawn-test failure body includes `recent_logs`
+/// (last ~20 lines) and an `early_log_path` filesystem path. The full file
+/// content (often 50+ lines including PG migration progress, panic info,
+/// the runner's startup banner, etc.) is the diagnostic gold but currently
+/// has to be read by hand from disk. This endpoint lets HTTP clients (slash
+/// commands, automation, dashboard) fetch it directly.
+///
+/// **Lookup order.** Live registry first (`state.runners`), then the
+/// post-mortem cache (`state.stopped_runners`). Both store the path in
+/// `early_log_path`. Returns 404 if neither has the runner OR the path is
+/// missing/the file no longer exists on disk.
+///
+/// **Body cap.** Responses are capped at 1 MB; if the file is larger, only
+/// the **last** 1 MB is returned (matches what crash diagnosis cares about).
+/// `truncated` is set to `true` in that case.
+pub async fn runner_early_log(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    // Live-registry first.
+    let path_opt = if let Some(managed) = state.get_runner(&id).await {
+        managed.early_log_path.read().await.clone()
+    } else {
+        // Fall through to the stopped-runner cache. Read lock is held only
+        // long enough to clone the PathBuf.
+        let cache = state.stopped_runners.read().await;
+        match cache.get(&id) {
+            Some(snapshot) => snapshot.early_log_path.clone(),
+            None => {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "runner_not_found",
+                        "runner_id": id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let path = match path_opt {
+        Some(p) => p,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "early_log_unavailable",
+                    "reason": "runner has no captured early_log_path (no managed spawn or open failed)",
+                    "runner_id": id,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Read the full file, then truncate to the last EARLY_LOG_RESPONSE_BYTE_CAP
+    // bytes if needed. We deliberately read into memory (not stream) because
+    // the byte cap is small and the response is JSON, not chunked-text — and
+    // streaming would race the writer's in-place truncation in
+    // `early_log::truncate_file_in_place`.
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "early_log_unavailable",
+                    "reason": format!("file not found at {}", path.display()),
+                    "runner_id": id,
+                    "path": path.to_string_lossy(),
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "early_log_unavailable",
+                    "reason": format!("read failed: {}", e),
+                    "runner_id": id,
+                    "path": path.to_string_lossy(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let original_size = raw.len();
+    let (content, truncated) = if original_size > EARLY_LOG_RESPONSE_BYTE_CAP {
+        // Take the *last* cap bytes. The boundary may land mid-UTF-8 code
+        // point (rare for log content, but possible). `char_indices` snaps
+        // forward to the next valid boundary so the JSON serializer doesn't
+        // bail.
+        let want_start = original_size - EARLY_LOG_RESPONSE_BYTE_CAP;
+        let snap = raw
+            .char_indices()
+            .find(|(i, _)| *i >= want_start)
+            .map(|(i, _)| i)
+            .unwrap_or(original_size);
+        (raw[snap..].to_string(), true)
+    } else {
+        (raw, false)
+    };
+
+    Json(json!({
+        "runner_id": id,
+        "path": path.to_string_lossy(),
+        "content": content,
+        "size_bytes": original_size,
+        "truncated": truncated,
+    }))
+    .into_response()
+}
+
+/// Maximum bytes returned in the `panic_excerpt` field of
+/// `GET /runners/{id}/crash-summary`. If the runner-last-panic.txt file is
+/// larger than this, only the last [`CRASH_SUMMARY_PANIC_EXCERPT_CAP`]
+/// bytes are returned (the tail is what matters for diagnosis).
+const CRASH_SUMMARY_PANIC_EXCERPT_CAP: usize = 8 * 1024;
+
+/// Number of recent log lines included in the `last_phase_log` field of
+/// the crash-summary response.
+const CRASH_SUMMARY_LAST_PHASE_LOG_LINES: usize = 20;
+
+/// GET /runners/{id}/crash-summary — post-mortem diagnostics for a stopped runner.
+///
+/// **Why this exists.** When a temp runner dies during startup, callers
+/// currently have to assemble crash diagnostics from multiple sources
+/// (spawn-test response body, `recent_logs`, `early_log_path`,
+/// `panic_log_dir`, `stopped_runners` cache). This endpoint centralizes
+/// them into a single response.
+///
+/// **Lookup order.**
+/// 1. If `id` is in the live registry AND the runner is currently running
+///    (`runner.running == true`) → return 404 with
+///    `{"error": "runner_still_alive"}`. Crash-summary is post-mortem only.
+/// 2. If `id` is in the stopped-runners cache → assemble the response from
+///    the snapshot.
+/// 3. Otherwise → 404 with `{"error": "runner_not_found"}`.
+///
+/// **`panic_excerpt`** is the contents of
+/// `<panic_log_dir>/runner-last-panic.txt` if the file exists, else `null`.
+/// Capped at [`CRASH_SUMMARY_PANIC_EXCERPT_CAP`] bytes (the *last* bytes if
+/// the file is larger).
+pub async fn runner_crash_summary(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    // Rule 1: live + running → not post-mortem yet.
+    if let Some(managed) = state.get_runner(&id).await {
+        let is_running = managed.runner.read().await.running;
+        if is_running {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "runner_still_alive",
+                    "runner_id": id,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Rule 2: stopped-cache lookup. Clone the snapshot under the read lock
+    // and then drop the lock before doing async file I/O.
+    let snapshot_opt = {
+        let cache = state.stopped_runners.read().await;
+        cache.get(&id).cloned()
+    };
+
+    let snapshot = match snapshot_opt {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "runner_not_found",
+                    "runner_id": id,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Compose `last_phase_log`: the last N log lines as a single newline-joined string.
+    let last_phase_log: String = {
+        let total = snapshot.last_log_lines.len();
+        let start = total.saturating_sub(CRASH_SUMMARY_LAST_PHASE_LOG_LINES);
+        snapshot.last_log_lines[start..]
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} [{:?}] [{:?}] {}",
+                    entry.timestamp.to_rfc3339(),
+                    entry.source,
+                    entry.level,
+                    entry.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Compose `panic_excerpt`: read <panic_log_dir>/runner-last-panic.txt if present.
+    let panic_excerpt: Option<String> = match snapshot.panic_log_dir.as_ref() {
+        Some(dir) => {
+            let path = dir.join("runner-last-panic.txt");
+            match tokio::fs::read_to_string(&path).await {
+                Ok(s) => {
+                    if s.len() > CRASH_SUMMARY_PANIC_EXCERPT_CAP {
+                        // Take the last cap bytes, snapping forward to a UTF-8
+                        // boundary so JSON serialization can't fail mid-codepoint.
+                        let want_start = s.len() - CRASH_SUMMARY_PANIC_EXCERPT_CAP;
+                        let snap = s
+                            .char_indices()
+                            .find(|(i, _)| *i >= want_start)
+                            .map(|(i, _)| i)
+                            .unwrap_or(s.len());
+                        Some(s[snap..].to_string())
+                    } else {
+                        Some(s)
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+
+    // duration_alive_ms = stopped_at - started_at (when both available).
+    let duration_alive_ms: Option<i64> = snapshot.started_at.map(|started| {
+        let delta = snapshot.stopped_at.signed_duration_since(started);
+        delta.num_milliseconds()
+    });
+
+    let stop_reason = match snapshot.exit_reason {
+        crate::process::stopped_cache::StopReason::GracefulStop => "GracefulStop",
+        crate::process::stopped_cache::StopReason::Reaped => "Reaped",
+        crate::process::stopped_cache::StopReason::Crashed => "Crashed",
+        crate::process::stopped_cache::StopReason::Unknown => "Unknown",
+    };
+
+    Json(json!({
+        "runner_id": snapshot.id,
+        "name": snapshot.name,
+        "exit_code": snapshot.exit_code,
+        "duration_alive_ms": duration_alive_ms,
+        "stopped_at": snapshot.stopped_at.to_rfc3339(),
+        "stop_reason": stop_reason,
+        "last_phase_log": last_phase_log,
+        "panic_excerpt": panic_excerpt,
+        "early_log_path": snapshot.early_log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    }))
+    .into_response()
+}
+
 /// GET /runners/{id}/logs/stream — SSE stream of real-time log events for a specific runner.
 ///
 /// Terminates on `state.shutdown_signal()` so axum's graceful drain can
@@ -2227,12 +2531,21 @@ pub async fn runner_log_stream(
     let rx = managed.logs.subscribe();
     let stream = BroadcastStream::new(rx);
 
-    let event_stream = stream.filter_map(|result| match result {
-        Ok(entry) => {
-            let data = serde_json::to_string(&entry).unwrap_or_default();
-            Some(Ok(Event::default().event("log").data(data)))
+    // Track this connection in `state.active_sse_connections`. Captured
+    // by-move into the per-event closure below so it lives exactly as long
+    // as the stream — drop happens when axum tears down the response.
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
+    let event_stream = stream.filter_map(move |result| {
+        // Hold the guard for every yielded event so the stream owns it.
+        let _hold = &conn_guard;
+        match result {
+            Ok(entry) => {
+                let data = serde_json::to_string(&entry).unwrap_or_default();
+                Some(Ok(Event::default().event("log").data(data)))
+            }
+            Err(_) => None,
         }
-        Err(_) => None,
     });
 
     let shutdown_state = state.clone();

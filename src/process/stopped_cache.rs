@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::log_capture::LogEntry;
 use crate::process::panic_log::RecentPanic;
@@ -59,6 +60,29 @@ pub struct StoppedRunnerSnapshot {
     /// runner exited cleanly or the file was missing/stale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_panic: Option<RecentPanic>,
+    /// Path to the per-spawn early-death log file captured during this
+    /// runner's lifetime, when one was opened. Survives the runner being
+    /// removed from the active registry so post-mortem callers (e.g.
+    /// `GET /runners/{id}/early-log`) can still read the on-disk file.
+    /// `None` when the runner had no early-log capture (primary runners,
+    /// runners imported into the registry without a managed start, or
+    /// when the supervisor failed to open the file).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_log_path: Option<PathBuf>,
+    /// Time the runner was last observed to start, captured from
+    /// `managed.runner.started_at` at snapshot time. Combined with
+    /// `stopped_at` to compute `duration_alive_ms` in
+    /// `GET /runners/{id}/crash-summary`. `None` when the runner never
+    /// started (e.g. spawn failed before the process came up).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Filesystem directory where the runner was told to write its
+    /// `runner-last-panic.txt` (via `QONTINUI_RUNNER_LOG_DIR`). Surfaced via
+    /// `GET /runners/{id}/crash-summary` so the panic excerpt can be read
+    /// post-mortem. `None` when no panic dir was configured for this
+    /// runner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panic_log_dir: Option<PathBuf>,
 }
 
 /// Insert a snapshot, then evict expired entries and trim to the size cap.
@@ -101,6 +125,9 @@ pub async fn snapshot_from_managed(
     let last_log_lines = all[start..].to_vec();
     let panic_stack = managed.logs.panic_buffer().snapshot_joined();
     let recent_panic = managed.recent_panic.read().await.clone();
+    let early_log_path = managed.early_log_path.read().await.clone();
+    let panic_log_dir = managed.panic_log_dir.read().await.clone();
+    let started_at = managed.runner.read().await.started_at;
     StoppedRunnerSnapshot {
         id: managed.config.id.clone(),
         name: managed.config.name.clone(),
@@ -111,5 +138,8 @@ pub async fn snapshot_from_managed(
         last_log_lines,
         panic_stack,
         recent_panic,
+        early_log_path,
+        started_at,
+        panic_log_dir,
     }
 }

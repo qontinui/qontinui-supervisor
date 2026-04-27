@@ -1,7 +1,7 @@
 use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
-use crate::log_capture::LogState;
+use crate::log_capture::{LogLevel, LogSource, LogState};
 use crate::process::job::RunnerJob;
 use crate::process::panic_log::RecentPanic;
 use crate::process::stopped_cache::StoppedRunnerSnapshot;
@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
@@ -186,6 +186,51 @@ pub struct SupervisorState {
     /// `process::job`'s cross-platform shim). Spawning continues either
     /// way — without the safety net, but functional.
     pub runner_job: Option<Arc<RunnerJob>>,
+    /// Log messages captured during synchronous `SupervisorState::new`
+    /// construction that need to be routed through `state.logs.emit` once
+    /// async context is available. The `logs` field is initialized inside the
+    /// struct literal, so callers like the JobObject creation step (which
+    /// runs *before* the `Self { ... }` block completes) can't `.await` on
+    /// `state.logs.emit(...)`. They push to this buffer instead, and
+    /// [`SupervisorState::flush_pending_startup_logs`] drains it after the
+    /// state is constructed and the runtime is ready.
+    pub pending_startup_logs: std::sync::Mutex<Vec<(LogLevel, String)>>,
+    /// Live count of in-flight SSE connections across every long-lived
+    /// streaming endpoint (`/health/stream`, `/logs/stream`,
+    /// `/expo/logs/stream`, `/runners/{id}/logs/stream`,
+    /// `/supervisor-bridge/commands/stream`). Each handler acquires an
+    /// [`SseConnectionGuard`] on entry whose `Drop` decrements this counter
+    /// when the response future is torn down.
+    ///
+    /// Surfaced via `GET /health` as `sse_active_connections` so ops can
+    /// verify the graceful-shutdown drain is actually releasing connections
+    /// without having to open a stream + trigger shutdown by hand.
+    pub active_sse_connections: Arc<AtomicUsize>,
+}
+
+/// RAII guard that increments [`SupervisorState::active_sse_connections`]
+/// on construction and decrements it on drop.
+///
+/// The guard is owned by the SSE stream itself (typically captured into the
+/// stream's combinator state), so it lives exactly as long as the response
+/// future. When axum drops the response — whether the client disconnected,
+/// `take_until(shutdown_signal)` fired, or the server is being torn down —
+/// the stream is dropped, the guard is dropped, and the counter ticks down.
+pub struct SseConnectionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl SseConnectionGuard {
+    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct RunnerState {
@@ -617,11 +662,21 @@ impl SupervisorState {
         // (graceful, panic, force-kill). On non-Windows it's a no-op stub.
         // Failure to create is logged loudly but never aborts startup —
         // the supervisor still functions, just without the safety net.
+        //
+        // The `state.logs` collector isn't constructed yet at this point
+        // (it's initialized inside the `Self { ... }` block below), so we
+        // can't directly emit to the dashboard log stream. Instead, we
+        // capture the success/failure message into `pending_startup_logs`,
+        // which `flush_pending_startup_logs` drains right after the state
+        // is wrapped in an `Arc` (see `main.rs`).
+        let mut startup_logs: Vec<(LogLevel, String)> = Vec::new();
         let runner_job = match RunnerJob::create() {
             Ok(j) => {
-                tracing::info!(
-                    "Created kill-on-exit JobObject for spawned runners (KILL_ON_JOB_CLOSE)"
-                );
+                let msg = "Created kill-on-exit JobObject for spawned runners \
+                           (KILL_ON_JOB_CLOSE)"
+                    .to_string();
+                tracing::info!("{}", msg);
+                startup_logs.push((LogLevel::Info, msg));
                 Some(Arc::new(j))
             }
             Err(e) => {
@@ -630,6 +685,14 @@ impl SupervisorState {
                     "Failed to create runner JobObject — supervisor exit will NOT \
                      terminate spawned runners; orphans may linger and lock build slots"
                 );
+                startup_logs.push((
+                    LogLevel::Warn,
+                    format!(
+                        "Failed to create runner JobObject: {} — supervisor exit will NOT \
+                         terminate spawned runners",
+                        e
+                    ),
+                ));
                 None
             }
         };
@@ -661,6 +724,29 @@ impl SupervisorState {
             boot_id: load_or_create_boot_id(),
             build_id: compute_build_id(),
             runner_job,
+            pending_startup_logs: std::sync::Mutex::new(startup_logs),
+            active_sse_connections: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Drain `pending_startup_logs` into `state.logs`.
+    ///
+    /// Called once from `main.rs` right after `SupervisorState::new` wraps
+    /// the state in an `Arc`. Messages captured during synchronous
+    /// construction (currently just JobObject create success/failure) are
+    /// routed through the same `state.logs.emit` path that the rest of the
+    /// supervisor uses, so they appear in `/logs/history`, the SSE stream,
+    /// and any persistent log file.
+    pub async fn flush_pending_startup_logs(&self) {
+        let drained: Vec<(LogLevel, String)> = {
+            let mut guard = match self.pending_startup_logs.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for (level, msg) in drained {
+            self.logs.emit(LogSource::Supervisor, level, msg).await;
         }
     }
 
@@ -1188,6 +1274,35 @@ mod tests {
         h.record(1.0, true, None);
         h.record(9.0, true, None);
         assert_eq!(h.p50_duration_secs(), Some(5.0));
+    }
+
+    #[test]
+    fn test_sse_connection_guard_increments_and_decrements() {
+        // Construction must increment, drop must decrement back to zero.
+        // The /health endpoint reads this via Ordering::Relaxed.
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        {
+            let _g = SseConnectionGuard::new(counter.clone());
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let _g2 = SseConnectionGuard::new(counter.clone());
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+        // Both guards dropped — counter must be back at zero.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_state_active_sse_connections_starts_at_zero() {
+        let config = make_test_config();
+        let state = SupervisorState::new(config);
+        assert_eq!(
+            state
+                .active_sse_connections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fresh supervisor must report zero active SSE connections"
+        );
     }
 
     #[tokio::test]

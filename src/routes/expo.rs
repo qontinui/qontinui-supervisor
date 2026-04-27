@@ -7,7 +7,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::log_capture::LogSource;
-use crate::state::SharedState;
+use crate::state::{SharedState, SseConnectionGuard};
 
 #[derive(Serialize)]
 pub struct ExpoStatusResponse {
@@ -78,12 +78,21 @@ pub async fn logs_stream(
     let rx = state.logs.subscribe();
     let stream = BroadcastStream::new(rx);
 
-    let event_stream = stream.filter_map(|result| match result {
-        Ok(entry) if entry.source == LogSource::Expo => {
-            let data = serde_json::to_string(&entry).unwrap_or_default();
-            Some(Ok(Event::default().event("log").data(data)))
+    // Track this connection in `state.active_sse_connections`. Captured
+    // by-move into the per-event closure below so it lives exactly as long
+    // as the stream — drop happens when axum tears down the response.
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
+    let event_stream = stream.filter_map(move |result| {
+        // Hold the guard for every yielded event so the stream owns it.
+        let _hold = &conn_guard;
+        match result {
+            Ok(entry) if entry.source == LogSource::Expo => {
+                let data = serde_json::to_string(&entry).unwrap_or_default();
+                Some(Ok(Event::default().event("log").data(data)))
+            }
+            _ => None,
         }
-        _ => None,
     });
 
     let shutdown_state = state.clone();

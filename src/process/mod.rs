@@ -1,4 +1,5 @@
 pub mod early_log;
+pub mod health_probe;
 pub mod job;
 pub mod manager;
 pub mod orphan_scan;

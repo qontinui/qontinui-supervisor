@@ -234,6 +234,14 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::runners::runner_crash_dump),
         )
         .route(
+            "/runners/{id}/early-log",
+            get(crate::routes::runners::runner_early_log),
+        )
+        .route(
+            "/runners/{id}/crash-summary",
+            get(crate::routes::runners::runner_crash_summary),
+        )
+        .route(
             "/runners/{id}/logs",
             get(crate::routes::runners::runner_log_history),
         )
