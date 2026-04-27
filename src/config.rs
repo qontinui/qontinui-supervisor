@@ -205,11 +205,22 @@ pub fn build_timeout_secs() -> u64 {
     use std::sync::OnceLock;
     static SECS: OnceLock<u64> = OnceLock::new();
     *SECS.get_or_init(|| {
-        std::env::var("QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(60, 7200))
-            .unwrap_or(DEFAULT_BUILD_TIMEOUT_SECS)
+        let raw = std::env::var("QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS").ok();
+        match raw {
+            None => DEFAULT_BUILD_TIMEOUT_SECS,
+            Some(ref s) => match s.parse::<u64>() {
+                Ok(n) => n.clamp(60, 7200),
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = "QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS",
+                        value = s.as_str(),
+                        default = DEFAULT_BUILD_TIMEOUT_SECS,
+                        "invalid value for env var, using default"
+                    );
+                    DEFAULT_BUILD_TIMEOUT_SECS
+                }
+            },
+        }
     })
 }
 #[allow(dead_code)]
