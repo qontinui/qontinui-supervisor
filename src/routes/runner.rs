@@ -260,10 +260,10 @@ pub async fn supervisor_shutdown(State(state): State<SharedState>) -> Json<serde
         .await;
 
     // The shutdown_signal task in main.rs races ctrl_c against shutdown_tx;
-    // a single broadcast here unblocks the drain. Drop the result (no
-    // subscribers is not an error — means the shutdown_signal future already
-    // fired, e.g. concurrent ctrl_c).
-    let _ = state.shutdown_tx.send(());
+    // `signal_shutdown` flips the latched flag *and* broadcasts so any
+    // handler that subscribes after this point still observes shutdown
+    // (broadcast channels don't replay missed messages).
+    state.signal_shutdown();
 
     Json(serde_json::json!({
         "status": "shutting_down",

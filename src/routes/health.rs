@@ -336,11 +336,23 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
 
 /// GET /health/stream — SSE stream that pushes health updates every 3s.
 /// Only emits an event when the serialized health JSON changes from the previous tick.
+///
+/// The stream terminates as soon as `state.shutdown_signal()` fires so that
+/// `axum::serve(..).with_graceful_shutdown(..)` can complete its drain phase
+/// promptly. Without this, the supervisor's own dashboard webview keeps a
+/// `/health/stream` connection open indefinitely, the drain never completes,
+/// and `POST /supervisor/shutdown` results in a 30+ second hang before the
+/// process exits.
 pub async fn health_stream(
     State(state): State<SharedState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let interval = IntervalStream::new(tokio::time::interval(Duration::from_secs(3)));
     let mut last_json = String::new();
+
+    // Cap the stream's lifetime at the shutdown signal so axum's graceful
+    // drain can release this connection.
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
 
     let stream = interval.map(move |_| {
         let state = state.clone();
@@ -458,6 +470,8 @@ pub async fn health_stream(
             Ok(Event::default().event("health").data(json))
         }
     });
+
+    let stream = futures::StreamExt::take_until(stream, shutdown);
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }

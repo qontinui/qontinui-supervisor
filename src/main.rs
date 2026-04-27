@@ -280,16 +280,51 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Supervisor shutting down");
 
-    // Stop Expo on shutdown
+    // Hard-exit safety net: arm a watchdog that force-exits the process if
+    // post-shutdown cleanup hangs for more than `HARD_EXIT_DEADLINE_SECS`
+    // seconds. We *should* exit cleanly via the natural return from `main`,
+    // but if some background task (a stuck `child.wait()`, an OS-level
+    // blocking IO inside spawn_blocking, etc.) keeps the runtime alive past
+    // its useful lifetime, this guarantees the process actually goes away.
+    //
+    // The supervisor's children are protected by the kill-on-job-close
+    // JobObject (`state.runner_job`); they die when *this* process dies,
+    // regardless of whether we stopped them gracefully first. So a hard
+    // exit here cannot leak orphan runners — it just skips the polite
+    // "ask everything to stop" step that's already redundant under the
+    // JobObject contract.
+    const HARD_EXIT_DEADLINE_SECS: u64 = 3;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(HARD_EXIT_DEADLINE_SECS)).await;
+        eprintln!(
+            "qontinui-supervisor: post-shutdown cleanup exceeded {HARD_EXIT_DEADLINE_SECS}s, \
+             forcing exit"
+        );
+        std::process::exit(0);
+    });
+
+    // Stop Expo on shutdown. Bounded internally to a 5s timeout, but we
+    // also wrap it in our own 2s ceiling to keep the total post-shutdown
+    // window inside the hard-exit deadline above. Expo is *not* covered by
+    // the runner JobObject (it's a Node process spawned outside the job),
+    // so we still try to stop it politely — but if it doesn't react in
+    // time, the hard-exit watchdog will reap it via process death.
     let expo_running = state.expo.read().await.running;
     if expo_running {
         info!("Stopping Expo before exit...");
-        let _ = expo::stop_expo(&state).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), expo::stop_expo(&state)).await;
     }
 
-    // Only stop temp runners on shutdown — user runners are left running
-    info!("Stopping temp runners before exit...");
-    let _ = process::manager::stop_all_temp_runners(&state).await;
+    // NOTE: We deliberately do NOT call `stop_all_temp_runners` here. The
+    // Win32 `RunnerJob` (held in `state.runner_job`) has `KILL_ON_JOB_CLOSE`
+    // set, so every supervisor-spawned runner is terminated by the kernel
+    // the instant the last handle to the Job closes — which happens when
+    // `state` drops at the end of `main`. The previous `stop_all_temp_runners`
+    // call here was the dominant source of `POST /supervisor/shutdown`
+    // latency: it iterated every temp runner with a 5s graceful-stop poll
+    // plus a 5s port-free wait, easily 30+ seconds wall-clock with several
+    // runners attached. The JobObject makes it redundant.
 
     Ok(())
 }
@@ -414,9 +449,12 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
         .await;
 
     // Notify all WS/SSE clients to close cleanly (prevents zombie sockets).
-    // Safe to re-send even when the HTTP endpoint already did: broadcast::send
-    // is idempotent for subscribers that already drained the prior message.
-    let _ = state.shutdown_tx.send(());
+    // `signal_shutdown` flips the latched bool *and* broadcasts: handlers
+    // that subscribe after this point still observe shutdown (broadcast
+    // does not replay), and existing subscribers get the wake-up event.
+    // Idempotent — safe even when the HTTP endpoint already called this
+    // (the latched bool is monotonic and the broadcast is best-effort).
+    state.signal_shutdown();
 
     // Give clients a moment to receive the shutdown message and close
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

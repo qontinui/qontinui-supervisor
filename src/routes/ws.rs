@@ -23,12 +23,20 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     }
 
     let mut rx = state.health_tx.subscribe();
-    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    // Use the latched shutdown helper instead of a raw broadcast subscribe:
+    // the helper resolves immediately if the WS connects *after* shutdown
+    // already fired, which protects axum's graceful drain from being held
+    // open by a freshly-arrived WebSocket. Without the latch, a late-
+    // connecting WS would race into `shutdown_rx.recv().await` and miss the
+    // already-broadcast shutdown event, holding the listener alive.
+    let shutdown_state = state.clone();
+    let shutdown_fut = async move { shutdown_state.shutdown_signal().await };
+    tokio::pin!(shutdown_fut);
 
     loop {
         tokio::select! {
             // Shutdown notification — tell client and close
-            _ = shutdown_rx.recv() => {
+            _ = &mut shutdown_fut => {
                 let _ = socket.send(Message::Text(r#"{"type":"shutdown"}"#.into())).await;
                 let _ = socket.send(Message::Close(None)).await;
                 break;

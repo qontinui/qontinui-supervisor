@@ -35,6 +35,11 @@ pub async fn log_history(
 }
 
 /// GET /logs/stream — SSE stream of real-time log events.
+///
+/// Terminates on `state.shutdown_signal()` so axum's graceful drain can
+/// complete promptly when the supervisor is asked to exit. See the
+/// matching note on [`crate::routes::health::health_stream`] for why
+/// every long-lived SSE handler has to do this.
 pub async fn log_stream(
     State(state): State<SharedState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -50,6 +55,10 @@ pub async fn log_stream(
             Err(_) => None, // Skip lagged messages
         }
     });
+
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
+    let event_stream = futures::StreamExt::take_until(event_stream, shutdown);
 
     Sse::new(event_stream).keep_alive(KeepAlive::default())
 }

@@ -69,6 +69,9 @@ pub async fn status(State(state): State<SharedState>) -> Json<ExpoStatusResponse
 }
 
 /// GET /expo/logs/stream — SSE stream filtered to LogSource::Expo.
+///
+/// Terminates on `state.shutdown_signal()` so axum's graceful drain can
+/// complete promptly when the supervisor is asked to exit.
 pub async fn logs_stream(
     State(state): State<SharedState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -82,6 +85,10 @@ pub async fn logs_stream(
         }
         _ => None,
     });
+
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
+    let event_stream = futures::StreamExt::take_until(event_stream, shutdown);
 
     Sse::new(event_stream).keep_alive(KeepAlive::default())
 }

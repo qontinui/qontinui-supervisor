@@ -29,13 +29,101 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use tracing::{info, warn};
 
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::is_temp_runner;
 use crate::process::windows::{find_pid_on_port, find_runner_processes, kill_by_pid};
 use crate::state::{ManagedRunner, SharedState};
+
+/// Tolerance window absorbing filesystem mtime resolution jitter and the
+/// multi-second gap between "build completes" and "supervisor records the
+/// timestamps." If an orphan binary is older than the freshest available
+/// source by **more than** this gap, the orphan is considered stale and
+/// killed instead of adopted. Matches the existing
+/// `STALE_BINARY_THRESHOLD_SECS` policy in `process::manager` so the
+/// "newer build available" badge and the orphan-staleness decision use
+/// the same threshold.
+const STALENESS_GAP_SECS: i64 = 30;
+
+/// Decision returned by `should_adopt_or_kill`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptDecision {
+    Adopt,
+    KillStale,
+}
+
+/// Pure comparison: should the orphan be adopted, or killed because it's
+/// running a stale binary that a fresh spawn would replace?
+///
+/// Rules (mirrors the algorithm documented in `scan_orphans_at_startup`):
+/// - `orphan_mtime is None` → adopt (can't tell, conservative).
+/// - `freshest_source_mtime is None` → adopt (orphan is the only thing on
+///   disk anyway; killing it would just leave the user with nothing).
+/// - `orphan_mtime + STALENESS_GAP < freshest_source_mtime` → kill.
+///   The freshest binary is meaningfully newer than what the orphan is
+///   running, so the user's `/runner/restart` flow would launch a newer
+///   exe than what's running today.
+/// - Otherwise → adopt (orphan is current enough; preserve the session).
+fn should_adopt_or_kill(
+    orphan_mtime: Option<DateTime<Utc>>,
+    freshest_source_mtime: Option<DateTime<Utc>>,
+    gap_secs: i64,
+) -> AdoptDecision {
+    let Some(orphan) = orphan_mtime else {
+        return AdoptDecision::Adopt;
+    };
+    let Some(fresh) = freshest_source_mtime else {
+        return AdoptDecision::Adopt;
+    };
+    let gap = chrono::Duration::seconds(gap_secs);
+    if orphan + gap < fresh {
+        AdoptDecision::KillStale
+    } else {
+        AdoptDecision::Adopt
+    }
+}
+
+/// Read mtime of a path as `DateTime<Utc>`. Returns `None` when the file
+/// is missing or its metadata is unreadable — caller treats `None` as
+/// "couldn't tell, fall back to safe behavior."
+fn path_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some(mtime.into())
+}
+
+/// Freshest mtime across every existing
+/// `target-pool/slot-*/debug/qontinui-runner.exe` plus
+/// `target-pool/lkg/qontinui-runner.exe`. This is the upper bound on what
+/// `start_managed_runner` would launch on the user's next `/runner/restart`.
+///
+/// Returns `None` only when no source binary exists anywhere — at that
+/// point the orphan is the only artifact on disk and adoption is the
+/// safe choice. Slot scans use the same `state.build_pool.slots` list
+/// that the build pool itself walks, so we never go out of sync with
+/// supervisor config.
+async fn freshest_source_mtime(state: &SharedState) -> Option<DateTime<Utc>> {
+    let mut best: Option<DateTime<Utc>> = None;
+    for slot in &state.build_pool.slots {
+        let p = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        if let Some(mt) = path_mtime_utc(&p) {
+            best = Some(match best {
+                Some(b) if b >= mt => b,
+                _ => mt,
+            });
+        }
+    }
+    let lkg = state.config.lkg_exe_path();
+    if let Some(mt) = path_mtime_utc(&lkg) {
+        best = Some(match best {
+            Some(b) if b >= mt => b,
+            _ => mt,
+        });
+    }
+    best
+}
 
 /// Result of resolving a single orphan PID — used to log the summary.
 #[derive(Debug, Default)]
@@ -145,6 +233,54 @@ pub async fn scan_orphans_at_startup(state: &SharedState) {
                             format!(
                                 "Killing orphan qontinui-runner.exe PID {} (temp runner '{}', port {})",
                                 pid, managed.config.id, port
+                            ),
+                        )
+                        .await;
+                    if kill_by_pid(pid).await.unwrap_or(false) {
+                        summary.killed += 1;
+                    }
+                    continue;
+                }
+
+                // Stale-binary check: refuse to adopt orphans whose exe
+                // is meaningfully older than the freshest available
+                // source binary. After a `/runner/restart {rebuild: true}`
+                // the user expects the runner to be running the freshly
+                // built code; adopting an old orphan would silently
+                // produce a stale runner. The check trades the user's
+                // session continuity for build-correctness — but only
+                // when there's actually a newer binary on disk waiting
+                // to be launched.
+                let orphan_mtime = path_mtime_utc(&exe_path);
+                let fresh_mtime = freshest_source_mtime(state).await;
+                if should_adopt_or_kill(orphan_mtime, fresh_mtime, STALENESS_GAP_SECS)
+                    == AdoptDecision::KillStale
+                {
+                    let orphan_iso = orphan_mtime
+                        .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let fresh_iso = fresh_mtime
+                        .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let gap_secs = match (orphan_mtime, fresh_mtime) {
+                        (Some(o), Some(f)) => (f - o).num_seconds(),
+                        _ => 0,
+                    };
+                    warn!(
+                        "Killing stale-adopted-orphan runner '{}' PID {} — \
+                         orphan binary mtime {} is {}s older than freshest source mtime {}; \
+                         user's session will be lost but adoption would have produced a stale runner",
+                        managed.config.id, pid, orphan_iso, gap_secs, fresh_iso
+                    );
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!(
+                                "Killing stale-adopted-orphan runner '{}' PID {} — \
+                                 orphan binary mtime {} is {}s older than freshest source mtime {}",
+                                managed.config.id, pid, orphan_iso, gap_secs, fresh_iso
                             ),
                         )
                         .await;
@@ -317,6 +453,7 @@ fn canonicalize_or_keep(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::path::Path;
 
     #[test]
@@ -339,5 +476,123 @@ mod tests {
         let parent = Path::new(r"C:\Qontinui\Target-Pool");
         let child = Path::new(r"c:\qontinui\target-pool\slot-0\debug\qontinui-runner.exe");
         assert!(path_is_under(child, parent));
+    }
+
+    /// Helper for constructing UTC timestamps in tests.
+    fn ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, sec)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    #[test]
+    fn should_adopt_or_kill_unknown_orphan_mtime_adopts() {
+        // Conservative: missing orphan mtime → adopt (don't kill what we
+        // can't classify).
+        let fresh = Some(ts(2026, 4, 27, 12, 0, 0));
+        assert_eq!(
+            should_adopt_or_kill(None, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_no_source_on_disk_adopts() {
+        // No source binary anywhere → orphan is the only artifact, killing
+        // it would leave the user with nothing.
+        let orphan = Some(ts(2026, 4, 27, 12, 0, 0));
+        assert_eq!(
+            should_adopt_or_kill(orphan, None, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_newer_than_source_adopts() {
+        // Orphan was built after the freshest source on disk (e.g. cleared
+        // slot dirs since spawn). Definitely adopt.
+        let orphan = Some(ts(2026, 4, 27, 12, 5, 0));
+        let fresh = Some(ts(2026, 4, 27, 12, 0, 0));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_equal_to_source_adopts() {
+        // Same mtime — orphan is the freshest binary. Adopt.
+        let t = Some(ts(2026, 4, 27, 12, 0, 0));
+        assert_eq!(
+            should_adopt_or_kill(t, t, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_within_tolerance_adopts() {
+        // Orphan is 30s older than source — exactly at the tolerance
+        // boundary. The check is `orphan + GAP < fresh`, so 30s gap is
+        // NOT strictly less than (orphan + 30s) and we adopt.
+        let orphan = Some(ts(2026, 4, 27, 12, 0, 0));
+        let fresh = Some(ts(2026, 4, 27, 12, 0, 30));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_just_inside_tolerance_adopts() {
+        // 29s older — well within the 30s jitter window. Adopt.
+        let orphan = Some(ts(2026, 4, 27, 12, 0, 0));
+        let fresh = Some(ts(2026, 4, 27, 12, 0, 29));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_60s_older_kills() {
+        // Orphan is 60s older than freshest source — well past the 30s
+        // tolerance. The user just rebuilt; adopting would silently run
+        // the stale binary. Kill.
+        let orphan = Some(ts(2026, 4, 27, 12, 0, 0));
+        let fresh = Some(ts(2026, 4, 27, 12, 1, 0));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::KillStale
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_orphan_one_hour_older_kills() {
+        // Pathological "user restarted supervisor an hour after rebuild"
+        // case — definitely kill.
+        let orphan = Some(ts(2026, 4, 27, 11, 0, 0));
+        let fresh = Some(ts(2026, 4, 27, 12, 0, 0));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh, STALENESS_GAP_SECS),
+            AdoptDecision::KillStale
+        );
+    }
+
+    #[test]
+    fn should_adopt_or_kill_zero_gap_strict_compare() {
+        // gap=0 reduces to strict-less-than — equal mtimes adopt, any
+        // older orphan kills. Sanity check that the comparison is
+        // strict and the gap_secs parameter actually plumbs through.
+        let orphan = Some(ts(2026, 4, 27, 12, 0, 0));
+        let fresh_same = Some(ts(2026, 4, 27, 12, 0, 0));
+        let fresh_1s = Some(ts(2026, 4, 27, 12, 0, 1));
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh_same, 0),
+            AdoptDecision::Adopt
+        );
+        assert_eq!(
+            should_adopt_or_kill(orphan, fresh_1s, 0),
+            AdoptDecision::KillStale
+        );
     }
 }

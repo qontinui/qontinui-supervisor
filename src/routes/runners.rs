@@ -2212,6 +2212,9 @@ pub async fn runner_crash_dump(
 }
 
 /// GET /runners/{id}/logs/stream — SSE stream of real-time log events for a specific runner.
+///
+/// Terminates on `state.shutdown_signal()` so axum's graceful drain can
+/// complete promptly when the supervisor is asked to exit.
 pub async fn runner_log_stream(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -2231,6 +2234,10 @@ pub async fn runner_log_stream(
         }
         Err(_) => None,
     });
+
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
+    let event_stream = futures::StreamExt::take_until(event_stream, shutdown);
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }

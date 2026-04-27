@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
@@ -127,6 +127,12 @@ pub struct SupervisorState {
     pub logs: LogState,
     pub health_tx: broadcast::Sender<()>,
     pub shutdown_tx: broadcast::Sender<()>,
+    /// Latched shutdown flag. Flips to `true` the first time a shutdown is
+    /// signaled (HTTP endpoint or Ctrl+C). Used by [`SupervisorState::shutdown_signal`]
+    /// so handlers that subscribe to `shutdown_tx` *after* the broadcast
+    /// already fired still observe the shutdown — broadcast channels do
+    /// not replay missed messages, but this latched bool does.
+    pub shutdown_latched: AtomicBool,
     pub cached_health: RwLock<CachedPortHealth>,
     /// Cached per-runner health snapshots, updated by the background health refresher.
     /// Readable via `try_read()` in sync contexts (SSE streams).
@@ -645,6 +651,7 @@ impl SupervisorState {
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
+            shutdown_latched: AtomicBool::new(false),
             cached_health: RwLock::new(CachedPortHealth::default()),
             cached_runner_health: RwLock::new(Vec::new()),
             health_cache_notify: Notify::new(),
@@ -659,6 +666,51 @@ impl SupervisorState {
 
     pub fn notify_health_change(&self) {
         let _ = self.health_tx.send(());
+    }
+
+    /// Future that completes when a shutdown is signaled on `shutdown_tx`.
+    ///
+    /// Long-lived streams (SSE handlers, polling loops) call this to learn
+    /// that the supervisor is exiting so they can terminate promptly. This
+    /// is what unblocks `axum::serve(..).with_graceful_shutdown(..)`'s
+    /// drain phase: until every in-flight response future resolves, axum
+    /// keeps the listener alive and `serve_future.await` does not return.
+    /// Without this hook, SSE handlers (`/health/stream`, `/logs/stream`,
+    /// `/supervisor-bridge/commands/stream`, etc.) hold their connections
+    /// open forever and the supervisor process lingers for 30+ seconds
+    /// after `POST /supervisor/shutdown` fires.
+    ///
+    /// Resolution order:
+    /// 1. **Latched check** — if `shutdown_latched` is already `true`,
+    ///    return immediately. This handles handlers that subscribed AFTER
+    ///    the broadcast already fired (broadcast channels don't replay).
+    /// 2. **Subscribe + recv** — otherwise, subscribe a fresh receiver and
+    ///    await. `recv()` returning either `Ok(())` (broadcast) or
+    ///    `Err(_)` (sender dropped) both indicate "shut down now"; we
+    ///    treat them identically.
+    pub async fn shutdown_signal(&self) {
+        // Subscribe BEFORE the latch check so we don't lose a broadcast
+        // that fires between the check and the recv.
+        let mut rx = self.shutdown_tx.subscribe();
+        if self
+            .shutdown_latched
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let _ = rx.recv().await;
+    }
+
+    /// Mark the supervisor as shutting down and broadcast to all subscribers.
+    ///
+    /// Sets the latched flag *before* the broadcast so handlers that race in
+    /// (subscribing between the broadcast and observing it) still see the
+    /// latch on their next poll. Idempotent — repeated calls are cheap and
+    /// safe; the broadcast just goes to whoever subscribed since last time.
+    pub fn signal_shutdown(&self) {
+        self.shutdown_latched
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.shutdown_tx.send(());
     }
 
     /// Get a managed runner by ID.
@@ -1043,6 +1095,58 @@ mod tests {
         let state = SupervisorState::new(config);
         // Should not panic even with no subscribers
         state.notify_health_change();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_unblocks_live_subscriber() {
+        // Regression test for the /supervisor/shutdown hang fix — live path.
+        //
+        // Long-lived SSE handlers race their work against
+        // `state.shutdown_signal()`; if this future doesn't resolve when
+        // shutdown is signaled, axum's graceful drain never completes and
+        // the supervisor process lingers.
+        let config = make_test_config();
+        let state = Arc::new(SupervisorState::new(config));
+
+        // Subscribe BEFORE the signal so the broadcast catches the
+        // pre-existing receiver — this is the steady-state production path
+        // (handlers connect, then shutdown fires later).
+        let signal_state = state.clone();
+        let signal = tokio::spawn(async move { signal_state.shutdown_signal().await });
+        // Yield briefly so the spawned task reaches `rx.recv().await`
+        // before we send. Without this, the test passes for the wrong
+        // reason (it would hit the latched-fast-path instead).
+        tokio::task::yield_now().await;
+
+        // Fires the same path that `routes/runner.rs::supervisor_shutdown` uses.
+        state.signal_shutdown();
+
+        // Generous timeout: anything more than a few millis is a regression.
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal)
+            .await
+            .expect("shutdown_signal must resolve once signal_shutdown fires")
+            .expect("signal task must not panic");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_late_subscriber_sees_latch() {
+        // The other half of the regression: handlers that race in *after*
+        // shutdown was already signaled. Broadcast channels do not replay
+        // missed messages, so without the latched bool, a late subscriber
+        // would block forever — wedging axum's graceful drain just as
+        // surely as a never-terminating SSE stream.
+        let config = make_test_config();
+        let state = Arc::new(SupervisorState::new(config));
+
+        // Signal first, subscribe second.
+        state.signal_shutdown();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown_signal()).await;
+        assert!(
+            result.is_ok(),
+            "late shutdown_signal subscriber must see the latched flag"
+        );
     }
 
     // --- SlotHistory tests ---

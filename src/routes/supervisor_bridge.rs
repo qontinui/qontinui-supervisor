@@ -321,6 +321,12 @@ fn success_response(data: serde_json::Value) -> Json<ApiResponse> {
 /// GET /supervisor-bridge/commands/stream?tabId=xxx
 ///
 /// SSE endpoint. The browser's CommandRelayListener connects here to receive commands.
+///
+/// Terminates on `state.shutdown_signal()` so axum's graceful drain can
+/// complete promptly when the supervisor is asked to exit. The supervisor's
+/// own ambient WebView2 dashboard subscribes to this stream as soon as it
+/// loads, so without shutdown wiring this single connection alone is enough
+/// to wedge `POST /supervisor/shutdown` for 30+ seconds.
 pub async fn commands_stream(
     State(state): State<SharedState>,
     Query(query): Query<StreamQuery>,
@@ -375,6 +381,10 @@ pub async fn commands_stream(
     });
 
     let stream = initial.chain(command_stream).chain(cleanup_stream);
+
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
+    let stream = futures::StreamExt::take_until(stream, shutdown);
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
