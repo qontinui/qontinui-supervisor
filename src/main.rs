@@ -11,6 +11,7 @@ mod routes;
 mod sdk_features;
 mod server;
 mod settings;
+mod spec_api;
 mod state;
 mod velocity;
 mod velocity_improvement;

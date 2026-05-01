@@ -40,8 +40,12 @@ tempfile = "3"
 # `oneshot` extension trait for driving an axum::Router in unit tests
 # without binding a real socket. tower 0.5 is already pulled in
 # transitively by axum 0.8 / tower-http; declaring it explicitly here just
-# unlocks the dev-only `util::ServiceExt` import.
+# unlocks the dev-only `util::ServiceExt` import. Used by the synthetic
+# build-id injection endpoint tests and by the spec_api tests.
 tower = { version = "0.5", features = ["util"] }
+# Used by spec_api tests for env-override scoping (matches runner's spec_api
+# test dependencies).
+scopeguard = "1.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
