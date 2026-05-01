@@ -297,6 +297,12 @@ async fn run_build_inner(
             Command::new("cmd")
                 .args(["/C", "npm.cmd run build"])
                 .current_dir(&npm_dir)
+                // Tauri's CLI sets this when it drives the frontend build itself,
+                // but we invoke `npm run build` directly — so vite.config.ts's
+                // `target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari13"`
+                // would otherwise fall back to safari13 and esbuild fails on
+                // destructuring transpilation, leaving dist/ stale.
+                .env("TAURI_PLATFORM", "windows")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW_)
