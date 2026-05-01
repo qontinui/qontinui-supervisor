@@ -16,28 +16,50 @@ use crate::process::windows::{
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
 
-/// RAII guard that clears a `BuildSlot::busy` field on drop.
+/// RAII guard that clears a `BuildSlot::busy` field on drop AND reconciles
+/// the global `state.build.build_in_progress` legacy flag.
 ///
-/// Ensures the slot is released on every exit path — happy path, `?`
-/// early-return, panic, and task cancellation. Without this, an aborted
-/// build task would leave `slot.busy = Some(..)` forever even though its
-/// permit gets dropped correctly, preventing `claim_idle_slot` from ever
-/// picking that slot again.
+/// Ensures both pieces of state are released on every exit path — happy
+/// path, `?` early-return, panic, and task cancellation. Without this, an
+/// aborted build task would leave `slot.busy = Some(..)` forever and/or
+/// the legacy `build_in_progress` flag stuck at `true`. The pre-2026-05-01
+/// version only handled `slot.busy`; the global flag was reconciled by an
+/// explicit recompute after the build finished, which was skipped on
+/// cancellation, leaving `health.build.in_progress: true` while every slot
+/// reported `idle`.
 struct SlotGuard {
     slot: Arc<BuildSlot>,
+    state: SharedState,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        if let Ok(mut busy) = self.slot.busy.try_write() {
+        // Path 1 (sync, fast): try to clear the slot in-place.
+        let cleared_inline = if let Ok(mut busy) = self.slot.busy.try_write() {
             *busy = None;
+            true
         } else {
-            let slot = self.slot.clone();
-            tokio::spawn(async move {
+            false
+        };
+
+        // Path 2 (async fallback): if we couldn't take the slot lock here,
+        // OR after we've cleared it, schedule a task that recomputes the
+        // global flag from authoritative slot state. Spawn unconditionally
+        // so the recompute always runs — `any_slot_busy(state)` requires
+        // async access to every slot's RwLock, which we can't do from Drop.
+        let slot = self.slot.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            if !cleared_inline {
                 let mut busy = slot.busy.write().await;
                 *busy = None;
-            });
-        }
+            }
+            // Reconcile the global legacy flag. Authoritative source is
+            // `any_slot_busy` — never trust the cached flag during recovery.
+            let any_busy = any_slot_busy(&state).await;
+            let mut build = state.build.write().await;
+            build.build_in_progress = any_busy;
+        });
     }
 }
 
@@ -91,9 +113,13 @@ pub async fn run_cargo_build_with_requester(
         rebuild_kind: "exe".to_string(),
     };
     let slot = state.build_pool.claim_idle_slot(info).await;
-    // RAII guard: clears `slot.busy = None` on every exit path (happy path,
-    // `?`, panic, task cancellation). Prevents permanently-stuck slots.
-    let _slot_guard = SlotGuard { slot: slot.clone() };
+    // RAII guard: clears `slot.busy = None` AND reconciles the global
+    // `build_in_progress` flag on every exit path (happy path, `?`, panic,
+    // task cancellation). Prevents permanently-stuck slots and stale flags.
+    let _slot_guard = SlotGuard {
+        slot: slot.clone(),
+        state: state.clone(),
+    };
 
     // Update legacy build flag for external consumers (health API, smart rebuild,
     // overnight watchdog). Flag is true whenever any slot is busy.
@@ -836,7 +862,10 @@ async fn prewarm_single_slot(
             rebuild_kind: "prewarm".to_string(),
         });
     }
-    let _slot_guard = SlotGuard { slot: slot.clone() };
+    let _slot_guard = SlotGuard {
+        slot: slot.clone(),
+        state: state.clone(),
+    };
 
     info!(
         "Prewarming build slot {} (target: {:?})...",
