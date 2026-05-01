@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod dashboard;
+pub mod dev_endpoints;
 pub mod diagnostics;
 pub mod evaluation;
 pub mod expo;

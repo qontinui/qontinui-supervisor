@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio_stream::wrappers::IntervalStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tokio_stream::StreamExt;
 
 use crate::config::RUNNER_API_PORT;
@@ -355,10 +355,151 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
 /// `/health/stream` connection open indefinitely, the drain never completes,
 /// and `POST /supervisor/shutdown` results in a 30+ second hang before the
 /// process exits.
+/// Build a `HealthResponse` snapshot using sync-safe `try_read` calls so it
+/// can run inside the SSE stream's `map` closure without blocking the tick
+/// loop. When `build_id_override` is `Some(id)`, the returned response's
+/// `build_id` field is set to that value verbatim — used by the synthetic
+/// build-id injection path
+/// (see [`crate::routes::dev_endpoints::emit_build_id`]). When `None`, the
+/// supervisor's real `state.build_id` is used.
+///
+/// Returns `Err(())` when any lock is contended; the SSE caller should emit
+/// a keepalive comment instead of a stale event in that case. The error is
+/// `()` because every lock failure mode is identical from the stream's
+/// perspective: skip this tick, try again at the next interval.
+fn try_build_sse_health(
+    state: &SharedState,
+    build_id_override: Option<&str>,
+) -> Result<HealthResponse, ()> {
+    // Sync-safe: try_read on every lock to avoid blocking the stream.
+    let build = state.build.try_read().map_err(|_| ())?;
+    let expo = state.expo.try_read().map_err(|_| ())?;
+    let cached = state.cached_health.try_read().map_err(|_| ())?;
+    let runner_snapshots = state.cached_runner_health.try_read();
+
+    let api_responding = cached.runner_responding;
+    let api_in_use = cached.runner_port_open;
+
+    // Use the primary runner from cached snapshots (not the legacy
+    // state.runner which is never updated for user-managed runners).
+    let primary_snapshot = runner_snapshots
+        .as_ref()
+        .ok()
+        .and_then(|snaps| snaps.iter().find(|r| r.is_primary));
+    let (primary_running, primary_pid) = match primary_snapshot {
+        Some(p) => (p.running, p.pid),
+        None => {
+            // Fallback to legacy state.runner
+            match state.runner.try_read() {
+                Ok(r) => (r.running, r.pid),
+                Err(_) => (false, None),
+            }
+        }
+    };
+
+    let overall_status =
+        determine_overall_status(primary_running, api_responding, build.build_in_progress);
+
+    // Sync-safe scan: use try_read on each slot's frontend_stale flag.
+    // If any slot's lock is contended, skip reporting staleness for that
+    // slot on this tick — the flag is a UX nudge, not a hard invariant, and
+    // it's fine to miss one tick.
+    let frontend_stale_any = state
+        .build_pool
+        .slots
+        .iter()
+        .any(|s| s.frontend_stale.try_read().map(|g| *g).unwrap_or(false));
+
+    let build_id = match build_id_override {
+        Some(s) => s.to_string(),
+        None => state.build_id.clone(),
+    };
+
+    Ok(HealthResponse {
+        status: overall_status.to_string(),
+        runner: RunnerHealth {
+            running: primary_running,
+            pid: primary_pid,
+            started_at: None, // Not available from cached snapshot
+            api_responding,
+        },
+        ports: PortsHealth {
+            api_port: PortStatus {
+                port: RUNNER_API_PORT,
+                in_use: api_in_use,
+            },
+        },
+        watchdog: WatchdogHealth::disabled(),
+        build: BuildHealth {
+            in_progress: build.build_in_progress,
+            available_slots: state.build_pool.permits.available_permits(),
+            error_detected: build.build_error_detected,
+            last_error: build.last_build_error.clone(),
+            last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            frontend_stale_any,
+            // SSE path: try_read on the LKG lock — if contended, skip the
+            // field this tick (the next tick will catch up).
+            lkg: state
+                .build_pool
+                .last_known_good
+                .try_read()
+                .ok()
+                .and_then(|g| {
+                    g.as_ref().map(|info| LkgHealth {
+                        built_at: info.built_at.to_rfc3339(),
+                        source_slot: info.source_slot,
+                        exe_size: info.exe_size,
+                    })
+                }),
+        },
+        expo: ExpoHealth {
+            running: expo.running,
+            pid: expo.pid,
+            port: expo.port,
+            configured: state.config.expo_dir.is_some(),
+        },
+        supervisor: SupervisorInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            project_dir: state.config.project_dir.display().to_string(),
+        },
+        // Read cached runner snapshots (built by background health refresher)
+        runners: build_sse_runners(state),
+        sdk_features: SDK_FEATURES.to_vec(),
+        sdk_features_doc_url: SDK_FEATURE_DOC_URL,
+        build_id,
+        sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
+    })
+}
+
+/// Internal stream item carrying either a regular tick (no override) or a
+/// synthetic build-id event (override = Some).
+enum HealthTick {
+    Regular,
+    SyntheticBuildId(String),
+}
+
 pub async fn health_stream(
     State(state): State<SharedState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let interval = IntervalStream::new(tokio::time::interval(Duration::from_secs(3)));
+    let interval = IntervalStream::new(tokio::time::interval(Duration::from_secs(3)))
+        .map(|_| HealthTick::Regular);
+
+    // Subscribe to the synthetic build-id broadcast channel. Lagged messages
+    // are ignored — see channel docs in [`SupervisorState::synthetic_build_id_tx`].
+    // Closed channels (sender dropped) just terminate this side of the merge,
+    // which is fine; the regular interval stream keeps running.
+    let synthetic_rx = state.synthetic_build_id_tx.subscribe();
+    let synthetic = BroadcastStream::new(synthetic_rx).filter_map(|r| match r {
+        Ok(s) => Some(HealthTick::SyntheticBuildId(s)),
+        Err(_lagged_or_closed) => None,
+    });
+
+    // Merge the two sources. `tokio_stream::StreamExt::merge` polls both
+    // streams and yields whichever has an item first. The synthetic events
+    // arrive on demand (manual test trigger) so they almost always interleave
+    // between regular ticks.
+    let merged = interval.merge(synthetic);
+
     let mut last_json = String::new();
 
     // Cap the stream's lifetime at the shutdown signal so axum's graceful
@@ -372,119 +513,32 @@ pub async fn health_stream(
     // disconnect, take_until on shutdown_signal, server drain).
     let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
 
-    let stream = interval.map(move |_| {
+    let stream = merged.map(move |tick| {
         // Hold the guard for every yielded event so the stream owns it.
         let _hold = &conn_guard;
         let state = state.clone();
-        let health = {
-            // Sync-safe: use try_read on each lock to avoid blocking the stream
-            let build = state.build.try_read();
-            let expo = state.expo.try_read();
-            let cached = state.cached_health.try_read();
-            let runner_snapshots = state.cached_runner_health.try_read();
 
-            // If any lock is contended, skip this tick
-            let Ok(build) = build else {
-                return Ok(Event::default().comment("keepalive"));
-            };
-            let Ok(expo) = expo else {
-                return Ok(Event::default().comment("keepalive"));
-            };
-            let Ok(cached) = cached else {
-                return Ok(Event::default().comment("keepalive"));
-            };
+        let (override_build_id, is_synthetic) = match &tick {
+            HealthTick::Regular => (None, false),
+            HealthTick::SyntheticBuildId(id) => (Some(id.as_str()), true),
+        };
 
-            let api_responding = cached.runner_responding;
-            let api_in_use = cached.runner_port_open;
-
-            // Use the primary runner from cached snapshots (not the legacy
-            // state.runner which is never updated for user-managed runners).
-            let primary_snapshot = runner_snapshots
-                .as_ref()
-                .ok()
-                .and_then(|snaps| snaps.iter().find(|r| r.is_primary));
-            let (primary_running, primary_pid) = match primary_snapshot {
-                Some(p) => (p.running, p.pid),
-                None => {
-                    // Fallback to legacy state.runner
-                    match state.runner.try_read() {
-                        Ok(r) => (r.running, r.pid),
-                        Err(_) => (false, None),
-                    }
-                }
-            };
-
-            let overall_status =
-                determine_overall_status(primary_running, api_responding, build.build_in_progress);
-
-            // Sync-safe scan: use try_read on each slot's frontend_stale flag.
-            // If any slot's lock is contended, skip reporting staleness for
-            // that slot on this tick — the flag is a UX nudge, not a hard
-            // invariant, and it's fine to miss one tick.
-            let frontend_stale_any = state
-                .build_pool
-                .slots
-                .iter()
-                .any(|s| s.frontend_stale.try_read().map(|g| *g).unwrap_or(false));
-
-            HealthResponse {
-                status: overall_status.to_string(),
-                runner: RunnerHealth {
-                    running: primary_running,
-                    pid: primary_pid,
-                    started_at: None, // Not available from cached snapshot
-                    api_responding,
-                },
-                ports: PortsHealth {
-                    api_port: PortStatus {
-                        port: RUNNER_API_PORT,
-                        in_use: api_in_use,
-                    },
-                },
-                watchdog: WatchdogHealth::disabled(),
-                build: BuildHealth {
-                    in_progress: build.build_in_progress,
-                    available_slots: state.build_pool.permits.available_permits(),
-                    error_detected: build.build_error_detected,
-                    last_error: build.last_build_error.clone(),
-                    last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
-                    frontend_stale_any,
-                    // SSE path: try_read on the LKG lock — if contended,
-                    // skip the field this tick (the next tick will catch up).
-                    lkg: state
-                        .build_pool
-                        .last_known_good
-                        .try_read()
-                        .ok()
-                        .and_then(|g| {
-                            g.as_ref().map(|info| LkgHealth {
-                                built_at: info.built_at.to_rfc3339(),
-                                source_slot: info.source_slot,
-                                exe_size: info.exe_size,
-                            })
-                        }),
-                },
-                expo: ExpoHealth {
-                    running: expo.running,
-                    pid: expo.pid,
-                    port: expo.port,
-                    configured: state.config.expo_dir.is_some(),
-                },
-                supervisor: SupervisorInfo {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    project_dir: state.config.project_dir.display().to_string(),
-                },
-                // Read cached runner snapshots (built by background health refresher)
-                runners: build_sse_runners(&state),
-                sdk_features: SDK_FEATURES.to_vec(),
-                sdk_features_doc_url: SDK_FEATURE_DOC_URL,
-                build_id: state.build_id.clone(),
-                sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
-            }
+        let health = match try_build_sse_health(&state, override_build_id) {
+            Ok(h) => h,
+            Err(()) => return Ok(Event::default().comment("keepalive")),
         };
 
         let json = serde_json::to_string(&health).unwrap_or_default();
-        if json == last_json {
+
+        if is_synthetic {
+            // Synthetic events MUST always emit (even if the JSON happens to
+            // match `last_json`) — the whole point of the injection is to
+            // wake up the dashboard's `useBuildIdWatcher`. Skip the
+            // change-only filter and refresh `last_json` so the next regular
+            // tick correctly compares against this synthetic frame.
+            last_json = json.clone();
+            Ok(Event::default().event("health").data(json))
+        } else if json == last_json {
             Ok(Event::default().comment("keepalive"))
         } else {
             last_json = json.clone();

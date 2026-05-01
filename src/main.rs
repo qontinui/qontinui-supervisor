@@ -126,6 +126,23 @@ async fn main() -> anyhow::Result<()> {
     // through the same persistent file writer attached above.
     state.flush_pending_startup_logs().await;
 
+    // Visibility for the debug-endpoints gate. When enabled, log loudly so
+    // an operator tailing the supervisor log can see that
+    // `/control/dev/*` are accepting requests; when disabled (the default),
+    // no log line is emitted to keep startup quiet for normal users.
+    if state.debug_endpoints_enabled {
+        let msg = format!(
+            "Debug endpoints ENABLED ({}=1) — POST /control/dev/* are admitted on this supervisor. \
+             This must NEVER be set in shared / multi-tenant deployments.",
+            state::DEBUG_ENDPOINTS_ENV
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+            .await;
+    }
+
     // Load persistent settings and apply to state
     {
         let path = settings::settings_path(&state.config);

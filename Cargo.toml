@@ -37,6 +37,11 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `oneshot` extension trait for driving an axum::Router in unit tests
+# without binding a real socket. tower 0.5 is already pulled in
+# transitively by axum 0.8 / tower-http; declaring it explicitly here just
+# unlocks the dev-only `util::ServiceExt` import.
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

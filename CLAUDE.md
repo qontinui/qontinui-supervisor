@@ -267,6 +267,14 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/fix-and-rebuild` | Fix errors and rebuild (legacy single-runner endpoint) |
 
+### Debug endpoints (gated)
+
+Debug-only endpoints under `/control/dev/*` are admitted **only** when the supervisor is started with `QONTINUI_SUPERVISOR_DEBUG_ENDPOINTS=1`. The env var is read once at startup and cached on `SharedState`; an unset / `0` / empty value makes every endpoint here return `403 {"error": "debug_endpoints_disabled"}`. These are for local manual testing — never set this in shared deployments.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/control/dev/emit-build-id` | Inject a synthetic `buildId` value (body: `{"buildId": "<string>"}`) into the live `/health/stream` SSE without rebuilding the supervisor. Returns `{"ok": true, "emitted": "<buildId>", "subscribers": <usize>}`. The on-disk `build_id` is unchanged; only the next streamed health event carries the override. Used by `/manual-test` to exercise `BuildRefreshBanner` without a full rebuild + restart. |
+
 ## Dashboard
 
 The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9875/` in a browser.

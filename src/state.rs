@@ -206,6 +206,23 @@ pub struct SupervisorState {
     /// verify the graceful-shutdown drain is actually releasing connections
     /// without having to open a stream + trigger shutdown by hand.
     pub active_sse_connections: Arc<AtomicUsize>,
+    /// True when debug-only HTTP endpoints (under `/control/dev/*`) are
+    /// admitted. Cached at startup from
+    /// `QONTINUI_SUPERVISOR_DEBUG_ENDPOINTS=1` so handlers don't re-read the
+    /// env on every request. Off by default — debug endpoints are local-dev
+    /// only and must never be exposed in shared / multi-tenant deployments.
+    pub debug_endpoints_enabled: bool,
+    /// Broadcast channel for synthetic build-id injection events from the
+    /// debug endpoint `POST /control/dev/emit-build-id`. Each `String` sent
+    /// is a build-id value that the `/health/stream` SSE handler should
+    /// emit as a one-shot synthetic `event: health` to all currently
+    /// connected dashboard tabs, overriding the real
+    /// [`SupervisorState::build_id`] in the JSON payload (without changing
+    /// the on-disk value). Capacity 8; if multiple synthetic events arrive
+    /// faster than every SSE consumer drains, the oldest is dropped — the
+    /// channel is best-effort, since the goal is exercising the watcher's
+    /// divergence path during manual tests, not durable delivery.
+    pub synthetic_build_id_tx: broadcast::Sender<String>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -563,6 +580,26 @@ pub fn compute_build_id() -> String {
     }
 }
 
+/// Env var name that admits the supervisor's debug-only HTTP endpoints
+/// (currently just `POST /control/dev/emit-build-id`). Set to `1` to enable;
+/// any other value (or unset) keeps the endpoints returning 403. The env is
+/// read once at startup and cached on
+/// [`SupervisorState::debug_endpoints_enabled`] so per-request env reads
+/// stay off the hot path.
+pub const DEBUG_ENDPOINTS_ENV: &str = "QONTINUI_SUPERVISOR_DEBUG_ENDPOINTS";
+
+/// Read the debug-endpoints gate from the environment. Returns true only when
+/// `DEBUG_ENDPOINTS_ENV` is exactly `"1"`. Empty / unset / `"0"` / anything
+/// else is treated as disabled. We intentionally do not accept `"true"` /
+/// `"yes"` to keep the activation surface as narrow and unambiguous as
+/// possible — this gate guards endpoints that bypass production safety
+/// checks, so the on-state must be deliberate.
+pub fn read_debug_endpoints_env() -> bool {
+    std::env::var(DEBUG_ENDPOINTS_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Default platform-appropriate path for the persisted `boot.id` file.
 ///
 /// - Windows: `%LOCALAPPDATA%\qontinui-supervisor\boot.id`
@@ -635,6 +672,12 @@ impl SupervisorState {
         let expo_port = config.expo_port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
+        // Capacity 8 with `broadcast` semantics: lagging receivers see Lagged,
+        // not Closed, and we ignore Lagged in the SSE consumer (it just means
+        // we missed an injection — fine for a debug-only "kick the watcher"
+        // signal).
+        let (synthetic_build_id_tx, _) = broadcast::channel::<String>(8);
+        let debug_endpoints_enabled = read_debug_endpoints_env();
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(4)
@@ -726,6 +769,8 @@ impl SupervisorState {
             runner_job,
             pending_startup_logs: std::sync::Mutex::new(startup_logs),
             active_sse_connections: Arc::new(AtomicUsize::new(0)),
+            debug_endpoints_enabled,
+            synthetic_build_id_tx,
         }
     }
 

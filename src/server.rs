@@ -25,6 +25,11 @@ pub fn build_router(state: SharedState) -> Router {
     let vt_state = state.clone();
     let vi_state = state.clone();
     let spa_state = state.clone();
+    // Debug-only endpoints (gated by QONTINUI_SUPERVISOR_DEBUG_ENDPOINTS=1).
+    // Always merged into the router; the gate is enforced inside each
+    // handler so a misconfiguration returns 403 (well-defined response)
+    // rather than 404 (looks like the supervisor binary is too old).
+    let dev_state = state.clone();
 
     // Build main stateful routes, then apply state to get Router<()>
     let main_routes = Router::new()
@@ -276,6 +281,7 @@ pub fn build_router(state: SharedState) -> Router {
             ),
         )
         .merge(crate::routes::dashboard::spa_routes(spa_state))
+        .merge(crate::routes::dev_endpoints::router(dev_state))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }
