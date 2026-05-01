@@ -1,0 +1,128 @@
+{
+  "version": "1.0",
+  "id": "dashboard",
+  "name": "Dashboard",
+  "states": [
+    {
+      "id": "dashboard-layout",
+      "name": "Page Layout & Navigation",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "The dashboard has a fixed 220px sidebar with navigation links and a main content area. The sidebar contains the Qontinui logo, nav links to all pages, and the supervisor port badge.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "service-table",
+      "name": "Service Health Table",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "The service table is the primary dashboard element. Each row shows a service name, port, real-time status (UP/DOWN/ERR/OFF), and action buttons. Status is indicated by color-coded dots with animated pulse for connecting states. Services include: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "bulk-actions",
+      "name": "Bulk Action Controls",
+      "requiredElements": [
+        {
+          "role": "button",
+          "textContains": "Start All"
+        },
+        {
+          "role": "button",
+          "textContains": "Stop All"
+        }
+      ],
+      "description": "Below the service table, bulk action buttons provide one-click operations: Docker (start containers), Start All, Stop All, Clean, Fresh (clean + migrate + start), Migrate. Each shows a confirmation dialog before executing.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "runner-instances-panel",
+      "name": "Runner Instances Panel",
+      "requiredElements": [
+        {
+          "textContains": "Runner"
+        },
+        {
+          "textContains": "Runner"
+        }
+      ],
+      "description": "Shows all runner instances (temp and user-managed) with their status, port, PID, and action controls. Temp runners (test-* IDs) can be stopped. User runners are observe-only.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "build-pool-status",
+      "name": "Build Pool Status",
+      "requiredElements": [
+        {
+          "textContains": "Build"
+        }
+      ],
+      "description": "Shows the supervisor's parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "log-viewer",
+      "name": "Log Viewer Panel",
+      "requiredElements": [
+        {
+          "textContains": "Log"
+        },
+        {
+          "textContains": "Log"
+        }
+      ],
+      "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "dashboard-design",
+      "name": "Dashboard Visual Design",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The dashboard uses a dark theme with CSS custom properties for consistent styling. Background is dark (--bg-primary), text is light (--text-primary), accent color is indigo (--accent). Cards have subtle borders and rounded corners. Status colors: green for success, red for danger, amber for warning.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Supervisor Dashboard — primary control surface for dev infrastructure. Shows real-time health of all services (runner, backend, frontend, PostgreSQL, Redis, MinIO, Expo), provides start/stop/restart controls, runner instance management, build pool status, and a log viewer with source/level filtering.",
+  "metadata": {
+    "tags": [
+      "supervisor",
+      "dashboard",
+      "health",
+      "services",
+      "runners",
+      "logs",
+      "build-pool"
+    ]
+  }
+}
