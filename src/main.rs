@@ -337,12 +337,31 @@ async fn main() -> anyhow::Result<()> {
 
 /// Maximum seconds a build slot may be "busy" before the reaper clears it.
 /// Normal builds take 3-8 minutes; 15 minutes is a generous ceiling.
-const MAX_BUILD_AGE_SECS: i64 = 15 * 60;
+/// Margin added to the configured build timeout when the reaper decides a
+/// slot is stuck. The reaper is a backstop for leaked slots; cargo's own
+/// timeout (`build_timeout_secs()`) should always fire first on a real
+/// long-running build. The margin gives cargo room to finish even if it's
+/// slightly over its own timeout (e.g. a slow link step).
+const REAPER_MARGIN_SECS: i64 = 600;
+
+/// Compute the threshold at which the reaper considers a slot stuck.
+/// Always strictly greater than `build_timeout_secs()` so cargo gets to
+/// fail on its own first.
+fn max_build_age_secs() -> i64 {
+    config::build_timeout_secs() as i64 + REAPER_MARGIN_SECS
+}
 
 /// Periodically scan build slots and clear any that have been "busy" for
-/// longer than [`MAX_BUILD_AGE_SECS`]. Runs every 2 minutes. This catches
+/// longer than [`max_build_age_secs`]. Runs every 2 minutes. This catches
 /// leaked slots from crashed cargo builds or supervisor panics where the
 /// `SlotGuard` RAII type didn't execute its `Drop`.
+///
+/// Pre-2026-05-01 the threshold was a hard-coded 15 minutes, which was
+/// shorter than the configured cargo build timeout (30 min default). On a
+/// cold-cache Tauri build the reaper would kill cargo before cargo's own
+/// timeout fired, leaving the slot's history without a record. The reaper
+/// is now strictly above `build_timeout_secs()` so cargo always gets to
+/// finish (or fail) on its own first.
 async fn reap_stuck_build_slots(state: state::SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
     interval.tick().await; // skip the immediate first tick
@@ -350,18 +369,19 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
+        let max_age = max_build_age_secs();
 
         for slot in &state.build_pool.slots {
             if let Ok(mut busy) = slot.busy.try_write() {
                 if let Some(ref info) = *busy {
                     let elapsed = (now - info.started_at).num_seconds().max(0);
-                    if elapsed > MAX_BUILD_AGE_SECS {
+                    if elapsed > max_age {
                         warn!(
                             "Build slot {} stuck for {}s (max {}s) — auto-clearing. \
                              requester_id={:?}, rebuild_kind={}",
                             slot.id,
                             elapsed,
-                            MAX_BUILD_AGE_SECS,
+                            max_age,
                             info.requester_id,
                             info.rebuild_kind
                         );
@@ -372,7 +392,7 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
                                 log_capture::LogLevel::Warn,
                                 format!(
                                     "Auto-cleared stuck build slot {} after {}s (limit {}s)",
-                                    slot.id, elapsed, MAX_BUILD_AGE_SECS
+                                    slot.id, elapsed, max_age
                                 ),
                             )
                             .await;
