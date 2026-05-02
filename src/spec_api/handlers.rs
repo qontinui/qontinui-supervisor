@@ -208,7 +208,10 @@ pub struct QueryBody {
     pub value: String,
 }
 
-pub async fn post_query(State(_state): State<SharedState>, Json(body): Json<QueryBody>) -> Response {
+pub async fn post_query(
+    State(_state): State<SharedState>,
+    Json(body): Json<QueryBody>,
+) -> Response {
     let root = storage::resolve_specs_root();
     let ids = match storage::list_pages(&root) {
         Ok(ids) => ids,
@@ -429,7 +432,10 @@ pub async fn get_diff(State(_state): State<SharedState>, Query(_q): Query<DiffQu
 // POST /spec/author
 // ---------------------------------------------------------------------------
 
-pub async fn post_author(State(_state): State<SharedState>, Json(doc): Json<IrDocument>) -> Response {
+pub async fn post_author(
+    State(_state): State<SharedState>,
+    Json(doc): Json<IrDocument>,
+) -> Response {
     if doc.id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,

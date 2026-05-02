@@ -397,11 +397,7 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
                         warn!(
                             "Build slot {} stuck for {}s (max {}s) — auto-clearing. \
                              requester_id={:?}, rebuild_kind={}",
-                            slot.id,
-                            elapsed,
-                            max_age,
-                            info.requester_id,
-                            info.rebuild_kind
+                            slot.id, elapsed, max_age, info.requester_id, info.rebuild_kind
                         );
                         state
                             .logs
