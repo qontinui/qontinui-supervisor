@@ -80,10 +80,13 @@ jobs:
 
       # ui-bridge-eslint-plugin's dist/ is committed upstream
       # (qontinui/ui-bridge#2), so the cloned sibling has the built
-      # artifacts ready to use. No build step needed.
-
+      # artifacts ready to use.
+      #
+      # --install-links copies the file: dep into node_modules instead of
+      # symlinking, so the plugin's transitive deps resolve through the
+      # consumer's node_modules tree.
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --install-links
 
       - name: TypeScript type check
         run: npx tsc --noEmit
