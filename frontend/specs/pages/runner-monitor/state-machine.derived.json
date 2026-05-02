@@ -1,0 +1,69 @@
+{
+  "version": "1.0",
+  "id": "runner-monitor",
+  "name": "RunnerMonitor",
+  "states": [
+    {
+      "id": "runner-health-card",
+      "name": "Runner Health Card",
+      "requiredElements": [
+        {
+          "textContains": "Runner Health"
+        },
+        {},
+        {
+          "role": "button",
+          "textContains": "Refresh"
+        }
+      ],
+      "description": "Top card showing the primary runner's health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "running-task-runs",
+      "name": "Running Task Runs",
+      "requiredElements": [
+        {
+          "textContains": "Running Task Runs"
+        },
+        {},
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection.",
+      "precondition": "At least one task run is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "result-panel",
+      "name": "Result Panel",
+      "requiredElements": [
+        {}
+      ],
+      "description": "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked.",
+      "precondition": "An action has been executed via one of the task run buttons",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Runner Monitor page — shows detailed health of the primary runner (JSON health response), list of running task runs with actions (stop, view output, view reflection), and a result panel for displaying action output.",
+  "metadata": {
+    "tags": [
+      "supervisor",
+      "runner",
+      "health",
+      "task-runs",
+      "monitoring"
+    ]
+  }
+}

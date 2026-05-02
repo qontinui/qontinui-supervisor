@@ -2,6 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
 import eslintConfigPrettier from "eslint-config-prettier";
+import uiBridgePlugin from "@qontinui/ui-bridge-eslint-plugin";
 
 export default tseslint.config(
   // Global ignores
@@ -41,6 +42,14 @@ export default tseslint.config(
 
       // Allow empty catch blocks (common pattern for fire-and-forget)
       "no-empty": ["error", { allowEmptyCatch: true }],
+    },
+  },
+
+  // UI Bridge IR — flag conditional rendering at configuration boundaries
+  {
+    plugins: { "@qontinui/ui-bridge": uiBridgePlugin },
+    rules: {
+      "@qontinui/ui-bridge/require-state-annotation": "warn",
     },
   },
 

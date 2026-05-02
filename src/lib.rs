@@ -14,6 +14,7 @@ pub mod routes;
 pub mod sdk_features;
 pub mod server;
 pub mod settings;
+pub mod spec_api;
 pub mod state;
 pub mod velocity;
 pub mod velocity_improvement;

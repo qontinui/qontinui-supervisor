@@ -1,0 +1,208 @@
+{
+  "description": "Runner Monitor page — shows detailed health of the primary runner (JSON health response), list of running task runs with actions (stop, view output, view reflection), and a result panel for displaying action output.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Runner Health Card",
+          "enabled": true,
+          "id": "runner-health-card-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Runner Health"
+            },
+            "label": "Required element for Runner Health Card",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Runner Health Card",
+          "enabled": true,
+          "id": "runner-health-card-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Runner Health Card",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Runner Health Card",
+          "enabled": true,
+          "id": "runner-health-card-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContains": "Refresh"
+            },
+            "label": "Required element for Runner Health Card",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Top card showing the primary runner's health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+      "id": "runner-health-card",
+      "name": "Runner Health Card",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Running Task Runs",
+          "enabled": true,
+          "id": "running-task-runs-elem-0",
+          "precondition": "At least one task run is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Running Task Runs"
+            },
+            "label": "Required element for Running Task Runs",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Running Task Runs",
+          "enabled": true,
+          "id": "running-task-runs-elem-1",
+          "precondition": "At least one task run is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Running Task Runs",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Running Task Runs",
+          "enabled": true,
+          "id": "running-task-runs-elem-2",
+          "precondition": "At least one task run is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Running Task Runs",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection.",
+      "id": "running-task-runs",
+      "name": "Running Task Runs",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Result Panel",
+          "enabled": true,
+          "id": "result-panel-elem-0",
+          "precondition": "An action has been executed via one of the task run buttons",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Result Panel",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked.",
+      "id": "result-panel",
+      "name": "Result Panel",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "runner-monitor",
+    "tags": [
+      "supervisor",
+      "runner",
+      "health",
+      "task-runs",
+      "monitoring"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "Top card showing the primary runner's health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+        "elements": [
+          {
+            "textContains": "Runner Health"
+          },
+          {},
+          {
+            "role": "button",
+            "textContains": "Refresh"
+          }
+        ],
+        "id": "runner-health-card",
+        "isInitial": false,
+        "name": "Runner Health Card",
+        "transitions": []
+      },
+      {
+        "description": "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection.",
+        "elements": [
+          {
+            "textContains": "Running Task Runs"
+          },
+          {},
+          {
+            "role": "button"
+          }
+        ],
+        "id": "running-task-runs",
+        "isInitial": false,
+        "name": "Running Task Runs",
+        "transitions": []
+      },
+      {
+        "description": "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked.",
+        "elements": [
+          {}
+        ],
+        "id": "result-panel",
+        "isInitial": false,
+        "name": "Result Panel",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

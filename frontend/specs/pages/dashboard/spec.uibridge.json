@@ -1,0 +1,484 @@
+{
+  "description": "Supervisor Dashboard — primary control surface for dev infrastructure. Shows real-time health of all services (runner, backend, frontend, PostgreSQL, Redis, MinIO, Expo), provides start/stop/restart controls, runner instance management, build pool status, and a log viewer with source/level filtering.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Layout & Navigation",
+          "enabled": true,
+          "id": "dashboard-layout-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Layout & Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Layout & Navigation",
+          "enabled": true,
+          "id": "dashboard-layout-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Layout & Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Layout & Navigation",
+          "enabled": true,
+          "id": "dashboard-layout-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Layout & Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Page Layout & Navigation",
+          "enabled": true,
+          "id": "dashboard-layout-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Layout & Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard has a fixed 220px sidebar with navigation links and a main content area. The sidebar contains the Qontinui logo, nav links to all pages, and the supervisor port badge.",
+      "id": "dashboard-layout",
+      "name": "Page Layout & Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Service Health Table",
+          "enabled": true,
+          "id": "service-table-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Service Health Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Service Health Table",
+          "enabled": true,
+          "id": "service-table-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Service Health Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Service Health Table",
+          "enabled": true,
+          "id": "service-table-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Service Health Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Service Health Table",
+          "enabled": true,
+          "id": "service-table-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Service Health Table",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Service Health Table",
+          "enabled": true,
+          "id": "service-table-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Service Health Table",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The service table is the primary dashboard element. Each row shows a service name, port, real-time status (UP/DOWN/ERR/OFF), and action buttons. Status is indicated by color-coded dots with animated pulse for connecting states. Services include: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog.",
+      "id": "service-table",
+      "name": "Service Health Table",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Bulk Action Controls",
+          "enabled": true,
+          "id": "bulk-actions-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContains": "Start All"
+            },
+            "label": "Required element for Bulk Action Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Bulk Action Controls",
+          "enabled": true,
+          "id": "bulk-actions-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContains": "Stop All"
+            },
+            "label": "Required element for Bulk Action Controls",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Below the service table, bulk action buttons provide one-click operations: Docker (start containers), Start All, Stop All, Clean, Fresh (clean + migrate + start), Migrate. Each shows a confirmation dialog before executing.",
+      "id": "bulk-actions",
+      "name": "Bulk Action Controls",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Runner Instances Panel",
+          "enabled": true,
+          "id": "runner-instances-panel-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Runner"
+            },
+            "label": "Required element for Runner Instances Panel",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Runner Instances Panel",
+          "enabled": true,
+          "id": "runner-instances-panel-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Runner"
+            },
+            "label": "Required element for Runner Instances Panel",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Shows all runner instances (temp and user-managed) with their status, port, PID, and action controls. Temp runners (test-* IDs) can be stopped. User runners are observe-only.",
+      "id": "runner-instances-panel",
+      "name": "Runner Instances Panel",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Build Pool Status",
+          "enabled": true,
+          "id": "build-pool-status-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Build"
+            },
+            "label": "Required element for Build Pool Status",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Shows the supervisor's parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration.",
+      "id": "build-pool-status",
+      "name": "Build Pool Status",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Log Viewer Panel",
+          "enabled": true,
+          "id": "log-viewer-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Log"
+            },
+            "label": "Required element for Log Viewer Panel",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Log Viewer Panel",
+          "enabled": true,
+          "id": "log-viewer-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Log"
+            },
+            "label": "Required element for Log Viewer Panel",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
+      "id": "log-viewer",
+      "name": "Log Viewer Panel",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Dashboard Visual Design",
+          "enabled": true,
+          "id": "dashboard-design-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Dashboard Visual Design",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Dashboard Visual Design",
+          "enabled": true,
+          "id": "dashboard-design-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Dashboard Visual Design",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Dashboard Visual Design",
+          "enabled": true,
+          "id": "dashboard-design-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Dashboard Visual Design",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard uses a dark theme with CSS custom properties for consistent styling. Background is dark (--bg-primary), text is light (--text-primary), accent color is indigo (--accent). Cards have subtle borders and rounded corners. Status colors: green for success, red for danger, amber for warning.",
+      "id": "dashboard-design",
+      "name": "Dashboard Visual Design",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "dashboard",
+    "tags": [
+      "supervisor",
+      "dashboard",
+      "health",
+      "services",
+      "runners",
+      "logs",
+      "build-pool"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The dashboard has a fixed 220px sidebar with navigation links and a main content area. The sidebar contains the Qontinui logo, nav links to all pages, and the supervisor port badge.",
+        "elements": [
+          {},
+          {},
+          {},
+          {}
+        ],
+        "id": "dashboard-layout",
+        "isInitial": false,
+        "name": "Page Layout & Navigation",
+        "transitions": []
+      },
+      {
+        "description": "The service table is the primary dashboard element. Each row shows a service name, port, real-time status (UP/DOWN/ERR/OFF), and action buttons. Status is indicated by color-coded dots with animated pulse for connecting states. Services include: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog.",
+        "elements": [
+          {},
+          {},
+          {},
+          {},
+          {}
+        ],
+        "id": "service-table",
+        "isInitial": false,
+        "name": "Service Health Table",
+        "transitions": []
+      },
+      {
+        "description": "Below the service table, bulk action buttons provide one-click operations: Docker (start containers), Start All, Stop All, Clean, Fresh (clean + migrate + start), Migrate. Each shows a confirmation dialog before executing.",
+        "elements": [
+          {
+            "role": "button",
+            "textContains": "Start All"
+          },
+          {
+            "role": "button",
+            "textContains": "Stop All"
+          }
+        ],
+        "id": "bulk-actions",
+        "isInitial": false,
+        "name": "Bulk Action Controls",
+        "transitions": []
+      },
+      {
+        "description": "Shows all runner instances (temp and user-managed) with their status, port, PID, and action controls. Temp runners (test-* IDs) can be stopped. User runners are observe-only.",
+        "elements": [
+          {
+            "textContains": "Runner"
+          },
+          {
+            "textContains": "Runner"
+          }
+        ],
+        "id": "runner-instances-panel",
+        "isInitial": false,
+        "name": "Runner Instances Panel",
+        "transitions": []
+      },
+      {
+        "description": "Shows the supervisor's parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration.",
+        "elements": [
+          {
+            "textContains": "Build"
+          }
+        ],
+        "id": "build-pool-status",
+        "isInitial": false,
+        "name": "Build Pool Status",
+        "transitions": []
+      },
+      {
+        "description": "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
+        "elements": [
+          {
+            "textContains": "Log"
+          },
+          {
+            "textContains": "Log"
+          }
+        ],
+        "id": "log-viewer",
+        "isInitial": false,
+        "name": "Log Viewer Panel",
+        "transitions": []
+      },
+      {
+        "description": "The dashboard uses a dark theme with CSS custom properties for consistent styling. Background is dark (--bg-primary), text is light (--text-primary), accent color is indigo (--accent). Cards have subtle borders and rounded corners. Status colors: green for success, red for danger, amber for warning.",
+        "elements": [
+          {},
+          {},
+          {}
+        ],
+        "id": "dashboard-design",
+        "isInitial": false,
+        "name": "Dashboard Visual Design",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}
