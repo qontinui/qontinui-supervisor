@@ -68,17 +68,6 @@ jobs:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v4
 
-      # qontinui-supervisor's frontend declares a file:-protocol dep:
-      #   - @qontinui/ui-bridge-eslint-plugin
-      #     -> file:../../ui-bridge/packages/ui-bridge-eslint-plugin
-      # From qontinui-supervisor/frontend/, ../.. resolves to
-      # /home/runner/work/qontinui-supervisor/. Cloning ui-bridge there
-      # makes the file: dep resolve. Public repo, no auth needed.
-      - name: Checkout sibling repos
-        run: |
-          cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -86,15 +75,8 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      # ui-bridge-eslint-plugin's dist/ is committed upstream
-      # (qontinui/ui-bridge#2), so the cloned sibling has the built
-      # artifacts ready to use.
-      #
-      # --install-links copies the file: dep into node_modules instead of
-      # symlinking, so the plugin's transitive deps resolve through the
-      # consumer's node_modules tree.
       - name: Install dependencies
-        run: npm ci --install-links
+        run: npm ci
 
       - name: TypeScript type check
         run: npx tsc --noEmit

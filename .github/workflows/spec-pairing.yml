@@ -8,10 +8,8 @@ name: Spec Pairing Gate
 # fails the PR. The plan is to flip to `--mode=block` after one week of
 # warn-only running has confirmed no false positives.
 #
-# The shared check script lives in `ui-bridge-auto`. We clone the sibling
-# repos (`ui-bridge-auto` + `qontinui-schemas`) at workflow time because GitHub
-# Actions doesn't have a native multi-repo checkout primitive. Both repos are
-# public, so no auth is needed.
+# The shared check script lives in `@qontinui/ui-bridge-auto` on npm and
+# is invoked via `npx`, so no sibling clones or pre-build steps are needed.
 
 on:
   pull_request:
@@ -35,35 +33,12 @@ jobs:
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v4
-        with:
-          path: qontinui-supervisor
-
-      - name: Checkout sibling repos
-        run: |
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
-          git clone --depth 1 https://github.com/qontinui/ui-bridge-auto.git
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Build qontinui-schemas TypeScript bundle
-        working-directory: qontinui-schemas/ts
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build ui-bridge-auto CLI
-        working-directory: ui-bridge-auto
-        run: |
-          npm ci
-          npm run build
-
       - name: Run pairing check (warn-only)
         run: |
-          node ui-bridge-auto/dist/ir-builder/check-pairing.cjs \
-            --root qontinui-supervisor \
-            --app qontinui-supervisor \
-            --mode=warn
+          npx @qontinui/ui-bridge-auto check-spec-pairing --root .
