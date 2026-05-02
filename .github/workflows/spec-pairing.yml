@@ -4,12 +4,12 @@ name: Spec Pairing Gate
 # file under `specs/pages/<id>/`, and that the pairing round-trips cleanly
 # (group count + ids + assertion total match the IR's forward projection).
 #
-# Currently warn-only: the job logs missing/mismatched pairings but never
-# fails the PR. The plan is to flip to `--mode=block` after one week of
-# warn-only running has confirmed no false positives.
+# Block mode: the job fails the PR on any missing or mismatched pairing.
+# Supervisor is currently clean (paired: 5, missing: 0, mismatched: 0).
 #
 # The shared check script lives in `@qontinui/ui-bridge-auto` on npm and
-# is invoked via `npx`, so no sibling clones or pre-build steps are needed.
+# is invoked via `npx --yes -p <pkg> <bin>`. The `-p` flag is required
+# because the package exposes multiple binaries.
 
 on:
   pull_request:
@@ -39,6 +39,5 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Run pairing check (warn-only)
-        run: |
-          npx @qontinui/ui-bridge-auto check-spec-pairing --root .
+      - name: Run pairing check (block mode)
+        run: npx --yes -p @qontinui/ui-bridge-auto check-spec-pairing --root . --mode=block
