@@ -80,11 +80,13 @@ jobs:
 
       # ui-bridge-eslint-plugin's dist/ is gitignored upstream — every
       # consumer must build it after cloning before lint can resolve it.
+      # Workspace-scoped install (-w) avoids npm walking up to the
+      # ui-bridge root and hitting a peer-dep conflict in devDeps.
       - name: Build ui-bridge-eslint-plugin
-        working-directory: ${{ github.workspace }}/../ui-bridge/packages/ui-bridge-eslint-plugin
+        working-directory: ${{ github.workspace }}/../ui-bridge
         run: |
-          npm install --no-audit --no-fund
-          npm run build
+          npm install -w @qontinui/ui-bridge-eslint-plugin --no-audit --no-fund --legacy-peer-deps
+          npm run build -w @qontinui/ui-bridge-eslint-plugin
 
       - name: Install dependencies
         run: npm ci
