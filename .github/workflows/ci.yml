@@ -18,6 +18,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
+      # at ../qontinui-schemas/rust. Without the sibling clone, clippy + tests
+      # fail with "failed to read ../qontinui-schemas/rust/Cargo.toml".
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
