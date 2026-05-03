@@ -590,6 +590,11 @@ async fn forward_window_position_env(
         slot_label: Option<String>,
         #[serde(default)]
         source: Option<String>,
+        /// Per-placement decorations override. `None` = use runner default
+        /// (chrome on); `Some(true)` = chrome on; `Some(false)` = borderless.
+        /// We forward to the runner as `QONTINUI_WINDOW_DECORATIONS=0|1`.
+        #[serde(default)]
+        decorations: Option<bool>,
     }
 
     // Runner endpoints wrap responses in `{success, data, error?}`.
@@ -664,6 +669,9 @@ async fn forward_window_position_env(
     cmd.env("QONTINUI_WINDOW_Y", placement.global_y.to_string());
     cmd.env("QONTINUI_WINDOW_WIDTH", placement.width.to_string());
     cmd.env("QONTINUI_WINDOW_HEIGHT", placement.height.to_string());
+    if let Some(d) = placement.decorations {
+        cmd.env("QONTINUI_WINDOW_DECORATIONS", if d { "1" } else { "0" });
+    }
 }
 
 fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
