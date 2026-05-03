@@ -2230,6 +2230,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             "p50_duration_secs": history_snapshot.p50_duration_secs(),
             "last_completed_at": history_snapshot.last_completed_at.map(|t| t.to_rfc3339()),
             "last_error": history_snapshot.last_error,
+            "last_error_detail": history_snapshot.last_error_detail,
         });
 
         let slot_json = match info_opt {
@@ -2293,6 +2294,62 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "slots": slots_json,
         "lkg": lkg_json,
     }))
+}
+
+/// GET /builds/{slot_id}/last-build-stderr — return the persisted cargo
+/// stderr from the most recent failed build on this slot.
+///
+/// Reads `target-pool/slot-{slot_id}/last-build.stderr`. Returns 404 when
+/// the slot id is out of range or the file does not exist (no failure has
+/// been recorded since the slot dir was provisioned).
+pub async fn slot_last_build_stderr(
+    State(state): State<SharedState>,
+    Path(slot_id): Path<usize>,
+) -> impl IntoResponse {
+    let slot = match state.build_pool.slots.get(slot_id) {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "slot_not_found",
+                    "slot_id": slot_id,
+                    "pool_size": state.build_pool.slots.len(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let path = slot.target_dir.join("last-build.stderr");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => {
+            let mut resp = axum::response::Response::new(axum::body::Body::from(contents));
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            resp
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "no_stderr_recorded",
+                "slot_id": slot_id,
+                "path": path.to_string_lossy(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "read_failed",
+                "slot_id": slot_id,
+                "path": path.to_string_lossy(),
+                "detail": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // --- Per-runner log endpoints ---

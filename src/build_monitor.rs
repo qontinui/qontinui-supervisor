@@ -173,6 +173,10 @@ pub async fn run_cargo_build_with_requester(
     };
     let duration_secs = build_start.elapsed().as_secs_f64();
 
+    // Pull any captured cargo stderr the inner build deposited so it can be
+    // recorded alongside the rolling history entry.
+    let captured_stderr = slot.last_build_stderr_capture.write().await.take();
+
     // Record build duration into this slot's rolling history BEFORE
     // releasing the slot, so the history write doesn't race with the next
     // build on this slot.
@@ -182,6 +186,11 @@ pub async fn run_cargo_build_with_requester(
             duration_secs,
             result.is_ok(),
             result.as_ref().err().map(|e| e.to_string()),
+            if result.is_err() {
+                captured_stderr
+            } else {
+                None
+            },
         );
     }
 
@@ -527,10 +536,37 @@ async fn run_build_inner(
         info!("Build completed successfully");
         Ok(())
     } else {
-        let error_summary = if error_lines.is_empty() {
+        let full_stderr = all_stderr_lines.join("\n");
+
+        // Persist the full captured stderr next to the slot so it survives
+        // a supervisor restart for postmortem inspection. Best-effort: a
+        // failed write is logged but does not change the build outcome.
+        let stderr_path = slot.target_dir.join("last-build.stderr");
+        if let Err(e) = tokio::fs::write(&stderr_path, full_stderr.as_bytes()).await {
+            warn!(
+                "Failed to persist last-build.stderr for slot {} at {:?}: {}",
+                slot.id, stderr_path, e
+            );
+        }
+
+        // Stash the tail (capped) on the slot so the outer caller can fold
+        // it into SlotHistory::last_error_detail.
+        let detail_tail = tail_bytes_keep_utf8(&full_stderr, LAST_BUILD_STDERR_DETAIL_BYTES);
+        *slot.last_build_stderr_capture.write().await = Some(detail_tail.clone());
+
+        // Append a short tail to the user-visible error so even the legacy
+        // `last_error` string carries actionable info (the SlotHistory
+        // detail field has the longer cap).
+        let short_tail = tail_bytes_keep_utf8(&full_stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+        let base = if error_lines.is_empty() {
             format!("Build failed with exit code: {}", status)
         } else {
             format!("Build failed:\n{}", error_lines.join("\n"))
+        };
+        let error_summary = if short_tail.is_empty() {
+            base
+        } else {
+            format!("{}\n\n--- cargo stderr (last 2KB) ---\n{}", base, short_tail)
         };
         error!("{}", error_summary);
         state
@@ -539,6 +575,29 @@ async fn run_build_inner(
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
     }
+}
+
+/// Cap on the per-slot `last_build_stderr_capture` blob. Matches
+/// `state::LAST_ERROR_DETAIL_MAX_BYTES`; lifted into a const so the constant
+/// expression is local to the build_monitor and the source of truth for
+/// `SlotHistory::last_error_detail` is `state.rs`.
+const LAST_BUILD_STDERR_DETAIL_BYTES: usize = 4 * 1024;
+
+/// Cap on the inline tail appended to the user-visible build error string.
+const LAST_BUILD_STDERR_SHORT_TAIL_BYTES: usize = 2 * 1024;
+
+/// Return the last `max_bytes` bytes of `s`, snapped forward to a UTF-8
+/// character boundary so the result is always valid UTF-8. Returns `s`
+/// unchanged when it's already shorter than `max_bytes`.
+fn tail_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = s.len() - max_bytes;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
 }
 
 /// Wait for the runner exe in a specific slot's target dir to be writable
@@ -795,11 +854,129 @@ async fn resolve_pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
 /// Timeout per slot's pre-warm `cargo check`.
 const PREWARM_TIMEOUT_SECS: u64 = 60;
 
+/// Sweep each slot's target dir for stale `.cargo-lock` advisory files left
+/// behind by a previous supervisor that was killed mid-build.
+///
+/// Cargo deletes `.cargo-lock` on graceful exit; a `.cargo-lock` whose mtime
+/// predates this supervisor process's start time is from a prior process and
+/// can be safely removed. Locks newer than supervisor start belong to a build
+/// in flight on this process and must not be touched.
+///
+/// Best-effort: any IO error is logged at warn level and processing continues
+/// with the next slot. Never aborts startup.
+pub async fn cleanup_stale_slot_locks(state: &crate::state::SharedState) {
+    let supervisor_started_at = state.supervisor_started_at;
+    let slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
+    for slot in &slots {
+        sweep_slot_for_stale_locks(slot, supervisor_started_at).await;
+        check_slot_fingerprint(slot).await;
+    }
+}
+
+async fn sweep_slot_for_stale_locks(
+    slot: &Arc<BuildSlot>,
+    supervisor_started_at: std::time::SystemTime,
+) {
+    let mut stack: Vec<std::path::PathBuf> = vec![slot.target_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Slot {}: read_dir {:?} failed during stale-lock sweep: {}",
+                        slot.id, dir, e
+                    );
+                }
+                continue;
+            }
+        };
+        loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "Slot {}: next_entry under {:?} failed: {}",
+                        slot.id, dir, e
+                    );
+                    break;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_cargo_lock = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == ".cargo-lock");
+            if !is_cargo_lock {
+                continue;
+            }
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "Slot {}: metadata for {:?} failed: {}",
+                        slot.id, path, e
+                    );
+                    continue;
+                }
+            };
+            let mtime = match meta.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if mtime < supervisor_started_at {
+                let mtime_str = chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339();
+                match tokio::fs::remove_file(&path).await {
+                    Ok(_) => {
+                        info!(
+                            "Removed stale .cargo-lock from slot {} at {:?} (mtime: {})",
+                            slot.id, path, mtime_str
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Slot {}: failed to remove stale .cargo-lock {:?}: {}",
+                            slot.id, path, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn check_slot_fingerprint(slot: &Arc<BuildSlot>) {
+    let fingerprint = slot.target_dir.join("debug").join(".fingerprint");
+    let exists = tokio::fs::metadata(&fingerprint).await.is_ok();
+    if !exists {
+        let exe = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        if tokio::fs::metadata(&exe).await.is_ok() {
+            warn!(
+                "Slot {}: target/debug/.fingerprint missing but exe is present at {:?}; \
+                 incremental state may be inconsistent. Consider a manual \
+                 `cargo clean` (CARGO_TARGET_DIR={:?}).",
+                slot.id, exe, slot.target_dir
+            );
+        }
+    }
+}
+
 /// Pre-warm each build slot's incremental cache by running `cargo check`.
 ///
 /// Spawned as `tokio::spawn` after the HTTP server binds so it doesn't delay
 /// startup. Skipped when `--no-prewarm` is set.
 pub async fn prewarm_build_slots(state: crate::state::SharedState) {
+    cleanup_stale_slot_locks(&state).await;
+
     if state.config.no_prewarm {
         info!("Build slot pre-warm disabled via --no-prewarm / QONTINUI_SUPERVISOR_NO_PREWARM");
         return;

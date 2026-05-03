@@ -211,6 +211,10 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .route("/builds", get(crate::routes::runners::list_builds))
         .route(
+            "/builds/{slot_id}/last-build-stderr",
+            get(crate::routes::runners::slot_last_build_stderr),
+        )
+        .route(
             "/builds/caches",
             delete(crate::routes::runners::clear_build_caches),
         )

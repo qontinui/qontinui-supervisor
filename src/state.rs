@@ -212,6 +212,11 @@ pub struct SupervisorState {
     /// env on every request. Off by default — debug endpoints are local-dev
     /// only and must never be exposed in shared / multi-tenant deployments.
     pub debug_endpoints_enabled: bool,
+    /// Wall-clock time the current supervisor process started. Used by
+    /// startup-time slot pre-flight to distinguish stale `.cargo-lock`
+    /// advisory files left behind by a previous supervisor (older mtime)
+    /// from locks placed by a build that's just now starting on this slot.
+    pub supervisor_started_at: std::time::SystemTime,
     /// Broadcast channel for synthetic build-id injection events from the
     /// debug endpoint `POST /control/dev/emit-build-id`. Each `String` sent
     /// is a build-id value that the `/health/stream` SSE handler should
@@ -303,6 +308,11 @@ pub struct BuildInfo {
 /// Cap on the per-slot rolling duration window.
 pub const RECENT_BUILD_SAMPLE_COUNT: usize = 10;
 
+/// Cap on `SlotHistory::last_error_detail` size. When a captured cargo stderr
+/// blob exceeds this, the front is truncated so the tail (where the actual
+/// failure message lives in cargo output) is preserved.
+pub const LAST_ERROR_DETAIL_MAX_BYTES: usize = 4 * 1024;
+
 /// Per-slot build duration history. In-memory only; resets on supervisor
 /// restart. Used by `GET /builds` and the 503 `build_pool_full` response to
 /// estimate wait times for callers.
@@ -313,6 +323,11 @@ pub struct SlotHistory {
     pub successful_builds: u64,
     pub last_completed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    /// Tail of the captured cargo stderr from the most recent failed build on
+    /// this slot. Capped at [`LAST_ERROR_DETAIL_MAX_BYTES`]; oldest bytes are
+    /// truncated to keep the tail (where the actual failure lives in cargo
+    /// output). `None` until a failure is recorded with detail.
+    pub last_error_detail: Option<String>,
 }
 
 impl Default for SlotHistory {
@@ -329,10 +344,17 @@ impl SlotHistory {
             successful_builds: 0,
             last_completed_at: None,
             last_error: None,
+            last_error_detail: None,
         }
     }
 
-    pub fn record(&mut self, duration_secs: f64, success: bool, error: Option<String>) {
+    pub fn record(
+        &mut self,
+        duration_secs: f64,
+        success: bool,
+        error: Option<String>,
+        error_detail: Option<String>,
+    ) {
         if self.recent_durations_secs.len() >= RECENT_BUILD_SAMPLE_COUNT {
             self.recent_durations_secs.pop_front();
         }
@@ -342,6 +364,7 @@ impl SlotHistory {
             self.successful_builds += 1;
         } else {
             self.last_error = error;
+            self.last_error_detail = error_detail.map(truncate_error_detail_keep_tail);
         }
         self.last_completed_at = Some(Utc::now());
     }
@@ -362,6 +385,25 @@ impl SlotHistory {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(sorted[sorted.len() / 2])
     }
+}
+
+/// Truncate `s` to at most [`LAST_ERROR_DETAIL_MAX_BYTES`] bytes by removing
+/// from the front, preserving the tail. Truncates on a UTF-8 boundary so the
+/// result is always valid UTF-8. When a cut is performed, a leading marker
+/// is prepended so consumers know the prefix was elided.
+pub fn truncate_error_detail_keep_tail(s: String) -> String {
+    if s.len() <= LAST_ERROR_DETAIL_MAX_BYTES {
+        return s;
+    }
+    let cut_target = s.len().saturating_sub(LAST_ERROR_DETAIL_MAX_BYTES);
+    let mut cut = cut_target;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let mut out = String::with_capacity(s.len() - cut + 32);
+    out.push_str("[...truncated]\n");
+    out.push_str(&s[cut..]);
+    out
 }
 
 /// One slot in the parallel build pool.
@@ -386,6 +428,12 @@ pub struct BuildSlot {
     /// build. Independent from the `busy`/`history` locks so readers can check
     /// it cheaply without blocking in-progress builds.
     pub frontend_stale: RwLock<bool>,
+    /// Tail of cargo stderr captured by the most recent build attempt on this
+    /// slot. Populated by `run_build_inner` on a non-zero cargo exit so the
+    /// outer `run_cargo_build_with_requester` can fold it into
+    /// [`SlotHistory::last_error_detail`] alongside the duration record.
+    /// Cleared when populated; readers consume by `take`.
+    pub last_build_stderr_capture: RwLock<Option<String>>,
 }
 
 /// Metadata for the last-known-good (LKG) runner binary preserved at
@@ -466,6 +514,7 @@ impl BuildPool {
                 busy: RwLock::new(None),
                 history: RwLock::new(SlotHistory::new()),
                 frontend_stale: RwLock::new(false),
+                last_build_stderr_capture: RwLock::new(None),
             }));
         }
         // Try to hydrate LKG metadata from the on-disk sidecar. We do this
@@ -770,6 +819,7 @@ impl SupervisorState {
             pending_startup_logs: std::sync::Mutex::new(startup_logs),
             active_sse_connections: Arc::new(AtomicUsize::new(0)),
             debug_endpoints_enabled,
+            supervisor_started_at: std::time::SystemTime::now(),
             synthetic_build_id_tx,
         }
     }
@@ -1293,20 +1343,21 @@ mod tests {
     #[test]
     fn test_slot_history_record_and_avg() {
         let mut h = SlotHistory::new();
-        h.record(10.0, true, None);
-        h.record(20.0, true, None);
-        h.record(30.0, false, Some("boom".into()));
+        h.record(10.0, true, None, None);
+        h.record(20.0, true, None, None);
+        h.record(30.0, false, Some("boom".into()), Some("stderr detail".into()));
         assert_eq!(h.total_builds, 3);
         assert_eq!(h.successful_builds, 2);
         assert!((h.avg_duration_secs().unwrap() - 20.0).abs() < 1e-9);
         assert_eq!(h.last_error.as_deref(), Some("boom"));
+        assert_eq!(h.last_error_detail.as_deref(), Some("stderr detail"));
     }
 
     #[test]
     fn test_slot_history_window_evicts() {
         let mut h = SlotHistory::new();
         for i in 0..(RECENT_BUILD_SAMPLE_COUNT + 3) {
-            h.record(i as f64, true, None);
+            h.record(i as f64, true, None, None);
         }
         assert_eq!(h.recent_durations_secs.len(), RECENT_BUILD_SAMPLE_COUNT);
         assert_eq!(h.recent_durations_secs.front().copied(), Some(3.0));
@@ -1315,10 +1366,58 @@ mod tests {
     #[test]
     fn test_slot_history_p50() {
         let mut h = SlotHistory::new();
-        h.record(5.0, true, None);
-        h.record(1.0, true, None);
-        h.record(9.0, true, None);
+        h.record(5.0, true, None, None);
+        h.record(1.0, true, None, None);
+        h.record(9.0, true, None, None);
         assert_eq!(h.p50_duration_secs(), Some(5.0));
+    }
+
+    #[test]
+    fn test_truncate_error_detail_keep_tail_short_passthrough() {
+        let s = "short string".to_string();
+        let out = truncate_error_detail_keep_tail(s.clone());
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn test_truncate_error_detail_keep_tail_truncates_front() {
+        // Build a string substantially larger than the cap.
+        let big = "X".repeat(LAST_ERROR_DETAIL_MAX_BYTES * 2);
+        // Make the tail uniquely identifiable so we can confirm it survived.
+        let s = format!("{}TAIL_MARKER_END", big);
+        let out = truncate_error_detail_keep_tail(s.clone());
+        // The tail must be preserved verbatim.
+        assert!(
+            out.ends_with("TAIL_MARKER_END"),
+            "tail not preserved; got: {:?}",
+            &out[out.len().saturating_sub(40)..]
+        );
+        // The result must be near the cap (cap + small marker).
+        assert!(
+            out.len() <= LAST_ERROR_DETAIL_MAX_BYTES + 64,
+            "result too large: {}",
+            out.len()
+        );
+        // And a truncation marker must appear at the start so consumers know.
+        assert!(out.starts_with("[...truncated]"));
+    }
+
+    #[test]
+    fn test_slot_history_record_truncates_long_detail() {
+        let mut h = SlotHistory::new();
+        let big = "Y".repeat(LAST_ERROR_DETAIL_MAX_BYTES + 1024);
+        let detail = format!("{}END_OF_STDERR", big);
+        h.record(1.0, false, Some("err".into()), Some(detail));
+        let stored = h.last_error_detail.as_ref().expect("detail recorded");
+        assert!(stored.ends_with("END_OF_STDERR"));
+        assert!(stored.len() <= LAST_ERROR_DETAIL_MAX_BYTES + 64);
+    }
+
+    #[test]
+    fn test_slot_history_success_clears_no_detail() {
+        let mut h = SlotHistory::new();
+        h.record(1.0, true, None, Some("should be ignored".into()));
+        assert!(h.last_error_detail.is_none());
     }
 
     #[test]

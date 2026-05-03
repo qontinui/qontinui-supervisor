@@ -74,7 +74,7 @@ async fn test_concurrent_slot_acquisition() {
             // 4. Record history
             {
                 let mut h = slot.history.write().await;
-                h.record(0.1, true, None);
+                h.record(0.1, true, None, None);
             }
 
             // 5. Mark slot as not busy and update last_successful_slot
