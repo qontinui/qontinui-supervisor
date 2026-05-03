@@ -259,6 +259,12 @@ pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
 
 // Log constants
 const DEFAULT_LOG_BUFFER_SIZE: usize = 500;
+/// Default cap for the build-only log buffer. Cargo output is dense
+/// (thousands of lines per rebuild), so this is intentionally much larger
+/// than the supervisor-events buffer to keep the prior build's output
+/// available alongside the current one. Override via
+/// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE`.
+const DEFAULT_BUILD_LOG_BUFFER_SIZE: usize = 5000;
 
 /// Resolved log buffer size, read from `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`
 /// env var at first access. Clamped to [100, 10000], defaults to 500.
@@ -271,6 +277,27 @@ pub fn log_buffer_size() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.clamp(100, 10000))
             .unwrap_or(DEFAULT_LOG_BUFFER_SIZE)
+    })
+}
+
+/// Resolved build-only log buffer size, read from
+/// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE` env var at first access.
+/// Clamped to [500, 50000], defaults to 5000.
+///
+/// Build output (`LogSource::Build`) is segregated into its own buffer so a
+/// dense cargo rebuild (thousands of lines) does not evict supervisor-side
+/// events (placement preview HTTP traces, spawn lifecycle records, expo
+/// status, etc.) from the main 500-cap buffer. See `LogState` in
+/// `log_capture.rs`.
+pub fn build_log_buffer_size() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(500, 50000))
+            .unwrap_or(DEFAULT_BUILD_LOG_BUFFER_SIZE)
     })
 }
 

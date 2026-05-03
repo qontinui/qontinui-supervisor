@@ -11,7 +11,7 @@ use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
-use crate::config::log_buffer_size;
+use crate::config::{build_log_buffer_size, log_buffer_size};
 use crate::process::early_log::EarlyLogWriter;
 
 /// Append-only file writer shared across log readers. Uses a std::sync::Mutex
@@ -179,7 +179,16 @@ fn is_panic_line(line: &str) -> bool {
 }
 
 pub struct LogState {
+    /// Buffer for everything except `LogSource::Build`. Capacity from
+    /// `log_buffer_size()` (default 500).
     buffer: Arc<RwLock<VecDeque<LogEntry>>>,
+    /// Dedicated buffer for `LogSource::Build` entries. Capacity from
+    /// `build_log_buffer_size()` (default 5000). Cargo build output is dense
+    /// — segregating it keeps a single rebuild from evicting supervisor
+    /// events (placement preview, spawn lifecycle, expo status, etc.) from
+    /// the main buffer. The broadcast channel still receives every entry so
+    /// SSE consumers see one merged stream.
+    build_buffer: Arc<RwLock<VecDeque<LogEntry>>>,
     sender: broadcast::Sender<LogEntry>,
     /// Optional append-only file writer. When set, every entry pushed to the
     /// in-memory buffer is also written here. Arc<Mutex<File>> so clones of
@@ -210,6 +219,9 @@ impl LogState {
         let (sender, _) = broadcast::channel(256);
         Self {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(log_buffer_size()))),
+            build_buffer: Arc::new(RwLock::new(
+                VecDeque::with_capacity(build_log_buffer_size()),
+            )),
             sender,
             file_writer: std::sync::RwLock::new(None),
             early_log_writer: std::sync::RwLock::new(None),
@@ -262,12 +274,24 @@ impl LogState {
     }
 
     pub async fn push(&self, entry: LogEntry) {
-        let mut buf = self.buffer.write().await;
-        if buf.len() >= log_buffer_size() {
-            buf.pop_front();
+        // Route by source: `LogSource::Build` lands in the dedicated
+        // build_buffer (5000-cap default) so cargo's flood does not evict
+        // supervisor events from the main 500-cap buffer. Everything else
+        // goes to the main buffer. The broadcast channel below still
+        // receives every entry — SSE/stream consumers see one merged stream.
+        if entry.source == LogSource::Build {
+            let mut buf = self.build_buffer.write().await;
+            if buf.len() >= build_log_buffer_size() {
+                buf.pop_front();
+            }
+            buf.push_back(entry.clone());
+        } else {
+            let mut buf = self.buffer.write().await;
+            if buf.len() >= log_buffer_size() {
+                buf.pop_front();
+            }
+            buf.push_back(entry.clone());
         }
-        buf.push_back(entry.clone());
-        drop(buf);
 
         // Persist before broadcasting so a crashing receiver can't drop the line.
         if let Some(w) = self.current_writer() {
@@ -277,8 +301,31 @@ impl LogState {
         let _ = self.sender.send(entry);
     }
 
+    /// Returns the non-build history. Build output is segregated into
+    /// `build_history()` so that callers (and the dashboard's `/logs/history`
+    /// endpoint) are not flooded by cargo output during a rebuild.
     pub async fn history(&self) -> Vec<LogEntry> {
         self.buffer.read().await.iter().cloned().collect()
+    }
+
+    /// Returns only `LogSource::Build` entries from the dedicated build
+    /// buffer. Surfaces via `GET /logs/build/history`.
+    pub async fn build_history(&self) -> Vec<LogEntry> {
+        self.build_buffer.read().await.iter().cloned().collect()
+    }
+
+    /// Returns build + non-build entries merged in chronological order.
+    /// Convenience accessor for callers that want one stream over the live
+    /// state of both buffers (e.g. ad-hoc debugging dumps). Allocates O(n+m).
+    #[allow(dead_code)]
+    pub async fn merged_history(&self) -> Vec<LogEntry> {
+        let main = self.buffer.read().await;
+        let build = self.build_buffer.read().await;
+        let mut merged: Vec<LogEntry> = Vec::with_capacity(main.len() + build.len());
+        merged.extend(main.iter().cloned());
+        merged.extend(build.iter().cloned());
+        merged.sort_by_key(|e| e.timestamp);
+        merged
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
@@ -436,7 +483,14 @@ pub fn spawn_reader_with_source(
     classify: bool,
 ) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
-    let buffer = logs.buffer.clone();
+    // Route by source: `LogSource::Build` lands in the segregated build_buffer
+    // (5000-cap default); everything else uses the main buffer. See
+    // `LogState::push` for the same routing logic on the `emit` path.
+    let (buffer, buffer_cap) = if source == LogSource::Build {
+        (logs.build_buffer.clone(), build_log_buffer_size())
+    } else {
+        (logs.buffer.clone(), log_buffer_size())
+    };
     let file_writer = logs.current_writer();
     let source_name = format!("{:?}", source).to_lowercase();
 
@@ -463,7 +517,7 @@ pub fn spawn_reader_with_source(
 
                     {
                         let mut buf = buffer.write().await;
-                        if buf.len() >= log_buffer_size() {
+                        if buf.len() >= buffer_cap {
                             buf.pop_front();
                         }
                         buf.push_back(entry.clone());
