@@ -38,6 +38,14 @@ pub fn build_router(state: SharedState) -> Router {
         // Health
         .route("/health", get(crate::routes::health::health))
         .route("/health/stream", get(crate::routes::health::health_stream))
+        // LKG coverage helper for agents — see routes/lkg_coverage.rs.
+        // Single-call collapse of the manual "is my fix in the LKG?" rule
+        // documented under "Last-known-good (LKG) fallback for agents" in
+        // CLAUDE.md.
+        .route(
+            "/lkg/coverage",
+            get(crate::routes::lkg_coverage::lkg_coverage),
+        )
         // Runner lifecycle
         .route("/runner/stop", post(crate::routes::runner::stop_runner))
         .route(
