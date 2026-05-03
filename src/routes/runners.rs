@@ -898,6 +898,13 @@ pub struct SpawnTestRequest {
     ///   slot exe (`resolve_source_exe` ordering).
     #[serde(default)]
     pub use_lkg: bool,
+    /// When true, return HTTP 503 if the spawned runner would embed a stale
+    /// frontend (`frontend_stale: true` for any reason — build failure or
+    /// `src/` newer than `dist/`). Default false: stale-frontend spawns
+    /// proceed but the response carries `frontend_stale: true` + a
+    /// `frontend_stale_reason` so callers can branch.
+    #[serde(default)]
+    pub frontend_strict: bool,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1421,10 +1428,40 @@ pub async fn spawn_test(
     };
 
     // Determine if the slot we used for the binary has a stale frontend
-    // baked in. We consult `last_successful_slot` (the slot whose exe the
-    // spawn-start path copies) — if that slot's `frontend_stale` is true, the
-    // caller's runner is running with a potentially-old UI.
-    let (frontend_stale, stale_slot_id) = resolve_frontend_stale_for_spawn(&state).await;
+    // baked in (build failure) OR if `src/` is newer than `dist/index.html`
+    // (someone forgot to `npm run build`). Either way, the runner ships with
+    // a UI that doesn't reflect current source.
+    let (frontend_stale, stale_reason, stale_slot_id) =
+        resolve_frontend_stale_for_spawn(&state).await;
+
+    // frontend_strict: short-circuit with 503 before reporting success when
+    // the caller has explicitly opted into strict-frontend enforcement.
+    if frontend_stale && body.frontend_strict {
+        // Stop the runner we just spawned — strict mode means "don't ship a
+        // stale UI to the caller."
+        let _ = manager::stop_runner_by_id(&state, &id).await;
+        {
+            let mut runners = state.runners.write().await;
+            runners.remove(&id);
+        }
+        state.notify_health_change();
+        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
+        let body = json!({
+            "error": "frontend_stale",
+            "message": format!(
+                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
+                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
+                 or pass {{\"frontend_strict\": false}} to override.",
+                reason_str
+            ),
+            "frontend_stale": true,
+            "frontend_stale_reason": reason_str,
+            "stale_slot_id": stale_slot_id,
+        });
+        return Ok(
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+        );
+    }
 
     let mut resp = json!({
         "id": id,
@@ -1469,18 +1506,27 @@ pub async fn spawn_test(
         }
     }
 
-    // If the runner's binary came from a slot with a stale frontend, surface
-    // a loud top-level warning + header so calling agents see it immediately.
+    // Always emit `frontend_stale` so callers can branch on a predictable
+    // field shape rather than needing missing-field handling. When stale,
+    // also emit `frontend_stale_reason` for diagnostic surfaces and keep
+    // the existing `warnings` entry + `X-Frontend-Stale` header for
+    // backward compat with anyone parsing those today.
+    resp["frontend_stale"] = json!(frontend_stale);
     if frontend_stale {
-        let stale_msg = match stale_slot_id {
-            Some(sid) => format!(
-                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                sid
-            ),
-            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
+        resp["frontend_stale_reason"] = json!(reason_str);
+        let stale_msg = match stale_reason {
+            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
+                Some(sid) => format!(
+                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                    sid
+                ),
+                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+            },
+            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
         };
         resp["warnings"] = json!([stale_msg]);
-        resp["frontend_stale"] = json!(true);
 
         let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
         response
@@ -1492,22 +1538,139 @@ pub async fn spawn_test(
     Ok(Json(resp).into_response())
 }
 
-/// Inspect the build pool and return `(frontend_stale, slot_id)` describing
-/// the slot whose binary a caller of `spawn-test` / `spawn-named` will pick
-/// up. Prefers `last_successful_slot`; if that isn't set, reports true if
-/// any slot is stale (conservative — we can't pinpoint which slot's exe the
-/// resolver will choose from disk).
-async fn resolve_frontend_stale_for_spawn(state: &SharedState) -> (bool, Option<usize>) {
+/// Reason a `frontend_stale: true` was raised. `BuildFailed` corresponds to
+/// the existing slot-level flag set when `npm run build` errored; `SrcDrift`
+/// is the mtime-based check (any `src/**/*.{ts,tsx,css,json,html}` newer than
+/// `dist/index.html`). Reported back to callers via `frontend_stale_reason`.
+#[derive(Clone, Copy, Debug)]
+enum FrontendStaleReason {
+    BuildFailed,
+    SrcDrift,
+}
+
+impl FrontendStaleReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FrontendStaleReason::BuildFailed => "build_failed",
+            FrontendStaleReason::SrcDrift => "src_newer_than_dist",
+        }
+    }
+}
+
+/// Inspect the build pool and the on-disk dist mtime; return
+/// `(stale, reason, slot_id)` describing the spawn-test/spawn-named caller's
+/// effective frontend freshness. `stale` is the OR of:
+///
+/// 1. The slot-level `frontend_stale` flag (set by `build_monitor` when the
+///    most recent `npm run build` for that slot errored). Prefers
+///    `last_successful_slot`; falls back to "any slot stale" otherwise.
+/// 2. mtime drift: the newest mtime under `qontinui-runner/src/` is greater
+///    than `qontinui-runner/dist/index.html`'s mtime. This catches the common
+///    case where someone edited a `.tsx` file but never ran `npm run build`,
+///    so the dist on disk doesn't reflect current source.
+///
+/// `reason` distinguishes the two for diagnostic surfaces. `BuildFailed` wins
+/// when both are true (the error is more actionable than the drift). `slot_id`
+/// is populated only for the build-failure path; mtime-drift is per-checkout,
+/// not per-slot.
+async fn resolve_frontend_stale_for_spawn(
+    state: &SharedState,
+) -> (bool, Option<FrontendStaleReason>, Option<usize>) {
+    // (1) Build-failure flag first — most actionable signal.
     let last_successful = *state.build_pool.last_successful_slot.read().await;
     if let Some(sid) = last_successful {
         if let Some(slot) = state.build_pool.slots.iter().find(|s| s.id == sid) {
-            let stale = *slot.frontend_stale.read().await;
-            return (stale, Some(sid));
+            if *slot.frontend_stale.read().await {
+                return (true, Some(FrontendStaleReason::BuildFailed), Some(sid));
+            }
         }
+    } else if state.build_pool.any_slot_has_stale_frontend().await {
+        return (true, Some(FrontendStaleReason::BuildFailed), None);
     }
-    // Fall back to "any slot stale" — conservative but honest.
-    let any = state.build_pool.any_slot_has_stale_frontend().await;
-    (any, None)
+
+    // (2) mtime drift — `qontinui-runner/dist/index.html` vs newest mtime in
+    // `qontinui-runner/src/`. project_dir is `qontinui-runner/src-tauri/`, so
+    // the runner root is its parent.
+    let runner_root = match state.config.project_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return (false, None, None),
+    };
+    if check_src_newer_than_dist(&runner_root).await {
+        return (true, Some(FrontendStaleReason::SrcDrift), None);
+    }
+
+    (false, None, None)
+}
+
+/// True iff the newest mtime under `<runner_root>/src/` is later than
+/// `<runner_root>/dist/index.html`'s mtime. Walks `.ts`, `.tsx`, `.css`,
+/// `.json`, `.html` files only — touching unrelated assets shouldn't trip
+/// the signal. Returns false on any I/O error so callers don't get
+/// false-positive "stale" reports from a missing `src/` or missing
+/// `dist/index.html` (manual-build setups, fresh checkouts, etc.).
+async fn check_src_newer_than_dist(runner_root: &std::path::Path) -> bool {
+    use std::time::SystemTime;
+
+    let dist_index = runner_root.join("dist").join("index.html");
+    let src_root = runner_root.join("src");
+
+    let dist_mtime = match std::fs::metadata(&dist_index).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // no dist yet — let the build fail loudly elsewhere
+    };
+
+    // Walk synchronously — the supervisor spawn-test path is already async
+    // but the walk itself is short (a few hundred files at most). Using
+    // `tokio::task::spawn_blocking` to keep the runtime responsive.
+    let src_root = src_root.clone();
+    let newest_src = tokio::task::spawn_blocking(move || -> Option<SystemTime> {
+        let mut newest: Option<SystemTime> = None;
+        let mut stack = vec![src_root];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    // Skip node_modules / .git / generated dirs to keep the
+                    // walk bounded and avoid false positives from churn in
+                    // dependency trees.
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if matches!(name, "node_modules" | ".git" | "dist" | "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if ft.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if matches!(ext, "ts" | "tsx" | "css" | "json" | "html") {
+                        if let Ok(mtime) =
+                            std::fs::metadata(&path).and_then(|m| m.modified())
+                        {
+                            newest = Some(match newest {
+                                Some(n) if n >= mtime => n,
+                                _ => mtime,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        newest
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match newest_src {
+        Some(n) => n > dist_mtime,
+        None => false, // empty src tree — nothing to be stale relative to
+    }
 }
 
 /// Outcome of the post-spawn health probe.
@@ -1967,7 +2130,8 @@ pub async fn spawn_named(
         .ok()
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
-    let (frontend_stale, stale_slot_id) = resolve_frontend_stale_for_spawn(&state).await;
+    let (frontend_stale, stale_reason, stale_slot_id) =
+        resolve_frontend_stale_for_spawn(&state).await;
 
     let mut resp = json!({
         "id": id,
@@ -1992,16 +2156,26 @@ pub async fn spawn_named(
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
     }
 
+    // Symmetric with spawn_test: always emit `frontend_stale`, plus a
+    // diagnostic `frontend_stale_reason` when set. (Named runners don't get
+    // the `frontend_strict` opt-out yet — they're long-lived, so callers who
+    // care can pre-check the response and stop the runner explicitly.)
+    resp["frontend_stale"] = json!(frontend_stale);
     if frontend_stale {
-        let stale_msg = match stale_slot_id {
-            Some(sid) => format!(
-                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                sid
-            ),
-            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
+        resp["frontend_stale_reason"] = json!(reason_str);
+        let stale_msg = match stale_reason {
+            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
+                Some(sid) => format!(
+                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                    sid
+                ),
+                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+            },
+            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
         };
         resp["warnings"] = json!([stale_msg]);
-        resp["frontend_stale"] = json!(true);
 
         let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
         response
