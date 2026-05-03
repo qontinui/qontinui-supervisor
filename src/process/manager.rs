@@ -578,28 +578,14 @@ async fn forward_window_position_env(
         return;
     }
 
-    #[derive(serde::Deserialize)]
-    struct PlacementPreview {
-        global_x: i32,
-        global_y: i32,
-        width: u32,
-        height: u32,
-        #[serde(default)]
-        monitor_label: Option<String>,
-        #[serde(default)]
-        slot_label: Option<String>,
-        #[serde(default)]
-        source: Option<String>,
-        /// Per-placement decorations override. `None` = use runner default
-        /// (chrome on); `Some(true)` = chrome on; `Some(false)` = borderless.
-        /// We forward to the runner as `QONTINUI_WINDOW_DECORATIONS=0|1`.
-        #[serde(default)]
-        decorations: Option<bool>,
-    }
+    use qontinui_types::wire::placement::SpawnPlacementResponse;
 
     // Runner endpoints wrap responses in `{success, data, error?}`.
     // We deserialize the envelope and pull `data` out; falling back to
-    // bare-payload only if there's no envelope (forward-compat).
+    // bare-payload only if there's no envelope. The envelope itself stays
+    // a runner-side HTTP convention; the typed payload comes from
+    // `qontinui_types::wire::placement` so the runner and supervisor agree
+    // on the shape at compile time.
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum PlacementResponse {
@@ -607,14 +593,14 @@ async fn forward_window_position_env(
             #[serde(default)]
             success: bool,
             #[serde(default)]
-            data: Option<PlacementPreview>,
+            data: Option<SpawnPlacementResponse>,
             #[serde(default)]
             error: Option<String>,
         },
-        Bare(PlacementPreview),
+        Bare(SpawnPlacementResponse),
     }
 
-    let placement: PlacementPreview = match resp.json::<PlacementResponse>().await {
+    let placement: SpawnPlacementResponse = match resp.json::<PlacementResponse>().await {
         Ok(PlacementResponse::Wrapped {
             success,
             data: Some(p),

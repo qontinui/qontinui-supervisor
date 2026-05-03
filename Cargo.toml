@@ -32,7 +32,7 @@ glob = "0.3"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
-qontinui-types = { path = "../qontinui-schemas/rust" }
+qontinui-types = { path = "../wt-plan-item1-schemas/rust" }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
