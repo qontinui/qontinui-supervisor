@@ -558,19 +558,25 @@ async fn forward_window_position_env(
     drop(runners);
     let index = temp_count;
 
-    let url = format!("http://localhost:9876/spawn-placement/temp?index={index}&overflow=wrap");
-    let resp = match state
-        .http_client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
-        Ok(r) => r,
+    // The URL building, GET, envelope-vs-bare unwrap, and response typing
+    // all live behind `qontinui_runner_client::SpawnPlacementClient` so any
+    // future consumer (fleet UI, second supervisor, etc.) gets the same
+    // single typed call site instead of re-deriving the parsing logic.
+    // We keep the per-call 3s budget by wrapping the call in a short
+    // `tokio::time::timeout` — the shared `state.http_client` has a 10s
+    // default that we want to tighten for this latency-sensitive path
+    // (it's blocking spawn). Errors are still mapped to a logged "skip,
+    // fall back to runner default" branch so a slow runner never blocks
+    // a spawn.
+    use qontinui_runner_client::{Overflow, SpawnPlacementClient, SpawnPlacementClientError};
+
+    let base = match reqwest::Url::parse("http://localhost:9876") {
+        Ok(u) => u,
         Err(e) => {
+            // Static URL — this should never fail, but log defensively.
             let msg = format!(
-                "Spawn temp placement: skipping runner '{}' — request to {} failed: {}",
-                runner_name, url, e
+                "Spawn temp placement: skipping runner '{}' — runner base URL parse failed: {}",
+                runner_name, e
             );
             tracing::info!("{}", msg);
             state
@@ -580,54 +586,26 @@ async fn forward_window_position_env(
             return;
         }
     };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let msg = format!(
-            "Spawn temp placement: skipping runner '{}' — index {} returned {}: {}",
-            runner_name,
-            index,
-            status,
-            body.chars().take(200).collect::<String>()
-        );
-        tracing::info!("{}", msg);
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Info, msg)
-            .await;
-        return;
-    }
-
-    use qontinui_types::wire::placement::SpawnPlacementResponse;
-
-    // Runner endpoints wrap responses in `{success, data, error?}`.
-    // We deserialize the envelope and pull `data` out; falling back to
-    // bare-payload only if there's no envelope. The envelope itself stays
-    // a runner-side HTTP convention; the typed payload comes from
-    // `qontinui_types::wire::placement` so the runner and supervisor agree
-    // on the shape at compile time.
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum PlacementResponse {
-        Wrapped {
-            #[serde(default)]
-            success: bool,
-            #[serde(default)]
-            data: Option<SpawnPlacementResponse>,
-            #[serde(default)]
-            error: Option<String>,
-        },
-        Bare(SpawnPlacementResponse),
-    }
-
-    let placement: SpawnPlacementResponse = match resp.json::<PlacementResponse>().await {
-        Ok(PlacementResponse::Wrapped {
-            success,
-            data: Some(p),
-            ..
-        }) if success => p,
-        Ok(PlacementResponse::Wrapped { error, .. }) => {
+    let client = SpawnPlacementClient::new(base, state.http_client.clone());
+    let fetch = client.temp(index, Overflow::Wrap);
+    let placement = match tokio::time::timeout(std::time::Duration::from_secs(3), fetch).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(SpawnPlacementClientError::Status { status, body })) => {
+            let msg = format!(
+                "Spawn temp placement: skipping runner '{}' — index {} returned {}: {}",
+                runner_name,
+                index,
+                status,
+                body.chars().take(200).collect::<String>()
+            );
+            tracing::info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            return;
+        }
+        Ok(Err(SpawnPlacementClientError::EnvelopeError { error })) => {
             let msg = format!(
                 "Spawn temp placement: skipping runner '{}' — endpoint returned envelope without success/data (error={:?})",
                 runner_name, error
@@ -639,11 +617,35 @@ async fn forward_window_position_env(
                 .await;
             return;
         }
-        Ok(PlacementResponse::Bare(p)) => p,
-        Err(e) => {
+        Ok(Err(SpawnPlacementClientError::Parse(e))) => {
             let msg = format!(
                 "Spawn temp placement: skipping runner '{}' — failed to parse response: {}",
                 runner_name, e
+            );
+            tracing::info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            return;
+        }
+        Ok(Err(e)) => {
+            // Http(reqwest::Error) and Url(url::ParseError) both flow here.
+            let msg = format!(
+                "Spawn temp placement: skipping runner '{}' — request failed: {}",
+                runner_name, e
+            );
+            tracing::info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            return;
+        }
+        Err(_) => {
+            let msg = format!(
+                "Spawn temp placement: skipping runner '{}' — request to runner timed out after 3s",
+                runner_name
             );
             tracing::info!("{}", msg);
             state
