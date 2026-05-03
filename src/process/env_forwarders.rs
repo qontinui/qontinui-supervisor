@@ -239,11 +239,8 @@ impl EnvForwarder for WindowPositionEnv {
             };
             let client = SpawnPlacementClient::new(base, state.http_client.clone());
             let fetch = client.temp(index, Overflow::Wrap);
-            let placement = match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                fetch,
-            )
-            .await
+            let placement = match tokio::time::timeout(std::time::Duration::from_secs(3), fetch)
+                .await
             {
                 Ok(Ok(p)) => p,
                 Ok(Err(SpawnPlacementClientError::Status { status, body })) => {
