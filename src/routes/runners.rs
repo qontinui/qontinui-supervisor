@@ -2231,6 +2231,9 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             "last_completed_at": history_snapshot.last_completed_at.map(|t| t.to_rfc3339()),
             "last_error": history_snapshot.last_error,
             "last_error_detail": history_snapshot.last_error_detail,
+            // Inline ~1 KiB tail of the most recent FAILED build's stderr.
+            // Cleared on subsequent success. Full log: GET /builds/{id}/log.
+            "last_error_log": history_snapshot.last_error_log,
         });
 
         let slot_json = match info_opt {
@@ -2294,6 +2297,51 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "slots": slots_json,
         "lkg": lkg_json,
     }))
+}
+
+/// GET /builds/{slot_id}/log — return the in-memory combined log of the
+/// most recent build attempt on this slot (success or failure).
+///
+/// Reads `BuildSlot::last_build_log`, populated by `run_build_inner`. Reset
+/// at the start of each build so a reader hitting this endpoint mid-build
+/// gets `null` rather than stale bytes from the previous attempt. Persists
+/// across builds on the same slot until the next build replaces it; lost on
+/// supervisor restart (use `GET /builds/{slot_id}/last-build-stderr` for the
+/// disk-persisted failure log).
+///
+/// Response: `{ slot_id, log: Option<String>, captured_at: Option<String> }`
+/// — `captured_at` is the build-completion timestamp in RFC3339, `null` when
+/// no build has finished on this slot yet (or one is in flight). 404 when
+/// `slot_id` is out of range.
+pub async fn slot_build_log(
+    State(state): State<SharedState>,
+    Path(slot_id): Path<usize>,
+) -> impl IntoResponse {
+    let slot = match state.build_pool.slots.get(slot_id) {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "slot_not_found",
+                    "slot_id": slot_id,
+                    "pool_size": state.build_pool.slots.len(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let captured = slot.last_build_log.read().await.clone();
+    let (log, captured_at) = match captured {
+        Some((ts, log)) => (Some(log), Some(ts.to_rfc3339())),
+        None => (None, None),
+    };
+    Json(json!({
+        "slot_id": slot_id,
+        "log": log,
+        "captured_at": captured_at,
+    }))
+    .into_response()
 }
 
 /// GET /builds/{slot_id}/last-build-stderr — return the persisted cargo
