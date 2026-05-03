@@ -62,6 +62,10 @@ pub fn build_router(state: SharedState) -> Router {
         )
         // Logs
         .route("/logs/history", get(crate::routes::logs::log_history))
+        .route(
+            "/logs/build/history",
+            get(crate::routes::logs::build_log_history),
+        )
         .route("/logs/stream", get(crate::routes::logs::log_stream))
         .route("/logs/file/{type}", get(crate::routes::logs::log_file))
         .route("/logs/files", get(crate::routes::logs::log_files))

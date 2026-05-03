@@ -18,12 +18,36 @@ fn default_limit() -> usize {
     100
 }
 
-/// GET /logs/history — return recent log entries from circular buffer.
+/// GET /logs/history — return recent entries from the supervisor-events
+/// buffer.
+///
+/// Build output (`LogSource::Build`) is segregated into its own buffer so a
+/// dense cargo rebuild does not evict supervisor events here. Use
+/// `GET /logs/build/history` to inspect the build buffer; the SSE stream at
+/// `GET /logs/stream` continues to deliver every source merged.
 pub async fn log_history(
     State(state): State<SharedState>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<serde_json::Value> {
     let entries = state.logs.history().await;
+    let total = entries.len();
+    let entries: Vec<_> = entries.into_iter().rev().take(query.limit).collect();
+
+    Json(serde_json::json!({
+        "entries": entries,
+        "total": total,
+        "limit": query.limit,
+    }))
+}
+
+/// GET /logs/build/history — return recent entries from the build-only
+/// buffer (`LogSource::Build`). Capacity defaults to 5000, override via
+/// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE`.
+pub async fn build_log_history(
+    State(state): State<SharedState>,
+    Query(query): Query<HistoryQuery>,
+) -> Json<serde_json::Value> {
+    let entries = state.logs.build_history().await;
     let total = entries.len();
     let entries: Vec<_> = entries.into_iter().rev().take(query.limit).collect();
 
