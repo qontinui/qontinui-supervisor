@@ -4,12 +4,11 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{
-    RunnerConfig, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
-};
+use crate::config::{RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::env_forwarders;
 use crate::process::port::wait_for_port_free;
 use crate::process::windows::{
     kill_by_pid, kill_by_port, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
@@ -408,328 +407,12 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 // Per-Runner Process Management (multi-runner)
 // =============================================================================
 
-/// Forward test auto-login credentials to a spawned non-primary runner.
-///
-/// Sets `QONTINUI_TEST_AUTO_LOGIN_EMAIL` / `QONTINUI_TEST_AUTO_LOGIN_PASSWORD`
-/// on the child, which the runner's Tauri backend exposes via
-/// `get_test_auto_login` so the React AuthProvider can auto-authenticate
-/// temp/named runners for UI Bridge inspection of authenticated pages.
-///
-/// Resolution order (first hit wins):
-///   1. Runtime-configured creds via `POST /test-login` — explicit opt-in.
-///   2. The runner's own `.env` file: `VITE_DEV_EMAIL` + `VITE_DEV_PASSWORD`
-///      — resolved from `<project_dir>/../.env`. This is the same account the
-///      runner frontend is baked against, so non-primary runners reliably
-///      auto-login with zero extra supervisor setup. `.env` wins over
-///      ambient shell env vars because stale shell vars (e.g. leftover from
-///      an earlier test session) otherwise silently override the
-///      project-intended account.
-///   3. Supervisor process env vars: `QONTINUI_TEST_LOGIN_EMAIL` +
-///      `QONTINUI_TEST_LOGIN_PASSWORD` — last-resort fallback, e.g. for
-///      CI where no `.env` is checked out.
-///
-/// SECURITY: Never forwarded to primary runners. The supervisor is a
-/// development-only tool; these credentials are dev-account only and never
-/// reach a production binary.
-/// Apply the caller-supplied `extra_env` map to the spawn command.
-///
-/// Called last (after `forward_restate_env` and the hardcoded env chain) so
-/// callers can override anything the supervisor set — including
-/// `QONTINUI_SERVER_MODE`, `QONTINUI_API_URL`, etc. The main consumer is
-/// `POST /runners/spawn-test` with a body like
-/// `{"extra_env": {"QONTINUI_SCRIPTED_OUTPUT": "1"}}`.
-pub fn forward_extra_env(cmd: &mut Command, config: &RunnerConfig) {
-    for (k, v) in &config.extra_env {
-        cmd.env(k, v);
-    }
-}
-
-/// Decide and set `QONTINUI_RUNNER_LOG_DIR` for the spawned runner, plus
-/// `QONTINUI_RUNNER_ID` so the runner's panic hook can tag its output.
-///
-/// Resolution:
-/// * If `config.log_dir` is set on the supervisor (`--log-dir <dir>`), use
-///   `<log-dir>/runner-<id>/`. The per-runner subdir avoids clobbering a
-///   sibling runner's `runner-panic.log` when several test runners panic
-///   in quick succession.
-/// * Otherwise the runner's default path is fine — we still set
-///   `QONTINUI_RUNNER_ID` so any diagnostic tooling can correlate.
-///
-/// Returns the path the supervisor should check for `runner-panic.log`
-/// when the process exits, or `None` when we deferred to the default.
-fn forward_panic_log_env(
-    cmd: &mut Command,
-    state: &crate::state::SharedState,
-    runner_id: &str,
-) -> Option<std::path::PathBuf> {
-    cmd.env("QONTINUI_RUNNER_ID", runner_id);
-    if let Some(log_dir) = state.config.log_dir.as_ref() {
-        let per_runner = log_dir.join(format!("runner-{}", runner_id));
-        let _ = std::fs::create_dir_all(&per_runner);
-        cmd.env("QONTINUI_RUNNER_LOG_DIR", &per_runner);
-        Some(per_runner)
-    } else {
-        None
-    }
-}
-
-pub fn forward_restate_env(cmd: &mut Command, config: &RunnerConfig) {
-    if !config.server_mode {
-        return;
-    }
-    if let Some(p) = config.restate_ingress_port {
-        cmd.env("QONTINUI_RESTATE_INGRESS_PORT", p.to_string());
-    }
-    if let Some(p) = config.restate_admin_port {
-        cmd.env("QONTINUI_RESTATE_ADMIN_PORT", p.to_string());
-    }
-    if let Some(p) = config.restate_service_port {
-        cmd.env("QONTINUI_RESTATE_SERVICE_PORT", p.to_string());
-    }
-    if let Some(ref u) = config.external_restate_admin_url {
-        cmd.env("QONTINUI_RESTATE_EXTERNAL_ADMIN_URL", u);
-    }
-    if let Some(ref u) = config.external_restate_ingress_url {
-        cmd.env("QONTINUI_RESTATE_EXTERNAL_INGRESS_URL", u);
-    }
-    cmd.env("QONTINUI_SERVER_MODE", "1");
-}
-
-/// Fetch placement for a TEMP runner from the primary runner's
-/// `/spawn-placement/temp` endpoint, then push its rect as
-/// QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT. The runner reads these at window-build
-/// time.
-///
-/// **Temp-only.** Callers MUST gate this on `is_temp_runner(...)` —
-/// applying a temp placement to a named runner would override that
-/// runner's own per-instance `spawn_placement` (see runner-side
-/// `RunnerInstanceConfig.spawn_placement`). Named runners read their
-/// own placement from settings.json on startup.
-///
-/// The temp placement list is its own 0-indexed array dedicated to temp
-/// runners (the named-instance preview UI flow uses `/spawn-placement/preview`
-/// separately). We use `count(test-* runners)` as the index so the first
-/// temp runner lands on index 0, the second on index 1, etc.
-/// `overflow=wrap` makes the runner cycle through configured placements
-/// when there are more temp runners than entries.
-///
-/// On any failure (404 — no temp placements configured / index out of
-/// range without wrap, 502, network error, timeout, parse error) we log
-/// and skip — the runner falls back to its built-in default behavior.
-/// Never fails the spawn. We do NOT fall back to the slot endpoint;
-/// the temp list is the dedicated source of truth for temp spawn placement.
-async fn forward_window_position_env(
-    cmd: &mut Command,
-    state: &SharedState,
-    runner_id: &str,
-    runner_name: &str,
-) {
-    // Count existing test-* runners EXCLUDING the one we're about to spawn.
-    // `start_managed_runner` pre-inserts the new runner into `state.runners`
-    // (defensive re-insertion against the spawn-test 404 race), so a naive
-    // count would include the runner-to-be and shift every spawn one index
-    // off — the first temp would land on index 1 instead of 0.
-    let runners = state.runners.read().await;
-    let temp_count = runners
-        .keys()
-        .filter(|id| id.starts_with("test-") && id.as_str() != runner_id)
-        .count();
-    drop(runners);
-    let index = temp_count;
-
-    let url = format!("http://localhost:9876/spawn-placement/temp?index={index}&overflow=wrap");
-    let resp = match state
-        .http_client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!(
-                "Spawn temp placement: skipping runner '{}' — request to {} failed: {}",
-                runner_name, url, e
-            );
-            tracing::info!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Info, msg)
-                .await;
-            return;
-        }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let msg = format!(
-            "Spawn temp placement: skipping runner '{}' — index {} returned {}: {}",
-            runner_name,
-            index,
-            status,
-            body.chars().take(200).collect::<String>()
-        );
-        tracing::info!("{}", msg);
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Info, msg)
-            .await;
-        return;
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PlacementPreview {
-        global_x: i32,
-        global_y: i32,
-        width: u32,
-        height: u32,
-        #[serde(default)]
-        monitor_label: Option<String>,
-        #[serde(default)]
-        slot_label: Option<String>,
-        #[serde(default)]
-        source: Option<String>,
-        /// Per-placement decorations override. `None` = use runner default
-        /// (chrome on); `Some(true)` = chrome on; `Some(false)` = borderless.
-        /// We forward to the runner as `QONTINUI_WINDOW_DECORATIONS=0|1`.
-        #[serde(default)]
-        decorations: Option<bool>,
-    }
-
-    // Runner endpoints wrap responses in `{success, data, error?}`.
-    // We deserialize the envelope and pull `data` out; falling back to
-    // bare-payload only if there's no envelope (forward-compat).
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum PlacementResponse {
-        Wrapped {
-            #[serde(default)]
-            success: bool,
-            #[serde(default)]
-            data: Option<PlacementPreview>,
-            #[serde(default)]
-            error: Option<String>,
-        },
-        Bare(PlacementPreview),
-    }
-
-    let placement: PlacementPreview = match resp.json::<PlacementResponse>().await {
-        Ok(PlacementResponse::Wrapped {
-            success,
-            data: Some(p),
-            ..
-        }) if success => p,
-        Ok(PlacementResponse::Wrapped { error, .. }) => {
-            let msg = format!(
-                "Spawn temp placement: skipping runner '{}' — endpoint returned envelope without success/data (error={:?})",
-                runner_name, error
-            );
-            tracing::info!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Info, msg)
-                .await;
-            return;
-        }
-        Ok(PlacementResponse::Bare(p)) => p,
-        Err(e) => {
-            let msg = format!(
-                "Spawn temp placement: skipping runner '{}' — failed to parse response: {}",
-                runner_name, e
-            );
-            tracing::info!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Info, msg)
-                .await;
-            return;
-        }
-    };
-
-    let msg = format!(
-        "Spawn temp placement: runner '{}' index={} (label={:?}, monitor={:?}, source={:?}) at ({},{}) {}x{}",
-        runner_name,
-        index,
-        placement.slot_label,
-        placement.monitor_label,
-        placement.source,
-        placement.global_x,
-        placement.global_y,
-        placement.width,
-        placement.height
-    );
-    tracing::info!("{}", msg);
-    state
-        .logs
-        .emit(LogSource::Supervisor, LogLevel::Info, msg)
-        .await;
-
-    cmd.env("QONTINUI_WINDOW_X", placement.global_x.to_string());
-    cmd.env("QONTINUI_WINDOW_Y", placement.global_y.to_string());
-    cmd.env("QONTINUI_WINDOW_WIDTH", placement.width.to_string());
-    cmd.env("QONTINUI_WINDOW_HEIGHT", placement.height.to_string());
-    if let Some(d) = placement.decorations {
-        cmd.env("QONTINUI_WINDOW_DECORATIONS", if d { "1" } else { "0" });
-    }
-}
-
-fn forward_test_auto_login_env(cmd: &mut Command, state: &SharedState) {
-    // Priority 1: runtime-configured credentials (set via POST /test-login).
-    if let Ok(guard) = state.test_auto_login.try_read() {
-        if let Some((ref email, ref password)) = *guard {
-            cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-            cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-            return;
-        }
-    }
-    // Priority 2: the runner's own `.env` file. Same account the baked
-    // VITE_DEV_EMAIL/PASSWORD point at, so temp/named runners pick up the
-    // live dev credentials without extra supervisor setup. Wins over loose
-    // shell env vars because project-intent > ambient-shell.
-    if let Some((email, password)) = read_runner_env_creds(&state.config.project_dir) {
-        cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-        cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-        return;
-    }
-    // Priority 3: supervisor process env vars. Last-resort fallback for
-    // environments where `.env` isn't checked out (CI).
-    if let (Ok(email), Ok(password)) = (
-        std::env::var("QONTINUI_TEST_LOGIN_EMAIL"),
-        std::env::var("QONTINUI_TEST_LOGIN_PASSWORD"),
-    ) {
-        if !email.is_empty() && !password.is_empty() {
-            cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-            cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-        }
-    }
-}
-
-/// Read `VITE_DEV_EMAIL` / `VITE_DEV_PASSWORD` from the runner's `.env` file.
-/// `project_dir` points at `<runner>/src-tauri`; `.env` lives at its parent.
-/// Returns `None` if the file is missing, unreadable, or either key is absent.
-fn read_runner_env_creds(project_dir: &std::path::Path) -> Option<(String, String)> {
-    let env_path = project_dir.parent()?.join(".env");
-    let content = std::fs::read_to_string(env_path).ok()?;
-    let mut email: Option<String> = None;
-    let mut password: Option<String> = None;
-    for raw_line in content.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = match line.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim().trim_matches(|c| c == '"' || c == '\'')),
-            None => continue,
-        };
-        match key {
-            "VITE_DEV_EMAIL" if !value.is_empty() => email = Some(value.to_string()),
-            "VITE_DEV_PASSWORD" if !value.is_empty() => password = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    Some((email?, password?))
-}
+// Per-runner env forwarders moved to `process::env_forwarders`. See
+// [`crate::process::env_forwarders::EnvForwarder`] and
+// [`crate::process::env_forwarders::default_env_forwarders`]. Every spawned
+// runner runs the same registered list once in `start_exe_mode_for_runner`,
+// replacing the previous five hand-written `forward_*_env` functions and
+// the duplicated cfg(windows) / cfg(not(windows)) call-site chains.
 
 /// Start a specific runner by ID.
 ///
@@ -1083,63 +766,51 @@ async fn start_exe_mode_for_runner(
         managed.config.name, exe_path, managed.config.port
     );
 
+    let mut cmd = Command::new(&exe_path);
+    cmd.current_dir(&state.config.project_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("CLAUDECODE")
+        .env("QONTINUI_PORT", managed.config.port.to_string())
+        .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
+
+    // Windows-only creation flags: detach from console (no flash window) +
+    // own process group (so the supervisor can send Ctrl-Break for graceful
+    // shutdown without killing siblings).
     #[cfg(windows)]
-    let (child, panic_log_dir) = {
+    {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
 
-        let mut cmd = Command::new(&exe_path);
-        cmd.current_dir(&state.config.project_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", managed.config.port.to_string())
-            .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
-
-        // Test-auto-login credentials apply to every supervisor-spawned
-        // runner, primary or not. The runner's AuthProvider reads them via
-        // `get_test_auto_login` and uses them only when no other auth state
-        // exists, so this can't override an interactively-logged-in user.
-        // Forwarding to the primary lets `POST /test-login` propagate
-        // without a runner rebuild even when the supervisor is configured
-        // to manage the primary.
-        forward_test_auto_login_env(&mut cmd, state);
-
-        // Non-primary runners get QONTINUI_INSTANCE_NAME to skip scheduler
-        // and QONTINUI_PRIMARY_PORT so they can proxy process commands to the primary
-        if !managed.config.is_primary {
-            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            // Find the primary runner's port for process log proxying.
-            //
-            // The user-started primary isn't in the supervisor's runners
-            // registry (the supervisor only tracks runners IT spawned),
-            // so `state.get_primary()` returns None on most setups. Fall
-            // back to the conventional default port — the runner's
-            // `process_capture::primary_proxy::is_secondary()` requires
-            // BOTH env vars to be set, so leaving the port unset would
-            // cause every secondary to silently behave as a primary
-            // (re-introducing the wrappers-dir contention this var was
-            // added to fix).
-            let primary_port = state
-                .get_primary()
-                .await
-                .map(|p| p.config.port)
-                .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
-            cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
-            // Only temp runners (test-*) consume the supervisor's temp
-            // placement list. Named runners have their own per-instance
-            // `spawn_placement` and look it up runner-side from settings.
-            if is_temp_runner(&managed.config.id) {
-                forward_window_position_env(
-                    &mut cmd,
-                    state,
-                    &managed.config.id,
-                    &managed.config.name,
-                )
-                .await;
-            }
-        }
+    // Inline non-forwarder env vars. Test-auto-login credentials are pulled
+    // by `TestAutoLoginEnv` below and apply to every supervisor-spawned
+    // runner — primary included — for the rationale documented on the
+    // forwarder type.
+    //
+    // Non-primary runners additionally get `QONTINUI_INSTANCE_NAME` to skip
+    // the scheduler and `QONTINUI_PRIMARY_PORT` so they can proxy process
+    // commands to the primary.
+    if !managed.config.is_primary {
+        cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
+        // Find the primary runner's port for process log proxying.
+        //
+        // The user-started primary isn't in the supervisor's runners
+        // registry (the supervisor only tracks runners IT spawned),
+        // so `state.get_primary()` returns None on most setups. Fall
+        // back to the conventional default port — the runner's
+        // `process_capture::primary_proxy::is_secondary()` requires
+        // BOTH env vars to be set, so leaving the port unset would
+        // cause every secondary to silently behave as a primary
+        // (re-introducing the wrappers-dir contention this var was
+        // added to fix).
+        let primary_port = state
+            .get_primary()
+            .await
+            .map(|p| p.config.port)
+            .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
+        cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
 
         // Per-runner WebView2 data dir — non-primary runners get isolated
         // localStorage, IndexedDB, cookies, and caches. Primary keeps the
@@ -1147,93 +818,48 @@ async fn start_exe_mode_for_runner(
         // is preserved. This prevents state bleed-over when spawning temp
         // test runners and eliminates the "216 restored terminals" problem
         // where one runner's persisted UI state floods every other runner.
-        if let Some(webview_dir) =
-            webview2_user_data_folder(&managed.config.id, managed.config.is_primary)
-        {
-            if !managed.config.is_primary {
-                // Ensure the folder exists so WebView2 doesn't race to create
-                // it against the parent dir's permissions.
-                if let Err(e) = std::fs::create_dir_all(&webview_dir) {
-                    warn!(
-                        "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
-                        webview_dir, managed.config.name, e
-                    );
-                }
-                info!(
-                    "Runner '{}' using isolated WebView2 data dir: {:?}",
-                    managed.config.name, webview_dir
+        // On non-Windows the variable is ignored by other webview backends,
+        // so this is harmless but keeps behavior consistent.
+        if let Some(webview_dir) = webview2_user_data_folder(&managed.config.id, false) {
+            // Ensure the folder exists so WebView2 doesn't race to create
+            // it against the parent dir's permissions.
+            if let Err(e) = std::fs::create_dir_all(&webview_dir) {
+                warn!(
+                    "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
+                    webview_dir, managed.config.name, e
                 );
-                cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
             }
+            info!(
+                "Runner '{}' using isolated WebView2 data dir: {:?}",
+                managed.config.name, webview_dir
+            );
+            cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
         }
+    }
 
-        forward_restate_env(&mut cmd, &managed.config);
-        // Startup-panic telemetry: tell the runner where to drop
-        // `runner-panic.log` so `monitor_runner_process_exit` can pick it up.
-        let panic_log_dir = forward_panic_log_env(&mut cmd, state, &managed.config.id);
-        forward_extra_env(&mut cmd, &managed.config);
+    // Apply the registered env forwarders. Order is load-bearing — see
+    // `process::env_forwarders` for the per-forwarder rationale. Adding a
+    // new forwarder is one struct + one registration line in
+    // `default_env_forwarders`, replacing the previous five-place edit
+    // (forwarder fn + two cfg-gated call sites + state.rs storage).
+    for forwarder in env_forwarders::default_env_forwarders() {
+        debug!(
+            "applying env forwarder '{}' for runner '{}'",
+            forwarder.name(),
+            managed.config.name
+        );
+        forwarder.apply(&mut cmd, state, managed).await;
+    }
 
-        (
-            cmd.spawn()
-                .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?,
-            panic_log_dir,
-        )
-    };
+    // `PanicLogEnv` stashed the resolved per-runner panic-log path on
+    // `managed.panic_log_dir` while applying — read it back so
+    // `monitor_runner_process_exit` can find `runner-panic.log` after a
+    // non-zero exit. Cloning out keeps the lock held for the minimum span.
+    let panic_log_dir = managed.panic_log_dir.read().await.clone();
 
-    #[cfg(not(windows))]
-    let (child, panic_log_dir) = {
-        let mut cmd = Command::new(&exe_path);
-        cmd.current_dir(&state.config.project_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("CLAUDECODE")
-            .env("QONTINUI_PORT", managed.config.port.to_string())
-            .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
-
-        // See Windows branch for rationale: every supervisor-spawned runner
-        // gets test-auto-login creds, including the primary.
-        forward_test_auto_login_env(&mut cmd, state);
-
-        if !managed.config.is_primary {
-            cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
-            // See Windows branch above for the fallback rationale.
-            let primary_port = state
-                .get_primary()
-                .await
-                .map(|p| p.config.port)
-                .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
-            cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
-            // Only temp runners (test-*) consume the supervisor's temp
-            // placement list. Named runners have their own per-instance
-            // `spawn_placement` and look it up runner-side from settings.
-            if is_temp_runner(&managed.config.id) {
-                forward_window_position_env(
-                    &mut cmd,
-                    state,
-                    &managed.config.id,
-                    &managed.config.name,
-                )
-                .await;
-            }
-            // Per-runner WebView2 data dir (see Windows branch for rationale).
-            // On non-Windows the variable is ignored by other webview backends,
-            // so this is harmless but keeps behavior consistent.
-            if let Some(webview_dir) = webview2_user_data_folder(&managed.config.id, false) {
-                let _ = std::fs::create_dir_all(&webview_dir);
-                cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
-            }
-        }
-
-        forward_restate_env(&mut cmd, &managed.config);
-        let panic_log_dir = forward_panic_log_env(&mut cmd, state, &managed.config.id);
-        forward_extra_env(&mut cmd, &managed.config);
-
-        (
-            cmd.spawn()
-                .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?,
-            panic_log_dir,
-        )
-    };
+    let child = cmd
+        .spawn()
+        .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?;
 
     Ok(SpawnResult {
         child,
