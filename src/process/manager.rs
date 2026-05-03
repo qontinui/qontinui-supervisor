@@ -21,11 +21,32 @@ use crate::state::{ManagedRunner, SharedState};
 // Runner Category Helpers
 // =============================================================================
 
+/// Classify a runner from its supervisor-assigned id.
+///
+/// Single source of truth for the prefix scheme — see
+/// [`qontinui_types::wire::runner_kind::RunnerKind`] for the full mapping
+/// and `routes::runners` for where the ids are constructed.
+///
+/// Note: this drops back to [`RunnerKind::from_id`] verbatim and exists
+/// primarily to give callers a stable supervisor-side import path. For
+/// classification that needs the user-friendly display name, prefer
+/// [`RunnerConfig::kind`] which can mirror it from `RunnerConfig.name`.
+#[allow(dead_code)] // Item 2: helper exposed for follow-up migration of `is_primary` checks.
+pub fn runner_kind(runner_id: &str) -> qontinui_types::wire::runner_kind::RunnerKind {
+    qontinui_types::wire::runner_kind::RunnerKind::from_id(runner_id)
+}
+
 /// Returns true if this runner is a temp/test runner managed by the supervisor.
 /// Only temp runners can be started, stopped, or restarted by the supervisor.
 /// All other runners (primary, user-opened) are observe-only.
+///
+/// Thin wrapper over [`runner_kind`] — kept as a standalone helper because
+/// the boolean form is the most common predicate in the supervisor and
+/// avoids a `match` ceremony at every call site. Migrating call sites to
+/// `match runner_kind(id) { RunnerKind::Temp { .. } => ... }` is a
+/// follow-up; out of scope for Item 2.
 pub fn is_temp_runner(runner_id: &str) -> bool {
-    runner_id.starts_with("test-")
+    runner_kind(runner_id).is_temp()
 }
 
 /// Binary metadata for diagnostics — lets callers detect stale binaries.
