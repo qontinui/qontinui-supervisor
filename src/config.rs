@@ -118,6 +118,13 @@ impl Default for BuildPoolConfig {
 }
 
 /// Configuration for a single managed runner instance.
+///
+/// Note: `is_primary: bool` is retained for serde compat with the on-disk
+/// `settings.json` file format. Switching this to a `RunnerKind` field would
+/// break older settings files; the cleaner migration is a one-shot
+/// settings.json rewrite (per the plan's guiding priorities) tracked as a
+/// follow-up to Item 2. The [`RunnerConfig::kind`] method provides the
+/// `RunnerKind` view without changing the on-disk shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
     pub id: String,
@@ -156,6 +163,29 @@ pub struct RunnerConfig {
 }
 
 impl RunnerConfig {
+    /// Classify this runner.
+    ///
+    /// Combines the legacy `is_primary` boolean (which wins if true) with
+    /// the id-prefix scheme handled by [`RunnerKind::from_id`]. For
+    /// `RunnerKind::Named`, the user-friendly display name from
+    /// [`RunnerConfig::name`] is mirrored into the variant rather than the
+    /// raw `named-{port}-{uuid}` id, since that's what callers actually want
+    /// for UI/logs.
+    #[allow(dead_code)] // Item 2: helper exposed for follow-up migration of `is_primary` checks.
+    pub fn kind(&self) -> qontinui_types::wire::runner_kind::RunnerKind {
+        use qontinui_types::wire::runner_kind::RunnerKind;
+        if self.is_primary {
+            return RunnerKind::Primary;
+        }
+        match RunnerKind::from_id(&self.id) {
+            // Override Named's name with the friendly display name.
+            RunnerKind::Named { .. } => RunnerKind::Named {
+                name: self.name.clone(),
+            },
+            other => other,
+        }
+    }
+
     /// Create the default primary runner config.
     pub fn default_primary() -> Self {
         Self {
