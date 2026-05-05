@@ -62,10 +62,10 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             // Client messages — handle ping/pong/close
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
+                    Some(Ok(Message::Ping(data)))
+                        if socket.send(Message::Pong(data.clone())).await.is_err() =>
+                    {
+                        break;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
