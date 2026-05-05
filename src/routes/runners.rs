@@ -442,6 +442,7 @@ pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, 
         let port = managed.config.port;
 
         // Best-effort kill anything still on the port
+        #[cfg(target_os = "windows")]
         let _ = crate::process::windows::kill_by_port(port).await;
 
         // Preserve logs for post-mortem. purge-stale only targets test runners
