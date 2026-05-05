@@ -22,9 +22,7 @@ use crate::process::manager;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
 use std::sync::Arc;
-use tracing::info;
-#[cfg(windows)]
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Deserialize)]
 pub struct AddRunnerRequest {
