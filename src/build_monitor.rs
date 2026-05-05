@@ -10,6 +10,7 @@ use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+#[cfg(target_os = "windows")]
 use crate::process::windows::{
     cleanup_orphaned_build_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
 };
@@ -160,6 +161,7 @@ pub async fn run_cargo_build_with_requester(
     stop_exe_runners_for_build(state).await;
 
     // Cleanup orphaned build processes first
+    #[cfg(target_os = "windows")]
     cleanup_orphaned_build_processes().await;
 
     // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit).
@@ -167,10 +169,13 @@ pub async fn run_cargo_build_with_requester(
     // Returns Err only if the holder is a user-managed primary/named runner; in that case we
     // skip cargo entirely so we don't masquerade a pre-build conflict as a build failure.
     let build_start = std::time::Instant::now();
+    #[cfg(target_os = "windows")]
     let result = match free_slot_exe(state, &slot).await {
         Ok(()) => run_build_inner(state, &slot).await,
         Err(e) => Err(e),
     };
+    #[cfg(not(target_os = "windows"))]
+    let result = run_build_inner(state, &slot).await;
     let duration_secs = build_start.elapsed().as_secs_f64();
 
     // Pull any captured cargo stderr the inner build deposited so it can be
@@ -651,6 +656,7 @@ fn tail_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
 ///   error, and let the operator decide. (This shouldn't happen because
 ///   non-temp runners also use copied exes; if it does, Fix B should
 ///   prevent it from recurring.)
+#[cfg(target_os = "windows")]
 async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
     let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
     if !exe_path.exists() {
@@ -872,7 +878,15 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
 /// this file can read like `resolve_pid_exe_path(pid)` and the sysinfo
 /// plumbing lives in one place.
 async fn resolve_pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
-    pid_exe_path(pid).await
+    #[cfg(target_os = "windows")]
+    {
+        pid_exe_path(pid).await
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 // =============================================================================
