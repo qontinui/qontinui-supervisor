@@ -358,7 +358,6 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             }
 
             let id = managed.config.id.clone();
-            #[cfg(target_os = "windows")]
             let name = managed.config.name.clone();
             let port = managed.config.port;
 
