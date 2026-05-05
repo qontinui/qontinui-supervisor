@@ -313,6 +313,17 @@ pub const RECENT_BUILD_SAMPLE_COUNT: usize = 10;
 /// failure message lives in cargo output) is preserved.
 pub const LAST_ERROR_DETAIL_MAX_BYTES: usize = 4 * 1024;
 
+/// Cap on `SlotHistory::last_error_log` size. Sized for inline surfacing in
+/// `GET /builds` so a single curl reveals the gist without dumping a wall of
+/// text. The full last build's stderr lives on the slot (`BuildSlot::last_build_log`)
+/// and is fetched on demand via `GET /builds/{slot_id}/log`.
+pub const LAST_ERROR_LOG_MAX_BYTES: usize = 1024;
+
+/// Cap on `BuildSlot::last_build_log` size. Hard upper bound to avoid
+/// pathological retention if a build dumps gigabytes of output. Tail is
+/// preserved (where the actual error message lives in cargo output).
+pub const LAST_BUILD_LOG_MAX_BYTES: usize = 1024 * 1024;
+
 /// Per-slot build duration history. In-memory only; resets on supervisor
 /// restart. Used by `GET /builds` and the 503 `build_pool_full` response to
 /// estimate wait times for callers.
@@ -328,6 +339,13 @@ pub struct SlotHistory {
     /// truncated to keep the tail (where the actual failure lives in cargo
     /// output). `None` until a failure is recorded with detail.
     pub last_error_detail: Option<String>,
+    /// Short (≤[`LAST_ERROR_LOG_MAX_BYTES`]) tail of the most recent FAILED
+    /// build's stderr. Surfaced inline in `GET /builds` so a single curl
+    /// reveals the gist of the failure without paging through the full log.
+    /// Cleared on the next successful build (success supersedes prior
+    /// failures for that slot — the failure is no longer the current state).
+    /// Use `GET /builds/{slot_id}/log` for the full untruncated log.
+    pub last_error_log: Option<String>,
 }
 
 impl Default for SlotHistory {
@@ -345,6 +363,7 @@ impl SlotHistory {
             last_completed_at: None,
             last_error: None,
             last_error_detail: None,
+            last_error_log: None,
         }
     }
 
@@ -362,7 +381,19 @@ impl SlotHistory {
         self.total_builds += 1;
         if success {
             self.successful_builds += 1;
+            // Clear the inline error log on a green build. Rationale: the
+            // surfaced field reflects the slot's CURRENT failure state, not
+            // its history — a successful build supersedes any prior failure.
+            // Full last-build log stays at the slot level for forensics.
+            self.last_error_log = None;
         } else {
+            // Compute the short inline tail from the same source as the 4 KiB
+            // detail so they tell a consistent story. `last_error_log` is the
+            // 1 KiB summary surfaced in `GET /builds`; `last_error_detail` is
+            // the longer tail. Both are derived from the captured stderr.
+            self.last_error_log = error_detail
+                .as_deref()
+                .map(|s| tail_bytes_keep_utf8(s, LAST_ERROR_LOG_MAX_BYTES));
             self.last_error = error;
             self.last_error_detail = error_detail.map(truncate_error_detail_keep_tail);
         }
@@ -385,6 +416,20 @@ impl SlotHistory {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(sorted[sorted.len() / 2])
     }
+}
+
+/// Return the last `max_bytes` bytes of `s`, snapped forward to a UTF-8
+/// character boundary so the result is always valid UTF-8. Returns `s`
+/// unchanged when it's already shorter than `max_bytes`.
+pub fn tail_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = s.len() - max_bytes;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
 }
 
 /// Truncate `s` to at most [`LAST_ERROR_DETAIL_MAX_BYTES`] bytes by removing
@@ -434,6 +479,15 @@ pub struct BuildSlot {
     /// [`SlotHistory::last_error_detail`] alongside the duration record.
     /// Cleared when populated; readers consume by `take`.
     pub last_build_stderr_capture: RwLock<Option<String>>,
+    /// Full combined cargo stderr (and stdout, if cargo wrote any) of the
+    /// most recent build attempt on this slot — success or failure. Capped
+    /// at [`LAST_BUILD_LOG_MAX_BYTES`] to avoid pathological retention.
+    /// Populated at the end of every cargo build, replacing whatever was
+    /// there. Surfaced via `GET /builds/{slot_id}/log`.
+    ///
+    /// Tuple: `(captured_at, log_bytes)`. The timestamp is when the build
+    /// finished, not when the log was read.
+    pub last_build_log: RwLock<Option<(DateTime<Utc>, String)>>,
 }
 
 /// Metadata for the last-known-good (LKG) runner binary preserved at
@@ -515,6 +569,7 @@ impl BuildPool {
                 history: RwLock::new(SlotHistory::new()),
                 frontend_stale: RwLock::new(false),
                 last_build_stderr_capture: RwLock::new(None),
+                last_build_log: RwLock::new(None),
             }));
         }
         // Try to hydrate LKG metadata from the on-disk sidecar. We do this
@@ -1351,6 +1406,51 @@ mod tests {
         assert!((h.avg_duration_secs().unwrap() - 20.0).abs() < 1e-9);
         assert_eq!(h.last_error.as_deref(), Some("boom"));
         assert_eq!(h.last_error_detail.as_deref(), Some("stderr detail"));
+        // Short error log mirrors the detail when below the cap.
+        assert_eq!(h.last_error_log.as_deref(), Some("stderr detail"));
+    }
+
+    #[test]
+    fn test_slot_history_success_clears_last_error_log() {
+        let mut h = SlotHistory::new();
+        h.record(1.0, false, Some("err".into()), Some("boom".into()));
+        assert_eq!(h.last_error_log.as_deref(), Some("boom"));
+        // A subsequent green build supersedes the failure for inline display.
+        h.record(2.0, true, None, None);
+        assert!(h.last_error_log.is_none());
+        // The longer detail / error string can stay (forensic history).
+        // We only enforce the inline summary clears.
+    }
+
+    #[test]
+    fn test_slot_history_last_error_log_truncates_to_1k() {
+        let mut h = SlotHistory::new();
+        let big = "Z".repeat(LAST_ERROR_LOG_MAX_BYTES * 4);
+        let detail = format!("{}TAIL_LOG_END", big);
+        h.record(1.0, false, Some("err".into()), Some(detail));
+        let stored = h.last_error_log.as_ref().expect("log recorded");
+        assert!(stored.ends_with("TAIL_LOG_END"));
+        // Tail-only helper does not prepend a marker; the cap is the cap.
+        assert!(
+            stored.len() <= LAST_ERROR_LOG_MAX_BYTES,
+            "log too large: {}",
+            stored.len()
+        );
+    }
+
+    #[test]
+    fn test_tail_bytes_keep_utf8_short_passthrough() {
+        let s = "short";
+        assert_eq!(tail_bytes_keep_utf8(s, 1024), "short");
+    }
+
+    #[test]
+    fn test_tail_bytes_keep_utf8_long_keeps_tail_on_boundary() {
+        // Build a multi-byte string and ensure the result is valid UTF-8.
+        let s: String = "ééééééééééééé".repeat(200); // 'é' is 2 bytes in UTF-8
+        let out = tail_bytes_keep_utf8(&s, 50);
+        assert!(out.len() <= 50 + 1); // up to 1 byte of slack to land on boundary
+        assert!(s.ends_with(&out));
     }
 
     #[test]

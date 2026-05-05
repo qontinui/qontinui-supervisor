@@ -448,6 +448,12 @@ async fn run_build_inner(
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
     };
 
+    // Reset the per-slot full-build log at the start of each build so a reader
+    // hitting `GET /builds/{slot_id}/log` while a build is in flight doesn't
+    // see a confusing mix of "old log + still building". `None` = "no log
+    // captured yet for the current build attempt".
+    *slot.last_build_log.write().await = None;
+
     // Stream stderr (cargo outputs to stderr)
     let stderr = child.stderr.take();
 
@@ -519,9 +525,27 @@ async fn run_build_inner(
     };
 
     // Store full stderr for smart rebuild AI fix prompt
+    let joined_stderr = all_stderr_lines.join("\n");
     if !all_stderr_lines.is_empty() {
         let mut build = state.build.write().await;
-        build.last_build_stderr = Some(all_stderr_lines.join("\n"));
+        build.last_build_stderr = Some(joined_stderr.clone());
+    }
+
+    // Record the full combined log on the slot regardless of build outcome
+    // so `GET /builds/{slot_id}/log` works after every attempt. Cap at
+    // LAST_BUILD_LOG_MAX_BYTES — preserve the tail since cargo's actual
+    // error messages live near the end of its output.
+    {
+        let captured_at = chrono::Utc::now();
+        let log = if joined_stderr.is_empty() {
+            String::new()
+        } else {
+            crate::state::tail_bytes_keep_utf8(
+                &joined_stderr,
+                crate::state::LAST_BUILD_LOG_MAX_BYTES,
+            )
+        };
+        *slot.last_build_log.write().await = Some((captured_at, log));
     }
 
     if status.success() {
@@ -536,7 +560,8 @@ async fn run_build_inner(
         info!("Build completed successfully");
         Ok(())
     } else {
-        let full_stderr = all_stderr_lines.join("\n");
+        // Reuse `joined_stderr` from above; identical to `all_stderr_lines.join("\n")`.
+        let full_stderr = joined_stderr;
 
         // Persist the full captured stderr next to the slot so it survives
         // a supervisor restart for postmortem inspection. Best-effort: a
