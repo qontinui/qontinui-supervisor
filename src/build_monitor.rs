@@ -591,7 +591,10 @@ async fn run_build_inner(
         let error_summary = if short_tail.is_empty() {
             base
         } else {
-            format!("{}\n\n--- cargo stderr (last 2KB) ---\n{}", base, short_tail)
+            format!(
+                "{}\n\n--- cargo stderr (last 2KB) ---\n{}",
+                base, short_tail
+            )
         };
         error!("{}", error_summary);
         state
@@ -921,10 +924,7 @@ async fn sweep_slot_for_stale_locks(
                 Ok(Some(e)) => e,
                 Ok(None) => break,
                 Err(e) => {
-                    warn!(
-                        "Slot {}: next_entry under {:?} failed: {}",
-                        slot.id, dir, e
-                    );
+                    warn!("Slot {}: next_entry under {:?} failed: {}", slot.id, dir, e);
                     break;
                 }
             };
@@ -947,10 +947,7 @@ async fn sweep_slot_for_stale_locks(
             let meta = match entry.metadata().await {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(
-                        "Slot {}: metadata for {:?} failed: {}",
-                        slot.id, path, e
-                    );
+                    warn!("Slot {}: metadata for {:?} failed: {}", slot.id, path, e);
                     continue;
                 }
             };
