@@ -331,7 +331,7 @@ pub fn get_endpoints(
     }
 
     // Sort by request count descending for convenience
-    results.sort_by(|a, b| b.request_count.cmp(&a.request_count));
+    results.sort_by_key(|r| std::cmp::Reverse(r.request_count));
     Ok(results)
 }
 

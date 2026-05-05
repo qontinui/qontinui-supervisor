@@ -4,6 +4,12 @@
 //! registered runner config claims the port they're listening on) or
 //! kills them so the next build can replace the slot binary.
 //!
+//! The scan is Windows-specific (PID enumeration + file-lock semantics).
+//! On other platforms `scan_orphans_at_startup` is a no-op stub and every
+//! helper / type below is genuinely unused — gate the dead-code lint
+//! accordingly so non-Windows CI doesn't trip on unreachable items.
+#![cfg_attr(not(target_os = "windows"), allow(unused))]
+//!
 //! Why this exists when Layer 2 (the kill-on-exit JobObject) already kills
 //! children at supervisor shutdown:
 //!
@@ -34,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::is_temp_runner;
+#[cfg(target_os = "windows")]
 use crate::process::windows::{find_pid_on_port, find_runner_processes, kill_by_pid};
 use crate::state::{ManagedRunner, SharedState};
 
@@ -148,6 +155,14 @@ struct ScanSummary {
 /// Always logs a single summary line at info level, even when the scan
 /// finds nothing. Per-PID actions (adopt or kill) emit their own log
 /// entries so an operator can audit what happened.
+#[cfg(not(target_os = "windows"))]
+pub async fn scan_orphans_at_startup(_state: &SharedState) {
+    // Orphan scanning is Windows-specific (handles `qontinui-runner.exe`
+    // file locks via Win32 process enumeration). On other platforms the
+    // supervisor is not supported, so this is a no-op.
+}
+
+#[cfg(target_os = "windows")]
 pub async fn scan_orphans_at_startup(state: &SharedState) {
     info!("Startup orphan scan: enumerating qontinui-runner.exe processes...");
 
@@ -381,6 +396,7 @@ async fn registered_pid(runners: &[Arc<ManagedRunner>], pid: u32) -> bool {
 /// netstat reports, which is good enough for adoption — the other PID
 /// either gets caught by a subsequent registered-port probe or falls
 /// through to the kill branch.
+#[cfg(target_os = "windows")]
 async fn listening_port_for_pid(pid: u32, runners: &[Arc<ManagedRunner>]) -> Option<u16> {
     for r in runners {
         let port = r.config.port;

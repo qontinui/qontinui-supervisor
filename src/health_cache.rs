@@ -282,6 +282,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // listening on the port, so netstat tells us which PID
                     // to track. Netstat is ~100ms on Windows, so guard on
                     // `pid.is_none()` to keep this out of the steady state.
+                    #[cfg(target_os = "windows")]
                     if needs_pid_recovery {
                         if let Some(pid) =
                             crate::process::windows::find_pid_on_port(runner_port).await
@@ -292,6 +293,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                             }
                         }
                     }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = needs_pid_recovery;
                 }
 
                 // If the runner's TCP port is responsive, GET its /health to

@@ -22,9 +22,7 @@ use crate::process::manager;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
 use std::sync::Arc;
-use tracing::info;
-#[cfg(windows)]
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Deserialize)]
 pub struct AddRunnerRequest {
@@ -442,6 +440,7 @@ pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, 
         let port = managed.config.port;
 
         // Best-effort kill anything still on the port
+        #[cfg(target_os = "windows")]
         let _ = crate::process::windows::kill_by_port(port).await;
 
         // Preserve logs for post-mortem. purge-stale only targets test runners
@@ -1458,9 +1457,7 @@ pub async fn spawn_test(
             "frontend_stale_reason": reason_str,
             "stale_slot_id": stale_slot_id,
         });
-        return Ok(
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
-        );
+        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
     }
 
     let mut resp = json!({
@@ -1649,9 +1646,7 @@ async fn check_src_newer_than_dist(runner_root: &std::path::Path) -> bool {
                 } else if ft.is_file() {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if matches!(ext, "ts" | "tsx" | "css" | "json" | "html") {
-                        if let Ok(mtime) =
-                            std::fs::metadata(&path).and_then(|m| m.modified())
-                        {
+                        if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
                             newest = Some(match newest {
                                 Some(n) if n >= mtime => n,
                                 _ => mtime,

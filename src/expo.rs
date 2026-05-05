@@ -4,6 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::error::SupervisorError;
 use crate::log_capture::{self, LogLevel, LogSource};
+#[cfg(target_os = "windows")]
 use crate::process::windows::kill_by_port;
 use crate::state::SharedState;
 
@@ -144,7 +145,10 @@ pub async fn stop_expo(state: &SharedState) -> Result<(), SupervisorError> {
 
     // Fallback: kill by port
     let expo_port = state.config.expo_port;
+    #[cfg(target_os = "windows")]
     let _ = kill_by_port(expo_port).await;
+    #[cfg(not(target_os = "windows"))]
+    let _ = expo_port;
 
     // Update state
     {
