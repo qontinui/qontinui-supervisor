@@ -275,6 +275,7 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
         }
     }
 
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut killed_any = false;
     #[cfg(target_os = "windows")]
     for &port in &ports {

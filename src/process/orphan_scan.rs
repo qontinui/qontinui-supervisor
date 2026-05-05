@@ -8,7 +8,7 @@
 //! On other platforms `scan_orphans_at_startup` is a no-op stub and every
 //! helper / type below is genuinely unused — gate the dead-code lint
 //! accordingly so non-Windows CI doesn't trip on unreachable items.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#![cfg_attr(not(target_os = "windows"), allow(unused))]
 //!
 //! Why this exists when Layer 2 (the kill-on-exit JobObject) already kills
 //! children at supervisor shutdown:
