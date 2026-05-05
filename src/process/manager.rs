@@ -10,6 +10,7 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::env_forwarders;
 use crate::process::port::wait_for_port_free;
+#[cfg(target_os = "windows")]
 use crate::process::windows::{
     kill_by_pid, kill_by_port, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
     webview2_user_data_folder,
@@ -294,13 +295,17 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
         }
     }
 
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut killed_any = false;
+    #[cfg(target_os = "windows")]
     for &port in &ports {
         if let Ok(true) = kill_by_port(port).await {
             info!("Killed orphaned temp runner on port {}", port);
             killed_any = true;
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = ports;
 
     // Remove stale test runner entries from the in-memory registry.
     if !stale_ids.is_empty() {
@@ -377,6 +382,7 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             let name = managed.config.name.clone();
             let port = managed.config.port;
 
+            #[cfg(target_os = "windows")]
             let _ = kill_by_port(port).await;
 
             // Preserve the runner's logs in the stopped-runners cache before
@@ -841,6 +847,7 @@ async fn start_exe_mode_for_runner(
         // where one runner's persisted UI state floods every other runner.
         // On non-Windows the variable is ignored by other webview backends,
         // so this is harmless but keeps behavior consistent.
+        #[cfg(target_os = "windows")]
         if let Some(webview_dir) = webview2_user_data_folder(&managed.config.id, false) {
             // Ensure the folder exists so WebView2 doesn't race to create
             // it against the parent dir's permissions.
@@ -1005,19 +1012,30 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
                     .emit(LogSource::Supervisor, LogLevel::Error, msg)
                     .await;
 
-                match crate::process::windows::kill_by_pid(pid).await {
-                    Ok(true) => info!(
-                        "First-healthy watchdog killed wedged runner '{}' PID {}",
+                #[cfg(target_os = "windows")]
+                {
+                    match crate::process::windows::kill_by_pid(pid).await {
+                        Ok(true) => info!(
+                            "First-healthy watchdog killed wedged runner '{}' PID {}",
+                            runner_name, pid
+                        ),
+                        Ok(false) => warn!(
+                            "First-healthy watchdog: PID {} for runner '{}' no longer present",
+                            pid, runner_name
+                        ),
+                        Err(e) => error!(
+                            "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
+                            pid, runner_name, e
+                        ),
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    warn!(
+                        "First-healthy watchdog: kill_by_pid not implemented on non-Windows; \
+                         leaving wedged runner '{}' PID {} in place",
                         runner_name, pid
-                    ),
-                    Ok(false) => warn!(
-                        "First-healthy watchdog: PID {} for runner '{}' no longer present",
-                        pid, runner_name
-                    ),
-                    Err(e) => error!(
-                        "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
-                        pid, runner_name, e
-                    ),
+                    );
                 }
                 return;
             }
@@ -1270,6 +1288,7 @@ pub async fn stop_runner_by_id(
     // that the current supervisor adopted partially. Kill it up-front so the
     // graceful path below has a free port to verify, instead of returning
     // success while the OS process keeps running.
+    #[cfg(target_os = "windows")]
     if pid_to_kill.is_none() {
         if let Some(orphan_pid) = crate::process::windows::find_pid_on_port(port).await {
             let msg = format!(
@@ -1340,7 +1359,10 @@ pub async fn stop_runner_by_id(
     //    (taskkill reports "PID not found" at debug level) and the primary
     //    mechanism otherwise.
     if let Some(pid) = pid_to_kill {
+        #[cfg(target_os = "windows")]
         let _ = kill_by_pid(pid).await;
+        #[cfg(not(target_os = "windows"))]
+        let _ = pid;
     }
 
     // 3. Clean up the runner's port
@@ -1350,6 +1372,7 @@ pub async fn stop_runner_by_id(
             "Port {} still in use after stopping runner '{}', force-killing",
             port, runner_name
         );
+        #[cfg(target_os = "windows")]
         let _ = kill_by_port(port).await;
     }
 
