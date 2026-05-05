@@ -4,6 +4,12 @@
 //! registered runner config claims the port they're listening on) or
 //! kills them so the next build can replace the slot binary.
 //!
+//! The scan is Windows-specific (PID enumeration + file-lock semantics).
+//! On other platforms `scan_orphans_at_startup` is a no-op stub and every
+//! helper / type below is genuinely unused — gate the dead-code lint
+//! accordingly so non-Windows CI doesn't trip on unreachable items.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+//!
 //! Why this exists when Layer 2 (the kill-on-exit JobObject) already kills
 //! children at supervisor shutdown:
 //!
