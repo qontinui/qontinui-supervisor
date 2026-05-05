@@ -280,25 +280,30 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
 ///   via the `WEBVIEW2_USER_DATA_FOLDER` env var.
 ///
 /// Returns `None` if `LOCALAPPDATA` is not set (non-Windows or broken env).
+///
+/// Thin compatibility wrapper around
+/// [`qontinui_types::wire::webview2::webview2_data_dir`]; the layout logic
+/// is owned by `qontinui-types` so the runner can fall back to the same
+/// path scheme when launched standalone (no supervisor setting the env
+/// var). `is_primary` is the existing call-site idiom on this crate;
+/// internally it discriminates only the `Primary` branch — the non-primary
+/// branch retains the historical `EBWebView-<id>` naming regardless of
+/// whether the runner is `Temp`, `Named`, or `External`.
 pub fn webview2_user_data_folder(runner_id: &str, is_primary: bool) -> Option<std::path::PathBuf> {
-    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    let base = std::path::PathBuf::from(local_app_data).join("com.qontinui.runner");
-    if is_primary {
-        Some(base.join("EBWebView"))
+    use qontinui_types::wire::RunnerKind;
+    // The shared helper only inspects `kind` to decide Primary-vs-other; the
+    // non-Primary branch ignores the specific variant and uses `runner_id`
+    // for the folder suffix. Reflect that: `External` is a safe placeholder
+    // for "any non-primary" — we deliberately do NOT call
+    // `RunnerKind::from_id(runner_id)` here so a non-primary call with id
+    // `"primary"` (theoretical edge case) keeps producing
+    // `EBWebView-primary` instead of collapsing onto the primary folder.
+    let kind = if is_primary {
+        RunnerKind::Primary
     } else {
-        // Sanitize id for filesystem use (alphanumerics, dash, underscore only).
-        let safe_id: String = runner_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        Some(base.join(format!("EBWebView-{}", safe_id)))
-    }
+        RunnerKind::External
+    };
+    qontinui_types::wire::webview2_data_dir(&kind, runner_id)
 }
 
 /// Remove a non-primary runner's WebView2 data folder. Used when a temp

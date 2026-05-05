@@ -118,6 +118,13 @@ impl Default for BuildPoolConfig {
 }
 
 /// Configuration for a single managed runner instance.
+///
+/// Note: `is_primary: bool` is retained for serde compat with the on-disk
+/// `settings.json` file format. Switching this to a `RunnerKind` field would
+/// break older settings files; the cleaner migration is a one-shot
+/// settings.json rewrite (per the plan's guiding priorities) tracked as a
+/// follow-up to Item 2. The [`RunnerConfig::kind`] method provides the
+/// `RunnerKind` view without changing the on-disk shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
     pub id: String,
@@ -156,6 +163,29 @@ pub struct RunnerConfig {
 }
 
 impl RunnerConfig {
+    /// Classify this runner.
+    ///
+    /// Combines the legacy `is_primary` boolean (which wins if true) with
+    /// the id-prefix scheme handled by [`RunnerKind::from_id`]. For
+    /// `RunnerKind::Named`, the user-friendly display name from
+    /// [`RunnerConfig::name`] is mirrored into the variant rather than the
+    /// raw `named-{port}-{uuid}` id, since that's what callers actually want
+    /// for UI/logs.
+    #[allow(dead_code)] // Item 2: helper exposed for follow-up migration of `is_primary` checks.
+    pub fn kind(&self) -> qontinui_types::wire::runner_kind::RunnerKind {
+        use qontinui_types::wire::runner_kind::RunnerKind;
+        if self.is_primary {
+            return RunnerKind::Primary;
+        }
+        match RunnerKind::from_id(&self.id) {
+            // Override Named's name with the friendly display name.
+            RunnerKind::Named { .. } => RunnerKind::Named {
+                name: self.name.clone(),
+            },
+            other => other,
+        }
+    }
+
     /// Create the default primary runner config.
     pub fn default_primary() -> Self {
         Self {
@@ -229,6 +259,12 @@ pub const PORT_CHECK_INTERVAL_MS: u64 = 500;
 
 // Log constants
 const DEFAULT_LOG_BUFFER_SIZE: usize = 500;
+/// Default cap for the build-only log buffer. Cargo output is dense
+/// (thousands of lines per rebuild), so this is intentionally much larger
+/// than the supervisor-events buffer to keep the prior build's output
+/// available alongside the current one. Override via
+/// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE`.
+const DEFAULT_BUILD_LOG_BUFFER_SIZE: usize = 5000;
 
 /// Resolved log buffer size, read from `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`
 /// env var at first access. Clamped to [100, 10000], defaults to 500.
@@ -241,6 +277,27 @@ pub fn log_buffer_size() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.clamp(100, 10000))
             .unwrap_or(DEFAULT_LOG_BUFFER_SIZE)
+    })
+}
+
+/// Resolved build-only log buffer size, read from
+/// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE` env var at first access.
+/// Clamped to [500, 50000], defaults to 5000.
+///
+/// Build output (`LogSource::Build`) is segregated into its own buffer so a
+/// dense cargo rebuild (thousands of lines) does not evict supervisor-side
+/// events (placement preview HTTP traces, spawn lifecycle records, expo
+/// status, etc.) from the main 500-cap buffer. See `LogState` in
+/// `log_capture.rs`.
+pub fn build_log_buffer_size() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(500, 50000))
+            .unwrap_or(DEFAULT_BUILD_LOG_BUFFER_SIZE)
     })
 }
 
