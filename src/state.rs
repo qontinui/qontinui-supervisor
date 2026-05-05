@@ -1400,7 +1400,12 @@ mod tests {
         let mut h = SlotHistory::new();
         h.record(10.0, true, None, None);
         h.record(20.0, true, None, None);
-        h.record(30.0, false, Some("boom".into()), Some("stderr detail".into()));
+        h.record(
+            30.0,
+            false,
+            Some("boom".into()),
+            Some("stderr detail".into()),
+        );
         assert_eq!(h.total_builds, 3);
         assert_eq!(h.successful_builds, 2);
         assert!((h.avg_duration_secs().unwrap() - 20.0).abs() < 1e-9);
