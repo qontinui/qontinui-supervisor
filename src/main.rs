@@ -4,6 +4,7 @@ mod diagnostics;
 mod error;
 mod evaluation;
 mod expo;
+mod fs_atomic;
 mod health_cache;
 mod log_capture;
 mod process;
@@ -90,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             );
             config.runners = saved.runners;
             // Ensure there's always a primary
-            if !config.runners.iter().any(|r| r.is_primary) {
+            if !config.runners.iter().any(|r| r.kind().is_primary()) {
                 warn!("No primary runner in saved settings, adding default");
                 config
                     .runners

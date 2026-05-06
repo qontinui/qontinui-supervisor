@@ -10,6 +10,7 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::is_temp_runner;
 use crate::process::port;
 use crate::state::SupervisorState;
+use qontinui_types::wire::runner_kind::RunnerKind;
 
 /// Returns true if this runner is a named runner managed by the supervisor.
 fn is_named_runner(runner_id: &str) -> bool {
@@ -100,7 +101,7 @@ pub struct CachedRunnerHealth {
     pub id: String,
     pub name: String,
     pub port: u16,
-    pub is_primary: bool,
+    pub kind: RunnerKind,
     pub running: bool,
     pub pid: Option<u32>,
     pub api_responding: bool,
@@ -250,7 +251,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 
             for managed in &runners {
                 let runner_port = managed.config.port;
-                let is_primary = managed.config.is_primary;
+                let kind = managed.config.kind();
+                let is_primary = kind.is_primary();
 
                 let runner_port_open = port::is_port_in_use(runner_port);
                 let runner_responding = port::is_runner_responding(runner_port).await;
@@ -323,7 +325,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     id: managed.config.id.clone(),
                     name: managed.config.name.clone(),
                     port: runner_port,
-                    is_primary,
+                    kind: kind.clone(),
                     running: runner_state.running,
                     pid: runner_state.pid,
                     api_responding: runner_responding,

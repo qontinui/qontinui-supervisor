@@ -18,11 +18,11 @@
 //! mid-write cannot leave a half-written file.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::projection::project_to_pretty_json;
 use super::types::IrDocument;
+use crate::fs_atomic::atomic_write;
 
 /// Resolve the storage root for the supervisor's Spec API.
 ///
@@ -140,29 +140,6 @@ pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> 
     } else {
         Ok(Some(trimmed))
     }
-}
-
-/// Atomic write: write to `<target>.tmp` then rename. Cleans up the tmp
-/// file on failure.
-fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = target.with_extension(format!(
-        "{}.tmp",
-        target
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("write")
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, target).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
 }
 
 /// Write an IR document and regenerate its projection. Returns the absolute

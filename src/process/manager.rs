@@ -31,7 +31,6 @@ use crate::state::{ManagedRunner, SharedState};
 /// primarily to give callers a stable supervisor-side import path. For
 /// classification that needs the user-friendly display name, prefer
 /// [`RunnerConfig::kind`] which can mirror it from `RunnerConfig.name`.
-#[allow(dead_code)] // Item 2: helper exposed for follow-up migration of `is_primary` checks.
 pub fn runner_kind(runner_id: &str) -> qontinui_types::wire::runner_kind::RunnerKind {
     qontinui_types::wire::runner_kind::RunnerKind::from_id(runner_id)
 }
@@ -499,7 +498,7 @@ pub async fn start_managed_runner(
         }
     }
 
-    let is_primary = managed.config.is_primary;
+    let is_primary = managed.config.kind().is_primary();
     let port = managed.config.port;
     let runner_name = managed.config.name.clone();
 
@@ -819,7 +818,7 @@ async fn start_exe_mode_for_runner(
     // Non-primary runners additionally get `QONTINUI_INSTANCE_NAME` to skip
     // the scheduler and `QONTINUI_PRIMARY_PORT` so they can proxy process
     // commands to the primary.
-    if !managed.config.is_primary {
+    if !managed.config.kind().is_primary() {
         cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
         // Find the primary runner's port for process log proxying.
         //
@@ -1052,7 +1051,7 @@ async fn monitor_runner_process_exit(
     managed: Arc<ManagedRunner>,
     _runner_id: String,
 ) {
-    let is_primary = managed.config.is_primary;
+    let is_primary = managed.config.kind().is_primary();
     let runner_name = managed.config.name.clone();
 
     // Take the child out of state so we can await without holding the lock.
@@ -1254,7 +1253,7 @@ pub async fn stop_runner_by_id(
 
     let runner_name = managed.config.name.clone();
     let port = managed.config.port;
-    let is_primary = managed.config.is_primary;
+    let is_primary = managed.config.kind().is_primary();
 
     {
         let mut runner = managed.runner.write().await;
@@ -1654,14 +1653,14 @@ pub async fn restart_all(
 
     // Start primary first
     for managed in &runners {
-        if managed.config.is_primary && was_running.contains(&managed.config.id) {
+        if managed.config.kind().is_primary() && was_running.contains(&managed.config.id) {
             start_runner_by_id(state, &managed.config.id).await?;
         }
     }
 
     // Then start non-primary with 2s delay
     for managed in &runners {
-        if !managed.config.is_primary && was_running.contains(&managed.config.id) {
+        if !managed.config.kind().is_primary() && was_running.contains(&managed.config.id) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             start_runner_by_id(state, &managed.config.id).await?;
         }

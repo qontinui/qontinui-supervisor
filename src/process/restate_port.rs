@@ -207,9 +207,10 @@ mod tests {
         admin: Option<u16>,
         service: Option<u16>,
     ) -> RunnerConfig {
+        use qontinui_types::wire::runner_kind::RunnerKind;
         let mut c = RunnerConfig::default_primary();
         c.id = "t".to_string();
-        c.is_primary = false;
+        c.kind = RunnerKind::External;
         c.server_mode = true;
         c.restate_ingress_port = ingress;
         c.restate_admin_port = admin;

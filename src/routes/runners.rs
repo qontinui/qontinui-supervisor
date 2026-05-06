@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::error::SupervisorError;
+use qontinui_types::wire::runner_kind::RunnerKind;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::settings;
@@ -131,7 +132,7 @@ pub async fn list_runners(
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
-            "is_primary": managed.config.is_primary,
+            "kind": managed.config.kind(),
             "protected": is_protected,
             "running": effectively_running,
             "pid": runner.pid,
@@ -220,7 +221,7 @@ pub async fn add_runner(
             id: id.clone(),
             name: name.clone(),
             port: body.port,
-            is_primary: false,
+            kind: RunnerKind::External,
             protected: true,
             server_mode,
             restate_ingress_port: resolved.ingress_port,
@@ -271,7 +272,7 @@ pub async fn remove_runner(
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
 
-    if managed.config.is_primary {
+    if managed.config.kind().is_primary() {
         return Err(SupervisorError::Validation(
             "Cannot remove the primary runner".to_string(),
         ));
@@ -1024,7 +1025,7 @@ pub async fn spawn_test(
             id: id.clone(),
             name,
             port,
-            is_primary: false,
+            kind: RunnerKind::Temp { id: id.clone() },
             protected: true,
             server_mode,
             restate_ingress_port: resolved.ingress_port,
@@ -1910,7 +1911,7 @@ pub async fn spawn_named(
             id: id.clone(),
             name: name.clone(),
             port,
-            is_primary: false,
+            kind: RunnerKind::Named { name: name.clone() },
             protected: body.protected,
             server_mode,
             restate_ingress_port: resolved.ingress_port,

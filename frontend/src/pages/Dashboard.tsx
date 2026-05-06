@@ -8,6 +8,7 @@ import {
   RecentCrashSummary,
   RecentPanicSummary,
   RunnerDerivedStatus,
+  RunnerKindWire,
   StaleBinarySummary,
   UiErrorSummary,
 } from '../lib/api';
@@ -223,7 +224,7 @@ interface RunnerInstance {
   id: string;
   name: string;
   port: number;
-  is_primary: boolean;
+  kind: RunnerKindWire;
   protected: boolean;
   running: boolean;
   pid: number | null;
@@ -557,7 +558,7 @@ function RunnerRow({
   onProtect,
 }: RunnerRowProps) {
   const isUp = r.running || r.api_responding;
-  const isPrimary = r.is_primary;
+  const isPrimary = r.kind.type === 'primary';
 
   // Register per-row action buttons with UI Bridge. Keep IDs stable per
   // runner id (matches the F5 spec: `runner-<id>-<action>`).
@@ -929,7 +930,7 @@ function RunnerInstancesPanel() {
             </thead>
             <tbody>
               {visibleRunners.map((r) => {
-                const isPrimary = r.is_primary;
+                const isPrimary = r.kind.type === 'primary';
                 // Primary uses the legacy single-runner endpoint; secondary
                 // runners use the per-id endpoint.
                 const doRestart = (rebuild: boolean) =>

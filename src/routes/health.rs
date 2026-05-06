@@ -13,6 +13,7 @@ use crate::config::RUNNER_API_PORT;
 use crate::health_cache::{CachedRunnerHealth, RecentCrashSummary, RunnerStatus, UiErrorSummary};
 use crate::sdk_features::{SDK_FEATURES, SDK_FEATURE_DOC_URL};
 use crate::state::{SharedState, SseConnectionGuard};
+use qontinui_types::wire::runner_kind::RunnerKind;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -62,7 +63,7 @@ pub struct RunnerInstanceHealth {
     pub id: String,
     pub name: String,
     pub port: u16,
-    pub is_primary: bool,
+    pub kind: RunnerKind,
     pub running: bool,
     pub pid: Option<u32>,
     pub started_at: Option<String>,
@@ -217,7 +218,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 id: r.id.clone(),
                 name: r.name.clone(),
                 port: r.port,
-                is_primary: r.is_primary,
+                kind: r.kind.clone(),
                 running: r.running,
                 pid: r.pid,
                 started_at: None, // Not cached — use GET /runners for full detail
@@ -291,7 +292,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             id: managed.config.id.clone(),
             name: managed.config.name.clone(),
             port: managed.config.port,
-            is_primary: managed.config.is_primary,
+            kind: managed.config.kind(),
             running: mr.running,
             pid: mr.pid,
             started_at: mr.started_at.map(|t| t.to_rfc3339()),
@@ -385,7 +386,7 @@ fn try_build_sse_health(
     let primary_snapshot = runner_snapshots
         .as_ref()
         .ok()
-        .and_then(|snaps| snaps.iter().find(|r| r.is_primary));
+        .and_then(|snaps| snaps.iter().find(|r| r.kind.is_primary()));
     let (primary_running, primary_pid) = match primary_snapshot {
         Some(p) => (p.running, p.pid),
         None => {

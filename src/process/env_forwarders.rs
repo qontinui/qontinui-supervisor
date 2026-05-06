@@ -183,7 +183,7 @@ impl EnvForwarder for WindowPositionEnv {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Gate: temp runners only, never primary.
-            if runner.config.is_primary {
+            if runner.config.kind().is_primary() {
                 return;
             }
             if !is_temp_runner(&runner.config.id) {

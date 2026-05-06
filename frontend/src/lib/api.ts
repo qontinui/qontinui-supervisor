@@ -182,6 +182,17 @@ export type RunnerDerivedStatus =
   | { kind: 'offline' }
   | { kind: 'starting' };
 
+/// Wire-format classification of a runner. Mirrors
+/// `qontinui_types::wire::runner_kind::RunnerKind`. Serde uses
+/// `tag = "type"` (not `"kind"`) so when this is embedded as a `kind` field
+/// on a parent struct the on-the-wire shape is `"kind": {"type": "primary"}`
+/// rather than the doubly-nested `"kind": {"kind": "primary"}`.
+export type RunnerKindWire =
+  | { type: 'primary' }
+  | { type: 'named'; name: string }
+  | { type: 'temp'; id: string }
+  | { type: 'external' };
+
 /// One runner's entry as surfaced by the supervisor `/health` endpoint's
 /// `runners[]` array and by `/runners`. Mirrors
 /// `qontinui-supervisor::routes::health::RunnerInstanceHealth`.
@@ -189,7 +200,7 @@ export interface RunnerInstanceHealth {
   id: string;
   name: string;
   port: number;
-  is_primary: boolean;
+  kind: RunnerKindWire;
   running: boolean;
   pid?: number;
   started_at?: string;
@@ -735,7 +746,7 @@ export const api = {
         id: string;
         name: string;
         port: number;
-        is_primary: boolean;
+        kind: RunnerKindWire;
         protected: boolean;
         running: boolean;
         pid?: number;

@@ -1,4 +1,5 @@
 use clap::Parser;
+use qontinui_types::wire::runner_kind::RunnerKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -119,18 +120,20 @@ impl Default for BuildPoolConfig {
 
 /// Configuration for a single managed runner instance.
 ///
-/// Note: `is_primary: bool` is retained for serde compat with the on-disk
-/// `settings.json` file format. Switching this to a `RunnerKind` field would
-/// break older settings files; the cleaner migration is a one-shot
-/// settings.json rewrite (per the plan's guiding priorities) tracked as a
-/// follow-up to Item 2. The [`RunnerConfig::kind`] method provides the
-/// `RunnerKind` view without changing the on-disk shape.
+/// The canonical discriminator is the `kind` field (a [`RunnerKind`]).
+/// Pre-migration on-disk shapes (with `is_primary: bool` and no `kind`) are
+/// rewritten in place at startup by `settings::migrate_settings`, so this
+/// struct only ever sees the post-migration shape. The
+/// `#[serde(default = "default_kind")]` attribute is retained so test fixtures
+/// constructed from JSON literals without an explicit `kind` still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
     pub id: String,
     pub name: String,
     pub port: u16,
-    pub is_primary: bool,
+    /// Canonical runner classifier.
+    #[serde(default = "default_kind")]
+    pub kind: RunnerKind,
     /// When true, this runner cannot be stopped or restarted by smart rebuild,
     /// watchdog, AI sessions, or workflow loop between-iterations. Only manual
     /// API calls with `force: true` can override protection.
@@ -165,24 +168,16 @@ pub struct RunnerConfig {
 impl RunnerConfig {
     /// Classify this runner.
     ///
-    /// Combines the legacy `is_primary` boolean (which wins if true) with
-    /// the id-prefix scheme handled by [`RunnerKind::from_id`]. For
-    /// `RunnerKind::Named`, the user-friendly display name from
-    /// [`RunnerConfig::name`] is mirrored into the variant rather than the
-    /// raw `named-{port}-{uuid}` id, since that's what callers actually want
-    /// for UI/logs.
-    #[allow(dead_code)] // Item 2: helper exposed for follow-up migration of `is_primary` checks.
-    pub fn kind(&self) -> qontinui_types::wire::runner_kind::RunnerKind {
-        use qontinui_types::wire::runner_kind::RunnerKind;
-        if self.is_primary {
-            return RunnerKind::Primary;
-        }
-        match RunnerKind::from_id(&self.id) {
-            // Override Named's name with the friendly display name.
+    /// Mirrors the friendly display name from [`RunnerConfig::name`] onto the
+    /// `Named { name }` variant so callers don't have to reach back into
+    /// `RunnerConfig` for the name (the raw id carries the
+    /// `named-{port}-{uuid}` form, not what UIs/logs want).
+    pub fn kind(&self) -> RunnerKind {
+        match &self.kind {
             RunnerKind::Named { .. } => RunnerKind::Named {
                 name: self.name.clone(),
             },
-            other => other,
+            other => other.clone(),
         }
     }
 
@@ -192,7 +187,7 @@ impl RunnerConfig {
             id: "primary".to_string(),
             name: "Primary".to_string(),
             port: DEFAULT_RUNNER_API_PORT,
-            is_primary: true,
+            kind: RunnerKind::Primary,
             protected: true,
             server_mode: false,
             restate_ingress_port: None,
@@ -207,6 +202,10 @@ impl RunnerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_kind() -> RunnerKind {
+    RunnerKind::Primary
 }
 
 // Port constants
@@ -727,7 +726,7 @@ mod tests {
         // Default single primary runner
         assert_eq!(config.runners.len(), 1);
         assert_eq!(config.runners[0].id, "primary");
-        assert!(config.runners[0].is_primary);
+        assert!(config.runners[0].kind().is_primary());
     }
 
     #[test]
