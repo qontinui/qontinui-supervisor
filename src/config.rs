@@ -266,6 +266,21 @@ const DEFAULT_LOG_BUFFER_SIZE: usize = 500;
 /// `QONTINUI_SUPERVISOR_BUILD_LOG_BUFFER_SIZE`.
 const DEFAULT_BUILD_LOG_BUFFER_SIZE: usize = 5000;
 
+/// Default maximum entries retained in the post-mortem `stopped_runners`
+/// cache (see `process::stopped_cache`). Bumped from the original 100 to
+/// give agent-driven post-mortem queries (bulk crash-summary fetches hours
+/// after a stale-spawn sweep) more headroom. Override via
+/// `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP`.
+const DEFAULT_STOPPED_CACHE_MAX_ENTRIES: usize = 1000;
+
+/// Default TTL in seconds for entries in the post-mortem `stopped_runners`
+/// cache. Bumped from the original 600s (10 min) so post-mortem queries
+/// landing an hour after a crash still find the snapshot. Override via
+/// `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS`. `i64` because chrono's
+/// `Duration::num_seconds()` returns `i64` at the comparison call site
+/// (`process::stopped_cache::insert_and_evict`).
+const DEFAULT_STOPPED_CACHE_TTL_SECS: i64 = 3600;
+
 /// Resolved log buffer size, read from `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`
 /// env var at first access. Clamped to [100, 10000], defaults to 500.
 pub fn log_buffer_size() -> usize {
@@ -298,6 +313,74 @@ pub fn build_log_buffer_size() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.clamp(500, 50000))
             .unwrap_or(DEFAULT_BUILD_LOG_BUFFER_SIZE)
+    })
+}
+
+/// Pure helper: read `env_var`, parse as `usize`, clamp to `[min, max]`,
+/// fall back to `default` on missing/unparseable. Factored out so unit
+/// tests can exercise the parse/clamp logic directly without hitting the
+/// `OnceLock`-cached accessors above (which memoize their first read for
+/// the lifetime of the process).
+pub(crate) fn parse_clamped_usize(env_var: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(min, max))
+        .unwrap_or(default)
+}
+
+/// Pure helper: read `env_var`, parse as `i64`, clamp to `[min, max]`,
+/// fall back to `default` on missing/unparseable. Sibling of
+/// [`parse_clamped_usize`] for the i64-typed bounds (chrono::Duration's
+/// `num_seconds()` returns `i64`).
+pub(crate) fn parse_clamped_i64(env_var: &str, default: i64, min: i64, max: i64) -> i64 {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|n| n.clamp(min, max))
+        .unwrap_or(default)
+}
+
+/// Resolved maximum entries for the post-mortem `stopped_runners` cache
+/// (see `process::stopped_cache`), read from
+/// `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP` env var at first access.
+/// Clamped to `[100, 100_000]`, defaults to 1000.
+///
+/// Memoized via `OnceLock`, so subsequent env-var changes are ignored
+/// after the first read. Tests should drive [`parse_clamped_usize`]
+/// directly to avoid the cache.
+pub fn stopped_cache_max_entries() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        parse_clamped_usize(
+            "QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP",
+            DEFAULT_STOPPED_CACHE_MAX_ENTRIES,
+            100,
+            100_000,
+        )
+    })
+}
+
+/// Resolved TTL (seconds) for entries in the post-mortem
+/// `stopped_runners` cache (see `process::stopped_cache`), read from
+/// `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS` env var at first access.
+/// Clamped to `[60, 86_400]`, defaults to 3600 (60 min). Returns `i64`
+/// because the consumer compares against `chrono::Duration::num_seconds()`.
+///
+/// Memoized via `OnceLock`, so subsequent env-var changes are ignored
+/// after the first read. Tests should drive [`parse_clamped_i64`]
+/// directly to avoid the cache.
+pub fn stopped_cache_ttl_secs() -> i64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<i64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        parse_clamped_i64(
+            "QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS",
+            DEFAULT_STOPPED_CACHE_TTL_SECS,
+            60,
+            86_400,
+        )
     })
 }
 

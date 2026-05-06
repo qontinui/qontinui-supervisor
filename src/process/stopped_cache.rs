@@ -16,12 +16,6 @@ use std::path::PathBuf;
 use crate::log_capture::LogEntry;
 use crate::process::panic_log::RecentPanic;
 
-/// Maximum entries retained in the stopped-runner cache.
-pub const STOPPED_CACHE_MAX_ENTRIES: usize = 100;
-
-/// How long a snapshot is retained before eviction.
-pub const STOPPED_CACHE_TTL_SECS: i64 = 600; // 10 minutes
-
 /// How many recent log lines to retain per stopped runner.
 pub const STOPPED_CACHE_LOG_CAP: usize = 500;
 
@@ -87,20 +81,37 @@ pub struct StoppedRunnerSnapshot {
 
 /// Insert a snapshot, then evict expired entries and trim to the size cap.
 ///
-/// Eviction is inline on write: the 100-entry / 10-minute caps are small
-/// enough that a linear scan per insert is fine.
+/// Eviction is inline on write: a linear scan per insert is fine for the
+/// configured cap. The cap and TTL come from the env-overridable accessors
+/// [`crate::config::stopped_cache_max_entries`] and
+/// [`crate::config::stopped_cache_ttl_secs`] (defaults: 1000 entries /
+/// 60-min TTL; see those functions for env vars and clamps).
 pub fn insert_and_evict(
     cache: &mut HashMap<String, StoppedRunnerSnapshot>,
     snapshot: StoppedRunnerSnapshot,
+) {
+    let max_entries = crate::config::stopped_cache_max_entries();
+    let ttl_secs = crate::config::stopped_cache_ttl_secs();
+    insert_and_evict_with_bounds(cache, snapshot, max_entries, ttl_secs);
+}
+
+/// Inner form of [`insert_and_evict`] with explicit bounds. Exists so unit
+/// tests can drive eviction logic without going through the
+/// `OnceLock`-cached accessors in `crate::config`.
+fn insert_and_evict_with_bounds(
+    cache: &mut HashMap<String, StoppedRunnerSnapshot>,
+    snapshot: StoppedRunnerSnapshot,
+    max_entries: usize,
+    ttl_secs: i64,
 ) {
     cache.insert(snapshot.id.clone(), snapshot);
 
     // Drop entries older than the TTL.
     let now = Utc::now();
-    cache.retain(|_, v| (now - v.stopped_at).num_seconds() < STOPPED_CACHE_TTL_SECS);
+    cache.retain(|_, v| (now - v.stopped_at).num_seconds() < ttl_secs);
 
     // Trim to the size cap by evicting the oldest `stopped_at`.
-    while cache.len() > STOPPED_CACHE_MAX_ENTRIES {
+    while cache.len() > max_entries {
         if let Some(oldest_id) = cache
             .iter()
             .min_by_key(|(_, v)| v.stopped_at)
@@ -141,5 +152,195 @@ pub async fn snapshot_from_managed(
         early_log_path,
         started_at,
         panic_log_dir,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    /// Fixture builder so tests don't have to spell out every Option field.
+    fn fixture_snapshot(id: &str, stopped_at: DateTime<Utc>) -> StoppedRunnerSnapshot {
+        StoppedRunnerSnapshot {
+            id: id.to_string(),
+            name: id.to_string(),
+            port: 9876,
+            exit_code: Some(0),
+            exit_reason: StopReason::GracefulStop,
+            stopped_at,
+            last_log_lines: Vec::new(),
+            panic_stack: None,
+            recent_panic: None,
+            early_log_path: None,
+            started_at: None,
+            panic_log_dir: None,
+        }
+    }
+
+    #[test]
+    fn insert_and_evict_with_bounds_trims_to_cap() {
+        let mut cache: HashMap<String, StoppedRunnerSnapshot> = HashMap::new();
+        let now = Utc::now();
+        let cap = 3usize;
+        let ttl = 86_400i64; // huge TTL so cap is the only thing evicting
+
+        // Insert 5 entries with monotonically increasing stopped_at so the
+        // "oldest" eviction order is deterministic.
+        for i in 0..5 {
+            let stopped_at = now + Duration::seconds(i as i64);
+            let snap = fixture_snapshot(&format!("runner-{}", i), stopped_at);
+            insert_and_evict_with_bounds(&mut cache, snap, cap, ttl);
+        }
+
+        assert_eq!(cache.len(), cap, "cache should be trimmed to cap");
+        // The two oldest (runner-0, runner-1) should have been evicted.
+        assert!(!cache.contains_key("runner-0"));
+        assert!(!cache.contains_key("runner-1"));
+        // The three newest survive.
+        assert!(cache.contains_key("runner-2"));
+        assert!(cache.contains_key("runner-3"));
+        assert!(cache.contains_key("runner-4"));
+    }
+
+    #[test]
+    fn insert_and_evict_with_bounds_drops_expired_entries() {
+        let mut cache: HashMap<String, StoppedRunnerSnapshot> = HashMap::new();
+        let now = Utc::now();
+        let cap = 100usize;
+        let ttl = 60i64; // 1 minute
+
+        // Stale entry: stopped 2 minutes ago, well past the 1-minute TTL.
+        let stale = fixture_snapshot("stale", now - Duration::seconds(120));
+        insert_and_evict_with_bounds(&mut cache, stale, cap, ttl);
+        // After the first insert, the stale entry was just inserted then
+        // immediately retained; (now - stopped_at) = 120 >= 60 so it should
+        // be evicted on the same call.
+        assert!(
+            !cache.contains_key("stale"),
+            "stale entry older than TTL should be evicted on insert"
+        );
+
+        // Now insert a fresh one and another stale one to confirm the fresh
+        // one survives while a newly-inserted stale entry also gets pruned.
+        let fresh = fixture_snapshot("fresh", now);
+        insert_and_evict_with_bounds(&mut cache, fresh, cap, ttl);
+        assert!(cache.contains_key("fresh"));
+
+        let stale2 = fixture_snapshot("stale2", now - Duration::seconds(120));
+        insert_and_evict_with_bounds(&mut cache, stale2, cap, ttl);
+        assert!(!cache.contains_key("stale2"));
+        assert!(
+            cache.contains_key("fresh"),
+            "fresh entry should survive subsequent insertions"
+        );
+    }
+
+    #[test]
+    fn insert_and_evict_with_bounds_replaces_same_id() {
+        // Reinserting the same id should overwrite (HashMap semantics) and
+        // keep cache size at 1.
+        let mut cache: HashMap<String, StoppedRunnerSnapshot> = HashMap::new();
+        let now = Utc::now();
+        let snap1 = fixture_snapshot("dup", now);
+        insert_and_evict_with_bounds(&mut cache, snap1, 100, 86_400);
+        let mut snap2 = fixture_snapshot("dup", now + Duration::seconds(1));
+        snap2.port = 1234;
+        insert_and_evict_with_bounds(&mut cache, snap2, 100, 86_400);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get("dup").unwrap().port, 1234);
+    }
+
+    // --- parse_clamped_* helper tests ---
+    //
+    // Each test uses a unique env-var name so concurrent test runners don't
+    // clobber each other (no `serial_test` dep available in this crate).
+
+    #[test]
+    fn parse_clamped_usize_returns_default_when_unset() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_USIZE_UNSET";
+        std::env::remove_var(var);
+        let got = crate::config::parse_clamped_usize(var, 1000, 100, 100_000);
+        assert_eq!(got, 1000);
+    }
+
+    #[test]
+    fn parse_clamped_usize_parses_valid_value() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_USIZE_VALID";
+        std::env::set_var(var, "5000");
+        let got = crate::config::parse_clamped_usize(var, 1000, 100, 100_000);
+        std::env::remove_var(var);
+        assert_eq!(got, 5000);
+    }
+
+    #[test]
+    fn parse_clamped_usize_clamps_below_min() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_USIZE_LOW";
+        std::env::set_var(var, "5");
+        let got = crate::config::parse_clamped_usize(var, 1000, 100, 100_000);
+        std::env::remove_var(var);
+        assert_eq!(got, 100);
+    }
+
+    #[test]
+    fn parse_clamped_usize_clamps_above_max() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_USIZE_HIGH";
+        std::env::set_var(var, "999999999");
+        let got = crate::config::parse_clamped_usize(var, 1000, 100, 100_000);
+        std::env::remove_var(var);
+        assert_eq!(got, 100_000);
+    }
+
+    #[test]
+    fn parse_clamped_usize_falls_back_on_garbage() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_USIZE_BAD";
+        std::env::set_var(var, "not-a-number");
+        let got = crate::config::parse_clamped_usize(var, 1000, 100, 100_000);
+        std::env::remove_var(var);
+        assert_eq!(got, 1000);
+    }
+
+    #[test]
+    fn parse_clamped_i64_returns_default_when_unset() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_I64_UNSET";
+        std::env::remove_var(var);
+        let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
+        assert_eq!(got, 3600);
+    }
+
+    #[test]
+    fn parse_clamped_i64_parses_valid_value() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_I64_VALID";
+        std::env::set_var(var, "1800");
+        let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
+        std::env::remove_var(var);
+        assert_eq!(got, 1800);
+    }
+
+    #[test]
+    fn parse_clamped_i64_clamps_below_min() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_I64_LOW";
+        std::env::set_var(var, "1");
+        let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
+        std::env::remove_var(var);
+        assert_eq!(got, 60);
+    }
+
+    #[test]
+    fn parse_clamped_i64_clamps_above_max() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_I64_HIGH";
+        std::env::set_var(var, "999999");
+        let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
+        std::env::remove_var(var);
+        assert_eq!(got, 86_400);
+    }
+
+    #[test]
+    fn parse_clamped_i64_falls_back_on_garbage() {
+        let var = "QONTINUI_TEST_PARSE_CLAMP_I64_BAD";
+        std::env::set_var(var, "abc");
+        let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
+        std::env::remove_var(var);
+        assert_eq!(got, 3600);
     }
 }
