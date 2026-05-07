@@ -447,8 +447,16 @@ mod tests {
     fn test_resolve_path_absolute_passes_through() {
         let project = Path::new("D:/tmp/project");
         // An absolute path outside project_dir is accepted (spec: "absolute
-        // paths AND paths relative to project_dir").
-        let abs = "D:/somewhere/else/file.rs";
+        // paths AND paths relative to project_dir"). Use a platform-appropriate
+        // absolute path: `D:/...` is absolute on Windows but relative on Linux,
+        // so on Linux pick `/...` instead. Without this, Linux CI joins the
+        // (relative-on-Linux) input under project_dir and the is_absolute
+        // assertion fires.
+        let abs = if cfg!(windows) {
+            "D:/somewhere/else/file.rs"
+        } else {
+            "/somewhere/else/file.rs"
+        };
         let got = resolve_path(abs, project).expect("absolute path resolves");
         assert!(got.is_absolute(), "result must be absolute, got {:?}", got);
     }
