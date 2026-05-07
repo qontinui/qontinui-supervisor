@@ -17,11 +17,11 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::error::SupervisorError;
-use qontinui_types::wire::runner_kind::RunnerKind;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
+use qontinui_types::wire::runner_kind::RunnerKind;
 use std::sync::Arc;
 use tracing::{info, warn};
 
