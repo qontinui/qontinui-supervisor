@@ -142,7 +142,10 @@ fn migrate_settings(path: &Path) {
         }
     };
     if let Err(e) = crate::fs_atomic::atomic_write(path, pretty.as_bytes()) {
-        warn!("settings: migrate skipped, cannot atomic_write {:?}: {e}", path);
+        warn!(
+            "settings: migrate skipped, cannot atomic_write {:?}: {e}",
+            path
+        );
         return;
     }
 

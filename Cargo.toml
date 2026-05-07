@@ -32,8 +32,8 @@ glob = "0.3"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
-qontinui-types = { path = "../qontinui-schemas/rust" }
-qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client" }
+qontinui-types = { path = "../qontinui-schemas/rust", version = "^0.1.2" }
+qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = "^0.1.1" }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
