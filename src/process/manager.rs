@@ -53,6 +53,10 @@ pub fn is_temp_runner(runner_id: &str) -> bool {
 pub struct BinaryMeta {
     pub binary_mtime: String,
     pub binary_size_bytes: u64,
+    /// Wall-clock seconds since the file was last modified, computed at the
+    /// time `binary_meta` ran. Saturates at 0 if mtime is in the future
+    /// (clock skew).
+    pub binary_age_secs: u64,
 }
 
 /// Read mtime + size of a binary file.
@@ -61,9 +65,12 @@ pub fn binary_meta(path: &std::path::Path) -> Option<BinaryMeta> {
     let mtime = meta.modified().ok()?;
     let dt: chrono::DateTime<chrono::Utc> = mtime.into();
     let mtime_str = dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = chrono::Utc::now();
+    let age_secs = (now - dt).num_seconds().max(0) as u64;
     Some(BinaryMeta {
         binary_mtime: mtime_str,
         binary_size_bytes: meta.len(),
+        binary_age_secs: age_secs,
     })
 }
 
@@ -619,12 +626,22 @@ pub async fn start_managed_runner(
         *slot = None;
     }
 
-    // Capture stdout/stderr to the managed runner's logs
+    // Capture stdout/stderr to the managed runner's logs. Pass the managed
+    // Arc so the readers can populate `last_auth_result` on auth-failure
+    // patterns (Item B of the supervisor cleanup plan).
     if let Some(stdout) = child.stdout.take() {
-        crate::log_capture::spawn_stdout_reader(stdout, &managed.logs);
+        crate::log_capture::spawn_stdout_reader_for_runner(
+            stdout,
+            &managed.logs,
+            Some(managed.clone()),
+        );
     }
     if let Some(stderr) = child.stderr.take() {
-        crate::log_capture::spawn_stderr_reader(stderr, &managed.logs);
+        crate::log_capture::spawn_stderr_reader_for_runner(
+            stderr,
+            &managed.logs,
+            Some(managed.clone()),
+        );
     }
 
     // Update per-runner state
@@ -1694,6 +1711,143 @@ pub async fn restart_runner(
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
     restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
+}
+
+/// Implementation backing `POST /runners/{id}/rebuild-and-restart` (Item E
+/// of the supervisor cleanup plan).
+///
+/// Sequence: stop → cargo build → start. Returns a JSON envelope containing
+/// the same `build_result` shape used by spawn-test plus stop/build/start
+/// timestamps. Rejects the primary outright — the supervisor never
+/// rebuilds-and-restarts a user-managed primary runner.
+///
+/// On build failure this returns the cargo error directly (no automatic
+/// stale-binary fallback). The runner is left stopped — callers can hit
+/// `/runners/{id}/start` if they want to revive it from the previous slot
+/// exe.
+pub async fn rebuild_and_restart_by_id(
+    state: &SharedState,
+    runner_id: &str,
+    body: crate::routes::runners::RebuildAndRestartRequest,
+) -> Result<serde_json::Value, SupervisorError> {
+    let managed = state
+        .get_runner(runner_id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+
+    if managed.config.kind().is_primary() {
+        return Err(SupervisorError::Validation(
+            "cannot_rebuild_primary: refusing to rebuild a user-managed primary runner".to_string(),
+        ));
+    }
+
+    let runner_name = managed.config.name.clone();
+    let source_label = if body.source.is_empty() {
+        "rebuild-and-restart".to_string()
+    } else {
+        format!("rebuild-and-restart:{}", body.source)
+    };
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "rebuild-and-restart: stopping runner '{}' (source={})",
+                runner_name, source_label
+            ),
+        )
+        .await;
+
+    // Step 1: stop. Best-effort — if the runner is already stopped this
+    // returns NotRunning which we tolerate.
+    let stopped_at = chrono::Utc::now();
+    match stop_runner_by_id(state, runner_id).await {
+        Ok(()) | Err(SupervisorError::RunnerNotRunning) => {}
+        Err(e) => return Err(e),
+    }
+
+    // Step 2: rebuild.
+    let rebuilt_at = chrono::Utc::now();
+    let build_outcome = crate::build_monitor::run_cargo_build_with_requester(
+        state,
+        Some(format!("rebuild-and-restart:{}", runner_id)),
+    )
+    .await;
+
+    let (build_attempted, build_succeeded, build_error): (bool, Option<bool>, Option<String>) =
+        match build_outcome {
+            Ok(()) => (true, Some(true), None),
+            Err(e) => return Err(e),
+        };
+
+    // Step 3: start.
+    let started_at = chrono::Utc::now();
+    start_managed_runner(state, &managed).await?;
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "rebuild-and-restart: runner '{}' restarted (source={})",
+                runner_name, source_label
+            ),
+        )
+        .await;
+
+    // Step 4: optional wait for /health.
+    let mut wait_ms: u64 = 0;
+    if body.wait {
+        let timeout_secs = body.wait_timeout_secs.unwrap_or(120);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        let port = managed.config.port;
+        let health_url = format!("http://localhost:{}/health", port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        while start.elapsed() < timeout {
+            tokio::time::sleep(poll_interval).await;
+            if let Ok(resp) = client.get(&health_url).send().await {
+                if resp.status().is_success() {
+                    wait_ms = start.elapsed().as_millis() as u64;
+                    break;
+                }
+            }
+        }
+        if wait_ms == 0 {
+            wait_ms = start.elapsed().as_millis() as u64;
+        }
+    }
+
+    // Build the response. Mirror spawn-test/spawn-named's build_result shape.
+    let exe_meta = resolve_source_exe(state)
+        .await
+        .ok()
+        .and_then(|p| binary_meta(&p));
+    let post_build_slot_id = *state.build_pool.last_successful_slot.read().await;
+    let build_result = crate::routes::runners::build_result_json(
+        build_attempted,
+        build_succeeded,
+        false,
+        build_error.as_deref(),
+        post_build_slot_id,
+        exe_meta.as_ref(),
+    );
+
+    Ok(serde_json::json!({
+        "id": runner_id,
+        "build_result": build_result,
+        "stopped_at": stopped_at.to_rfc3339(),
+        "rebuilt_at": rebuilt_at.to_rfc3339(),
+        "started_at": started_at.to_rfc3339(),
+        "wait_ms": wait_ms,
+    }))
 }
 
 #[cfg(test)]
