@@ -62,8 +62,74 @@ pub struct StopRunnerRequest {
     pub force: bool,
 }
 
+/// Body for `POST /runners/{id}/rebuild-and-restart` (Item E).
+///
+/// The rebuild-and-restart cycle is one round-trip for callers that today
+/// have to combine `POST /runners/{id}/stop` + a build + `POST .../start`
+/// manually. Refuses to operate on the primary or any user-managed runner
+/// (the supervisor never starts/stops those unprompted).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RebuildAndRestartRequest {
+    /// Optional source label, recorded in diagnostic events.
+    #[serde(default)]
+    pub source: String,
+    /// Reserved for future "force unprotect" semantics. Currently a no-op
+    /// since the rebuild-and-restart cycle goes through `stop_runner_by_id`
+    /// which already respects protection.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub force: bool,
+    /// If true, after starting the runner block until its `/health` returns
+    /// 200 OK or `wait_timeout_secs` elapses.
+    #[serde(default)]
+    pub wait: bool,
+    /// Maximum seconds to wait when `wait` is true. Defaults to 120s.
+    #[serde(default)]
+    pub wait_timeout_secs: Option<u64>,
+}
+
 fn default_source_manual() -> String {
     "manual".to_string()
+}
+
+/// Build the `build_result` JSON object surfaced on spawn-test / spawn-named
+/// success responses (item A of the supervisor cleanup plan).
+///
+/// `attempted` is the request's `rebuild` bit. `succeeded` is `None` when
+/// `!attempted` (no build was run, so neither true nor false applies);
+/// otherwise it is `Some(true)` for a successful build or `Some(false)` for
+/// a failure that the caller chose to swallow via `allow_stale_fallback`.
+/// `reused_stale` is true only when a build failure was swallowed AND we
+/// resolved an exe to fall back to. `error` carries the cargo error string
+/// on failure. `slot_id` is `state.build_pool.last_successful_slot` read
+/// after the build attempt — for stale-fallback runs this points at the
+/// slot whose exe we are reusing. `meta` describes the actual binary that
+/// will run (mtime / size / age in seconds).
+pub fn build_result_json(
+    attempted: bool,
+    succeeded: Option<bool>,
+    reused_stale: bool,
+    error: Option<&str>,
+    slot_id: Option<usize>,
+    meta: Option<&crate::process::manager::BinaryMeta>,
+) -> serde_json::Value {
+    let mut obj = json!({
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "reused_stale": reused_stale,
+        "error": error,
+        "slot_id": slot_id,
+    });
+    if let Some(m) = meta {
+        obj["binary_mtime"] = json!(m.binary_mtime);
+        obj["binary_size_bytes"] = json!(m.binary_size_bytes);
+        obj["binary_age_secs"] = json!(m.binary_age_secs);
+    } else {
+        obj["binary_mtime"] = serde_json::Value::Null;
+        obj["binary_size_bytes"] = serde_json::Value::Null;
+        obj["binary_age_secs"] = serde_json::Value::Null;
+    }
+    obj
 }
 
 #[derive(Deserialize)]
@@ -613,6 +679,22 @@ pub async fn restart_runner(
     })))
 }
 
+/// POST /runners/{id}/rebuild-and-restart — stop → cargo build → start, in
+/// one round-trip.
+///
+/// Refuses to act on the primary runner. On build failure, returns the
+/// cargo error directly (no automatic stale-fallback — callers who want
+/// that should pair `spawn-test {allow_stale_fallback: true}` with their
+/// own restart logic).
+pub async fn rebuild_and_restart_runner(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<RebuildAndRestartRequest>,
+) -> Result<Json<serde_json::Value>, SupervisorError> {
+    let outcome = manager::rebuild_and_restart_by_id(&state, &id, body).await?;
+    Ok(Json(outcome))
+}
+
 /// POST /runners/{id}/watchdog — control per-runner watchdog.
 pub async fn control_runner_watchdog(
     State(state): State<SharedState>,
@@ -905,6 +987,17 @@ pub struct SpawnTestRequest {
     /// `frontend_stale_reason` so callers can branch.
     #[serde(default)]
     pub frontend_strict: bool,
+    /// When true and a `rebuild: true` cargo build fails, fall through to
+    /// the existing exe-resolution chain and spawn the runner using the
+    /// previous slot exe. The `build_result` field of the response carries
+    /// `succeeded: false`, `reused_stale: true`, and the cargo error text so
+    /// callers can choose to ignore stale-binary risk for fast diagnostics.
+    ///
+    /// When false (default), a build failure short-circuits with HTTP 500
+    /// and no spawn is attempted. See item A of the supervisor cleanup plan
+    /// for the rationale.
+    #[serde(default)]
+    pub allow_stale_fallback: bool,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -947,6 +1040,10 @@ pub struct SpawnNamedRequest {
     pub external_restate_admin_url: Option<String>,
     #[serde(default)]
     pub external_restate_ingress_url: Option<String>,
+    /// Mirror of `SpawnTestRequest::allow_stale_fallback`. Defaults to false:
+    /// build failures short-circuit with HTTP 500 and no spawn happens.
+    #[serde(default)]
+    pub allow_stale_fallback: bool,
 }
 
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
@@ -1044,6 +1141,15 @@ pub async fn spawn_test(
         (id, port, managed)
     };
 
+    // Build-result tracking for the response. Populated by the rebuild
+    // branch below; surfaced via the `build_result` JSON field. When
+    // `body.rebuild` is false, `attempted` stays false and `succeeded`
+    // stays None.
+    let mut build_attempted = false;
+    let mut build_succeeded: Option<bool> = None;
+    let mut build_error: Option<String> = None;
+    let mut build_reused_stale = false;
+
     // Rebuild if requested
     if body.rebuild {
         // If caller opted out of waiting AND all slots are currently busy,
@@ -1113,7 +1219,9 @@ pub async fn spawn_test(
 
         // Run the build, optionally bounded by a queue timeout.
         // On any failure (build error, timeout, etc.), remove the placeholder
-        // we reserved above so the port doesn't leak.
+        // we reserved above so the port doesn't leak — UNLESS the caller
+        // opted into `allow_stale_fallback`, in which case we keep the
+        // placeholder and fall through to spawn from the previous slot exe.
         let build_fut =
             crate::build_monitor::run_cargo_build_with_requester(&state, body.requester_id.clone());
         let build_result = match body.queue_timeout_secs {
@@ -1129,11 +1237,34 @@ pub async fn spawn_test(
             }
             None => build_fut.await,
         };
-        if let Err(e) = build_result {
-            // Release the placeholder port reservation.
-            let mut runners = state.runners.write().await;
-            runners.remove(&id);
-            return Err(e);
+        match build_result {
+            Ok(()) => {
+                build_attempted = true;
+                build_succeeded = Some(true);
+            }
+            Err(e) => {
+                if body.allow_stale_fallback {
+                    let err_str = e.to_string();
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!("spawn-test stale fallback engaged: {}", err_str),
+                        )
+                        .await;
+                    build_attempted = true;
+                    build_succeeded = Some(false);
+                    build_error = Some(err_str);
+                    // Fall through to exe-resolution + spawn below. If the
+                    // resolution fails, we'll surface 500 there.
+                } else {
+                    // Release the placeholder port reservation.
+                    let mut runners = state.runners.write().await;
+                    runners.remove(&id);
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -1184,6 +1315,13 @@ pub async fn spawn_test(
             "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
         ));
+    }
+
+    // If we got here after a failed build with `allow_stale_fallback: true`,
+    // the previous slot exe survived the resolve_source_exe check above —
+    // mark the build_result as reusing-stale so callers can detect it.
+    if matches!(build_succeeded, Some(false)) {
+        build_reused_stale = true;
     }
 
     let name = format!("test-{}", port);
@@ -1461,6 +1599,42 @@ pub async fn spawn_test(
         return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
     }
 
+    // Item A: assemble the build_result JSON object. `slot_id` reads
+    // last_successful_slot AFTER the build (or after the no-op when
+    // !attempted) so stale-fallback runs report the slot whose exe is
+    // being reused.
+    let post_build_slot_id = *state.build_pool.last_successful_slot.read().await;
+    let build_result = build_result_json(
+        build_attempted,
+        build_succeeded,
+        build_reused_stale,
+        build_error.as_deref(),
+        post_build_slot_id,
+        exe_meta.as_ref(),
+    );
+
+    // Item B: assemble the auth_state JSON object.
+    let auto_login_configured = state.test_auto_login.read().await.is_some();
+    let auth_state_json = {
+        let last_auth = managed.last_auth_result.read().await.clone();
+        match last_auth {
+            Some(r) => json!({
+                "auto_login_configured": auto_login_configured,
+                "auto_login_attempted": r.attempted,
+                "auto_login_succeeded": r.succeeded,
+                "last_login_attempt_at": r.attempt_at.to_rfc3339(),
+                "rate_limit_hint": r.rate_limit_hint,
+            }),
+            None => json!({
+                "auto_login_configured": auto_login_configured,
+                "auto_login_attempted": serde_json::Value::Null,
+                "auto_login_succeeded": serde_json::Value::Null,
+                "last_login_attempt_at": serde_json::Value::Null,
+                "rate_limit_hint": serde_json::Value::Null,
+            }),
+        }
+    };
+
     let mut resp = json!({
         "id": id,
         "name": name,
@@ -1475,6 +1649,8 @@ pub async fn spawn_test(
         // agents testing runner internals should hit these instead.
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
+        "build_result": build_result,
+        "auth_state": auth_state_json,
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
         } else if body.wait {
@@ -1483,10 +1659,6 @@ pub async fn spawn_test(
             format!("Test runner spawned on port {}", port)
         }
     });
-    if let Some(meta) = exe_meta {
-        resp["binary_mtime"] = json!(meta.binary_mtime);
-        resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
-    }
     if let Some(ms) = health_probe_ms {
         resp["health_probe_ms"] = json!(ms);
     }
@@ -1930,6 +2102,12 @@ pub async fn spawn_named(
         (id, port, managed)
     };
 
+    // Item A — build_result tracking (mirror of spawn_test).
+    let mut build_attempted = false;
+    let mut build_succeeded: Option<bool> = None;
+    let mut build_error: Option<String> = None;
+    let mut build_reused_stale = false;
+
     // Rebuild if requested
     if body.rebuild {
         if no_wait && state.build_pool.permits.available_permits() == 0 {
@@ -1997,13 +2175,34 @@ pub async fn spawn_named(
             )
             .await;
 
-        let build_result =
+        let build_outcome =
             crate::build_monitor::run_cargo_build_with_requester(&state, body.requester_id.clone())
                 .await;
-        if let Err(e) = build_result {
-            let mut runners = state.runners.write().await;
-            runners.remove(&id);
-            return Err(e);
+        match build_outcome {
+            Ok(()) => {
+                build_attempted = true;
+                build_succeeded = Some(true);
+            }
+            Err(e) => {
+                if body.allow_stale_fallback {
+                    let err_str = e.to_string();
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!("spawn-named stale fallback engaged: {}", err_str),
+                        )
+                        .await;
+                    build_attempted = true;
+                    build_succeeded = Some(false);
+                    build_error = Some(err_str);
+                } else {
+                    let mut runners = state.runners.write().await;
+                    runners.remove(&id);
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -2015,6 +2214,12 @@ pub async fn spawn_named(
             "Runner binary not found in any build slot. Use rebuild: true to build it first."
                 .to_string(),
         ));
+    }
+
+    // After resolve_source_exe succeeded with a failed-but-swallowed build,
+    // the previous slot exe is what we'll launch — flag it as stale-reuse.
+    if matches!(build_succeeded, Some(false)) {
+        build_reused_stale = true;
     }
 
     // Start the runner using the Arc captured at insertion time (race-free
@@ -2129,6 +2334,19 @@ pub async fn spawn_named(
     let (frontend_stale, stale_reason, stale_slot_id) =
         resolve_frontend_stale_for_spawn(&state).await;
 
+    // Item A: assemble build_result alongside the existing top-level
+    // binary_mtime/binary_size_bytes (preserved on spawn-named for
+    // backward compat).
+    let post_build_slot_id = *state.build_pool.last_successful_slot.read().await;
+    let build_result = build_result_json(
+        build_attempted,
+        build_succeeded,
+        build_reused_stale,
+        build_error.as_deref(),
+        post_build_slot_id,
+        exe_meta.as_ref(),
+    );
+
     let mut resp = json!({
         "id": id,
         "name": name,
@@ -2139,6 +2357,7 @@ pub async fn spawn_named(
         "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
+        "build_result": build_result,
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {

@@ -961,11 +961,7 @@ mod tests {
         let lkg_built = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 + 60);
         let lkg_at = Some(DateTime::<Utc>::from(lkg_built));
 
-        let resp = build_coverage_response(
-            &[file.to_string_lossy().into_owned()],
-            project,
-            lkg_at,
-        );
+        let resp = build_coverage_response(&[file.to_string_lossy().into_owned()], project, lkg_at);
         let f = &resp.files[0];
 
         // Property: a freshly-built LKG covers an unmodified file.
