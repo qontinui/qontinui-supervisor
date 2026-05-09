@@ -257,6 +257,13 @@ pub struct SupervisorState {
     /// channel is best-effort, since the goal is exercising the watcher's
     /// divergence path during manual tests, not durable delivery.
     pub synthetic_build_id_tx: broadcast::Sender<String>,
+    /// Machine identity loaded from `~/.qontinui/machine.json` at supervisor
+    /// startup (see `crate::machine_id::load_machine_id`). Identifies this
+    /// installation in `coord.build_events` posts emitted from
+    /// `coord_reporter`. `None` means the runner-side `qontinui_profile
+    /// machine init` was never run on this host — coord build-event
+    /// reporting is disabled (graceful no-op).
+    pub machine_id: Option<uuid::Uuid>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -905,6 +912,7 @@ impl SupervisorState {
             debug_endpoints_enabled,
             supervisor_started_at: std::time::SystemTime::now(),
             synthetic_build_id_tx,
+            machine_id: crate::machine_id::load_machine_id(),
         }
     }
 

@@ -107,6 +107,10 @@ pub async fn run_cargo_build_with_requester(
     let _permit = permit_result
         .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
+    // Capture the requester id before `info` moves into the build pool so
+    // we can pass it through to the coord build-event reporter below.
+    let requester_id_for_report = requester_id.clone();
+
     // Claim a slot and mark it busy with our BuildInfo.
     let info = BuildInfo {
         started_at: chrono::Utc::now(),
@@ -121,6 +125,22 @@ pub async fn run_cargo_build_with_requester(
         slot: slot.clone(),
         state: state.clone(),
     };
+
+    // Phase B2 (coord-tinderbox): emit a `coord.build_events` start record so
+    // peer agents can see this build via `GET /coord/builds/peers`. Repo is
+    // hard-coded to "qontinui-runner" because that's what the supervisor's
+    // `state.config.project_dir` points at — supervisor builds the runner.
+    // Best-effort: returns None if no machine_id, COORD_URL is empty, or the
+    // POST fails. Never blocks or fails the build.
+    let head_sha = crate::coord_reporter::resolve_head_sha(&state.config.project_dir).await;
+    let build_id_opt = crate::coord_reporter::report_build_start(
+        state,
+        "qontinui-runner",
+        slot.id,
+        requester_id_for_report,
+        head_sha,
+    )
+    .await;
 
     // Update legacy build flag for external consumers (health API, smart rebuild,
     // overnight watchdog). Flag is true whenever any slot is busy.
@@ -253,6 +273,36 @@ pub async fn run_cargo_build_with_requester(
         });
 
     state.notify_health_change();
+
+    // Phase B2 (coord-tinderbox): emit a `coord.build_events` finish record.
+    // For failures we mine the just-recorded SlotHistory.last_error string
+    // (which the inner build path populates with the cargo error line via
+    // `slot.history.write().await.last_error = Some(...)` at lines 379+/405+)
+    // and run `parse_error_file` over its lines to extract the source-file
+    // pointer. Best-effort; never blocks or fails the build.
+    if let Some(build_id) = build_id_opt {
+        let (summary, file) = if result.is_ok() {
+            (None, None)
+        } else {
+            let captured = slot.history.read().await.last_error.clone();
+            let captured_lines: Vec<String> = captured
+                .as_deref()
+                .map(|s| s.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_default();
+            let summary = crate::coord_reporter::first_n_error_lines(&captured_lines, 3);
+            let file = crate::coord_reporter::parse_error_file(&captured_lines);
+            (summary, file)
+        };
+        crate::coord_reporter::report_build_finish(
+            state,
+            build_id,
+            result.is_ok(),
+            (duration_secs * 1000.0) as u64,
+            summary,
+            file,
+        )
+        .await;
+    }
 
     // Permit drops here, releasing the slot for the next waiter.
     drop(_permit);

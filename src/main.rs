@@ -1,5 +1,6 @@
 mod build_monitor;
 mod config;
+mod coord_reporter;
 mod diagnostics;
 mod error;
 mod evaluation;
@@ -7,6 +8,7 @@ mod expo;
 mod fs_atomic;
 mod health_cache;
 mod log_capture;
+mod machine_id;
 mod process;
 mod routes;
 mod sdk_features;
@@ -127,6 +129,17 @@ async fn main() -> anyhow::Result<()> {
     // dashboard log stream. Done after Arc-wrapping so the messages flow
     // through the same persistent file writer attached above.
     state.flush_pending_startup_logs().await;
+
+    // Log the result of loading `~/.qontinui/machine.json` for coord
+    // build-event reporting (Phase B2 of coord-tinderbox-build-status plan).
+    // Absent file is graceful — reporter short-circuits and the build still
+    // runs; we just lose peer visibility into this supervisor's outcomes.
+    match state.machine_id {
+        Some(id) => info!("supervisor machine_id loaded: {id}"),
+        None => warn!(
+            "~/.qontinui/machine.json not found or unreadable; coord build-event reporting disabled"
+        ),
+    }
 
     // Visibility for the debug-endpoints gate. When enabled, log loudly so
     // an operator tailing the supervisor log can see that

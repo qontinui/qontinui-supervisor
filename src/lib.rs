@@ -3,6 +3,7 @@
 
 pub mod build_monitor;
 pub mod config;
+pub mod coord_reporter;
 pub mod diagnostics;
 pub mod error;
 pub mod evaluation;
@@ -10,6 +11,7 @@ pub mod expo;
 pub mod fs_atomic;
 pub mod health_cache;
 pub mod log_capture;
+pub mod machine_id;
 pub mod process;
 pub mod routes;
 pub mod sdk_features;
