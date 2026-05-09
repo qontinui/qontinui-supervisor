@@ -1,9 +1,630 @@
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::state::SharedState;
+
+/// One row in the supervisor's HTTP API manifest. Returned by `GET /help`.
+///
+/// Sourced from the "API Endpoints" section of `CLAUDE.md`. The list is
+/// intentionally static (compiled into the binary) so the manifest reflects
+/// what the build supports — not whatever the docs file on disk happens to
+/// say at runtime. When you add or remove a route, update this list AND
+/// `CLAUDE.md` together.
+#[derive(serde::Serialize)]
+pub struct EndpointEntry {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub summary: &'static str,
+}
+
+pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
+    // Health & Dashboard
+    EndpointEntry {
+        method: "GET",
+        path: "/",
+        summary: "React SPA dashboard",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/health",
+        summary: "Comprehensive status (runners, build, expo)",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/health/stream",
+        summary: "SSE stream of real-time health data",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor/restart",
+        summary: "Self-restart supervisor (runners are left running)",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor/shutdown",
+        summary: "Graceful supervisor shutdown",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/help",
+        summary: "List of supervisor HTTP endpoints",
+    },
+    // Runner Management
+    EndpointEntry {
+        method: "GET",
+        path: "/runners",
+        summary: "List all runners with status",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners",
+        summary: "Add a runner config to the registry",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/spawn-test",
+        summary: "Spawn ephemeral test runner on next free port",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/spawn-named",
+        summary: "Spawn persistent named runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/purge-stale",
+        summary: "Remove runners whose processes are no longer alive",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/runners/{id}",
+        summary: "Remove a runner from the registry",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/start",
+        summary: "Start a runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/stop",
+        summary: "Stop a runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/restart",
+        summary: "Restart a runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/protect",
+        summary: "Toggle protection on a runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/watchdog",
+        summary: "Control watchdog for a specific runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/rebuild-and-restart",
+        summary: "Rebuild then restart a non-primary runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/logs",
+        summary: "Log history for a specific runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/logs/stream",
+        summary: "SSE log stream for a specific runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/early-log",
+        summary: "Per-spawn early-death log file content",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/crash-summary",
+        summary: "Crash summary for a stopped runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/crash-dump",
+        summary: "Full crash dump payload",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runners/{id}/ui-bridge/{*path}",
+        summary: "Proxy GET UI Bridge requests to a runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runners/{id}/ui-bridge/{*path}",
+        summary: "Proxy POST UI Bridge requests to a runner",
+    },
+    // Parallel Build Pool
+    EndpointEntry {
+        method: "GET",
+        path: "/builds",
+        summary: "Snapshot of the parallel build pool",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/builds/{slot_id}/log",
+        summary: "Latest combined build log for a slot",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/builds/{slot_id}/last-build-stderr",
+        summary: "Latest stderr output for a slot",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/builds/caches",
+        summary: "Clear build caches across all pool slots",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/build/reset",
+        summary: "Reset build state",
+    },
+    // Logs
+    EndpointEntry {
+        method: "GET",
+        path: "/logs/history",
+        summary: "Recent log entries from circular buffer",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/logs/build/history",
+        summary: "Recent entries from the build-only buffer",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/logs/stream",
+        summary: "SSE stream of real-time log events",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/logs/file/{type}",
+        summary: "Read .dev-logs/ files",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/logs/files",
+        summary: "List available log files",
+    },
+    // Expo
+    EndpointEntry {
+        method: "POST",
+        path: "/expo/start",
+        summary: "Start Expo dev server",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/expo/stop",
+        summary: "Stop Expo dev server",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/expo/status",
+        summary: "Expo running state, PID, port, configured flag",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/expo/logs/stream",
+        summary: "SSE stream filtered to Expo log source",
+    },
+    // Velocity (HTTP Span Tracing)
+    EndpointEntry {
+        method: "POST",
+        path: "/velocity/ingest",
+        summary: "Ingest HTTP span data",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/summary",
+        summary: "Aggregated latency summary (P50/P95/P99)",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/endpoints",
+        summary: "Per-endpoint latency breakdown",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/slow",
+        summary: "Slowest requests",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/timeline",
+        summary: "Latency over time",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/compare",
+        summary: "Before/after comparison",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity/trace/{request_id}",
+        summary: "Detailed trace for a single request",
+    },
+    // Velocity Tests
+    EndpointEntry {
+        method: "POST",
+        path: "/velocity-tests/start",
+        summary: "Start a velocity test run",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/velocity-tests/stop",
+        summary: "Stop a running test",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-tests/status",
+        summary: "Current test status",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-tests/runs",
+        summary: "List past runs",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-tests/runs/{id}",
+        summary: "Get a specific run",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-tests/trend",
+        summary: "Performance trend across runs",
+    },
+    // Velocity Improvement
+    EndpointEntry {
+        method: "POST",
+        path: "/velocity-improvement/start",
+        summary: "Start improvement analysis",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/velocity-improvement/stop",
+        summary: "Stop running analysis",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-improvement/status",
+        summary: "Current analysis status",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/velocity-improvement/history",
+        summary: "Past improvement results",
+    },
+    // Evaluation
+    EndpointEntry {
+        method: "POST",
+        path: "/eval/start",
+        summary: "Start an evaluation run",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/eval/stop",
+        summary: "Stop a running evaluation",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/eval/status",
+        summary: "Current evaluation status",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/eval/continuous/start",
+        summary: "Start continuous evaluation",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/eval/continuous/stop",
+        summary: "Stop continuous evaluation",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/eval/runs",
+        summary: "List past evaluation runs",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/eval/runs/{id}",
+        summary: "Get a specific evaluation run",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/eval/test-suite",
+        summary: "List test prompts",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/eval/test-suite",
+        summary: "Add a test prompt",
+    },
+    EndpointEntry {
+        method: "PUT",
+        path: "/eval/test-suite/{id}",
+        summary: "Update a test prompt",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/eval/test-suite/{id}",
+        summary: "Delete a test prompt",
+    },
+    // AI Provider/Model Config
+    EndpointEntry {
+        method: "GET",
+        path: "/ai/provider",
+        summary: "Get current AI provider/model selection",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ai/provider",
+        summary: "Set AI provider/model",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/ai/models",
+        summary: "List available AI models",
+    },
+    // Proxies
+    EndpointEntry {
+        method: "GET",
+        path: "/ui-bridge/{*path}",
+        summary: "Proxy GET UI Bridge requests to runner port 9876",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ui-bridge/{*path}",
+        summary: "Proxy POST UI Bridge requests to runner port 9876",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runner-api/{*path}",
+        summary: "Proxy GET runner-API requests to runner port 9876",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runner-api/{*path}",
+        summary: "Proxy POST runner-API requests to runner port 9876",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/graphql",
+        summary: "Proxy GraphQL queries to runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/graphql/ws",
+        summary: "Proxy GraphQL WebSocket subscriptions to runner",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/web-fleet",
+        summary: "Proxy listing of qontinui-web fleet",
+    },
+    // Supervisor Bridge
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/commands/stream",
+        summary: "SSE stream of pending commands",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/commands",
+        summary: "Submit a command response",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/heartbeat",
+        summary: "Dashboard heartbeat",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/boot-id",
+        summary: "Stable installation boot id",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/health",
+        summary: "Bridge health status",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/status",
+        summary: "Bridge status alias",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/control/snapshot",
+        summary: "Full snapshot of dashboard UI",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/control/elements",
+        summary: "List dashboard UI elements",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/element/{id}/action",
+        summary: "Execute action on dashboard element",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/discover",
+        summary: "Trigger element discovery",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/control/console-errors",
+        summary: "Get console errors from dashboard",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/page/evaluate",
+        summary: "Evaluate JS in dashboard webview",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/page/navigate",
+        summary: "Navigate dashboard page",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/page/refresh",
+        summary: "Refresh dashboard page",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/network/stubs",
+        summary: "Register a fetch stub",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/supervisor-bridge/control/network/stubs",
+        summary: "List active stubs",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/supervisor-bridge/control/network/stubs",
+        summary: "Clear all stubs",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/supervisor-bridge/control/network/stubs/{id}",
+        summary: "Remove one stub by id",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/supervisor-bridge/control/network/verify-stub",
+        summary: "Non-consuming stub verification",
+    },
+    // Diagnostics
+    EndpointEntry {
+        method: "GET",
+        path: "/diagnostics",
+        summary: "Build/restart event history",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/diagnostics/clear",
+        summary: "Clear diagnostic events",
+    },
+    // Test login
+    EndpointEntry {
+        method: "GET",
+        path: "/test-login",
+        summary: "Get test login credentials",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/test-login",
+        summary: "Set test login credentials",
+    },
+    EndpointEntry {
+        method: "DELETE",
+        path: "/test-login",
+        summary: "Clear test login credentials",
+    },
+    // LKG coverage helper
+    EndpointEntry {
+        method: "GET",
+        path: "/lkg/coverage",
+        summary: "Single-call LKG coverage check for agents",
+    },
+    // WebSocket
+    EndpointEntry {
+        method: "GET",
+        path: "/ws",
+        summary: "WebSocket endpoint",
+    },
+    // Legacy single-runner endpoints
+    EndpointEntry {
+        method: "POST",
+        path: "/runner/stop",
+        summary: "Stop runner (legacy single-runner endpoint)",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/runner/stop",
+        summary: "Stop runner (legacy single-runner endpoint)",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runner/restart",
+        summary: "Restart runner (legacy single-runner endpoint)",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runner/watchdog",
+        summary: "Control watchdog (legacy single-runner endpoint)",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/runner/fix-and-rebuild",
+        summary: "Fix errors and rebuild (legacy single-runner endpoint)",
+    },
+    // Debug-gated
+    EndpointEntry {
+        method: "POST",
+        path: "/control/dev/emit-build-id",
+        summary: "Inject synthetic buildId into /health/stream (debug-only)",
+    },
+];
+
+/// Handler for `GET /help`. Returns the static endpoint manifest as JSON.
+pub async fn help_handler() -> impl axum::response::IntoResponse {
+    axum::Json(serde_json::json!({ "endpoints": ENDPOINT_MANIFEST }))
+}
+
+/// Translate a panic in any axum handler into a 500 JSON response that
+/// mirrors `SupervisorError::IntoResponse` (see `src/error.rs`). Without
+/// this, a handler panic propagates through `tower::Service::poll_ready` /
+/// `call`, axum drops the connection, and clients see `connection reset by
+/// peer` with no logging — extremely hostile to debug.
+///
+/// We can't push a structured entry to `state.logs` here because the
+/// `tower-http` `CatchPanicLayer` doesn't have access to `SharedState`. The
+/// `tracing::error!` line is enough — every log surface in the supervisor
+/// already subscribes to the global tracing subscriber, so the entry shows
+/// up in `--log-file` / `--log-dir` output and on the console.
+pub fn supervisor_panic_handler(
+    err: Box<dyn std::any::Any + Send + 'static>,
+) -> axum::response::Response {
+    let message = if let Some(s) = err.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    };
+
+    tracing::error!(handler_panic = true, %message, "supervisor handler panicked");
+
+    let body = serde_json::json!({
+        "error": format!("supervisor handler panicked: {}", message),
+        "panicked": true,
+    });
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(body),
+    )
+        .into_response()
+}
 
 pub fn build_router(state: SharedState) -> Router {
     // Resolve dev_logs directory for velocity routes
@@ -35,6 +656,8 @@ pub fn build_router(state: SharedState) -> Router {
     let main_routes = Router::new()
         // Dashboard
         .route("/", get(crate::routes::dashboard::index))
+        // Endpoint manifest
+        .route("/help", get(help_handler))
         // Health
         .route("/health", get(crate::routes::health::health))
         .route("/health/stream", get(crate::routes::health::health_stream))
@@ -247,6 +870,10 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::runners::restart_runner),
         )
         .route(
+            "/runners/{id}/rebuild-and-restart",
+            post(crate::routes::runners::rebuild_and_restart_runner),
+        )
+        .route(
             "/runners/{id}/watchdog",
             post(crate::routes::runners::control_runner_watchdog),
         )
@@ -308,4 +935,12 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(crate::routes::dev_endpoints::router(dev_state))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+        // CatchPanicLayer wraps everything below it (tower applies layers
+        // bottom-up, so this is the OUTERMOST layer). A panic anywhere in
+        // a handler — including a deeper layer — is converted into a 500
+        // JSON response mirroring SupervisorError. See
+        // `supervisor_panic_handler` for the body shape.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            supervisor_panic_handler,
+        ))
 }

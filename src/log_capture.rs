@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
@@ -13,6 +13,51 @@ use tracing::{debug, warn};
 
 use crate::config::{build_log_buffer_size, log_buffer_size};
 use crate::process::early_log::EarlyLogWriter;
+use crate::state::{LastAuthResult, ManagedRunner};
+
+/// Patterns matched against runner stdout/stderr lines to detect failed
+/// auto-login attempts and rate-limit signals. A match populates
+/// `ManagedRunner::last_auth_result` so the spawn-test response can surface
+/// the most recent diagnostic to callers (e.g. autonomous agents that need
+/// to know whether their freshly-spawned runner can talk to the backend).
+///
+/// Only failure-side patterns are matched here — the runner emits no
+/// distinguishing line on success today. Patterns are case-insensitive and
+/// expected to land somewhere in a single log line. See item B of the
+/// supervisor cleanup plan for the rationale.
+pub static AUTH_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)auto-?login\s+failed|rate[\s-]?limit(?:ed)?|HTTP\s+429|backend\s+returned\s+429",
+    )
+    .expect("AUTH_PATTERNS regex must compile")
+});
+
+/// Inspect a captured log line and, if it matches `AUTH_PATTERNS`, update
+/// the runner's `last_auth_result` to record an observed failed attempt.
+///
+/// Spawned as a fire-and-forget task so the log-reader path stays sync. The
+/// snippet is truncated to 200 chars (by char-count, not bytes) to keep the
+/// API response small even if a runner emits a 4 KiB JSON-formatted line.
+pub fn record_auth_signal_if_matching(managed: Arc<ManagedRunner>, line: String) {
+    if !AUTH_PATTERNS.is_match(&line) {
+        return;
+    }
+    tokio::spawn(async move {
+        let snippet: String = line.chars().take(200).collect();
+        let now = Utc::now();
+        let mut guard = managed.last_auth_result.write().await;
+        let entry = guard.get_or_insert_with(|| LastAuthResult {
+            attempted: true,
+            succeeded: Some(false),
+            attempt_at: now,
+            rate_limit_hint: None,
+        });
+        entry.attempted = true;
+        entry.succeeded = Some(false);
+        entry.attempt_at = now;
+        entry.rate_limit_hint = Some(snippet);
+    });
+}
 
 /// Append-only file writer shared across log readers. Uses a std::sync::Mutex
 /// because `write_all` is a blocking syscall — we only hold it long enough to
@@ -344,7 +389,25 @@ impl LogState {
 }
 
 /// Spawn a background task that reads lines from runner stdout and emits log entries.
+///
+/// Convenience wrapper that does not track per-runner auth signals. Callers
+/// that want to populate `ManagedRunner::last_auth_result` should use
+/// [`spawn_stdout_reader_for_runner`] instead.
+#[allow(dead_code)]
 pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task::JoinHandle<()> {
+    spawn_stdout_reader_for_runner(stdout, logs, None)
+}
+
+/// Spawn a background task that reads lines from runner stdout and emits log entries.
+///
+/// When `managed` is `Some`, every captured line is also passed through
+/// [`record_auth_signal_if_matching`] so failed auto-login attempts and
+/// rate-limit hints surface on the runner's `last_auth_result` field.
+pub fn spawn_stdout_reader_for_runner(
+    stdout: ChildStdout,
+    logs: &LogState,
+    managed: Option<Arc<ManagedRunner>>,
+) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
     let file_writer = logs.current_writer();
@@ -357,6 +420,9 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
+                    if let Some(m) = managed.as_ref() {
+                        record_auth_signal_if_matching(m.clone(), line.clone());
+                    }
                     let level = classify_log_level(&line);
                     let entry = LogEntry {
                         timestamp: Utc::now(),
@@ -401,9 +467,24 @@ pub fn spawn_stdout_reader(stdout: ChildStdout, logs: &LogState) -> tokio::task:
 /// Also detects Rust panic / backtrace lines and accumulates them in the
 /// per-runner [`PanicBuffer`] so they can be preserved in the stopped-runner
 /// cache for the `/runners/{id}/crash-dump` endpoint.
+///
+/// Convenience wrapper around [`spawn_stderr_reader_for_runner`] without
+/// auth-signal tracking.
+#[allow(dead_code)]
 pub fn spawn_stderr_reader(
     stderr: tokio::process::ChildStderr,
     logs: &LogState,
+) -> tokio::task::JoinHandle<()> {
+    spawn_stderr_reader_for_runner(stderr, logs, None)
+}
+
+/// Same as [`spawn_stderr_reader`] but with optional per-runner auth-signal
+/// tracking. When `managed` is `Some`, every captured line is matched
+/// against [`AUTH_PATTERNS`] and `last_auth_result` is updated on a hit.
+pub fn spawn_stderr_reader_for_runner(
+    stderr: tokio::process::ChildStderr,
+    logs: &LogState,
+    managed: Option<Arc<ManagedRunner>>,
 ) -> tokio::task::JoinHandle<()> {
     let sender = logs.sender.clone();
     let buffer = logs.buffer.clone();
@@ -422,6 +503,9 @@ pub fn spawn_stderr_reader(
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
+                    if let Some(m) = managed.as_ref() {
+                        record_auth_signal_if_matching(m.clone(), line.clone());
+                    }
                     // Panic detection: accumulate into the sliding window.
                     if !in_panic && is_panic_line(&line) {
                         in_panic = true;

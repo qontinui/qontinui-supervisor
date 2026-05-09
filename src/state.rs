@@ -57,6 +57,34 @@ pub struct ManagedRunner {
     /// restart still gets the LKG; cleared only by replacing the runner
     /// (which spawn-test does anyway since each call creates a fresh id).
     pub source_exe_override: RwLock<Option<PathBuf>>,
+    /// Most recent observed auto-login attempt for this runner, derived from
+    /// the runner's stdout/stderr stream by `log_capture` matching the
+    /// `AUTH_PATTERNS` regex. `None` means we have no evidence either way —
+    /// either auto-login wasn't attempted, or the runner hasn't logged yet.
+    /// Surfaced via the `auth_state` field of the `spawn-test` response.
+    pub last_auth_result: RwLock<Option<LastAuthResult>>,
+}
+
+/// Snapshot of the most recent auto-login attempt observed for a runner.
+///
+/// Populated by the log-capture path when a line in the runner's stdout/stderr
+/// matches `crate::log_capture::AUTH_PATTERNS`. Only failure cases are tracked
+/// here — a successful login emits no diagnostic line, and the supervisor has
+/// no other observability into the runner's auth state today.
+#[derive(Clone, Debug)]
+pub struct LastAuthResult {
+    /// True when an auto-login attempt was observed (i.e. a matching
+    /// log line surfaced).
+    pub attempted: bool,
+    /// `Some(true)` for a confirmed success (currently never set — no
+    /// success-line pattern is matched), `Some(false)` for an observed
+    /// failure, `None` if the outcome could not be determined.
+    pub succeeded: Option<bool>,
+    /// Wall-clock time the matching log line was captured.
+    pub attempt_at: DateTime<Utc>,
+    /// Up to ~200 chars of the offending log line. Kept short so it can
+    /// be safely embedded in API responses.
+    pub rate_limit_hint: Option<String>,
 }
 
 impl ManagedRunner {
@@ -97,6 +125,7 @@ impl ManagedRunner {
             panic_log_dir: RwLock::new(None),
             early_log_path: RwLock::new(None),
             source_exe_override: RwLock::new(None),
+            last_auth_result: RwLock::new(None),
         }
     }
 
