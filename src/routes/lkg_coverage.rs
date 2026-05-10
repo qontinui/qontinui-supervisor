@@ -8,6 +8,29 @@
 //! compiled into the LKG binary and the agent can spawn with
 //! `{rebuild: false, use_lkg: true}` without running stale code.
 //!
+//! ## Field-name conventions (READ THIS — this used to be ambiguous)
+//!
+//! `covered: true` means **the file's content is in the LKG binary** (file
+//! is at least as old as the LKG, so the LKG was built AFTER the file's
+//! current contents were written, so a `use_lkg: true` spawn runs your
+//! changes). `covered: false` means the file is newer than the LKG — the
+//! LKG predates your edits and would silently run stale code.
+//!
+//! `file_newer_than_lkg_secs` is signed and self-documenting:
+//!   * **positive** ⇒ file mtime is N seconds AFTER the LKG built_at; the
+//!     edit is NOT in the LKG (`covered: false`). N is "how stale the LKG
+//!     is relative to this file."
+//!   * **zero** ⇒ file mtime equals LKG built_at exactly (still covered;
+//!     the rule is `<=`).
+//!   * **negative** ⇒ file mtime is |N| seconds BEFORE the LKG built_at;
+//!     the LKG was built after this file's last edit, so the file is in the
+//!     LKG (`covered: true`). |N| is "how old the file is relative to the
+//!     LKG."
+//!
+//! In short: `file_newer_than_lkg_secs > 0` ⇔ `covered: false`. The two
+//! fields are redundant by design — callers gate decisions on `covered`,
+//! and the signed delta is for human inspection.
+//!
 //! ## Query
 //!
 //! `path` is repeatable: `?path=foo.rs&path=bar.rs` checks both files in one
@@ -22,6 +45,9 @@
 //! {
 //!   success: true,
 //!   data: {
+//!     description: "covered=true means the file's content is in the LKG binary. \
+//!                   file_newer_than_lkg_secs > 0 ⇔ file mtime > LKG built_at ⇔ \
+//!                   covered: false (LKG is stale relative to this file).",
 //!     lkg_built_at: <RFC3339 string | null>,
 //!     files: [
 //!       {
@@ -29,9 +55,17 @@
 //!         exists: <bool>,
 //!         file_mtime: <RFC3339 string | null>,
 //!         covered: <bool>,
-//!         delta_secs: <i64 | null>,  // (lkg_built_at - file_mtime).as_secs()
-//!                                    // positive => LKG is newer (covered)
-//!                                    // negative => file is newer (NOT covered)
+//!         file_newer_than_lkg_secs: <i64 | null>,
+//!             // = (file_mtime - lkg_built_at).num_seconds()
+//!             // positive  => file is newer than LKG (NOT covered, rebuild needed)
+//!             // zero      => file mtime equals LKG built_at (covered, by `<=` rule)
+//!             // negative  => file is older than LKG (covered, in the binary)
+//!         reason: <string>,
+//!             // Human-readable explanation of the `covered` decision.
+//!             // One of: "covered_file_at_or_before_lkg",
+//!             //         "not_covered_file_newer_than_lkg",
+//!             //         "no_lkg_yet",
+//!             //         "file_not_found".
 //!       },
 //!       ...
 //!     ],
@@ -44,16 +78,19 @@
 //! ## Edge cases
 //!
 //! - `path` missing or invalid: returned as `{exists: false, covered: false,
-//!   file_mtime: null, delta_secs: null}` so a script passing a list of files
-//!   doesn't bail on the first bad entry. This includes path-traversal
-//!   attempts (e.g. `../../etc/passwd`) — those resolve outside `project_dir`
-//!   and are reported as `exists: false` rather than 400, on the same
-//!   "graceful per-file failure" principle.
+//!   file_mtime: null, file_newer_than_lkg_secs: null, reason:
+//!   "file_not_found"}` so a script passing a list of files doesn't bail on
+//!   the first bad entry. This includes path-traversal attempts (e.g.
+//!   `../../etc/passwd`) — those resolve outside `project_dir` and are
+//!   reported as `exists: false` rather than 400, on the same "graceful
+//!   per-file failure" principle.
 //! - `state.build_pool.last_known_good == None` (no successful build yet):
-//!   `lkg_built_at: null`, every file `covered: false`, `delta_secs: null`,
+//!   `lkg_built_at: null`, every file `covered: false,
+//!   file_newer_than_lkg_secs: null, reason: "no_lkg_yet"`,
 //!   `all_covered: false`.
 //! - File doesn't exist on disk: `exists: false, file_mtime: null,
-//!   covered: false, delta_secs: null`.
+//!   covered: false, file_newer_than_lkg_secs: null, reason:
+//!   "file_not_found"`.
 
 use axum::extract::{RawQuery, State};
 use axum::response::Json;
@@ -76,17 +113,32 @@ pub struct FileCoverage {
     /// File's last-modified time as RFC3339 UTC. `None` when `exists: false`.
     #[serde(serialize_with = "ser_opt_dt")]
     pub file_mtime: Option<DateTime<Utc>>,
-    /// True iff the LKG is at least as new as this file.
+    /// True iff the LKG is at least as new as this file (i.e. the file's
+    /// content is in the LKG binary).
     pub covered: bool,
-    /// `(lkg_built_at - file_mtime).num_seconds()`. Positive means LKG is
-    /// newer (good — file is covered). Negative means file is newer than
-    /// LKG (not covered). `None` when either timestamp is missing.
-    pub delta_secs: Option<i64>,
+    /// `(file_mtime - lkg_built_at).num_seconds()`. Self-documenting sign
+    /// convention — see the module doc-comment for the full table:
+    ///
+    /// * **positive** ⇒ file is newer than LKG ⇒ NOT covered (rebuild needed).
+    /// * **zero** ⇒ file mtime equals LKG built_at exactly ⇒ covered.
+    /// * **negative** ⇒ file is older than LKG ⇒ covered (in the binary).
+    ///
+    /// `None` when either timestamp is missing (no LKG, or file not on disk).
+    pub file_newer_than_lkg_secs: Option<i64>,
+    /// Human-readable explanation of the `covered` decision. Stable enum
+    /// values that callers can branch on if they want machine-readable
+    /// reasons in addition to the boolean. See module-level doc for the
+    /// fixed set of values.
+    pub reason: &'static str,
 }
 
 /// Top-level response payload for `GET /lkg/coverage`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CoverageResponse {
+    /// One-line semantics summary. Embedded in every response so a future
+    /// caller doesn't have to read the source to understand what
+    /// `covered: false` and `file_newer_than_lkg_secs > 0` mean.
+    pub description: &'static str,
     /// LKG `built_at` as RFC3339 UTC. `None` when no successful build has
     /// produced an LKG yet on this checkout.
     #[serde(serialize_with = "ser_opt_dt")]
@@ -95,6 +147,25 @@ pub struct CoverageResponse {
     /// True iff every requested file is `covered: true`. `false` when there
     /// are no files OR when LKG is absent OR when any file is not covered.
     pub all_covered: bool,
+}
+
+/// One-line semantics summary embedded in every `/lkg/coverage` response.
+/// Kept as a single source of truth so the Rust doc-comments and the
+/// runtime payload can't drift.
+pub const COVERAGE_DESCRIPTION: &str = "covered=true means the file's content is in the LKG binary (file mtime <= lkg_built_at). file_newer_than_lkg_secs > 0 means the file was edited AFTER the LKG was built (covered=false, rebuild needed). Negative means file is older than LKG (covered=true).";
+
+/// Stable string values for `FileCoverage.reason`. Exposed as constants so
+/// tests and downstream callers can match on them without hard-coding
+/// string literals.
+pub mod reason {
+    /// LKG was built at or after the file's mtime — file is in the binary.
+    pub const COVERED: &str = "covered_file_at_or_before_lkg";
+    /// File was edited after the LKG was built — rebuild required.
+    pub const NOT_COVERED: &str = "not_covered_file_newer_than_lkg";
+    /// No successful LKG build has been recorded yet.
+    pub const NO_LKG: &str = "no_lkg_yet";
+    /// File doesn't exist on disk (or path traversal escape).
+    pub const FILE_NOT_FOUND: &str = "file_not_found";
 }
 
 /// Custom serializer for `Option<DateTime<Utc>>` that emits `null` for `None`
@@ -277,22 +348,35 @@ pub fn read_file_mtime(p: &Path) -> Option<DateTime<Utc>> {
 }
 
 /// Pure decision function: given the LKG timestamp and a file's mtime,
-/// produce a `(covered, delta_secs)` pair. Extracted for unit testing —
-/// the file-system parts of the handler are unit-tested separately via
-/// `tempfile`-backed real files, but the decision rule itself doesn't need
-/// I/O to verify.
+/// produce a `(covered, file_newer_than_lkg_secs, reason)` triple.
+///
+/// Sign convention is self-documenting from the field name —
+/// `file_newer_than_lkg_secs = (file_mtime - lkg_built_at).num_seconds()`.
+/// Positive ⇒ file is newer than LKG ⇒ NOT covered. See the module
+/// doc-comment for the full table.
+///
+/// Extracted for unit testing — the file-system parts of the handler are
+/// unit-tested separately via `tempfile`-backed real files, but the
+/// decision rule itself doesn't need I/O to verify.
 pub fn decide_coverage(
     lkg_at: Option<DateTime<Utc>>,
     file_mtime: Option<DateTime<Utc>>,
-) -> (bool, Option<i64>) {
+) -> (bool, Option<i64>, &'static str) {
     match (lkg_at, file_mtime) {
         (Some(lkg), Some(m)) => {
-            let delta = (lkg - m).num_seconds();
-            // Covered when LKG is at least as new as the file:
-            //   file_mtime <= lkg_built_at  iff  delta >= 0.
-            (delta >= 0, Some(delta))
+            // file_newer_than_lkg_secs = (file - lkg).num_seconds():
+            //   > 0 ⇒ file was edited after LKG built ⇒ NOT covered.
+            //   = 0 ⇒ exact equality ⇒ covered (rule is `mtime <= lkg`).
+            //   < 0 ⇒ file predates LKG ⇒ covered.
+            let file_newer = (m - lkg).num_seconds();
+            if file_newer <= 0 {
+                (true, Some(file_newer), reason::COVERED)
+            } else {
+                (false, Some(file_newer), reason::NOT_COVERED)
+            }
         }
-        _ => (false, None),
+        (None, _) => (false, None, reason::NO_LKG),
+        (Some(_), None) => (false, None, reason::FILE_NOT_FOUND),
     }
 }
 
@@ -307,13 +391,14 @@ fn coverage_for_resolved(
     let path = resolved;
     let mtime = path.and_then(read_file_mtime);
     let exists = mtime.is_some();
-    let (covered, delta_secs) = decide_coverage(lkg_at, mtime);
+    let (covered, file_newer_than_lkg_secs, reason) = decide_coverage(lkg_at, mtime);
     FileCoverage {
         path: echo_path.to_string(),
         exists,
         file_mtime: mtime,
         covered,
-        delta_secs,
+        file_newer_than_lkg_secs,
+        reason,
     }
 }
 
@@ -333,6 +418,7 @@ pub fn build_coverage_response(
     }
     let all_covered = !files.is_empty() && files.iter().all(|f| f.covered);
     CoverageResponse {
+        description: COVERAGE_DESCRIPTION,
         lkg_built_at: lkg_at,
         files,
         all_covered,
@@ -490,48 +576,100 @@ mod tests {
     }
 
     // --- decide_coverage ---
+    //
+    // Sign convention reminder (see module doc):
+    //   file_newer_than_lkg_secs = (file_mtime - lkg_built_at).num_seconds()
+    //   > 0 ⇒ file edited after LKG built ⇒ NOT covered (rebuild needed).
+    //   = 0 ⇒ exactly equal ⇒ covered (rule is `mtime <= lkg`).
+    //   < 0 ⇒ file older than LKG ⇒ covered (in the binary).
 
     #[test]
     fn test_decide_coverage_no_lkg() {
-        let (covered, delta) = decide_coverage(None, Some(Utc::now()));
+        let (covered, delta, reason) = decide_coverage(None, Some(Utc::now()));
         assert!(!covered);
         assert_eq!(delta, None);
+        assert_eq!(reason, reason::NO_LKG);
     }
 
     #[test]
     fn test_decide_coverage_no_file() {
-        let (covered, delta) = decide_coverage(Some(Utc::now()), None);
+        let (covered, delta, reason) = decide_coverage(Some(Utc::now()), None);
         assert!(!covered);
         assert_eq!(delta, None);
+        assert_eq!(reason, reason::FILE_NOT_FOUND);
     }
 
     #[test]
     fn test_decide_coverage_file_older_than_lkg() {
-        // file at T=100, LKG at T=200 → covered=true, delta=+100s.
+        // file at T=100, LKG at T=200 → covered=true,
+        // file_newer_than_lkg_secs = 100 - 200 = -100 (file older).
         let lkg = Utc.timestamp_opt(200, 0).unwrap();
         let file = Utc.timestamp_opt(100, 0).unwrap();
-        let (covered, delta) = decide_coverage(Some(lkg), Some(file));
+        let (covered, delta, reason) = decide_coverage(Some(lkg), Some(file));
         assert!(covered);
-        assert_eq!(delta, Some(100));
+        assert_eq!(delta, Some(-100));
+        assert_eq!(reason, super::reason::COVERED);
     }
 
     #[test]
     fn test_decide_coverage_file_equal_to_lkg() {
-        // Spec: "max(mtime) <= lkg.built_at" — equal counts as covered.
+        // Spec: "max(mtime) <= lkg.built_at" — equal counts as covered,
+        // file_newer_than_lkg_secs = 0.
         let t = Utc.timestamp_opt(150, 0).unwrap();
-        let (covered, delta) = decide_coverage(Some(t), Some(t));
+        let (covered, delta, reason) = decide_coverage(Some(t), Some(t));
         assert!(covered);
         assert_eq!(delta, Some(0));
+        assert_eq!(reason, super::reason::COVERED);
     }
 
     #[test]
     fn test_decide_coverage_file_newer_than_lkg() {
-        // file at T=300, LKG at T=200 → covered=false, delta=-100s.
+        // file at T=300, LKG at T=200 → covered=false,
+        // file_newer_than_lkg_secs = 300 - 200 = +100 (file newer).
         let lkg = Utc.timestamp_opt(200, 0).unwrap();
         let file = Utc.timestamp_opt(300, 0).unwrap();
-        let (covered, delta) = decide_coverage(Some(lkg), Some(file));
+        let (covered, delta, reason) = decide_coverage(Some(lkg), Some(file));
         assert!(!covered);
-        assert_eq!(delta, Some(-100));
+        assert_eq!(delta, Some(100));
+        assert_eq!(reason, super::reason::NOT_COVERED);
+    }
+
+    /// Pin down the new self-documenting semantics. The reverse-implication
+    /// `file_newer_than_lkg_secs > 0  ⇔  covered: false` is the property
+    /// callers rely on; if a future refactor breaks it, this test catches
+    /// it in CI rather than at a manual-test pre-flight.
+    #[test]
+    fn test_decide_coverage_self_documenting_sign_convention() {
+        // Case 1: freshly-built LKG older than your changes.
+        // file_newer_than_lkg_secs > 0 ⇒ covered=false.
+        let lkg = Utc.timestamp_opt(1_000, 0).unwrap();
+        let file = Utc.timestamp_opt(1_500, 0).unwrap(); // 500s after LKG
+        let (covered, delta, reason) = decide_coverage(Some(lkg), Some(file));
+        assert_eq!(
+            (covered, delta, reason),
+            (false, Some(500), super::reason::NOT_COVERED),
+            "file_newer_than_lkg_secs > 0 must imply covered=false",
+        );
+
+        // Case 2: LKG built after your changes (no fresh edits).
+        // file_newer_than_lkg_secs < 0 ⇒ covered=true.
+        let lkg = Utc.timestamp_opt(2_000, 0).unwrap();
+        let file = Utc.timestamp_opt(1_500, 0).unwrap(); // 500s before LKG
+        let (covered, delta, reason) = decide_coverage(Some(lkg), Some(file));
+        assert_eq!(
+            (covered, delta, reason),
+            (true, Some(-500), super::reason::COVERED),
+            "file_newer_than_lkg_secs < 0 must imply covered=true",
+        );
+
+        // Case 3: edge — exact equality.
+        let t = Utc.timestamp_opt(3_000, 0).unwrap();
+        let (covered, delta, reason) = decide_coverage(Some(t), Some(t));
+        assert_eq!(
+            (covered, delta, reason),
+            (true, Some(0), super::reason::COVERED),
+            "file_newer_than_lkg_secs == 0 must imply covered=true (boundary case)",
+        );
     }
 
     // --- end-to-end build_coverage_response with real files ---
@@ -539,6 +677,7 @@ mod tests {
     #[test]
     fn test_lkg_coverage_absolute_path_covered() {
         // File mtime BEFORE LKG → covered.
+        // file_newer_than_lkg_secs = (file - lkg) = (100 - 200) = -100.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
         let file = project.join("hello.rs");
@@ -557,13 +696,19 @@ mod tests {
         let f = &resp.files[0];
         assert!(f.exists, "file should exist: {f:?}");
         assert!(f.covered, "file older than LKG should be covered: {f:?}");
-        assert!(f.delta_secs.unwrap_or(0) > 0);
+        assert!(
+            f.file_newer_than_lkg_secs.unwrap_or(0) < 0,
+            "file older than LKG ⇒ file_newer_than_lkg_secs < 0, got {f:?}"
+        );
+        assert_eq!(f.reason, super::reason::COVERED);
         assert!(resp.all_covered);
+        assert_eq!(resp.description, COVERAGE_DESCRIPTION);
     }
 
     #[test]
     fn test_lkg_coverage_absolute_path_not_covered() {
         // File mtime AFTER LKG → not covered.
+        // file_newer_than_lkg_secs = (file - lkg) = (500 - 200) = +300.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
         let file = project.join("recent.rs");
@@ -579,7 +724,11 @@ mod tests {
         let f = &resp.files[0];
         assert!(f.exists);
         assert!(!f.covered, "file newer than LKG must NOT be covered");
-        assert!(f.delta_secs.unwrap_or(0) < 0);
+        assert!(
+            f.file_newer_than_lkg_secs.unwrap_or(0) > 0,
+            "file newer than LKG ⇒ file_newer_than_lkg_secs > 0, got {f:?}"
+        );
+        assert_eq!(f.reason, super::reason::NOT_COVERED);
         assert!(!resp.all_covered);
     }
 
@@ -622,7 +771,8 @@ mod tests {
         assert!(!f.exists, "traversal must report exists: false: {f:?}");
         assert!(!f.covered);
         assert_eq!(f.file_mtime, None);
-        assert_eq!(f.delta_secs, None);
+        assert_eq!(f.file_newer_than_lkg_secs, None);
+        assert_eq!(f.reason, super::reason::FILE_NOT_FOUND);
         assert!(!resp.all_covered);
     }
 
@@ -638,7 +788,8 @@ mod tests {
         assert!(!f.exists);
         assert!(!f.covered);
         assert_eq!(f.file_mtime, None);
-        assert_eq!(f.delta_secs, None);
+        assert_eq!(f.file_newer_than_lkg_secs, None);
+        assert_eq!(f.reason, super::reason::FILE_NOT_FOUND);
         assert!(!resp.all_covered);
     }
 
@@ -658,7 +809,8 @@ mod tests {
         let f = &resp.files[0];
         assert!(f.exists, "file should still report exists: {f:?}");
         assert!(!f.covered, "no LKG => not covered");
-        assert_eq!(f.delta_secs, None);
+        assert_eq!(f.file_newer_than_lkg_secs, None);
+        assert_eq!(f.reason, super::reason::NO_LKG);
         assert!(!resp.all_covered);
         assert_eq!(resp.lkg_built_at, None);
     }
@@ -691,9 +843,20 @@ mod tests {
         let resp = build_coverage_response(&req, project, lkg_at);
         assert_eq!(resp.files.len(), 3);
         assert!(resp.files[0].covered, "old.rs should be covered");
+        assert_eq!(resp.files[0].reason, super::reason::COVERED);
+        assert!(
+            resp.files[0].file_newer_than_lkg_secs.unwrap_or(0) < 0,
+            "old.rs file_newer_than_lkg_secs should be negative (file older than LKG)"
+        );
         assert!(!resp.files[1].covered, "new.rs should NOT be covered");
+        assert_eq!(resp.files[1].reason, super::reason::NOT_COVERED);
+        assert!(
+            resp.files[1].file_newer_than_lkg_secs.unwrap_or(0) > 0,
+            "new.rs file_newer_than_lkg_secs should be positive (file newer than LKG)"
+        );
         assert!(!resp.files[2].exists, "missing.rs should not exist");
         assert!(!resp.files[2].covered);
+        assert_eq!(resp.files[2].reason, super::reason::FILE_NOT_FOUND);
         assert!(!resp.all_covered);
     }
 
@@ -715,13 +878,15 @@ mod tests {
     #[test]
     fn test_response_serializes_with_null_for_missing_timestamps() {
         let resp = CoverageResponse {
+            description: COVERAGE_DESCRIPTION,
             lkg_built_at: None,
             files: vec![FileCoverage {
                 path: "missing.rs".to_string(),
                 exists: false,
                 file_mtime: None,
                 covered: false,
-                delta_secs: None,
+                file_newer_than_lkg_secs: None,
+                reason: super::reason::FILE_NOT_FOUND,
             }],
             all_covered: false,
         };
@@ -735,23 +900,33 @@ mod tests {
             "expected null file_mtime, got: {json}"
         );
         assert!(
-            json.contains("\"delta_secs\":null"),
-            "expected null delta_secs, got: {json}"
+            json.contains("\"file_newer_than_lkg_secs\":null"),
+            "expected null file_newer_than_lkg_secs, got: {json}"
+        );
+        assert!(
+            json.contains("\"reason\":\"file_not_found\""),
+            "expected reason=file_not_found, got: {json}"
         );
         assert!(json.contains("\"all_covered\":false"));
+        assert!(
+            json.contains("\"description\":"),
+            "response must carry semantics description, got: {json}"
+        );
     }
 
     #[test]
     fn test_response_serializes_rfc3339_timestamps() {
         let t = rfc3339("2026-04-26T12:00:00Z");
         let resp = CoverageResponse {
+            description: COVERAGE_DESCRIPTION,
             lkg_built_at: Some(t),
             files: vec![FileCoverage {
                 path: "x.rs".to_string(),
                 exists: true,
                 file_mtime: Some(t),
                 covered: true,
-                delta_secs: Some(0),
+                file_newer_than_lkg_secs: Some(0),
+                reason: super::reason::COVERED,
             }],
             all_covered: true,
         };
@@ -760,5 +935,56 @@ mod tests {
             json.contains("2026-04-26T12:00:00+00:00"),
             "expected RFC3339 string, got: {json}"
         );
+    }
+
+    /// Pin the no-bug-from-2026-05-07 case end-to-end. With a freshly-built
+    /// LKG, a file unmodified since before the build must report:
+    ///
+    /// - `covered: true`
+    /// - `file_newer_than_lkg_secs <= 0` (file at or older than LKG)
+    /// - `reason: COVERED`
+    ///
+    /// This is the regression test for the ambiguity the manual-test agent
+    /// hit: `delta_secs: -229250` (negative, file older than LKG, in
+    /// today's convention) was paired with `covered: false`. With the
+    /// flipped sign + reason field, the agent can't misread it again.
+    #[test]
+    fn test_unmodified_file_reports_covered_true_and_self_documents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path();
+        let file = project.join("unchanged_since_lkg.rs");
+        fs::write(&file, "fn x() {}").expect("write");
+        // File last touched 1 day BEFORE LKG built_at — i.e. unmodified
+        // since before the build. Mirrors the user's bug report scenario.
+        let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+        touch_file_mtime(&file, file_at);
+        let lkg_built = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 + 60);
+        let lkg_at = Some(DateTime::<Utc>::from(lkg_built));
+
+        let resp = build_coverage_response(&[file.to_string_lossy().into_owned()], project, lkg_at);
+        let f = &resp.files[0];
+
+        // Property: a freshly-built LKG covers an unmodified file.
+        assert!(
+            f.covered,
+            "given a freshly-built LKG, an unmodified file MUST report covered=true; got {f:?}",
+        );
+        // Sign convention: file is older than LKG ⇒ field is non-positive.
+        let secs = f
+            .file_newer_than_lkg_secs
+            .expect("present when both timestamps are set");
+        assert!(
+            secs <= 0,
+            "covered file must have file_newer_than_lkg_secs <= 0, got {secs}",
+        );
+        // Stable machine-readable reason.
+        assert_eq!(f.reason, super::reason::COVERED);
+        // The response carries a description so a human caller doesn't
+        // have to read the source.
+        assert!(
+            !resp.description.is_empty(),
+            "response.description must be non-empty so callers can self-document",
+        );
+        assert!(resp.all_covered);
     }
 }
