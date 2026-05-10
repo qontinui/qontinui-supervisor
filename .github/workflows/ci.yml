@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
       # at ../qontinui-schemas/rust. Without the sibling clone, clippy + tests
@@ -66,10 +66,10 @@ jobs:
 
     steps:
       - name: Checkout qontinui-supervisor
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
