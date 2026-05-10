@@ -105,6 +105,19 @@ fn default_source_manual() -> String {
 /// after the build attempt — for stale-fallback runs this points at the
 /// slot whose exe we are reusing. `meta` describes the actual binary that
 /// will run (mtime / size / age in seconds).
+///
+/// `state` is a discriminator added 2026-05-10 so JSON-driven clients can
+/// switch on a single field instead of decoding the (`attempted`,
+/// `succeeded`, `reused_stale`) cross-product:
+///
+/// | state          | attempted | succeeded   | reused_stale |
+/// |----------------|-----------|-------------|--------------|
+/// | `reused`       | false     | None        | false        |
+/// | `built`        | true      | Some(true)  | false        |
+/// | `failed`       | true      | Some(false) | false        |
+/// | `reused_stale` | true      | Some(false) | true         |
+///
+/// The legacy fields stay populated unchanged for backward compatibility.
 pub fn build_result_json(
     attempted: bool,
     succeeded: Option<bool>,
@@ -113,7 +126,9 @@ pub fn build_result_json(
     slot_id: Option<usize>,
     meta: Option<&crate::process::manager::BinaryMeta>,
 ) -> serde_json::Value {
+    let state = build_result_state(attempted, succeeded, reused_stale);
     let mut obj = json!({
+        "state": state,
         "attempted": attempted,
         "succeeded": succeeded,
         "reused_stale": reused_stale,
@@ -130,6 +145,26 @@ pub fn build_result_json(
         obj["binary_age_secs"] = serde_json::Value::Null;
     }
     obj
+}
+
+/// Map the (attempted, succeeded, reused_stale) cross-product to a stable
+/// discriminator string. Used inside `build_result_json` and by tests.
+fn build_result_state(
+    attempted: bool,
+    succeeded: Option<bool>,
+    reused_stale: bool,
+) -> &'static str {
+    match (attempted, succeeded, reused_stale) {
+        (false, _, _) => "reused",
+        (true, Some(true), _) => "built",
+        (true, Some(false), true) => "reused_stale",
+        (true, Some(false), false) => "failed",
+        // `attempted=true, succeeded=None` shouldn't happen — every build
+        // path either resolves to true/false or returns an error before
+        // calling build_result_json. Surface it as "failed" rather than
+        // panicking on what's effectively a programmer error elsewhere.
+        (true, None, _) => "failed",
+    }
 }
 
 #[derive(Deserialize)]

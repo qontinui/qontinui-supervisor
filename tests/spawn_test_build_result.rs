@@ -20,6 +20,7 @@ fn fake_meta() -> BinaryMeta {
 #[test]
 fn build_result_when_not_attempted() {
     let v = build_result_json(false, None, false, None, None, None);
+    assert_eq!(v["state"], "reused");
     assert_eq!(v["attempted"], false);
     assert!(v["succeeded"].is_null());
     assert_eq!(v["reused_stale"], false);
@@ -36,6 +37,7 @@ fn build_result_when_not_attempted() {
 fn build_result_successful_build_with_meta() {
     let meta = fake_meta();
     let v = build_result_json(true, Some(true), false, None, Some(2), Some(&meta));
+    assert_eq!(v["state"], "built");
     assert_eq!(v["attempted"], true);
     assert_eq!(v["succeeded"], true);
     assert_eq!(v["reused_stale"], false);
@@ -57,12 +59,60 @@ fn build_result_failed_build_stale_fallback() {
         Some(0),
         Some(&meta),
     );
+    assert_eq!(v["state"], "reused_stale");
     assert_eq!(v["attempted"], true);
     assert_eq!(v["succeeded"], false);
     assert_eq!(v["reused_stale"], true);
     assert_eq!(v["error"], "error[E0277]: trait bound not satisfied");
     assert_eq!(v["slot_id"], 0);
     assert_eq!(v["binary_age_secs"], 42u64);
+}
+
+#[test]
+fn build_result_failed_build_no_fallback() {
+    // attempted=true, succeeded=false, reused_stale=false → "failed"
+    // (caller didn't ask for stale-fallback, so the spawn surfaced the
+    // build error directly to the client without resolving a binary).
+    let v = build_result_json(
+        true,
+        Some(false),
+        false,
+        Some("error[E0277]: trait bound not satisfied"),
+        Some(1),
+        None,
+    );
+    assert_eq!(v["state"], "failed");
+    assert_eq!(v["attempted"], true);
+    assert_eq!(v["succeeded"], false);
+    assert_eq!(v["reused_stale"], false);
+}
+
+#[test]
+fn build_result_state_is_one_of_four_stable_strings() {
+    // Lock the state-string set so a future refactor that adds a new
+    // case has to update this test (and presumably any client that
+    // switches on the value).
+    let states = [
+        build_result_json(false, None, false, None, None, None)["state"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        build_result_json(true, Some(true), false, None, Some(0), None)["state"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        build_result_json(true, Some(false), false, None, Some(0), None)["state"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        build_result_json(true, Some(false), true, None, Some(0), None)["state"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+    let mut sorted: Vec<&str> = states.iter().map(String::as_str).collect();
+    sorted.sort();
+    assert_eq!(sorted, vec!["built", "failed", "reused", "reused_stale"]);
 }
 
 #[test]
