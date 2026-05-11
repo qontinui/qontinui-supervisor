@@ -337,18 +337,58 @@ async fn run_build_inner(
 
         match npm_result {
             Ok(output) if output.status.success() => {
-                info!("Slot {}: frontend build succeeded", slot.id);
-                state
-                    .logs
-                    .emit(
-                        LogSource::Build,
-                        LogLevel::Info,
-                        format!("Slot {}: frontend build succeeded", slot.id),
-                    )
-                    .await;
-                // Clear any prior "stale frontend" marker — the dist/ snapshot
-                // cargo is about to consume is known-fresh.
-                *slot.frontend_stale.write().await = false;
+                // Defense-in-depth: even though npm exited 0, verify the
+                // dist/ output is actually present and non-empty BEFORE
+                // flipping `frontend_stale = false`. The npm step is
+                // serialized inside this supervisor via `npm_lock`, but
+                // a concurrent EXTERNAL `npm run build` (multi-agent
+                // machines, manual builds) can wipe dist/ between npm
+                // exit and cargo's embed. We've also seen empty-output
+                // regressions where vite exits 0 with nothing written
+                // (proj_issue_runner_npm_build_safari13_target.md).
+                //
+                // Existence + non-emptiness only — leave mtime drift to
+                // `routes::runners::check_dist_freshness` which runs on
+                // every spawn. We deliberately don't compare against
+                // package.json/tsconfig.json/vite.config.ts here:
+                // package.json is touched on every `npm install`, which
+                // would produce a flood of false positives.
+                if dist_index_ok(&npm_dir) {
+                    info!("Slot {}: frontend build succeeded", slot.id);
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Build,
+                            LogLevel::Info,
+                            format!("Slot {}: frontend build succeeded", slot.id),
+                        )
+                        .await;
+                    // Clear any prior "stale frontend" marker — the dist/ snapshot
+                    // cargo is about to consume is known-fresh.
+                    *slot.frontend_stale.write().await = false;
+                } else {
+                    let msg = format!(
+                        "Slot {}: frontend_stale: npm exit 0 but dist/index.html missing or empty (likely concurrent external `npm run build` wiped dist/, or empty-output regression)",
+                        slot.id
+                    );
+                    error!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Build, LogLevel::Error, &msg)
+                        .await;
+                    *slot.frontend_stale.write().await = true;
+                    {
+                        let mut history = slot.history.write().await;
+                        history.last_error = Some(
+                            "frontend_stale: npm exit 0 but dist/index.html missing or empty (likely concurrent external `npm run build` wiped dist/, or empty-output regression)".to_string()
+                        );
+                    }
+                    // Continue with cargo build — the binary will still
+                    // build (rust-embed of an empty dir succeeds), but
+                    // the slot flag now honestly reflects the broken
+                    // state and spawn-test will surface it via
+                    // `frontend_stale_reason: "build_failed"`.
+                }
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -607,6 +647,28 @@ async fn run_build_inner(
             .emit(LogSource::Build, LogLevel::Error, &error_summary)
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
+    }
+}
+
+/// True iff `<npm_dir>/dist/index.html` exists, is a regular file, and is
+/// non-empty.
+///
+/// Used by the frontend-build success arm in `run_build_inner` as a
+/// defense-in-depth check after `npm run build` exits 0: an empty or
+/// missing `dist/index.html` means the cargo `rust-embed` step is about to
+/// embed a broken frontend even though the npm child reported success.
+/// The most common causes are a concurrent external `npm run build` that
+/// wiped `dist/` between npm-exit and cargo-embed, and historical
+/// empty-output vite regressions
+/// (`proj_issue_runner_npm_build_safari13_target.md`).
+///
+/// Pulled into a separate helper so the slot-mutating success-arm logic
+/// can be exercised by unit tests without invoking npm.
+fn dist_index_ok(npm_dir: &std::path::Path) -> bool {
+    let dist_index = npm_dir.join("dist").join("index.html");
+    match std::fs::metadata(&dist_index) {
+        Ok(m) => m.is_file() && m.len() > 0,
+        Err(_) => false,
     }
 }
 
@@ -1312,4 +1374,82 @@ async fn update_lkg_after_success(
     let mut lkg_lock = state.build_pool.last_known_good.write().await;
     *lkg_lock = Some(info);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the post-`npm exit 0` defense-in-depth `dist/`
+    //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
+    //! the bug these guard against.
+    use super::dist_index_ok;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn dist_index_ok_returns_false_when_dist_dir_missing() {
+        // Simulates the multi-agent scenario where a concurrent external
+        // `npm run build` wiped the entire dist/ directory between this
+        // supervisor's npm exit and cargo's embed step.
+        let tmp = TempDir::new().expect("tempdir");
+        assert!(
+            !dist_index_ok(tmp.path()),
+            "missing dist/ must be reported as not-ok so the slot is flagged stale"
+        );
+    }
+
+    #[test]
+    fn dist_index_ok_returns_false_when_index_html_missing() {
+        // Simulates an empty-output regression: dist/ exists (an earlier
+        // build created it) but index.html specifically is gone.
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("dist")).expect("mkdir dist");
+        assert!(
+            !dist_index_ok(tmp.path()),
+            "dist/ without index.html must be reported as not-ok"
+        );
+    }
+
+    #[test]
+    fn dist_index_ok_returns_false_when_index_html_is_empty() {
+        // Simulates the historical safari13 regression where vite exited 0
+        // having written zero bytes (proj_issue_runner_npm_build_safari13_target.md).
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(dist.join("index.html"), b"").expect("write empty index");
+        assert!(
+            !dist_index_ok(tmp.path()),
+            "empty dist/index.html must be reported as not-ok"
+        );
+    }
+
+    #[test]
+    fn dist_index_ok_returns_true_when_index_html_present_and_nonempty() {
+        // Happy path — a real build wrote a non-empty index.html.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(
+            dist.join("index.html"),
+            b"<!doctype html><html><body>ok</body></html>",
+        )
+        .expect("write index");
+        assert!(
+            dist_index_ok(tmp.path()),
+            "non-empty dist/index.html is the only signal of a healthy build"
+        );
+    }
+
+    #[test]
+    fn dist_index_ok_returns_false_when_index_html_is_a_directory() {
+        // Pathological case: someone created dist/index.html as a
+        // directory (mkdir -p dist/index.html). The metadata.is_file()
+        // guard catches this — without it, len() would return junk.
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("dist").join("index.html")).expect("mkdir");
+        assert!(
+            !dist_index_ok(tmp.path()),
+            "dist/index.html as a directory must be reported as not-ok"
+        );
+    }
 }

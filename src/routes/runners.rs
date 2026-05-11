@@ -1729,6 +1729,7 @@ pub async fn spawn_test(
                 None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
             },
             Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
             None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
         };
         resp["warnings"] = json!([stale_msg]);
@@ -1743,14 +1744,25 @@ pub async fn spawn_test(
     Ok(Json(resp).into_response())
 }
 
-/// Reason a `frontend_stale: true` was raised. `BuildFailed` corresponds to
-/// the existing slot-level flag set when `npm run build` errored; `SrcDrift`
-/// is the mtime-based check (any `src/**/*.{ts,tsx,css,json,html}` newer than
-/// `dist/index.html`). Reported back to callers via `frontend_stale_reason`.
-#[derive(Clone, Copy, Debug)]
+/// Reason a `frontend_stale: true` was raised.
+///
+/// - `BuildFailed`: the slot-level flag set when `npm run build` errored
+///   (or a defense-in-depth check in `build_monitor` flagged the slot).
+/// - `SrcDrift`: mtime-based check (any
+///   `src/**/*.{ts,tsx,css,json,html}` newer than `dist/index.html`).
+/// - `DistMissing`: `dist/index.html` does not exist on disk at all. This
+///   used to be silently treated as "not stale" by the per-spawn walker —
+///   exactly the silent-success bug in
+///   `supervisor-frontend-build-silent-success.md`. Surface it loudly
+///   instead so callers learn the runner will serve `asset not found:
+///   index.html`.
+///
+/// Reported back to callers via `frontend_stale_reason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrontendStaleReason {
     BuildFailed,
     SrcDrift,
+    DistMissing,
 }
 
 impl FrontendStaleReason {
@@ -1758,6 +1770,7 @@ impl FrontendStaleReason {
         match self {
             FrontendStaleReason::BuildFailed => "build_failed",
             FrontendStaleReason::SrcDrift => "src_newer_than_dist",
+            FrontendStaleReason::DistMissing => "dist_missing",
         }
     }
 }
@@ -1793,27 +1806,43 @@ async fn resolve_frontend_stale_for_spawn(
         return (true, Some(FrontendStaleReason::BuildFailed), None);
     }
 
-    // (2) mtime drift — `qontinui-runner/dist/index.html` vs newest mtime in
-    // `qontinui-runner/src/`. project_dir is `qontinui-runner/src-tauri/`, so
-    // the runner root is its parent.
+    // (2) On-disk dist/ check — handles two cases:
+    //   - `dist/index.html` is missing entirely (the silent-success bug:
+    //     prior to 2026-05-11 this returned "not stale" and the runner
+    //     went on to serve `asset not found: index.html`).
+    //   - mtime drift: newest mtime under `qontinui-runner/src/` is later
+    //     than `qontinui-runner/dist/index.html`.
+    // project_dir is `qontinui-runner/src-tauri/`, so the runner root is
+    // its parent.
     let runner_root = match state.config.project_dir.parent() {
         Some(p) => p.to_path_buf(),
         None => return (false, None, None),
     };
-    if check_src_newer_than_dist(&runner_root).await {
-        return (true, Some(FrontendStaleReason::SrcDrift), None);
+    if let Some(reason) = check_dist_freshness(&runner_root).await {
+        return (true, Some(reason), None);
     }
 
     (false, None, None)
 }
 
-/// True iff the newest mtime under `<runner_root>/src/` is later than
-/// `<runner_root>/dist/index.html`'s mtime. Walks `.ts`, `.tsx`, `.css`,
-/// `.json`, `.html` files only — touching unrelated assets shouldn't trip
-/// the signal. Returns false on any I/O error so callers don't get
-/// false-positive "stale" reports from a missing `src/` or missing
-/// `dist/index.html` (manual-build setups, fresh checkouts, etc.).
-async fn check_src_newer_than_dist(runner_root: &std::path::Path) -> bool {
+/// Inspect `<runner_root>/dist/index.html` against `<runner_root>/src/` and
+/// return the appropriate `FrontendStaleReason` (or `None` if the dist on
+/// disk genuinely covers the current source).
+///
+/// Three outcomes:
+///
+/// - `Some(DistMissing)` — `dist/index.html` doesn't exist on disk. Prior
+///   to 2026-05-11 this silently returned "not stale", which let the
+///   runner spawn with no embedded frontend and serve `asset not found:
+///   index.html` at every route. See
+///   `supervisor-frontend-build-silent-success.md`.
+/// - `Some(SrcDrift)` — newest mtime under `src/` walks `.ts`, `.tsx`,
+///   `.css`, `.json`, `.html` only and is later than the dist mtime —
+///   touching unrelated assets shouldn't trip the signal.
+/// - `None` — dist exists and is at least as new as every input file we
+///   look at, OR the `src/` tree is empty (nothing to be stale relative
+///   to).
+async fn check_dist_freshness(runner_root: &std::path::Path) -> Option<FrontendStaleReason> {
     use std::time::SystemTime;
 
     let dist_index = runner_root.join("dist").join("index.html");
@@ -1821,7 +1850,13 @@ async fn check_src_newer_than_dist(runner_root: &std::path::Path) -> bool {
 
     let dist_mtime = match std::fs::metadata(&dist_index).and_then(|m| m.modified()) {
         Ok(t) => t,
-        Err(_) => return false, // no dist yet — let the build fail loudly elsewhere
+        // Missing dist/index.html IS the stale state we want to catch — the
+        // runner about to spawn has no embedded frontend at all. The earlier
+        // "no dist yet — let the build fail loudly elsewhere" comment was
+        // wrong: nothing else fails loudly, the cargo build embeds the
+        // empty dist/ silently and the runner serves
+        // `asset not found: index.html`.
+        Err(_) => return Some(FrontendStaleReason::DistMissing),
     };
 
     // Walk synchronously — the supervisor spawn-test path is already async
@@ -1871,8 +1906,10 @@ async fn check_src_newer_than_dist(runner_root: &std::path::Path) -> bool {
     .flatten();
 
     match newest_src {
-        Some(n) => n > dist_mtime,
-        None => false, // empty src tree — nothing to be stale relative to
+        Some(n) if n > dist_mtime => Some(FrontendStaleReason::SrcDrift),
+        // Either dist is at least as new as every src file, or the src
+        // tree is empty / unreadable — nothing to flag.
+        _ => None,
     }
 }
 
@@ -2423,6 +2460,7 @@ pub async fn spawn_named(
                 None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
             },
             Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
             None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
         };
         resp["warnings"] = json!([stale_msg]);
@@ -3206,4 +3244,130 @@ pub async fn clear_test_login(State(state): State<SharedState>) -> impl IntoResp
     *state.test_auto_login.write().await = None;
     info!("Test auto-login credentials cleared");
     Json(json!({"success": true, "message": "Auto-login credentials cleared"}))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for `check_dist_freshness` and the
+    //! `FrontendStaleReason` wire format. The motivating bug
+    //! (`supervisor-frontend-build-silent-success.md`) was that the old
+    //! `check_src_newer_than_dist` returned `false` (= "not stale") on a
+    //! missing `dist/index.html`, exactly the case the gate was supposed
+    //! to catch. These tests pin the new contract: missing dist surfaces
+    //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
+    //! state as `None`.
+    use super::{check_dist_freshness, FrontendStaleReason};
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_file(path: &std::path::Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        fs::write(path, contents).expect("write file");
+    }
+
+    #[tokio::test]
+    async fn returns_dist_missing_when_dist_index_absent() {
+        // Repro of the exact silent-success bug: src/ has files but
+        // dist/index.html is gone. Old code returned false (not stale);
+        // new code must return Some(DistMissing).
+        let tmp = TempDir::new().expect("tempdir");
+        write_file(
+            &tmp.path().join("src").join("App.tsx"),
+            b"export const App = () => null;",
+        );
+
+        let result = check_dist_freshness(tmp.path()).await;
+        assert_eq!(
+            result,
+            Some(FrontendStaleReason::DistMissing),
+            "missing dist/index.html must be flagged DistMissing, not silently treated as fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_dist_missing_even_when_src_tree_is_empty() {
+        // Edge case: no src files at all, no dist either. Should still
+        // flag DistMissing rather than silently returning None — a
+        // runner with no embedded frontend is broken regardless of
+        // whether src/ has anything to drift.
+        let tmp = TempDir::new().expect("tempdir");
+        let result = check_dist_freshness(tmp.path()).await;
+        assert_eq!(result, Some(FrontendStaleReason::DistMissing));
+    }
+
+    #[tokio::test]
+    async fn returns_src_drift_when_src_newer_than_dist() {
+        // Build dist first, then write src/. The src file's mtime will
+        // be at least as new as dist/index.html — sleep is enough on
+        // every supported platform to guarantee strict-newer.
+        let tmp = TempDir::new().expect("tempdir");
+        write_file(&tmp.path().join("dist").join("index.html"), b"<old/>");
+
+        // Filesystem mtime resolution can be coarse (FAT = 2s, HFS = 1s);
+        // sleep enough to clear the worst case so the assertion is
+        // deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+
+        write_file(
+            &tmp.path().join("src").join("App.tsx"),
+            b"export const App = () => 'changed';",
+        );
+
+        let result = check_dist_freshness(tmp.path()).await;
+        assert_eq!(result, Some(FrontendStaleReason::SrcDrift));
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_dist_newer_than_src() {
+        // Happy path: src/ written, then dist built afterward.
+        let tmp = TempDir::new().expect("tempdir");
+        write_file(
+            &tmp.path().join("src").join("App.tsx"),
+            b"export const App = () => null;",
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+
+        write_file(
+            &tmp.path().join("dist").join("index.html"),
+            b"<!doctype html><html/>",
+        );
+
+        let result = check_dist_freshness(tmp.path()).await;
+        assert_eq!(
+            result, None,
+            "dist newer than src is the healthy state; must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_unrelated_extensions_in_src() {
+        // Touching a .md or .png in src/ shouldn't trip the drift signal —
+        // the walker only looks at .ts/.tsx/.css/.json/.html.
+        let tmp = TempDir::new().expect("tempdir");
+        write_file(&tmp.path().join("dist").join("index.html"), b"<built/>");
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        write_file(&tmp.path().join("src").join("README.md"), b"# notes");
+        write_file(&tmp.path().join("src").join("logo.png"), b"\x89PNG fake");
+
+        let result = check_dist_freshness(tmp.path()).await;
+        assert_eq!(
+            result, None,
+            "non-source extensions must not trigger SrcDrift"
+        );
+    }
+
+    #[test]
+    fn frontend_stale_reason_wire_format_is_stable() {
+        // External callers parse the `frontend_stale_reason` string —
+        // pin the wire format so a refactor can't silently rename it.
+        assert_eq!(FrontendStaleReason::BuildFailed.as_str(), "build_failed");
+        assert_eq!(
+            FrontendStaleReason::SrcDrift.as_str(),
+            "src_newer_than_dist"
+        );
+        assert_eq!(FrontendStaleReason::DistMissing.as_str(), "dist_missing");
+    }
 }
