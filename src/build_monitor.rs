@@ -452,6 +452,14 @@ async fn run_build_inner(
         // npm_guard drops here, releasing the frontend build lock before cargo starts.
     }
 
+    // Diagnostic-only: emit a WARN if the runner working tree isn't on
+    // origin/main. Multi-agent flow can leave the tree on a feature branch
+    // between sessions, and cargo silently compiles whatever's there. The
+    // warn surfaces the mismatch in supervisor.log so a caller intending to
+    // test main-side code has a chance to spot it before reading `git_sha`
+    // on the spawn response. See qontinui-supervisor#21.
+    warn_if_working_tree_off_main(state, slot.id).await;
+
     // Always pass --features custom-protocol so Tauri embeds the frontend from
     // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
     // from devUrl (localhost:1420), which isn't running.
@@ -670,6 +678,75 @@ fn dist_index_ok(npm_dir: &std::path::Path) -> bool {
         Ok(m) => m.is_file() && m.len() > 0,
         Err(_) => false,
     }
+}
+
+/// Emit a `WARN`-level log line when the qontinui-runner working tree's
+/// HEAD does not match `origin/main`. `cargo build` compiles whatever is
+/// on disk regardless of branch, so in a multi-agent setup where another
+/// session has `git switch`ed the runner tree to a feature branch a
+/// caller intending to test main-side code will silently get the feat
+/// branch's binary instead. The only existing signal is the `git_sha`
+/// field on the spawn-test response, which most callers don't compare.
+///
+/// Best-effort: any git error (not a repo, no `origin/main` remote ref,
+/// git missing from PATH) returns without emitting. The warn is
+/// diagnostic, not gate. See [qontinui-supervisor#21] for context.
+///
+/// `project_dir` is `qontinui-runner/src-tauri`; the git repo root is
+/// the parent.
+///
+/// [qontinui-supervisor#21]: https://github.com/qontinui/qontinui-supervisor/issues/21
+async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
+    let project_dir = &state.config.project_dir;
+    let git_dir = match project_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+
+    async fn run_git(args: &[&str], cwd: &std::path::Path) -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    let head = match run_git(&["rev-parse", "HEAD"], &git_dir).await {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    let origin_main = match run_git(&["rev-parse", "origin/main"], &git_dir).await {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    if head == origin_main {
+        return;
+    }
+
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &git_dir)
+        .await
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    let head_short: String = head.chars().take(12).collect();
+    let main_short: String = origin_main.chars().take(12).collect();
+
+    let msg = format!(
+        "Slot {}: working tree HEAD ({}, branch={}) differs from origin/main ({}). \
+         This build will compile {}, NOT main. Read `git_sha` from the spawn response \
+         to confirm what actually ran. See qontinui-supervisor#21.",
+        slot_id, head_short, branch, main_short, head_short
+    );
+    warn!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
 }
 
 /// Cap on the per-slot `last_build_stderr_capture` blob. Matches

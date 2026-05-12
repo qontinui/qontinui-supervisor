@@ -398,6 +398,13 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 If the build fails, the placeholder port reservation is cleaned up and the error is returned.
 
+**Hazard: `rebuild: true` compiles whatever branch the runner working tree is checked out to — not `origin/main`.** The supervisor doesn't fetch, doesn't compare against any expected ref, doesn't switch branches. In a multi-agent setup where another session `git switch`es `qontinui-runner` between agents, a `rebuild: true` call intending to test code on `main` will silently produce a binary from whichever feature branch is currently checked out. The build succeeds; the wrong code runs. Two diagnostic surfaces help:
+
+1. **`git_sha` on the spawn-test response** is the authoritative answer to *"what did I actually run?"* — always compare it against what you expected before drawing conclusions from the resulting runner. The value is a 12-char abbreviated SHA of `HEAD` in the runner repo at build time.
+2. **`tracing::warn!` in supervisor.log** — when the working tree's `HEAD` differs from `origin/main`, the supervisor emits a `WARN` line with the actual SHA, branch name, and origin/main SHA before the cargo invocation. Best-effort: missing git, missing `origin/main` remote, or non-repo skip the warning silently. Filter `supervisor.log` for `working tree HEAD` to surface these.
+
+If a `rebuild: true` returned a `git_sha` you didn't expect, the recovery path is to either (a) `git switch main && git pull && curl POST /runners/spawn-test {rebuild: true}` again (disruptive — touches state another agent's session may be using), or (b) build locally in a worktree off `origin/main` and `cp` the resulting exe into `target-pool/slot-N/debug/qontinui-runner.exe`, then spawn-test with `rebuild: false`. (b) is non-destructive and the recommended path during contested-worktree windows.
+
 ## Key Constants
 
 | Constant | Value |
