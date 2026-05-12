@@ -107,10 +107,13 @@ pub struct StaleBinary {
 ///
 /// Returns `None` when the copy does not exist yet (runner never started under
 /// this supervisor, or the path resolver failed to copy). The live path is
-/// `target/debug/qontinui-runner-<id>.exe` — the same path set up by
-/// `start_exe_mode_for_runner` before spawning the child.
-pub fn running_binary_mtime(state: &SharedState, runner_id: &str) -> Option<std::time::SystemTime> {
-    let path = state.config.runner_exe_copy_path(runner_id);
+/// determined by [`crate::config::SupervisorConfig::runner_exe_copy_path`] —
+/// pool-named for `Temp`/`Named`, id-named for `Primary`/`External`.
+pub fn running_binary_mtime(
+    state: &SharedState,
+    config: &crate::config::RunnerConfig,
+) -> Option<std::time::SystemTime> {
+    let path = state.config.runner_exe_copy_path(config);
     std::fs::metadata(&path).ok()?.modified().ok()
 }
 
@@ -178,8 +181,11 @@ pub fn compute_stale_binary(
 /// Convenience wrapper: look up the runner's running copy + newest slot and
 /// call `compute_stale_binary`. Returns `None` on any I/O miss — callers
 /// treat the field as strictly informational.
-pub async fn stale_binary_for_runner(state: &SharedState, runner_id: &str) -> Option<StaleBinary> {
-    let running = running_binary_mtime(state, runner_id);
+pub async fn stale_binary_for_runner(
+    state: &SharedState,
+    config: &crate::config::RunnerConfig,
+) -> Option<StaleBinary> {
+    let running = running_binary_mtime(state, config);
     let newest_slot = newest_slot_binary_mtime(state).await;
     compute_stale_binary(running, newest_slot)
 }
@@ -791,7 +797,7 @@ async fn start_exe_mode_for_runner(
     // (locked previous copy, disk full, AV) instead of silently producing
     // a worse failure mode later.
     let exe_path = {
-        let copy_path = state.config.runner_exe_copy_path(&managed.config.id);
+        let copy_path = state.config.runner_exe_copy_path(&managed.config);
         match std::fs::copy(&source_exe, &copy_path) {
             Ok(_) => {
                 info!(
@@ -1512,7 +1518,7 @@ pub async fn stop_runner_by_id(
         // Clean up the per-runner exe copy to prevent disk bloat.
         // Each copy is ~200MB + ~1.3GB PDB; without cleanup, orphaned copies
         // accumulated to ~200GB in a recent audit.
-        let exe_copy = state.config.runner_exe_copy_path(&runner_id);
+        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
         if exe_copy.exists() {
             if let Err(e) = std::fs::remove_file(&exe_copy) {
                 warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
