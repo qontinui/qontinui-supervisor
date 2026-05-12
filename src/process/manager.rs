@@ -348,6 +348,16 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
 /// A test runner is considered stale if:
 ///   - Its `running` flag is false, OR
 ///   - Its `running` flag is true but nothing is listening on its port (crash).
+///
+/// **Active-build grace:** a placeholder with `running=false` is the normal
+/// pre-spawn state while `spawn-test --rebuild` runs `npm run build` +
+/// `cargo build`. Cold cargo builds can exceed 10-15 min on a fresh checkout,
+/// far longer than the prior 2-minute grace period. Reaping a placeholder
+/// mid-build leaves the build orphaned (cancelled when its associated
+/// placeholder vanishes) and the user with no runner. We now additionally
+/// skip reaping when any build slot is currently busy — the assumption being
+/// that an active build is overwhelmingly likely to be feeding a recent
+/// placeholder.
 pub async fn reap_stale_test_runners(state: SharedState) {
     const INTERVAL: Duration = Duration::from_secs(5 * 60);
     // Wait a bit on startup to let normal init complete
@@ -355,6 +365,14 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 
     loop {
         tokio::time::sleep(INTERVAL).await;
+
+        // Sample build-pool state once per sweep. Cheap (per-slot RwLock try_read).
+        let any_build_active = state
+            .build_pool
+            .slots
+            .iter()
+            .any(|s| s.busy.try_read().map(|g| g.is_some()).unwrap_or(true));
+
         let runners = state.get_all_runners().await;
         let mut reaped = 0u32;
 
@@ -372,6 +390,15 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                 let runner = managed.runner.read().await;
                 runner.running
             };
+            // Active-build grace: a pre-running placeholder (`running=false`)
+            // while ANY build slot is busy is almost certainly the spawn-test
+            // request that triggered that build. Don't reap it — wait for the
+            // build to finish so the handler can promote it to running=true.
+            // Runners that say `running=true` get the post-crash sweep below
+            // regardless of pool state.
+            if !is_running && any_build_active {
+                continue;
+            }
             if is_running {
                 if crate::process::port::is_port_in_use(managed.config.port) {
                     continue; // genuinely alive
