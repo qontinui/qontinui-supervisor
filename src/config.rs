@@ -524,11 +524,36 @@ impl SupervisorConfig {
     /// This avoids locking the main build artifact so dev-mode rebuilds succeed.
     /// Lives alongside the source exe under `target/debug/` so it picks up the
     /// same incremental build outputs (DLLs, PDBs, etc.) as the original.
-    pub fn runner_exe_copy_path(&self, runner_id: &str) -> PathBuf {
+    ///
+    /// **Pool naming.** For `Temp` and `Named` runners the filename is keyed
+    /// off the runner's port (`qontinui-runner-test-{port}.exe`,
+    /// `qontinui-runner-named-{port}.exe`) rather than its unique id. This
+    /// gives a stable, bounded set of filenames (23 test slots × the named
+    /// port set) so Windows Firewall rules registered against those paths
+    /// keep matching across spawn-test invocations. Without the pool naming,
+    /// each spawn produced a new binary path (`qontinui-runner-test-{uuid}.exe`),
+    /// every cold spawn triggered a "Allow this app through firewall?" prompt,
+    /// and the install-firewall-rules.ps1 helper had to be re-run after
+    /// every cargo build.
+    ///
+    /// `Primary` and `External` runners keep id-based names — primary's id is
+    /// already a stable `"primary"`, and external runners are user-managed
+    /// (the supervisor only observes them).
+    pub fn runner_exe_copy_path(&self, config: &RunnerConfig) -> PathBuf {
+        let filename = match &config.kind {
+            RunnerKind::Temp { .. } => format!("qontinui-runner-test-{}.exe", config.port),
+            RunnerKind::Named { .. } => format!("qontinui-runner-named-{}.exe", config.port),
+            RunnerKind::Primary => format!("qontinui-runner-{}.exe", config.id),
+            // `External` and any future `RunnerKind` variants (the enum is
+            // `#[non_exhaustive]`) — fall back to the id-based name so
+            // user-managed runners that the supervisor only observes keep
+            // working without supervisor changes.
+            _ => format!("qontinui-runner-{}.exe", config.id),
+        };
         self.runner_npm_dir()
             .join("target")
             .join("debug")
-            .join(format!("qontinui-runner-{}.exe", runner_id))
+            .join(filename)
     }
 
     /// Path to the runner npm project root (parent of src-tauri).

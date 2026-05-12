@@ -227,7 +227,7 @@ pub async fn list_runners(
         // badge prompting the user to restart. File-stat only, swallows I/O
         // errors — this is strictly informational and must never block the
         // listing.
-        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config.id).await;
+        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config).await;
 
         result.push(json!({
             "id": managed.config.id,
@@ -442,7 +442,7 @@ pub async fn remove_runner(
 
     // Clean up the per-runner exe copy for temp runners to prevent disk bloat.
     if manager::is_temp_runner(&id) {
-        let exe_copy = state.config.runner_exe_copy_path(&id);
+        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
         if exe_copy.exists() {
             if let Err(e) = std::fs::remove_file(&exe_copy) {
                 warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
@@ -618,7 +618,7 @@ pub async fn purge_stale_test_runners_core(
         }
 
         // Clean up the per-runner exe copy to prevent disk bloat.
-        let exe_copy = state.config.runner_exe_copy_path(&id);
+        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
         if exe_copy.exists() {
             if let Err(e) = std::fs::remove_file(&exe_copy) {
                 warn!(
@@ -2770,7 +2770,7 @@ pub async fn runner_log_history(
         // Phase 2c (Item 9): mirror `stale_binary` from the `/runners` listing
         // so single-runner-drill-down callers (dashboard log pane, CLI) see
         // the same freshness signal without issuing a second request.
-        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config.id).await;
+        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config).await;
         // Per-spawn early-death log file path, when the runner was started
         // by the supervisor (any spawn flow). `null` for primary runners or
         // runners imported into the registry without a managed start.
