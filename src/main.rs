@@ -434,7 +434,10 @@ async fn reap_stale_test_runners(state: state::SharedState) {
 
     loop {
         interval.tick().await;
-        let purged = crate::routes::runners::purge_stale_test_runners_core(&state).await;
+        // `respect_active_builds=true`: cold cargo builds can run longer than
+        // this 5-minute sweep cadence; if a build is in flight, leave its
+        // placeholder alone so the spawn-test handler can promote it.
+        let purged = crate::routes::runners::purge_stale_test_runners_core(&state, true).await;
         if !purged.is_empty() {
             info!(
                 "reap_stale_test_runners: swept {} stale placeholder(s): {:?}",

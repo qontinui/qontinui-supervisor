@@ -481,7 +481,8 @@ pub async fn remove_runner(
 pub async fn purge_stale(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let purged_triples = purge_stale_test_runners_core(&state).await;
+    // Explicit user request — purge regardless of build-pool state.
+    let purged_triples = purge_stale_test_runners_core(&state, false).await;
     let count = purged_triples.len();
     let purged: Vec<serde_json::Value> = purged_triples
         .iter()
@@ -510,7 +511,31 @@ pub async fn purge_stale(
 /// `(id, name, port)` of every test runner that was evicted — placeholders
 /// whose process never became responsive, plus zombies where the process died
 /// but the in-memory registry still said "running".
-pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, String, u16)> {
+///
+/// `respect_active_builds`:
+/// - `false` — caller explicitly asked to purge regardless of state (route
+///   handler `POST /runners/purge-stale` is the canonical example: the user
+///   knows what they're doing).
+/// - `true` — caller is a periodic sweep; skip pre-running placeholders
+///   (`running=false`) when ANY build slot is busy, because that placeholder
+///   is overwhelmingly likely to be the one the active build is feeding.
+///   Cold cargo builds can run 10-15 min on a fresh checkout, far longer
+///   than the sweep cadence; reaping the placeholder mid-build leaves the
+///   build orphaned and the spawn-test request without a runner.
+pub async fn purge_stale_test_runners_core(
+    state: &SharedState,
+    respect_active_builds: bool,
+) -> Vec<(String, String, u16)> {
+    let any_build_active = if respect_active_builds {
+        state
+            .build_pool
+            .slots
+            .iter()
+            .any(|s| s.busy.try_read().map(|g| g.is_some()).unwrap_or(true))
+    } else {
+        false
+    };
+
     let runners = state.get_all_runners().await;
     let mut purged: Vec<(String, String, u16)> = Vec::new();
 
@@ -522,6 +547,14 @@ pub async fn purge_stale_test_runners_core(state: &SharedState) -> Vec<(String, 
             let runner = managed.runner.read().await;
             runner.running
         };
+        // Active-build grace: a `running=false` placeholder during an active
+        // build is the spawn-test request that triggered that build. Skip
+        // reaping; the next sweep will pick it up if the build never produces
+        // a healthy runner. Only zombies (`running=true` with a dead port)
+        // continue to fall through.
+        if respect_active_builds && !is_running && any_build_active {
+            continue;
+        }
         if is_running {
             // Try to detect zombie: process is gone but state says running.
             // If nothing is actually listening on the port, treat it as stale.
