@@ -10,8 +10,8 @@
 //! Override with `QONTINUI_SPECS_ROOT`.
 //!
 //! Submodules:
-//! - [`types`]      Rust mirrors of `IRDocument` + legacy spec types
-//! - [`projection`] Pure `IrDocument -> LegacySpec` projection (Rust port of
+//! - [`types`]      Rust mirrors of `IrPageSpec` + legacy spec types
+//! - [`projection`] Pure `IrPageSpec -> LegacySpec` projection (Rust port of
 //!   the TS `projectIRToBundledPage`)
 //! - [`storage`]    Filesystem layer for the storage layout under the specs root
 //! - [`responses`]  Empty/error envelope shapes — every empty response carries `reason`

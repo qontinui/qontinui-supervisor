@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::projection::project_to_pretty_json;
-use super::types::IrDocument;
+use super::types::IrPageSpec;
 use crate::fs_atomic::atomic_write;
 
 /// Resolve the storage root for the supervisor's Spec API.
@@ -100,14 +100,14 @@ pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
 /// Read an IR document from disk. Returns `Ok(None)` if the file is missing
 /// (so callers can return a `reason: "page-not-found"` rather than an
 /// internal error).
-pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrDocument>, String> {
+pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if !paths.ir_path.exists() {
         return Ok(None);
     }
     let data = fs::read_to_string(&paths.ir_path)
         .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
-    let doc: IrDocument = serde_json::from_str(&data)
+    let doc: IrPageSpec = serde_json::from_str(&data)
         .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
     Ok(Some(doc))
 }
@@ -144,7 +144,7 @@ pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> 
 
 /// Write an IR document and regenerate its projection. Returns the absolute
 /// path to the projection file on success.
-pub fn write_ir_and_regenerate(root: &Path, doc: &IrDocument) -> Result<PathBuf, String> {
+pub fn write_ir_and_regenerate(root: &Path, doc: &IrPageSpec) -> Result<PathBuf, String> {
     let paths = PagePaths::for_page(root, &doc.id);
     let ir_json =
         serde_json::to_string_pretty(doc).map_err(|e| format!("serialize IR failed: {}", e))?;

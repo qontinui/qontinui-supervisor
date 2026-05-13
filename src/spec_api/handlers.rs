@@ -33,7 +33,7 @@ use super::events::{self, SpecChanged};
 use super::projection::project_ir_to_bundled_page;
 use super::responses::{EmptyOk, QueryResult, SpecError};
 use super::storage::{self, ReadWithinRootError};
-use super::types::IrDocument;
+use super::types::IrPageSpec;
 
 // ---------------------------------------------------------------------------
 // GET /spec/get?path=<rel>
@@ -227,7 +227,7 @@ pub async fn post_query(
         }
     };
 
-    let mut docs: Vec<IrDocument> = Vec::new();
+    let mut docs: Vec<IrPageSpec> = Vec::new();
     for id in &ids {
         if let Ok(Some(doc)) = storage::read_ir(&root, id) {
             docs.push(doc);
@@ -434,7 +434,7 @@ pub async fn get_diff(State(_state): State<SharedState>, Query(_q): Query<DiffQu
 
 pub async fn post_author(
     State(_state): State<SharedState>,
-    Json(doc): Json<IrDocument>,
+    Json(doc): Json<IrPageSpec>,
 ) -> Response {
     if doc.id.trim().is_empty() {
         return (
