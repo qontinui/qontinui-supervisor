@@ -9,7 +9,7 @@
 use serde_json::{json, Map, Value};
 
 use super::types::{
-    IrPageSpec, IrElementCriteria, IrState, IrTransition, IrTransitionAction, LegacyAssertion,
+    IrElementCriteria, IrPageSpec, IrState, IrTransition, IrTransitionAction, LegacyAssertion,
     LegacyAssertionTarget, LegacyGroup, LegacyProcessStep, LegacySpec, LegacyStateMachine,
     LegacyStateMachineState, LegacyTransition,
 };
