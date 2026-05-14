@@ -1,22 +1,21 @@
-# qontinui-supervisor cargo config — Row 2 Phase 2 sccache wiring.
+# qontinui-supervisor cargo config — Row 2 Phase 2 sccache defaults.
 #
-# Mirrors qontinui-runner/src-tauri/.cargo/config.toml so the supervisor
-# (which runs the build pool) participates in the same LAN-shared cache.
-# Build-pool slots produce runner binaries; without sccache here every
-# pool slot would warm its own rustc compile-unit cache from scratch.
+# Mirrors qontinui-runner/src-tauri/.cargo/config.toml. Supervisor
+# build-pool slots produce runner binaries; with sccache in place each
+# slot's rustc compile units land in the canonical S3-backed cache
+# and become reusable across slots and across cloud-burst CI workers.
+#
+# RUSTC_WRAPPER is set per-shell (dev-start.ps1 / cargo-guard.sh / CI
+# workflow `env:` block), NOT pinned here — CI runners without sccache
+# installed would otherwise fail.
 #
 # See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3.
-
-[build]
-rustc-wrapper = "sccache"
 
 [env]
 SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
 SCCACHE_REGION = { value = "us-east-1", force = false }
 SCCACHE_S3_USE_SSL = { value = "off", force = false }
 SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
-# SCCACHE_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY intentionally
-# omitted — see qontinui-runner/src-tauri/.cargo/config.toml for rationale.
 
 # Repro flags for content-addressed cache compatibility (Row 10 Wave 0).
 [target.x86_64-pc-windows-msvc]
