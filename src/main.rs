@@ -12,6 +12,11 @@ mod expo;
 // `max_concurrent_builds` to coord on startup. See
 // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
 mod fleet;
+// Stream E (spec-check v1, plan 05 §10): nightly cron that composes
+// /spec/proposals/scan → /execute (per proposal) → /sweep-pending on the
+// primary runner. No-op when the runner's spec-authoring feature is off
+// (returns 404 → warn-once + skip). See `src/flywheel.rs`.
+mod flywheel;
 mod fs_atomic;
 mod health_cache;
 mod log_capture;
@@ -256,6 +261,19 @@ async fn main() -> anyhow::Result<()> {
         let state_clone = state.clone();
         tokio::spawn(async move {
             reap_stale_test_runners(state_clone).await;
+        });
+    }
+
+    // Spawn flywheel cron (Stream E — spec coverage-growth loop). Time-driven
+    // (24h cadence by default, env-overridable); targets the primary runner
+    // at port 9876 only. No-op when the runner's `spec-authoring` feature is
+    // compiled out — the loop logs warn-once on 404 and continues to the
+    // next tick. Errors are swallowed; the loop never panics. See
+    // `src/flywheel.rs` for the cron contract.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            flywheel::flywheel_loop(state_clone).await;
         });
     }
 
