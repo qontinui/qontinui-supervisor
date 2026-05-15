@@ -6,3 +6,10 @@
 *.sh text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+
+# Cross-repo compose() parity fixture — must stay byte-identical to
+# qontinui-coord/tests/fixtures/compose_parity.json. eol=lf is load-bearing:
+# the CI fixture-drift check byte-compares this working-tree copy against
+# coord's raw blob from origin/main (always LF). Covered by *.json above;
+# kept explicit so the parity constraint is visible at the path.
+tests/fixtures/compose_parity.json text eol=lf
