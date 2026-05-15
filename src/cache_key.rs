@@ -210,6 +210,18 @@ async fn run_canonical_diff(
 
 /// Compose the cache key from its five dimensions. Pure — separated so
 /// it is unit-testable without git/rustc/python on the box.
+///
+/// PARITY: must stay byte-identical to
+/// `qontinui-coord/src/ac_gate.rs::compose`. The coord AC-freshness gate
+/// looks keys up in the same bazel-remote Action Cache this pool writes;
+/// if the two `compose()` impls drift, coord's lookups miss every entry
+/// the pool wrote and the optimization silently degrades to a permanent
+/// 0% hit rate. Changing the serialization, field order, or hash
+/// construction here requires updating BOTH impls AND regenerating
+/// `tests/fixtures/compose_parity.json` (byte-identical in both repos)
+/// in lockstep. Guarded by `compose_parity::matches_canonical_fixture`
+/// and the cross-repo fixture-drift CI step; see memory
+/// `proj_row_10_item_8_ac_gate`.
 pub fn compose(
     base_sha: &str,
     diff_sha: &str,
@@ -359,5 +371,47 @@ mod tests {
         assert_eq!(target_subdir(BuildKind::Release), "release");
         assert_eq!(target_subdir(BuildKind::Build), "debug");
         assert_eq!(target_subdir(BuildKind::Check), "debug");
+    }
+
+    /// Cross-repo compose() parity guard. Loads the canonical fixture
+    /// (byte-identical in qontinui-supervisor and qontinui-coord) and
+    /// asserts this repo's `compose()` reproduces its `expected_key`. If
+    /// this implementation drifts from canonical, this test fires here;
+    /// the supervisor CI fixture-drift step independently catches the
+    /// fixture itself diverging from coord's. See memory
+    /// `proj_row_10_item_8_ac_gate`.
+    mod compose_parity {
+        use super::super::compose;
+
+        #[test]
+        fn matches_canonical_fixture() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/compose_parity.json"
+            );
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("compose-parity fixture unreadable at {path}: {e}"));
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).expect("compose-parity fixture is not valid JSON");
+            let i = &v["inputs"];
+            let got = compose(
+                i["base_sha"].as_str().expect("inputs.base_sha"),
+                i["diff_sha"].as_str().expect("inputs.diff_sha"),
+                i["rustc_version"].as_str().expect("inputs.rustc_version"),
+                i["cargo_profile"].as_str().expect("inputs.cargo_profile"),
+                i["target_triple"].as_str().expect("inputs.target_triple"),
+            );
+            let expected = v["expected_key"].as_str().expect("fixture expected_key");
+            assert_eq!(
+                got, expected,
+                "CROSS-REPO PARITY VIOLATION: qontinui-supervisor \
+                 cache_key::compose drifted from the canonical fixture. \
+                 qontinui-coord/src/ac_gate.rs::compose must stay \
+                 byte-identical or its AC lookups miss every entry this \
+                 pool writes (silent 0% hit rate). Update BOTH impls AND \
+                 regenerate tests/fixtures/compose_parity.json in both \
+                 repos in lockstep. See memory proj_row_10_item_8_ac_gate."
+            );
+        }
     }
 }

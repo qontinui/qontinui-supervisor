@@ -1,0 +1,11 @@
+{
+  "_comment": "CROSS-REPO PARITY FIXTURE. This file MUST be byte-identical at tests/fixtures/compose_parity.json in both qontinui-supervisor and qontinui-coord. qontinui-supervisor/src/cache_key.rs::compose and qontinui-coord/src/ac_gate.rs::compose must each produce `expected_key` from `inputs`. The coord AC-freshness gate looks keys up in the same bazel-remote Action Cache the supervisor pool writes; if either compose() drifts, the lookups miss every entry the pool wrote and the optimization silently degrades to a permanent 0% hit rate. Changing serialization, field order, or hash construction in EITHER compose() requires updating BOTH implementations AND regenerating expected_key here, in lockstep, in the same change window. See memory proj_row_10_item_8_ac_gate.",
+  "inputs": {
+    "base_sha": "0000000000000000000000000000000000000000",
+    "diff_sha": "1111111111111111111111111111111111111111111111111111111111111111",
+    "rustc_version": "rustc 1.95.0 (compose-parity-fixture)",
+    "cargo_profile": "build:dev",
+    "target_triple": "x86_64-unknown-linux-gnu"
+  },
+  "expected_key": "c368ca01d94a32cb20a8196ee6e0d96830a312072b9f22e8b9b57869ae790828"
+}
