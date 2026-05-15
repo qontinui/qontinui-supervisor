@@ -1,4 +1,5 @@
 mod build_monitor;
+mod build_submissions;
 mod config;
 mod diagnostics;
 mod error;

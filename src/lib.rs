@@ -2,6 +2,7 @@
 // main.rs has its own mod declarations; this re-exports all modules.
 
 pub mod build_monitor;
+pub mod build_submissions;
 pub mod config;
 pub mod diagnostics;
 pub mod error;
