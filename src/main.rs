@@ -8,6 +8,10 @@ mod diagnostics;
 mod error;
 mod evaluation;
 mod expo;
+// Row 2 Phase 1 (fleet topology): detects CPU/RAM/disk and POSTs
+// `max_concurrent_builds` to coord on startup. See
+// `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
+mod fleet;
 mod fs_atomic;
 mod health_cache;
 mod log_capture;
@@ -192,6 +196,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn health cache refresher (caches expensive port checks every 2s)
     let _health_cache_handle = health_cache::spawn_health_cache_refresher(state.clone());
+
+    // Row 2 Phase 1: publish this supervisor's MachineBudget (role=build,
+    // max_concurrent_builds derived from CPU + RAM per §3.2) to coord on
+    // startup. Fire-and-forget — supervisor never blocks on coord
+    // availability. See `fleet.rs::publish_on_startup`.
+    tokio::spawn(async move {
+        fleet::publish_on_startup().await;
+    });
 
     // Layer 3 of the orphan-runner safety net: scan for `qontinui-runner.exe`
     // processes left over from a prior supervisor instance and either adopt
