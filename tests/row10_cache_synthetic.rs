@@ -129,7 +129,13 @@ async fn item6_7_cache_hit_roundtrip_under_2s() {
 
     // Synthetic artifact (stands in for target/release/<bin>) — unique
     // per run so reruns don't false-hit a prior populate.
-    let nonce = format!("{}", std::time::SystemTime::now().elapsed().unwrap_or_default().as_nanos());
+    let nonce = format!(
+        "{}",
+        std::time::SystemTime::now()
+            .elapsed()
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let artifact = format!("ROW10-SYNTHETIC-ARTIFACT-{nonce}").into_bytes();
     let artifact_sha = {
         let mut h = Sha256::new();
