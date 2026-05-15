@@ -153,6 +153,14 @@ pub struct SupervisorState {
     /// worktree path (not the slot dirs). Bounded at 1000 entries with
     /// terminal-oldest LRU eviction.
     pub build_submissions: Arc<BuildSubmissionStore>,
+    /// Row 10 Items 6-7 — bazel-remote CAS+AC client for the
+    /// content-addressed build cache. Fail-open: a down backend never
+    /// stalls or fails a build.
+    pub bazel_remote: crate::bazel_remote::BazelRemoteClient,
+    /// Row 10 Items 6-7 — content-hash cache telemetry (ac_hit_rate per
+    /// worker/repo/profile + dual-write shadow counters). Exposed at
+    /// `GET /builds/cache-stats`.
+    pub cache_telemetry: crate::cache_telemetry::CacheTelemetry,
     pub ai: RwLock<AiState>,
     pub expo: RwLock<ExpoState>,
     pub diagnostics: RwLock<DiagnosticsState>,
@@ -888,6 +896,8 @@ impl SupervisorState {
             build: RwLock::new(BuildState::new()),
             build_pool,
             build_submissions: Arc::new(BuildSubmissionStore::new(1000)),
+            bazel_remote: crate::bazel_remote::BazelRemoteClient::from_env(),
+            cache_telemetry: crate::cache_telemetry::CacheTelemetry::new(),
             ai: RwLock::new(AiState::new(auto_debug)),
             expo: RwLock::new(ExpoState::new(expo_port)),
             diagnostics: RwLock::new(DiagnosticsState::new()),

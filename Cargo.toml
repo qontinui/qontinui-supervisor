@@ -35,6 +35,11 @@ dirs = "6"
 qontinui-types = { path = "../qontinui-schemas/rust", version = "^0.1.2" }
 qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = "^0.1.1" }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Row 10 Items 5-7 — content-addressed build cache. sha256 for the
+# canonical-diff cache key + artifact CAS digests; hex for wire encoding.
+sha2 = "0.10"
+hex = "0.4"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"

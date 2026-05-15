@@ -180,6 +180,12 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
         summary: "Clear build caches across all pool slots",
     },
     EndpointEntry {
+        method: "GET",
+        path: "/builds/cache-stats",
+        summary: "Content-addressed cache telemetry (Row 10 Items 6-7): \
+                   ac_hit_rate per worker/repo/profile + dual-write shadow",
+    },
+    EndpointEntry {
         method: "POST",
         path: "/build/reset",
         summary: "Reset build state",
@@ -859,6 +865,10 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::build_submit::get_status),
         )
         .route("/builds", get(crate::routes::runners::list_builds))
+        .route(
+            "/builds/cache-stats",
+            get(crate::routes::build_submit::get_cache_stats),
+        )
         .route(
             "/builds/{slot_id}/log",
             get(crate::routes::runners::slot_build_log),
