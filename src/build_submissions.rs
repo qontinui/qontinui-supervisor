@@ -99,7 +99,10 @@ pub enum BuildStatus {
 
 impl BuildStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, BuildStatus::Succeeded { .. } | BuildStatus::Failed { .. })
+        matches!(
+            self,
+            BuildStatus::Succeeded { .. } | BuildStatus::Failed { .. }
+        )
     }
 }
 
@@ -283,7 +286,11 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
         )
         .await;
 
-    let mut args: Vec<String> = build_kind.cargo_args().iter().map(|s| s.to_string()).collect();
+    let mut args: Vec<String> = build_kind
+        .cargo_args()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     if let Some(p) = &package {
         args.push("-p".to_string());
         args.push(p.clone());
@@ -451,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn store_evicts_oldest_terminal_when_over_cap() {
         let store = BuildSubmissionStore::new(16); // cap floored at 16
-        // Insert 17 terminal entries; the cap is 16, so one must evict.
+                                                   // Insert 17 terminal entries; the cap is 16, so one must evict.
         let now = Utc::now();
         for i in 0..17u32 {
             let sub = BuildSubmission {

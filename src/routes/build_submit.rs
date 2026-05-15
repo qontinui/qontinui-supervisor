@@ -69,11 +69,7 @@ pub async fn post_submit(
             })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e})),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
 }
 
