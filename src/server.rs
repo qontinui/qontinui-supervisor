@@ -955,6 +955,17 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .merge(crate::routes::dashboard::spa_routes(spa_state))
         .merge(crate::routes::dev_endpoints::router(dev_state))
+        // Row 9 Phase 5 — extract W3C traceparent from inbound
+        // requests BEFORE TraceLayer creates its per-request span, so
+        // the supervisor's spans inherit the upstream trace from coord
+        // / runner. Layer ordering: tower applies bottom-up, so the
+        // extract middleware needs to land AFTER (visually above)
+        // TraceLayer in `.layer(...)` chains. We use `axum::middleware`
+        // here rather than reordering the existing TraceLayer because
+        // any reordering risks moving the cors / panic-catch wrappers.
+        .layer(axum::middleware::from_fn(
+            crate::trace_propagation::extract_trace_context,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         // CatchPanicLayer wraps everything below it (tower applies layers

@@ -36,6 +36,16 @@ qontinui-types = { path = "../qontinui-schemas/rust", version = "^0.1.2" }
 qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = "^0.1.1" }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
+# Row 9 Phase 5 — OpenTelemetry distributed tracing. Versions match
+# the runner's pin (`qontinui-runner/src-tauri/Cargo.toml`) and coord's
+# (`../qontinui-coord/Cargo.toml`) so any shared instrumentation crate
+# can use identical types. `grpc-tonic` is the default OTLP transport
+# (gRPC :4317 → Jaeger / Tempo / etc.).
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.28"
+
 [dev-dependencies]
 tempfile = "3"
 # `oneshot` extension trait for driving an axum::Router in unit tests

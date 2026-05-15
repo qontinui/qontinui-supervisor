@@ -8,6 +8,8 @@ mod expo;
 mod fs_atomic;
 mod health_cache;
 mod log_capture;
+mod otel;
+mod pii_scrub;
 mod process;
 mod routes;
 mod sdk_features;
@@ -15,6 +17,7 @@ mod server;
 mod settings;
 mod spec_api;
 mod state;
+mod trace_propagation;
 mod velocity;
 mod velocity_improvement;
 mod velocity_layer;
@@ -49,14 +52,21 @@ async fn main() -> anyhow::Result<()> {
     // Clear previous velocity JSONL on startup
     velocity_layer::clear_velocity_jsonl(&dev_logs_dir);
 
-    // Initialize tracing with velocity layer for HTTP span capture
+    // Initialize tracing with velocity layer for HTTP span capture +
+    // Row 9 Phase 5 OpenTelemetry export. The OTel guard must outlive
+    // the subscriber so the batched span exporter flushes on shutdown;
+    // we capture it into a let-binding below `init` and drop it at
+    // program exit.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "qontinui_supervisor=info,tower_http=info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
     let velocity = velocity_layer::VelocityLayer::new(dev_logs_dir);
+    let (_otel_guard, otel_tracer) = otel::init_otel("qontinui-supervisor");
+    let otel_layer = otel_tracer.map(|t| tracing_opentelemetry::layer().with_tracer(t));
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(otel_layer)
         .with(fmt_layer)
         .with(velocity)
         .init();
