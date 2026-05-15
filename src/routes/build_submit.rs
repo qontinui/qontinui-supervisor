@@ -40,6 +40,13 @@ pub struct SubmitRequest {
     /// `--features` arg.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Optional base ref the content-hash diff is computed against
+    /// (Row 10 Item 5). Production callers should pass `origin/main`
+    /// (or the agent's branch point) so the cache key reflects the
+    /// agent's change set, not the whole history. Omitted ⇒
+    /// `canonical_diff_hash.py` defaults to the first commit on HEAD.
+    #[serde(default)]
+    pub base_ref: Option<String>,
 }
 
 /// `POST /build/submit` — submit a build action against a worktree.
@@ -58,6 +65,7 @@ pub async fn post_submit(
         req.agent_id,
         req.package,
         req.features,
+        req.base_ref,
     )
     .await
     {
@@ -103,4 +111,22 @@ pub async fn get_status(
     };
     let sub = arc.read().await;
     (StatusCode::OK, Json(serde_json::to_value(&*sub).unwrap())).into_response()
+}
+
+/// `GET /builds/cache-stats` — Row 10 Items 6-7 content-addressed
+/// cache telemetry: `ac_hit_rate` per worker / repo / profile, plus
+/// the dual-write shadow counters the measure phase (tracker step B)
+/// consumes. Also reports whether the bazel-remote backend is wired.
+pub async fn get_cache_stats(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut stats = state.cache_telemetry.snapshot_json().await;
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert(
+            "bazel_remote".into(),
+            json!({
+                "enabled": state.bazel_remote.enabled(),
+                "url": state.bazel_remote.base_url(),
+            }),
+        );
+    }
+    (StatusCode::OK, Json(stats)).into_response()
 }

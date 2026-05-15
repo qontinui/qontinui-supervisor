@@ -1,5 +1,8 @@
+mod bazel_remote;
 mod build_monitor;
 mod build_submissions;
+mod cache_key;
+mod cache_telemetry;
 mod config;
 mod diagnostics;
 mod error;
@@ -9,6 +12,7 @@ mod fs_atomic;
 mod health_cache;
 mod log_capture;
 mod process;
+mod reapi;
 mod routes;
 mod sdk_features;
 mod server;
