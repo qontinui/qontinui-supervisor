@@ -150,6 +150,16 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     },
     // Parallel Build Pool
     EndpointEntry {
+        method: "POST",
+        path: "/build/submit",
+        summary: "Submit a build action against a worktree (Row 2 Phase 3)",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/build/{id}/status",
+        summary: "Get the status of a submitted build",
+    },
+    EndpointEntry {
         method: "GET",
         path: "/builds",
         summary: "Snapshot of the parallel build pool",
@@ -835,6 +845,18 @@ pub fn build_router(state: SharedState) -> Router {
             post(crate::routes::runners::set_test_login)
                 .get(crate::routes::runners::get_test_login)
                 .delete(crate::routes::runners::clear_test_login),
+        )
+        // Row 2 Phase 3 — generalized build pool. `POST /build/submit`
+        // accepts an external worktree + cargo command; `GET /build/:id/status`
+        // returns the submission state. Shares the build_pool permits with
+        // spawn-test (`POST /runners/spawn-test`).
+        .route(
+            "/build/submit",
+            post(crate::routes::build_submit::post_submit),
+        )
+        .route(
+            "/build/{id}/status",
+            get(crate::routes::build_submit::get_status),
         )
         .route("/builds", get(crate::routes::runners::list_builds))
         .route(

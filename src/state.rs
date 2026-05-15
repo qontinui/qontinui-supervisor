@@ -1,3 +1,4 @@
+use crate::build_submissions::BuildSubmissionStore;
 use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
@@ -146,6 +147,12 @@ pub struct SupervisorState {
     pub build: RwLock<BuildState>,
     /// Parallel cargo build slot pool. Semaphore permits + per-slot target dirs.
     pub build_pool: BuildPool,
+    /// Generalized build-submissions store — Row 2 Phase 3.
+    /// Backs `POST /build/submit` + `GET /build/:id/status`. Submissions
+    /// share the build_pool's semaphore but bring their own external
+    /// worktree path (not the slot dirs). Bounded at 1000 entries with
+    /// terminal-oldest LRU eviction.
+    pub build_submissions: Arc<BuildSubmissionStore>,
     pub ai: RwLock<AiState>,
     pub expo: RwLock<ExpoState>,
     pub diagnostics: RwLock<DiagnosticsState>,
@@ -880,6 +887,7 @@ impl SupervisorState {
             watchdog: RwLock::new(WatchdogState::new(watchdog_enabled)),
             build: RwLock::new(BuildState::new()),
             build_pool,
+            build_submissions: Arc::new(BuildSubmissionStore::new(1000)),
             ai: RwLock::new(AiState::new(auto_debug)),
             expo: RwLock::new(ExpoState::new(expo_port)),
             diagnostics: RwLock::new(DiagnosticsState::new()),

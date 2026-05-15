@@ -1,0 +1,47 @@
+# qontinui-supervisor cargo config — Row 2 Phase 2 sccache defaults +
+# Row 2 Phase 3 path-remap.
+#
+# Mirrors qontinui-runner/src-tauri/.cargo/config.toml. Supervisor
+# build-pool slots produce runner binaries; with sccache in place each
+# slot's rustc compile units land in the canonical S3-backed cache
+# and become reusable across slots and across cloud-burst CI workers.
+#
+# RUSTC_WRAPPER is set per-shell (dev-start.ps1 / cargo-guard.sh / CI
+# workflow `env:` block), NOT pinned here — CI runners without sccache
+# installed would otherwise fail.
+#
+# See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3.
+
+[env]
+SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
+SCCACHE_REGION = { value = "us-east-1", force = false }
+SCCACHE_S3_USE_SSL = { value = "off", force = false }
+SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
+
+# Repro flags for content-addressed cache compatibility (Row 10 Wave 0).
+#
+# --remap-path-prefix entries (Row 2 Phase 3): collapse the per-worktree
+# absolute prefix so sccache cache keys are path-independent across
+# worktrees on the same machine. Order: longer prefix first (`.wt`
+# before bare). For variable per-agent worktree paths the agent shell
+# additionally sets `RUSTFLAGS=--remap-path-prefix=$WORKTREE_ROOT=...`.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-arg=/Brepro",
+    "--remap-path-prefix=D:/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=D:/qontinui-root=/qontinui",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,--build-id=none",
+    "--remap-path-prefix=/home/runner/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=/home/runner/qontinui-root=/qontinui",
+]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,--build-id=none",
+    "--remap-path-prefix=/home/runner/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=/home/runner/qontinui-root=/qontinui",
+]
