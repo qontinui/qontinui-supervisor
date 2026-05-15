@@ -182,7 +182,9 @@ mod tests {
 
     #[test]
     fn tagged_event_always_samples_even_at_zero_ratio() {
-        let sampler = TaggedSampler { inner: ratio_zero() };
+        let sampler = TaggedSampler {
+            inner: ratio_zero(),
+        };
         for prefix in TAGGED_EVENT_PREFIXES {
             let r = sampler.should_sample(
                 None,
@@ -202,7 +204,9 @@ mod tests {
 
     #[test]
     fn untagged_event_at_zero_ratio_does_not_sample() {
-        let sampler = TaggedSampler { inner: ratio_zero() };
+        let sampler = TaggedSampler {
+            inner: ratio_zero(),
+        };
         let r = sampler.should_sample(
             None,
             TraceId::from_bytes([1; 16]),
@@ -216,7 +220,9 @@ mod tests {
 
     #[test]
     fn tagged_event_inherits_trace_state_when_parent_invalid() {
-        let sampler = TaggedSampler { inner: ratio_zero() };
+        let sampler = TaggedSampler {
+            inner: ratio_zero(),
+        };
         let r = sampler.should_sample(
             None,
             TraceId::from_bytes([1; 16]),
