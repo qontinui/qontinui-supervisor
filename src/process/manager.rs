@@ -371,6 +371,13 @@ pub struct SlotFreshness {
     pub picked_slot_id: Option<usize>,
     pub slot_shas: Vec<(usize, Option<String>)>,
     pub drift: Option<SlotShaDrift>,
+    /// Sibling warning: a stale exe at the legacy `target/debug/` location
+    /// that operators sometimes produce by running `cargo build` from the
+    /// workspace root instead of into a slot. See
+    /// [`detect_target_debug_staleness`] for the comparison rule;
+    /// operator-facing recovery is documented in the `feedback_runner_manual_build`
+    /// memory.
+    pub target_debug_staleness: Option<TargetDebugStaleness>,
 }
 
 /// Compute the cross-slot SHA snapshot. Used by both `resolve_source_exe`
@@ -390,11 +397,143 @@ pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
             .and_then(|(_, s)| s.clone());
         detect_slot_sha_drift(pid, picked_sha.as_deref(), &slot_shas)
     });
+    let target_debug_staleness = compute_target_debug_staleness_for_state(state);
     SlotFreshness {
         picked_slot_id,
         slot_shas,
         drift,
+        target_debug_staleness,
     }
+}
+
+// =============================================================================
+// Legacy target/debug/ staleness detection (feedback_runner_manual_build)
+// =============================================================================
+//
+// The supervisor's build pool writes exes into `target-pool/slot-N/debug/`.
+// An operator running `cargo build` from the runner workspace root produces
+// an exe at `<workspace>/target/debug/qontinui-runner.exe` — NOT in any slot.
+// `resolve_source_exe` never picks from that path, so the workspace-root exe
+// can sit stale indefinitely while slot exes move forward. Anyone scripting
+// against `target/debug/qontinui-runner.exe` (or the operator expecting
+// `spawn-test {rebuild:false}` to use it) hits silent staleness.
+//
+// This module surfaces the staleness as observability — same shape as the
+// cross-slot SHA drift check, on the adjacent surface. It does NOT promote
+// the legacy path to a resolution source.
+
+/// Structured warning produced when the legacy `target/debug/qontinui-runner.exe`
+/// is older than every build-pool slot exe. Pure data — emitted to logs and
+/// `/builds`; never alters resolution. The legacy path is observability-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetDebugStaleness {
+    /// Absolute path to the legacy exe (`<workspace>/target/debug/qontinui-runner.exe`).
+    pub legacy_path: std::path::PathBuf,
+    /// mtime of the legacy exe.
+    pub legacy_mtime: std::time::SystemTime,
+    /// The oldest mtime across slots that have an exe on disk. Surface this
+    /// (not the newest) so the operator knows the staleness gap reaches even
+    /// the laggard slot — "legacy is older than every slot".
+    pub oldest_slot_mtime: std::time::SystemTime,
+}
+
+/// Pure mtime-comparison core of [`detect_target_debug_staleness`]. Separated
+/// so the staleness rule can be exercised with synthetic timestamps in tests
+/// without depending on filesystem mtime resolution.
+///
+/// Returns `Some` only when:
+/// - `legacy_mtime` is `Some`, AND
+/// - at least one entry in `slot_mtimes` is `Some`, AND
+/// - `legacy_mtime` is strictly less than every `Some` slot mtime.
+///
+/// `None` entries in `slot_mtimes` (failed reads, missing exes) are silently
+/// skipped — matches the per-slot scan pattern in [`newest_slot_binary_mtime`].
+pub fn compute_target_debug_staleness(
+    legacy_path: &std::path::Path,
+    legacy_mtime: Option<std::time::SystemTime>,
+    slot_mtimes: &[Option<std::time::SystemTime>],
+) -> Option<TargetDebugStaleness> {
+    let legacy = legacy_mtime?;
+    let oldest_slot = slot_mtimes.iter().filter_map(|m| *m).min()?;
+    // Strict `<` — equal mtimes are NOT stale (same build wave; jitter possible).
+    if legacy < oldest_slot {
+        Some(TargetDebugStaleness {
+            legacy_path: legacy_path.to_path_buf(),
+            legacy_mtime: legacy,
+            oldest_slot_mtime: oldest_slot,
+        })
+    } else {
+        None
+    }
+}
+
+/// Detect whether a legacy `target/debug/qontinui-runner.exe` is older than
+/// every slot exe in the build pool. Returns `Some` only when:
+/// - the legacy file exists AND its mtime is readable, AND
+/// - at least one slot exe exists with a readable mtime, AND
+/// - the legacy mtime is strictly older than every readable slot mtime.
+///
+/// Slot paths that can't be stat'd are silently skipped (matches the pattern
+/// in [`newest_slot_binary_mtime`]). If all slot reads fail, treat that as
+/// "no baseline" and return `None`.
+///
+/// **Observability only.** Resolution order is unchanged; the legacy path is
+/// never used as a fallback resolution source by [`resolve_source_exe`] (it
+/// only falls back to the legacy path when NO slot has an exe, which is the
+/// pre-pool case the legacy fallback originally covered).
+pub fn detect_target_debug_staleness(
+    legacy_exe_path: &std::path::Path,
+    slot_exe_paths: &[(usize, &std::path::Path)],
+) -> Option<TargetDebugStaleness> {
+    let legacy_mtime = match std::fs::metadata(legacy_exe_path).and_then(|m| m.modified()) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            debug!(
+                "detect_target_debug_staleness: legacy mtime unreadable at {:?}: {} \
+                 — skipping staleness check",
+                legacy_exe_path, e
+            );
+            None
+        }
+    };
+    let slot_mtimes: Vec<Option<std::time::SystemTime>> = slot_exe_paths
+        .iter()
+        .map(|(_, p)| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect();
+    compute_target_debug_staleness(legacy_exe_path, legacy_mtime, &slot_mtimes)
+}
+
+/// Format a [`TargetDebugStaleness`] as a human-readable warning line.
+pub fn format_target_debug_warning(s: &TargetDebugStaleness) -> String {
+    let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
+    let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
+    format!(
+        "target_debug_staleness: legacy {} (mtime {}) is older than every \
+         slot exe (oldest slot mtime {}). It will not be used by spawn-test \
+         {{rebuild:false}}. Either rebuild via supervisor (build into a slot) \
+         or delete the stale exe. See feedback_runner_manual_build.",
+        s.legacy_path.display(),
+        legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+/// Read the legacy + slot exe paths from `SharedState` and run the staleness
+/// check. Returns `None` when the legacy exe is absent, no slot exes exist,
+/// or the legacy exe is not strictly older than every slot exe.
+fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<TargetDebugStaleness> {
+    let legacy = state.config.runner_exe_path();
+    let slot_paths: Vec<(usize, std::path::PathBuf)> = state
+        .build_pool
+        .slots
+        .iter()
+        .map(|s| (s.id, s.target_dir.join("debug").join("qontinui-runner.exe")))
+        .collect();
+    let slot_refs: Vec<(usize, &std::path::Path)> = slot_paths
+        .iter()
+        .map(|(id, p)| (*id, p.as_path()))
+        .collect();
+    detect_target_debug_staleness(&legacy, &slot_refs)
 }
 
 /// Locate the most recent successfully-built runner exe across the build pool.
@@ -428,6 +567,18 @@ pub async fn resolve_source_exe(
             .and_then(|(_, s)| s.clone());
         if let Some(drift) = detect_slot_sha_drift(picked_id, picked_sha.as_deref(), &slot_shas) {
             let msg = format_drift_warning(&drift);
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+
+        // Adjacent observability: a stale exe at `target/debug/` (operator ran
+        // `cargo build` from the workspace root instead of into a slot). Same
+        // shape as the cross-slot drift check — log + SSE; resolution unchanged.
+        if let Some(staleness) = compute_target_debug_staleness_for_state(state) {
+            let msg = format_target_debug_warning(&staleness);
             warn!("{}", msg);
             state
                 .logs
@@ -2427,5 +2578,174 @@ mod tests {
         let slots = fake_slots(&[(0, "/a")]);
         let picked = pick_slot_decision(Some(99), &slots, |p| p == std::path::Path::new("/a"));
         assert_eq!(picked, Some(0));
+    }
+
+    // =========================================================================
+    // Legacy target/debug/ staleness detection
+    // (feedback_runner_manual_build — sibling failure mode of slot drift)
+    //
+    // The pure comparison logic (`compute_target_debug_staleness`) is exercised
+    // with synthetic SystemTime values so the staleness rule can be tested
+    // without depending on filesystem mtime resolution. The I/O wrapper
+    // (`detect_target_debug_staleness`) gets one round-trip sanity test
+    // against a real tempdir to guard the read path.
+    // =========================================================================
+
+    fn legacy_p() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/qontinui-runner/target/debug/qontinui-runner.exe")
+    }
+
+    /// Legacy mtime strictly older than every slot mtime — staleness fires.
+    #[test]
+    fn target_debug_staleness_fires_when_older_than_all_slots() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let legacy = Some(t0);
+        // Two slots, both newer than legacy.
+        let slots = vec![
+            Some(t0 + Duration::from_secs(3600)),
+            Some(t0 + Duration::from_secs(7200)),
+        ];
+        let s = compute_target_debug_staleness(&legacy_p(), legacy, &slots)
+            .expect("legacy older than every slot must surface staleness");
+        assert_eq!(s.legacy_mtime, t0);
+        // oldest_slot_mtime is the OLDER of the two slot mtimes.
+        assert_eq!(s.oldest_slot_mtime, t0 + Duration::from_secs(3600));
+    }
+
+    /// Legacy exe doesn't exist (or its mtime read failed) — silent.
+    #[test]
+    fn target_debug_staleness_silent_when_no_legacy() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slots = vec![Some(t0)];
+        assert!(
+            compute_target_debug_staleness(&legacy_p(), None, &slots).is_none(),
+            "missing legacy must yield None"
+        );
+    }
+
+    /// No slot exes exist — silent (no baseline to compare against).
+    #[test]
+    fn target_debug_staleness_silent_when_no_slots() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // All slot entries are None (no exe present in any slot).
+        let slots_all_missing: Vec<Option<std::time::SystemTime>> = vec![None, None];
+        assert!(
+            compute_target_debug_staleness(&legacy_p(), Some(t0), &slots_all_missing).is_none(),
+            "no slot exe means no baseline — must yield None"
+        );
+        // Truly empty slot list.
+        let empty: Vec<Option<std::time::SystemTime>> = vec![];
+        assert!(compute_target_debug_staleness(&legacy_p(), Some(t0), &empty).is_none());
+    }
+
+    /// Legacy is newer than at least one slot — silent. That other slot might
+    /// be stale (PR #34's drift surface, if SHA-distinct), but THIS check
+    /// only fires when legacy is older than EVERY slot.
+    #[test]
+    fn target_debug_staleness_silent_when_legacy_newer_than_any_slot() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let legacy = Some(t0 + Duration::from_secs(60));
+        let slots = vec![
+            Some(t0), // older than legacy — this is the one that prevents firing
+            Some(t0 + Duration::from_secs(3600)),
+        ];
+        assert!(
+            compute_target_debug_staleness(&legacy_p(), legacy, &slots).is_none(),
+            "legacy newer than ANY slot must yield None"
+        );
+    }
+
+    /// Equal mtimes (legacy == oldest slot) — silent. Strict `<` only.
+    #[test]
+    fn target_debug_staleness_silent_when_equal() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let slots = vec![Some(t0)];
+        assert!(
+            compute_target_debug_staleness(&legacy_p(), Some(t0), &slots).is_none(),
+            "equal mtimes must yield None (strict ordering)"
+        );
+    }
+
+    /// Mixed slot-readability: some slots have mtimes, some are None (failed
+    /// reads / missing exes). Only the readable ones contribute to the
+    /// staleness comparison.
+    #[test]
+    fn target_debug_staleness_skips_unreadable_slots() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let legacy = Some(t0);
+        let slots = vec![
+            None,                                 // slot-0 has no exe
+            Some(t0 + Duration::from_secs(3600)), // slot-1 exists, newer
+            None,                                 // slot-2 has no exe
+        ];
+        let s = compute_target_debug_staleness(&legacy_p(), legacy, &slots)
+            .expect("legacy older than the one readable slot must fire");
+        assert_eq!(s.oldest_slot_mtime, t0 + Duration::from_secs(3600));
+    }
+
+    /// Unreadable legacy mtime in the I/O wrapper — synthetic IO failure →
+    /// returns None (debug log, no panic). Driven by pointing the function
+    /// at a path inside a non-existent directory.
+    #[test]
+    fn target_debug_staleness_handles_unreadable_mtime() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        // legacy_path points inside a directory that doesn't exist —
+        // `std::fs::metadata` returns Err with ErrorKind::NotFound.
+        let bogus_legacy = root
+            .path()
+            .join("does-not-exist")
+            .join("nested")
+            .join("qontinui-runner.exe");
+        // Also point slots at non-existent paths — verifies the wrapper
+        // returns None without panicking when nothing is readable.
+        let bogus_slot = root.path().join("slot-0").join("qontinui-runner.exe");
+        let slots: Vec<(usize, &std::path::Path)> = vec![(0, &bogus_slot)];
+        assert!(detect_target_debug_staleness(&bogus_legacy, &slots).is_none());
+    }
+
+    /// I/O wrapper sanity: real legacy file + a real slot file with legacy
+    /// strictly older. Verifies the wrapper threads filesystem reads through
+    /// to the pure helper correctly.
+    #[test]
+    fn target_debug_staleness_io_wrapper_roundtrip() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let legacy = root.path().join("legacy.exe");
+        std::fs::write(&legacy, b"old").expect("write legacy");
+        // Force >= 50ms gap so even coarse filesystem mtime resolution
+        // produces a strict-less-than ordering. NTFS mtime res ~100ns,
+        // FAT32 ~2s; we don't ship on FAT32 dev machines.
+        std::thread::sleep(Duration::from_millis(50));
+        let slot0 = root.path().join("slot-0.exe");
+        std::fs::write(&slot0, b"new").expect("write slot");
+        let slots: Vec<(usize, &std::path::Path)> = vec![(0, &slot0)];
+        let s = detect_target_debug_staleness(&legacy, &slots)
+            .expect("legacy older than slot (file-write order) must fire");
+        assert_eq!(s.legacy_path, legacy);
+        assert!(s.legacy_mtime < s.oldest_slot_mtime);
+    }
+
+    /// Warning message includes the legacy path, both ISO timestamps, and the
+    /// pointer to feedback_runner_manual_build.
+    #[test]
+    fn target_debug_warning_message_shape() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let s = TargetDebugStaleness {
+            legacy_path: legacy_p(),
+            legacy_mtime: t0,
+            oldest_slot_mtime: t0 + Duration::from_secs(3600),
+        };
+        let msg = format_target_debug_warning(&s);
+        assert!(msg.contains("target_debug_staleness"), "{}", msg);
+        assert!(msg.contains("qontinui-runner.exe"), "{}", msg);
+        assert!(
+            msg.contains("feedback_runner_manual_build"),
+            "warning must point operator at the relevant memory: {}",
+            msg
+        );
+        assert!(
+            msg.contains("spawn-test {rebuild:false}"),
+            "warning must name the failure mode: {}",
+            msg
+        );
     }
 }
