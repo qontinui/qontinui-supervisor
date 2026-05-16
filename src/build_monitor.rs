@@ -210,6 +210,12 @@ pub async fn run_cargo_build_with_requester(
         *last = Some(slot.id);
         drop(last);
 
+        // Stamp the slot's exe with the HEAD SHA so resolve_source_exe and
+        // /builds can detect drift across slots (a fresh exe staged into one
+        // slot while a stale exe lingers in another). Best-effort: no git, no
+        // sidecar, no warning surface — but the build still succeeded.
+        write_slot_sha_sidecar(state, &slot).await;
+
         // Capture this exe as the new last-known-good. Survives subsequent
         // failed builds that overwrite or delete the slot's exe; agents
         // testing changes can fall back to it via spawn-test {use_lkg: true}
@@ -747,6 +753,77 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
     );
     warn!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+}
+
+/// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
+/// (git missing, not a repo, detached HEAD with no SHA, etc.). Best-effort.
+async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(git_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Stamp the slot's freshly-built runner exe with the HEAD SHA in a sidecar
+/// file (`<slot>/debug/qontinui-runner.exe.git_sha`). Best-effort — every
+/// failure path is logged at debug and ignored. The build still counts as
+/// succeeded; the sidecar is observability for cross-slot drift detection.
+///
+/// Sidecar format: plain UTF-8, single line, exactly the SHA, no trailing
+/// newline. Read back by [`crate::process::manager::read_slot_sha`].
+async fn write_slot_sha_sidecar(state: &SharedState, slot: &Arc<BuildSlot>) {
+    use tracing::debug;
+    let project_dir = &state.config.project_dir;
+    let git_dir = match project_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            debug!(
+                "Slot {} sha sidecar: project_dir has no parent ({:?}); skipping",
+                slot.id, project_dir
+            );
+            return;
+        }
+    };
+    let sha = match rev_parse_head(&git_dir).await {
+        Some(s) => s,
+        None => {
+            debug!(
+                "Slot {} sha sidecar: git rev-parse HEAD failed or returned empty in {:?}; skipping",
+                slot.id, git_dir
+            );
+            return;
+        }
+    };
+    let exe_path = state.config.runner_exe_path_for_slot(slot.id);
+    let sidecar = match exe_path.parent() {
+        Some(dir) => dir.join(crate::process::manager::SLOT_SHA_SIDECAR_FILENAME),
+        None => {
+            debug!(
+                "Slot {} sha sidecar: exe path {:?} has no parent dir; skipping",
+                slot.id, exe_path
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&sidecar, sha.as_bytes()) {
+        debug!(
+            "Slot {} sha sidecar: write failed for {:?}: {}",
+            slot.id, sidecar, e
+        );
+    }
 }
 
 /// Cap on the per-slot `last_build_stderr_capture` blob. Matches

@@ -2521,6 +2521,12 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
     let mut global_sum: f64 = 0.0;
     let mut global_count: usize = 0;
 
+    // Cross-slot SHA snapshot — what resolve_source_exe would pick now,
+    // each slot's sidecar SHA (None when absent), and the drift warning.
+    let freshness = crate::process::manager::compute_slot_freshness(&state).await;
+    let sha_by_slot: std::collections::HashMap<usize, Option<String>> =
+        freshness.slot_shas.iter().cloned().collect();
+
     let mut any_slot_has_stale_frontend = false;
     for slot in &state.build_pool.slots {
         let info_opt = match slot.busy.try_read() {
@@ -2557,6 +2563,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             "last_error_log": history_snapshot.last_error_log,
         });
 
+        let slot_git_sha = sha_by_slot.get(&slot.id).cloned().flatten();
         let slot_json = match info_opt {
             Some(i) => {
                 let elapsed = (now - i.started_at).num_seconds().max(0);
@@ -2569,6 +2576,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
                     "frontend_stale": frontend_stale,
+                    "git_sha": slot_git_sha,
                     "history": history_json,
                 })
             }
@@ -2577,6 +2585,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                 "target_dir": slot.target_dir.to_string_lossy(),
                 "state": "idle",
                 "frontend_stale": frontend_stale,
+                "git_sha": slot_git_sha,
                 "history": history_json,
             }),
         };
@@ -2608,15 +2617,32 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                 "exe_size": info.exe_size,
             })
         });
+    let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
+        json!({
+            "picked_slot_id": d.picked_slot_id,
+            "picked_sha": d.picked_sha,
+            "conflicting": d.conflicting.iter().map(|(id, sha)| json!({
+                "slot_id": id,
+                "sha": sha,
+            })).collect::<Vec<_>>(),
+            "message": crate::process::manager::format_drift_warning(d),
+        })
+    });
+
     Json(json!({
         "pool_size": state.build_pool.slots.len(),
         "available_permits": available,
         "queued": queued,
         "last_successful_slot": last_successful,
+        // The slot resolve_source_exe would pick right now. Differs from
+        // last_successful_slot when that slot's exe is gone (supervisor restart,
+        // wipe, etc.) and the scan falls through to a different slot.
+        "resolved_slot_id": freshness.picked_slot_id,
         "avg_build_duration_secs": avg_build_duration_secs,
         "any_slot_has_stale_frontend": any_slot_has_stale_frontend,
         "slots": slots_json,
         "lkg": lkg_json,
+        "slot_freshness_warning": slot_freshness_warning,
     }))
 }
 
