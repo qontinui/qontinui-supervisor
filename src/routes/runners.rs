@@ -2628,6 +2628,19 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             "message": crate::process::manager::format_drift_warning(d),
         })
     });
+    // Adjacent staleness surface: a stale exe at `target/debug/` (operator
+    // built from workspace root instead of into a slot). Null when no legacy
+    // exe, no slot exes, or legacy is not strictly older than every slot.
+    let legacy_target_debug_warning = freshness.target_debug_staleness.as_ref().map(|s| {
+        let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
+        let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
+        json!({
+            "legacy_path": s.legacy_path.to_string_lossy(),
+            "legacy_mtime": legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "oldest_slot_mtime": oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "message": crate::process::manager::format_target_debug_warning(s),
+        })
+    });
 
     Json(json!({
         "pool_size": state.build_pool.slots.len(),
@@ -2643,6 +2656,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "slots": slots_json,
         "lkg": lkg_json,
         "slot_freshness_warning": slot_freshness_warning,
+        "legacy_target_debug_warning": legacy_target_debug_warning,
     }))
 }
 
