@@ -224,6 +224,179 @@ pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, 
     Ok(p)
 }
 
+/// Filename of the sidecar that records which git SHA a slot's exe was built
+/// from. Written by `build_monitor::run_cargo_build` after a successful build;
+/// read by [`resolve_source_exe`] and `GET /builds` to detect cross-slot drift.
+pub const SLOT_SHA_SIDECAR_FILENAME: &str = "qontinui-runner.exe.git_sha";
+
+/// Read the sidecar file recording which git SHA the slot's exe was built from.
+/// Returns `None` if the sidecar is missing, unreadable, or empty after trimming.
+///
+/// Absence is "unknown SHA" — never an error.
+pub fn read_slot_sha(slot_target_dir: &std::path::Path) -> Option<String> {
+    let p = slot_target_dir
+        .join("debug")
+        .join(SLOT_SHA_SIDECAR_FILENAME);
+    let content = std::fs::read_to_string(&p).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Structured warning produced when [`resolve_source_exe`] picks a slot whose
+/// sidecar SHA differs from at least one other slot's sidecar SHA. Pure data
+/// — emitted to logs and `/builds`; never alters resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotShaDrift {
+    pub picked_slot_id: usize,
+    pub picked_sha: String,
+    /// Other slots with a sidecar SHA distinct from `picked_sha`. Sorted by
+    /// slot id for deterministic output.
+    pub conflicting: Vec<(usize, String)>,
+}
+
+/// Compute SHA drift across the build pool. Returns `Some` only when both:
+/// - the picked slot has a sidecar SHA, AND
+/// - at least one other slot has a sidecar SHA distinct from the picked one.
+///
+/// Slots without sidecars are treated as unknown — they don't trigger drift.
+pub fn detect_slot_sha_drift(
+    picked_slot_id: usize,
+    picked_sha: Option<&str>,
+    all_slot_shas: &[(usize, Option<String>)],
+) -> Option<SlotShaDrift> {
+    let picked = picked_sha?;
+    let mut conflicting: Vec<(usize, String)> = all_slot_shas
+        .iter()
+        .filter_map(|(id, sha)| {
+            if *id == picked_slot_id {
+                return None;
+            }
+            let s = sha.as_ref()?;
+            if s != picked {
+                Some((*id, s.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if conflicting.is_empty() {
+        return None;
+    }
+    conflicting.sort_by_key(|(id, _)| *id);
+    Some(SlotShaDrift {
+        picked_slot_id,
+        picked_sha: picked.to_string(),
+        conflicting,
+    })
+}
+
+fn sha_short(s: &str) -> &str {
+    let cut = s.char_indices().nth(12).map(|(i, _)| i).unwrap_or(s.len());
+    &s[..cut]
+}
+
+/// Format a [`SlotShaDrift`] as a human-readable warning line.
+pub fn format_drift_warning(d: &SlotShaDrift) -> String {
+    let others: Vec<String> = d
+        .conflicting
+        .iter()
+        .map(|(id, sha)| format!("slot {} (sha {})", id, sha_short(sha)))
+        .collect();
+    let plural = if d.conflicting.len() > 1 { "s" } else { "" };
+    format!(
+        "resolve_source_exe: picked slot {} (sha {}) but {} carries distinct sha{}. \
+         If newer, spawn-test {{rebuild:false}} will return a stale binary. Stage \
+         fresh exe into slot {} or set last_successful_slot. See \
+         proj_supervisor_slot_resolution_order.",
+        d.picked_slot_id,
+        sha_short(&d.picked_sha),
+        others.join(", "),
+        plural,
+        d.picked_slot_id,
+    )
+}
+
+/// Pure decision: which slot would [`resolve_source_exe`] pick, given the
+/// recorded `last_successful_slot` and a list of `(slot_id, exe_path)` pairs?
+///
+/// Preference order (unchanged from before sidecar instrumentation):
+/// 1. `last_successful_slot` if its exe exists.
+/// 2. First slot in iteration order whose exe exists.
+/// 3. `None` (caller's legacy fallback applies).
+///
+/// `exists` is injected so tests can drive the decision without touching the
+/// filesystem.
+pub fn pick_slot_decision<F: Fn(&std::path::Path) -> bool>(
+    last_successful_slot: Option<usize>,
+    slots: &[(usize, std::path::PathBuf)],
+    exists: F,
+) -> Option<usize> {
+    if let Some(id) = last_successful_slot {
+        if let Some((_, p)) = slots.iter().find(|(sid, _)| *sid == id) {
+            if exists(p) {
+                return Some(id);
+            }
+        }
+    }
+    for (id, p) in slots {
+        if exists(p) {
+            return Some(*id);
+        }
+    }
+    None
+}
+
+/// Determine which slot id [`resolve_source_exe`] would pick right now,
+/// applying the same preference order without the legacy fallback.
+///
+/// Returns `None` when no slot has an exe on disk (legacy fallback applies).
+pub async fn pick_slot_for_resolution(state: &SharedState) -> Option<usize> {
+    let last = *state.build_pool.last_successful_slot.read().await;
+    let slots: Vec<(usize, std::path::PathBuf)> = state
+        .build_pool
+        .slots
+        .iter()
+        .map(|s| (s.id, s.target_dir.join("debug").join("qontinui-runner.exe")))
+        .collect();
+    pick_slot_decision(last, &slots, |p| p.exists())
+}
+
+/// Snapshot of cross-slot SHA state — what resolve_source_exe would pick now,
+/// each slot's sidecar SHA (`None` when absent), and the drift warning (if any).
+pub struct SlotFreshness {
+    pub picked_slot_id: Option<usize>,
+    pub slot_shas: Vec<(usize, Option<String>)>,
+    pub drift: Option<SlotShaDrift>,
+}
+
+/// Compute the cross-slot SHA snapshot. Used by both `resolve_source_exe`
+/// (which emits the warning) and `GET /builds` (which surfaces it as JSON).
+pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
+    let slot_shas: Vec<(usize, Option<String>)> = state
+        .build_pool
+        .slots
+        .iter()
+        .map(|s| (s.id, read_slot_sha(&s.target_dir)))
+        .collect();
+    let picked_slot_id = pick_slot_for_resolution(state).await;
+    let drift = picked_slot_id.and_then(|pid| {
+        let picked_sha = slot_shas
+            .iter()
+            .find(|(id, _)| *id == pid)
+            .and_then(|(_, s)| s.clone());
+        detect_slot_sha_drift(pid, picked_sha.as_deref(), &slot_shas)
+    });
+    SlotFreshness {
+        picked_slot_id,
+        slot_shas,
+        drift,
+    }
+}
+
 /// Locate the most recent successfully-built runner exe across the build pool.
 ///
 /// Preference order:
@@ -231,23 +404,38 @@ pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, 
 /// 2. Any slot whose exe exists on disk (e.g. after a supervisor restart).
 /// 3. The legacy `runner_exe_path()` (default `target/debug/`) for builds
 ///    that predate the build pool.
+///
+/// After picking a slot (preference 1 or 2), this function emits a `WARN`
+/// log line when the picked slot's `.git_sha` sidecar differs from any other
+/// slot's sidecar. The warning is observability only — resolution proceeds
+/// with the picked slot regardless. See `proj_supervisor_slot_resolution_order`.
 pub async fn resolve_source_exe(
     state: &SharedState,
 ) -> Result<std::path::PathBuf, SupervisorError> {
-    // Preference 1: last successful slot.
-    if let Some(slot_id) = *state.build_pool.last_successful_slot.read().await {
-        let p = state.config.runner_exe_path_for_slot(slot_id);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
+    if let Some(picked_id) = pick_slot_for_resolution(state).await {
+        let picked_path = state.config.runner_exe_path_for_slot(picked_id);
 
-    // Preference 2: scan all slots for any existing exe (supervisor restart case).
-    for slot in &state.build_pool.slots {
-        let p = slot.target_dir.join("debug").join("qontinui-runner.exe");
-        if p.exists() {
-            return Ok(p);
+        // Drift check after pick — observability only, does NOT change which slot wins.
+        let slot_shas: Vec<(usize, Option<String>)> = state
+            .build_pool
+            .slots
+            .iter()
+            .map(|s| (s.id, read_slot_sha(&s.target_dir)))
+            .collect();
+        let picked_sha = slot_shas
+            .iter()
+            .find(|(id, _)| *id == picked_id)
+            .and_then(|(_, s)| s.clone());
+        if let Some(drift) = detect_slot_sha_drift(picked_id, picked_sha.as_deref(), &slot_shas) {
+            let msg = format_drift_warning(&drift);
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
         }
+
+        return Ok(picked_path);
     }
 
     // Preference 3: legacy path for pre-pool builds.
@@ -2021,5 +2209,223 @@ mod tests {
             decide_first_healthy(true, false, false),
             FirstHealthyDecision::Wait
         );
+    }
+
+    // =========================================================================
+    // Slot SHA drift detection (proj_supervisor_slot_resolution_order)
+    // =========================================================================
+
+    fn sha_a() -> String {
+        "a".repeat(40)
+    }
+    fn sha_b() -> String {
+        "b".repeat(40)
+    }
+    fn sha_c() -> String {
+        "c".repeat(40)
+    }
+
+    /// Distinct SHAs across multiple slots — drift surfaces.
+    #[test]
+    fn drift_fires_when_two_slots_disagree() {
+        let all = vec![(0usize, Some(sha_a())), (1usize, Some(sha_b()))];
+        let d = detect_slot_sha_drift(0, Some(&sha_a()), &all)
+            .expect("distinct SHAs must surface drift");
+        assert_eq!(d.picked_slot_id, 0);
+        assert_eq!(d.picked_sha, sha_a());
+        assert_eq!(d.conflicting, vec![(1usize, sha_b())]);
+    }
+
+    /// All sidecar-present slots share a SHA — no drift.
+    #[test]
+    fn drift_silent_when_all_slots_agree() {
+        let all = vec![
+            (0usize, Some(sha_a())),
+            (1usize, Some(sha_a())),
+            (2usize, Some(sha_a())),
+        ];
+        assert!(detect_slot_sha_drift(0, Some(&sha_a()), &all).is_none());
+    }
+
+    /// Picked slot has no sidecar — drift is silent (unknown SHA can't compare).
+    #[test]
+    fn drift_silent_when_picked_sha_missing() {
+        let all = vec![(0usize, None), (1usize, Some(sha_b()))];
+        assert!(detect_slot_sha_drift(0, None, &all).is_none());
+    }
+
+    /// Other slots have no sidecar — drift is silent (no conflict to surface).
+    #[test]
+    fn drift_silent_when_other_slots_have_no_sidecar() {
+        let all = vec![(0usize, Some(sha_a())), (1usize, None), (2usize, None)];
+        assert!(detect_slot_sha_drift(0, Some(&sha_a()), &all).is_none());
+    }
+
+    /// Three slots, two carry distinct SHAs — both surface in `conflicting`.
+    #[test]
+    fn drift_collects_all_distinct_others() {
+        let all = vec![
+            (0usize, Some(sha_a())),
+            (1usize, Some(sha_b())),
+            (2usize, Some(sha_c())),
+        ];
+        let d = detect_slot_sha_drift(0, Some(&sha_a()), &all)
+            .expect("two distinct others must surface");
+        assert_eq!(d.conflicting.len(), 2);
+        // Sorted by slot id deterministically.
+        assert_eq!(d.conflicting[0].0, 1);
+        assert_eq!(d.conflicting[1].0, 2);
+    }
+
+    /// `format_drift_warning` includes the picked slot id, abbreviated SHA,
+    /// and the conflict count.
+    #[test]
+    fn drift_warning_message_shape() {
+        let d = SlotShaDrift {
+            picked_slot_id: 0,
+            picked_sha: sha_a(),
+            conflicting: vec![(1, sha_b())],
+        };
+        let msg = format_drift_warning(&d);
+        assert!(msg.contains("picked slot 0"));
+        assert!(msg.contains("aaaaaaaaaaaa"), "{}", msg);
+        assert!(msg.contains("slot 1"), "{}", msg);
+        assert!(msg.contains("bbbbbbbbbbbb"), "{}", msg);
+        assert!(
+            msg.contains("proj_supervisor_slot_resolution_order"),
+            "warning must point operator at the relevant memory: {}",
+            msg
+        );
+    }
+
+    /// Pluralization: multiple conflicting slots produce "shas", not "sha".
+    #[test]
+    fn drift_warning_pluralizes_multiple_conflicts() {
+        let d = SlotShaDrift {
+            picked_slot_id: 0,
+            picked_sha: sha_a(),
+            conflicting: vec![(1, sha_b()), (2, sha_c())],
+        };
+        let msg = format_drift_warning(&d);
+        assert!(msg.contains("distinct shas"), "{}", msg);
+    }
+
+    // =========================================================================
+    // Sidecar IO (read_slot_sha)
+    // =========================================================================
+
+    /// Round-trip: write SHA bytes, read returns the same SHA trimmed.
+    #[test]
+    fn read_slot_sha_round_trip() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let debug = dir.path().join("debug");
+        std::fs::create_dir_all(&debug).expect("mkdir debug");
+        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
+        std::fs::write(&sidecar, sha_a().as_bytes()).expect("write");
+        let got = read_slot_sha(dir.path()).expect("must read");
+        assert_eq!(got, sha_a());
+    }
+
+    /// Missing sidecar — no error, returns None.
+    #[test]
+    fn read_slot_sha_missing_returns_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        assert!(read_slot_sha(dir.path()).is_none());
+    }
+
+    /// Empty / whitespace-only sidecar — returns None (treated as unknown).
+    #[test]
+    fn read_slot_sha_blank_returns_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let debug = dir.path().join("debug");
+        std::fs::create_dir_all(&debug).expect("mkdir debug");
+        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
+        std::fs::write(&sidecar, b"   \n\t  ").expect("write");
+        assert!(read_slot_sha(dir.path()).is_none());
+    }
+
+    /// Sidecar with leading/trailing whitespace — returns trimmed SHA.
+    #[test]
+    fn read_slot_sha_trims_whitespace() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let debug = dir.path().join("debug");
+        std::fs::create_dir_all(&debug).expect("mkdir debug");
+        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
+        std::fs::write(&sidecar, format!("  {}\n", sha_a()).as_bytes()).expect("write");
+        assert_eq!(read_slot_sha(dir.path()), Some(sha_a()));
+    }
+
+    // =========================================================================
+    // pick_slot_decision — guards that the sidecar instrumentation didn't shift
+    // resolution behavior. Slot selection must remain:
+    //   1. last_successful_slot (if its exe exists)
+    //   2. first slot by iteration order whose exe exists
+    //   3. None
+    // =========================================================================
+
+    fn fake_slots(ids_with_paths: &[(usize, &str)]) -> Vec<(usize, std::path::PathBuf)> {
+        ids_with_paths
+            .iter()
+            .map(|(id, p)| (*id, std::path::PathBuf::from(p)))
+            .collect()
+    }
+
+    /// last_successful_slot wins when its exe exists, even if other slots also have exes.
+    #[test]
+    fn pick_decision_prefers_last_successful_slot() {
+        let slots = fake_slots(&[(0, "/a"), (1, "/b"), (2, "/c")]);
+        let picked = pick_slot_decision(Some(1), &slots, |p| {
+            p == std::path::Path::new("/a")
+                || p == std::path::Path::new("/b")
+                || p == std::path::Path::new("/c")
+        });
+        assert_eq!(picked, Some(1));
+    }
+
+    /// last_successful_slot is recorded but its exe is missing — fall through to
+    /// first-by-index scan. This is the multi-slot-staleness scenario the
+    /// memory was written about.
+    #[test]
+    fn pick_decision_falls_through_when_recorded_slot_missing() {
+        let slots = fake_slots(&[(0, "/a"), (1, "/b"), (2, "/c")]);
+        // Recorded slot is 2, but only slots 0 and 1 have exes.
+        let picked = pick_slot_decision(Some(2), &slots, |p| {
+            p == std::path::Path::new("/a") || p == std::path::Path::new("/b")
+        });
+        // Scan returns first-by-index, NOT newest-by-anything.
+        assert_eq!(picked, Some(0));
+    }
+
+    /// No last_successful_slot, scan picks the lowest-id slot with an exe
+    /// (this is exactly the silent-staleness quirk the sidecar surfaces).
+    #[test]
+    fn pick_decision_scan_returns_first_by_index() {
+        let slots = fake_slots(&[(0, "/a"), (1, "/b"), (2, "/c")]);
+        let picked = pick_slot_decision(None, &slots, |p| p == std::path::Path::new("/b"));
+        assert_eq!(picked, Some(1));
+        // Even if multiple slots have exes, the lower id still wins.
+        let picked2 = pick_slot_decision(None, &slots, |p| {
+            p == std::path::Path::new("/b") || p == std::path::Path::new("/c")
+        });
+        assert_eq!(picked2, Some(1));
+    }
+
+    /// No exe anywhere — None, caller falls back to legacy.
+    #[test]
+    fn pick_decision_none_when_no_exe_exists() {
+        let slots = fake_slots(&[(0, "/a"), (1, "/b")]);
+        let picked = pick_slot_decision(Some(0), &slots, |_| false);
+        assert_eq!(picked, None);
+        let picked2 = pick_slot_decision(None, &slots, |_| false);
+        assert_eq!(picked2, None);
+    }
+
+    /// last_successful_slot points at an id NOT in the slots list (e.g. stale
+    /// state after pool size shrink) — must fall through cleanly, not panic.
+    #[test]
+    fn pick_decision_handles_unknown_recorded_slot() {
+        let slots = fake_slots(&[(0, "/a")]);
+        let picked = pick_slot_decision(Some(99), &slots, |p| p == std::path::Path::new("/a"));
+        assert_eq!(picked, Some(0));
     }
 }
