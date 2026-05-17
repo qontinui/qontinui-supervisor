@@ -12,6 +12,11 @@ mod expo;
 // `max_concurrent_builds` to coord on startup. See
 // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
 mod fleet;
+// Row 9 Phase 3 fill-in: advertises this supervisor's `/health` URL to
+// coord on startup and periodically refreshes it, so the coord-side
+// `health_watcher` can probe this machine. See
+// `plans/2026-05-17-fleet-health-url-advertisement-plan.md` §Phase 3.
+mod health_advertiser;
 // Stream E (spec-check v1, plan 05 §10): nightly cron that composes
 // /spec/proposals/scan → /execute (per proposal) → /sweep-pending on the
 // primary runner. No-op when the runner's spec-authoring feature is off
@@ -208,6 +213,16 @@ async fn main() -> anyhow::Result<()> {
     // availability. See `fleet.rs::publish_on_startup`.
     tokio::spawn(async move {
         fleet::publish_on_startup().await;
+    });
+
+    // Row 9 Phase 3 fill-in: advertise this supervisor's `/health` URL
+    // to coord on startup and refresh it every 5min ± 30s so coord's
+    // `health_watcher` can probe this machine. Fire-and-forget — both
+    // calls warn-and-continue on coord-unavailable. See
+    // `health_advertiser.rs`.
+    tokio::spawn(async move {
+        health_advertiser::register_on_startup().await;
+        health_advertiser::heartbeat_loop().await;
     });
 
     // Layer 3 of the orphan-runner safety net: scan for `qontinui-runner.exe`
