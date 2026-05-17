@@ -421,6 +421,7 @@ If a `rebuild: true` returned a `git_sha` you didn't expect, the recovery path i
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
 | Temp runner port range | 9877-9899 |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
+| Fleet health URL advertised to coord | `http://host.docker.internal:9875/health` (override: `QONTINUI_SUPERVISOR_PUBLIC_HEALTH_URL`). Row 9 Phase 3: supervisor POSTs this to `/coord/machine/register` on startup and refreshes it every 5min ± 30s so coord's `health_watcher` can probe this machine. See `src/health_advertiser.rs`. |
 
 ## Diagnosing failed runner spawns
 
