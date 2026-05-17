@@ -511,7 +511,7 @@ fn build_velocity_fix_prompt(
     // Section 1: Context
     prompt.push_str("# Frontend Performance Fix Request\n\n");
     prompt.push_str("You are fixing frontend performance issues in `qontinui-web/frontend`.\n");
-    prompt.push_str("The current working directory is the `qontinui_parent` directory which contains `qontinui-web/frontend/`.\n\n");
+    prompt.push_str("The current working directory is the `qontinui-root` directory which contains `qontinui-web/frontend/`.\n\n");
 
     // Section 2: Current Scores
     prompt.push_str("## Current Scores\n\n");

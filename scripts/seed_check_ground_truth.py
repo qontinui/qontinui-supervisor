@@ -70,7 +70,7 @@ def upsert_prompt(prompt_data):
 PROMPTS = []
 
 # Base path for all repos
-WS = r"C:\Users\jspin\Documents\qontinui_parent"
+WS = r"C:\Users\jspin\Documents\qontinui-root"
 
 
 def add(prompt_id, prompt_text, ground_truth_checks):

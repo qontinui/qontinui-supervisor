@@ -12,7 +12,7 @@ import urllib.request
 
 RUNNER = "http://localhost:9876"
 
-WS = r"C:\Users\jspin\Documents\qontinui_parent"
+WS = r"C:\Users\jspin\Documents\qontinui-root"
 
 
 def api_post(url, data):
