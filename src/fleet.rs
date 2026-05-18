@@ -14,7 +14,7 @@
 //! 2. Detects local CPU + RAM + disk via `sysinfo`.
 //! 3. Computes `max_concurrent_builds = min(memory_gb / 4, cpu_cores / 4)`
 //!    per §3.2.
-//! 4. POSTs the budget to qontinui-coord's `/coord/machines/budget`
+//! 4. POSTs the budget to qontinui-coord's `/coord/devices/:id/budget`
 //!    endpoint. The coord URL is sourced from
 //!    `~/.qontinui/profiles.json`'s active profile.
 //!
@@ -122,7 +122,7 @@ fn load_machine_file() -> Option<MachineFile> {
 /// Resolve the coord HTTP base from the active profile's `coord_url`.
 /// Profile stores `ws://host:9870/ws` (the WebSocket upgrade URL); we
 /// convert that to `http://host:9870` so reqwest can POST to
-/// `/coord/machines/budget`. Returns `None` if profiles.json is
+/// `/coord/devices/:id/budget`. Returns `None` if profiles.json is
 /// missing or the active profile has no coord_url.
 fn coord_http_base() -> Option<String> {
     let bytes = std::fs::read(profiles_path()?).ok()?;
@@ -148,7 +148,6 @@ fn coord_http_base() -> Option<String> {
 
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
-    machine_id: uuid::Uuid,
     role: &'static str,
     cpu_cores: u32,
     memory_gb: u32,
@@ -177,7 +176,7 @@ pub async fn publish_budget(
             return Ok(());
         }
     };
-    let machine_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+    let device_id = match uuid::Uuid::parse_str(&machine.machine_id) {
         Ok(id) => id,
         Err(e) => {
             warn!("fleet::publish_budget: machine.json machine_id not a UUID ({e}). Skipping.");
@@ -197,7 +196,6 @@ pub async fn publish_budget(
 
     let max_concurrent_builds = derive_max_builds(resources.memory_gb, resources.cpu_cores);
     let payload = BudgetPayload {
-        machine_id,
         role,
         cpu_cores: resources.cpu_cores,
         memory_gb: resources.memory_gb,
@@ -212,7 +210,7 @@ pub async fn publish_budget(
         hostname: machine.hostname.clone(),
     };
 
-    let url = format!("{base}/coord/machines/budget");
+    let url = format!("{base}/coord/devices/{device_id}/budget");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -227,7 +225,7 @@ pub async fn publish_budget(
     let status = resp.status();
     if status.is_success() {
         info!(
-            "fleet::publish_budget: published role={role} machine_id={machine_id} \
+            "fleet::publish_budget: published role={role} device_id={device_id} \
              max_concurrent_builds={max_concurrent_builds} (cpu={} mem_gb={} disk_gb={})",
             resources.cpu_cores, resources.memory_gb, resources.disk_total_gb
         );
@@ -235,7 +233,7 @@ pub async fn publish_budget(
     } else {
         let body = resp.text().await.unwrap_or_default();
         Err(format!(
-            "coord returned {status} for POST /coord/machines/budget: {body}"
+            "coord returned {status} for POST /coord/devices/{device_id}/budget: {body}"
         ))
     }
 }
