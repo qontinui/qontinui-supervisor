@@ -1066,6 +1066,25 @@ pub struct SpawnTestRequest {
     /// for the rationale.
     #[serde(default)]
     pub allow_stale_fallback: bool,
+    /// Optional git ref (branch, tag, or SHA) to build instead of the live
+    /// working tree at `state.config.project_dir`.
+    ///
+    /// **Requires `rebuild: true`.** When set with `rebuild: true`, the
+    /// supervisor materializes a managed *detached* worktree at this ref
+    /// (under `<repo>/../.supervisor-spawn-worktrees/<sanitized_ref>`),
+    /// runs `cargo build` against that tree, and spawns the resulting exe.
+    /// Slot isolation / exe resolution are unchanged — only the build's
+    /// source tree differs, so the spawned runner provably reflects the
+    /// requested ref (e.g. `origin/main`) regardless of what branch the
+    /// live tree is parked on.
+    ///
+    /// When set without `rebuild: true`, the request fails with HTTP 400
+    /// (`git_ref requires rebuild:true`) rather than silently ignoring it.
+    ///
+    /// On success the response carries `git_ref` (the requested ref) and
+    /// `git_ref_resolved_sha` (`git rev-parse HEAD` of the worktree).
+    #[serde(default)]
+    pub git_ref: Option<String>,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1140,6 +1159,15 @@ pub async fn spawn_test(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.eq_ignore_ascii_case("no-wait"))
         .unwrap_or(false);
+
+    // `git_ref` only makes sense when we're actually compiling — silently
+    // ignoring it would hand back the live tree's binary while the caller
+    // believes they got the ref. Fail fast with 400 before reserving a port.
+    if body.git_ref.is_some() && !body.rebuild {
+        return Err(SupervisorError::Validation(
+            "git_ref requires rebuild:true".to_string(),
+        ));
+    }
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner
     // into the registry under a single write lock. Without this, two
@@ -1217,6 +1245,9 @@ pub async fn spawn_test(
     let mut build_succeeded: Option<bool> = None;
     let mut build_error: Option<String> = None;
     let mut build_reused_stale = false;
+    // Set when a `git_ref` build occurred: (requested_ref, resolved_sha).
+    // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
+    let mut git_ref_info: Option<(String, String)> = None;
 
     // Rebuild if requested
     if body.rebuild {
@@ -1273,14 +1304,52 @@ pub async fn spawn_test(
             });
         }
 
+        // If the caller asked for a specific git ref, materialize a managed
+        // detached worktree at that ref now and build *that* tree instead of
+        // the live project dir. Any git failure aborts the request (no
+        // silent fallback to the live tree — provenance is the whole point).
+        // Release the placeholder port on failure so it doesn't leak.
+        let build_dir_override = match body.git_ref.as_deref() {
+            Some(git_ref) => {
+                match crate::spawn_worktree::prepare_worktree(&state.config.project_dir, git_ref)
+                    .await
+                {
+                    Ok(wt) => {
+                        state
+                            .logs
+                            .emit(
+                                LogSource::Supervisor,
+                                LogLevel::Info,
+                                format!(
+                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} (requester={:?})",
+                                    wt.requested_ref,
+                                    wt.resolved_sha,
+                                    wt.worktree_path,
+                                    body.requester_id
+                                ),
+                            )
+                            .await;
+                        git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
+                        Some(wt.src_tauri)
+                    }
+                    Err(e) => {
+                        let mut runners = state.runners.write().await;
+                        runners.remove(&id);
+                        return Err(e);
+                    }
+                }
+            }
+            None => None,
+        };
+
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 LogLevel::Info,
                 format!(
-                    "Rebuilding runner before spawning test runner on port {} (requester={:?})",
-                    port, body.requester_id
+                    "Rebuilding runner before spawning test runner on port {} (requester={:?}, git_ref={:?})",
+                    port, body.requester_id, body.git_ref
                 ),
             )
             .await;
@@ -1290,8 +1359,11 @@ pub async fn spawn_test(
         // we reserved above so the port doesn't leak — UNLESS the caller
         // opted into `allow_stale_fallback`, in which case we keep the
         // placeholder and fall through to spawn from the previous slot exe.
-        let build_fut =
-            crate::build_monitor::run_cargo_build_with_requester(&state, body.requester_id.clone());
+        let build_fut = crate::build_monitor::run_cargo_build_with_dir(
+            &state,
+            body.requester_id.clone(),
+            build_dir_override,
+        );
         let build_result = match body.queue_timeout_secs {
             Some(secs) => {
                 let timeout = std::time::Duration::from_secs(secs);
@@ -1741,7 +1813,45 @@ pub async fn spawn_test(
                 "source_slot": info.source_slot,
                 "exe_size": info.exe_size,
             });
+
+            // Staleness signal: there's no per-request changed-file list at
+            // spawn time, so compute a server-side one. Walk the runner's
+            // Rust sources under `<project_dir>/src` for the newest mtime;
+            // if it's newer than the LKG build, the spawned binary may not
+            // reflect recent changes. Single bounded walk, one file
+            // reported. Does not change /lkg/coverage behavior.
+            let project_dir = state.config.project_dir.clone();
+            let built_at = info.built_at;
+            let scan = tokio::task::spawn_blocking(move || {
+                crate::routes::lkg_coverage::scan_lkg_staleness(&project_dir, built_at)
+            })
+            .await
+            .ok()
+            .flatten();
+            match scan {
+                Some(s) if s.stale => {
+                    resp["lkg_stale_warning"] = json!({
+                        "stale": true,
+                        "lkg_built_at": s.lkg_built_at.to_rfc3339(),
+                        "newest_src_mtime": s.newest_src_mtime.to_rfc3339(),
+                        "newest_src_file": s.newest_src_file,
+                        "lag_secs": s.lag_secs,
+                        "message": "LKG binary predates current runner source; spawned runner may not reflect recent changes. Use rebuild:true (optionally with git_ref) to build current code.",
+                    });
+                }
+                _ => {
+                    resp["lkg_stale_warning"] = json!({ "stale": false });
+                }
+            }
         }
+    }
+
+    // Provenance for a git_ref build: the requested ref and the SHA the
+    // managed worktree actually resolved to. Only present when a git_ref
+    // build occurred (rebuild:true + git_ref).
+    if let Some((requested_ref, resolved_sha)) = &git_ref_info {
+        resp["git_ref"] = json!(requested_ref);
+        resp["git_ref_resolved_sha"] = json!(resolved_sha);
     }
 
     // Always emit `frontend_stale` so callers can branch on a predictable

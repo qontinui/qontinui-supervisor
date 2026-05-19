@@ -451,6 +451,97 @@ pub async fn lkg_coverage(
     }))
 }
 
+/// Result of the spawn-time LKG staleness scan.
+///
+/// `stale` is true iff the newest runner Rust source under `<root>/src`
+/// has an mtime strictly later than the LKG `built_at` — meaning a
+/// `use_lkg: true` spawn would run a binary that predates current source.
+#[derive(Debug, Clone)]
+pub struct LkgStaleScan {
+    pub stale: bool,
+    pub lkg_built_at: DateTime<Utc>,
+    pub newest_src_mtime: DateTime<Utc>,
+    /// Path of the newest source file, relative to `root` (forward slashes).
+    pub newest_src_file: String,
+    pub lag_secs: i64,
+}
+
+/// Pure decision: given the LKG `built_at` and the newest `(relpath, mtime)`
+/// among the runner sources, decide whether the LKG is stale.
+///
+/// Extracted from the directory walk so the rule is unit-testable without
+/// touching the filesystem. `stale` ⇔ `newest_src_mtime > lkg_built_at`.
+pub fn decide_lkg_stale(
+    lkg_built_at: DateTime<Utc>,
+    newest: Option<(String, DateTime<Utc>)>,
+) -> Option<LkgStaleScan> {
+    let (relpath, mtime) = newest?;
+    let lag_secs = (mtime - lkg_built_at).num_seconds();
+    Some(LkgStaleScan {
+        stale: lag_secs > 0,
+        lkg_built_at,
+        newest_src_mtime: mtime,
+        newest_src_file: relpath,
+        lag_secs,
+    })
+}
+
+/// Find the newest-mtime `*.rs` file under `<root>/src`, returning its
+/// path relative to `root` (forward-slashed) and its mtime.
+///
+/// Bounded + cheap: a single iterative directory walk that prunes
+/// `target*`, `node_modules`, and `.git`. No symlink following. Returns
+/// `None` if `<root>/src` doesn't exist or contains no readable `.rs`.
+pub fn newest_rs_under_src(root: &Path) -> Option<(String, DateTime<Utc>)> {
+    let src_root = root.join("src");
+    if !src_root.is_dir() {
+        return None;
+    }
+    let mut stack: Vec<PathBuf> = vec![src_root];
+    let mut best: Option<(String, DateTime<Utc>)> = None;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ftype = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ftype.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == ".git" || name == "node_modules" || name.starts_with("target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if ftype.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Some(mtime) = read_file_mtime(&path) {
+                    let is_newer = best.as_ref().map(|(_, m)| mtime > *m).unwrap_or(true);
+                    if is_newer {
+                        let rel = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        best = Some((rel, mtime));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Top-level helper for the spawn-test handler: scan `<root>/src` for the
+/// newest `*.rs` and decide whether the LKG (`lkg_built_at`) is stale
+/// relative to it. `None` ⇒ no sources found / nothing to compare.
+pub fn scan_lkg_staleness(root: &Path, lkg_built_at: DateTime<Utc>) -> Option<LkgStaleScan> {
+    decide_lkg_stale(lkg_built_at, newest_rs_under_src(root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,5 +1077,80 @@ mod tests {
             "response.description must be non-empty so callers can self-document",
         );
         assert!(resp.all_covered);
+    }
+
+    // ---- spawn-test LKG staleness scan ----
+
+    #[test]
+    fn decide_lkg_stale_when_src_newer_than_lkg() {
+        let lkg = rfc3339("2026-05-17T00:00:00Z");
+        let newest = Some(("src/main.rs".to_string(), rfc3339("2026-05-17T00:05:00Z")));
+        let s = decide_lkg_stale(lkg, newest).expect("some when newest present");
+        assert!(s.stale, "src newer than LKG must be stale");
+        assert_eq!(s.lag_secs, 300);
+        assert_eq!(s.newest_src_file, "src/main.rs");
+    }
+
+    #[test]
+    fn decide_lkg_not_stale_when_src_older_or_equal() {
+        let lkg = rfc3339("2026-05-17T00:00:00Z");
+        // older
+        let older = Some(("src/a.rs".to_string(), rfc3339("2026-05-16T23:00:00Z")));
+        let s = decide_lkg_stale(lkg, older).expect("some");
+        assert!(!s.stale);
+        assert_eq!(s.lag_secs, -3600);
+        // exact equality ⇒ NOT stale (rule is strictly greater)
+        let eq = Some(("src/a.rs".to_string(), rfc3339("2026-05-17T00:00:00Z")));
+        let s = decide_lkg_stale(lkg, eq).expect("some");
+        assert!(!s.stale);
+        assert_eq!(s.lag_secs, 0);
+    }
+
+    #[test]
+    fn decide_lkg_stale_none_when_no_sources() {
+        let lkg = rfc3339("2026-05-17T00:00:00Z");
+        assert!(decide_lkg_stale(lkg, None).is_none());
+    }
+
+    #[test]
+    fn newest_rs_walk_picks_newest_and_prunes() {
+        let tmp = std::env::temp_dir().join(format!("qsup-lkg-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        fs::create_dir_all(src.join("nested")).expect("mkdir");
+        fs::create_dir_all(src.join("target").join("debug")).expect("mkdir target");
+
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mid = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_001_000);
+        let new = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_002_000);
+        let newest_pruned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_009_999);
+
+        touch_file_mtime(&src.join("a.rs"), old);
+        touch_file_mtime(&src.join("nested").join("b.rs"), new);
+        touch_file_mtime(&src.join("nested").join("c.rs"), mid);
+        // A .rs under a pruned `target*` dir must be ignored even though
+        // it's the newest file on disk.
+        touch_file_mtime(
+            &src.join("target").join("debug").join("z.rs"),
+            newest_pruned,
+        );
+        // Non-.rs must be ignored.
+        touch_file_mtime(&src.join("d.txt"), newest_pruned);
+
+        let (relpath, mtime) = newest_rs_under_src(&tmp).expect("some — readable .rs present");
+        assert_eq!(relpath, "src/nested/b.rs");
+        let expected: DateTime<Utc> = new.into();
+        assert_eq!(mtime, expected);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn newest_rs_walk_none_when_no_src_dir() {
+        let tmp = std::env::temp_dir().join(format!("qsup-lkg-nosrc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("mkdir");
+        assert!(newest_rs_under_src(&tmp).is_none());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

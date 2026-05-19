@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -89,9 +90,33 @@ pub async fn run_cargo_build(state: &SharedState) -> Result<(), SupervisorError>
 }
 
 /// Same as `run_cargo_build` but records a requester_id for queue visibility.
+///
+/// `build_dir_override` is always `None` for this entry point; callers that
+/// need to compile a source tree other than `state.config.project_dir`
+/// (e.g. a detached git-ref worktree built by `spawn-test {git_ref}`) call
+/// [`run_cargo_build_with_dir`] directly.
 pub async fn run_cargo_build_with_requester(
     state: &SharedState,
     requester_id: Option<String>,
+) -> Result<(), SupervisorError> {
+    run_cargo_build_with_dir(state, requester_id, None).await
+}
+
+/// Run a cargo build, optionally compiling a source tree other than
+/// `state.config.project_dir`.
+///
+/// `build_dir_override`:
+/// - `None` ⇒ cargo's `current_dir` is `state.config.project_dir` (the live
+///   working tree), exactly as the legacy behavior.
+/// - `Some(dir)` ⇒ cargo's `current_dir` is `dir` (must be a runner
+///   `src-tauri` directory). Slot isolation is unchanged — `CARGO_TARGET_DIR`
+///   still points at the claimed slot's `target_dir`, and the built exe is
+///   resolved from that slot exactly as today. Only the *source* tree
+///   differs.
+pub async fn run_cargo_build_with_dir(
+    state: &SharedState,
+    requester_id: Option<String>,
+    build_dir_override: Option<PathBuf>,
 ) -> Result<(), SupervisorError> {
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -147,7 +172,11 @@ pub async fn run_cargo_build_with_requester(
         .await;
     info!(
         "Starting cargo build on slot {} in {:?} (CARGO_TARGET_DIR={:?})",
-        slot.id, state.config.project_dir, slot.target_dir
+        slot.id,
+        build_dir_override
+            .as_deref()
+            .unwrap_or(state.config.project_dir.as_path()),
+        slot.target_dir
     );
 
     state
@@ -171,11 +200,11 @@ pub async fn run_cargo_build_with_requester(
     let build_start = std::time::Instant::now();
     #[cfg(target_os = "windows")]
     let result = match free_slot_exe(state, &slot).await {
-        Ok(()) => run_build_inner(state, &slot).await,
+        Ok(()) => run_build_inner(state, &slot, build_dir_override.as_deref()).await,
         Err(e) => Err(e),
     };
     #[cfg(not(target_os = "windows"))]
-    let result = run_build_inner(state, &slot).await;
+    let result = run_build_inner(state, &slot, build_dir_override.as_deref()).await;
     let duration_secs = build_start.elapsed().as_secs_f64();
 
     // Pull any captured cargo stderr the inner build deposited so it can be
@@ -279,7 +308,11 @@ async fn any_slot_busy(state: &SharedState) -> bool {
 async fn run_build_inner(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
+    build_dir_override: Option<&std::path::Path>,
 ) -> Result<(), SupervisorError> {
+    // Source tree cargo will compile. `None` ⇒ the live project dir (legacy);
+    // `Some(dir)` ⇒ a detached git-ref worktree's `src-tauri`.
+    let cargo_cwd: &std::path::Path = build_dir_override.unwrap_or(&state.config.project_dir);
     // The frontend is embedded in the binary via tauri_build, so we must run
     // `npm run build` first to produce a fresh dist/ before cargo build.
     //
@@ -289,7 +322,17 @@ async fn run_build_inner(
     // for the npm invocation (~12s), not the whole cargo build (~180s), so
     // this is a much smaller serialization point than the legacy global flag.
     {
-        let npm_dir = state.config.runner_npm_dir();
+        // For a git-ref worktree build the frontend must also come from the
+        // worktree (parent of its `src-tauri`), not the live tree's dist/.
+        // Otherwise cargo would embed the live tree's dist/ into a binary
+        // compiled from the ref's source — defeating the provenance goal.
+        let npm_dir = match build_dir_override {
+            Some(src_tauri) => src_tauri
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| state.config.runner_npm_dir()),
+            None => state.config.runner_npm_dir(),
+        };
         state
             .logs
             .emit(
@@ -484,7 +527,7 @@ async fn run_build_inner(
 
         let mut cmd = Command::new("cargo");
         cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(&state.config.project_dir)
+            .current_dir(cargo_cwd)
             // Redirect cargo output to this slot's isolated target dir so
             // concurrent builds on other slots don't contend on the same target/.
             .env("CARGO_TARGET_DIR", &slot.target_dir)
@@ -499,7 +542,7 @@ async fn run_build_inner(
     let mut child = {
         let mut cmd = Command::new("cargo");
         cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(&state.config.project_dir)
+            .current_dir(cargo_cwd)
             .env("CARGO_TARGET_DIR", &slot.target_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
