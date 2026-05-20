@@ -33,7 +33,7 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 qontinui-types = { path = "../qontinui-schemas/rust", version = ">=0.1.2, <2.0.0" }
-qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = "^0.1.1" }
+qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = ">=0.1.1, <2.0.0" }
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
 # report CPU/RAM/disk + build-slot capacity on startup. `system` is
 # already enabled; `disk` adds the per-mountpoint enumerator we need
