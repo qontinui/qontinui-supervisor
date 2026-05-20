@@ -410,7 +410,7 @@ mod tests {
             let id = uuid::Uuid::new_v4();
             let j = deterministic_jitter_secs(id);
             assert!(
-                j >= -HEARTBEAT_JITTER_SECS && j <= HEARTBEAT_JITTER_SECS,
+                (-HEARTBEAT_JITTER_SECS..=HEARTBEAT_JITTER_SECS).contains(&j),
                 "jitter {} outside [-{}, {}] for {}",
                 j,
                 HEARTBEAT_JITTER_SECS,
