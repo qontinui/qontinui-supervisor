@@ -8,3 +8,4 @@ Cargo.lock
 /dist
 /frontend/node_modules
 .worktrees/
+/target-agent
