@@ -462,10 +462,7 @@ fn coverage_for_resolved(
 ///
 /// `now` is taken as a parameter so the rule is unit-testable without
 /// mocking the system clock — the HTTP handler passes `Utc::now()`.
-pub fn compute_lkg_age(
-    lkg_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> (Option<i64>, bool) {
+pub fn compute_lkg_age(lkg_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> (Option<i64>, bool) {
     match lkg_at {
         Some(built_at) => {
             let age = (now - built_at).num_seconds();
@@ -989,10 +986,7 @@ mod tests {
         assert_eq!(f.reason, super::reason::NO_LKG);
         assert!(!resp.all_covered);
         assert_eq!(resp.lkg_built_at, None);
-        assert_eq!(
-            resp.lkg_age_secs, None,
-            "no LKG ⇒ lkg_age_secs is None"
-        );
+        assert_eq!(resp.lkg_age_secs, None, "no LKG ⇒ lkg_age_secs is None");
         assert!(!resp.lkg_stale, "no LKG ⇒ lkg_stale is false (no signal)");
     }
 
