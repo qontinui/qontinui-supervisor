@@ -2630,6 +2630,16 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
     let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(state.build_pool.slots.len());
     let mut global_sum: f64 = 0.0;
     let mut global_count: usize = 0;
+    // Derive `active_builds` and the slot-based permit count from the same
+    // per-slot iteration that builds `slots_json` so the three views never
+    // disagree. Previously `available_permits` came from the semaphore
+    // (`state.build_pool.permits.available_permits()`) while per-slot state
+    // came from each `slot.busy` lock — those release at different points in
+    // `run_cargo_build_with_dir` and a reader hitting `/builds` mid-release
+    // could observe `permits_free=3` while `slots[0].state=building` with
+    // multi-minute elapsed.
+    let mut active_builds: Vec<serde_json::Value> =
+        Vec::with_capacity(state.build_pool.slots.len());
 
     // Cross-slot SHA snapshot — what resolve_source_exe would pick now,
     // each slot's sidecar SHA (None when absent), and the drift warning.
@@ -2675,8 +2685,18 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
 
         let slot_git_sha = sha_by_slot.get(&slot.id).cloned().flatten();
         let slot_json = match info_opt {
-            Some(i) => {
+            Some(ref i) => {
                 let elapsed = (now - i.started_at).num_seconds().max(0);
+                // Also push a compact summary into active_builds so the
+                // top-level field is derived from the same per-slot
+                // snapshot — matches the 503 `build_pool_full` body shape.
+                active_builds.push(json!({
+                    "slot": slot.id,
+                    "started_at": i.started_at.to_rfc3339(),
+                    "elapsed_secs": elapsed,
+                    "requester_id": i.requester_id,
+                    "rebuild_kind": i.rebuild_kind,
+                }));
                 json!({
                     "id": slot.id,
                     "target_dir": slot.target_dir.to_string_lossy(),
@@ -2713,7 +2733,22 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         .queue_depth
         .load(std::sync::atomic::Ordering::Relaxed);
     let last_successful = *state.build_pool.last_successful_slot.read().await;
-    let available = state.build_pool.permits.available_permits();
+    // Derive `available_permits` from per-slot busy counts rather than the
+    // semaphore. The semaphore permit is dropped in `run_cargo_build_with_dir`
+    // after `slot.busy` is cleared, so during the gap between
+    // `Drop for SlotGuard` (which clears busy via `tokio::spawn`) and
+    // `drop(_permit)` two views disagreed: `permits.available_permits()` could
+    // still report 2 while every slot's `busy` was already `None`, or vice
+    // versa. Deriving from the same iteration as `slots_json` / `active_builds`
+    // makes the three views mathematically consistent: by construction
+    // `pool_size = available_permits + active_builds.len()`.
+    let available = state.build_pool.slots.len() - active_builds.len();
+    // Also expose the raw semaphore count under a distinct field so callers
+    // who care about the throttle (queue admission) can still read it. When
+    // it disagrees with `available_permits`, the semaphore is the gate; the
+    // disagreement is transient (release ordering inside `run_cargo_build_*`)
+    // and self-heals once both views land at steady state.
+    let semaphore_permits = state.build_pool.permits.available_permits();
     let lkg_json = state
         .build_pool
         .last_known_good
@@ -2755,6 +2790,11 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
     Json(json!({
         "pool_size": state.build_pool.slots.len(),
         "available_permits": available,
+        // Diagnostic: raw semaphore count. Equal to `available_permits` at
+        // steady state; transient divergence indicates a slot release in
+        // flight inside `run_cargo_build_with_dir` (see comment above where
+        // `available` is derived). Useful for debugging stuck-build reports.
+        "semaphore_permits": semaphore_permits,
         "queued": queued,
         "last_successful_slot": last_successful,
         // The slot resolve_source_exe would pick right now. Differs from
@@ -2764,6 +2804,11 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "avg_build_duration_secs": avg_build_duration_secs,
         "any_slot_has_stale_frontend": any_slot_has_stale_frontend,
         "slots": slots_json,
+        // Compact view of in-flight builds, derived from the same per-slot
+        // iteration as `slots[]` so the two views can never disagree. Shape
+        // matches the 503 `build_pool_full` error body for symmetry.
+        // Invariant: `pool_size == available_permits + active_builds.len()`.
+        "active_builds": active_builds,
         "lkg": lkg_json,
         "slot_freshness_warning": slot_freshness_warning,
         "legacy_target_debug_warning": legacy_target_debug_warning,
@@ -2813,6 +2858,182 @@ pub async fn slot_build_log(
         "captured_at": captured_at,
     }))
     .into_response()
+}
+
+/// GET /builds/{slot_id}/log/stream — SSE stream of cargo stderr lines for
+/// THIS slot's currently-running build.
+///
+/// Each cargo stderr line is emitted as an SSE event with `event: cargo` and
+/// the raw line as the `data:` payload. Subscribers pick up at the next line
+/// cargo writes — there is no replay of lines from before the subscription.
+/// For a one-shot view of the most recent completed build, use
+/// `GET /builds/{slot_id}/log`.
+///
+/// Behavior matrix:
+/// * Slot id out of range → 404 `{error: "slot_not_found", ...}`.
+/// * Slot is idle when the SSE connection opens → the stream sends one
+///   `event: status` frame with `{"state": "idle"}` so clients can detect
+///   "no active build" without parsing the empty stream; then it keeps the
+///   connection open and starts streaming as soon as the next build on this
+///   slot begins. This is the "tail -f" semantics the user expects when
+///   wiring this up to `POST /runners/spawn-test {rebuild: true}`.
+/// * Build completes → the stream emits one `event: completed` frame and
+///   keeps the connection open (the per-slot broadcast persists across
+///   builds). Clients that only care about the current build should
+///   disconnect on `completed`.
+/// * Subscriber lags behind (cargo produces lines faster than the client
+///   reads) → the broadcast layer drops the oldest unread lines and the
+///   client receives an `event: lagged` frame with `{"skipped": <usize>}`.
+///   Clients should refetch the full log from `GET /builds/{slot_id}/log`
+///   once the build completes if they need every line.
+///
+/// Terminates on `state.shutdown_signal()` for graceful supervisor exit,
+/// same pattern as the other SSE handlers in the supervisor.
+pub async fn slot_build_log_stream(
+    State(state): State<SharedState>,
+    Path(slot_id): Path<usize>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, axum::response::Response>
+{
+    let slot = match state.build_pool.slots.get(slot_id) {
+        Some(s) => s.clone(),
+        None => {
+            return Err((
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "slot_not_found",
+                    "slot_id": slot_id,
+                    "pool_size": state.build_pool.slots.len(),
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    // Subscribe BEFORE checking the current `busy` state. If we read
+    // `slot.busy` first and the build starts between the read and the
+    // subscribe, we'd miss the early cargo lines. Subscribing first means
+    // we'd at worst see one extra "status: idle" frame followed immediately
+    // by real cargo data — strictly safer.
+    let rx = slot.log_stream.subscribe();
+    let initial_busy_info = match slot.busy.try_read() {
+        Ok(g) => g.as_ref().map(|i| (i.started_at, i.rebuild_kind.clone())),
+        Err(_) => slot
+            .busy
+            .read()
+            .await
+            .as_ref()
+            .map(|i| (i.started_at, i.rebuild_kind.clone())),
+    };
+
+    // Track this connection in `state.active_sse_connections` so it shows up
+    // on /health like every other SSE stream.
+    let conn_guard = SseConnectionGuard::new(state.active_sse_connections.clone());
+
+    // Stream construction (no async_stream — supervisor doesn't pull that
+    // crate). We compose three streams:
+    //   1. A one-shot prelude `event: status` frame derived from
+    //      `initial_busy_info`.
+    //   2. The slot's broadcast wrapped in `BroadcastStream`, mapped to
+    //      `event: cargo` data frames. `BroadcastStream`'s `Lagged` error
+    //      variant becomes `event: lagged` frames so clients know to fetch
+    //      the full log from `GET /builds/{slot_id}/log` on completion.
+    //   3. A periodic 1s tick observing `slot.busy` to emit one `event:
+    //      completed` frame when the build transitions back to idle. We
+    //      can't rely on `RecvError::Closed` because the sender lives on
+    //      the slot for the whole supervisor lifetime.
+    //
+    // Both `tokio_stream::StreamExt` and `futures::StreamExt` are in scope
+    // (the former via the file-level `use`, the latter via the
+    // `futures::StreamExt::take_until` call below). To avoid the E0034
+    // ambiguity that bit the first compile, this block uses fully qualified
+    // syntax: `futures::stream::*` for adapters, `tokio_stream::wrappers::*`
+    // for the broadcast / interval wrappers. Nothing here calls
+    // `.filter_map`/`.chain`/`.map` via method syntax.
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+    use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
+
+    let status_payload = match &initial_busy_info {
+        Some((started_at, rebuild_kind)) => json!({
+            "slot_id": slot_id,
+            "state": "building",
+            "started_at": started_at.to_rfc3339(),
+            "rebuild_kind": rebuild_kind,
+        }),
+        None => json!({
+            "slot_id": slot_id,
+            "state": "idle",
+        }),
+    };
+    let initial = futures::stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("status")
+                .data(status_payload.to_string()),
+        )
+    });
+
+    let cargo_lines = futures::StreamExt::filter_map(BroadcastStream::new(rx), |res| async move {
+        match res {
+            Ok(line) => Some(Ok::<_, Infallible>(
+                Event::default().event("cargo").data(line),
+            )),
+            Err(BroadcastStreamRecvError::Lagged(n)) => Some(Ok(Event::default()
+                .event("lagged")
+                .data(json!({"skipped": n}).to_string()))),
+        }
+    });
+
+    // Completion ticker: 1s cadence, emits at most one `event: completed`
+    // per building→idle transition. State lives in a `tokio::sync::Mutex<bool>`
+    // Arc so the captured closure can mutate it across ticks.
+    let was_building_state = Arc::new(tokio::sync::Mutex::new(initial_busy_info.is_some()));
+    let ticker_slot = slot.clone();
+    let ticker_state = was_building_state.clone();
+    let ticker = futures::StreamExt::filter_map(
+        IntervalStream::new(tokio::time::interval(std::time::Duration::from_secs(1))),
+        move |_| {
+            let slot = ticker_slot.clone();
+            let was_building_arc = ticker_state.clone();
+            async move {
+                let is_busy = match slot.busy.try_read() {
+                    Ok(g) => g.is_some(),
+                    Err(_) => slot.busy.read().await.is_some(),
+                };
+                let mut was_building = was_building_arc.lock().await;
+                if !*was_building && is_busy {
+                    *was_building = true;
+                    None
+                } else if *was_building && !is_busy {
+                    *was_building = false;
+                    Some(Ok::<_, Infallible>(
+                        Event::default()
+                            .event("completed")
+                            .data(json!({"slot_id": slot_id}).to_string()),
+                    ))
+                } else {
+                    None
+                }
+            }
+        },
+    );
+
+    // Merge the cargo lines + completion ticks. `select` interleaves
+    // ready events from both; ordering between a final cargo line and the
+    // completed frame is best-effort (cargo lines win when ready).
+    let live = futures::stream::select(cargo_lines, ticker);
+    let event_stream = futures::StreamExt::chain(initial, live);
+    // Hold the SSE connection guard for the lifetime of the stream so
+    // /health's `sse_active_connections` reflects this subscriber.
+    let event_stream = futures::StreamExt::map(event_stream, move |ev| {
+        let _hold = &conn_guard;
+        ev
+    });
+
+    let shutdown_state = state.clone();
+    let shutdown = Box::pin(async move { shutdown_state.shutdown_signal().await });
+    let event_stream = futures::StreamExt::take_until(event_stream, shutdown);
+
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
 /// GET /builds/{slot_id}/last-build-stderr — return the persisted cargo

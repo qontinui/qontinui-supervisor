@@ -131,7 +131,8 @@ The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, ov
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), and `last_successful_slot`. |
+| GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), `last_successful_slot`, and a top-level `active_builds` array. **Invariant:** `pool_size == available_permits + active_builds.len()`. `active_builds` and `available_permits` are derived from the same per-slot iteration as `slots[]` so the three views can never disagree mid-release. A separate `semaphore_permits` field exposes the raw `Semaphore::available_permits()` value for debugging transient release-ordering divergence inside `run_cargo_build_with_dir` — at steady state it equals `available_permits`. |
+| GET | `/builds/{slot_id}/log/stream` | SSE stream of cargo stderr lines for this slot's currently-running build. Events: `status` (one-shot prelude with `{state: "idle"\|"building", ...}`), `cargo` (one per stderr line, data is the raw line), `lagged` (broadcast drop count when the subscriber falls behind), `completed` (one frame on each building→idle transition, then the stream stays open for the next build). Returns 404 with `{error: "slot_not_found", ...}` if `slot_id` is out of range. Best for "tail cold cargo builds spawned via `POST /runners/spawn-test {rebuild: true}` so the user has progress visibility without polling `/builds/{slot_id}/log`." |
 | DELETE | `/builds/caches` | Clear build caches across all pool slots |
 | POST | `/build/reset` | Reset build state |
 

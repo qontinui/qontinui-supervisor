@@ -561,6 +561,14 @@ async fn run_build_inner(
 
     let stderr_handle = if let Some(stderr) = stderr {
         let state_clone = state.clone();
+        // Snapshot the slot's broadcast sender once outside the per-line loop.
+        // `broadcast::Sender::send` returns `Err` when there are no
+        // subscribers — that's the expected steady-state (nobody is
+        // currently `GET /builds/{slot_id}/log/stream`ing), so the error
+        // is intentionally swallowed via `let _ =`. Keeping the sender on
+        // the slot (rather than per-build) means SSE clients connected
+        // mid-build naturally pick up subsequent builds without re-handshake.
+        let log_stream = slot.log_stream.clone();
         Some(tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -576,6 +584,9 @@ async fn run_build_inner(
                 };
 
                 state_clone.logs.emit(LogSource::Build, level, &line).await;
+                // Fanout to per-slot SSE subscribers. Err == no subscribers,
+                // which is the common case — drop silently.
+                let _ = log_stream.send(line.clone());
                 all_lines.push(line.clone());
 
                 if is_error {

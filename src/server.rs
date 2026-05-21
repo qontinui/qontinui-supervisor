@@ -171,6 +171,11 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     },
     EndpointEntry {
         method: "GET",
+        path: "/builds/{slot_id}/log/stream",
+        summary: "SSE stream of cargo stderr for a slot's active build",
+    },
+    EndpointEntry {
+        method: "GET",
         path: "/builds/{slot_id}/last-build-stderr",
         summary: "Latest stderr output for a slot",
     },
@@ -872,6 +877,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/builds/{slot_id}/log",
             get(crate::routes::runners::slot_build_log),
+        )
+        .route(
+            "/builds/{slot_id}/log/stream",
+            get(crate::routes::runners::slot_build_log_stream),
         )
         .route(
             "/builds/{slot_id}/last-build-stderr",

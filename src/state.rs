@@ -532,6 +532,24 @@ pub struct BuildSlot {
     /// Tuple: `(captured_at, log_bytes)`. The timestamp is when the build
     /// finished, not when the log was read.
     pub last_build_log: RwLock<Option<(DateTime<Utc>, String)>>,
+    /// Live broadcast of cargo stderr lines for THIS slot's currently-running
+    /// build. Each subscriber sees every line `run_build_inner` reads from
+    /// `child.stderr` for this slot's cargo invocation. Lines are pushed
+    /// untagged (plain `String`) — the SSE handler at
+    /// `GET /builds/{slot_id}/log/stream` wraps them as `event: cargo` data
+    /// frames.
+    ///
+    /// Channel capacity is intentionally small (256): cargo's output isn't
+    /// dense relative to typical SSE consumers, and the broadcast channel
+    /// drops slow subscribers via `RecvError::Lagged` rather than blocking
+    /// the cargo reader. Lagged events are surfaced to clients as a
+    /// `event: lagged` frame so they know to fetch the full log from
+    /// `GET /builds/{slot_id}/log` on completion.
+    ///
+    /// The channel is created once at slot construction and reused across
+    /// builds — receivers from a previous build naturally start seeing the
+    /// next build's lines, which is the desired "tail -f" semantics.
+    pub log_stream: tokio::sync::broadcast::Sender<String>,
 }
 
 /// Metadata for the last-known-good (LKG) runner binary preserved at
@@ -606,6 +624,7 @@ impl BuildPool {
                     e
                 );
             }
+            let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
             slots.push(Arc::new(BuildSlot {
                 id,
                 target_dir,
@@ -614,6 +633,7 @@ impl BuildPool {
                 frontend_stale: RwLock::new(false),
                 last_build_stderr_capture: RwLock::new(None),
                 last_build_log: RwLock::new(None),
+                log_stream: log_tx,
             }));
         }
         // Try to hydrate LKG metadata from the on-disk sidecar. We do this
