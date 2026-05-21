@@ -34,7 +34,6 @@ mod sdk_features;
 mod server;
 mod settings;
 mod spawn_worktree;
-mod spec_api;
 mod state;
 mod trace_propagation;
 mod velocity;

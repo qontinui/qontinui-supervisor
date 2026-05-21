@@ -1,5 +1,4 @@
-//! Crash-safe atomic file writes used by both the spec_api storage layer
-//! and the persistent settings migrator.
+//! Crash-safe atomic file writes used by the persistent settings migrator.
 use std::fs;
 use std::io::Write;
 use std::path::Path;

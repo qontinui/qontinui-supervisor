@@ -62,10 +62,9 @@ tempfile = "3"
 # without binding a real socket. tower 0.5 is already pulled in
 # transitively by axum 0.8 / tower-http; declaring it explicitly here just
 # unlocks the dev-only `util::ServiceExt` import. Used by the synthetic
-# build-id injection endpoint tests and by the spec_api tests.
+# build-id injection endpoint tests.
 tower = { version = "0.5", features = ["util"] }
-# Used by spec_api tests for env-override scoping (matches runner's spec_api
-# test dependencies).
+# Used for env-override scoping in tests.
 scopeguard = "1.2"
 
 [target.'cfg(windows)'.dependencies]

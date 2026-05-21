@@ -24,7 +24,6 @@ pub mod sdk_features;
 pub mod server;
 pub mod settings;
 pub mod spawn_worktree;
-pub mod spec_api;
 pub mod state;
 pub mod trace_propagation;
 pub mod velocity;

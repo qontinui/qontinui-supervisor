@@ -938,10 +938,9 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::runners::proxy_ui_bridge)
                 .post(crate::routes::runners::proxy_ui_bridge),
         )
-        // Spec API (Section 3 / Phase B5c). Mounted at `/spec/...` for
-        // parity with the runner's spec_api. Storage root defaults to
-        // `<supervisor>/frontend/specs/` (override via QONTINUI_SPECS_ROOT).
-        .merge(crate::spec_api::routes())
+        // Spec API removed — supervisor is just another app served by the
+        // runner's canonical multi-tenant mount on port 9876 at
+        // `/apps/qontinui-supervisor/spec/*`. See spec-multi-app PLAN §F.0.
         .with_state(state);
 
     // Merge stateless routers (velocity/eval have their own state, SPA has none)
