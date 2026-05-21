@@ -59,6 +59,7 @@ pub trait EnvForwarder: Send + Sync {
 pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
     vec![
         Box::new(TestAutoLoginEnv),
+        Box::new(DevBootstrapEnv),
         Box::new(WindowPositionEnv),
         Box::new(RestateEnv),
         Box::new(PanicLogEnv),
@@ -148,6 +149,50 @@ fn read_runner_env_creds(project_dir: &std::path::Path) -> Option<(String, Strin
         }
     }
     Some((email?, password?))
+}
+
+// =============================================================================
+// DevBootstrapEnv
+// =============================================================================
+
+/// Forwards `QONTINUI_DEV_BOOTSTRAP` from the supervisor's own environment
+/// onto every spawned runner.
+///
+/// When set (typically `=1` in dev), the runner's bootstrap flow registers
+/// the dev app set (runner + web + supervisor) automatically into
+/// `project.apps` so the spec-multi-app routes (`/apps/<app_id>/spec/*`) have
+/// a populated registry on first boot. Without this forwarder, temp runners
+/// boot with an empty `project.apps` registry even though the supervisor
+/// process has the bootstrap flag set, and callers have to `POST /apps` by
+/// hand to register every dev app.
+///
+/// Forwarded unconditionally when the supervisor has the var set — there is
+/// no scenario where a runner spawned by this supervisor benefits from a
+/// different bootstrap mode than the supervisor itself. Callers that need
+/// to disable bootstrap on a specific temp runner can still do so via
+/// `extra_env: {"QONTINUI_DEV_BOOTSTRAP": "0"}` because [`ExtraEnv`] runs
+/// after this forwarder (see module docs on order).
+pub struct DevBootstrapEnv;
+
+impl EnvForwarder for DevBootstrapEnv {
+    fn name(&self) -> &'static str {
+        "dev_bootstrap"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        _state: &'a SharedState,
+        _runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Ok(val) = std::env::var("QONTINUI_DEV_BOOTSTRAP") {
+                if !val.is_empty() {
+                    cmd.env("QONTINUI_DEV_BOOTSTRAP", val);
+                }
+            }
+        })
+    }
 }
 
 // =============================================================================
