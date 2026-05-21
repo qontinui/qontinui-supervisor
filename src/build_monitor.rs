@@ -313,6 +313,28 @@ async fn run_build_inner(
     // Source tree cargo will compile. `None` ⇒ the live project dir (legacy);
     // `Some(dir)` ⇒ a detached git-ref worktree's `src-tauri`.
     let cargo_cwd: &std::path::Path = build_dir_override.unwrap_or(&state.config.project_dir);
+
+    // When building a detached git-ref worktree, the worktree starts empty —
+    // no `node_modules/`, no `dist/`. The legacy `state.config.project_dir`
+    // tree has both because devs run `npm install` + `npm run build`
+    // routinely; a fresh `git worktree add` does not. Without this step the
+    // subsequent `npm run build` fails (`tsc`/`vite`/`ui-bridge-build-ir`
+    // not installed) and even if it didn't, cargo's
+    // `tauri::generate_context!` macro would panic on the missing
+    // `<wt>/dist/index.html` (the empirical 2026-05-21 manual-test failure
+    // mode this gate exists to prevent).
+    //
+    // Runs ONLY when `build_dir_override` is set. The live-tree code path
+    // below is unchanged byte-for-byte.
+    if let Some(src_tauri) = build_dir_override {
+        let wt_root: PathBuf = src_tauri.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+            SupervisorError::Other(format!(
+                "build_dir_override src-tauri path {:?} has no parent",
+                src_tauri
+            ))
+        })?;
+        prebuild_worktree_frontend(state, slot, &wt_root).await?;
+    }
     // The frontend is embedded in the binary via tauri_build, so we must run
     // `npm run build` first to produce a fresh dist/ before cargo build.
     //
@@ -715,6 +737,263 @@ async fn run_build_inner(
             .emit(LogSource::Build, LogLevel::Error, &error_summary)
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
+    }
+}
+
+/// Prebuild the frontend inside a fresh spawn worktree before cargo runs.
+///
+/// A fresh `git worktree add --detach` produces an empty checkout — no
+/// `node_modules/`, no `dist/`. The next `npm run build` would fail because
+/// the npm binaries (`tsc`, `vite`, `ui-bridge-build-ir`, …) aren't
+/// installed, and even if they were, cargo's `tauri::generate_context!`
+/// would panic on the missing `<wt>/dist/index.html`. Idempotent: once both
+/// `<wt>/node_modules/.bin/ui-bridge-build-ir` and `<wt>/dist/index.html`
+/// exist, this returns immediately with the `frontend_prebuild_skipped`
+/// log reason — repeated spawn-test calls on the same ref don't re-pay
+/// the ~30s npm install cost.
+///
+/// The whole prebuild is serialized via `BuildPool.npm_lock` (the same
+/// mutex the live-tree `npm run build` uses): `tsc` + `vite` are heavy
+/// enough that two concurrent runs on the same machine routinely OOM in
+/// CI, and the lock guarantees only one frontend build is in flight at a
+/// time across all worktrees + the live tree.
+///
+/// On any failure (npm install non-zero exit, npm build non-zero exit, or
+/// post-build `dist/index.html` still missing) returns
+/// `SupervisorError::BuildFailed` with the cargo-style 2KB stderr tail
+/// embedded so callers see what went wrong without trawling the supervisor
+/// log.
+async fn prebuild_worktree_frontend(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    wt_root: &std::path::Path,
+) -> Result<(), SupervisorError> {
+    if !needs_frontend_prebuild(wt_root) {
+        info!(
+            "Slot {}: frontend_prebuild_skipped — {:?} already has node_modules + dist/",
+            slot.id, wt_root
+        );
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!(
+                    "Slot {}: frontend_prebuild_skipped — {:?} already has node_modules + dist/",
+                    slot.id, wt_root
+                ),
+            )
+            .await;
+        return Ok(());
+    }
+
+    // Serialize against the live-tree npm step + any other worktree's
+    // prebuild. Held for both `npm install` and `npm run build`.
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "Slot {}: waiting for npm lock (worktree frontend prebuild in {:?})",
+                slot.id, wt_root
+            ),
+        )
+        .await;
+    let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+
+    // 1) npm install — produces node_modules/.bin/ui-bridge-build-ir +
+    //    everything else `npm run build` needs. Prefer `npm ci` when a
+    //    package-lock.json exists (reproducible, faster than `npm install`
+    //    in the presence of a lockfile); otherwise fall back to
+    //    `npm install`.
+    let has_lockfile = wt_root.join("package-lock.json").exists();
+    let install_subcmd = if has_lockfile { "ci" } else { "install" };
+
+    info!(
+        "Slot {}: npm {} starting in {:?}",
+        slot.id, install_subcmd, wt_root
+    );
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "Slot {}: npm {} starting in {:?}",
+                slot.id, install_subcmd, wt_root
+            ),
+        )
+        .await;
+
+    let install_started = std::time::Instant::now();
+    let install_output = run_npm_command(wt_root, install_subcmd)
+        .await
+        .map_err(|e| {
+            SupervisorError::BuildFailed(format!(
+                "npm {} failed to spawn in spawn worktree {:?}: {}",
+                install_subcmd, wt_root, e
+            ))
+        })?;
+    if !install_output.status.success() {
+        let stderr_tail = tail_bytes_keep_utf8(
+            &String::from_utf8_lossy(&install_output.stderr),
+            LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+        );
+        return Err(SupervisorError::BuildFailed(format!(
+            "npm {} failed in spawn worktree {:?} (exit {}): {}",
+            install_subcmd, wt_root, install_output.status, stderr_tail
+        )));
+    }
+    let install_secs = install_started.elapsed().as_secs();
+    info!(
+        "Slot {}: npm {} completed in {:?} ({}s)",
+        slot.id, install_subcmd, wt_root, install_secs
+    );
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "Slot {}: npm {} completed in {:?} ({}s)",
+                slot.id, install_subcmd, wt_root, install_secs
+            ),
+        )
+        .await;
+
+    // 2) npm run build — produces dist/index.html.
+    info!("Slot {}: npm run build starting in {:?}", slot.id, wt_root);
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!("Slot {}: npm run build starting in {:?}", slot.id, wt_root),
+        )
+        .await;
+
+    let build_started = std::time::Instant::now();
+    let build_output = run_npm_command(wt_root, "run build").await.map_err(|e| {
+        SupervisorError::BuildFailed(format!(
+            "npm run build failed to spawn in spawn worktree {:?}: {}",
+            wt_root, e
+        ))
+    })?;
+    if !build_output.status.success() {
+        let stderr_tail = tail_bytes_keep_utf8(
+            &String::from_utf8_lossy(&build_output.stderr),
+            LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+        );
+        return Err(SupervisorError::BuildFailed(format!(
+            "npm run build failed in spawn worktree {:?} (exit {}): {}",
+            wt_root, build_output.status, stderr_tail
+        )));
+    }
+    let build_secs = build_started.elapsed().as_secs();
+    info!(
+        "Slot {}: npm run build completed in {:?} ({}s)",
+        slot.id, wt_root, build_secs
+    );
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Info,
+            format!(
+                "Slot {}: npm run build completed in {:?} ({}s)",
+                slot.id, wt_root, build_secs
+            ),
+        )
+        .await;
+
+    // 3) Defense-in-depth: even on exit 0 verify dist/index.html actually
+    //    landed before handing off to cargo. The very thing
+    //    `tauri::generate_context!` needs.
+    verify_frontend_built(wt_root)?;
+
+    Ok(())
+}
+
+/// True iff `<wt_root>` is missing EITHER `node_modules/.bin/ui-bridge-build-ir`
+/// OR `dist/index.html`. Used as the cheap idempotency gate by
+/// [`prebuild_worktree_frontend`] so repeated spawn-test calls on the same
+/// ref don't re-pay the ~30s npm install cost. Both signals together prove
+/// (a) the npm dependency tree was installed AND (b) the previous frontend
+/// build actually produced output.
+fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
+    let bin = wt_root
+        .join("node_modules")
+        .join(".bin")
+        .join(if cfg!(windows) {
+            "ui-bridge-build-ir.cmd"
+        } else {
+            "ui-bridge-build-ir"
+        });
+    let dist_index = wt_root.join("dist").join("index.html");
+    !(bin.exists() && dist_index.exists())
+}
+
+/// Verify the frontend output exists after a successful `npm run build`.
+/// Returns `SupervisorError::BuildFailed` mentioning `dist/index.html` on
+/// failure so callers see exactly which artifact is missing.
+fn verify_frontend_built(wt_root: &std::path::Path) -> Result<(), SupervisorError> {
+    let dist_index = wt_root.join("dist").join("index.html");
+    let metadata = match std::fs::metadata(&dist_index) {
+        Ok(m) => m,
+        Err(_) => {
+            return Err(SupervisorError::BuildFailed(format!(
+                "frontend prebuild produced no {:?} — `tauri::generate_context!` \
+                 would panic on the missing artifact when cargo runs",
+                dist_index
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(SupervisorError::BuildFailed(format!(
+            "frontend prebuild left an empty/invalid {:?} — \
+             `tauri::generate_context!` requires a non-empty dist/index.html",
+            dist_index
+        )));
+    }
+    Ok(())
+}
+
+/// Run `npm <args>` in `cwd` and return the captured `std::process::Output`.
+/// On Windows uses `cmd /C npm.cmd <args>` (npm ships as a `.cmd` shim) +
+/// `CREATE_NO_WINDOW` so headless supervisor builds don't flash a console.
+/// `args` is a single string passed unchanged to the shell (mirrors the
+/// existing live-tree npm invocation style in `run_build_inner`).
+async fn run_npm_command(
+    cwd: &std::path::Path,
+    args: &str,
+) -> Result<std::process::Output, std::io::Error> {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
+        Command::new("cmd")
+            .args(["/C", &format!("npm.cmd {}", args)])
+            .current_dir(cwd)
+            // Match the live-tree invocation: vite.config.ts gates the
+            // build target on TAURI_PLATFORM=windows.
+            .env("TAURI_PLATFORM", "windows")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW_)
+            .output()
+            .await
+    }
+    #[cfg(not(windows))]
+    {
+        // Split the args string so tokens land as separate argv entries.
+        let split_args: Vec<&str> = args.split_whitespace().collect();
+        Command::new("npm")
+            .args(&split_args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
     }
 }
 
@@ -1589,9 +1868,131 @@ mod tests {
     //! Regression tests for the post-`npm exit 0` defense-in-depth `dist/`
     //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
     //! the bug these guard against.
-    use super::dist_index_ok;
+    use super::{dist_index_ok, needs_frontend_prebuild, verify_frontend_built};
     use std::fs;
     use tempfile::TempDir;
+
+    /// Filename of the npm bin stub. `.cmd` on Windows (where npm installs
+    /// `.bin/<tool>.cmd` shims), bare elsewhere. Mirrors the platform check
+    /// inside [`needs_frontend_prebuild`].
+    fn ui_bridge_build_ir_bin() -> &'static str {
+        if cfg!(windows) {
+            "ui-bridge-build-ir.cmd"
+        } else {
+            "ui-bridge-build-ir"
+        }
+    }
+
+    #[test]
+    fn needs_frontend_prebuild_true_when_node_modules_and_dist_absent() {
+        // Simulates a fresh `git worktree add --detach` — nothing in the
+        // workspace, no prior frontend build. Must trigger the prebuild.
+        let tmp = TempDir::new().expect("tempdir");
+        assert!(
+            needs_frontend_prebuild(tmp.path()),
+            "fresh worktree (no node_modules + no dist/) must require prebuild"
+        );
+    }
+
+    #[test]
+    fn needs_frontend_prebuild_true_when_only_node_modules_present() {
+        // Half-installed state — npm install succeeded but the previous
+        // `npm run build` never ran or failed. We should NOT skip the
+        // prebuild because dist/index.html is what cargo embeds.
+        let tmp = TempDir::new().expect("tempdir");
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
+        assert!(
+            needs_frontend_prebuild(tmp.path()),
+            "node_modules present but no dist/index.html must still require prebuild"
+        );
+    }
+
+    #[test]
+    fn needs_frontend_prebuild_true_when_only_dist_present() {
+        // Inverse half-installed state — somehow dist/ exists but
+        // node_modules is gone (e.g. someone ran `rm -rf node_modules`
+        // between sessions). Must re-prebuild because `npm run build`
+        // can't run without the dep tree.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(dist.join("index.html"), b"<!doctype html>").expect("write index");
+        assert!(
+            needs_frontend_prebuild(tmp.path()),
+            "dist/ present but no node_modules must still require prebuild"
+        );
+    }
+
+    #[test]
+    fn needs_frontend_prebuild_false_when_both_present() {
+        // Idempotency gate — both signals say a prior prebuild succeeded
+        // and we should reuse it. This is the path that saves ~30s per
+        // repeated spawn-test on the same ref.
+        let tmp = TempDir::new().expect("tempdir");
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(dist.join("index.html"), b"<!doctype html>").expect("write index");
+        assert!(
+            !needs_frontend_prebuild(tmp.path()),
+            "fully populated worktree must skip prebuild (idempotent reuse)"
+        );
+    }
+
+    #[test]
+    fn verify_frontend_built_err_when_index_missing() {
+        // Simulates the empirical 2026-05-21 failure mode: npm exit 0 but
+        // dist/index.html still missing. Must surface a clear error
+        // mentioning the missing artifact so the user can correlate it
+        // with the eventual `tauri::generate_context!` panic.
+        let tmp = TempDir::new().expect("tempdir");
+        let res = verify_frontend_built(tmp.path());
+        let err = res.expect_err("missing dist/index.html must error");
+        let s = err.to_string();
+        assert!(
+            s.contains("dist") && s.contains("index.html"),
+            "error must name the missing artifact (dist/index.html); got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn verify_frontend_built_err_when_index_empty() {
+        // Pathological case carried over from the legacy safari13
+        // regression: vite exits 0 having written zero bytes. Cargo would
+        // embed an empty index.html and the runner would render a blank
+        // page. Surface as an error too.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(dist.join("index.html"), b"").expect("write empty index");
+        let res = verify_frontend_built(tmp.path());
+        let err = res.expect_err("empty dist/index.html must error");
+        let s = err.to_string();
+        assert!(
+            s.contains("dist") && s.contains("index.html"),
+            "error must name the empty artifact (dist/index.html); got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn verify_frontend_built_ok_when_index_present_and_nonempty() {
+        // Happy path — a real npm build wrote a non-empty index.html.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(
+            dist.join("index.html"),
+            b"<!doctype html><html><body>ok</body></html>",
+        )
+        .expect("write index");
+        verify_frontend_built(tmp.path()).expect("non-empty dist/index.html must verify clean");
+    }
 
     #[test]
     fn dist_index_ok_returns_false_when_dist_dir_missing() {

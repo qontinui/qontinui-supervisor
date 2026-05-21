@@ -175,10 +175,7 @@ pub(crate) async fn run_one_tick_against(
         Err(e) => return Err(format!("list apps failed: {}", e)),
     };
     report.apps_seen = apps.len();
-    tracing::info!(
-        "flywheel: registry returned {} app(s) to scan",
-        apps.len()
-    );
+    tracing::info!("flywheel: registry returned {} app(s) to scan", apps.len());
 
     // 1..3. Per-app scan → execute → sweep. Per-app failures are logged at
     // warn! and the loop continues — one flaky app must not starve the
@@ -249,7 +246,10 @@ async fn run_one_tick_for_app(
 
     // 2. Execute every queued proposal — SEQUENTIAL (§6.7 anti-pattern guard).
     for prop_id in &queued {
-        let url = format!("{}/apps/{}/spec/proposals/{}/execute", base, app_id, prop_id);
+        let url = format!(
+            "{}/apps/{}/spec/proposals/{}/execute",
+            base, app_id, prop_id
+        );
         match http_post_json(client, &url, &serde_json::json!({})).await {
             Ok(_) => {
                 counts.executed += 1;
@@ -721,8 +721,7 @@ mod tests {
     #[tokio::test]
     async fn tick_multiple_apps_aggregates_counts() {
         let mock = Arc::new(MockState::default());
-        *mock.apps_response.lock() =
-            vec![mk_app("qontinui-runner"), mk_app("qontinui-web")];
+        *mock.apps_response.lock() = vec![mk_app("qontinui-runner"), mk_app("qontinui-web")];
         *mock.scan_response.lock() = serde_json::json!({
             "queuedProposals": [{"proposal_id": "p1"}]
         });

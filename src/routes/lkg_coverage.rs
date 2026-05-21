@@ -855,14 +855,12 @@ mod tests {
         let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         touch_file_mtime(&file, file_at);
         // LKG at T=200s.
-        let lkg_at = Some(DateTime::<Utc>::from(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(200),
-        ));
+        let lkg_at = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(200));
 
         let req = vec![file.to_string_lossy().into_owned()];
         // `now` is the LKG built_at — LKG is "fresh" so lkg_stale stays false
         // and we exercise the bare COVERED reason path here.
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         assert_eq!(resp.files.len(), 1);
         let f = &resp.files[0];
         assert!(f.exists, "file should exist: {f:?}");
@@ -888,12 +886,10 @@ mod tests {
         fs::write(&file, "// new").expect("write");
         let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
         touch_file_mtime(&file, file_at);
-        let lkg_at = Some(DateTime::<Utc>::from(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(200),
-        ));
+        let lkg_at = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(200));
 
         let req = vec![file.to_string_lossy().into_owned()];
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         let f = &resp.files[0];
         assert!(f.exists);
         assert!(!f.covered, "file newer than LKG must NOT be covered");
@@ -915,12 +911,10 @@ mod tests {
         fs::write(&file, "fn x() {}").expect("write");
         let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         touch_file_mtime(&file, file_at);
-        let lkg_at = Some(DateTime::<Utc>::from(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(300),
-        ));
+        let lkg_at = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300));
 
         let req = vec!["relative.rs".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         let f = &resp.files[0];
         assert_eq!(
             f.path, "relative.rs",
@@ -936,10 +930,10 @@ mod tests {
         // `../../etc/passwd` escapes project_dir → exists: false.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
-        let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
+        let lkg_at = rfc3339("2026-04-26T12:00:00Z");
 
         let req = vec!["../../etc/passwd".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         let f = &resp.files[0];
         assert!(!f.exists, "traversal must report exists: false: {f:?}");
         assert!(!f.covered);
@@ -953,10 +947,10 @@ mod tests {
     fn test_lkg_coverage_nonexistent_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
-        let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
+        let lkg_at = rfc3339("2026-04-26T12:00:00Z");
 
         let req = vec!["definitely-not-a-real-file.rs".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         let f = &resp.files[0];
         assert!(!f.exists);
         assert!(!f.covered);
@@ -1006,16 +1000,14 @@ mod tests {
         fs::write(&new, "x").unwrap();
         touch_file_mtime(&new, SystemTime::UNIX_EPOCH + Duration::from_secs(500));
 
-        let lkg_at = Some(DateTime::<Utc>::from(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(300),
-        ));
+        let lkg_at = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300));
 
         let req = vec![
             "old.rs".to_string(),
             "new.rs".to_string(),
             "missing.rs".to_string(),
         ];
-        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
+        let resp = build_coverage_response(&req, project, Some(lkg_at), lkg_at);
         assert_eq!(resp.files.len(), 3);
         assert!(resp.files[0].covered, "old.rs should be covered");
         assert_eq!(resp.files[0].reason, super::reason::COVERED);
@@ -1043,8 +1035,8 @@ mod tests {
         // any files.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
-        let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
-        let resp = build_coverage_response(&[], project, lkg_at, lkg_at.unwrap());
+        let lkg_at = rfc3339("2026-04-26T12:00:00Z");
+        let resp = build_coverage_response(&[], project, Some(lkg_at), lkg_at);
         assert!(resp.files.is_empty());
         assert!(!resp.all_covered);
     }
@@ -1155,13 +1147,13 @@ mod tests {
         let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
         touch_file_mtime(&file, file_at);
         let lkg_built = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 + 60);
-        let lkg_at = Some(DateTime::<Utc>::from(lkg_built));
+        let lkg_at = DateTime::<Utc>::from(lkg_built);
 
         let resp = build_coverage_response(
             &[file.to_string_lossy().into_owned()],
             project,
+            Some(lkg_at),
             lkg_at,
-            lkg_at.unwrap(),
         );
         let f = &resp.files[0];
 

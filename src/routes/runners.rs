@@ -1085,6 +1085,20 @@ pub struct SpawnTestRequest {
     /// `git_ref_resolved_sha` (`git rev-parse HEAD` of the worktree).
     #[serde(default)]
     pub git_ref: Option<String>,
+    /// When true, and a `git_ref` build fails downstream of `prepare_worktree`,
+    /// best-effort remove the spawn worktree dir on disk via
+    /// `git worktree remove --force` + `git worktree prune`. Default false:
+    /// the worktree is left in place for idempotent reuse (the same ref's
+    /// next spawn-test call reuses the existing dir and force-resets it).
+    ///
+    /// Use this when the worktree itself is the problem (corrupted tree,
+    /// stale lockfile, contaminated `node_modules/`) and you want the next
+    /// call to start from a fresh `git worktree add`. The flag is a no-op
+    /// when `git_ref` is None (no worktree was created for this request).
+    /// Cleanup is a side effect — the original build error is what the
+    /// caller sees.
+    #[serde(default)]
+    pub cleanup_worktree_on_fail: bool,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1248,6 +1262,10 @@ pub async fn spawn_test(
     // Set when a `git_ref` build occurred: (requested_ref, resolved_sha).
     // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
     let mut git_ref_info: Option<(String, String)> = None;
+    // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
+    // the `cleanup_worktree_on_fail` flag to wipe the worktree dir on a
+    // downstream cargo failure. (repo_root, wt_path)
+    let mut git_ref_cleanup_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
 
     // Rebuild if requested
     if body.rebuild {
@@ -1330,6 +1348,17 @@ pub async fn spawn_test(
                             )
                             .await;
                         git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
+                        // Stash paths for the optional cleanup-on-fail branch
+                        // below. `find_repo_root` walks up from the
+                        // configured project_dir; if it errors here (the
+                        // supervisor lost track of the runner repo) we can't
+                        // safely run `git worktree remove` anyway — skip
+                        // cleanup wiring rather than 500 the spawn.
+                        if let Ok(repo_root) =
+                            crate::spawn_worktree::find_repo_root(&state.config.project_dir)
+                        {
+                            git_ref_cleanup_paths = Some((repo_root, wt.worktree_path.clone()));
+                        }
                         Some(wt.src_tauri)
                     }
                     Err(e) => {
@@ -1383,6 +1412,29 @@ pub async fn spawn_test(
                 build_succeeded = Some(true);
             }
             Err(e) => {
+                // Optional spawn-worktree cleanup. Best-effort, runs before
+                // any of the existing error-path branches so the worktree
+                // is gone whether we fall through (allow_stale_fallback)
+                // OR short-circuit with 500. The cleanup itself can't fail
+                // the caller's request — `cleanup_fresh_worktree` logs and
+                // swallows internally.
+                if body.cleanup_worktree_on_fail && body.git_ref.is_some() {
+                    if let Some((repo_root, wt_path)) = &git_ref_cleanup_paths {
+                        state
+                            .logs
+                            .emit(
+                                LogSource::Supervisor,
+                                LogLevel::Info,
+                                format!(
+                                    "spawn-test cleanup_worktree_on_fail: removing {:?} after build failure",
+                                    wt_path
+                                ),
+                            )
+                            .await;
+                        crate::spawn_worktree::cleanup_fresh_worktree(repo_root, wt_path).await;
+                    }
+                }
+
                 if body.allow_stale_fallback {
                     let err_str = e.to_string();
                     state
@@ -2892,8 +2944,10 @@ pub async fn slot_build_log(
 pub async fn slot_build_log_stream(
     State(state): State<SharedState>,
     Path(slot_id): Path<usize>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, axum::response::Response>
-{
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>,
+    axum::response::Response,
+> {
     let slot = match state.build_pool.slots.get(slot_id) {
         Some(s) => s.clone(),
         None => {
@@ -3773,5 +3827,30 @@ mod tests {
             "src_newer_than_dist"
         );
         assert_eq!(FrontendStaleReason::DistMissing.as_str(), "dist_missing");
+    }
+
+    /// Pin the default + explicit-true wire shapes for the
+    /// `cleanup_worktree_on_fail` flag. External agents call this endpoint
+    /// with arbitrary JSON; a typo or default-change must be caught here.
+    #[test]
+    fn spawn_test_request_cleanup_worktree_on_fail_defaults_false() {
+        // Empty payload (every field at default) — flag must be false so
+        // existing callers' idempotent-reuse semantics are preserved.
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(
+            !req.cleanup_worktree_on_fail,
+            "default must be false (idempotent reuse)"
+        );
+    }
+
+    #[test]
+    fn spawn_test_request_cleanup_worktree_on_fail_explicit_true() {
+        // Explicit opt-in by an agent that wants a fresh worktree on the
+        // next attempt after a downstream cargo failure.
+        let req: super::SpawnTestRequest =
+            serde_json::from_str(r#"{"cleanup_worktree_on_fail": true}"#)
+                .expect("deserialize SpawnTestRequest with cleanup_worktree_on_fail");
+        assert!(req.cleanup_worktree_on_fail);
     }
 }
