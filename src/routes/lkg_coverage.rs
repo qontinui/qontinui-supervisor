@@ -49,6 +49,17 @@
 //!                   file_newer_than_lkg_secs > 0 ⇔ file mtime > LKG built_at ⇔ \
 //!                   covered: false (LKG is stale relative to this file).",
 //!     lkg_built_at: <RFC3339 string | null>,
+//!     lkg_age_secs: <i64 | null>,
+//!         // = (now - lkg_built_at).num_seconds(). `null` when there is no
+//!         // LKG yet (mirrors `lkg_built_at: null`). Agents use this to
+//!         // detect a stale-but-covering LKG without parsing the RFC3339
+//!         // string themselves.
+//!     lkg_stale: <bool>,
+//!         // true iff `lkg_age_secs.is_some() && lkg_age_secs > 86400`
+//!         // (LKG older than 24h). `false` when no LKG OR when the LKG is
+//!         // fresh enough to be trusted. Independent of per-file `covered`:
+//!         // the LKG may be stale-as-a-fallback (lkg_stale=true) yet still
+//!         // contain a specific file's edits (covered=true).
 //!     files: [
 //!       {
 //!         path: <echoed back, normalized>,
@@ -63,9 +74,14 @@
 //!         reason: <string>,
 //!             // Human-readable explanation of the `covered` decision.
 //!             // One of: "covered_file_at_or_before_lkg",
+//!             //         "covered_but_lkg_stale",
 //!             //         "not_covered_file_newer_than_lkg",
 //!             //         "no_lkg_yet",
 //!             //         "file_not_found".
+//!             // `covered_but_lkg_stale` fires when the file's content IS in
+//!             // the LKG binary (covered=true) but the LKG itself is older
+//!             // than 24h. Distinguishes "covered, ship it" from "covered
+//!             // but you should rebuild anyway."
 //!       },
 //!       ...
 //!     ],
@@ -143,11 +159,29 @@ pub struct CoverageResponse {
     /// produced an LKG yet on this checkout.
     #[serde(serialize_with = "ser_opt_dt")]
     pub lkg_built_at: Option<DateTime<Utc>>,
+    /// `(now - lkg_built_at).num_seconds()`. `None` when there is no LKG
+    /// yet (i.e. when `lkg_built_at` is `None`). Exposed so agents can
+    /// detect a stale-but-still-covering LKG without re-parsing the RFC3339
+    /// `built_at` string. See `lkg_stale` for the threshold-applied flag.
+    pub lkg_age_secs: Option<i64>,
+    /// `true` iff `lkg_age_secs.is_some_and(|s| s > LKG_STALE_THRESHOLD_SECS)`.
+    /// `false` when there is no LKG (no signal yet) or the LKG is fresh.
+    /// Independent of per-file `covered`: an LKG can be stale-as-a-fallback
+    /// while still containing a specific file's content. See module-level
+    /// docs and `reason::COVERED_BUT_STALE` for the per-file companion signal.
+    pub lkg_stale: bool,
     pub files: Vec<FileCoverage>,
     /// True iff every requested file is `covered: true`. `false` when there
     /// are no files OR when LKG is absent OR when any file is not covered.
     pub all_covered: bool,
 }
+
+/// Number of seconds an LKG can age before `lkg_stale` flips to `true`.
+/// Chosen at 24h (`86_400`s): a binary older than a day in an active
+/// codebase is likely to predate at least one schema/protocol change that
+/// silently breaks `use_lkg: true` spawns, even when the agent's own files
+/// are covered.
+pub const LKG_STALE_THRESHOLD_SECS: i64 = 86_400;
 
 /// One-line semantics summary embedded in every `/lkg/coverage` response.
 /// Kept as a single source of truth so the Rust doc-comments and the
@@ -160,6 +194,11 @@ pub const COVERAGE_DESCRIPTION: &str = "covered=true means the file's content is
 pub mod reason {
     /// LKG was built at or after the file's mtime — file is in the binary.
     pub const COVERED: &str = "covered_file_at_or_before_lkg";
+    /// LKG contains the file's content (covered=true) BUT the LKG itself
+    /// is older than `LKG_STALE_THRESHOLD_SECS`. Distinguishes "covered, ship
+    /// it" from "covered but you should rebuild anyway because the LKG is
+    /// likely to be missing other ecosystem changes (schema, protocol, etc.)."
+    pub const COVERED_BUT_STALE: &str = "covered_but_lkg_stale";
     /// File was edited after the LKG was built — rebuild required.
     pub const NOT_COVERED: &str = "not_covered_file_newer_than_lkg";
     /// No successful LKG build has been recorded yet.
@@ -383,15 +422,28 @@ pub fn decide_coverage(
 /// Coverage decision for one file given a normalized absolute path and the
 /// LKG built_at. Pure-ish (filesystem read for mtime). Caller is responsible
 /// for path resolution; this function just stats and decides.
+///
+/// `lkg_stale` is the top-level "LKG is older than the staleness threshold"
+/// flag computed once per response. When the file is covered AND the LKG is
+/// stale, the per-file `reason` is upgraded from `COVERED` to
+/// `COVERED_BUT_STALE` so agents can distinguish "covered, ship it" from
+/// "covered, but rebuild anyway because the rest of the LKG is stale."
 fn coverage_for_resolved(
     echo_path: &str,
     resolved: Option<&Path>,
     lkg_at: Option<DateTime<Utc>>,
+    lkg_stale: bool,
 ) -> FileCoverage {
     let path = resolved;
     let mtime = path.and_then(read_file_mtime);
     let exists = mtime.is_some();
-    let (covered, file_newer_than_lkg_secs, reason) = decide_coverage(lkg_at, mtime);
+    let (covered, file_newer_than_lkg_secs, mut reason) = decide_coverage(lkg_at, mtime);
+    // Promote COVERED → COVERED_BUT_STALE when the LKG itself is past the
+    // threshold. Only applies to the `covered=true` case; NOT_COVERED /
+    // NO_LKG / FILE_NOT_FOUND already carry the stronger signal.
+    if covered && lkg_stale && reason == self::reason::COVERED {
+        reason = self::reason::COVERED_BUT_STALE;
+    }
     FileCoverage {
         path: echo_path.to_string(),
         exists,
@@ -402,24 +454,53 @@ fn coverage_for_resolved(
     }
 }
 
+/// Compute the LKG age + stale flag for a response.
+///
+/// * `lkg_age_secs` is `Some((now - built_at).num_seconds())` when `lkg_at`
+///   is present, else `None`.
+/// * `lkg_stale` is `true` iff `lkg_age_secs.is_some_and(|s| s > LKG_STALE_THRESHOLD_SECS)`.
+///
+/// `now` is taken as a parameter so the rule is unit-testable without
+/// mocking the system clock — the HTTP handler passes `Utc::now()`.
+pub fn compute_lkg_age(
+    lkg_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (Option<i64>, bool) {
+    match lkg_at {
+        Some(built_at) => {
+            let age = (now - built_at).num_seconds();
+            (Some(age), age > LKG_STALE_THRESHOLD_SECS)
+        }
+        None => (None, false),
+    }
+}
+
 /// Compute the full coverage response from already-resolved data. Pulled
 /// out as a pure function so the bulk of the logic can be unit-tested
 /// without a router or `SharedState`.
+///
+/// `now` is taken as a parameter for testability — the HTTP handler passes
+/// `Utc::now()`. It's used solely to compute `lkg_age_secs` / `lkg_stale`;
+/// per-file `covered` decisions don't consult the wall clock.
 pub fn build_coverage_response(
     requested: &[String],
     project_dir: &Path,
     lkg_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
 ) -> CoverageResponse {
+    let (lkg_age_secs, lkg_stale) = compute_lkg_age(lkg_at, now);
     let mut files = Vec::with_capacity(requested.len());
     for raw in requested {
         let resolved = resolve_path(raw, project_dir);
         let resolved_ref = resolved.as_deref();
-        files.push(coverage_for_resolved(raw, resolved_ref, lkg_at));
+        files.push(coverage_for_resolved(raw, resolved_ref, lkg_at, lkg_stale));
     }
     let all_covered = !files.is_empty() && files.iter().all(|f| f.covered);
     CoverageResponse {
         description: COVERAGE_DESCRIPTION,
         lkg_built_at: lkg_at,
+        lkg_age_secs,
+        lkg_stale,
         files,
         all_covered,
     }
@@ -441,7 +522,7 @@ pub async fn lkg_coverage(
         .as_ref()
         .map(|info| info.built_at);
     let project_dir = state.config.project_dir.clone();
-    let response = build_coverage_response(&requested, &project_dir, lkg_at);
+    let response = build_coverage_response(&requested, &project_dir, lkg_at, Utc::now());
 
     let data = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
     Json(json!({
@@ -782,7 +863,9 @@ mod tests {
         ));
 
         let req = vec![file.to_string_lossy().into_owned()];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        // `now` is the LKG built_at — LKG is "fresh" so lkg_stale stays false
+        // and we exercise the bare COVERED reason path here.
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         assert_eq!(resp.files.len(), 1);
         let f = &resp.files[0];
         assert!(f.exists, "file should exist: {f:?}");
@@ -793,6 +876,8 @@ mod tests {
         );
         assert_eq!(f.reason, super::reason::COVERED);
         assert!(resp.all_covered);
+        assert!(!resp.lkg_stale, "LKG built_at == now ⇒ not stale");
+        assert_eq!(resp.lkg_age_secs, Some(0));
         assert_eq!(resp.description, COVERAGE_DESCRIPTION);
     }
 
@@ -811,7 +896,7 @@ mod tests {
         ));
 
         let req = vec![file.to_string_lossy().into_owned()];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         let f = &resp.files[0];
         assert!(f.exists);
         assert!(!f.covered, "file newer than LKG must NOT be covered");
@@ -838,7 +923,7 @@ mod tests {
         ));
 
         let req = vec!["relative.rs".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         let f = &resp.files[0];
         assert_eq!(
             f.path, "relative.rs",
@@ -857,7 +942,7 @@ mod tests {
         let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
 
         let req = vec!["../../etc/passwd".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         let f = &resp.files[0];
         assert!(!f.exists, "traversal must report exists: false: {f:?}");
         assert!(!f.covered);
@@ -874,7 +959,7 @@ mod tests {
         let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
 
         let req = vec!["definitely-not-a-real-file.rs".to_string()];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         let f = &resp.files[0];
         assert!(!f.exists);
         assert!(!f.covered);
@@ -896,7 +981,7 @@ mod tests {
         touch_file_mtime(&file, file_at);
 
         let req = vec![file.to_string_lossy().into_owned()];
-        let resp = build_coverage_response(&req, project, None);
+        let resp = build_coverage_response(&req, project, None, Utc::now());
         let f = &resp.files[0];
         assert!(f.exists, "file should still report exists: {f:?}");
         assert!(!f.covered, "no LKG => not covered");
@@ -904,6 +989,11 @@ mod tests {
         assert_eq!(f.reason, super::reason::NO_LKG);
         assert!(!resp.all_covered);
         assert_eq!(resp.lkg_built_at, None);
+        assert_eq!(
+            resp.lkg_age_secs, None,
+            "no LKG ⇒ lkg_age_secs is None"
+        );
+        assert!(!resp.lkg_stale, "no LKG ⇒ lkg_stale is false (no signal)");
     }
 
     #[test]
@@ -931,7 +1021,7 @@ mod tests {
             "new.rs".to_string(),
             "missing.rs".to_string(),
         ];
-        let resp = build_coverage_response(&req, project, lkg_at);
+        let resp = build_coverage_response(&req, project, lkg_at, lkg_at.unwrap());
         assert_eq!(resp.files.len(), 3);
         assert!(resp.files[0].covered, "old.rs should be covered");
         assert_eq!(resp.files[0].reason, super::reason::COVERED);
@@ -959,7 +1049,8 @@ mod tests {
         // any files.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path();
-        let resp = build_coverage_response(&[], project, Some(rfc3339("2026-04-26T12:00:00Z")));
+        let lkg_at = Some(rfc3339("2026-04-26T12:00:00Z"));
+        let resp = build_coverage_response(&[], project, lkg_at, lkg_at.unwrap());
         assert!(resp.files.is_empty());
         assert!(!resp.all_covered);
     }
@@ -971,6 +1062,8 @@ mod tests {
         let resp = CoverageResponse {
             description: COVERAGE_DESCRIPTION,
             lkg_built_at: None,
+            lkg_age_secs: None,
+            lkg_stale: false,
             files: vec![FileCoverage {
                 path: "missing.rs".to_string(),
                 exists: false,
@@ -985,6 +1078,14 @@ mod tests {
         assert!(
             json.contains("\"lkg_built_at\":null"),
             "expected null lkg_built_at, got: {json}"
+        );
+        assert!(
+            json.contains("\"lkg_age_secs\":null"),
+            "expected null lkg_age_secs when no LKG, got: {json}"
+        );
+        assert!(
+            json.contains("\"lkg_stale\":false"),
+            "expected lkg_stale=false when no LKG, got: {json}"
         );
         assert!(
             json.contains("\"file_mtime\":null"),
@@ -1011,6 +1112,8 @@ mod tests {
         let resp = CoverageResponse {
             description: COVERAGE_DESCRIPTION,
             lkg_built_at: Some(t),
+            lkg_age_secs: Some(0),
+            lkg_stale: false,
             files: vec![FileCoverage {
                 path: "x.rs".to_string(),
                 exists: true,
@@ -1025,6 +1128,14 @@ mod tests {
         assert!(
             json.contains("2026-04-26T12:00:00+00:00"),
             "expected RFC3339 string, got: {json}"
+        );
+        assert!(
+            json.contains("\"lkg_age_secs\":0"),
+            "expected lkg_age_secs serialized as number, got: {json}"
+        );
+        assert!(
+            json.contains("\"lkg_stale\":false"),
+            "expected lkg_stale=false, got: {json}"
         );
     }
 
@@ -1052,7 +1163,12 @@ mod tests {
         let lkg_built = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 + 60);
         let lkg_at = Some(DateTime::<Utc>::from(lkg_built));
 
-        let resp = build_coverage_response(&[file.to_string_lossy().into_owned()], project, lkg_at);
+        let resp = build_coverage_response(
+            &[file.to_string_lossy().into_owned()],
+            project,
+            lkg_at,
+            lkg_at.unwrap(),
+        );
         let f = &resp.files[0];
 
         // Property: a freshly-built LKG covers an unmodified file.
@@ -1077,6 +1193,197 @@ mod tests {
             "response.description must be non-empty so callers can self-document",
         );
         assert!(resp.all_covered);
+    }
+
+    // ---- top-level LKG age + stale flag (Phase 7) ----
+    //
+    // Phase 7 of the 2026-05-20 manual-test remediation: expose
+    // `lkg_age_secs` and `lkg_stale` on `/lkg/coverage` so agents can detect
+    // a stale-but-covering LKG without parsing the RFC3339 `built_at` string
+    // themselves. These tests pin the three documented cases (fresh,
+    // stale, absent) plus the per-file `covered_but_lkg_stale` promotion.
+
+    /// LKG present and fresh (built 100s ago): age ≈ 100, stale=false.
+    #[test]
+    fn test_lkg_age_fresh_under_threshold() {
+        let now = rfc3339("2026-05-20T12:00:00Z");
+        let built_at = now - chrono::Duration::seconds(100);
+        let (age, stale) = compute_lkg_age(Some(built_at), now);
+        assert_eq!(age, Some(100), "age must be (now - built_at).num_seconds()");
+        assert!(
+            !stale,
+            "100s < {LKG_STALE_THRESHOLD_SECS}s threshold ⇒ not stale"
+        );
+    }
+
+    /// LKG present and stale (built 90000s ago > 86400s): age ≈ 90000,
+    /// stale=true. 90000s is the spec value from the Phase 7 brief.
+    #[test]
+    fn test_lkg_age_stale_over_threshold() {
+        let now = rfc3339("2026-05-20T12:00:00Z");
+        let built_at = now - chrono::Duration::seconds(90_000);
+        let (age, stale) = compute_lkg_age(Some(built_at), now);
+        assert_eq!(age, Some(90_000));
+        assert!(
+            stale,
+            "90000s > {LKG_STALE_THRESHOLD_SECS}s threshold ⇒ stale"
+        );
+    }
+
+    /// Boundary: age exactly == threshold ⇒ NOT stale (rule is strictly `>`).
+    /// Pin this so a future "off-by-one" refactor can't silently flip it.
+    #[test]
+    fn test_lkg_age_exactly_at_threshold_is_not_stale() {
+        let now = rfc3339("2026-05-20T12:00:00Z");
+        let built_at = now - chrono::Duration::seconds(LKG_STALE_THRESHOLD_SECS);
+        let (age, stale) = compute_lkg_age(Some(built_at), now);
+        assert_eq!(age, Some(LKG_STALE_THRESHOLD_SECS));
+        assert!(
+            !stale,
+            "age == threshold must be `not stale` (rule is `age > threshold`)"
+        );
+
+        // One second over the boundary: now stale.
+        let built_at = now - chrono::Duration::seconds(LKG_STALE_THRESHOLD_SECS + 1);
+        let (_, stale) = compute_lkg_age(Some(built_at), now);
+        assert!(stale, "age == threshold + 1 must flip to stale");
+    }
+
+    /// No LKG: age=None, stale=false. Mirrors the `no_lkg_yet` case so
+    /// callers see a single "I have no signal yet" shape rather than
+    /// `stale=true` (which would falsely imply "rebuild needed because LKG
+    /// is old").
+    #[test]
+    fn test_lkg_age_none_when_no_lkg() {
+        let now = rfc3339("2026-05-20T12:00:00Z");
+        let (age, stale) = compute_lkg_age(None, now);
+        assert_eq!(age, None, "no LKG ⇒ lkg_age_secs is None");
+        assert!(!stale, "no LKG ⇒ lkg_stale is false (no signal, not stale)");
+    }
+
+    /// End-to-end: fresh LKG + covered file ⇒ `lkg_stale: false`,
+    /// `lkg_age_secs: Some(~100)`, per-file `reason: COVERED` (NOT the
+    /// stale variant).
+    #[test]
+    fn test_build_coverage_response_lkg_present_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path();
+        let file = project.join("covered.rs");
+        fs::write(&file, "x").unwrap();
+        // file mtime: 1000s before LKG (covered).
+        let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        touch_file_mtime(&file, file_at);
+        // LKG built_at: 1_001_000s since epoch.
+        let lkg_at = Some(DateTime::<Utc>::from(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_001_000),
+        ));
+        // now: 100s after LKG built_at ⇒ fresh.
+        let now = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(1_001_100));
+
+        let req = vec!["covered.rs".to_string()];
+        let resp = build_coverage_response(&req, project, lkg_at, now);
+
+        assert_eq!(resp.lkg_age_secs, Some(100));
+        assert!(!resp.lkg_stale, "100s LKG ⇒ not stale");
+        let f = &resp.files[0];
+        assert!(f.covered, "older file ⇒ covered");
+        assert_eq!(
+            f.reason,
+            super::reason::COVERED,
+            "fresh LKG ⇒ per-file reason stays at COVERED, not COVERED_BUT_STALE"
+        );
+        assert!(resp.all_covered);
+    }
+
+    /// End-to-end: stale LKG + covered file ⇒ `lkg_stale: true`,
+    /// `lkg_age_secs: Some(~90000)`, AND the per-file `reason` is promoted
+    /// from `COVERED` to `COVERED_BUT_STALE`. This is the signal the
+    /// 2026-05-16 manual-test session was missing.
+    #[test]
+    fn test_build_coverage_response_lkg_present_stale_promotes_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path();
+        let file = project.join("ancient.rs");
+        fs::write(&file, "x").unwrap();
+        // file is much older than LKG (still covered).
+        let file_at = SystemTime::UNIX_EPOCH + Duration::from_secs(500_000);
+        touch_file_mtime(&file, file_at);
+        let lkg_at = Some(DateTime::<Utc>::from(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
+        ));
+        // now: 90_000s after LKG ⇒ stale (> 86_400).
+        let now = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH + Duration::from_secs(1_090_000));
+
+        let req = vec!["ancient.rs".to_string()];
+        let resp = build_coverage_response(&req, project, lkg_at, now);
+
+        assert_eq!(resp.lkg_age_secs, Some(90_000));
+        assert!(resp.lkg_stale, "90000s > 86400s threshold ⇒ stale");
+        let f = &resp.files[0];
+        assert!(f.covered, "file still older than LKG ⇒ covered=true");
+        assert_eq!(
+            f.reason,
+            super::reason::COVERED_BUT_STALE,
+            "covered + stale LKG ⇒ reason promoted to COVERED_BUT_STALE"
+        );
+        // `all_covered` tracks `covered`, NOT staleness. Agents reading
+        // `all_covered: true` plus `lkg_stale: true` can decide for
+        // themselves whether to rebuild.
+        assert!(
+            resp.all_covered,
+            "all_covered tracks per-file `covered`, independent of staleness"
+        );
+    }
+
+    /// End-to-end: no LKG ⇒ age and stale are both the "absent" shape.
+    /// Confirms that the per-file `NO_LKG` reason is NOT promoted to
+    /// `COVERED_BUT_STALE` (the promotion only fires when `covered=true`).
+    #[test]
+    fn test_build_coverage_response_no_lkg_age_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path();
+        let file = project.join("any.rs");
+        fs::write(&file, "x").unwrap();
+        touch_file_mtime(&file, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+
+        let resp = build_coverage_response(
+            &["any.rs".to_string()],
+            project,
+            None, // no LKG
+            Utc::now(),
+        );
+        assert_eq!(resp.lkg_age_secs, None);
+        assert!(!resp.lkg_stale);
+        assert_eq!(
+            resp.files[0].reason,
+            super::reason::NO_LKG,
+            "no-LKG case must keep the NO_LKG reason, not COVERED_BUT_STALE"
+        );
+    }
+
+    /// `lkg_age_secs` and `lkg_stale` serialize as plain JSON number /
+    /// boolean (no string-wrapping). Pins the wire shape so a future
+    /// `#[serde(serialize_with)]` refactor can't silently change it.
+    #[test]
+    fn test_response_serializes_lkg_age_and_stale_as_plain_types() {
+        let t = rfc3339("2026-05-20T12:00:00Z");
+        let resp = CoverageResponse {
+            description: COVERAGE_DESCRIPTION,
+            lkg_built_at: Some(t),
+            lkg_age_secs: Some(90_000),
+            lkg_stale: true,
+            files: vec![],
+            all_covered: false,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            json.contains("\"lkg_age_secs\":90000"),
+            "lkg_age_secs must serialize as a plain JSON number, got: {json}"
+        );
+        assert!(
+            json.contains("\"lkg_stale\":true"),
+            "lkg_stale must serialize as a plain JSON boolean, got: {json}"
+        );
     }
 
     // ---- spawn-test LKG staleness scan ----
