@@ -163,7 +163,12 @@ pub struct PreparedWorktree {
 /// Best-effort cleanup of a freshly-added worktree dir whose follow-up
 /// operations failed. Logs (via `tracing`) on cleanup failure but never
 /// propagates — the caller's original error must stay the user-visible one.
-async fn cleanup_fresh_worktree(repo_root: &Path, wt_path: &Path) {
+///
+/// Public so the `spawn-test` route handler can invoke it via the
+/// `cleanup_worktree_on_fail` request flag after a downstream cargo build
+/// failure (the in-function call below only covers errors raised inside
+/// `prepare_worktree` itself).
+pub async fn cleanup_fresh_worktree(repo_root: &Path, wt_path: &Path) {
     let wt_path_str = wt_path.to_string_lossy().to_string();
     if let Err(e) = git(
         &["worktree", "remove", "--force", &wt_path_str],
