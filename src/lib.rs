@@ -25,6 +25,13 @@ pub mod server;
 pub mod settings;
 pub mod spawn_worktree;
 pub mod state;
+// Phase 4.1 (`plans/2026-05-21-coordination-improvements.md`): per-machine
+// tree-sitter symbol watcher daemon. Reports `ClaimKind::Symbol` claims to
+// coord via the existing `/claims/{acquire,release}` endpoints. Shipped as
+// a separate binary (`src/bin/symbol_watcher.rs`) but the module lives in
+// the library crate so integration tests can drive it via
+// `SymbolWatcher::with_transport(...)` + `MockTransport`.
+pub mod symbol_watcher;
 pub mod trace_propagation;
 pub mod velocity;
 pub mod velocity_improvement;
