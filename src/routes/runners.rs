@@ -174,6 +174,150 @@ pub struct WatchdogRunnerRequest {
     pub reset_attempts: bool,
 }
 
+/// Phase 2b of `plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md` —
+/// resolve and apply a `paired_profile_id` snapshot before runner spawn.
+///
+/// Looks up a profile snapshot dir under
+/// `<profiles_root>/<paired_profile_id>/` and copies its `paired_user.json`
+/// (required) + `auth_tokens.enc` (optional) into `<data_local_dir>/`.
+///
+/// Both root paths are injected (not pulled from `dirs::*`) so unit tests
+/// can drive the helper hermetically against tempdirs. The HTTP handler
+/// passes `dirs::home_dir().unwrap().join(".qontinui").join("profiles")`
+/// and `dirs::data_local_dir().unwrap().join("com.qontinui.runner")`
+/// respectively.
+///
+/// Returns `Ok(applied_files)` on success — the list of basenames copied,
+/// for surfacing on the spawn-test response. Returns `Err((status_code,
+/// error_body))` on validation failure so the caller can short-circuit
+/// with the right HTTP status.
+pub(crate) fn apply_paired_profile(
+    profile_id: &str,
+    profiles_root: &std::path::Path,
+    data_local_runner_dir: &std::path::Path,
+) -> Result<Vec<String>, (axum::http::StatusCode, serde_json::Value)> {
+    // Defense-in-depth: refuse traversal characters. `~/.qontinui/profiles/`
+    // is owned by the operator but a profile id like `../../etc/passwd`
+    // would still expand to whatever the OS allows reads from. clap
+    // doesn't validate JSON bodies for us.
+    if profile_id.trim().is_empty()
+        || profile_id.contains('/')
+        || profile_id.contains('\\')
+        || profile_id.contains("..")
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            json!({
+                "error": "validation_error",
+                "message": "paired_profile_id must be a simple identifier (no slashes or '..')",
+                "paired_profile_id": profile_id,
+            }),
+        ));
+    }
+
+    let snapshot_dir = profiles_root.join(profile_id);
+    let paired_src = snapshot_dir.join("paired_user.json");
+    if !paired_src.exists() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            json!({
+                "error": "profile_not_found",
+                "paired_profile_id": profile_id,
+                "expected_path": paired_src.display().to_string(),
+                "message": "no paired_user.json under the requested profile snapshot dir",
+            }),
+        ));
+    }
+
+    if let Err(e) = std::fs::create_dir_all(data_local_runner_dir) {
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "profile_apply_failed",
+                "paired_profile_id": profile_id,
+                "message": format!(
+                    "could not create {}: {e}",
+                    data_local_runner_dir.display()
+                ),
+            }),
+        ));
+    }
+
+    let paired_dst = data_local_runner_dir.join("paired_user.json");
+    if let Err(e) = std::fs::copy(&paired_src, &paired_dst) {
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "profile_apply_failed",
+                "paired_profile_id": profile_id,
+                "message": format!(
+                    "copy {} -> {} failed: {e}",
+                    paired_src.display(),
+                    paired_dst.display(),
+                ),
+            }),
+        ));
+    }
+
+    let mut applied = vec!["paired_user.json".to_string()];
+
+    // auth_tokens.enc is optional in the snapshot — older snapshots may
+    // only have paired_user.json. Without the encrypted JWT cache the
+    // runner will need to refresh on its own, but it can still register
+    // because the paired_user.json carries the user_id + tenant_id.
+    let tokens_src = snapshot_dir.join("auth_tokens.enc");
+    if tokens_src.exists() {
+        let tokens_dst = data_local_runner_dir.join("auth_tokens.enc");
+        if let Err(e) = std::fs::copy(&tokens_src, &tokens_dst) {
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "profile_apply_failed",
+                    "paired_profile_id": profile_id,
+                    "message": format!(
+                        "copy {} -> {} failed: {e}",
+                        tokens_src.display(),
+                        tokens_dst.display(),
+                    ),
+                }),
+            ));
+        }
+        applied.push("auth_tokens.enc".to_string());
+    }
+
+    Ok(applied)
+}
+
+/// HTTP-level wrapper around [`apply_paired_profile`] that resolves the
+/// production `profiles_root` + `data_local_runner_dir` from `dirs::*` and
+/// surfaces failures as `(StatusCode, Json)`. Returns the list of applied
+/// file basenames on success.
+fn apply_paired_profile_for_spawn(
+    profile_id: &str,
+) -> Result<Vec<String>, (axum::http::StatusCode, serde_json::Value)> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "home_dir_unresolved",
+                "message": "could not resolve home directory",
+            }),
+        )
+    })?;
+    let data_local = dirs::data_local_dir().ok_or_else(|| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "data_local_dir_unresolved",
+                "message": "could not resolve data_local_dir",
+            }),
+        )
+    })?;
+    let profiles_root = home.join(".qontinui").join("profiles");
+    let data_local_runner_dir = data_local.join("com.qontinui.runner");
+    apply_paired_profile(profile_id, &profiles_root, &data_local_runner_dir)
+}
+
 /// GET /runners — list all runners with status.
 pub async fn list_runners(
     State(state): State<SharedState>,
@@ -1099,6 +1243,34 @@ pub struct SpawnTestRequest {
     /// caller sees.
     #[serde(default)]
     pub cleanup_worktree_on_fail: bool,
+
+    /// Optional paired-profile snapshot id. When provided, the supervisor
+    /// looks up a profile snapshot directory at
+    /// `~/.qontinui/profiles/<paired_profile_id>/` and copies its
+    /// `paired_user.json` (and `auth_tokens.enc`, when present) into the
+    /// shared runner data dir at `{data_local_dir}/com.qontinui.runner/`
+    /// BEFORE starting the spawned runner.
+    ///
+    /// This lets a paired CI machine inherit its operator's pairing without
+    /// re-running the headless pair flow on every spawn (Phase 2b of
+    /// `plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md`).
+    ///
+    /// **Resolution failure is not silent.** If the snapshot dir does not
+    /// exist OR contains no `paired_user.json`, the request returns
+    /// `400 profile_not_found` — falling back to an unpaired spawn would
+    /// silently produce a less-paired runner than the caller asked for.
+    /// Profile snapshots are created out-of-band (operator copies the live
+    /// `paired_user.json` from `{data_local_dir}/com.qontinui.runner/` into
+    /// `~/.qontinui/profiles/<id>/` after a successful browser pair).
+    ///
+    /// **Shared data-dir caveat.** The runner reads `paired_user.json` from
+    /// a fixed `dirs::data_local_dir()` path with no env override. Copying
+    /// the snapshot in therefore overwrites whatever pairing the live data
+    /// dir currently holds — single-user dev boxes are the supported case.
+    /// For multi-tenant CI boxes a future iteration will need per-runner
+    /// data-dir isolation via the runner-side `--data-dir` flag.
+    #[serde(default)]
+    pub paired_profile_id: Option<String>,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1518,6 +1690,39 @@ pub async fn spawn_test(
 
     let name = format!("test-{}", port);
 
+    // Phase 2b — `paired_profile_id`. If the caller asked the spawned runner
+    // to inherit a previously-stashed pairing, copy the snapshot files into
+    // the shared runner data dir BEFORE starting the runner. On failure
+    // release the placeholder port and return the structured error body.
+    //
+    // Tracked under the spawn-test response as `paired_profile_applied`
+    // (the list of basenames actually copied).
+    let mut paired_profile_applied: Option<Vec<String>> = None;
+    if let Some(profile_id) = body.paired_profile_id.as_deref() {
+        match apply_paired_profile_for_spawn(profile_id) {
+            Ok(applied) => {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "spawn-test paired_profile_id='{}' applied: {:?}",
+                            profile_id, applied
+                        ),
+                    )
+                    .await;
+                paired_profile_applied = Some(applied);
+            }
+            Err((status, body_json)) => {
+                let mut runners = state.runners.write().await;
+                runners.remove(&id);
+                drop(runners);
+                return Ok((status, Json(body_json)).into_response());
+            }
+        }
+    }
+
     // Start the runner using the Arc captured at insertion time. This avoids
     // the id-based lookup in `start_runner_by_id` which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
@@ -1851,6 +2056,15 @@ pub async fn spawn_test(
             format!("Test runner spawned on port {}", port)
         }
     });
+    if let Some(applied) = &paired_profile_applied {
+        // Phase 2b — surface which snapshot files were materialized into
+        // the runner data dir. Callers can verify the pair-state inheritance
+        // happened before treating the runner as paired.
+        resp["paired_profile_applied"] = json!(applied);
+        if let Some(pid) = body.paired_profile_id.as_deref() {
+            resp["paired_profile_id"] = json!(pid);
+        }
+    }
     if let Some(ms) = health_probe_ms {
         resp["health_probe_ms"] = json!(ms);
     }
@@ -3852,5 +4066,104 @@ mod tests {
             serde_json::from_str(r#"{"cleanup_worktree_on_fail": true}"#)
                 .expect("deserialize SpawnTestRequest with cleanup_worktree_on_fail");
         assert!(req.cleanup_worktree_on_fail);
+    }
+
+    /// Phase 2b — `paired_profile_id` defaults to None and round-trips a
+    /// supplied string verbatim. Pinned so a typo or default-change is
+    /// caught here rather than at `/manual-test-coord` runtime.
+    #[test]
+    fn spawn_test_request_paired_profile_id_defaults_none() {
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(req.paired_profile_id.is_none());
+    }
+
+    #[test]
+    fn spawn_test_request_paired_profile_id_explicit() {
+        let req: super::SpawnTestRequest =
+            serde_json::from_str(r#"{"paired_profile_id":"jspinak-spaceship"}"#)
+                .expect("deserialize SpawnTestRequest with paired_profile_id");
+        assert_eq!(req.paired_profile_id.as_deref(), Some("jspinak-spaceship"));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2b — apply_paired_profile helper tests.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn apply_paired_profile_rejects_traversal() {
+        let tmp_profiles = tempfile::tempdir().unwrap();
+        let tmp_data = tempfile::tempdir().unwrap();
+        for bad in ["", "../etc", "a/b", "a\\b", ".."] {
+            let result = super::apply_paired_profile(bad, tmp_profiles.path(), tmp_data.path());
+            assert!(
+                result.is_err(),
+                "profile_id={:?} must be rejected as traversal",
+                bad
+            );
+            let (status, _body) = result.err().unwrap();
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn apply_paired_profile_404_when_snapshot_missing() {
+        let tmp_profiles = tempfile::tempdir().unwrap();
+        let tmp_data = tempfile::tempdir().unwrap();
+        let result =
+            super::apply_paired_profile("does-not-exist", tmp_profiles.path(), tmp_data.path());
+        let (status, body) = result.expect_err("must error");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "profile_not_found");
+        assert_eq!(body["paired_profile_id"], "does-not-exist");
+    }
+
+    #[test]
+    fn apply_paired_profile_copies_paired_user_only_when_no_tokens() {
+        // Snapshot dir has paired_user.json but no auth_tokens.enc.
+        // applied list must include only the file actually present.
+        let tmp_profiles = tempfile::tempdir().unwrap();
+        let tmp_data = tempfile::tempdir().unwrap();
+        let snapshot = tmp_profiles.path().join("dev-profile");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join("paired_user.json"),
+            r#"{"user_id":"abc","tenant_id":"def"}"#,
+        )
+        .unwrap();
+
+        let applied =
+            super::apply_paired_profile("dev-profile", tmp_profiles.path(), tmp_data.path())
+                .expect("must succeed");
+
+        assert_eq!(applied, vec!["paired_user.json".to_string()]);
+        // File landed in the data dir.
+        let dst = tmp_data.path().join("paired_user.json");
+        assert!(dst.exists(), "paired_user.json must be copied to data dir");
+        let copied = std::fs::read_to_string(&dst).unwrap();
+        assert!(copied.contains("abc"));
+    }
+
+    #[test]
+    fn apply_paired_profile_copies_both_files_when_present() {
+        let tmp_profiles = tempfile::tempdir().unwrap();
+        let tmp_data = tempfile::tempdir().unwrap();
+        let snapshot = tmp_profiles.path().join("paired");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("paired_user.json"), b"{}").unwrap();
+        std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02").unwrap();
+
+        let applied = super::apply_paired_profile("paired", tmp_profiles.path(), tmp_data.path())
+            .expect("must succeed");
+
+        assert_eq!(
+            applied,
+            vec![
+                "paired_user.json".to_string(),
+                "auth_tokens.enc".to_string()
+            ]
+        );
+        assert!(tmp_data.path().join("paired_user.json").exists());
+        assert!(tmp_data.path().join("auth_tokens.enc").exists());
     }
 }

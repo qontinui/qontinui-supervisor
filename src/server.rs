@@ -75,6 +75,12 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     },
     EndpointEntry {
         method: "POST",
+        path: "/runners/pair-with-token",
+        summary: "Headless device pair via qontinui_profile CLI \
+                  (Phase 2c of mtc-iter3 web-dashboard plan)",
+    },
+    EndpointEntry {
+        method: "POST",
         path: "/runners/purge-stale",
         summary: "Remove runners whose processes are no longer alive",
     },
@@ -850,6 +856,14 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/runners/spawn-named",
             post(crate::routes::runners::spawn_named),
+        )
+        // Phase 2c of mtc-iter3 (`plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md`):
+        // headless device pair flow for `/manual-test-coord`'s autonomous
+        // test-runner setup. Shells out to `qontinui_profile device pair
+        // --auth-token ...`.
+        .route(
+            "/runners/pair-with-token",
+            post(crate::routes::runners_pair::pair_with_token),
         )
         .route(
             "/test-login",
