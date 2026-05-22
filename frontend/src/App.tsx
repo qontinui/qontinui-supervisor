@@ -21,7 +21,7 @@ import { BuildRefreshBanner } from './components/BuildRefreshBanner';
 export default function App() {
   return (
     <UIBridgeProvider features={{ control: true }}>
-      <AutoRegisterProvider>
+      <AutoRegisterProvider enabled>
         <CommandRelayListener
           basePath="/supervisor-bridge"
           appId="qontinui-supervisor-dashboard"
