@@ -62,6 +62,7 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
         Box::new(DevBootstrapEnv),
         Box::new(WindowPositionEnv),
         Box::new(RestateEnv),
+        Box::new(RunnerTierEnv),
         Box::new(PanicLogEnv),
         Box::new(ExtraEnv),
     ]
@@ -424,6 +425,60 @@ impl EnvForwarder for RestateEnv {
                 cmd.env("QONTINUI_RESTATE_EXTERNAL_INGRESS_URL", u);
             }
             cmd.env("QONTINUI_SERVER_MODE", "1");
+        })
+    }
+}
+
+// =============================================================================
+// RunnerTierEnv
+// =============================================================================
+
+/// Force a spawned temp runner to boot at Tier 0 (`Local`) regardless of what
+/// the shared runner settings.json says.
+///
+/// **Why this is necessary.** The runner's `settings::get_settings_path()`
+/// resolves to `dirs::config_dir() / "com.qontinui.runner" / "settings.json"`
+/// — a single shared file across the primary runner, every named runner, and
+/// every temp runner. When the primary is signed into Qontinui (Tier 2,
+/// `runner_token` populated), every fresh temp runner reads the same shared
+/// settings, sees `tier == qontinui_account`, has no JWT in its (also-shared)
+/// keychain slot, and parks on `LoginScreen` waiting for credentials. The
+/// supervisor cannot fix this by `POST`ing `set_runner_tier` to the temp
+/// runner because that handler persists, and the persist would clobber the
+/// primary's Tier 2 state on disk.
+///
+/// The runner now honors `QONTINUI_RUNNER_TIER` as an in-memory overlay
+/// inside `load_settings()` (parallel to the existing `QONTINUI_RESTATE_*`
+/// and `QONTINUI_WEB_*` overlays — never persisted). This forwarder sets
+/// it to `local` for temp runners only.
+///
+/// **Temp-only.** Named runners are user-managed and can be promoted to
+/// Tier 2 by the operator; we must not silently demote them. Primary
+/// runners are user-managed too. The temp-runner gate matches
+/// [`WindowPositionEnv`]'s gating.
+///
+/// **Order.** Registered before [`ExtraEnv`] so callers can still override
+/// via `extra_env: {"QONTINUI_RUNNER_TIER": "qontinui_account"}` when a
+/// specific test needs Tier 2 (e.g., the calibration matrix's auto-login
+/// fixture). See the module docs.
+pub struct RunnerTierEnv;
+
+impl EnvForwarder for RunnerTierEnv {
+    fn name(&self) -> &'static str {
+        "runner_tier"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        _state: &'a SharedState,
+        runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if !is_temp_runner(&runner.config.id) {
+                return;
+            }
+            cmd.env("QONTINUI_RUNNER_TIER", "local");
         })
     }
 }
