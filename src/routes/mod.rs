@@ -12,6 +12,7 @@ pub mod logs;
 pub mod runner;
 pub mod runner_monitor;
 pub mod runners;
+pub mod runners_pair;
 pub mod supervisor_bridge;
 pub mod ui_bridge;
 pub mod velocity;
