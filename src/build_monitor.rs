@@ -316,9 +316,9 @@ async fn run_build_inner(
 
     // When building a detached git-ref worktree, the worktree starts empty —
     // no `node_modules/`, no `dist/`. The legacy `state.config.project_dir`
-    // tree has both because devs run `npm install` + `npm run build`
+    // tree has both because devs run `pnpm install` + `pnpm run build`
     // routinely; a fresh `git worktree add` does not. Without this step the
-    // subsequent `npm run build` fails (`tsc`/`vite`/`ui-bridge-build-ir`
+    // subsequent `pnpm run build` fails (`tsc`/`vite`/`ui-bridge-build-ir`
     // not installed) and even if it didn't, cargo's
     // `tauri::generate_context!` macro would panic on the missing
     // `<wt>/dist/index.html` (the empirical 2026-05-21 manual-test failure
@@ -336,7 +336,7 @@ async fn run_build_inner(
         prebuild_worktree_frontend(state, slot, &wt_root).await?;
     }
     // The frontend is embedded in the binary via tauri_build, so we must run
-    // `npm run build` first to produce a fresh dist/ before cargo build.
+    // `pnpm run build` first to produce a fresh dist/ before cargo build.
     //
     // Frontend builds are serialized across slots via `build_pool.npm_lock`:
     // Tauri's `rust-embed` pulls from a single `dist/` directory, so two
@@ -371,49 +371,21 @@ async fn run_build_inner(
             .emit(
                 LogSource::Build,
                 LogLevel::Info,
-                format!("Slot {}: building frontend (npm run build)...", slot.id),
+                format!("Slot {}: building frontend (pnpm run build)...", slot.id),
             )
             .await;
         info!("Slot {}: building frontend in {:?}", slot.id, npm_dir);
 
-        #[cfg(windows)]
-        let npm_result = {
-            const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
-            Command::new("cmd")
-                .args(["/C", "npm.cmd run build"])
-                .current_dir(&npm_dir)
-                // Tauri's CLI sets this when it drives the frontend build itself,
-                // but we invoke `npm run build` directly — so vite.config.ts's
-                // `target: process.env.TAURI_PLATFORM == "windows" ? "chrome105" : "safari13"`
-                // would otherwise fall back to safari13 and esbuild fails on
-                // destructuring transpilation, leaving dist/ stale.
-                .env("TAURI_PLATFORM", "windows")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .creation_flags(CREATE_NO_WINDOW_)
-                .output()
-                .await
-        };
-
-        #[cfg(not(windows))]
-        let npm_result = {
-            Command::new("npm")
-                .args(["run", "build"])
-                .current_dir(&npm_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await
-        };
+        let npm_result = run_pnpm_command(&npm_dir, "run build").await;
 
         match npm_result {
             Ok(output) if output.status.success() => {
-                // Defense-in-depth: even though npm exited 0, verify the
+                // Defense-in-depth: even though pnpm exited 0, verify the
                 // dist/ output is actually present and non-empty BEFORE
-                // flipping `frontend_stale = false`. The npm step is
+                // flipping `frontend_stale = false`. The pnpm step is
                 // serialized inside this supervisor via `npm_lock`, but
-                // a concurrent EXTERNAL `npm run build` (multi-agent
-                // machines, manual builds) can wipe dist/ between npm
+                // a concurrent EXTERNAL `pnpm run build` (multi-agent
+                // machines, manual builds) can wipe dist/ between pnpm
                 // exit and cargo's embed. We've also seen empty-output
                 // regressions where vite exits 0 with nothing written
                 // (proj_issue_runner_npm_build_safari13_target.md).
@@ -422,7 +394,7 @@ async fn run_build_inner(
                 // `routes::runners::check_dist_freshness` which runs on
                 // every spawn. We deliberately don't compare against
                 // package.json/tsconfig.json/vite.config.ts here:
-                // package.json is touched on every `npm install`, which
+                // package.json is touched on every `pnpm install`, which
                 // would produce a flood of false positives.
                 if dist_index_ok(&npm_dir) {
                     info!("Slot {}: frontend build succeeded", slot.id);
@@ -439,7 +411,7 @@ async fn run_build_inner(
                     *slot.frontend_stale.write().await = false;
                 } else {
                     let msg = format!(
-                        "Slot {}: frontend_stale: npm exit 0 but dist/index.html missing or empty (likely concurrent external `npm run build` wiped dist/, or empty-output regression)",
+                        "Slot {}: frontend_stale: pnpm exit 0 but dist/index.html missing or empty (likely concurrent external `pnpm run build` wiped dist/, or empty-output regression)",
                         slot.id
                     );
                     error!("{}", msg);
@@ -451,7 +423,7 @@ async fn run_build_inner(
                     {
                         let mut history = slot.history.write().await;
                         history.last_error = Some(
-                            "frontend_stale: npm exit 0 but dist/index.html missing or empty (likely concurrent external `npm run build` wiped dist/, or empty-output regression)".to_string()
+                            "frontend_stale: pnpm exit 0 but dist/index.html missing or empty (likely concurrent external `pnpm run build` wiped dist/, or empty-output regression)".to_string()
                         );
                     }
                     // Continue with cargo build — the binary will still
@@ -480,15 +452,15 @@ async fn run_build_inner(
                     )
                     .await;
                 // Mark the slot as embedding a stale frontend until the next
-                // successful npm build clears it.
+                // successful pnpm build clears it.
                 *slot.frontend_stale.write().await = true;
-                // Record the npm failure reason in the slot's rolling history
+                // Record the pnpm failure reason in the slot's rolling history
                 // so `GET /builds` can show it even though the cargo build may
                 // ultimately succeed.
                 {
                     let mut history = slot.history.write().await;
                     history.last_error = Some(format!(
-                        "frontend_stale: npm run build failed: {}",
+                        "frontend_stale: pnpm run build failed: {}",
                         truncated
                     ));
                 }
@@ -514,7 +486,7 @@ async fn run_build_inner(
                 {
                     let mut history = slot.history.write().await;
                     history.last_error = Some(format!(
-                        "frontend_stale: npm run build failed to spawn: {}",
+                        "frontend_stale: pnpm run build failed to spawn: {}",
                         e
                     ));
                 }
@@ -743,22 +715,22 @@ async fn run_build_inner(
 /// Prebuild the frontend inside a fresh spawn worktree before cargo runs.
 ///
 /// A fresh `git worktree add --detach` produces an empty checkout — no
-/// `node_modules/`, no `dist/`. The next `npm run build` would fail because
-/// the npm binaries (`tsc`, `vite`, `ui-bridge-build-ir`, …) aren't
+/// `node_modules/`, no `dist/`. The next `pnpm run build` would fail because
+/// the dep binaries (`tsc`, `vite`, `ui-bridge-build-ir`, …) aren't
 /// installed, and even if they were, cargo's `tauri::generate_context!`
 /// would panic on the missing `<wt>/dist/index.html`. Idempotent: once both
 /// `<wt>/node_modules/.bin/ui-bridge-build-ir` and `<wt>/dist/index.html`
 /// exist, this returns immediately with the `frontend_prebuild_skipped`
 /// log reason — repeated spawn-test calls on the same ref don't re-pay
-/// the ~30s npm install cost.
+/// the ~30s pnpm install cost.
 ///
 /// The whole prebuild is serialized via `BuildPool.npm_lock` (the same
-/// mutex the live-tree `npm run build` uses): `tsc` + `vite` are heavy
+/// mutex the live-tree `pnpm run build` uses): `tsc` + `vite` are heavy
 /// enough that two concurrent runs on the same machine routinely OOM in
 /// CI, and the lock guarantees only one frontend build is in flight at a
 /// time across all worktrees + the live tree.
 ///
-/// On any failure (npm install non-zero exit, npm build non-zero exit, or
+/// On any failure (pnpm install non-zero exit, pnpm build non-zero exit, or
 /// post-build `dist/index.html` still missing) returns
 /// `SupervisorError::BuildFailed` with the cargo-style 2KB stderr tail
 /// embedded so callers see what went wrong without trawling the supervisor
@@ -787,8 +759,8 @@ async fn prebuild_worktree_frontend(
         return Ok(());
     }
 
-    // Serialize against the live-tree npm step + any other worktree's
-    // prebuild. Held for both `npm install` and `npm run build`.
+    // Serialize against the live-tree pnpm step + any other worktree's
+    // prebuild. Held for both `pnpm install` and `pnpm run build`.
     state
         .logs
         .emit(
@@ -802,17 +774,21 @@ async fn prebuild_worktree_frontend(
         .await;
     let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
 
-    // 1) npm install — produces node_modules/.bin/ui-bridge-build-ir +
-    //    everything else `npm run build` needs. Prefer `npm ci` when a
-    //    package-lock.json exists (reproducible, faster than `npm install`
-    //    in the presence of a lockfile); otherwise fall back to
-    //    `npm install`.
-    let has_lockfile = wt_root.join("package-lock.json").exists();
-    let install_subcmd = if has_lockfile { "ci" } else { "install" };
+    // 1) pnpm install — produces node_modules/.bin/ui-bridge-build-ir +
+    //    everything else `pnpm run build` needs. Use `--frozen-lockfile`
+    //    when a pnpm-lock.yaml exists (reproducible, matches CI's
+    //    `pnpm install --frozen-lockfile`); otherwise fall back to a plain
+    //    `pnpm install`.
+    let has_lockfile = wt_root.join("pnpm-lock.yaml").exists();
+    let install_args = if has_lockfile {
+        "install --frozen-lockfile"
+    } else {
+        "install"
+    };
 
     info!(
-        "Slot {}: npm {} starting in {:?}",
-        slot.id, install_subcmd, wt_root
+        "Slot {}: pnpm {} starting in {:?}",
+        slot.id, install_args, wt_root
     );
     state
         .logs
@@ -820,35 +796,33 @@ async fn prebuild_worktree_frontend(
             LogSource::Build,
             LogLevel::Info,
             format!(
-                "Slot {}: npm {} starting in {:?}",
-                slot.id, install_subcmd, wt_root
+                "Slot {}: pnpm {} starting in {:?}",
+                slot.id, install_args, wt_root
             ),
         )
         .await;
 
     let install_started = std::time::Instant::now();
-    let install_output = run_npm_command(wt_root, install_subcmd)
-        .await
-        .map_err(|e| {
-            SupervisorError::BuildFailed(format!(
-                "npm {} failed to spawn in spawn worktree {:?}: {}",
-                install_subcmd, wt_root, e
-            ))
-        })?;
+    let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
+        SupervisorError::BuildFailed(format!(
+            "pnpm {} failed to spawn in spawn worktree {:?}: {}",
+            install_args, wt_root, e
+        ))
+    })?;
     if !install_output.status.success() {
         let stderr_tail = tail_bytes_keep_utf8(
             &String::from_utf8_lossy(&install_output.stderr),
             LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
         );
         return Err(SupervisorError::BuildFailed(format!(
-            "npm {} failed in spawn worktree {:?} (exit {}): {}",
-            install_subcmd, wt_root, install_output.status, stderr_tail
+            "pnpm {} failed in spawn worktree {:?} (exit {}): {}",
+            install_args, wt_root, install_output.status, stderr_tail
         )));
     }
     let install_secs = install_started.elapsed().as_secs();
     info!(
-        "Slot {}: npm {} completed in {:?} ({}s)",
-        slot.id, install_subcmd, wt_root, install_secs
+        "Slot {}: pnpm {} completed in {:?} ({}s)",
+        slot.id, install_args, wt_root, install_secs
     );
     state
         .logs
@@ -856,27 +830,27 @@ async fn prebuild_worktree_frontend(
             LogSource::Build,
             LogLevel::Info,
             format!(
-                "Slot {}: npm {} completed in {:?} ({}s)",
-                slot.id, install_subcmd, wt_root, install_secs
+                "Slot {}: pnpm {} completed in {:?} ({}s)",
+                slot.id, install_args, wt_root, install_secs
             ),
         )
         .await;
 
-    // 2) npm run build — produces dist/index.html.
-    info!("Slot {}: npm run build starting in {:?}", slot.id, wt_root);
+    // 2) pnpm run build — produces dist/index.html.
+    info!("Slot {}: pnpm run build starting in {:?}", slot.id, wt_root);
     state
         .logs
         .emit(
             LogSource::Build,
             LogLevel::Info,
-            format!("Slot {}: npm run build starting in {:?}", slot.id, wt_root),
+            format!("Slot {}: pnpm run build starting in {:?}", slot.id, wt_root),
         )
         .await;
 
     let build_started = std::time::Instant::now();
-    let build_output = run_npm_command(wt_root, "run build").await.map_err(|e| {
+    let build_output = run_pnpm_command(wt_root, "run build").await.map_err(|e| {
         SupervisorError::BuildFailed(format!(
-            "npm run build failed to spawn in spawn worktree {:?}: {}",
+            "pnpm run build failed to spawn in spawn worktree {:?}: {}",
             wt_root, e
         ))
     })?;
@@ -886,13 +860,13 @@ async fn prebuild_worktree_frontend(
             LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
         );
         return Err(SupervisorError::BuildFailed(format!(
-            "npm run build failed in spawn worktree {:?} (exit {}): {}",
+            "pnpm run build failed in spawn worktree {:?} (exit {}): {}",
             wt_root, build_output.status, stderr_tail
         )));
     }
     let build_secs = build_started.elapsed().as_secs();
     info!(
-        "Slot {}: npm run build completed in {:?} ({}s)",
+        "Slot {}: pnpm run build completed in {:?} ({}s)",
         slot.id, wt_root, build_secs
     );
     state
@@ -918,8 +892,8 @@ async fn prebuild_worktree_frontend(
 /// True iff `<wt_root>` is missing EITHER `node_modules/.bin/ui-bridge-build-ir`
 /// OR `dist/index.html`. Used as the cheap idempotency gate by
 /// [`prebuild_worktree_frontend`] so repeated spawn-test calls on the same
-/// ref don't re-pay the ~30s npm install cost. Both signals together prove
-/// (a) the npm dependency tree was installed AND (b) the previous frontend
+/// ref don't re-pay the ~30s pnpm install cost. Both signals together prove
+/// (a) the pnpm dependency tree was installed AND (b) the previous frontend
 /// build actually produced output.
 fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
     let bin = wt_root
@@ -959,12 +933,21 @@ fn verify_frontend_built(wt_root: &std::path::Path) -> Result<(), SupervisorErro
     Ok(())
 }
 
-/// Run `npm <args>` in `cwd` and return the captured `std::process::Output`.
-/// On Windows uses `cmd /C npm.cmd <args>` (npm ships as a `.cmd` shim) +
+/// Run `pnpm <args>` in `cwd` and return the captured `std::process::Output`.
+/// On Windows uses `cmd /C pnpm.cmd <args>` (pnpm ships as a `.cmd` shim) +
 /// `CREATE_NO_WINDOW` so headless supervisor builds don't flash a console.
 /// `args` is a single string passed unchanged to the shell (mirrors the
-/// existing live-tree npm invocation style in `run_build_inner`).
-async fn run_npm_command(
+/// live-tree pnpm invocation style in `run_build_inner`).
+///
+/// The runner is a pnpm workspace (`packageManager: pnpm@…` + `pnpm-lock.yaml`,
+/// CI installs with `pnpm install --frozen-lockfile`). `npm install` produces
+/// a flat `node_modules` layout that fails to dedupe the nested
+/// `@qontinui/ui-bridge-auto/node_modules/@qontinui/shared-types` against the
+/// top-level copy, breaking the frontend `tsc`/`vite` build with a
+/// `requiredElements` type mismatch and an unresolved `graphql-ws` import.
+/// pnpm's symlinked store reproduces the exact layout CI validates, so the
+/// supervisor must use pnpm too.
+async fn run_pnpm_command(
     cwd: &std::path::Path,
     args: &str,
 ) -> Result<std::process::Output, std::io::Error> {
@@ -972,7 +955,7 @@ async fn run_npm_command(
     {
         const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
         Command::new("cmd")
-            .args(["/C", &format!("npm.cmd {}", args)])
+            .args(["/C", &format!("pnpm.cmd {}", args)])
             .current_dir(cwd)
             // Match the live-tree invocation: vite.config.ts gates the
             // build target on TAURI_PLATFORM=windows.
@@ -987,7 +970,7 @@ async fn run_npm_command(
     {
         // Split the args string so tokens land as separate argv entries.
         let split_args: Vec<&str> = args.split_whitespace().collect();
-        Command::new("npm")
+        Command::new("pnpm")
             .args(&split_args)
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -1872,7 +1855,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Filename of the npm bin stub. `.cmd` on Windows (where npm installs
+    /// Filename of the pnpm bin stub. `.cmd` on Windows (where pnpm installs
     /// `.bin/<tool>.cmd` shims), bare elsewhere. Mirrors the platform check
     /// inside [`needs_frontend_prebuild`].
     fn ui_bridge_build_ir_bin() -> &'static str {
@@ -1896,8 +1879,8 @@ mod tests {
 
     #[test]
     fn needs_frontend_prebuild_true_when_only_node_modules_present() {
-        // Half-installed state — npm install succeeded but the previous
-        // `npm run build` never ran or failed. We should NOT skip the
+        // Half-installed state — pnpm install succeeded but the previous
+        // `pnpm run build` never ran or failed. We should NOT skip the
         // prebuild because dist/index.html is what cargo embeds.
         let tmp = TempDir::new().expect("tempdir");
         let bin_dir = tmp.path().join("node_modules").join(".bin");
@@ -1913,7 +1896,7 @@ mod tests {
     fn needs_frontend_prebuild_true_when_only_dist_present() {
         // Inverse half-installed state — somehow dist/ exists but
         // node_modules is gone (e.g. someone ran `rm -rf node_modules`
-        // between sessions). Must re-prebuild because `npm run build`
+        // between sessions). Must re-prebuild because `pnpm run build`
         // can't run without the dep tree.
         let tmp = TempDir::new().expect("tempdir");
         let dist = tmp.path().join("dist");
