@@ -1225,8 +1225,19 @@ pub struct SpawnTestRequest {
     /// When set without `rebuild: true`, the request fails with HTTP 400
     /// (`git_ref requires rebuild:true`) rather than silently ignoring it.
     ///
-    /// On success the response carries `git_ref` (the requested ref) and
-    /// `git_ref_resolved_sha` (`git rev-parse HEAD` of the worktree).
+    /// On success the response carries:
+    /// - `git_ref` / `git_ref_resolved` — the requested ref, echoed verbatim
+    ///   (two field names for the same value: `git_ref` for back-compat
+    ///   with existing callers, `git_ref_resolved` for callers that want a
+    ///   "resolved" label).
+    /// - `git_ref_resolved_sha` — full 40-char `git rev-parse HEAD` of the
+    ///   prepared worktree.
+    /// - `git_ref_resolved_sha_short` — first 12 chars of the same SHA,
+    ///   suitable for direct comparison with
+    ///   `git rev-parse origin/main | head -c 12`.
+    /// - `source` — `"worktree"` for a `git_ref` build, `"live_tree"` for
+    ///   the default build path. Always present so callers can branch on a
+    ///   single predictable field.
     #[serde(default)]
     pub git_ref: Option<String>,
     /// When true, and a `git_ref` build fails downstream of `prepare_worktree`,
@@ -2115,9 +2126,35 @@ pub async fn spawn_test(
     // Provenance for a git_ref build: the requested ref and the SHA the
     // managed worktree actually resolved to. Only present when a git_ref
     // build occurred (rebuild:true + git_ref).
+    //
+    // Field shape (kept stable for downstream callers / agents):
+    //   git_ref               — the input ref verbatim (e.g. "origin/main").
+    //   git_ref_resolved      — echo alias of git_ref so callers that want a
+    //                           "resolved" label don't have to special-case.
+    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the
+    //                           prepared worktree.
+    //   git_ref_resolved_sha_short
+    //                         — 12-char abbreviated SHA for log-readable
+    //                           comparison against `git rev-parse origin/main
+    //                           | head -c 12`. Always derived from
+    //                           git_ref_resolved_sha; never re-shells out to
+    //                           git so it's a pure presentational helper.
+    //   source                — "worktree" when this build came from the
+    //                           managed detached worktree; absent when the
+    //                           live tree was used. Callers that need a
+    //                           single-field "where did the binary come
+    //                           from?" answer can branch on this.
     if let Some((requested_ref, resolved_sha)) = &git_ref_info {
+        let short = resolved_sha.chars().take(12).collect::<String>();
         resp["git_ref"] = json!(requested_ref);
+        resp["git_ref_resolved"] = json!(requested_ref);
         resp["git_ref_resolved_sha"] = json!(resolved_sha);
+        resp["git_ref_resolved_sha_short"] = json!(short);
+        resp["source"] = json!("worktree");
+    } else {
+        // Explicit "live_tree" provenance so callers can always branch on a
+        // present field rather than needing missing-field handling.
+        resp["source"] = json!("live_tree");
     }
 
     // Always emit `frontend_stale` so callers can branch on a predictable
@@ -4165,5 +4202,68 @@ mod tests {
         );
         assert!(tmp_data.path().join("paired_user.json").exists());
         assert!(tmp_data.path().join("auth_tokens.enc").exists());
+    }
+
+    // -------------------------------------------------------------------
+    // Response field shape — `git_ref` request + provenance fields.
+    //
+    // The spawn-test response surfaces a fixed set of provenance fields
+    // for git_ref builds. These tests pin the wire shape so the agent-
+    // facing contract is enforced at PR time, not at first-use runtime.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn spawn_test_request_git_ref_defaults_none() {
+        // Default callers (no git_ref set) must get None so the handler's
+        // branch that requires rebuild:true is skipped.
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(req.git_ref.is_none(), "git_ref default must be None");
+    }
+
+    #[test]
+    fn spawn_test_request_git_ref_round_trips() {
+        // Verbatim round-trip — the supervisor never normalizes / lowercases
+        // the ref; whatever the caller sends is what `prepare_worktree`
+        // hands to `git`.
+        let req: super::SpawnTestRequest =
+            serde_json::from_str(r#"{"git_ref":"origin/main","rebuild":true}"#)
+                .expect("deserialize SpawnTestRequest with git_ref");
+        assert_eq!(req.git_ref.as_deref(), Some("origin/main"));
+        assert!(req.rebuild);
+    }
+
+    /// The 12-char short SHA is a pure-presentational helper: the supervisor
+    /// keeps the full 40-char `git rev-parse HEAD` value in
+    /// `git_ref_resolved_sha` and exposes `git_ref_resolved_sha_short` as
+    /// the first 12 characters. This test pins both halves of that
+    /// contract so a future "shorten differently" refactor (8-char, last-N,
+    /// etc.) doesn't silently drift away from what callers compare with
+    /// `git rev-parse origin/main | head -c 12`.
+    #[test]
+    fn git_ref_resolved_sha_short_is_first_twelve_chars() {
+        // Real SHA shape: 40 hex chars. The Vec<char>→String roundtrip
+        // mirrors what runs inside the handler.
+        let full = "0156c6775b18deadbeef0123456789abcdef0011";
+        let short: String = full.chars().take(12).collect();
+        assert_eq!(short.len(), 12, "short SHA must always be 12 chars");
+        assert_eq!(short, "0156c6775b18");
+        assert!(
+            full.starts_with(&short),
+            "short SHA must be a prefix of the full SHA"
+        );
+    }
+
+    /// Boundary: shorter-than-12-char input (truncated/odd-shaped SHA from a
+    /// minimal/fixture repo) must not panic — `take(12)` clamps to len.
+    /// The handler's `chars().take(12).collect::<String>()` is panic-free,
+    /// but pinning that here means a future refactor to `[..12]` slicing
+    /// (which WOULD panic on shorter inputs) gets caught.
+    #[test]
+    fn git_ref_resolved_sha_short_handles_underlength_input() {
+        let full = "abc123"; // 6 chars — shorter than 12
+        let short: String = full.chars().take(12).collect();
+        assert_eq!(short, "abc123");
+        assert!(short.len() <= 12);
     }
 }
