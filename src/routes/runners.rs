@@ -404,6 +404,39 @@ pub async fn list_runners(
     Ok(Json(json!(result)))
 }
 
+/// GET /runners/by-unit/{unit_id} — resolve the preview handle(s) bound to an
+/// autonomous-dev work unit (Track 2 UI-Bridge preview-verification).
+///
+/// Returns an array of `{runner_id, port, ui_bridge_url, git_sha, attempt_id}`
+/// for every live runner whose `preview_binding.unit_id` matches — typically
+/// one per attempt. Reads the in-memory `state.runners` map (the supervisor's
+/// single source of truth for runner↔port); no HTTP probe is issued, so this is
+/// cheap. An unknown unit returns `200 []`, NOT a 404 — "no previews for this
+/// unit" is a valid, queryable answer, not an error.
+pub async fn runners_by_unit(
+    State(state): State<SharedState>,
+    Path(unit_id): Path<String>,
+) -> Result<Json<serde_json::Value>, SupervisorError> {
+    let runners = state.get_all_runners().await;
+    let mut result = Vec::new();
+    for managed in &runners {
+        let binding = managed.preview_binding.read().await;
+        let Some(b) = binding.as_ref() else { continue };
+        if b.unit_id != unit_id {
+            continue;
+        }
+        let port = managed.config.port;
+        result.push(json!({
+            "runner_id": managed.config.id,
+            "port": port,
+            "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+            "git_sha": b.git_sha,
+            "attempt_id": b.attempt_id,
+        }));
+    }
+    Ok(Json(json!(result)))
+}
+
 /// POST /runners — add a new runner config.
 pub async fn add_runner(
     State(state): State<SharedState>,
@@ -1282,6 +1315,22 @@ pub struct SpawnTestRequest {
     /// data-dir isolation via the runner-side `--data-dir` flag.
     #[serde(default)]
     pub paired_profile_id: Option<String>,
+
+    /// Optional autonomous-dev work-unit id this spawn is a *preview* for
+    /// (Track 2 UI-Bridge preview-verification). Pure passthrough correlation:
+    /// the supervisor stores it on the spawned `ManagedRunner` and echoes it in
+    /// the response, and `GET /runners/by-unit/{unit_id}` resolves the
+    /// preview handle(s) for the unit. Has no effect on port arbitration or the
+    /// build — the preview is built from `git_ref` exactly as a normal
+    /// `git_ref` spawn. `None` for ordinary (non-preview) spawns.
+    #[serde(default)]
+    pub unit_id: Option<String>,
+    /// Optional attempt id within `unit_id` (the specific attempt whose
+    /// `git_ref` was built). Passthrough/echo only; surfaced in
+    /// `GET /runners/by-unit/{unit_id}` so a verifier can distinguish multiple
+    /// attempts' previews for the same unit. `None` for ordinary spawns.
+    #[serde(default)]
+    pub attempt_id: Option<String>,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1330,6 +1379,23 @@ pub struct SpawnNamedRequest {
     pub allow_stale_fallback: bool,
 }
 
+/// Provenance guard for `git_ref` spawns: a `git_ref` is only honored when
+/// `rebuild: true`, because the supervisor must actually recompile that tree to
+/// give the caller a binary that reflects the requested ref. Setting `git_ref`
+/// with `rebuild: false` would silently hand back the live tree's existing exe
+/// while the caller believes they got the ref — so it is rejected with a 400
+/// (`git_ref requires rebuild:true`) rather than lying about provenance.
+///
+/// Pure (no I/O / no state) so it is unit-testable without a live `SharedState`.
+fn git_ref_rebuild_guard(git_ref: Option<&str>, rebuild: bool) -> Result<(), SupervisorError> {
+    if git_ref.is_some() && !rebuild {
+        return Err(SupervisorError::Validation(
+            "git_ref requires rebuild:true".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
 ///
 /// Automatically picks a free port (9877-9899), creates a temporary runner,
@@ -1360,11 +1426,8 @@ pub async fn spawn_test(
     // `git_ref` only makes sense when we're actually compiling — silently
     // ignoring it would hand back the live tree's binary while the caller
     // believes they got the ref. Fail fast with 400 before reserving a port.
-    if body.git_ref.is_some() && !body.rebuild {
-        return Err(SupervisorError::Validation(
-            "git_ref requires rebuild:true".to_string(),
-        ));
-    }
+    // (Provenance is sacrosanct — see `git_ref_rebuild_guard`.)
+    git_ref_rebuild_guard(body.git_ref.as_deref(), body.rebuild)?;
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner
     // into the registry under a single write lock. Without this, two
@@ -1433,6 +1496,23 @@ pub async fn spawn_test(
         runners.insert(id.clone(), managed.clone());
         (id, port, managed)
     };
+
+    // Track 2 (UI-Bridge preview-verification): if this spawn is a preview for
+    // an autonomous-dev work unit, record the (unit_id, attempt_id) correlation
+    // on the ManagedRunner so it round-trips in the response and is resolvable
+    // via `GET /runners/by-unit/{unit_id}`. The runner is already in the
+    // registry, so a concurrent by-unit query observes it as soon as this set
+    // completes. No effect on the build/port logic below.
+    if let Some(unit_id) = body.unit_id.clone() {
+        *managed.preview_binding.write().await = Some(crate::state::PreviewBinding {
+            unit_id,
+            attempt_id: body.attempt_id.clone(),
+            // `git_sha` is filled in after the health probe resolves the SHA the
+            // runner actually booted (see below). `None` here for the window
+            // between insert and probe.
+            git_sha: None,
+        });
+    }
 
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
@@ -2079,8 +2159,25 @@ pub async fn spawn_test(
     if let Some(ms) = health_probe_ms {
         resp["health_probe_ms"] = json!(ms);
     }
-    if let Some(sha) = probed_git_sha {
+    if let Some(sha) = &probed_git_sha {
         resp["git_sha"] = json!(sha);
+    }
+    // Track 2 (UI-Bridge preview-verification): backfill the resolved git_sha
+    // onto the preview binding now that the health probe has run, so the
+    // `GET /runners/by-unit/{unit_id}` handle carries provenance. Only touches
+    // the binding when this spawn is a preview (binding already set above).
+    if body.unit_id.is_some() {
+        if let Some(binding) = managed.preview_binding.write().await.as_mut() {
+            binding.git_sha = probed_git_sha.clone();
+        }
+    }
+    // Track 2 (UI-Bridge preview-verification): echo the work-unit / attempt
+    // correlation back next to id/port/ui_bridge_url/git_sha so the caller gets
+    // the full preview handle in one round-trip. Only present when the spawn
+    // carried `unit_id`; `attempt_id` is null when only `unit_id` was supplied.
+    if let Some(unit_id) = &body.unit_id {
+        resp["unit_id"] = json!(unit_id);
+        resp["attempt_id"] = json!(body.attempt_id);
     }
     if body.use_lkg {
         resp["used_lkg"] = json!(true);
@@ -4265,5 +4362,196 @@ mod tests {
         let short: String = full.chars().take(12).collect();
         assert_eq!(short, "abc123");
         assert!(short.len() <= 12);
+    }
+
+    // -------------------------------------------------------------------
+    // Track 2 (UI-Bridge preview-verification) — work-unit ↔ preview binding.
+    //
+    // Pins: (1) the new `unit_id`/`attempt_id` passthrough fields default to
+    // None and round-trip verbatim; (2) the `git_ref requires rebuild:true`
+    // provenance guard still fires (and only when git_ref is set); (3) the
+    // `GET /runners/by-unit/{unit_id}` handler resolves bound previews and
+    // returns `[]` (not 404) for an unknown unit.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn spawn_test_request_unit_attempt_default_none() {
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(req.unit_id.is_none(), "unit_id default must be None");
+        assert!(req.attempt_id.is_none(), "attempt_id default must be None");
+    }
+
+    #[test]
+    fn spawn_test_request_unit_attempt_round_trip() {
+        let req: super::SpawnTestRequest = serde_json::from_str(
+            r#"{"rebuild":true,"git_ref":"feat/x","unit_id":"u1","attempt_id":"a1"}"#,
+        )
+        .expect("deserialize SpawnTestRequest with unit/attempt");
+        assert_eq!(req.unit_id.as_deref(), Some("u1"));
+        assert_eq!(req.attempt_id.as_deref(), Some("a1"));
+        // unit_id present without attempt_id is a valid shape (attempt unknown).
+        let req2: super::SpawnTestRequest =
+            serde_json::from_str(r#"{"unit_id":"u1"}"#).expect("deserialize unit-only");
+        assert_eq!(req2.unit_id.as_deref(), Some("u1"));
+        assert!(req2.attempt_id.is_none());
+    }
+
+    #[test]
+    fn git_ref_rebuild_guard_rejects_ref_without_rebuild() {
+        // The no-silent-fallback provenance guard: git_ref + rebuild:false → 400.
+        let err = super::git_ref_rebuild_guard(Some("feat/x"), false)
+            .expect_err("git_ref without rebuild must be rejected");
+        let status = axum::response::IntoResponse::into_response(err).status();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn git_ref_rebuild_guard_allows_ref_with_rebuild() {
+        assert!(super::git_ref_rebuild_guard(Some("feat/x"), true).is_ok());
+    }
+
+    #[test]
+    fn git_ref_rebuild_guard_allows_no_ref() {
+        // No git_ref: guard is a no-op regardless of rebuild.
+        assert!(super::git_ref_rebuild_guard(None, false).is_ok());
+        assert!(super::git_ref_rebuild_guard(None, true).is_ok());
+    }
+
+    /// Helper: insert a runner with an optional preview binding into a state's
+    /// registry, mirroring the spawn-test path (config + binding on the
+    /// ManagedRunner). Returns the runner id.
+    async fn insert_runner_with_binding(
+        state: &crate::state::SharedState,
+        port: u16,
+        binding: Option<crate::state::PreviewBinding>,
+    ) -> String {
+        let id = format!("test-{}", port);
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = id.clone();
+        config.name = id.clone();
+        config.port = port;
+        config.kind = super::RunnerKind::Temp { id: id.clone() };
+        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+            config, false, None,
+        ));
+        if let Some(b) = binding {
+            *managed.preview_binding.write().await = Some(b);
+        }
+        state.runners.write().await.insert(id.clone(), managed);
+        id
+    }
+
+    fn make_state() -> crate::state::SharedState {
+        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+        use std::path::PathBuf;
+        let config = SupervisorConfig {
+            project_dir: PathBuf::from("/tmp/test/src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 19000,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: false,
+            no_webview: true,
+        };
+        std::sync::Arc::new(crate::state::SupervisorState::new(config))
+    }
+
+    #[tokio::test]
+    async fn runners_by_unit_resolves_bound_previews() {
+        use axum::extract::{Path, State};
+        let state = make_state();
+        // u1 has two attempts' previews on distinct ports; u2 has one.
+        insert_runner_with_binding(
+            &state,
+            9877,
+            Some(crate::state::PreviewBinding {
+                unit_id: "u1".into(),
+                attempt_id: Some("a1".into()),
+                git_sha: Some("0156c6775b18".into()),
+            }),
+        )
+        .await;
+        insert_runner_with_binding(
+            &state,
+            9878,
+            Some(crate::state::PreviewBinding {
+                unit_id: "u1".into(),
+                attempt_id: Some("a2".into()),
+                git_sha: None,
+            }),
+        )
+        .await;
+        insert_runner_with_binding(
+            &state,
+            9879,
+            Some(crate::state::PreviewBinding {
+                unit_id: "u2".into(),
+                attempt_id: None,
+                git_sha: None,
+            }),
+        )
+        .await;
+        // An unbound runner must never appear in any unit's handle list.
+        insert_runner_with_binding(&state, 9880, None).await;
+
+        let resp = super::runners_by_unit(State(state.clone()), Path("u1".to_string()))
+            .await
+            .expect("by-unit must succeed");
+        let arr = resp.0.as_array().expect("array body").clone();
+        assert_eq!(arr.len(), 2, "u1 has exactly two bound previews");
+        let ports: std::collections::HashSet<u64> =
+            arr.iter().map(|h| h["port"].as_u64().unwrap()).collect();
+        assert_eq!(
+            ports,
+            std::collections::HashSet::from([9877, 9878]),
+            "only u1's ports, not u2's or the unbound runner's"
+        );
+        // Handle shape: runner_id, port, ui_bridge_url, git_sha, attempt_id.
+        let a1 = arr
+            .iter()
+            .find(|h| h["attempt_id"] == "a1")
+            .expect("a1 present");
+        assert_eq!(a1["port"], 9877);
+        assert_eq!(a1["ui_bridge_url"], "http://localhost:9877/ui-bridge");
+        assert_eq!(a1["git_sha"], "0156c6775b18");
+        assert_eq!(a1["runner_id"], "test-9877");
+        let a2 = arr
+            .iter()
+            .find(|h| h["attempt_id"] == "a2")
+            .expect("a2 present");
+        assert!(a2["git_sha"].is_null(), "a2 sha not yet probed → null");
+    }
+
+    #[tokio::test]
+    async fn runners_by_unit_unknown_unit_returns_empty_not_404() {
+        use axum::extract::{Path, State};
+        let state = make_state();
+        insert_runner_with_binding(
+            &state,
+            9877,
+            Some(crate::state::PreviewBinding {
+                unit_id: "u1".into(),
+                attempt_id: Some("a1".into()),
+                git_sha: None,
+            }),
+        )
+        .await;
+        let resp = super::runners_by_unit(State(state.clone()), Path("nope".to_string()))
+            .await
+            .expect("unknown unit must be 200, not an error/404");
+        assert_eq!(
+            resp.0.as_array().expect("array body").len(),
+            0,
+            "unknown unit returns [] (a queryable answer), never 404"
+        );
     }
 }
