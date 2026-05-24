@@ -64,6 +64,12 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
         summary: "Add a runner config to the registry",
     },
     EndpointEntry {
+        method: "GET",
+        path: "/runners/by-unit/{unit_id}",
+        summary: "Resolve preview handle(s) bound to a work unit \
+                  (Track 2 UI-Bridge preview-verification)",
+    },
+    EndpointEntry {
         method: "POST",
         path: "/runners/spawn-test",
         summary: "Spawn ephemeral test runner on next free port",
@@ -849,6 +855,13 @@ pub fn build_router(state: SharedState) -> Router {
         // Multi-runner management
         .route("/runners", get(crate::routes::runners::list_runners))
         .route("/runners", post(crate::routes::runners::add_runner))
+        // Track 2 (UI-Bridge preview-verification): resolve preview handle(s)
+        // bound to an autonomous-dev work unit. Distinct segment count from
+        // `/runners/{id}`, so no route conflict.
+        .route(
+            "/runners/by-unit/{unit_id}",
+            get(crate::routes::runners::runners_by_unit),
+        )
         .route(
             "/runners/spawn-test",
             post(crate::routes::runners::spawn_test),

@@ -64,6 +64,30 @@ pub struct ManagedRunner {
     /// either auto-login wasn't attempted, or the runner hasn't logged yet.
     /// Surfaced via the `auth_state` field of the `spawn-test` response.
     pub last_auth_result: RwLock<Option<LastAuthResult>>,
+    /// Optional work-unit / attempt correlation for previews spawned by the
+    /// autonomous-dev loop (Track 2 UI-Bridge preview-verification). When a
+    /// `spawn-test` request carries `unit_id`/`attempt_id`, they are stored
+    /// here so the runner round-trips them in the spawn-test response and is
+    /// resolvable via `GET /runners/by-unit/{unit_id}`. `None` for ordinary
+    /// (non-preview) runners.
+    pub preview_binding: RwLock<Option<PreviewBinding>>,
+}
+
+/// Work-unit → preview correlation for a runner spawned as an attempt's
+/// preview. Keyed externally by `(unit_id, attempt_id)`; stored on the
+/// `ManagedRunner` so the supervisor's existing `runner_id -> ManagedRunner`
+/// map is the single source of truth (no parallel side map to keep in sync).
+#[derive(Clone, Debug)]
+pub struct PreviewBinding {
+    /// The autonomous-loop work unit this preview is built for.
+    pub unit_id: String,
+    /// The specific attempt within that unit (its git ref was the build source).
+    pub attempt_id: Option<String>,
+    /// Git SHA the preview actually ran, as reported by the runner's `/health`
+    /// probe at spawn time. `None` until the health probe completes (or if the
+    /// probe was skipped / the runner reported no SHA). This is the provenance
+    /// fact the verifier resolves via `GET /runners/by-unit/{unit_id}`.
+    pub git_sha: Option<String>,
 }
 
 /// Snapshot of the most recent auto-login attempt observed for a runner.
@@ -127,6 +151,7 @@ impl ManagedRunner {
             early_log_path: RwLock::new(None),
             source_exe_override: RwLock::new(None),
             last_auth_result: RwLock::new(None),
+            preview_binding: RwLock::new(None),
         }
     }
 
