@@ -5,21 +5,61 @@
     "states":  [
                    {
                        "id":  "dashboard-layout",
-                       "name":  "Page Layout \u0026 Navigation",
-                       "requiredElements":  [
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                }
-                                            ],
+                       "name":  "Page Layout & Navigation",
+                       "assertions":  [
+                                          {
+                                              "id":  "dashboard-layout-elem-0",
+                                              "description":  "Spawn submit button confirms the runner-instances panel rendered inside the main content area, proving the dashboard layout (sidebar + main) mounted",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Spawn"
+                                                                          },
+                                                             "label":  "Required element for Page Layout & Navigation"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "dashboard-layout-elem-1",
+                                              "description":  "Log source filter select confirms the log viewer card rendered, indicating the main content area populated",
+                                              "category":  "element-presence",
+                                              "severity":  "major",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "logs-source-filter"
+                                                                          },
+                                                             "label":  "Required element for Page Layout & Navigation"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "dashboard-layout-elem-2",
+                                              "description":  "Primary runner status badge confirms the service health table rendered, anchoring the main content region",
+                                              "category":  "element-presence",
+                                              "severity":  "major",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-status-badge"
+                                                                          },
+                                                             "label":  "Required element for Page Layout & Navigation"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "The dashboard has a fixed 220px sidebar with navigation links and a main content area. The sidebar contains the Qontinui logo, nav links to all pages, and the supervisor port badge.",
                        "provenance":  {
                                           "source":  "migrated"
@@ -28,23 +68,60 @@
                    {
                        "id":  "service-table",
                        "name":  "Service Health Table",
-                       "requiredElements":  [
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                }
-                                            ],
+                       "assertions":  [
+                                          {
+                                              "id":  "service-table-elem-0",
+                                              "description":  "Primary runner status badge — a row in the service health table showing real-time UP status",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-status-badge"
+                                                                          },
+                                                             "label":  "Required element for Service Health Table"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "service-table-elem-1",
+                                              "description":  "Primary row action button (Restart) confirms the service table renders per-row action controls",
+                                              "category":  "element-presence",
+                                              "severity":  "major",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-restart"
+                                                                          },
+                                                             "label":  "Required element for Service Health Table"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "service-table-elem-2",
+                                              "description":  "Healthy status text inside the Primary row confirms status-dot rendering with text label",
+                                              "category":  "element-presence",
+                                              "severity":  "major",
+                                              "assertionType":  "text-equals",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Healthy"
+                                                                          },
+                                                             "label":  "Required element for Service Health Table"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "The service table is the primary dashboard element. Each row shows a service name, port, real-time status (UP/DOWN/ERR/OFF), and action buttons. Status is indicated by color-coded dots with animated pulse for connecting states. Services include: Runner, Backend, Frontend, PostgreSQL, Redis, MinIO, Expo, Watchdog.",
                        "provenance":  {
                                           "source":  "migrated"
@@ -53,16 +130,61 @@
                    {
                        "id":  "bulk-actions",
                        "name":  "Bulk Action Controls",
-                       "requiredElements":  [
-                                                {
-                                                    "role":  "button",
-                                                    "textContains":  "Start All"
-                                                },
-                                                {
-                                                    "role":  "button",
-                                                    "textContains":  "Stop All"
-                                                }
-                                            ],
+                       "assertions":  [
+                                          {
+                                              "id":  "bulk-actions-elem-0",
+                                              "description":  "Restart button next to the Primary runner row — a per-row bulk action control",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Restart"
+                                                                          },
+                                                             "label":  "Required element for Bulk Action Controls"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "bulk-actions-elem-1",
+                                              "description":  "Rebuild button next to the Primary runner row — the second per-row bulk action that triggers cargo build + restart",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Rebuild"
+                                                                          },
+                                                             "label":  "Required element for Bulk Action Controls"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "bulk-actions-elem-2",
+                                              "description":  "Rebuild button tooltip describes the rebuild-then-restart bulk operation",
+                                              "category":  "element-presence",
+                                              "severity":  "minor",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-rebuild"
+                                                                          },
+                                                             "label":  "Required element for Bulk Action Controls"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "Below the service table, bulk action buttons provide one-click operations: Docker (start containers), Start All, Stop All, Clean, Fresh (clean + migrate + start), Migrate. Each shows a confirmation dialog before executing.",
                        "provenance":  {
                                           "source":  "migrated"
@@ -71,14 +193,43 @@
                    {
                        "id":  "runner-instances-panel",
                        "name":  "Runner Instances Panel",
-                       "requiredElements":  [
-                                                {
-                                                    "textContains":  "Runner"
-                                                },
-                                                {
-                                                    "textContains":  "Runner"
-                                                }
-                                            ],
+                       "assertions":  [
+                                          {
+                                              "id":  "runner-instances-panel-elem-0",
+                                              "description":  "Spawn submit button — the primary control of the runner instances panel for spawning a new named runner",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Spawn"
+                                                                          },
+                                                             "label":  "Required element for Runner Instances Panel"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "runner-instances-panel-elem-1",
+                                              "description":  "Primary runner status badge confirms a runner row is rendered in the instances panel",
+                                              "category":  "element-presence",
+                                              "severity":  "major",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-status-badge"
+                                                                          },
+                                                             "label":  "Required element for Runner Instances Panel"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "Shows all runner instances (temp and user-managed) with their status, port, PID, and action controls. Temp runners (test-* IDs) can be stopped. User runners are observe-only.",
                        "provenance":  {
                                           "source":  "migrated"
@@ -87,12 +238,26 @@
                    {
                        "id":  "build-pool-status",
                        "name":  "Build Pool Status",
-                       "requiredElements":  [
-                                                {
-                                                    "textContains":  "Build"
-                                                }
-                                            ],
-                       "description":  "Shows the supervisor\u0027s parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration.",
+                       "assertions":  [
+                                          {
+                                              "id":  "build-pool-status-elem-0",
+                                              "description":  "Rebuild button accessibility name references the build process, indirectly confirming build-pool integration is active on the dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "minor",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-rebuild"
+                                                                          },
+                                                             "label":  "Required element for Build Pool Status"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Shows the supervisor's parallel build pool state: pool size (default 3), available permits, queued builds, per-slot state (idle/building with elapsed time and requester), and average build duration. No dedicated build-pool elements are registered in the current snapshot — only indirect signal via the Rebuild button. Requires direct registration of build-pool slot elements to assert robustly.",
                        "provenance":  {
                                           "source":  "migrated"
                                       }
@@ -100,14 +265,61 @@
                    {
                        "id":  "log-viewer",
                        "name":  "Log Viewer Panel",
-                       "requiredElements":  [
-                                                {
-                                                    "textContains":  "Log"
-                                                },
-                                                {
-                                                    "textContains":  "Log"
-                                                }
-                                            ],
+                       "assertions":  [
+                                          {
+                                              "id":  "log-viewer-elem-0",
+                                              "description":  "Log source / level filter select — the log viewer's source-filter dropdown with All sources / Errors only / Warnings only options",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "logs-source-filter"
+                                                                          },
+                                                             "label":  "Required element for Log Viewer Panel"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "log-viewer-elem-1",
+                                              "description":  "Pause/resume toggle button — controls the SSE log stream pause state",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Pause"
+                                                                          },
+                                                             "label":  "Required element for Log Viewer Panel"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "log-viewer-elem-2",
+                                              "description":  "Clear button — empties the captured log lines from the viewer",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Clear"
+                                                                          },
+                                                             "label":  "Required element for Log Viewer Panel"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "Real-time log viewer at the bottom of the dashboard. Shows log entries via SSE stream with source badges (Supervisor, Runner, Build) and level indicators (INFO, WARN, ERROR). Supports filtering by source and level, pause/resume, and auto-scroll.",
                        "provenance":  {
                                           "source":  "migrated"
@@ -116,17 +328,43 @@
                    {
                        "id":  "dashboard-design",
                        "name":  "Dashboard Visual Design",
-                       "requiredElements":  [
-                                                {
-
-                                                },
-                                                {
-
-                                                },
-                                                {
-
-                                                }
-                                            ],
+                       "assertions":  [
+                                          {
+                                              "id":  "dashboard-design-elem-0",
+                                              "description":  "Healthy status badge uses the success-green color (rgb(34, 197, 94)) — confirms the dark-theme status color system is applied",
+                                              "category":  "element-presence",
+                                              "severity":  "minor",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "runner-primary-status-badge"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Visual Design"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "dashboard-design-elem-1",
+                                              "description":  "Spawn button renders with the dark card background (rgb(36, 40, 55)) — confirms global dark-theme CSS custom properties applied",
+                                              "category":  "element-presence",
+                                              "severity":  "info",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Spawn"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Visual Design"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "description":  "The dashboard uses a dark theme with CSS custom properties for consistent styling. Background is dark (--bg-primary), text is light (--text-primary), accent color is indigo (--accent). Cards have subtle borders and rounded corners. Status colors: green for success, red for danger, amber for warning.",
                        "provenance":  {
                                           "source":  "migrated"

@@ -18,7 +18,27 @@
                                                     "textContains":  "Refresh"
                                                 }
                                             ],
-                       "description":  "Top card showing the primary runner\u0027s health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+                       "description":  "Top card showing the primary runner's health status as a JSON response. Includes a status badge (Healthy/Unknown/Unreachable), the raw JSON health object, and a Refresh button.",
+                       "assertions":  [
+                                          {
+                                              "id":  "runner-health-card-elem-0",
+                                              "description":  "Required element 0 for state Runner Health Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "accessibleName":  "Refresh runner health"
+                                                                          },
+                                                             "label":  "Required element for Runner Health Card"
+                                                         },
+                                              "source":  "ai-generated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
                        "provenance":  {
                                           "source":  "migrated"
                                       }
@@ -37,8 +57,11 @@
                                                     "role":  "button"
                                                 }
                                             ],
-                       "description":  "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection.",
+                       "description":  "Full-width card showing active task runs on the runner. Displays a count badge and a table with task run details. Each row has action buttons: Stop, View Output, View Reflection. (no observable assertions captured — requires the task-runs heading, count badge, table rows, or row action buttons (Stop / View Output / View Reflection) to be instrumented; reaching this state also requires at least one task run to be active on the primary runner)",
                        "precondition":  "At least one task run is active",
+                       "assertions":  [
+
+                                      ],
                        "provenance":  {
                                           "source":  "migrated"
                                       }
@@ -51,8 +74,11 @@
 
                                                 }
                                             ],
-                       "description":  "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked.",
+                       "description":  "Full-width panel for displaying action results. Shows title (action name) and pre-formatted JSON content with auto-scroll. Appears after any action button is clicked. (no observable assertions captured — requires the result-panel container, its title element, and the pre-formatted JSON output area to be instrumented; reaching this state also requires clicking one of the task-run action buttons (Stop / View Output / View Reflection) first)",
                        "precondition":  "An action has been executed via one of the task run buttons",
+                       "assertions":  [
+
+                                      ],
                        "provenance":  {
                                           "source":  "migrated"
                                       }
