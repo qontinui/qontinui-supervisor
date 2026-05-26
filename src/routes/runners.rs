@@ -615,6 +615,12 @@ pub async fn remove_runner(
                 name, e
             );
         }
+        if let Err(e) = crate::process::windows::remove_instance_config_dir(&id, false).await {
+            warn!(
+                "Failed to remove instance config dir for runner '{}': {}",
+                id, e
+            );
+        }
     }
 
     // Clean up the per-runner exe copy for temp runners to prevent disk bloat.
@@ -790,6 +796,12 @@ pub async fn purge_stale_test_runners_core(
                 warn!(
                     "purge-stale: failed to remove app data for '{}': {}",
                     name, e
+                );
+            }
+            if let Err(e) = crate::process::windows::remove_instance_config_dir(&id, false).await {
+                warn!(
+                    "purge-stale: failed to remove instance config dir for '{}': {}",
+                    id, e
                 );
             }
         }

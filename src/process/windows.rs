@@ -343,6 +343,39 @@ pub async fn remove_webview2_user_data_folder(
     }
 }
 
+pub async fn remove_instance_config_dir(runner_id: &str, is_primary: bool) -> anyhow::Result<bool> {
+    if is_primary {
+        anyhow::bail!("refusing to remove the primary runner's instance config dir");
+    }
+    let dir = dirs::config_dir().map(|d| {
+        d.join("com.qontinui.runner")
+            .join("instances")
+            .join(runner_id)
+    });
+    let Some(dir) = dir else {
+        return Ok(false);
+    };
+    if !dir.exists() {
+        return Ok(false);
+    }
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => {
+            info!(
+                "Removed instance config dir for runner '{}' at {:?}",
+                runner_id, dir
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to remove instance config dir for runner '{}' at {:?}: {}",
+                runner_id, dir, e
+            );
+            Err(e.into())
+        }
+    }
+}
+
 /// Remove per-instance app-data directories for a non-primary runner.
 ///
 /// The runner's `crate::instance::scope_path()` helper writes per-runner

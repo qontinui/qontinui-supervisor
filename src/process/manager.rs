@@ -12,8 +12,8 @@ use crate::process::env_forwarders;
 use crate::process::port::wait_for_port_free;
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
-    kill_by_pid, kill_by_port, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
-    webview2_user_data_folder,
+    kill_by_pid, kill_by_port, remove_instance_config_dir, remove_runner_app_data_dirs,
+    remove_webview2_user_data_folder, webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -786,6 +786,7 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             {
                 let _ = remove_webview2_user_data_folder(&id, false).await;
                 let _ = remove_runner_app_data_dirs(&name, false).await;
+                let _ = remove_instance_config_dir(&id, false).await;
             }
 
             info!(
@@ -1250,6 +1251,22 @@ async fn start_exe_mode_for_runner(
                 managed.config.name, webview_dir
             );
             cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
+        }
+
+        let instance_dir = dirs::config_dir().map(|d| {
+            d.join("com.qontinui.runner")
+                .join("instances")
+                .join(&managed.config.id)
+        });
+        if let Some(ref dir) = instance_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(
+                    "Failed to create instance dir {:?} for runner '{}': {}",
+                    dir, managed.config.name, e
+                );
+            }
+            cmd.env("QONTINUI_CONFIG_DIR", dir);
+            cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
         }
     }
 
@@ -1850,6 +1867,12 @@ pub async fn stop_runner_by_id(
                 warn!(
                     "Failed to remove per-instance app data for test runner '{}': {}",
                     runner_name, e
+                );
+            }
+            if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
+                warn!(
+                    "Failed to remove instance config dir for test runner '{}': {}",
+                    runner_id, e
                 );
             }
         }
