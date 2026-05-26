@@ -141,11 +141,21 @@ fn deterministic_jitter_secs(machine_id: uuid::Uuid) -> i64 {
     in_range - HEARTBEAT_JITTER_SECS
 }
 
+fn detect_ci_runner_active() -> bool {
+    std::process::Command::new("wsl")
+        .args(["--", "pgrep", "-f", "actions-runner"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Serialize)]
 struct RegisterPayload {
     machine_id: uuid::Uuid,
     hostname: String,
     health_url: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,10 +200,15 @@ pub async fn register_on_startup() {
     };
     let health_url = resolve_health_url();
 
+    let mut capabilities = Vec::new();
+    if detect_ci_runner_active() {
+        capabilities.push("ci_runner".to_string());
+    }
     let payload = RegisterPayload {
         machine_id,
         hostname: machine.hostname.clone(),
         health_url: health_url.clone(),
+        capabilities,
     };
     let url = format!("{base}/coord/machine/register");
 
@@ -344,6 +359,42 @@ async fn send_one_heartbeat() {
             warn!("health_advertiser::heartbeat: POST {} failed: {}.", url, e);
         }
     }
+
+    // Re-register to refresh capabilities (CI runner may start/stop between beats)
+    let mut capabilities = Vec::new();
+    if detect_ci_runner_active() {
+        capabilities.push("ci_runner".to_string());
+    }
+    let register_payload = RegisterPayload {
+        machine_id,
+        hostname: machine.hostname.clone(),
+        health_url: health_url.clone(),
+        capabilities,
+    };
+    let register_url = format!("{base}/coord/machine/register");
+    match client
+        .post(&register_url)
+        .json(&register_payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    "health_advertiser::heartbeat: capability refresh returned {} (body: {}).",
+                    status, body
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "health_advertiser::heartbeat: capability refresh POST failed: {}.",
+                e
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +477,10 @@ mod tests {
         let a = deterministic_jitter_secs(id);
         let b = deterministic_jitter_secs(id);
         assert_eq!(a, b, "same uuid must yield same jitter");
+    }
+
+    #[test]
+    fn detect_ci_runner_does_not_panic() {
+        let _ = detect_ci_runner_active();
     }
 }

@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod build_submit;
+pub mod ci_runner;
 pub mod dashboard;
 pub mod dev_endpoints;
 pub mod diagnostics;
