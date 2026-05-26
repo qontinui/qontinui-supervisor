@@ -156,6 +156,20 @@ struct BudgetPayload {
     max_concurrent_agents: u32,
     max_concurrent_builds: u32,
     hostname: String,
+    /// CI runner labels (e.g. ["self-hosted", "qontinui", "spaceship"]).
+    /// Omitted from the JSON when no CI runner is detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_runner_labels: Option<Vec<String>>,
+    /// CI runner aggregate status: "idle", "busy", or "offline".
+    /// Omitted when no CI runner is detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_runner_status: Option<String>,
+}
+
+/// Optional CI runner info to include in the budget POST.
+pub struct CiRunnerInfo {
+    pub labels: Vec<String>,
+    pub status: String,
 }
 
 /// Best-effort publish: POST the supervisor's MachineBudget to coord.
@@ -165,6 +179,16 @@ pub async fn publish_budget(
     role: &'static str,
     resources: Resources,
     disk_reserved_gb: u64,
+) -> Result<(), String> {
+    publish_budget_with_ci(role, resources, disk_reserved_gb, None).await
+}
+
+/// Like `publish_budget` but includes optional CI runner state.
+pub async fn publish_budget_with_ci(
+    role: &'static str,
+    resources: Resources,
+    disk_reserved_gb: u64,
+    ci_runner: Option<CiRunnerInfo>,
 ) -> Result<(), String> {
     let machine = match load_machine_file() {
         Some(m) => m,
@@ -195,6 +219,11 @@ pub async fn publish_budget(
     };
 
     let max_concurrent_builds = derive_max_builds(resources.memory_gb, resources.cpu_cores);
+    let (ci_labels, ci_status) = match ci_runner {
+        Some(info) if !info.labels.is_empty() => (Some(info.labels), Some(info.status)),
+        Some(info) => (None, Some(info.status)),
+        None => (None, None),
+    };
     let payload = BudgetPayload {
         role,
         cpu_cores: resources.cpu_cores,
@@ -208,6 +237,8 @@ pub async fn publish_budget(
         max_concurrent_agents: 0,
         max_concurrent_builds,
         hostname: machine.hostname.clone(),
+        ci_runner_labels: ci_labels,
+        ci_runner_status: ci_status,
     };
 
     let url = format!("{base}/coord/devices/{device_id}/budget");

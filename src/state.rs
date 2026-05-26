@@ -1,4 +1,5 @@
 use crate::build_submissions::BuildSubmissionStore;
+use crate::ci_runner_probe::CiRunnerState;
 use crate::config::{RunnerConfig, SupervisorConfig};
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
@@ -297,6 +298,10 @@ pub struct SupervisorState {
     /// channel is best-effort, since the goal is exercising the watcher's
     /// divergence path during manual tests, not durable delivery.
     pub synthetic_build_id_tx: broadcast::Sender<String>,
+    /// CI runner state probed via WSL. Updated every 30s by
+    /// `ci_runner_probe::ci_runner_probe_loop`. Read by the fleet
+    /// heartbeat to include CI runner info in the budget POST.
+    pub ci_runner_state: RwLock<CiRunnerState>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -968,6 +973,7 @@ impl SupervisorState {
             debug_endpoints_enabled,
             supervisor_started_at: std::time::SystemTime::now(),
             synthetic_build_id_tx,
+            ci_runner_state: RwLock::new(CiRunnerState::default()),
         }
     }
 

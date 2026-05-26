@@ -6,6 +6,8 @@ pub mod build_monitor;
 pub mod build_submissions;
 pub mod cache_key;
 pub mod cache_telemetry;
+pub mod ci_runner_lifecycle;
+pub mod ci_runner_probe;
 pub mod config;
 pub mod diagnostics;
 pub mod error;

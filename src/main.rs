@@ -3,6 +3,12 @@ mod build_monitor;
 mod build_submissions;
 mod cache_key;
 mod cache_telemetry;
+// Phase 3b (self-hosted CI runners): probes WSL-based GitHub Actions
+// runner services via `wsl -e systemctl ...` every 30s. Stores status
+// on SupervisorState for fleet heartbeat consumption and auto-restarts
+// crashed services (rate-limited to 3/hour).
+mod ci_runner_lifecycle;
+mod ci_runner_probe;
 mod config;
 mod diagnostics;
 mod error;
@@ -224,6 +230,18 @@ async fn main() -> anyhow::Result<()> {
         health_advertiser::register_on_startup().await;
         health_advertiser::heartbeat_loop().await;
     });
+
+    // Phase 3b: CI runner health probe loop. Probes WSL-based GitHub
+    // Actions runner services every 30s. Stores aggregate status on
+    // SupervisorState for fleet heartbeat consumption. Auto-restarts
+    // crashed services (rate-limited to 3/hour). Fire-and-forget —
+    // probe failures are swallowed; the loop never panics.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            ci_runner_probe::ci_runner_probe_loop(state_clone).await;
+        });
+    }
 
     // Layer 3 of the orphan-runner safety net: scan for `qontinui-runner.exe`
     // processes left over from a prior supervisor instance and either adopt

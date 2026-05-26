@@ -233,6 +233,37 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
         path: "/logs/files",
         summary: "List available log files",
     },
+    // CI Runner Lifecycle (Phase 4b)
+    EndpointEntry {
+        method: "POST",
+        path: "/ci-runner/enable",
+        summary: "Install, configure, and start a CI runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ci-runner/disable",
+        summary: "Stop and deregister a CI runner",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ci-runner/start",
+        summary: "Start the CI runner service",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ci-runner/stop",
+        summary: "Stop the CI runner service",
+    },
+    EndpointEntry {
+        method: "POST",
+        path: "/ci-runner/update",
+        summary: "Update the CI runner binary to latest",
+    },
+    EndpointEntry {
+        method: "GET",
+        path: "/ci-runner/status",
+        summary: "Current CI runner state",
+    },
     // Expo
     EndpointEntry {
         method: "POST",
@@ -847,6 +878,16 @@ pub fn build_router(state: SharedState) -> Router {
             "/diagnostics/clear",
             post(crate::routes::diagnostics::clear_diagnostics),
         )
+        // CI runner lifecycle (Phase 4b)
+        .route("/ci-runner/enable", post(crate::routes::ci_runner::enable))
+        .route(
+            "/ci-runner/disable",
+            post(crate::routes::ci_runner::disable),
+        )
+        .route("/ci-runner/start", post(crate::routes::ci_runner::start))
+        .route("/ci-runner/stop", post(crate::routes::ci_runner::stop))
+        .route("/ci-runner/update", post(crate::routes::ci_runner::update))
+        .route("/ci-runner/status", get(crate::routes::ci_runner::status))
         // Expo
         .route("/expo/start", post(crate::routes::expo::start))
         .route("/expo/stop", post(crate::routes::expo::stop))
