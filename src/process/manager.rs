@@ -1188,7 +1188,15 @@ async fn start_exe_mode_for_runner(
         .stderr(Stdio::piped())
         .env_remove("CLAUDECODE")
         .env("QONTINUI_PORT", managed.config.port.to_string())
-        .env("QONTINUI_API_URL", "http://127.0.0.1:8000");
+        .env(
+            "QONTINUI_API_URL",
+            std::env::var("QONTINUI_API_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string()),
+        );
+
+    if let Ok(tier) = std::env::var("QONTINUI_RUNNER_TIER") {
+        cmd.env("QONTINUI_RUNNER_TIER", tier);
+    }
 
     // Windows-only creation flags: detach from console (no flash window) +
     // own process group (so the supervisor can send Ctrl-Break for graceful
