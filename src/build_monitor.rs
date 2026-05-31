@@ -656,6 +656,42 @@ async fn run_build_inner(
     }
 
     if status.success() {
+        // HARD GATE: cargo succeeded, but a binary whose embedded frontend is
+        // missing/empty renders a blank "asset not found: index.html" window.
+        // Such a build must NEVER be promoted to LKG / `last_successful_slot`
+        // and shipped to the operator. `frontend_stale == true` means the
+        // pnpm step failed OR `dist/index.html` was missing/empty
+        // (`!dist_index_ok`) earlier in this function, so cargo just embedded
+        // a broken/stale frontend. Convert that into a hard build error here
+        // so the outer `run_cargo_build_with_dir` skips LKG promotion + the
+        // `last_successful_slot` update (both gated on `result.is_ok()`) and
+        // surfaces `build.build_error_detected = true` + `last_build_error`
+        // to the operator instead of a silent "successful enough" LKG.
+        if *slot.frontend_stale.read().await {
+            // Prefer the precise reason recorded by the frontend-build branch
+            // above (pnpm failure vs. empty dist) for the operator-facing error.
+            let reason = slot
+                .history
+                .read()
+                .await
+                .last_error
+                .clone()
+                .unwrap_or_else(|| {
+                    "frontend build failed or dist/index.html missing/empty".to_string()
+                });
+            let msg = format!(
+                "Slot {}: cargo build succeeded but the frontend is broken \u{2014} \
+                 NOT promoting to LKG/last_successful_slot (the binary would render a \
+                 blank \"asset not found: index.html\" window). {}",
+                slot.id, reason
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Build, LogLevel::Error, &msg)
+                .await;
+            return Err(SupervisorError::BuildFailed(msg));
+        }
         state
             .logs
             .emit(
