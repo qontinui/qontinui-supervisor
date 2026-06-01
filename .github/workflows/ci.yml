@@ -66,72 +66,73 @@ jobs:
     name: Compose Parity (cross-repo fixture drift)
     runs-on: ubuntu-latest
 
-    # Enforces the load-bearing invariant that
+    # Enforces the supervisor-side half of the load-bearing invariant that
     # qontinui-supervisor/src/cache_key.rs::compose and
     # qontinui-coord/src/ac_gate.rs::compose stay byte-identical: the coord
-    # AC-freshness gate looks keys up in the same bazel-remote Action Cache
-    # this pool writes. The per-repo `compose_parity::matches_canonical_fixture`
-    # unit tests prove each compose() == its local fixture; this job proves
-    # the two fixtures themselves are byte-identical (coord has no CI of its
-    # own — see memory feedback_qontinui_coord_no_ci — so supervisor, the
-    # canonical impl, owns the cross-repo half).
+    # AC-freshness gate looks build-cache keys up in the same bazel-remote
+    # Action Cache this pool writes, so if the two compose() impls drift,
+    # coord's lookups miss every entry the pool wrote and the optimization
+    # silently degrades to a permanent 0% hit rate.
+    #
+    # The invariant has two halves:
+    #   1. each repo's compose() reproduces its LOCAL compose_parity.json
+    #      fixture (the `compose_parity::matches_canonical_fixture` unit test
+    #      in each repo), and
+    #   2. the two fixtures are byte-identical to each other (cross-repo).
+    #
+    # This job owns half 1 for the supervisor: it runs the in-repo
+    # `compose_parity` unit test asserting supervisor's compose() == its
+    # local fixture.
+    #
+    # Half 2 (cross-repo byte-identity) is NO LONGER done here. supervisor is
+    # a PUBLIC repo but qontinui-coord is now PRIVATE, and GitHub serves a 404
+    # for private raw.githubusercontent.com content to anonymous clients. The
+    # old curl-from-raw fetch therefore failed on every supervisor PR, and we
+    # deliberately do not add a cross-repo PAT secret (the default GITHUB_TOKEN
+    # cannot read another private repo either). The direction is flipped: coord
+    # now has its own CI which CAN fetch supervisor's PUBLIC fixture
+    # unauthenticated and assert byte-identity there. So the cross-repo check
+    # lives in coord's CI; this job is secret-free.
+    #
+    # FIX on drift: update BOTH compose() impls AND regenerate
+    # tests/fixtures/compose_parity.json in BOTH repos in lockstep.
+    # See memory proj_row_10_item_8_ac_gate.
 
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v5
 
-      - name: Fetch coord's fixture from origin/main and assert byte-identity
-        env:
-          COORD_RAW_URL: https://raw.githubusercontent.com/qontinui/qontinui-coord/main/tests/fixtures/compose_parity.json
-          LOCAL_FIXTURE: tests/fixtures/compose_parity.json
+      # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
+      # at ../qontinui-schemas/rust. Without the sibling clone, the build
+      # fails with "failed to read ../qontinui-schemas/rust/Cargo.toml".
+      - name: Checkout sibling repos
         run: |
-          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
 
-          fail() {
-            echo "::error title=compose() cross-repo parity violation::$1"
-            echo ""
-            echo "INVARIANT: qontinui-supervisor/src/cache_key.rs::compose and"
-            echo "qontinui-coord/src/ac_gate.rs::compose MUST be byte-identical."
-            echo "The coord AC-freshness gate looks build-cache keys up in the"
-            echo "same bazel-remote Action Cache the supervisor pool writes; if"
-            echo "the two compose() impls drift, coord's lookups miss every"
-            echo "entry the pool wrote and the optimization silently degrades"
-            echo "to a permanent 0% hit rate."
-            echo ""
-            echo "FIX: update BOTH impls AND regenerate"
-            echo "tests/fixtures/compose_parity.json in BOTH repos in lockstep."
-            echo "See memory proj_row_10_item_8_ac_gate."
-            exit 1
-          }
+      # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
+      # file overrides any other channel for every cargo invocation.
+      - name: Install Rust 1.95.0 toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
 
-          # Fetch coord's fixture with one retry (network-flake resilience).
-          # A persistent fetch failure FAILS the job naming the invariant —
-          # it must never silently pass.
-          fetch() { curl -fsSL --max-time 30 "$COORD_RAW_URL" -o coord_fixture.json; }
-          if ! fetch; then
-            echo "coord fixture fetch failed; retrying once in 5s..." >&2
-            sleep 5
-            if ! fetch; then
-              fail "could not fetch coord's compose_parity.json from origin/main after one retry ($COORD_RAW_URL). Refusing to silently pass a parity check."
-            fi
-          fi
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-          if [ ! -s coord_fixture.json ]; then
-            fail "fetched coord compose_parity.json is empty ($COORD_RAW_URL)."
-          fi
-
-          local_sha=$(sha256sum "$LOCAL_FIXTURE" | cut -d' ' -f1)
-          coord_sha=$(sha256sum coord_fixture.json | cut -d' ' -f1)
-          echo "supervisor $LOCAL_FIXTURE sha256 = $local_sha"
-          echo "coord   (origin/main) sha256 = $coord_sha"
-
-          if ! cmp -s "$LOCAL_FIXTURE" coord_fixture.json; then
-            echo "--- diff (supervisor vs coord@origin/main) ---"
-            diff -u "$LOCAL_FIXTURE" coord_fixture.json || true
-            fail "the two compose_parity.json fixtures have diverged (sha256 $local_sha vs $coord_sha)."
-          fi
-
-          echo "compose-parity fixtures are byte-identical across both repos ✓"
+      - name: Assert compose() reproduces the local parity fixture
+        run: cargo test compose_parity
 
   frontend-check:
     name: Frontend Check
