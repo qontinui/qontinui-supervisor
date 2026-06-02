@@ -2072,11 +2072,28 @@ pub async fn spawn_test(
     let (frontend_stale, stale_reason, stale_slot_id) =
         resolve_frontend_stale_for_spawn(&state).await;
 
-    // frontend_strict: short-circuit with 503 before reporting success when
-    // the caller has explicitly opted into strict-frontend enforcement.
-    if frontend_stale && body.frontend_strict {
-        // Stop the runner we just spawned — strict mode means "don't ship a
-        // stale UI to the caller."
+    // Short-circuit with 503 before reporting success when the spawned
+    // runner would serve a broken or stale UI. Two triggers:
+    //
+    //  1. `DistMissing` — ALWAYS hard-fails, regardless of `frontend_strict`.
+    //     A missing `dist/index.html` is not "stale but functional": the
+    //     runner has NO embedded frontend and serves `asset not found:
+    //     index.html` at every route — a blank screen. Returning
+    //     `status=healthy` here lies to the caller (a manual-test run caught
+    //     exactly this: gutted `node_modules/.bin` + empty `dist/` → the
+    //     freshly-built runner embedded a blank frontend, yet spawn-test only
+    //     warned and reported healthy). A blank UI is never healthy, so the
+    //     default path must refuse the spawn, not warn-and-serve.
+    //
+    //  2. Any other `frontend_stale` reason (`BuildFailed` / `SrcDrift`) —
+    //     hard-fails only when the caller opted into strict-frontend
+    //     enforcement via `frontend_strict: true`. These are stale-but-
+    //     functional (the UI renders, just not the latest source), so the
+    //     default stays warn-and-serve for back-compat.
+    let dist_missing = matches!(stale_reason, Some(FrontendStaleReason::DistMissing));
+    if frontend_stale && (dist_missing || body.frontend_strict) {
+        // Stop the runner we just spawned — we will not ship a broken/stale
+        // UI to the caller.
         let _ = manager::stop_runner_by_id(&state, &id).await;
         {
             let mut runners = state.runners.write().await;
@@ -2084,14 +2101,24 @@ pub async fn spawn_test(
         }
         state.notify_health_change();
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let body = json!({
-            "error": "frontend_stale",
-            "message": format!(
+        let message = if dist_missing {
+            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
+             missing, so the runner would embed no frontend and serve a blank screen \
+             (`asset not found: index.html`) at every route. Run \
+             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
+             unconditional: a missing dist is never reported as healthy."
+                .to_string()
+        } else {
+            format!(
                 "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
                  Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
                  or pass {{\"frontend_strict\": false}} to override.",
                 reason_str
-            ),
+            )
+        };
+        let body = json!({
+            "error": if dist_missing { "frontend_dist_missing" } else { "frontend_stale" },
+            "message": message,
             "frontend_stale": true,
             "frontend_stale_reason": reason_str,
             "stale_slot_id": stale_slot_id,
@@ -2960,6 +2987,37 @@ pub async fn spawn_named(
 
     let (frontend_stale, stale_reason, stale_slot_id) =
         resolve_frontend_stale_for_spawn(&state).await;
+
+    // DistMissing hard-fail (symmetric with spawn_test). A missing
+    // `dist/index.html` means the runner embeds NO frontend and serves a
+    // blank screen (`asset not found: index.html`) at every route — never a
+    // `healthy` outcome. Unlike `SrcDrift`/`BuildFailed` (stale-but-
+    // functional), this is unconditional. Tear the named runner back down
+    // (stop, drop from the registry, AND remove the just-persisted settings
+    // entry so it doesn't resurrect on the next supervisor restart) and
+    // return 503 instead of reporting a blank UI as healthy.
+    if frontend_stale && matches!(stale_reason, Some(FrontendStaleReason::DistMissing)) {
+        let _ = manager::stop_runner_by_id(&state, &id).await;
+        {
+            let mut runners = state.runners.write().await;
+            runners.remove(&id);
+        }
+        let settings_path = settings::settings_path(&state.config);
+        settings::remove_runner(&settings_path, &id);
+        state.notify_health_change();
+        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
+        let body = json!({
+            "error": "frontend_dist_missing",
+            "message": "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html \
+                is missing, so the runner would embed no frontend and serve a blank screen \
+                (`asset not found: index.html`) at every route. Run \
+                `cd qontinui-runner && npm run build` to rebuild dist/, then retry.",
+            "frontend_stale": true,
+            "frontend_stale_reason": reason_str,
+            "stale_slot_id": stale_slot_id,
+        });
+        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+    }
 
     // Item A: assemble build_result alongside the existing top-level
     // binary_mtime/binary_size_bytes (preserved on spawn-named for
