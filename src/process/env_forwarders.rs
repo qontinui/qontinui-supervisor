@@ -60,6 +60,7 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
     vec![
         Box::new(TestAutoLoginEnv),
         Box::new(DevBootstrapEnv),
+        Box::new(WorktreeModeEnv),
         Box::new(WindowPositionEnv),
         Box::new(RestateEnv),
         Box::new(RunnerTierEnv),
@@ -190,6 +191,113 @@ impl EnvForwarder for DevBootstrapEnv {
             if let Ok(val) = std::env::var("QONTINUI_DEV_BOOTSTRAP") {
                 if !val.is_empty() {
                     cmd.env("QONTINUI_DEV_BOOTSTRAP", val);
+                }
+            }
+        })
+    }
+}
+
+// =============================================================================
+// WorktreeModeEnv
+// =============================================================================
+
+/// Environment variable the runner reads to enable per-session git-worktree
+/// isolation for terminal edit sessions. When `=1`, each terminal edit session
+/// gets its own git worktree + coord Worktree claim instead of every session
+/// sharing one physical checkout (which causes concurrent `git switch`
+/// clobbers). The runner's compiled default is OFF; this forwarder makes
+/// worktree-isolation the supervisor's default-on posture (Layer 4 of
+/// `plans/2026-06-03-shared-checkout-coordination-gap-fix.md`).
+const ENV_AGENT_WORKTREE_MODE: &str = "QONTINUI_AGENT_WORKTREE_MODE";
+
+/// Supervisor-side opt-out. When set to one of `0`/`off`/`false`/`no`
+/// (case-insensitive), the supervisor injects NOTHING, leaving every runner on
+/// the runner's own compiled default (worktree-isolation off).
+const ENV_SUPERVISOR_WORKTREE_DEFAULT: &str = "QONTINUI_SUPERVISOR_WORKTREE_DEFAULT";
+
+/// Pure precedence resolver for the worktree-mode posture. Returns the value to
+/// inject as `QONTINUI_AGENT_WORKTREE_MODE` on the child, or `None` to inject
+/// nothing.
+///
+/// Precedence (highest first):
+/// 1. **Explicit opt-out.** If `supervisor_default` (the value of
+///    `QONTINUI_SUPERVISOR_WORKTREE_DEFAULT` in the supervisor's env) is one of
+///    `0`/`off`/`false`/`no` (case-insensitive, trimmed) → return `None`. The
+///    runner keeps its own compiled default (off).
+/// 2. **Respect operator override.** Else if `agent_mode` (the value of
+///    `QONTINUI_AGENT_WORKTREE_MODE` already set in the supervisor's env) is
+///    `Some` → propagate that EXACT value (including `0`/`off`) to the child.
+///    This makes the posture reversible without code changes.
+/// 3. **Default-on.** Else → return `Some("1")`, turning the dormant
+///    worktree-isolation mechanism on for every spawned runner.
+///
+/// Kept as a free function over its two inputs (not reading `std::env`
+/// directly) so it is exhaustively unit-testable without process-global env
+/// mutation. [`WorktreeModeEnv::apply`] is the thin env-reading wrapper.
+pub(crate) fn resolve_worktree_mode(
+    supervisor_default: Option<&str>,
+    agent_mode: Option<&str>,
+) -> Option<String> {
+    if let Some(raw) = supervisor_default {
+        let v = raw.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "0" | "off" | "false" | "no") {
+            return None;
+        }
+    }
+    if let Some(explicit) = agent_mode {
+        return Some(explicit.to_string());
+    }
+    Some("1".to_string())
+}
+
+/// Inject the worktree-isolation posture (`QONTINUI_AGENT_WORKTREE_MODE`) onto
+/// every supervisor-spawned runner per [`resolve_worktree_mode`].
+///
+/// Registered before [`ExtraEnv`] so a specific `POST /runners/spawn-test`
+/// caller can still override it via
+/// `extra_env: {"QONTINUI_AGENT_WORKTREE_MODE": "0"}` (see module docs on
+/// order).
+pub struct WorktreeModeEnv;
+
+impl EnvForwarder for WorktreeModeEnv {
+    fn name(&self) -> &'static str {
+        "worktree_mode"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        state: &'a SharedState,
+        runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let supervisor_default = std::env::var(ENV_SUPERVISOR_WORKTREE_DEFAULT).ok();
+            let agent_mode = std::env::var(ENV_AGENT_WORKTREE_MODE).ok();
+            match resolve_worktree_mode(supervisor_default.as_deref(), agent_mode.as_deref()) {
+                Some(val) => {
+                    cmd.env(ENV_AGENT_WORKTREE_MODE, &val);
+                    let msg = format!(
+                        "Worktree mode: runner '{}' spawned with {}={}",
+                        runner.config.name, ENV_AGENT_WORKTREE_MODE, val
+                    );
+                    tracing::info!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                        .await;
+                }
+                None => {
+                    let msg = format!(
+                        "Worktree mode: runner '{}' left on runner default ({}={} opt-out)",
+                        runner.config.name,
+                        ENV_SUPERVISOR_WORKTREE_DEFAULT,
+                        supervisor_default.as_deref().unwrap_or("")
+                    );
+                    tracing::info!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                        .await;
                 }
             }
         })
@@ -567,5 +675,77 @@ impl EnvForwarder for ExtraEnv {
                 cmd.env(k, v);
             }
         })
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_worktree_mode;
+
+    #[test]
+    fn default_on_when_nothing_set() {
+        // No supervisor opt-out, no operator override → inject =1.
+        assert_eq!(resolve_worktree_mode(None, None), Some("1".to_string()));
+    }
+
+    #[test]
+    fn opt_out_values_inject_nothing() {
+        // Each documented opt-out value (case-insensitive, trimmed) suppresses
+        // injection regardless of any operator override.
+        for v in ["0", "off", "false", "no", "OFF", "False", "No", " off "] {
+            assert_eq!(
+                resolve_worktree_mode(Some(v), None),
+                None,
+                "supervisor default {v:?} should opt out"
+            );
+            // Opt-out wins even when an operator override is also present.
+            assert_eq!(
+                resolve_worktree_mode(Some(v), Some("1")),
+                None,
+                "supervisor default {v:?} should opt out even with agent_mode=1"
+            );
+        }
+    }
+
+    #[test]
+    fn non_opt_out_supervisor_default_does_not_suppress() {
+        // A non-opt-out value of QONTINUI_SUPERVISOR_WORKTREE_DEFAULT (e.g. "1"
+        // or junk) is NOT an opt-out — falls through to the default-on path.
+        assert_eq!(
+            resolve_worktree_mode(Some("1"), None),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            resolve_worktree_mode(Some("yes"), None),
+            Some("1".to_string())
+        );
+        assert_eq!(resolve_worktree_mode(Some(""), None), Some("1".to_string()));
+    }
+
+    #[test]
+    fn operator_override_propagated_verbatim() {
+        // An explicit QONTINUI_AGENT_WORKTREE_MODE in the supervisor env is
+        // propagated EXACTLY (reversibility) when there's no opt-out.
+        assert_eq!(
+            resolve_worktree_mode(None, Some("1")),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            resolve_worktree_mode(None, Some("0")),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            resolve_worktree_mode(None, Some("off")),
+            Some("off".to_string())
+        );
+        // Verbatim — no normalization of an unusual value.
+        assert_eq!(
+            resolve_worktree_mode(None, Some("verbose")),
+            Some("verbose".to_string())
+        );
     }
 }
