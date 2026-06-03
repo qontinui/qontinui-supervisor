@@ -5,7 +5,9 @@
 //! migrates cleanly. Rather than mutating the live file, we copy it to a
 //! tempfile and exercise `load_settings` there.
 //!
-//! Skipped if the live fixture isn't present (e.g. CI).
+//! Skipped if the live fixture isn't present (e.g. CI) or is already in
+//! post-migration shape (any real supervisor start since the migrator
+//! shipped rewrites the live file).
 
 use qontinui_supervisor::settings::load_settings;
 use qontinui_types::wire::runner_kind::RunnerKind;
@@ -26,13 +28,20 @@ fn live_fixture_migrates_and_is_idempotent() {
     // Snapshot the original raw bytes so we can verify the migrator only
     // rewrites once.
     let before = std::fs::read_to_string(&temp_path).unwrap();
-    assert!(
-        before.contains("\"is_primary\""),
-        "live fixture is expected to be in pre-migration shape (contains is_primary). \
-         If this fails, the migrator already ran against the live file in a previous \
-         smoke run and the fixture is now post-shape. Re-seed it by copying from \
-         git history if you want to re-exercise the migration path."
-    );
+
+    // One-time Phase 5 smoke: only meaningful while the live file is still
+    // in pre-migration shape. Any real supervisor start since the migrator
+    // shipped rewrites the live file to post-shape — that's the migrator
+    // working, not a regression — so skip (like the missing-file case
+    // above) instead of failing every local `cargo test` forever. Re-seed
+    // the live file from git history to re-exercise the migration path.
+    if !before.contains("\"is_primary\"") {
+        eprintln!(
+            "live fixture at {live_path:?} is already post-migration shape \
+             (no is_primary keys); skipping smoke test"
+        );
+        return;
+    }
 
     // First load: triggers the migrator.
     let settings = load_settings(&temp_path);
