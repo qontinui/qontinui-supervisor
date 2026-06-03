@@ -48,6 +48,7 @@ mod velocity_layer;
 mod velocity_tests;
 #[cfg(windows)]
 mod webview;
+mod wsl_util;
 
 use clap::Parser;
 use std::sync::Arc;
