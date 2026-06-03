@@ -14,7 +14,6 @@ pub mod error;
 pub mod evaluation;
 pub mod expo;
 pub mod fs_atomic;
-pub mod health_advertiser;
 pub mod health_cache;
 pub mod log_capture;
 pub mod otel;

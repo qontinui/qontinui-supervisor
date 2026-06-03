@@ -22,7 +22,7 @@ use crate::state::SharedState;
 // ---------------------------------------------------------------------------
 
 /// Minimal subset of `~/.qontinui/profiles.json` — duplicated from
-/// `fleet.rs` / `health_advertiser.rs` to keep this module self-contained.
+/// `fleet.rs` to keep this module self-contained.
 #[derive(Debug, Clone, Deserialize)]
 struct ProfilesFile {
     active: Option<String>,
