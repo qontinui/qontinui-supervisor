@@ -10,7 +10,6 @@
 //! - `ci_runner_probe_loop()`: async 30s loop that stores state + auto-restarts
 //! - `try_restart_ci_runner()`: rate-limited `systemctl restart` via WSL
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +17,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::state::SupervisorState;
+use crate::wsl_util::wsl_command;
 
 /// Probe interval: how often we check CI runner health.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -149,7 +149,7 @@ pub fn probe_ci_runners() -> CiRunnerState {
 
 /// List `actions.runner.*` systemd services via WSL.
 fn list_runner_services() -> Result<Vec<String>, String> {
-    let output = Command::new("wsl")
+    let output = wsl_command()
         .args([
             "-e",
             "bash",
@@ -183,7 +183,7 @@ fn list_runner_services() -> Result<Vec<String>, String> {
 
 /// Check if any Runner.Worker process is alive (indicates a job is running).
 fn check_runner_busy() -> bool {
-    Command::new("wsl")
+    wsl_command()
         .args([
             "-e",
             "bash",
@@ -197,7 +197,7 @@ fn check_runner_busy() -> bool {
 
 /// Check if a specific systemd service is active (running).
 fn check_service_active(service_name: &str) -> bool {
-    Command::new("wsl")
+    wsl_command()
         .args([
             "-e",
             "bash",
@@ -212,7 +212,7 @@ fn check_service_active(service_name: &str) -> bool {
 /// Parse labels from the runner's `.runner` JSON config file.
 /// Falls back to a default set if the file can't be read.
 fn parse_runner_labels() -> Vec<String> {
-    let output = match Command::new("wsl")
+    let output = match wsl_command()
         .args([
             "-e",
             "bash",
@@ -247,7 +247,7 @@ fn parse_runner_labels() -> Vec<String> {
         if let Some(name) = parsed.get("agentName").and_then(|v| v.as_str()) {
             // Typical: "spaceship-wsl" — already added above.
             // Add the machine hostname as a label for fleet identification.
-            if let Ok(hostname_output) = Command::new("wsl").args(["-e", "hostname"]).output() {
+            if let Ok(hostname_output) = wsl_command().args(["-e", "hostname"]).output() {
                 if hostname_output.status.success() {
                     let hostname = String::from_utf8_lossy(&hostname_output.stdout)
                         .trim()
@@ -282,7 +282,7 @@ pub fn try_restart_ci_runner(service_name: &str) -> Result<(), String> {
         ));
     }
 
-    let output = Command::new("wsl")
+    let output = wsl_command()
         .args(["-e", "sudo", "systemctl", "restart", service_name])
         .output()
         .map_err(|e| format!("failed to run wsl: {}", e))?;

@@ -142,7 +142,7 @@ fn deterministic_jitter_secs(machine_id: uuid::Uuid) -> i64 {
 }
 
 fn detect_ci_runner_active() -> bool {
-    std::process::Command::new("wsl")
+    crate::wsl_util::wsl_command()
         .args(["--", "pgrep", "-f", "actions-runner"])
         .output()
         .map(|o| o.status.success())

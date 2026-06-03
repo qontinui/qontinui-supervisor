@@ -11,8 +11,9 @@
 //! `~/actions-runner/.runner` (a JSON file written by `config.sh`).
 
 use anyhow::{bail, Context, Result};
-use std::process::Command;
 use tracing::{info, warn};
+
+use crate::wsl_util::wsl_command;
 
 // ---------------------------------------------------------------------------
 // WSL helper
@@ -21,7 +22,7 @@ use tracing::{info, warn};
 /// Execute a command inside the default WSL distribution via
 /// `wsl -e bash -c "..."`. Returns trimmed stdout on success.
 fn wsl_exec(cmd: &str) -> Result<String> {
-    let output = Command::new("wsl")
+    let output = wsl_command()
         .args(["-e", "bash", "-c", cmd])
         .output()
         .context("failed to spawn wsl process")?;

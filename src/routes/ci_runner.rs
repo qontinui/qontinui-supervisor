@@ -163,7 +163,7 @@ async fn fetch_registration_token() -> Result<String, String> {
 
 fn resolve_runner_name() -> String {
     // Try the WSL hostname first; fall back to the Windows COMPUTERNAME env var.
-    if let Ok(output) = std::process::Command::new("wsl")
+    if let Ok(output) = crate::wsl_util::wsl_command()
         .args(["-e", "hostname"])
         .output()
     {
