@@ -14,12 +14,16 @@ use std::process::Command;
 /// Build a `Command` for `wsl`, suppressing the transient console window on
 /// Windows. Add args/output handling at the call site as usual.
 pub fn wsl_command() -> Command {
-    let mut cmd = Command::new("wsl");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("wsl");
         cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
     }
-    cmd
+    #[cfg(not(windows))]
+    {
+        Command::new("wsl")
+    }
 }
