@@ -1343,6 +1343,21 @@ pub struct SpawnTestRequest {
     /// attempts' previews for the same unit. `None` for ordinary spawns.
     #[serde(default)]
     pub attempt_id: Option<String>,
+
+    /// Item 6 — when true, do NOT hold the HTTP request open for the build.
+    /// Register the build in the build-submissions state machine, reserve the
+    /// runner port/slot, and return `202 {submission_id, port, status:"queued"}`
+    /// immediately. The build + spawn run in a background task; poll
+    /// `GET /build/{submission_id}/status` for the terminal state, whose
+    /// `spawn` field carries the same body the synchronous 200 would have.
+    ///
+    /// Survives a supervisor restart's connection reset: the long-poll no
+    /// longer conflates "build failed" with "supervisor died". Both the sync
+    /// (`async:false`, the default) and async paths route through the SAME
+    /// submission state machine — sync simply awaits the submission's
+    /// completion in-handler.
+    #[serde(default, rename = "async")]
+    pub r#async: bool,
 }
 
 fn default_health_probe_timeout() -> u64 {
@@ -1389,6 +1404,23 @@ pub struct SpawnNamedRequest {
     /// build failures short-circuit with HTTP 500 and no spawn happens.
     #[serde(default)]
     pub allow_stale_fallback: bool,
+}
+
+/// Paths needed to tear down a prepared spawn container on a downstream
+/// build failure (the `cleanup_worktree_on_fail` flag). Mirrors the argument
+/// list of [`crate::spawn_worktree::cleanup_fresh_worktree`].
+struct SpawnCleanupPaths {
+    /// Runner repo the runner worktree was registered in.
+    repo_root: std::path::PathBuf,
+    /// `<workspace_root>/.spawn-<ref>/` — removed last.
+    container_path: std::path::PathBuf,
+    /// Nested runner worktree (`<container>/qontinui-runner`).
+    runner_wt_path: std::path::PathBuf,
+    /// Shared `<workspace_root>/qontinui-schemas` repo the pinned worktree was
+    /// created from. `None` if the workspace root couldn't be derived.
+    schemas_repo_root: Option<std::path::PathBuf>,
+    /// Pinned schemas worktree (`<container>/qontinui-schemas`).
+    schemas_wt_path: Option<std::path::PathBuf>,
 }
 
 /// Provenance guard for `git_ref` spawns: a `git_ref` is only honored when
@@ -1526,6 +1558,122 @@ pub async fn spawn_test(
         });
     }
 
+    // Item 6 — route the build+spawn through the SINGLE build-submissions
+    // state machine. `submit_spawn` registers a submission and drives the
+    // extracted `execute_spawn_build` future in a background task; its
+    // `(status, body)` becomes the submission's terminal `spawn` outcome.
+    //
+    // - async: return 202 with the submission id + reserved port now.
+    // - sync (default): await the submission's terminal state in-handler and
+    //   return the stored outcome. Both paths share one state machine.
+    let want_async = body.r#async;
+    let store = state.build_submissions.clone();
+    let exec_state = state.clone();
+    let exec_managed = managed.clone();
+    let exec_id = id.clone();
+    let agent_id = body.requester_id.clone();
+    let worktree_label = state.config.project_dir.clone();
+    let (submission_id, sub_arc) =
+        crate::build_submissions::submit_spawn(store, worktree_label, agent_id, port, async move {
+            let (status, body_json) =
+                execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
+            (status.as_u16(), body_json)
+        });
+
+    if want_async {
+        return Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(json!({
+                "submission_id": submission_id.to_string(),
+                "status": "queued",
+                "id": id,
+                "port": port,
+                "api_url": format!("http://localhost:{}", port),
+                "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+                "poll_url": format!("/build/{}/status", submission_id),
+                "message": format!(
+                    "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
+                    submission_id, submission_id
+                ),
+            })),
+        )
+            .into_response());
+    }
+
+    // Sync path: await the submission terminal state, then return its stored
+    // spawn outcome (same shape as the legacy inline response).
+    crate::build_submissions::await_terminal(&sub_arc).await;
+    let outcome = {
+        let sub = sub_arc.read().await;
+        sub.spawn.clone()
+    };
+    match outcome {
+        Some(o) => {
+            let status = axum::http::StatusCode::from_u16(o.http_status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            // Back-compat: re-attach the legacy `X-Frontend-Stale: 1` header
+            // when the body flags a stale frontend (the header couldn't ride
+            // the stored submission outcome).
+            let frontend_stale = o
+                .body
+                .get("frontend_stale")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut response = (status, Json(o.body)).into_response();
+            if frontend_stale {
+                response
+                    .headers_mut()
+                    .insert("X-Frontend-Stale", "1".parse().unwrap());
+            }
+            Ok(response)
+        }
+        None => Err(SupervisorError::Other(
+            "spawn-test submission reached terminal state without a spawn outcome (internal error)"
+                .to_string(),
+        )),
+    }
+}
+
+/// Build + spawn + probe + assemble the spawn-test response.
+///
+/// Extracted from `spawn_test` (Item 6) so BOTH the synchronous and the
+/// `async: true` request paths execute identical logic through the single
+/// build-submissions state machine — the only difference is whether the HTTP
+/// handler awaits this future inline or polls for its recorded outcome.
+///
+/// Returns `(StatusCode, body)` rather than a `Response` so the result can be
+/// stored on the submission's terminal state and rebuilt into a `Response`
+/// later. On any internal `SupervisorError` the placeholder port reservation
+/// is released (as the inline path did) and the error is rendered to its
+/// canonical `(status, body)` via [`SupervisorError::to_status_body`].
+///
+/// `no_wait` mirrors the `X-Queue-Mode: no-wait` header semantics for the
+/// build-pool-full short-circuit.
+async fn execute_spawn_build(
+    state: SharedState,
+    body: SpawnTestRequest,
+    id: String,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait).await {
+        Ok((status, body)) => (status, body),
+        Err(e) => e.to_status_body(),
+    }
+}
+
+/// Inner body returning `Result` so the existing `?` / `return Err(e)` control
+/// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
+/// removal on the error paths below is unchanged.
+async fn execute_spawn_build_inner(
+    state: &SharedState,
+    body: SpawnTestRequest,
+    id: &str,
+    port: u16,
+    managed: &Arc<ManagedRunner>,
+    no_wait: bool,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
     // `body.rebuild` is false, `attempted` stays false and `succeeded`
@@ -1538,9 +1686,10 @@ pub async fn spawn_test(
     // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
     let mut git_ref_info: Option<(String, String)> = None;
     // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
-    // the `cleanup_worktree_on_fail` flag to wipe the worktree dir on a
-    // downstream cargo failure. (repo_root, wt_path)
-    let mut git_ref_cleanup_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
+    // the `cleanup_worktree_on_fail` flag to wipe the spawn container on a
+    // downstream cargo failure.
+    // (runner_repo_root, container_path, runner_wt_path, schemas_repo_root, schemas_wt_path)
+    let mut git_ref_cleanup_paths: Option<SpawnCleanupPaths> = None;
 
     // Rebuild if requested
     if body.rebuild {
@@ -1628,17 +1777,30 @@ pub async fn spawn_test(
                         // configured project_dir; if it errors here (the
                         // supervisor lost track of the runner repo) we can't
                         // safely run `git worktree remove` anyway — skip
-                        // cleanup wiring rather than 500 the spawn.
+                        // cleanup wiring rather than 500 the spawn. The schemas
+                        // repo root is the shared `<workspace_root>/qontinui-schemas`
+                        // checkout the pinned worktree was created from.
                         if let Ok(repo_root) =
                             crate::spawn_worktree::find_repo_root(&state.config.project_dir)
                         {
-                            git_ref_cleanup_paths = Some((repo_root, wt.worktree_path.clone()));
+                            let schemas_repo_root = crate::spawn_worktree::derive_workspace_root(
+                                &state.config.project_dir,
+                            )
+                            .ok()
+                            .map(|ws| ws.join("qontinui-schemas"));
+                            git_ref_cleanup_paths = Some(SpawnCleanupPaths {
+                                repo_root,
+                                container_path: wt.container_path.clone(),
+                                runner_wt_path: wt.worktree_path.clone(),
+                                schemas_repo_root,
+                                schemas_wt_path: Some(wt.schemas_path.clone()),
+                            });
                         }
                         Some(wt.src_tauri)
                     }
                     Err(e) => {
                         let mut runners = state.runners.write().await;
-                        runners.remove(&id);
+                        runners.remove(id);
                         return Err(e);
                     }
                 }
@@ -1664,7 +1826,7 @@ pub async fn spawn_test(
         // opted into `allow_stale_fallback`, in which case we keep the
         // placeholder and fall through to spawn from the previous slot exe.
         let build_fut = crate::build_monitor::run_cargo_build_with_dir(
-            &state,
+            state,
             body.requester_id.clone(),
             build_dir_override,
         );
@@ -1686,7 +1848,40 @@ pub async fn spawn_test(
                 build_attempted = true;
                 build_succeeded = Some(true);
             }
-            Err(e) => {
+            Err(mut e) => {
+                // Item 1(b) — drift diagnostic. With pinned-schemas isolation
+                // a build failure should reference only files inside the spawn
+                // container. If the cargo error references a path OUTSIDE the
+                // container (e.g. the SHARED qontinui-schemas checkout), the
+                // failure is residual shared path-dep drift, not the requested
+                // ref's fault — prefix the error so the caller doesn't chase a
+                // phantom regression. Only applies to git_ref (worktree) builds
+                // where we know the container path.
+                if let Some(paths) = &git_ref_cleanup_paths {
+                    if let Some(offending) =
+                        crate::spawn_worktree::classify_drift(&e.to_string(), &paths.container_path)
+                    {
+                        let prefixed = format!(
+                            "{}{} | {}",
+                            crate::spawn_worktree::DRIFT_PREFIX,
+                            offending,
+                            e
+                        );
+                        state
+                            .logs
+                            .emit(
+                                LogSource::Supervisor,
+                                LogLevel::Warn,
+                                format!(
+                                    "spawn-test build failure references a path outside the spawn container ({}); classifying as shared path-dep drift",
+                                    offending
+                                ),
+                            )
+                            .await;
+                        e = SupervisorError::BuildFailed(prefixed);
+                    }
+                }
+
                 // Optional spawn-worktree cleanup. Best-effort, runs before
                 // any of the existing error-path branches so the worktree
                 // is gone whether we fall through (allow_stale_fallback)
@@ -1694,19 +1889,26 @@ pub async fn spawn_test(
                 // the caller's request — `cleanup_fresh_worktree` logs and
                 // swallows internally.
                 if body.cleanup_worktree_on_fail && body.git_ref.is_some() {
-                    if let Some((repo_root, wt_path)) = &git_ref_cleanup_paths {
+                    if let Some(paths) = &git_ref_cleanup_paths {
                         state
                             .logs
                             .emit(
                                 LogSource::Supervisor,
                                 LogLevel::Info,
                                 format!(
-                                    "spawn-test cleanup_worktree_on_fail: removing {:?} after build failure",
-                                    wt_path
+                                    "spawn-test cleanup_worktree_on_fail: removing spawn container {:?} after build failure",
+                                    paths.container_path
                                 ),
                             )
                             .await;
-                        crate::spawn_worktree::cleanup_fresh_worktree(repo_root, wt_path).await;
+                        crate::spawn_worktree::cleanup_fresh_worktree(
+                            &paths.repo_root,
+                            &paths.container_path,
+                            &paths.runner_wt_path,
+                            paths.schemas_repo_root.as_deref(),
+                            paths.schemas_wt_path.as_deref(),
+                        )
+                        .await;
                     }
                 }
 
@@ -1728,7 +1930,7 @@ pub async fn spawn_test(
                 } else {
                     // Release the placeholder port reservation.
                     let mut runners = state.runners.write().await;
-                    runners.remove(&id);
+                    runners.remove(id);
                     return Err(e);
                 }
             }
@@ -1742,7 +1944,7 @@ pub async fn spawn_test(
     // optional rebuild so a `{rebuild: true, use_lkg: true}` call uses the
     // freshly-rebuilt binary as its LKG (the rebuild updated LKG on success).
     if body.use_lkg {
-        match manager::resolve_lkg_exe(&state).await {
+        match manager::resolve_lkg_exe(state).await {
             Ok(lkg_path) => {
                 let mut slot = managed.source_exe_override.write().await;
                 *slot = Some(lkg_path.clone());
@@ -1764,7 +1966,7 @@ pub async fn spawn_test(
             }
             Err(e) => {
                 let mut runners = state.runners.write().await;
-                runners.remove(&id);
+                runners.remove(id);
                 return Err(e);
             }
         }
@@ -1775,9 +1977,9 @@ pub async fn spawn_test(
     // fail inside `start_runner_by_id` with a less helpful error. If the check
     // fails, remove the placeholder we reserved above so the port frees up.
     // Skip when use_lkg pinned an override above — we already verified that path.
-    if !body.use_lkg && manager::resolve_source_exe(&state).await.is_err() {
+    if !body.use_lkg && manager::resolve_source_exe(state).await.is_err() {
         let mut runners = state.runners.write().await;
-        runners.remove(&id);
+        runners.remove(id);
         return Err(SupervisorError::Process(
             "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
@@ -1819,9 +2021,9 @@ pub async fn spawn_test(
             }
             Err((status, body_json)) => {
                 let mut runners = state.runners.write().await;
-                runners.remove(&id);
+                runners.remove(id);
                 drop(runners);
-                return Ok((status, Json(body_json)).into_response());
+                return Ok((status, body_json));
             }
         }
     }
@@ -1832,10 +2034,10 @@ pub async fn spawn_test(
     // spawn's failed health probe, stop_all_temp_runners, the reaper).
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    if let Err(e) = manager::start_managed_runner(state, managed).await {
         // Clean up on failure
         let mut runners = state.runners.write().await;
-        runners.remove(&id);
+        runners.remove(id);
         return Err(e);
     }
 
@@ -1870,7 +2072,7 @@ pub async fn spawn_test(
     let mut health_probe_ms: Option<u64> = None;
     let mut probed_git_sha: Option<String> = None;
     if body.health_probe_timeout_ms > 0 {
-        match probe_runner_health(&state, &id, port, body.health_probe_timeout_ms).await {
+        match probe_runner_health(state, id, port, body.health_probe_timeout_ms).await {
             ProbeOutcome::Healthy {
                 elapsed_ms,
                 git_sha,
@@ -1902,7 +2104,7 @@ pub async fn spawn_test(
                 // explicitly preserved across this cleanup path (it's the
                 // whole point of the early-death capture) — only the
                 // explicit user-facing /stop endpoint deletes it.
-                let early_log_path = if let Some(managed) = state.get_runner(&id).await {
+                let early_log_path = if let Some(managed) = state.get_runner(id).await {
                     managed
                         .early_log_path
                         .read()
@@ -1917,7 +2119,7 @@ pub async fn spawn_test(
                 // will also snapshot (as GracefulStop) for test- runners, but
                 // we overwrite with Crashed here since a health-probe failure
                 // is the more accurate reason.
-                if let Some(managed) = state.get_runner(&id).await {
+                if let Some(managed) = state.get_runner(id).await {
                     let snapshot = crate::process::stopped_cache::snapshot_from_managed(
                         managed.as_ref(),
                         None,
@@ -1929,10 +2131,10 @@ pub async fn spawn_test(
                 }
 
                 // Stop & clean up so we don't leak a zombie.
-                let _ = manager::stop_runner_by_id(&state, &id).await;
+                let _ = manager::stop_runner_by_id(state, id).await;
                 {
                     let mut runners = state.runners.write().await;
-                    runners.remove(&id);
+                    runners.remove(id);
                 }
                 state.notify_health_change();
 
@@ -1969,7 +2171,7 @@ pub async fn spawn_test(
                     "early_log_path": early_log_path,
                 });
 
-                return Ok((status, Json(body)).into_response());
+                return Ok((status, body));
             }
         }
     }
@@ -2054,12 +2256,12 @@ pub async fn spawn_test(
     // runner was pinned to LKG, prefer the LKG path's metadata over the
     // freshest slot's so the response describes what's actually running.
     let exe_meta = if body.use_lkg {
-        crate::process::manager::resolve_lkg_exe(&state)
+        crate::process::manager::resolve_lkg_exe(state)
             .await
             .ok()
             .and_then(|p| crate::process::manager::binary_meta(&p))
     } else {
-        crate::process::manager::resolve_source_exe(&state)
+        crate::process::manager::resolve_source_exe(state)
             .await
             .ok()
             .and_then(|p| crate::process::manager::binary_meta(&p))
@@ -2070,7 +2272,7 @@ pub async fn spawn_test(
     // (someone forgot to `npm run build`). Either way, the runner ships with
     // a UI that doesn't reflect current source.
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state).await;
+        resolve_frontend_stale_for_spawn(state).await;
 
     // Short-circuit with 503 before reporting success when the spawned
     // runner would serve a broken or stale UI. Two triggers:
@@ -2094,10 +2296,10 @@ pub async fn spawn_test(
     if frontend_stale && (dist_missing || body.frontend_strict) {
         // Stop the runner we just spawned — we will not ship a broken/stale
         // UI to the caller.
-        let _ = manager::stop_runner_by_id(&state, &id).await;
+        let _ = manager::stop_runner_by_id(state, id).await;
         {
             let mut runners = state.runners.write().await;
-            runners.remove(&id);
+            runners.remove(id);
         }
         state.notify_health_change();
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
@@ -2123,7 +2325,7 @@ pub async fn spawn_test(
             "frontend_stale_reason": reason_str,
             "stale_slot_id": stale_slot_id,
         });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
     }
 
     // Item A: assemble the build_result JSON object. `slot_id` reads
@@ -2316,14 +2518,13 @@ pub async fn spawn_test(
         };
         resp["warnings"] = json!([stale_msg]);
 
-        let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
-        response
-            .headers_mut()
-            .insert("X-Frontend-Stale", "1".parse().unwrap());
-        return Ok(response);
+        // The legacy `X-Frontend-Stale: 1` response header can't ride a stored
+        // submission outcome, so the sync handler re-attaches it by branching on
+        // the `frontend_stale` body field (always present here).
+        return Ok((axum::http::StatusCode::OK, resp));
     }
 
-    Ok(Json(resp).into_response())
+    Ok((axum::http::StatusCode::OK, resp))
 }
 
 /// Reason a `frontend_stale: true` was raised.

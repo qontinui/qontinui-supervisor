@@ -54,6 +54,55 @@ pub enum SupervisorError {
     Other(String),
 }
 
+impl SupervisorError {
+    /// Render this error to the same `(StatusCode, JSON body)` pair that
+    /// [`IntoResponse`] would, but as values rather than a `Response`.
+    ///
+    /// Lets callers that route an error through a non-HTTP boundary (e.g. a
+    /// build-submission terminal state recorded by a background task — Item 6)
+    /// reproduce the exact wire shape the synchronous path returns, then build
+    /// the `Response` later. `IntoResponse::into_response` is implemented in
+    /// terms of this so the two can never drift.
+    pub fn to_status_body(&self) -> (StatusCode, serde_json::Value) {
+        if let SupervisorError::BuildPoolFull {
+            queue_position,
+            active_builds,
+            estimated_wait_secs,
+        } = self
+        {
+            let mut body = serde_json::json!({
+                "error": "build_pool_full",
+                "message": self.to_string(),
+                "queue_position": queue_position,
+                "active_builds": active_builds,
+            });
+            if let Some(w) = estimated_wait_secs {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
+            }
+            return (StatusCode::SERVICE_UNAVAILABLE, body);
+        }
+
+        let status = match self {
+            SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
+            SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
+            SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
+            SupervisorError::BuildInProgress => StatusCode::CONFLICT,
+            SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
+            SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
+            SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let body = serde_json::json!({ "error": self.to_string() });
+        (status, body)
+    }
+}
+
 impl IntoResponse for SupervisorError {
     fn into_response(self) -> Response {
         if let SupervisorError::BuildPoolFull {
