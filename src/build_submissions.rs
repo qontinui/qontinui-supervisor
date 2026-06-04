@@ -142,6 +142,30 @@ pub struct BuildSubmission {
     pub stdout_tail: Vec<String>,
     /// Last ~500 lines of cargo stderr. Populated on completion.
     pub stderr_tail: Vec<String>,
+    /// Spawn-test outcome, when this submission was created via
+    /// [`submit_spawn`] (`POST /runners/spawn-test`). Carries the exact HTTP
+    /// status + body the synchronous spawn-test path would have returned —
+    /// build provenance, runner id/port, exe metadata, frontend-stale, etc.
+    /// `None` for plain `/build/submit` cargo submissions and until the spawn
+    /// build reaches a terminal state. See Item 6 of
+    /// `2026-06-03-ui-bridge-verification-friction-improvements`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnOutcome>,
+}
+
+/// Terminal outcome of a spawn-test build submission. Mirrors the
+/// synchronous `POST /runners/spawn-test` response so a `GET /build/:id/status`
+/// poll can recover the full result after a supervisor restart killed the
+/// original long-poll connection (Item 6).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpawnOutcome {
+    /// HTTP status the synchronous path would have returned (200, 503, …).
+    pub http_status: u16,
+    /// Reserved temp-runner port (echoed up-front in the 202 so callers can
+    /// target the runner before the build finishes).
+    pub port: u16,
+    /// The full response body (same shape as the sync 200/5xx body).
+    pub body: serde_json::Value,
 }
 
 /// Bounded in-memory submission store.
@@ -238,6 +262,7 @@ pub async fn submit(
         cache_hit: false,
         stdout_tail: Vec::new(),
         stderr_tail: Vec::new(),
+        spawn: None,
     };
 
     let store = state.build_submissions.clone();
@@ -253,6 +278,131 @@ pub async fn submit(
     });
 
     Ok(id)
+}
+
+/// Register a spawn-test build submission and drive it through the SAME
+/// state machine as `/build/submit`, so the supervisor has exactly one build
+/// state machine (Item 6 of
+/// `2026-06-03-ui-bridge-verification-friction-improvements`).
+///
+/// `exec` is the spawn build+spawn+probe+assemble future. It runs in a
+/// detached background task; its `(http_status, body)` result is stored on
+/// the submission's terminal state alongside the reserved `port`. The
+/// submission moves `Queued → Running → Succeeded/Failed` exactly like a
+/// cargo submission:
+///
+/// - The future is awaited under the `Running` state.
+/// - A `2xx` http_status records `Succeeded`; anything else records `Failed`
+///   (build/spawn/frontend error). `error` carries a short reason pulled from
+///   the body so `GET /build/:id/status` is useful without parsing `spawn`.
+///
+/// Returns the submission id immediately. The async spawn-test path returns a
+/// 202 with this id + `port`; the sync path awaits terminal via
+/// [`await_terminal`] and unwraps `spawn`.
+pub fn submit_spawn<F>(
+    store: Arc<BuildSubmissionStore>,
+    worktree_path: PathBuf,
+    agent_id: Option<String>,
+    port: u16,
+    exec: F,
+) -> (Uuid, Arc<RwLock<BuildSubmission>>)
+where
+    F: std::future::Future<Output = (u16, serde_json::Value)> + Send + 'static,
+{
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let submission = BuildSubmission {
+        id,
+        worktree_path,
+        build_kind: BuildKind::Build,
+        agent_id,
+        package: None,
+        features: vec!["custom-protocol".to_string()],
+        base_ref: None,
+        submitted_at: now,
+        status: BuildStatus::Queued,
+        cache_key: None,
+        cache_outcome: None,
+        cache_hit: false,
+        stdout_tail: Vec::new(),
+        stderr_tail: Vec::new(),
+        spawn: None,
+    };
+
+    // Insert synchronously-enough: callers await this fn (it's not async, so
+    // we block the insert onto the same task via a dedicated runtime handle is
+    // overkill). Instead we insert from the background task BEFORE running
+    // exec, and return the Arc the caller already holds. To keep the id
+    // queryable the instant this returns, we build the Arc here and insert it
+    // into the store from the spawned task's first step.
+    let arc = Arc::new(RwLock::new(submission));
+    let arc_ret = arc.clone();
+    let store_bg = store.clone();
+    tokio::spawn(async move {
+        // Register in the store so `GET /build/:id/status` can find it.
+        {
+            let mut map = store_bg.submissions.write().await;
+            map.insert(id, arc.clone());
+        }
+        let started_at = Utc::now();
+        {
+            let mut sub = arc.write().await;
+            sub.status = BuildStatus::Running { started_at };
+        }
+
+        let (http_status, body) = exec.await;
+        let finished_at = Utc::now();
+        let duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+        let succeeded = (200..300).contains(&http_status);
+
+        let mut sub = arc.write().await;
+        sub.spawn = Some(SpawnOutcome {
+            http_status,
+            port,
+            body: body.clone(),
+        });
+        sub.status = if succeeded {
+            BuildStatus::Succeeded {
+                started_at,
+                finished_at,
+                duration_secs,
+            }
+        } else {
+            // Pull a short reason from the body (build_result.error / error /
+            // message) so the terminal status is self-describing.
+            let reason = body
+                .get("build_result")
+                .and_then(|br| br.get("error"))
+                .and_then(|e| e.as_str())
+                .or_else(|| body.get("error").and_then(|e| e.as_str()))
+                .or_else(|| body.get("message").and_then(|m| m.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("spawn-test returned HTTP {http_status}"));
+            BuildStatus::Failed {
+                started_at,
+                finished_at,
+                duration_secs,
+                exit_code: None,
+                error: reason,
+            }
+        };
+    });
+
+    (id, arc_ret)
+}
+
+/// Block until `sub` reaches a terminal `BuildStatus`. Polls the submission's
+/// own lock every 100ms — the spawn build/probe is the long pole (seconds to
+/// minutes), so a coarse poll is fine and avoids threading a notifier through
+/// the state machine. Used by the SYNCHRONOUS spawn-test path so both sync and
+/// async requests flow through the same submission.
+pub async fn await_terminal(sub: &Arc<RwLock<BuildSubmission>>) {
+    loop {
+        if sub.read().await.status.is_terminal() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>>) {
@@ -797,6 +947,7 @@ mod tests {
             cache_hit: false,
             stdout_tail: vec![],
             stderr_tail: vec![],
+            spawn: None,
         };
         store.insert(sub).await;
         let found = store.get(&id).await;
@@ -828,6 +979,7 @@ mod tests {
                 cache_hit: false,
                 stdout_tail: vec![],
                 stderr_tail: vec![],
+                spawn: None,
             };
             store.insert(sub).await;
         }
@@ -858,6 +1010,7 @@ mod tests {
                 cache_hit: false,
                 stdout_tail: vec![],
                 stderr_tail: vec![],
+                spawn: None,
             };
             store.insert(sub).await;
         }
@@ -878,6 +1031,7 @@ mod tests {
             cache_hit: false,
             stdout_tail: vec![],
             stderr_tail: vec![],
+            spawn: None,
         };
         store.insert(extra).await;
         // 17 entries, all in-flight — no evictions possible.
@@ -886,5 +1040,125 @@ mod tests {
         for id in ids {
             assert!(store.get(&id).await.is_some());
         }
+    }
+
+    // ---------- spawn submission state machine (Item 6) ----------
+
+    #[tokio::test]
+    async fn submit_spawn_reaches_terminal_succeeded_and_stores_outcome() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        // Fake spawn exec: returns a 200 + a body shaped like the real
+        // spawn-test response. No cargo, no runner — exercises the state
+        // machine + outcome plumbing only.
+        let (id, arc) = submit_spawn(
+            store.clone(),
+            PathBuf::from("/tmp/runner/src-tauri"),
+            Some("agent-x".into()),
+            9881,
+            async {
+                (
+                    200,
+                    serde_json::json!({
+                        "id": "test-abc",
+                        "port": 9881,
+                        "status": "started",
+                        "build_result": { "state": "built", "succeeded": true },
+                    }),
+                )
+            },
+        );
+
+        // The id is queryable in the store (registered by the bg task).
+        await_terminal(&arc).await;
+        let found = store
+            .get(&id)
+            .await
+            .expect("submission registered in store");
+        let sub = found.read().await;
+        assert!(sub.status.is_terminal());
+        assert!(matches!(sub.status, BuildStatus::Succeeded { .. }));
+        let outcome = sub.spawn.as_ref().expect("spawn outcome recorded");
+        assert_eq!(outcome.http_status, 200);
+        assert_eq!(outcome.port, 9881);
+        assert_eq!(outcome.body["id"], "test-abc");
+        assert_eq!(outcome.body["build_result"]["succeeded"], true);
+    }
+
+    #[tokio::test]
+    async fn submit_spawn_non_2xx_records_failed_with_reason() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (_id, arc) = submit_spawn(
+            store.clone(),
+            PathBuf::from("/tmp/runner/src-tauri"),
+            None,
+            9882,
+            async {
+                (
+                    500,
+                    serde_json::json!({
+                        "build_result": {
+                            "state": "failed",
+                            "succeeded": false,
+                            "error": "error[E0277]: trait bound not satisfied",
+                        },
+                    }),
+                )
+            },
+        );
+
+        await_terminal(&arc).await;
+        let sub = arc.read().await;
+        match &sub.status {
+            BuildStatus::Failed { error, .. } => {
+                assert!(
+                    error.contains("E0277"),
+                    "failed status should carry the build error reason; got {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let outcome = sub
+            .spawn
+            .as_ref()
+            .expect("spawn outcome recorded even on failure");
+        assert_eq!(outcome.http_status, 500);
+    }
+
+    #[tokio::test]
+    async fn spawn_outcome_serializes_only_when_present() {
+        // A plain cargo submission must NOT serialize a `spawn` field (it's
+        // `skip_serializing_if = "Option::is_none"`); a spawn submission must.
+        let cargo = BuildSubmission {
+            id: Uuid::new_v4(),
+            worktree_path: PathBuf::from("/tmp/x"),
+            build_kind: BuildKind::Build,
+            agent_id: None,
+            package: None,
+            features: vec![],
+            base_ref: None,
+            submitted_at: Utc::now(),
+            status: BuildStatus::Queued,
+            cache_key: None,
+            cache_outcome: None,
+            cache_hit: false,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+            spawn: None,
+        };
+        let v = serde_json::to_value(&cargo).unwrap();
+        assert!(
+            v.get("spawn").is_none(),
+            "cargo submission must omit `spawn`"
+        );
+
+        let mut spawn_sub = cargo.clone();
+        spawn_sub.spawn = Some(SpawnOutcome {
+            http_status: 200,
+            port: 9881,
+            body: serde_json::json!({"id": "test-abc"}),
+        });
+        let v = serde_json::to_value(&spawn_sub).unwrap();
+        assert_eq!(v["spawn"]["http_status"], 200);
+        assert_eq!(v["spawn"]["port"], 9881);
     }
 }
