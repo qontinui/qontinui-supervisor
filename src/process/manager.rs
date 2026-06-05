@@ -397,6 +397,81 @@ pub fn format_drift_warning(d: &SlotShaDrift) -> String {
     )
 }
 
+/// Outcome of [`start_provenance_gate`] when the start is allowed but the
+/// supervisor has no positive evidence the slot exe is honest (pre-upgrade
+/// sidecar, write failure, legacy file). Carries a human-readable warning to
+/// log; the start proceeds. Refusal keys on POSITIVE evidence of wrongness
+/// only — an unknown provenance must never brick a start (e.g. the first
+/// watchdog auto-start after a deploy, when every pre-upgrade slot is unknown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartProvenanceWarning(pub String);
+
+/// Pure decision gate for a runner start, over `(temp-ness, slot provenance)`.
+///
+/// This is the last line of defense against the 2026-06-05 incident: a slot
+/// whose exe was built from a foreign override tree (`source == override`) must
+/// never be deployed to a NON-temp runner (the operator's primary, a named
+/// runner, or the watchdog boot auto-start). Phase 1 gave slots an honest
+/// provenance sidecar; this gate refuses to start a non-temp runner from a slot
+/// that positively says `override`.
+///
+/// Decision matrix (`is_temp`, `slot_provenance`):
+/// - **temp** → always `Ok(None)`. Temp runners (`test-*`) exist to run foreign
+///   refs; their spawn responses already carry full provenance, so the operator
+///   sees exactly what they asked for. Never gated.
+/// - **non-temp + `Some(source == Override)`** → `Err` naming the slot, the
+///   provenance (`built_from` + `sha`), and the recovery
+///   (`POST /runner/fix-and-rebuild`, then start). Positive evidence of a
+///   foreign exe — refuse.
+/// - **non-temp + `None`** (no sidecar / unreadable — pre-upgrade slot, write
+///   failure, legacy file) → `Ok(Some(warning))`. Warn-and-proceed: absence is
+///   "unknown", not "wrong". Degrades to pre-Phase-3 behavior.
+/// - **non-temp + `Some(source == LiveTree)`** → `Ok(None)`, regardless of
+///   whether `sha == HEAD`. Main advancing between build and start is staleness,
+///   NOT a provenance lie; existing slot-drift / `target/debug` staleness
+///   warnings already cover it. We deliberately do NOT gate on sha.
+///
+/// Pure (no I/O / no state) so it is unit-testable without a live `SharedState`,
+/// mirroring [`provenance_rebuild_guard`].
+pub fn start_provenance_gate(
+    is_temp: bool,
+    slot_id: usize,
+    slot_provenance: Option<&BuildProvenance>,
+) -> Result<Option<StartProvenanceWarning>, SupervisorError> {
+    // Temp runners are always permissive — they are the sanctioned vehicle for
+    // running foreign refs, and their spawn responses surface full provenance.
+    if is_temp {
+        return Ok(None);
+    }
+
+    match slot_provenance {
+        Some(prov) if prov.source == BuildSource::Override => {
+            let sha = prov.sha.as_deref().unwrap_or("(unknown)");
+            Err(SupervisorError::Process(format!(
+                "Refusing to start non-temp runner from slot {slot_id}: its exe was built \
+                 from a foreign override tree (source=override, built_from={}, sha={sha}), \
+                 not the live runner tree. Deploying it would put unverified branch code on \
+                 a managed runner. Recovery: POST /runner/fix-and-rebuild to rebuild the \
+                 live tree into the slots, then start. (Temp runners via spawn-test may run \
+                 foreign refs; non-temp runners may not.)",
+                prov.built_from,
+            )))
+        }
+        // Positive live-tree evidence — allow. sha-vs-HEAD staleness is covered
+        // by the existing drift warnings, not this gate.
+        Some(_) => Ok(None),
+        // No positive evidence either way — warn and proceed (pre-upgrade
+        // sidecar, write failure, legacy file). Never brick a start on unknown.
+        None => Ok(Some(StartProvenanceWarning(format!(
+            "Starting non-temp runner from slot {slot_id} with UNKNOWN provenance \
+             (no readable provenance sidecar — likely a pre-upgrade build, a sidecar \
+             write failure, or a legacy file). Proceeding: refusal keys on positive \
+             evidence of a foreign exe only. The slot self-heals on the next successful \
+             build, which rewrites the sidecar."
+        )))),
+    }
+}
+
 /// Pure decision: which slot would [`resolve_source_exe`] pick, given the
 /// recorded `last_successful_slot` and a list of `(slot_id, exe_path)` pairs?
 ///
@@ -1210,7 +1285,41 @@ async fn start_exe_mode_for_runner(
                     managed.config.name, p
                 )));
             }
-            None => resolve_source_exe(state).await?,
+            None => {
+                // Provenance gate (Phase 3): before resolving a slot exe for a
+                // NON-temp runner, refuse any slot whose provenance positively
+                // says it was built from a foreign override tree. This is the
+                // single funnel for manual start, restart_all, and the
+                // `--watchdog` boot auto-start — one wire-in covers every path.
+                // Temp runners are permissive (they exist to run foreign refs).
+                //
+                // The gate keys on the SAME slot `resolve_source_exe` would
+                // pick (`pick_slot_for_resolution`), so we never refuse a start
+                // over a slot that wouldn't actually be deployed. When no slot
+                // has an exe, the pick is `None` and we fall through to the
+                // legacy-path resolution unguarded (there is no slot provenance
+                // to evaluate, and the legacy path already hard-fails on a
+                // missing exe).
+                let is_temp = is_temp_runner(&managed.config.id);
+                if let Some(picked_id) = pick_slot_for_resolution(state).await {
+                    let prov = state
+                        .build_pool
+                        .slots
+                        .iter()
+                        .find(|s| s.id == picked_id)
+                        .and_then(|s| read_slot_provenance(&s.target_dir));
+                    if let Some(StartProvenanceWarning(msg)) =
+                        start_provenance_gate(is_temp, picked_id, prov.as_ref())?
+                    {
+                        warn!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                            .await;
+                    }
+                }
+                resolve_source_exe(state).await?
+            }
         }
     };
 
@@ -2734,6 +2843,144 @@ mod tests {
         std::fs::create_dir_all(&debug).expect("mkdir debug");
         std::fs::write(debug.join(SLOT_PROVENANCE_SIDECAR_FILENAME), b"   \n\t  ").expect("write");
         assert!(read_slot_provenance(dir.path()).is_none());
+    }
+
+    // =========================================================================
+    // Start provenance gate (Phase 3): non-temp start refuses a known-foreign
+    // (override) slot exe; temp stays permissive; unknown warns; live allows.
+    // =========================================================================
+
+    fn override_prov(sha: Option<String>) -> BuildProvenance {
+        BuildProvenance {
+            sha,
+            source: BuildSource::Override,
+            built_from: "/some/abs/.spawn-feat-x/qontinui-runner".to_string(),
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+        }
+    }
+    fn live_prov(sha: Option<String>) -> BuildProvenance {
+        BuildProvenance {
+            sha,
+            source: BuildSource::LiveTree,
+            built_from: "/live/tree".to_string(),
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+        }
+    }
+
+    /// Temp runner: always allowed, regardless of provenance. Temp runners
+    /// exist to run foreign refs.
+    #[test]
+    fn start_gate_temp_always_ok() {
+        // override
+        assert_eq!(
+            start_provenance_gate(true, 0, Some(&override_prov(Some(sha_a())))).unwrap(),
+            None
+        );
+        // live tree
+        assert_eq!(
+            start_provenance_gate(true, 1, Some(&live_prov(Some(sha_b())))).unwrap(),
+            None
+        );
+        // unknown
+        assert_eq!(start_provenance_gate(true, 2, None).unwrap(), None);
+    }
+
+    /// Non-temp + positive override evidence: refuse with an error naming the
+    /// slot, the provenance (built_from + sha), and the recovery path.
+    #[test]
+    fn start_gate_non_temp_override_refuses_with_recovery() {
+        let err = start_provenance_gate(false, 2, Some(&override_prov(Some(sha_a()))))
+            .expect_err("override must refuse");
+        let msg = err.to_string();
+        // Names the slot.
+        assert!(msg.contains("slot 2"), "missing slot id: {msg}");
+        // Names the provenance detail.
+        assert!(msg.contains("source=override"), "missing source: {msg}");
+        assert!(
+            msg.contains(".spawn-feat-x/qontinui-runner"),
+            "missing built_from: {msg}"
+        );
+        assert!(msg.contains(&sha_a()), "missing sha: {msg}");
+        // Names the recovery.
+        assert!(
+            msg.contains("POST /runner/fix-and-rebuild"),
+            "missing recovery: {msg}"
+        );
+        // Maps to a 500 through existing start-failure plumbing.
+        assert_eq!(
+            err.to_status_body().0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Non-temp + override with no sha still refuses and renders `(unknown)`.
+    #[test]
+    fn start_gate_non_temp_override_null_sha_still_refuses() {
+        let err = start_provenance_gate(false, 0, Some(&override_prov(None)))
+            .expect_err("override must refuse even without a sha");
+        assert!(err.to_string().contains("sha=(unknown)"), "{err}");
+    }
+
+    /// Non-temp + unknown provenance (no sidecar): warn-and-proceed, NOT a
+    /// refusal. Avoids bricking the first watchdog auto-start after a deploy.
+    #[test]
+    fn start_gate_non_temp_unknown_warns_proceeds() {
+        let out = start_provenance_gate(false, 1, None).expect("unknown must not error");
+        let StartProvenanceWarning(msg) = out.expect("unknown must produce a warning");
+        assert!(msg.contains("slot 1"), "{msg}");
+        assert!(msg.to_lowercase().contains("unknown"), "{msg}");
+    }
+
+    /// Non-temp + live-tree provenance: allowed regardless of sha. main
+    /// advancing between build and start is staleness, not a provenance lie.
+    #[test]
+    fn start_gate_non_temp_live_tree_ok_regardless_of_sha() {
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&live_prov(Some(sha_a())))).unwrap(),
+            None
+        );
+        // A different (stale) sha is still fine — no sha gating.
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&live_prov(Some(sha_c())))).unwrap(),
+            None
+        );
+        // Even a null sha live-tree build is allowed.
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&live_prov(None))).unwrap(),
+            None
+        );
+    }
+
+    /// Integration-style: a slot whose on-disk provenance sidecar says
+    /// `override` makes a NON-temp (primary) start fail with the documented
+    /// recovery message, while a `test-*` spawn resolving the SAME slot still
+    /// works. Exercises the real `read_slot_provenance` read path + the gate
+    /// together, reusing the Phase 1 temp-dir slot fixture (`write_provenance`).
+    #[test]
+    fn start_gate_same_override_slot_refuses_primary_allows_temp() {
+        let slot_dir = tempfile::TempDir::new().expect("tempdir");
+        // Phase 1 fixture: write a real override provenance sidecar into the
+        // slot's target dir.
+        write_provenance(slot_dir.path(), &override_prov(Some(sha_a())));
+        let prov = read_slot_provenance(slot_dir.path());
+        assert!(prov.is_some(), "fixture must produce readable provenance");
+
+        // Same slot id (7), same provenance. Primary (non-temp) is refused...
+        let primary_is_temp = is_temp_runner("primary");
+        assert!(!primary_is_temp, "primary must be non-temp");
+        let primary = start_provenance_gate(primary_is_temp, 7, prov.as_ref());
+        let err = primary.expect_err("primary start must be refused for an override slot");
+        assert!(err.to_string().contains("slot 7"), "{err}");
+        assert!(
+            err.to_string().contains("POST /runner/fix-and-rebuild"),
+            "{err}"
+        );
+
+        // ...while a test-* spawn resolving the SAME slot is allowed.
+        let temp_is_temp = is_temp_runner("test-9877");
+        assert!(temp_is_temp, "test-* must be temp");
+        let temp = start_provenance_gate(temp_is_temp, 7, prov.as_ref());
+        assert_eq!(temp.expect("temp start must be allowed"), None);
     }
 
     // =========================================================================
