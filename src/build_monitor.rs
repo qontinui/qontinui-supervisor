@@ -99,7 +99,7 @@ pub async fn run_cargo_build_with_requester(
     state: &SharedState,
     requester_id: Option<String>,
 ) -> Result<(), SupervisorError> {
-    run_cargo_build_with_dir(state, requester_id, None).await
+    run_cargo_build_with_dir(state, requester_id, None, false).await
 }
 
 /// Run a cargo build, optionally compiling a source tree other than
@@ -113,10 +113,19 @@ pub async fn run_cargo_build_with_requester(
 ///   still points at the claimed slot's `target_dir`, and the built exe is
 ///   resolved from that slot exactly as today. Only the *source* tree
 ///   differs.
+///
+/// `force_frontend_build` (Phase 3 `frontend_only`): when true AND
+/// `build_dir_override` is set, the worktree frontend prebuild ALWAYS runs
+/// `pnpm run build` even if the dist-present idempotency gate would skip it —
+/// so a TS edit made after the tree's last build is re-embedded rather than
+/// serving the stale dist. `pnpm install` is still skipped when the
+/// `node_modules` marker is present. No effect on a live-tree build (no
+/// override).
 pub async fn run_cargo_build_with_dir(
     state: &SharedState,
     requester_id: Option<String>,
     build_dir_override: Option<PathBuf>,
+    force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -200,11 +209,25 @@ pub async fn run_cargo_build_with_dir(
     let build_start = std::time::Instant::now();
     #[cfg(target_os = "windows")]
     let result = match free_slot_exe(state, &slot).await {
-        Ok(()) => run_build_inner(state, &slot, build_dir_override.as_deref()).await,
+        Ok(()) => {
+            run_build_inner(
+                state,
+                &slot,
+                build_dir_override.as_deref(),
+                force_frontend_build,
+            )
+            .await
+        }
         Err(e) => Err(e),
     };
     #[cfg(not(target_os = "windows"))]
-    let result = run_build_inner(state, &slot, build_dir_override.as_deref()).await;
+    let result = run_build_inner(
+        state,
+        &slot,
+        build_dir_override.as_deref(),
+        force_frontend_build,
+    )
+    .await;
     let duration_secs = build_start.elapsed().as_secs_f64();
 
     // Pull any captured cargo stderr the inner build deposited so it can be
@@ -309,6 +332,7 @@ async fn run_build_inner(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
     build_dir_override: Option<&std::path::Path>,
+    force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
     // Source tree cargo will compile. `None` ⇒ the live project dir (legacy);
     // `Some(dir)` ⇒ a detached git-ref worktree's `src-tauri`.
@@ -333,7 +357,7 @@ async fn run_build_inner(
                 src_tauri
             ))
         })?;
-        prebuild_worktree_frontend(state, slot, &wt_root).await?;
+        prebuild_worktree_frontend(state, slot, &wt_root, force_frontend_build).await?;
     }
     // The frontend is embedded in the binary via tauri_build, so we must run
     // `pnpm run build` first to produce a fresh dist/ before cargo build.
@@ -775,8 +799,24 @@ async fn prebuild_worktree_frontend(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
     wt_root: &std::path::Path,
+    force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
-    if !needs_frontend_prebuild(wt_root) {
+    // Idempotency gate, split for the Phase 3 `frontend_only` fast path:
+    //   * `needs_install` — the `node_modules/.bin/ui-bridge-build-ir` marker
+    //     is absent, so `pnpm install` must run.
+    //   * `needs_build`   — `dist/index.html` is absent, so `pnpm run build`
+    //     must run.
+    // Default (force_frontend_build=false): if BOTH artifacts already exist,
+    // skip the whole prebuild (the historical behavior — repeated spawns on the
+    // same ref don't re-pay install/build). `frontend_only:true` FORCES
+    // `pnpm run build` regardless of `dist/index.html` presence, because a TS
+    // edit made after the tree's last build would otherwise silently embed the
+    // stale dist — exactly the case frontend_only exists for. `pnpm install`
+    // is still skipped when the marker is present (the "fast" in fast path).
+    let needs_install = frontend_install_marker_missing(wt_root);
+    let needs_build = !dist_index_present(wt_root);
+
+    if !needs_install && !needs_build && !force_frontend_build {
         info!(
             "Slot {}: frontend_prebuild_skipped — {:?} already has node_modules + dist/",
             slot.id, wt_root
@@ -803,8 +843,8 @@ async fn prebuild_worktree_frontend(
             LogSource::Build,
             LogLevel::Info,
             format!(
-                "Slot {}: waiting for npm lock (worktree frontend prebuild in {:?})",
-                slot.id, wt_root
+                "Slot {}: waiting for npm lock (worktree frontend prebuild in {:?}, force_build={})",
+                slot.id, wt_root, force_frontend_build
             ),
         )
         .await;
@@ -814,63 +854,82 @@ async fn prebuild_worktree_frontend(
     //    everything else `pnpm run build` needs. Use `--frozen-lockfile`
     //    when a pnpm-lock.yaml exists (reproducible, matches CI's
     //    `pnpm install --frozen-lockfile`); otherwise fall back to a plain
-    //    `pnpm install`.
-    let has_lockfile = wt_root.join("pnpm-lock.yaml").exists();
-    let install_args = if has_lockfile {
-        "install --frozen-lockfile"
-    } else {
-        "install"
-    };
+    //    `pnpm install`. Skipped when the marker already exists (so a
+    //    `frontend_only` re-spawn pays only the `pnpm run build` cost).
+    if needs_install {
+        let has_lockfile = wt_root.join("pnpm-lock.yaml").exists();
+        let install_args = if has_lockfile {
+            "install --frozen-lockfile"
+        } else {
+            "install"
+        };
 
-    info!(
-        "Slot {}: pnpm {} starting in {:?}",
-        slot.id, install_args, wt_root
-    );
-    state
-        .logs
-        .emit(
-            LogSource::Build,
-            LogLevel::Info,
-            format!(
-                "Slot {}: pnpm {} starting in {:?}",
-                slot.id, install_args, wt_root
-            ),
-        )
-        .await;
-
-    let install_started = std::time::Instant::now();
-    let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
-        SupervisorError::BuildFailed(format!(
-            "pnpm {} failed to spawn in spawn worktree {:?}: {}",
-            install_args, wt_root, e
-        ))
-    })?;
-    if !install_output.status.success() {
-        let stderr_tail = tail_bytes_keep_utf8(
-            &String::from_utf8_lossy(&install_output.stderr),
-            LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+        info!(
+            "Slot {}: pnpm {} starting in {:?}",
+            slot.id, install_args, wt_root
         );
-        return Err(SupervisorError::BuildFailed(format!(
-            "pnpm {} failed in spawn worktree {:?} (exit {}): {}",
-            install_args, wt_root, install_output.status, stderr_tail
-        )));
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!(
+                    "Slot {}: pnpm {} starting in {:?}",
+                    slot.id, install_args, wt_root
+                ),
+            )
+            .await;
+
+        let install_started = std::time::Instant::now();
+        let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
+            SupervisorError::BuildFailed(format!(
+                "pnpm {} failed to spawn in spawn worktree {:?}: {}",
+                install_args, wt_root, e
+            ))
+        })?;
+        if !install_output.status.success() {
+            let stderr_tail = tail_bytes_keep_utf8(
+                &String::from_utf8_lossy(&install_output.stderr),
+                LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+            );
+            return Err(SupervisorError::BuildFailed(format!(
+                "pnpm {} failed in spawn worktree {:?} (exit {}): {}",
+                install_args, wt_root, install_output.status, stderr_tail
+            )));
+        }
+        let install_secs = install_started.elapsed().as_secs();
+        info!(
+            "Slot {}: pnpm {} completed in {:?} ({}s)",
+            slot.id, install_args, wt_root, install_secs
+        );
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!(
+                    "Slot {}: pnpm {} completed in {:?} ({}s)",
+                    slot.id, install_args, wt_root, install_secs
+                ),
+            )
+            .await;
+    } else {
+        info!(
+            "Slot {}: pnpm install skipped — node_modules marker present in {:?}",
+            slot.id, wt_root
+        );
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!(
+                    "Slot {}: pnpm install skipped — node_modules marker present in {:?}",
+                    slot.id, wt_root
+                ),
+            )
+            .await;
     }
-    let install_secs = install_started.elapsed().as_secs();
-    info!(
-        "Slot {}: pnpm {} completed in {:?} ({}s)",
-        slot.id, install_args, wt_root, install_secs
-    );
-    state
-        .logs
-        .emit(
-            LogSource::Build,
-            LogLevel::Info,
-            format!(
-                "Slot {}: pnpm {} completed in {:?} ({}s)",
-                slot.id, install_args, wt_root, install_secs
-            ),
-        )
-        .await;
 
     // 2) pnpm run build — produces dist/index.html.
     info!("Slot {}: pnpm run build starting in {:?}", slot.id, wt_root);
@@ -925,13 +984,11 @@ async fn prebuild_worktree_frontend(
     Ok(())
 }
 
-/// True iff `<wt_root>` is missing EITHER `node_modules/.bin/ui-bridge-build-ir`
-/// OR `dist/index.html`. Used as the cheap idempotency gate by
-/// [`prebuild_worktree_frontend`] so repeated spawn-test calls on the same
-/// ref don't re-pay the ~30s pnpm install cost. Both signals together prove
-/// (a) the pnpm dependency tree was installed AND (b) the previous frontend
-/// build actually produced output.
-fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
+/// True iff `<wt_root>/node_modules/.bin/ui-bridge-build-ir` is ABSENT — i.e.
+/// `pnpm install` still needs to run. Half of the split idempotency gate used
+/// by [`prebuild_worktree_frontend`]; proves the pnpm dependency tree was
+/// installed (the marker is a workspace bin produced by `pnpm install`).
+fn frontend_install_marker_missing(wt_root: &std::path::Path) -> bool {
     let bin = wt_root
         .join("node_modules")
         .join(".bin")
@@ -940,8 +997,25 @@ fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
         } else {
             "ui-bridge-build-ir"
         });
-    let dist_index = wt_root.join("dist").join("index.html");
-    !(bin.exists() && dist_index.exists())
+    !bin.exists()
+}
+
+/// True iff `<wt_root>/dist/index.html` EXISTS — i.e. a previous frontend build
+/// already produced output. The other half of the split idempotency gate. When
+/// false, `pnpm run build` must run; the Phase 3 `frontend_only` fast path
+/// forces the build even when this is true (a stale dist from before a TS edit
+/// must be re-embedded).
+fn dist_index_present(wt_root: &std::path::Path) -> bool {
+    wt_root.join("dist").join("index.html").exists()
+}
+
+/// True iff `<wt_root>` is missing EITHER the `pnpm install` marker OR
+/// `dist/index.html` — the original combined idempotency gate, retained for the
+/// unit tests that pin its behavior. Equivalent to
+/// `frontend_install_marker_missing(wt_root) || !dist_index_present(wt_root)`.
+#[cfg(test)]
+fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
+    frontend_install_marker_missing(wt_root) || !dist_index_present(wt_root)
 }
 
 /// Verify the frontend output exists after a successful `npm run build`.

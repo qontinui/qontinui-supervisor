@@ -108,7 +108,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 |--------|------|-------------|
 | GET | `/runners` | List all runners with status |
 | POST | `/runners` | Add a runner config to the registry |
-| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?}`. Returns `{id, port, api_url, ui_bridge_url}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, frontend_only?, async?}`. Returns `{id, port, api_url, ui_bridge_url, build_id, source}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: `git_ref` / `worktree_path` / `frontend_only`" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
@@ -294,6 +294,35 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 - SSE `GET /health/stream` for real-time health data
 - SSE `GET /logs/stream` for real-time log entries
 - Fetches runner, build, velocity, and evaluation data via REST
+
+## Build provenance: `git_ref` / `worktree_path` / `frontend_only`
+
+`POST /runners/spawn-test` builds the **live runner tree** by default. To build something else, pass **exactly one** provenance selector — and these are the **only** accepted names:
+
+| Param | Builds | Notes |
+|-------|--------|-------|
+| `git_ref` | A managed detached worktree at the ref (branch/tag/SHA) | Supervisor materializes `<ws>/.spawn-<ref>/` with a pinned `origin/main` schemas sibling. Requires `rebuild: true`. |
+| `worktree_path` | An **existing caller-owned** checkout at that absolute path | Built in place, **never mutated, never cleaned up** (the caller owns it). Requires `rebuild: true`. |
+
+**Rejected aliases (400, not silently ignored).** `branch`, `worktree`, and `ref` are **not** spawn-test fields. Passing any of them now returns `400` naming the correct field (`git_ref` / `worktree_path`). Previously serde silently dropped them and the request fell back to a `source: "live_tree"` spawn — the exact failure that motivated this change. Always check the response `source` field (`"live_tree" | "worktree" | "worktree_path"`) to confirm what you actually got.
+
+**Mutual exclusion.** Setting both `git_ref` and `worktree_path` → `400 provenance_conflict`. Either selector without `rebuild: true` → `400 <field> requires rebuild:true` (provenance is never inferred — without a recompile you'd get the live tree's exe).
+
+**`worktree_path` validation (each a precise 400):**
+- path must exist and be a directory;
+- must NOT be the live runner tree (`worktree_path_is_live_tree`) — this param can never touch the live tree;
+- must contain `src-tauri/Cargo.toml` (`not_a_runner_worktree`);
+- must have a `../qontinui-schemas/rust/Cargo.toml` **sibling** (one level up from the worktree root, because the runner's path-deps are `../../qontinui-schemas/rust` relative to `src-tauri/`) → `path_deps_unresolved`.
+
+The response echoes `schemas_path`, `schemas_sha`, and `schemas_is_shared` so you can see whether the build resolved its schemas path-dep against the **shared** `qontinui-root/qontinui-schemas` checkout (drift hazard — a peer may park it on a WIP branch) versus a pinned one. `git_ref_resolved_sha`/`_short` carry the worktree's HEAD when it is a git checkout.
+
+**`frontend_only` fast path.** Requires a provenance selector (`git_ref` or `worktree_path`) — a `frontend_only` build of the live tree is refused (it would touch the shared tree). When true it **forces** a fresh `pnpm run build` in the isolated tree (re-embedding a TS change made after the tree's last build, which the default dist-present idempotency gate would otherwise skip), while skipping `pnpm install` if `node_modules` is already populated.
+
+**`frontend_only` still runs cargo.** A Tauri binary embeds `dist/` at `cargo build` time (`rust-embed`), so a fresh `dist/` is only picked up by recompiling. "Fast" means **don't re-fetch / don't reinstall node_modules / don't touch the live tree** — NOT "skip cargo." If you combine `frontend_only` with `use_lkg`/`allow_stale_fallback` and the spawned exe comes from LKG/stale reuse, the response carries `frontend_only_warning`: the reused exe embeds the OLD dist.
+
+**`build_id`.** Every spawn-test response (sync 200 body and async poll body) carries `build_id` = the build submission id. It correlates with `GET /build/{build_id}/status`. Both the synchronous and `async: true` paths drive the same build-submissions state machine.
+
+**Operational: the running supervisor binary must be rebuilt to carry newly-merged spawn code.** The motivating incident hit a supervisor binary that predated the merged `git_ref` support, so the param was unknown and silently dropped. After merging any spawn-test change, rebuild + restart the supervisor (`cargo build` then relaunch) before relying on the new behavior — the supervisor does not hot-reload its own code.
 
 ## CRITICAL: Manually Building the Runner Binary
 
