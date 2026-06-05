@@ -255,6 +255,175 @@ pub struct PreparedWorktree {
     pub resolved_sha: String,
 }
 
+/// A validated, caller-owned worktree the supervisor will build *as-is*.
+///
+/// Returned by [`validate_existing_worktree`] for the `worktree_path`
+/// provenance selector. **Deliberately NOT a [`PreparedWorktree`]:** that
+/// struct carries the non-optional `container_path` + `schemas_path` fields
+/// that exist precisely to feed `SpawnCleanupPaths` / `cleanup_fresh_worktree`.
+/// A caller-owned checkout must NEVER enter the cleanup machinery (the caller,
+/// not the supervisor, created and owns it), so this is a distinct type with no
+/// cleanup paths — the "never clean up a caller-owned tree" invariant is
+/// enforced at the type level, not by a runtime flag check.
+#[derive(Debug)]
+pub struct ValidatedExistingWorktree {
+    /// Canonicalized worktree root the caller supplied (parent of `src-tauri`).
+    pub worktree_path: PathBuf,
+    /// `<worktree_path>/src-tauri` — cargo's `current_dir` for the build (fed
+    /// to `run_cargo_build_with_dir` as the `build_dir_override`).
+    pub src_tauri: PathBuf,
+    /// `git -C <worktree_path> rev-parse HEAD`, best-effort. `None` when the
+    /// tree isn't a git checkout (a non-repo tree still builds).
+    pub resolved_sha: Option<String>,
+    /// Canonicalized `../qontinui-schemas` sibling the runner crate's
+    /// `../../qontinui-schemas/...` path-deps resolve to. `None` only when
+    /// canonicalization of the (already-validated-present) sibling fails.
+    pub schemas_path: Option<PathBuf>,
+    /// `git -C <schemas_path> rev-parse HEAD`, best-effort.
+    pub schemas_sha: Option<String>,
+    /// True iff the resolved schemas sibling is the SHARED workspace-root
+    /// `qontinui-schemas` checkout (the drift hazard the pinned-schemas
+    /// containers eliminate for managed worktrees). Best-effort `false` when
+    /// the workspace root can't be derived.
+    pub schemas_is_shared: bool,
+}
+
+/// Best-effort `git -C <dir> rev-parse HEAD`. Returns `None` on any failure
+/// (no git, not a repo, detached/empty), so a non-repo tree still builds with
+/// `resolved_sha = None`.
+async fn rev_parse_head_best_effort(dir: &Path) -> Option<String> {
+    let dir_str = dir.to_string_lossy().to_string();
+    git(&["-C", &dir_str, "rev-parse", "HEAD"], dir, false)
+        .await
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Validate a caller-owned existing worktree/checkout for the `worktree_path`
+/// provenance selector of `POST /runners/spawn-test`.
+///
+/// Unlike [`prepare_worktree`] this NEVER materializes or mutates anything —
+/// the tree already exists and the caller owns it. Each failure is a precise
+/// [`SupervisorError::Validation`] (→ HTTP 400) so a bad path never silently
+/// falls back to the live tree.
+///
+/// Checks (in order):
+/// 1. `worktree_path` exists and is a directory (canonicalized).
+/// 2. It is NOT the live repo root (`worktree_path_is_live_tree`) — the new
+///    param can never be used to mutate/rebuild the live tree.
+/// 3. `<wt>/src-tauri/Cargo.toml` exists (`not_a_runner_worktree`).
+/// 4. `<wt>/../qontinui-schemas/rust/Cargo.toml` exists — ONE level above the
+///    worktree root, because the path-deps are `../../qontinui-schemas/rust`
+///    relative to `src-tauri/` (`path_deps_unresolved`).
+///
+/// Then records schemas provenance (best-effort, never fails the call):
+/// `schemas_path`, `schemas_sha`, `schemas_is_shared`, and the worktree's own
+/// `resolved_sha`.
+pub async fn validate_existing_worktree(
+    worktree_path: &Path,
+    live_repo_root: &Path,
+) -> Result<ValidatedExistingWorktree, SupervisorError> {
+    // 1. Exists + is a dir. Canonicalize so the live-tree comparison and the
+    //    echoed path are stable absolute paths.
+    let canon_wt = tokio::fs::canonicalize(worktree_path).await.map_err(|e| {
+        SupervisorError::Validation(format!(
+            "worktree_path {:?} does not exist or is not accessible: {}",
+            worktree_path, e
+        ))
+    })?;
+    let meta = tokio::fs::metadata(&canon_wt).await.map_err(|e| {
+        SupervisorError::Validation(format!(
+            "worktree_path {:?} is not accessible: {}",
+            canon_wt, e
+        ))
+    })?;
+    if !meta.is_dir() {
+        return Err(SupervisorError::Validation(format!(
+            "worktree_path {:?} is not a directory",
+            canon_wt
+        )));
+    }
+
+    // 2. Must NOT be the live tree. Compare canonicalized forms; if the live
+    //    repo root can't be canonicalized (shouldn't happen — it's the running
+    //    supervisor's project), fall back to a direct compare.
+    let canon_live = tokio::fs::canonicalize(live_repo_root)
+        .await
+        .unwrap_or_else(|_| live_repo_root.to_path_buf());
+    if canon_wt == canon_live {
+        return Err(SupervisorError::Validation(format!(
+            "worktree_path_is_live_tree: {:?} is the live runner tree — omit \
+             worktree_path (and git_ref) to build the live tree; worktree_path \
+             is only for an ISOLATED caller-owned checkout, never the live tree",
+            canon_wt
+        )));
+    }
+
+    // 3. Must look like a runner worktree: src-tauri/Cargo.toml present.
+    let src_tauri = canon_wt.join("src-tauri");
+    let runner_manifest = src_tauri.join("Cargo.toml");
+    if !runner_manifest.exists() {
+        return Err(SupervisorError::Validation(format!(
+            "not_a_runner_worktree: {:?} has no src-tauri/Cargo.toml — \
+             worktree_path must point at a qontinui-runner checkout root",
+            canon_wt
+        )));
+    }
+
+    // 4. Path-deps must resolve. The runner crate declares
+    //    `qontinui-types = {{ path = \"../../qontinui-schemas/rust\" }}` relative
+    //    to src-tauri/, i.e. the SIBLING of the worktree root — ONE level up
+    //    from <wt>, not two. Validate that sibling's rust/Cargo.toml exists.
+    let schemas_sibling = match canon_wt.parent() {
+        Some(p) => p.join("qontinui-schemas"),
+        None => {
+            return Err(SupervisorError::Validation(format!(
+                "path_deps_unresolved: worktree_path {:?} has no parent dir, so \
+                 the `../../qontinui-schemas/rust` path-dep cannot resolve",
+                canon_wt
+            )));
+        }
+    };
+    let schemas_rust_manifest = schemas_sibling.join("rust").join("Cargo.toml");
+    if !schemas_rust_manifest.exists() {
+        return Err(SupervisorError::Validation(format!(
+            "path_deps_unresolved: expected the runner's `../../qontinui-schemas/rust` \
+             path-dep to resolve to {:?}, but it does not exist. The schemas checkout \
+             must sit beside the worktree root (one level up): <worktree_path>/../qontinui-schemas",
+            schemas_rust_manifest
+        )));
+    }
+
+    // --- Provenance (best-effort; never fails the validation). ---
+    let resolved_sha = rev_parse_head_best_effort(&canon_wt).await;
+
+    let schemas_path = tokio::fs::canonicalize(&schemas_sibling).await.ok();
+    let schemas_sha = match &schemas_path {
+        Some(p) => rev_parse_head_best_effort(p).await,
+        None => None,
+    };
+
+    // `schemas_is_shared`: the resolved sibling equals the workspace-root
+    // shared `qontinui-schemas` checkout (the drift hazard). Best-effort false
+    // when the workspace root can't be derived from the live project dir.
+    let schemas_is_shared = match (&schemas_path, derive_workspace_root(live_repo_root).ok()) {
+        (Some(sp), Some(ws)) => match tokio::fs::canonicalize(ws.join("qontinui-schemas")).await {
+            Ok(shared_canon) => *sp == shared_canon,
+            Err(_) => false,
+        },
+        _ => false,
+    };
+
+    Ok(ValidatedExistingWorktree {
+        worktree_path: canon_wt,
+        src_tauri,
+        resolved_sha,
+        schemas_path,
+        schemas_sha,
+        schemas_is_shared,
+    })
+}
+
 /// Best-effort removal of a single registered worktree from `repo_root`,
 /// then a `prune` so the repo's `worktree` registration doesn't leak. Logs
 /// (via `tracing`) on failure but never propagates — cleanup is a side
@@ -895,6 +1064,161 @@ mod tests {
             Some(&prepared.schemas_path),
         )
         .await;
+    }
+
+    // ---------- validate_existing_worktree (Phase 2) ----------
+    //
+    // Builds a caller-owned worktree fixture (NOT a managed .spawn-<ref>
+    // container) and exercises the happy path + each precise 400.
+
+    /// Build a caller-owned worktree layout under `<base>`:
+    ///
+    /// ```text
+    /// <base>/
+    ///   qontinui-schemas/rust/Cargo.toml
+    ///   my-checkout/                  ← the "worktree_path" the caller owns
+    ///     src-tauri/Cargo.toml        ← path = "../../qontinui-schemas/rust"
+    /// ```
+    ///
+    /// `wt_name` is the worktree dir name (sibling of `qontinui-schemas`).
+    /// Returns `(workspace_root, worktree_path)`. The worktree is a real git
+    /// repo so `resolved_sha` populates; pass `git_init=false` for the
+    /// non-repo variant.
+    fn build_existing_worktree_fixture(base: &Path, wt_name: &str, git_init: bool) -> PathBuf {
+        let schemas_rust = base.join("qontinui-schemas").join("rust");
+        std::fs::create_dir_all(&schemas_rust).expect("mkdir schemas/rust");
+        std::fs::write(
+            schemas_rust.join("Cargo.toml"),
+            "[package]\nname = \"qontinui-types\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write schemas Cargo.toml");
+
+        let wt = base.join(wt_name);
+        let src_tauri = wt.join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir wt/src-tauri");
+        std::fs::write(
+            src_tauri.join("Cargo.toml"),
+            "[package]\nname = \"qontinui-runner\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n\
+             qontinui-types = { path = \"../../qontinui-schemas/rust\" }\n",
+        )
+        .expect("write runner Cargo.toml");
+        if git_init {
+            git_in(&wt, &["init", "-q", "-b", "main"]);
+            git_in(&wt, &["config", "user.email", "test@example.com"]);
+            git_in(&wt, &["config", "user.name", "test"]);
+            git_in(&wt, &["add", "-A"]);
+            git_in(&wt, &["commit", "-q", "-m", "initial"]);
+        }
+        wt
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_happy_path_resolves_provenance() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wt = build_existing_worktree_fixture(tmp.path(), "my-checkout", true);
+        // A distinct (non-matching) live repo root so the live-tree guard
+        // doesn't trip. Any existing dir works for the canonicalize.
+        let live_root = tmp.path().join("live-runner");
+        std::fs::create_dir_all(&live_root).expect("mkdir live-runner");
+
+        let v = validate_existing_worktree(&wt, &live_root)
+            .await
+            .expect("validate happy path");
+        assert!(
+            v.src_tauri.ends_with("src-tauri"),
+            "src_tauri must point at the worktree's src-tauri"
+        );
+        assert!(
+            v.resolved_sha.is_some(),
+            "a git checkout must populate resolved_sha"
+        );
+        assert!(v.schemas_path.is_some(), "schemas sibling must be recorded");
+        // The fixture's schemas is a sibling of the worktree, not a workspace
+        // root containing BOTH qontinui-runner AND qontinui-schemas, so
+        // schemas_is_shared is false here.
+        assert!(!v.schemas_is_shared);
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_non_repo_tree_still_validates() {
+        // A worktree that isn't a git repo still builds (resolved_sha = None).
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wt = build_existing_worktree_fixture(tmp.path(), "no-git-checkout", false);
+        let live_root = tmp.path().join("live-runner");
+        std::fs::create_dir_all(&live_root).expect("mkdir live-runner");
+
+        let v = validate_existing_worktree(&wt, &live_root)
+            .await
+            .expect("non-repo tree must still validate");
+        assert!(
+            v.resolved_sha.is_none(),
+            "a non-repo tree must have resolved_sha = None, got {:?}",
+            v.resolved_sha
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_rejects_nonexistent_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let live_root = tmp.path().join("live-runner");
+        std::fs::create_dir_all(&live_root).expect("mkdir live-runner");
+        let err = validate_existing_worktree(&missing, &live_root)
+            .await
+            .expect_err("nonexistent path must 400");
+        assert!(matches!(err, SupervisorError::Validation(_)));
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_rejects_live_tree() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wt = build_existing_worktree_fixture(tmp.path(), "my-checkout", true);
+        // Pass the worktree itself as the live repo root → must be refused.
+        let err = validate_existing_worktree(&wt, &wt)
+            .await
+            .expect_err("worktree == live tree must 400");
+        assert!(err.to_string().contains("worktree_path_is_live_tree"));
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_rejects_missing_src_tauri() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // A dir with the schemas sibling present but NO src-tauri/Cargo.toml.
+        let schemas_rust = tmp.path().join("qontinui-schemas").join("rust");
+        std::fs::create_dir_all(&schemas_rust).expect("mkdir schemas/rust");
+        std::fs::write(schemas_rust.join("Cargo.toml"), "[package]\nname=\"x\"\n").expect("write");
+        let wt = tmp.path().join("not-a-runner");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        let live_root = tmp.path().join("live-runner");
+        std::fs::create_dir_all(&live_root).expect("mkdir live-runner");
+
+        let err = validate_existing_worktree(&wt, &live_root)
+            .await
+            .expect_err("missing src-tauri must 400");
+        assert!(err.to_string().contains("not_a_runner_worktree"));
+    }
+
+    #[tokio::test]
+    async fn validate_existing_worktree_rejects_unresolved_path_deps() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // A runner worktree WITHOUT a ../qontinui-schemas sibling.
+        let wt = tmp.path().join("lonely-checkout");
+        let src_tauri = wt.join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir wt/src-tauri");
+        std::fs::write(
+            src_tauri.join("Cargo.toml"),
+            "[package]\nname=\"qontinui-runner\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+        )
+        .expect("write runner Cargo.toml");
+        let live_root = tmp.path().join("live-runner");
+        std::fs::create_dir_all(&live_root).expect("mkdir live-runner");
+
+        let err = validate_existing_worktree(&wt, &live_root)
+            .await
+            .expect_err("missing schemas sibling must 400");
+        assert!(err.to_string().contains("path_deps_unresolved"));
     }
 
     #[tokio::test]

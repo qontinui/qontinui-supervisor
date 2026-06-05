@@ -350,7 +350,18 @@ where
             sub.status = BuildStatus::Running { started_at };
         }
 
-        let (http_status, body) = exec.await;
+        let (http_status, mut body) = exec.await;
+        // `build_id` = this submission's id. Inject it into the stored outcome
+        // body so BOTH the sync path (which returns this stored body) and the
+        // async poll (`GET /build/:id/status`) expose `build_id` = submission_id
+        // — one build-identity abstraction, no second token. Only inject when
+        // the body is a JSON object (every spawn-test outcome is).
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "build_id".to_string(),
+                serde_json::Value::String(id.to_string()),
+            );
+        }
         let finished_at = Utc::now();
         let duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
         let succeeded = (200..300).contains(&http_status);
@@ -1082,6 +1093,12 @@ mod tests {
         assert_eq!(outcome.port, 9881);
         assert_eq!(outcome.body["id"], "test-abc");
         assert_eq!(outcome.body["build_result"]["succeeded"], true);
+        // build_id is injected into the stored outcome body = submission id.
+        assert_eq!(
+            outcome.body["build_id"],
+            id.to_string(),
+            "stored spawn outcome body must carry build_id = submission_id"
+        );
     }
 
     #[tokio::test]

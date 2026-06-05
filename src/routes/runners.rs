@@ -1285,6 +1285,51 @@ pub struct SpawnTestRequest {
     ///   single predictable field.
     #[serde(default)]
     pub git_ref: Option<String>,
+    /// Optional absolute path to an EXISTING caller-owned worktree/checkout to
+    /// build, instead of the live tree or a managed `git_ref` worktree.
+    ///
+    /// **Requires `rebuild: true`** (same provenance reason as `git_ref`):
+    /// without a rebuild the caller would get the live tree's exe while
+    /// believing they got their checkout. **Mutually exclusive with `git_ref`**
+    /// — setting both → 400 `provenance_conflict`.
+    ///
+    /// The path must (1) exist and be a directory, (2) NOT be the live runner
+    /// tree (`worktree_path_is_live_tree`), (3) contain `src-tauri/Cargo.toml`
+    /// (`not_a_runner_worktree`), and (4) have a `../qontinui-schemas/rust`
+    /// sibling so the runner crate's `../../qontinui-schemas/rust` path-deps
+    /// resolve (`path_deps_unresolved`). Each failure is a precise 400 — never
+    /// a silent live-tree fallback.
+    ///
+    /// The supervisor builds the tree exactly where it is and NEVER cleans it
+    /// up (the caller owns it — `cleanup_worktree_on_fail` applies only to
+    /// managed `git_ref` containers). The frontend prebuild runs for any
+    /// override tree, so a checkout with no `dist/` gets a full pnpm
+    /// install+build automatically; one WITH a built `dist/` is reused as-is.
+    ///
+    /// On success the response carries `source: "worktree_path"`, the echoed
+    /// `worktree_path`, `schemas_path` / `schemas_sha` / `schemas_is_shared`
+    /// (shared-checkout drift provenance), and `git_ref_resolved_sha`/`_short`
+    /// from the worktree's HEAD when it is a git checkout.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// Frontend-only fast path. When true, FORCE a fresh `pnpm run build` in
+    /// the isolated tree (re-embed the new `dist/` via cargo) while skipping
+    /// `pnpm install` when the `node_modules/.bin/ui-bridge-build-ir` marker is
+    /// already present, and never touching the live tree.
+    ///
+    /// **Requires a provenance selector** (`git_ref` or `worktree_path`) — a
+    /// `frontend_only` build of the live tree is meaningless (it would touch
+    /// the shared tree), so it 400s.
+    ///
+    /// **The cargo build still runs.** A Tauri binary embeds `dist/` at
+    /// `cargo build` time (`rust-embed`), so a fresh `dist/` is only picked up
+    /// by recompiling — "fast" means "don't re-fetch / don't reinstall
+    /// node_modules / don't touch the live tree", NOT "skip cargo". When
+    /// combined with `use_lkg`/`allow_stale_fallback` AND the spawned exe came
+    /// from LKG/stale reuse, the response carries `frontend_only_warning`
+    /// stating the reused exe embeds the OLD dist.
+    #[serde(default)]
+    pub frontend_only: bool,
     /// When true, and a `git_ref` build fails downstream of `prepare_worktree`,
     /// best-effort remove the spawn worktree dir on disk via
     /// `git worktree remove --force` + `git worktree prune`. Default false:
@@ -1423,19 +1468,73 @@ struct SpawnCleanupPaths {
     schemas_wt_path: Option<std::path::PathBuf>,
 }
 
-/// Provenance guard for `git_ref` spawns: a `git_ref` is only honored when
-/// `rebuild: true`, because the supervisor must actually recompile that tree to
-/// give the caller a binary that reflects the requested ref. Setting `git_ref`
-/// with `rebuild: false` would silently hand back the live tree's existing exe
-/// while the caller believes they got the ref — so it is rejected with a 400
-/// (`git_ref requires rebuild:true`) rather than lying about provenance.
+/// Provenance guard for spawn-test builds. Generalizes the original
+/// `git_ref`-only guard to cover BOTH provenance selectors (`git_ref` and
+/// `worktree_path`):
+///
+/// - **Mutual exclusion.** Both set → 400 `provenance_conflict` ("set git_ref
+///   OR worktree_path, not both"). They name two different build sources; the
+///   supervisor refuses to guess which one the caller meant.
+/// - **Rebuild required.** Either selector set with `rebuild: false` → 400
+///   naming the field (`<field> requires rebuild:true`). Without a recompile
+///   the caller would get the live tree's existing exe while believing they got
+///   the ref / checkout — provenance is sacrosanct, never lie about it.
 ///
 /// Pure (no I/O / no state) so it is unit-testable without a live `SharedState`.
-fn git_ref_rebuild_guard(git_ref: Option<&str>, rebuild: bool) -> Result<(), SupervisorError> {
+fn provenance_rebuild_guard(
+    git_ref: Option<&str>,
+    worktree_path: Option<&str>,
+    rebuild: bool,
+) -> Result<(), SupervisorError> {
+    if git_ref.is_some() && worktree_path.is_some() {
+        return Err(SupervisorError::Validation(
+            "provenance_conflict: set git_ref OR worktree_path, not both".to_string(),
+        ));
+    }
     if git_ref.is_some() && !rebuild {
         return Err(SupervisorError::Validation(
             "git_ref requires rebuild:true".to_string(),
         ));
+    }
+    if worktree_path.is_some() && !rebuild {
+        return Err(SupervisorError::Validation(
+            "worktree_path requires rebuild:true".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Detect known aliases of the real provenance params in a raw spawn-test JSON
+/// body. spawn-test carries many optional fields so a blanket
+/// `deny_unknown_fields` is too blunt; instead this targets the three keys the
+/// motivating incident's caller actually passed (`branch`, `worktree`, `ref`),
+/// which serde silently dropped, and returns a 400 naming the correct field so
+/// the caller learns the real name instead of getting a silent `live_tree`
+/// spawn.
+///
+/// Pure (operates on a parsed `serde_json::Value`) so it is unit-testable.
+fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), SupervisorError> {
+    let obj = match raw.as_object() {
+        Some(o) => o,
+        // A non-object body will fail the typed deserialize with its own clear
+        // error; nothing to alias-check.
+        None => return Ok(()),
+    };
+    // (alias key, correct field name)
+    const ALIASES: &[(&str, &str)] = &[
+        ("branch", "git_ref"),
+        ("ref", "git_ref"),
+        ("worktree", "worktree_path"),
+    ];
+    for (alias, correct) in ALIASES {
+        if obj.contains_key(*alias) {
+            return Err(SupervisorError::Validation(format!(
+                "unknown_provenance_param: `{alias}` is not a spawn-test field — \
+                 use `{correct}` instead (provenance params are `git_ref` and \
+                 `worktree_path` only; `branch`/`worktree`/`ref` are rejected, \
+                 not silently ignored)"
+            )));
+        }
     }
     Ok(())
 }
@@ -1459,7 +1558,7 @@ fn git_ref_rebuild_guard(git_ref: Option<&str>, rebuild: bool) -> Result<(), Sup
 pub async fn spawn_test(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(body): Json<SpawnTestRequest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, SupervisorError> {
     let no_wait = headers
         .get("X-Queue-Mode")
@@ -1467,11 +1566,38 @@ pub async fn spawn_test(
         .map(|s| s.eq_ignore_ascii_case("no-wait"))
         .unwrap_or(false);
 
-    // `git_ref` only makes sense when we're actually compiling — silently
-    // ignoring it would hand back the live tree's binary while the caller
-    // believes they got the ref. Fail fast with 400 before reserving a port.
-    // (Provenance is sacrosanct — see `git_ref_rebuild_guard`.)
-    git_ref_rebuild_guard(body.git_ref.as_deref(), body.rebuild)?;
+    // Two-step deserialize so we can inspect raw keys before typing the body.
+    // (1) Reject known aliases of the provenance params (`branch`/`worktree`/
+    // `ref`) that serde would otherwise silently drop — the motivating
+    // incident's caller passed `branch`/`worktree_path` and got a silent
+    // live-tree spawn. Do this on the RAW value before any state mutation.
+    reject_known_provenance_aliases(&raw)?;
+
+    // (2) Type the body. A malformed body surfaces serde's own message as a 400.
+    let body: SpawnTestRequest = serde_json::from_value(raw).map_err(|e| {
+        SupervisorError::Validation(format!("invalid spawn-test request body: {e}"))
+    })?;
+
+    // Provenance guards (mutual exclusion + rebuild-required), pure + before
+    // reserving a port. Either selector silently ignored / lying about
+    // provenance is the exact failure mode this prevents.
+    provenance_rebuild_guard(
+        body.git_ref.as_deref(),
+        body.worktree_path.as_deref(),
+        body.rebuild,
+    )?;
+
+    // `frontend_only` re-embeds a fresh dist into an ISOLATED tree; it requires
+    // a provenance selector (a live-tree frontend_only would touch the shared
+    // tree, which the whole feature exists to avoid).
+    if body.frontend_only && body.git_ref.is_none() && body.worktree_path.is_none() {
+        return Err(SupervisorError::Validation(
+            "frontend_only requires a provenance selector (git_ref or worktree_path) — \
+             a frontend_only build of the live tree is not supported (it would touch the \
+             shared tree)"
+                .to_string(),
+        ));
+    }
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner
     // into the registry under a single write lock. Without this, two
@@ -1691,6 +1817,13 @@ async fn execute_spawn_build_inner(
     // (runner_repo_root, container_path, runner_wt_path, schemas_repo_root, schemas_wt_path)
     let mut git_ref_cleanup_paths: Option<SpawnCleanupPaths> = None;
 
+    // Set when a `worktree_path` build occurred (Phase 2). Carries the echoed
+    // provenance: canonical path, optional HEAD SHA, and schemas-sibling drift
+    // info. The struct type (`ValidatedExistingWorktree`) has NO cleanup paths
+    // by construction — a caller-owned tree can never enter the cleanup
+    // machinery (the type-level guarantee from the plan).
+    let mut worktree_path_info: Option<crate::spawn_worktree::ValidatedExistingWorktree> = None;
+
     // Rebuild if requested
     if body.rebuild {
         // If caller opted out of waiting AND all slots are currently busy,
@@ -1805,7 +1938,62 @@ async fn execute_spawn_build_inner(
                     }
                 }
             }
-            None => None,
+            // No git_ref. If `worktree_path` was supplied (mutually exclusive
+            // with git_ref — already guarded), validate the caller-owned tree
+            // and build IT in place. We NEVER materialize, mutate, or clean up
+            // a caller-owned tree — `validate_existing_worktree` returns a
+            // `ValidatedExistingWorktree` which (by type) carries no cleanup
+            // paths, so `git_ref_cleanup_paths` stays None and the
+            // cleanup-on-fail machinery can't touch it.
+            None => match body.worktree_path.as_deref() {
+                Some(wt_path) => {
+                    // The live repo root the worktree must NOT be is derived
+                    // from the configured project_dir (its repo root).
+                    let live_repo_root =
+                        match crate::spawn_worktree::find_repo_root(&state.config.project_dir) {
+                            Ok(r) => r,
+                            // Can't determine the live tree → can't safely run
+                            // the live-tree-refusal guard. Fall back to the
+                            // configured project_dir's parent (the npm dir) so
+                            // the comparison still has a sane reference.
+                            Err(_) => state.config.runner_npm_dir(),
+                        };
+                    match crate::spawn_worktree::validate_existing_worktree(
+                        std::path::Path::new(wt_path),
+                        &live_repo_root,
+                    )
+                    .await
+                    {
+                        Ok(validated) => {
+                            state
+                                .logs
+                                .emit(
+                                    LogSource::Supervisor,
+                                    LogLevel::Info,
+                                    format!(
+                                        "spawn-test worktree_path build: path={:?} resolved_sha={:?} schemas_path={:?} schemas_sha={:?} schemas_is_shared={} (requester={:?})",
+                                        validated.worktree_path,
+                                        validated.resolved_sha,
+                                        validated.schemas_path,
+                                        validated.schemas_sha,
+                                        validated.schemas_is_shared,
+                                        body.requester_id
+                                    ),
+                                )
+                                .await;
+                            let src_tauri = validated.src_tauri.clone();
+                            worktree_path_info = Some(validated);
+                            Some(src_tauri)
+                        }
+                        Err(e) => {
+                            let mut runners = state.runners.write().await;
+                            runners.remove(id);
+                            return Err(e);
+                        }
+                    }
+                }
+                None => None,
+            },
         };
 
         state
@@ -1825,10 +2013,17 @@ async fn execute_spawn_build_inner(
         // we reserved above so the port doesn't leak — UNLESS the caller
         // opted into `allow_stale_fallback`, in which case we keep the
         // placeholder and fall through to spawn from the previous slot exe.
+        // Phase 3: `frontend_only` FORCES a fresh `pnpm run build` in the
+        // isolated override tree even when the dist-present idempotency gate
+        // would otherwise skip it (a TS edit after the tree's last build would
+        // silently embed stale dist). Only meaningful for an override tree —
+        // it was already guarded to require a provenance selector, and the
+        // build below only carries an override when git_ref/worktree_path set.
         let build_fut = crate::build_monitor::run_cargo_build_with_dir(
             state,
             body.requester_id.clone(),
             build_dir_override,
+            body.frontend_only,
         );
         let build_result = match body.queue_timeout_secs {
             Some(secs) => {
@@ -2489,10 +2684,53 @@ async fn execute_spawn_build_inner(
         resp["git_ref_resolved_sha"] = json!(resolved_sha);
         resp["git_ref_resolved_sha_short"] = json!(short);
         resp["source"] = json!("worktree");
+    } else if let Some(wt) = &worktree_path_info {
+        // Phase 2 — `worktree_path` provenance. Echo the canonical path, the
+        // worktree's HEAD SHA (when it's a git checkout) reusing the same
+        // `git_ref_resolved_sha`/`_short` field names callers already parse,
+        // and the schemas-sibling drift provenance (`schemas_path`,
+        // `schemas_sha`, `schemas_is_shared`). `source: "worktree_path"`
+        // distinguishes it from a managed `git_ref` worktree.
+        resp["source"] = json!("worktree_path");
+        resp["worktree_path"] = json!(wt.worktree_path.to_string_lossy());
+        if let Some(sha) = &wt.resolved_sha {
+            let short = sha.chars().take(12).collect::<String>();
+            resp["git_ref_resolved_sha"] = json!(sha);
+            resp["git_ref_resolved_sha_short"] = json!(short);
+        }
+        resp["schemas_path"] = match &wt.schemas_path {
+            Some(p) => json!(p.to_string_lossy()),
+            None => serde_json::Value::Null,
+        };
+        resp["schemas_sha"] = match &wt.schemas_sha {
+            Some(s) => json!(s),
+            None => serde_json::Value::Null,
+        };
+        resp["schemas_is_shared"] = json!(wt.schemas_is_shared);
     } else {
         // Explicit "live_tree" provenance so callers can always branch on a
         // present field rather than needing missing-field handling.
         resp["source"] = json!("live_tree");
+    }
+
+    // Phase 3 — `frontend_only` echo + honest stale-reuse warning. Always echo
+    // the flag when set so callers can confirm the fast path engaged. When the
+    // spawned exe came from LKG (`use_lkg`) or a stale-fallback reuse, that exe
+    // embeds the OLD dist — the fresh `pnpm run build` we forced was NOT
+    // re-embedded by a cargo recompile, so warn explicitly (never lie about
+    // provenance).
+    if body.frontend_only {
+        resp["frontend_only"] = json!(true);
+        let reused_old_exe = body.use_lkg || build_reused_stale;
+        if reused_old_exe {
+            resp["frontend_only_warning"] = json!(
+                "frontend_only forced a fresh `pnpm run build`, but the spawned \
+                 runner reuses a previously-built exe (use_lkg or stale-fallback) \
+                 which embeds the OLD dist at compile time — the new dist is NOT \
+                 reflected. Rebuild with frontend_only + rebuild:true (no LKG/stale \
+                 reuse) to re-embed the fresh dist via cargo."
+            );
+        }
     }
 
     // Always emit `frontend_stale` so callers can branch on a predictable
@@ -4671,7 +4909,7 @@ mod tests {
     #[test]
     fn git_ref_rebuild_guard_rejects_ref_without_rebuild() {
         // The no-silent-fallback provenance guard: git_ref + rebuild:false → 400.
-        let err = super::git_ref_rebuild_guard(Some("feat/x"), false)
+        let err = super::provenance_rebuild_guard(Some("feat/x"), None, false)
             .expect_err("git_ref without rebuild must be rejected");
         let status = axum::response::IntoResponse::into_response(err).status();
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
@@ -4679,14 +4917,135 @@ mod tests {
 
     #[test]
     fn git_ref_rebuild_guard_allows_ref_with_rebuild() {
-        assert!(super::git_ref_rebuild_guard(Some("feat/x"), true).is_ok());
+        assert!(super::provenance_rebuild_guard(Some("feat/x"), None, true).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1 — generalized provenance guard + alias detector.
+    // -------------------------------------------------------------------
+
+    /// Full matrix for `provenance_rebuild_guard`:
+    /// {none, git_ref, worktree_path, both} × {rebuild false, true}.
+    #[test]
+    fn provenance_rebuild_guard_matrix() {
+        use super::provenance_rebuild_guard as g;
+        use crate::error::SupervisorError;
+        // none → always ok regardless of rebuild.
+        assert!(g(None, None, false).is_ok());
+        assert!(g(None, None, true).is_ok());
+
+        // git_ref alone → requires rebuild:true.
+        let err = g(Some("feat/x"), None, false).expect_err("git_ref without rebuild must 400");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert!(g(Some("feat/x"), None, true).is_ok());
+
+        // worktree_path alone → requires rebuild:true (named in the message).
+        let err =
+            g(None, Some("D:/wt"), false).expect_err("worktree_path without rebuild must 400");
+        match &err {
+            SupervisorError::Validation(m) => {
+                assert!(m.contains("worktree_path requires rebuild:true"), "got {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(g(None, Some("D:/wt"), true).is_ok());
+
+        // both → provenance_conflict (even with rebuild:true).
+        let err = g(Some("feat/x"), Some("D:/wt"), true).expect_err("both selectors must 400");
+        match &err {
+            SupervisorError::Validation(m) => assert!(m.contains("provenance_conflict"), "got {m}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // both with rebuild:false → still the conflict (checked first).
+        let err = g(Some("feat/x"), Some("D:/wt"), false)
+            .expect_err("both selectors must 400 regardless of rebuild");
+        assert!(err.to_string().contains("provenance_conflict"));
+    }
+
+    #[test]
+    fn reject_known_provenance_aliases_flags_each_alias() {
+        use super::reject_known_provenance_aliases as r;
+        for (alias, correct) in [
+            ("branch", "git_ref"),
+            ("ref", "git_ref"),
+            ("worktree", "worktree_path"),
+        ] {
+            let body = serde_json::json!({ alias: "value", "rebuild": true });
+            let err = r(&body).expect_err("alias must be rejected");
+            let s = err.to_string();
+            assert!(
+                s.contains(alias) && s.contains(correct),
+                "alias `{alias}` 400 must name both the alias and the correct field `{correct}`; got: {s}"
+            );
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn reject_known_provenance_aliases_allows_real_fields() {
+        use super::reject_known_provenance_aliases as r;
+        // The real fields must pass the alias check.
+        assert!(r(&serde_json::json!({"git_ref": "origin/main", "rebuild": true})).is_ok());
+        assert!(r(&serde_json::json!({"worktree_path": "D:/wt", "rebuild": true})).is_ok());
+        assert!(r(&serde_json::json!({})).is_ok());
+        // A non-object body short-circuits ok (typed deserialize handles it).
+        assert!(r(&serde_json::json!("not-an-object")).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2/3 — new request-field wire shapes.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn spawn_test_request_worktree_path_defaults_none() {
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(
+            req.worktree_path.is_none(),
+            "worktree_path default must be None"
+        );
+    }
+
+    #[test]
+    fn spawn_test_request_worktree_path_round_trips() {
+        let req: super::SpawnTestRequest = serde_json::from_str(
+            r#"{"worktree_path":"D:/qontinui-root/.spawn-pr370","rebuild":true}"#,
+        )
+        .expect("deserialize SpawnTestRequest with worktree_path");
+        assert_eq!(
+            req.worktree_path.as_deref(),
+            Some("D:/qontinui-root/.spawn-pr370")
+        );
+        assert!(req.rebuild);
+    }
+
+    #[test]
+    fn spawn_test_request_frontend_only_defaults_false() {
+        let req: super::SpawnTestRequest =
+            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
+        assert!(!req.frontend_only, "frontend_only default must be false");
+    }
+
+    #[test]
+    fn spawn_test_request_frontend_only_round_trips() {
+        let req: super::SpawnTestRequest = serde_json::from_str(
+            r#"{"worktree_path":"D:/wt","frontend_only":true,"rebuild":true}"#,
+        )
+        .expect("deserialize SpawnTestRequest with frontend_only");
+        assert!(req.frontend_only);
     }
 
     #[test]
     fn git_ref_rebuild_guard_allows_no_ref() {
-        // No git_ref: guard is a no-op regardless of rebuild.
-        assert!(super::git_ref_rebuild_guard(None, false).is_ok());
-        assert!(super::git_ref_rebuild_guard(None, true).is_ok());
+        // No selector: guard is a no-op regardless of rebuild.
+        assert!(super::provenance_rebuild_guard(None, None, false).is_ok());
+        assert!(super::provenance_rebuild_guard(None, None, true).is_ok());
     }
 
     /// Helper: insert a runner with an optional preview binding into a state's
