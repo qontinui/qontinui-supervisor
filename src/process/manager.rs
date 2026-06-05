@@ -406,6 +406,19 @@ pub fn format_drift_warning(d: &SlotShaDrift) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartProvenanceWarning(pub String);
 
+/// Warning text for a NON-temp runner start that resolved to the legacy
+/// `target/debug/` exe (no build-pool slot, therefore no provenance sidecar at
+/// all). The legacy artifact is the most-unknown binary in the system — it is
+/// the very path `detect_target_debug_staleness` exists to distrust — so the
+/// unknown-provenance posture (warn-and-proceed, never refuse on absence)
+/// applies to it the same as to a sidecar-less slot. Pure so it is
+/// unit-testable.
+pub fn legacy_exe_provenance_warning(exe: &std::path::Path) -> StartProvenanceWarning {
+    StartProvenanceWarning(format!(
+        "Starting non-temp runner from the legacy exe {exe:?} with UNKNOWN provenance          (no build-pool slot, no provenance sidecar). Proceeding: refusal keys on          positive evidence of a foreign exe only. Prefer a pool build          (POST /runner/fix-and-rebuild) so the deploy carries a provenance record."
+    ))
+}
+
 /// Pure decision gate for a runner start, over `(temp-ness, slot provenance)`.
 ///
 /// This is the last line of defense against the 2026-06-05 incident: a slot
@@ -714,6 +727,23 @@ fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<Targe
 pub async fn resolve_source_exe(
     state: &SharedState,
 ) -> Result<std::path::PathBuf, SupervisorError> {
+    resolve_source_exe_with_slot(state).await.map(|(_, p)| p)
+}
+
+/// [`resolve_source_exe`] variant that ALSO returns which build-pool slot the
+/// exe came from (`None` for the legacy `target/debug/` fallback).
+///
+/// Exists so the start-path provenance gate can be evaluated on the SAME pick
+/// the resolution deploys: the previous shape (gate runs its own
+/// `pick_slot_for_resolution`, then `resolve_source_exe` re-picks) had a
+/// race — a build succeeding between the two picks moves
+/// `last_successful_slot`, so resolution could deploy a slot the gate never
+/// evaluated. A freshly-succeeded OVERRIDE build is exactly what moves
+/// `last_successful_slot`, i.e. the race window reintroduced the incident
+/// class the gate exists to kill. One pick, gate and path from the same id.
+pub async fn resolve_source_exe_with_slot(
+    state: &SharedState,
+) -> Result<(Option<usize>, std::path::PathBuf), SupervisorError> {
     if let Some(picked_id) = pick_slot_for_resolution(state).await {
         let picked_path = state.config.runner_exe_path_for_slot(picked_id);
 
@@ -756,13 +786,14 @@ pub async fn resolve_source_exe(
                 .await;
         }
 
-        return Ok(picked_path);
+        return Ok((Some(picked_id), picked_path));
     }
 
-    // Preference 3: legacy path for pre-pool builds.
+    // Preference 3: legacy path for pre-pool builds. No slot id — callers that
+    // gate on provenance treat this as the most-unknown artifact there is.
     let legacy = state.config.runner_exe_path();
     if legacy.exists() {
-        return Ok(legacy);
+        return Ok((None, legacy));
     }
 
     Err(SupervisorError::Process(format!(
@@ -1286,39 +1317,59 @@ async fn start_exe_mode_for_runner(
                 )));
             }
             None => {
-                // Provenance gate (Phase 3): before resolving a slot exe for a
-                // NON-temp runner, refuse any slot whose provenance positively
-                // says it was built from a foreign override tree. This is the
-                // single funnel for manual start, restart_all, and the
-                // `--watchdog` boot auto-start — one wire-in covers every path.
-                // Temp runners are permissive (they exist to run foreign refs).
+                // Provenance gate (Phase 3): refuse to deploy a slot exe whose
+                // provenance positively says it was built from a foreign
+                // override tree, for any NON-temp runner. This is the single
+                // funnel for manual start, restart_all, and the `--watchdog`
+                // boot auto-start — one wire-in covers every path. Temp
+                // runners are permissive (they exist to run foreign refs).
                 //
-                // The gate keys on the SAME slot `resolve_source_exe` would
-                // pick (`pick_slot_for_resolution`), so we never refuse a start
-                // over a slot that wouldn't actually be deployed. When no slot
-                // has an exe, the pick is `None` and we fall through to the
-                // legacy-path resolution unguarded (there is no slot provenance
-                // to evaluate, and the legacy path already hard-fails on a
-                // missing exe).
+                // SINGLE PICK: resolution and the gate share one
+                // `resolve_source_exe_with_slot` call, so the slot the gate
+                // evaluates IS the slot whose exe gets deployed. (The previous
+                // shape ran `pick_slot_for_resolution` for the gate and then
+                // re-picked inside `resolve_source_exe`; a build succeeding
+                // between the two picks — and a fresh OVERRIDE build is
+                // exactly what moves `last_successful_slot` — could deploy a
+                // slot the gate never saw.)
                 let is_temp = is_temp_runner(&managed.config.id);
-                if let Some(picked_id) = pick_slot_for_resolution(state).await {
-                    let prov = state
-                        .build_pool
-                        .slots
-                        .iter()
-                        .find(|s| s.id == picked_id)
-                        .and_then(|s| read_slot_provenance(&s.target_dir));
-                    if let Some(StartProvenanceWarning(msg)) =
-                        start_provenance_gate(is_temp, picked_id, prov.as_ref())?
-                    {
-                        warn!("{}", msg);
-                        state
-                            .logs
-                            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-                            .await;
+                let (picked_slot, resolved_path) = resolve_source_exe_with_slot(state).await?;
+                match picked_slot {
+                    Some(picked_id) => {
+                        let prov = state
+                            .build_pool
+                            .slots
+                            .iter()
+                            .find(|s| s.id == picked_id)
+                            .and_then(|s| read_slot_provenance(&s.target_dir));
+                        if let Some(StartProvenanceWarning(msg)) =
+                            start_provenance_gate(is_temp, picked_id, prov.as_ref())?
+                        {
+                            warn!("{}", msg);
+                            state
+                                .logs
+                                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                                .await;
+                        }
+                    }
+                    // Legacy `target/debug/` fallback — no slot, no sidecar:
+                    // the most-unknown artifact in the system. Same
+                    // unknown-provenance posture as a sidecar-less slot:
+                    // warn-and-proceed for non-temp runners, never refuse on
+                    // absence.
+                    None => {
+                        if !is_temp {
+                            let StartProvenanceWarning(msg) =
+                                legacy_exe_provenance_warning(&resolved_path);
+                            warn!("{}", msg);
+                            state
+                                .logs
+                                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                                .await;
+                        }
                     }
                 }
-                resolve_source_exe(state).await?
+                resolved_path
             }
         }
     };
@@ -2981,6 +3032,25 @@ mod tests {
         assert!(temp_is_temp, "test-* must be temp");
         let temp = start_provenance_gate(temp_is_temp, 7, prov.as_ref());
         assert_eq!(temp.expect("temp start must be allowed"), None);
+    }
+
+    /// The legacy-exe warning is the unknown-provenance posture applied to the
+    /// pool-less fallback path: names the exe, says UNKNOWN, names the
+    /// recovery. Pinning the load-bearing fragments keeps the start-path log
+    /// greppable.
+    #[test]
+    fn legacy_exe_warning_names_exe_and_recovery() {
+        let StartProvenanceWarning(msg) =
+            legacy_exe_provenance_warning(std::path::Path::new("/ws/target/debug/q.exe"));
+        assert!(msg.contains("q.exe"), "must name the exe: {msg}");
+        assert!(
+            msg.contains("UNKNOWN provenance"),
+            "must say unknown: {msg}"
+        );
+        assert!(
+            msg.contains("/runner/fix-and-rebuild"),
+            "must name the recovery: {msg}"
+        );
     }
 
     // =========================================================================
