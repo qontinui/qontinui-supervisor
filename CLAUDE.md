@@ -369,7 +369,9 @@ Every runner start copies the resolved source exe to `target/debug/qontinui-runn
 
 ### Last-known-good (LKG) fallback for agents
 
-The supervisor preserves the most recently successfully-built runner exe at `target-pool/lkg/qontinui-runner.exe` after every successful `cargo build`. Slot dirs can be clobbered by a subsequent failed build that overwrites or partially-deletes the slot's exe; the LKG copy is independent and survives those events. A sidecar at `target-pool/lkg/lkg.json` records `{built_at, source_slot, exe_size}` and is hydrated into `state.build_pool.last_known_good` at supervisor startup so it survives restarts.
+The supervisor preserves the most recently successfully-built runner exe at `target-pool/lkg/qontinui-runner.exe` after every successful **live-tree** `cargo build`. Slot dirs can be clobbered by a subsequent failed build that overwrites or partially-deletes the slot's exe; the LKG copy is independent and survives those events. A sidecar at `target-pool/lkg/lkg.json` records `{built_at, source_slot, exe_size, sha, source}` and is hydrated into `state.build_pool.last_known_good` at supervisor startup so it survives restarts.
+
+**Override builds are never promoted to LKG.** A `spawn-test {git_ref}` / `{worktree_path}` build of a foreign tree carries `provenance.source == override`; `update_lkg_after_success` skips LKG promotion for it entirely (the slot's exe + provenance sidecar are still written — only LKG is gated) and logs `skipping LKG promotion (override build of <path>)`. This is the root fix for the 2026-06-05 incident where a branch exe became LKG and a restart deployed it to the primary. Because the gate keys on `source` (not a sha-vs-HEAD comparison), every `lkg.json` written records `source: "live_tree"` by construction. `sha` is the git SHA of the built live tree (or `null` if the git probe failed). Legacy `lkg.json` files predating these fields still hydrate: missing `sha` → `null`, missing `source` → `live_tree`.
 
 **When this matters.** Multiple concurrent agents share the build pool. Agent A's broken build can leave the slots in a state where Agent B's `spawn-test {rebuild: false}` would either fail or run a worse binary than the LKG. If Agent B's own changes are *already in the LKG* (because Agent B's edits predate the most recent successful build), Agent B can pin to the LKG instead of waiting for the slots to recover.
 
@@ -390,7 +392,7 @@ The supervisor preserves the most recently successfully-built runner exe at `tar
 # Inspect LKG state
 curl localhost:9875/health   | jq '.build.lkg'
 curl localhost:9875/builds   | jq '.lkg'
-# → {"built_at": "2026-04-26T15:30:00Z", "source_slot": 1, "exe_size": 253749760}
+# → {"built_at": "2026-04-26T15:30:00Z", "source_slot": 1, "exe_size": 253749760, "sha": "a1b2c3d4e5f6", "source": "live_tree"}
 # → null if no successful build has happened yet on this checkout
 
 # Spawn a test runner pinned to LKG (no rebuild)

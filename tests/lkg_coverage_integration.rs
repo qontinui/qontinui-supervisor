@@ -52,6 +52,8 @@ async fn state_for(project_dir: PathBuf, lkg_at: Option<DateTime<Utc>>) -> Share
             built_at,
             source_slot: 0,
             exe_size: 0,
+            sha: None,
+            source: qontinui_supervisor::process::manager::BuildSource::LiveTree,
         });
     }
     state

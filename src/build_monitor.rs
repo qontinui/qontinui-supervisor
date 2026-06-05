@@ -280,12 +280,18 @@ pub async fn run_cargo_build_with_dir(
         // a write failure is logged but the build still succeeded.
         write_slot_provenance_sidecar(state, &slot, &provenance).await;
 
-        // Capture this exe as the new last-known-good. Survives subsequent
-        // failed builds that overwrite or delete the slot's exe; agents
-        // testing changes can fall back to it via spawn-test {use_lkg: true}
-        // when their own build fails. Failures here are logged but do not
-        // fail the build — LKG is a safety net, not a correctness gate.
-        if let Err(e) = update_lkg_after_success(state, &slot).await {
+        // Capture this exe as the new last-known-good — UNLESS this was an
+        // override build (a spawn-test git_ref / worktree_path preview of a
+        // foreign tree). Promoting an override build to LKG is the exact
+        // 2026-06-05 incident: a branch exe became LKG and a restart deployed
+        // it to the primary. The gate keys on `provenance.source`, not on a
+        // sha-vs-HEAD comparison, and `update_lkg_after_success` consumes the
+        // SAME provenance value computed above (no re-probe). LKG survives
+        // subsequent failed builds that overwrite or delete the slot's exe;
+        // agents testing changes can fall back to it via spawn-test
+        // {use_lkg: true}. Failures here are logged but do not fail the build
+        // — LKG is a safety net, not a correctness gate.
+        if let Err(e) = update_lkg_after_success(state, &slot, &provenance).await {
             warn!(
                 "Failed to update LKG copy after slot {} build success: {}",
                 slot.id, e
@@ -1926,19 +1932,55 @@ async fn prewarm_single_slot(
 // =============================================================================
 
 /// Copy the freshly-built slot exe to `target-pool/lkg/qontinui-runner.exe`
-/// and write a `lkg.json` sidecar with `{built_at, source_slot, exe_size}`.
+/// and write a `lkg.json` sidecar with `{built_at, source_slot, exe_size, sha,
+/// source}`.
+///
+/// **Override builds are not promoted.** When `provenance.source` is
+/// [`BuildSource::Override`] (a spawn-test `git_ref` / `worktree_path` preview
+/// of a foreign tree) the function logs and returns `Ok(())` WITHOUT touching
+/// the LKG exe or sidecar. This is the root fix for the 2026-06-05 incident
+/// where a branch build was promoted to LKG and a restart deployed it to the
+/// primary. Because the gate consumes the same `provenance` value the slot
+/// sidecar was written from, the writer and the gate can never disagree.
+/// Consequently every `lkg.json` written here records `source: "live_tree"`
+/// — taken from `provenance.source`, not hard-coded, so the record is honest
+/// by construction.
 ///
 /// Both writes go through a temp-file + atomic rename so a crash partway
 /// through cannot leave the LKG dir holding a torn binary or a sidecar that
 /// describes a different exe than the one on disk.
 ///
 /// Called from the build-success path with the slot whose cargo build just
-/// returned `Ok`. On any failure, the previous LKG (if any) is left intact
-/// — the caller logs the error but the build still counts as succeeded.
+/// returned `Ok` and that build's provenance. On any failure, the previous
+/// LKG (if any) is left intact — the caller logs the error but the build
+/// still counts as succeeded.
 async fn update_lkg_after_success(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
+    provenance: &BuildProvenance,
 ) -> Result<(), SupervisorError> {
+    // LKG promotion gate: an override build of a foreign tree must never
+    // become the deploy fallback. The slot sidecar was still written by the
+    // caller (Phase 1 behavior unchanged) — only LKG promotion is skipped.
+    if provenance.source == BuildSource::Override {
+        info!(
+            "skipping LKG promotion (override build of {})",
+            provenance.built_from
+        );
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Info,
+                format!(
+                    "LKG promotion skipped: override build of {} (slot {})",
+                    provenance.built_from, slot.id
+                ),
+            )
+            .await;
+        return Ok(());
+    }
+
     let source_exe = state.config.runner_exe_path_for_slot(slot.id);
     if !source_exe.exists() {
         return Err(SupervisorError::Process(format!(
@@ -1993,6 +2035,12 @@ async fn update_lkg_after_success(
         built_at: chrono::Utc::now(),
         source_slot: slot.id,
         exe_size,
+        // From provenance — never re-probed. `source` is necessarily
+        // `LiveTree` here (override builds returned early above), but we write
+        // it from `provenance.source` so the record is honest by construction,
+        // not by assumption.
+        sha: provenance.sha.clone(),
+        source: provenance.source,
     };
 
     let final_meta = state.config.lkg_metadata_path();
@@ -2037,9 +2085,12 @@ mod tests {
     //! the bug these guard against.
     use super::{
         dist_index_ok, needs_frontend_prebuild, provenance_tree_root, rev_parse_head,
-        verify_frontend_built, BuildSource,
+        update_lkg_after_success, verify_frontend_built, BuildProvenance, BuildSource,
     };
+    use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+    use crate::state::{SharedState, SupervisorState};
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     /// `git init` a real repo at `dir` with one commit, returning its HEAD SHA.
@@ -2326,6 +2377,188 @@ mod tests {
         assert!(
             !dist_index_ok(tmp.path()),
             "dist/index.html as a directory must be reported as not-ok"
+        );
+    }
+
+    // =====================================================================
+    // Phase 2: LKG promotion gate — `update_lkg_after_success` must promote
+    // live-tree builds (recording sha + source in lkg.json) and SKIP override
+    // builds entirely (exe + sidecar untouched). Root fix for the 2026-06-05
+    // incident where a branch build was promoted to LKG and deployed.
+    // =====================================================================
+
+    /// Build a `SharedState` whose runner workspace root is a tempdir, so the
+    /// LKG dir (`<root>/target-pool/lkg/`) and slot exe
+    /// (`<root>/target-pool/slot-0/debug/qontinui-runner.exe`) land under a
+    /// throwaway path. `project_dir` is `<root>/src-tauri` because
+    /// `runner_npm_dir()` takes its parent. Returns the state plus the
+    /// canonicalized workspace root (canonicalized to match `runner_npm_dir`'s
+    /// own `canonicalize()`, so the test's path expectations line up).
+    fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
+        let project_dir = workspace_root.join("src-tauri");
+        fs::create_dir_all(&project_dir).expect("mkdir src-tauri");
+        let config = SupervisorConfig {
+            project_dir,
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: workspace_root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 8081,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: true,
+            no_webview: true,
+        };
+        Arc::new(SupervisorState::new(config))
+    }
+
+    /// Stage a fake slot-0 exe with known bytes so the copy step has something
+    /// to promote. Returns the exe path.
+    fn stage_slot0_exe(state: &SharedState, bytes: &[u8]) -> std::path::PathBuf {
+        let exe = state.config.runner_exe_path_for_slot(0);
+        fs::create_dir_all(exe.parent().unwrap()).expect("mkdir slot debug");
+        fs::write(&exe, bytes).expect("write slot exe");
+        exe
+    }
+
+    fn live_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
+        BuildProvenance {
+            sha: sha.map(str::to_string),
+            source: BuildSource::LiveTree,
+            built_from: built_from.to_string(),
+            built_at: "2026-06-05T00:00:00Z".to_string(),
+        }
+    }
+
+    fn override_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
+        BuildProvenance {
+            sha: sha.map(str::to_string),
+            source: BuildSource::Override,
+            built_from: built_from.to_string(),
+            built_at: "2026-06-05T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Live-tree build promotes: the LKG exe is written with the slot's bytes
+    /// and `lkg.json` records `sha` + `"source":"live_tree"`. Also asserts the
+    /// in-memory `last_known_good` lock is populated from the same provenance.
+    #[tokio::test]
+    async fn live_tree_build_promotes_and_records_provenance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon root");
+        let state = lkg_test_state(&root);
+        stage_slot0_exe(&state, b"fresh-live-tree-bytes");
+
+        let slot = state.build_pool.slots[0].clone();
+        let prov = live_provenance(Some("abc123def456"), "/ws/qontinui-runner");
+
+        update_lkg_after_success(&state, &slot, &prov)
+            .await
+            .expect("live-tree build must promote to LKG");
+
+        // Exe promoted with the slot's bytes.
+        let lkg_exe = state.config.lkg_exe_path();
+        assert_eq!(
+            fs::read(&lkg_exe).expect("read lkg exe"),
+            b"fresh-live-tree-bytes",
+            "LKG exe must carry the promoted slot bytes"
+        );
+
+        // Sidecar carries sha + source from provenance.
+        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
+        assert_eq!(meta["sha"], "abc123def456", "lkg.json must record sha");
+        assert_eq!(
+            meta["source"], "live_tree",
+            "lkg.json must record source=live_tree, got {meta_raw}"
+        );
+        assert_eq!(meta["source_slot"], 0);
+
+        // In-memory lock hydrated from the same provenance.
+        let lkg = state.build_pool.last_known_good.read().await.clone();
+        let lkg = lkg.expect("last_known_good must be populated after live-tree promote");
+        assert_eq!(lkg.sha.as_deref(), Some("abc123def456"));
+        assert_eq!(lkg.source, BuildSource::LiveTree);
+    }
+
+    /// Live-tree build with a failed git probe (`sha: None`) still promotes;
+    /// `lkg.json`'s `sha` serializes as JSON null (honest "unknown SHA"),
+    /// `source` is still `live_tree`.
+    #[tokio::test]
+    async fn live_tree_build_with_null_sha_promotes_with_null_in_sidecar() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon root");
+        let state = lkg_test_state(&root);
+        stage_slot0_exe(&state, b"live-no-sha");
+
+        let slot = state.build_pool.slots[0].clone();
+        let prov = live_provenance(None, "/ws/qontinui-runner");
+
+        update_lkg_after_success(&state, &slot, &prov)
+            .await
+            .expect("live-tree build must promote even when sha probe failed");
+
+        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
+        assert!(
+            meta["sha"].is_null(),
+            "null sha must serialize as JSON null"
+        );
+        assert_eq!(meta["source"], "live_tree");
+    }
+
+    /// Override build does NOT promote: a PRE-EXISTING LKG exe + sidecar are
+    /// left byte-for-byte untouched, the in-memory lock is unchanged, and the
+    /// call still returns `Ok` (skip is not an error). This is the gate.
+    #[tokio::test]
+    async fn override_build_does_not_touch_lkg() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon root");
+        let state = lkg_test_state(&root);
+
+        // Pre-seed a prior good LKG (exe + sidecar) so we can prove the
+        // override build leaves it intact rather than there simply being
+        // nothing to write.
+        let lkg_dir = state.config.lkg_dir();
+        fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
+        let lkg_exe = state.config.lkg_exe_path();
+        fs::write(&lkg_exe, b"prior-good-lkg-bytes").expect("seed lkg exe");
+        let meta_path = state.config.lkg_metadata_path();
+        let prior_meta = r#"{"built_at":"2026-06-01T00:00:00Z","source_slot":2,"exe_size":20,"sha":"prior0000000","source":"live_tree"}"#;
+        fs::write(&meta_path, prior_meta).expect("seed lkg.json");
+
+        // Stage a DIFFERENT slot exe that would be promoted if the gate failed.
+        stage_slot0_exe(&state, b"foreign-override-bytes");
+
+        let slot = state.build_pool.slots[0].clone();
+        let prov = override_provenance(Some("feedface0000"), "/ws/.spawn-feat/qontinui-runner");
+
+        update_lkg_after_success(&state, &slot, &prov)
+            .await
+            .expect("override build must return Ok (skip, not error)");
+
+        // Exe untouched — still the prior good bytes, NOT the foreign slot exe.
+        assert_eq!(
+            fs::read(&lkg_exe).expect("read lkg exe"),
+            b"prior-good-lkg-bytes",
+            "override build must NOT overwrite the LKG exe"
+        );
+        // Sidecar untouched — byte-for-byte the prior content.
+        assert_eq!(
+            fs::read_to_string(&meta_path).expect("read lkg.json"),
+            prior_meta,
+            "override build must NOT rewrite lkg.json"
+        );
+        // In-memory lock unchanged (still None — we never set it on the prior
+        // seed; the gate must not populate it from an override build).
+        assert!(
+            state.build_pool.last_known_good.read().await.is_none(),
+            "override build must NOT populate the last_known_good lock"
         );
     }
 }
