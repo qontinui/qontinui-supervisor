@@ -136,7 +136,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let port = config.port;
-    let _auto_start = config.auto_start;
+    // `--auto-start` (which `--watchdog` implies) requests that the supervisor
+    // boot-start the PRIMARY runner once. Consumed below, after the orphan scan
+    // has had a chance to adopt a surviving primary. Lost in c415c5f (an
+    // `let _auto_start = ...` underscore-silenced the field); restored here.
+    let auto_start = config.auto_start;
 
     let supervisor_state = SupervisorState::new(config);
 
@@ -244,11 +248,91 @@ async fn main() -> anyhow::Result<()> {
 
     // Clean up any orphaned temp runner processes from previous sessions
     // and detect already-running user runners for health tracking.
-    // The supervisor does NOT auto-start any runners — users start their own.
+    //
+    // The supervisor does NOT auto-start any runners UNLESS `--auto-start`
+    // (or `--watchdog`, which implies it) was passed — an explicit operator
+    // request. When that flag is set, the boot-start task spawned below starts
+    // the PRIMARY once (and only the primary); named/temp/external runners stay
+    // user-managed in every case.
     {
         let state_clone = state.clone();
         tokio::spawn(async move {
             process::manager::cleanup_orphaned_runners(&state_clone).await;
+        });
+    }
+
+    // `--auto-start` / `--watchdog`: boot-start the PRIMARY runner once.
+    //
+    // The orphan scan above (awaited) may have already adopted a surviving
+    // primary back into the registry with `running = true`; in that case the
+    // decision function returns None and we leave it alone. We give the HTTP
+    // server + state a few seconds to settle first, mirroring the historical
+    // behavior where the boot start showed up ~4s after "Supervisor starting".
+    //
+    // Auto-start funnels through `start_runner_by_id` exactly like an operator
+    // `POST /runners/primary/start`, so the #65 provenance start gate applies:
+    // if it refuses (e.g. a foreign slot binary), the error is logged as a
+    // WARN and boot continues — it never crashes startup. This is one-shot:
+    // the supervisor still never restarts a primary that crashes later.
+    if auto_start {
+        let state_for_autostart = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let decision = {
+                let runners = state_for_autostart.runners.read().await;
+                let primary = runners.values().find(|r| r.config.kind().is_primary());
+                match primary {
+                    Some(p) => {
+                        let running = p.runner.read().await.running;
+                        primary_to_boot_start(true, Some((p.config.id.as_str(), running)))
+                    }
+                    None => primary_to_boot_start(true, None),
+                }
+            };
+            match decision {
+                None => {
+                    info!(
+                        "auto-start: primary already running (or no primary registered) — nothing to boot-start"
+                    );
+                }
+                Some(primary_id) => {
+                    info!("auto-start: boot-starting primary runner '{}'", primary_id);
+                    match process::manager::start_runner_by_id(&state_for_autostart, &primary_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!("auto-start: primary runner '{}' started", primary_id);
+                            state_for_autostart
+                                .logs
+                                .emit(
+                                    LogSource::Supervisor,
+                                    LogLevel::Info,
+                                    format!("Auto-started primary runner '{}' at boot", primary_id),
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "auto-start: failed to boot-start primary runner '{}': {} \
+                                 (supervisor stays healthy; start the primary manually via \
+                                 POST /runners/{}/start)",
+                                primary_id, e, primary_id
+                            );
+                            state_for_autostart
+                                .logs
+                                .emit(
+                                    LogSource::Supervisor,
+                                    LogLevel::Warn,
+                                    format!(
+                                        "Auto-start of primary runner '{}' failed: {}",
+                                        primary_id, e
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -471,6 +555,24 @@ fn max_build_age_secs() -> i64 {
     config::build_timeout_secs() as i64 + REAPER_MARGIN_SECS
 }
 
+/// Decide which runner id (if any) the boot-start path should start.
+///
+/// Pure so the boot wiring in `main` (which is otherwise hard to unit-test)
+/// has a testable seam. The caller passes the resolved primary as
+/// `Some((id, running))` or `None` when no primary is registered.
+///
+/// Returns `Some(id)` only when auto-start was requested AND a primary exists
+/// AND it is not already running (the orphan scan may have adopted it back).
+fn primary_to_boot_start(auto_start: bool, primary: Option<(&str, bool)>) -> Option<String> {
+    if !auto_start {
+        return None;
+    }
+    match primary {
+        Some((id, running)) if !running => Some(id.to_string()),
+        _ => None,
+    }
+}
+
 /// Periodically scan build slots and clear any that have been "busy" for
 /// longer than [`max_build_age_secs`]. Runs every 2 minutes. This catches
 /// leaked slots from crashed cargo builds or supervisor panics where the
@@ -603,4 +705,35 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
 
     // Give clients a moment to receive the shutdown message and close
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::primary_to_boot_start;
+
+    #[test]
+    fn no_auto_start_never_boot_starts() {
+        // Even with a stopped primary, auto_start=false => None.
+        assert_eq!(primary_to_boot_start(false, Some(("primary", false))), None);
+        assert_eq!(primary_to_boot_start(false, None), None);
+    }
+
+    #[test]
+    fn auto_start_with_running_primary_is_noop() {
+        // Orphan adoption already brought it back => leave it alone.
+        assert_eq!(primary_to_boot_start(true, Some(("primary", true))), None);
+    }
+
+    #[test]
+    fn auto_start_with_stopped_primary_returns_id() {
+        assert_eq!(
+            primary_to_boot_start(true, Some(("primary", false))),
+            Some("primary".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_start_with_no_primary_is_noop() {
+        assert_eq!(primary_to_boot_start(true, None), None);
+    }
 }
