@@ -181,6 +181,17 @@ pub struct LkgHealth {
     pub source_slot: usize,
     /// Byte size of the LKG exe. Useful for spotting truncated copies.
     pub exe_size: u64,
+    /// Git SHA of the live tree the LKG exe was built from (#65). `None` when
+    /// the git probe failed at build time, or when hydrated from a legacy
+    /// `lkg.json` predating the provenance fields. The artifact is
+    /// self-describing on disk — surface it rather than stripping it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// Which tree the LKG exe was built from (#65). Serializes as
+    /// `"live_tree"`/`"override"` via `BuildSource`'s serde; always
+    /// `"live_tree"` for any LKG written from #65 forward (override builds are
+    /// never promoted to LKG).
+    pub source: crate::process::manager::BuildSource,
 }
 
 #[derive(Serialize)]
@@ -251,6 +262,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             built_at: info.built_at.to_rfc3339(),
             source_slot: info.source_slot,
             exe_size: info.exe_size,
+            sha: info.sha.clone(),
+            source: info.source,
         });
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
@@ -450,6 +463,8 @@ fn try_build_sse_health(
                         built_at: info.built_at.to_rfc3339(),
                         source_slot: info.source_slot,
                         exe_size: info.exe_size,
+                        sha: info.sha.clone(),
+                        source: info.source,
                     })
                 }),
         },
@@ -654,6 +669,42 @@ mod tests {
         assert!(json.contains("\"softNavigate\""));
         assert!(json.contains("\"sdkFeaturesDocUrl\":\"https://"));
         assert!(json.contains("\"buildId\":\"2026-04-25T00:00:00+00:00\""));
+    }
+
+    /// `LkgHealth` surfaces the #65 provenance fields: `sha` (when present)
+    /// and `source` (serialized via `BuildSource` as `live_tree`/`override`).
+    #[test]
+    fn test_lkg_health_serializes_sha_and_source() {
+        let lkg = LkgHealth {
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+            source_slot: 1,
+            exe_size: 253749760,
+            sha: Some("a1b2c3d4e5f6".to_string()),
+            source: crate::process::manager::BuildSource::LiveTree,
+        };
+        let json = serde_json::to_string(&lkg).expect("should serialize");
+        assert!(json.contains("\"sha\":\"a1b2c3d4e5f6\""), "{json}");
+        assert!(json.contains("\"source\":\"live_tree\""), "{json}");
+    }
+
+    /// A null `sha` (git probe failed / legacy record) is skipped from the
+    /// wire (matching `skip_serializing_if`), while `source` still defaults
+    /// honestly to `live_tree`.
+    #[test]
+    fn test_lkg_health_omits_null_sha() {
+        let lkg = LkgHealth {
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+            source_slot: 0,
+            exe_size: 1,
+            sha: None,
+            source: crate::process::manager::BuildSource::LiveTree,
+        };
+        let json = serde_json::to_string(&lkg).expect("should serialize");
+        assert!(
+            !json.contains("\"sha\""),
+            "null sha should be omitted: {json}"
+        );
+        assert!(json.contains("\"source\":\"live_tree\""), "{json}");
     }
 
     #[test]

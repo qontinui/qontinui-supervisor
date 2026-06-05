@@ -2622,6 +2622,13 @@ async fn execute_spawn_build_inner(
                 "built_at": info.built_at.to_rfc3339(),
                 "source_slot": info.source_slot,
                 "exe_size": info.exe_size,
+                // Provenance of the LKG build (#65). `sha` is the git SHA of
+                // the built live tree (null if the git probe failed or the
+                // record predates these fields); `source` serializes via
+                // BuildSource's serde as "live_tree"/"override" (always
+                // "live_tree" for any LKG written from #65 forward).
+                "sha": info.sha,
+                "source": info.source,
             });
 
             // Staleness signal: there's no per-request changed-file list at
@@ -3682,6 +3689,12 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                 "built_at": info.built_at.to_rfc3339(),
                 "source_slot": info.source_slot,
                 "exe_size": info.exe_size,
+                // Provenance of the LKG build (#65). `sha` = git SHA of the
+                // built live tree (null when the git probe failed or the
+                // on-disk record predates these fields); `source` serializes
+                // via BuildSource as "live_tree"/"override".
+                "sha": info.sha,
+                "source": info.source,
             })
         });
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
