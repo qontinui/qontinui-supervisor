@@ -112,8 +112,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Load persistent settings to check for saved runner configs
     {
-        let dev_logs_dir_for_settings = config.dev_logs_dir.clone();
-        let settings_path = dev_logs_dir_for_settings.join("supervisor-settings.json");
+        // Per-instance settings path (namespaced under
+        // dev_logs_dir/instances/<instance-key>/) — NOT the flat path. This is
+        // what isolates each supervisor instance's runner registry; see
+        // `settings::settings_path`. Also performs the one-shot legacy
+        // migration for the default instance.
+        let settings_path = settings::settings_path(&config);
         let saved = settings::load_settings(&settings_path);
         if !saved.runners.is_empty() {
             info!(
