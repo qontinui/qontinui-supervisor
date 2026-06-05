@@ -1824,6 +1824,14 @@ async fn execute_spawn_build_inner(
     // machinery (the type-level guarantee from the plan).
     let mut worktree_path_info: Option<crate::spawn_worktree::ValidatedExistingWorktree> = None;
 
+    // Set to the spawn container path of a `git_ref` build that materialized a
+    // fresh `.spawn-*` container, so we can (a) mark it active for the duration
+    // of the build (the pruner's active-build exclusion) and (b) run an
+    // opportunistic prune sweep after the build, scrubbing OTHER stale
+    // containers this new one's parent dir accumulated. `None` for live-tree /
+    // worktree_path builds (no supervisor-owned scratch container involved).
+    let mut active_spawn_container: Option<std::path::PathBuf> = None;
+
     // Rebuild if requested
     if body.rebuild {
         // If caller opted out of waiting AND all slots are currently busy,
@@ -1929,6 +1937,15 @@ async fn execute_spawn_build_inner(
                                 schemas_wt_path: Some(wt.schemas_path.clone()),
                             });
                         }
+                        // Mark this container active so the pruner never reaps
+                        // it while the build below is in flight. Removed after
+                        // the build completes (success or failure) — see the
+                        // unregister + opportunistic-sweep block after the build.
+                        {
+                            let mut active = state.active_spawn_worktrees.lock().unwrap();
+                            active.insert(wt.container_path.clone());
+                        }
+                        active_spawn_container = Some(wt.container_path.clone());
                         Some(wt.src_tauri)
                     }
                     Err(e) => {
@@ -2124,10 +2141,54 @@ async fn execute_spawn_build_inner(
                     // resolution fails, we'll surface 500 there.
                 } else {
                     // Release the placeholder port reservation.
+                    if let Some(container) = active_spawn_container.take() {
+                        state
+                            .active_spawn_worktrees
+                            .lock()
+                            .unwrap()
+                            .remove(&container);
+                    }
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
                     return Err(e);
                 }
+            }
+        }
+
+        // Build finished (success, or stale-fallback that didn't early-return).
+        // Unregister the active spawn container so the pruner may reap it once
+        // it ages out, then run an OPPORTUNISTIC prune sweep: a freshly-built
+        // `.spawn-*` container is the natural trigger to scrub OTHER stale
+        // scratch containers its parent dir accumulated. Best-effort + bounded
+        // — the sweep itself never fails the spawn request.
+        if let Some(container) = active_spawn_container.take() {
+            state
+                .active_spawn_worktrees
+                .lock()
+                .unwrap()
+                .remove(&container);
+
+            let active_now: std::collections::HashSet<std::path::PathBuf> =
+                state.active_spawn_worktrees.lock().unwrap().clone();
+            let report = crate::spawn_worktree::prune_spawn_worktrees(
+                &state.config.project_dir,
+                &active_now,
+                std::time::SystemTime::now(),
+            )
+            .await;
+            if !report.removed.is_empty() || !report.failed.is_empty() {
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
+                            report.removed.len(),
+                            report.failed.len()
+                        ),
+                    )
+                    .await;
             }
         }
     }

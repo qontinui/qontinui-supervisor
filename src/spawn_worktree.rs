@@ -551,7 +551,7 @@ pub async fn prepare_worktree(
     let sanitized = sanitize_ref(git_ref);
 
     // Per-ref container holding both nested worktrees.
-    let container: PathBuf = workspace_root.join(format!(".spawn-{}", sanitized));
+    let container: PathBuf = workspace_root.join(format!("{}{}", SPAWN_DIR_PREFIX, sanitized));
     let runner_wt: PathBuf = container.join("qontinui-runner");
     let schemas_wt: PathBuf = container.join("qontinui-schemas");
 
@@ -694,6 +694,315 @@ pub async fn prepare_worktree(
             Err(e)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `.spawn-*` scratch-worktree pruning (deferred #64 Phase 4)
+// ---------------------------------------------------------------------------
+//
+// `prepare_worktree` creates supervisor-owned scratch containers named
+// `.spawn-<sanitized-ref>` directly under `<workspace_root>`. They are full
+// detached checkouts (GBs each) and were never cleaned, so a dev machine
+// accumulates them. This pruner removes the SAFE ones.
+//
+// Safety is the whole point — getting it wrong deletes a checkout. The
+// predicate is intentionally conservative and layered (see
+// [`prune_spawn_worktrees`]). The three never-touch invariants are enforced
+// structurally, not by comment:
+//
+//   1. Only directories whose name starts with the supervisor's own
+//      `SPAWN_DIR_PREFIX`, and only directly under the derived workspace root
+//      where the supervisor itself creates them. A caller-owned `worktree_path`
+//      tree lives elsewhere and never matches this prefix-under-root filter.
+//   2. Never a container that is the build tree of a currently-active build
+//      (the caller passes the active set).
+//   3. A container younger than the retention window is kept; a container that
+//      is a *dirty* registered worktree is kept until DOUBLE the window (a peer
+//      may have adopted the scratch tree and made edits).
+
+/// Directory-name prefix of every supervisor-created scratch worktree
+/// container. Centralized so [`prepare_worktree`] and the pruner agree.
+pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
+
+/// Env var overriding the idle-retention window, in hours. Default
+/// [`DEFAULT_SPAWN_RETENTION_HOURS`]. `0` prunes every idle container
+/// immediately (subject to the dirty-worktree double-retention rule, which a
+/// `0` window collapses to "prune dirty too" only once it has also aged out —
+/// i.e. with `0`, dirty trees are still pruned, matching "prune all idle").
+pub const SPAWN_RETENTION_ENV: &str = "QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS";
+
+/// Default idle-retention window for `.spawn-*` containers: 48h.
+pub const DEFAULT_SPAWN_RETENTION_HOURS: u64 = 48;
+
+/// Resolve the configured retention window (in hours) from
+/// [`SPAWN_RETENTION_ENV`], falling back to [`DEFAULT_SPAWN_RETENTION_HOURS`].
+/// A malformed value falls back to the default (logged once by the caller is
+/// unnecessary — we just ignore garbage and keep the safe default).
+fn retention_hours() -> u64 {
+    match std::env::var(SPAWN_RETENTION_ENV) {
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_SPAWN_RETENTION_HOURS),
+        Err(_) => DEFAULT_SPAWN_RETENTION_HOURS,
+    }
+}
+
+/// Outcome of a single prune sweep — returned so the caller can log a summary
+/// and tests can assert on what happened.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Container dirs successfully removed.
+    pub removed: Vec<PathBuf>,
+    /// Container dirs inspected but kept (with a short reason), e.g. too young,
+    /// active build, dirty-and-not-double-aged.
+    pub kept: Vec<(PathBuf, String)>,
+    /// Container dirs we attempted to remove but failed (logged + skipped).
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// Age of a path relative to `now`, from its filesystem mtime, as a
+/// `Duration`. `None` when the metadata/mtime can't be read OR when the mtime
+/// is in the future relative to `now` (clock skew) — both treated by the caller
+/// as "unknown/zero age ⇒ do not prune", the safe default. `now` is injected so
+/// tests can advance the clock deterministically without touching mtimes.
+fn dir_age(path: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    now.duration_since(mtime).ok()
+}
+
+/// True if `dir` is registered as a git worktree of `repo_root` AND has
+/// uncommitted changes. Best-effort: any git failure (not a worktree, no git,
+/// broken registration) returns `false` — a tree we can't prove is dirty is
+/// treated as clean for the double-retention rule, but it is still subject to
+/// the normal single-window retention, so this can never *shorten* retention,
+/// only extend it when we positively detect edits.
+///
+/// The runner worktree lives at `<container>/qontinui-runner`; the schemas
+/// worktree at `<container>/qontinui-schemas`. We check BOTH — a dirty edit in
+/// either nested worktree means "someone may be using this scratch tree."
+async fn container_has_dirty_worktree(container: &Path) -> bool {
+    for sub in ["qontinui-runner", "qontinui-schemas"] {
+        let wt = container.join(sub);
+        if !wt.exists() {
+            continue;
+        }
+        let wt_str = wt.to_string_lossy().to_string();
+        // `git -C <wt> status --porcelain` — non-empty stdout ⇒ dirty.
+        if let Ok(out) = git(&["-C", &wt_str, "status", "--porcelain"], &wt, false).await {
+            if !out.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remove a single `.spawn-*` container: deregister BOTH nested worktrees from
+/// their owning repos (`git worktree remove --force`), `prune` the
+/// registrations, then delete the container dir. If the worktree registration
+/// is already broken, the `remove`/`prune` are best-effort and the final
+/// `remove_dir_all` still mops up the directory (the fallback path). Returns
+/// `Err(reason)` only when the directory itself could not be removed.
+///
+/// `repo_root` is the runner repo; `schemas_repo_root` is the shared
+/// `<workspace_root>/qontinui-schemas` repo. Both `git worktree remove` calls
+/// are best-effort because a stale container may have a dangling registration
+/// (the repo was re-cloned, the gitdir file was deleted, etc.) — the
+/// authoritative cleanup is the directory delete.
+async fn remove_spawn_container(
+    container: &Path,
+    repo_root: &Path,
+    schemas_repo_root: Option<&Path>,
+) -> Result<(), String> {
+    let runner_wt = container.join("qontinui-runner");
+    let schemas_wt = container.join("qontinui-schemas");
+
+    // Deregister the runner worktree, then prune the runner repo.
+    remove_worktree_registration(repo_root, &runner_wt).await;
+    // Deregister the schemas worktree from the shared schemas repo, if known.
+    if let Some(srepo) = schemas_repo_root {
+        remove_worktree_registration(srepo, &schemas_wt).await;
+    }
+
+    // Authoritative cleanup: delete the container dir. This is the fallback
+    // that handles an already-broken worktree whose `git worktree remove`
+    // no-op'd above.
+    if container.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(container).await {
+            return Err(format!("remove_dir_all {:?} failed: {}", container, e));
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate and prune stale `.spawn-*` scratch worktree containers.
+///
+/// `project_dir` is the supervisor's configured runner `src-tauri` (used to
+/// derive the workspace root and the owning repos — the SAME derivation
+/// `prepare_worktree` uses, so the pruner looks exactly where the supervisor
+/// creates these dirs). `active_containers` is the set of container paths a
+/// build is currently using (the active-build exclusion). `now` is injected so
+/// tests can pin time; production passes `SystemTime::now()`.
+///
+/// Retention:
+/// - A container is "idle" (no active build) AND its mtime is older than the
+///   single window ⇒ prunable, unless it is a dirty registered worktree.
+/// - A dirty registered worktree requires DOUBLE the window before it is
+///   prunable (a peer may have adopted the scratch tree).
+///
+/// Best-effort throughout: a failure to derive roots, stat a dir, or remove a
+/// dir is logged and skipped — this never returns an error and never fails the
+/// caller. Returns a [`PruneReport`] for logging/tests.
+pub async fn prune_spawn_worktrees(
+    project_dir: &Path,
+    active_containers: &std::collections::HashSet<PathBuf>,
+    now: std::time::SystemTime,
+) -> PruneReport {
+    let mut report = PruneReport::default();
+
+    // Derive the workspace root + owning repos exactly as `prepare_worktree`
+    // does. If we can't, there is nothing we can safely prune — bail (no error).
+    let workspace_root = match derive_workspace_root(project_dir) {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::debug!(
+                "spawn-prune: cannot derive workspace root from {:?} ({}); skipping sweep",
+                project_dir,
+                e
+            );
+            return report;
+        }
+    };
+    let repo_root = match find_repo_root(project_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                "spawn-prune: cannot find runner repo root from {:?} ({}); skipping sweep",
+                project_dir,
+                e
+            );
+            return report;
+        }
+    };
+    let schemas_repo_root = {
+        let s = workspace_root.join("qontinui-schemas");
+        if s.is_dir() {
+            Some(s)
+        } else {
+            None
+        }
+    };
+
+    let retention = std::time::Duration::from_secs(retention_hours().saturating_mul(3600));
+    let double_retention = retention.saturating_mul(2);
+
+    // Enumerate `.spawn-*` dirs directly under the workspace root. Anything
+    // that isn't a directory whose name starts with the supervisor's own
+    // prefix is structurally ignored (invariant 1).
+    let mut entries = match tokio::fs::read_dir(&workspace_root).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                "spawn-prune: cannot read workspace root {:?} ({}); skipping sweep",
+                workspace_root,
+                e
+            );
+            return report;
+        }
+    };
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(
+                    "spawn-prune: read_dir iteration error: {}; stopping sweep",
+                    e
+                );
+                break;
+            }
+        };
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Invariant 1: only the supervisor's own scratch prefix, directly under
+        // the workspace root. (A bare `.spawn-` with no suffix is still ours.)
+        if !name.starts_with(SPAWN_DIR_PREFIX) {
+            continue;
+        }
+        let is_dir = match entry.file_type().await {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => path.is_dir(),
+        };
+        if !is_dir {
+            continue;
+        }
+
+        // Invariant 2: never prune a container with an active build.
+        if active_containers.contains(&path) {
+            report.kept.push((path.clone(), "active build".to_string()));
+            continue;
+        }
+
+        // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
+        let age = match dir_age(&path, now) {
+            Some(a) => a,
+            None => {
+                report
+                    .kept
+                    .push((path.clone(), "age unknown (mtime unreadable)".to_string()));
+                continue;
+            }
+        };
+        if age < retention {
+            report.kept.push((
+                path.clone(),
+                format!("younger than retention ({}h)", retention.as_secs() / 3600),
+            ));
+            continue;
+        }
+
+        // Dirty double-retention (invariant 3, part B). A dirty registered
+        // worktree is only prunable once it has aged past DOUBLE the window.
+        if container_has_dirty_worktree(&path).await && age < double_retention {
+            report.kept.push((
+                path.clone(),
+                format!(
+                    "dirty worktree, awaiting double-retention ({}h)",
+                    double_retention.as_secs() / 3600
+                ),
+            ));
+            continue;
+        }
+
+        // Safe to remove.
+        match remove_spawn_container(&path, &repo_root, schemas_repo_root.as_deref()).await {
+            Ok(()) => {
+                tracing::info!(
+                    "spawn-prune: removed stale scratch worktree {:?} (age {}h, retention {}h)",
+                    path,
+                    age.as_secs() / 3600,
+                    retention.as_secs() / 3600
+                );
+                report.removed.push(path);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "spawn-prune: failed to remove scratch worktree {:?}: {} (skipping)",
+                    path,
+                    e
+                );
+                report.failed.push((path, e));
+            }
+        }
+    }
+
+    report
 }
 
 #[cfg(test)]
@@ -1249,5 +1558,240 @@ mod tests {
             "cleanup_fresh_worktree must remove the container dir; still present: {:?}",
             prepared.container_path
         );
+    }
+
+    // ---------- prune_spawn_worktrees (Phase 4) ----------
+    //
+    // These build a real workspace fixture, materialize one or more genuine
+    // `.spawn-*` containers via `prepare_worktree`, and drive the pruner with
+    // an injected `now` so retention boundaries are deterministic without
+    // touching mtimes.
+
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime};
+
+    /// Serializes tests that read or mutate the process-wide retention env var
+    /// so a `set_var("0")` in one test can't bleed into another's
+    /// `retention_hours()` read while cargo runs tests in parallel threads.
+    /// A tokio (async-aware) mutex so the guard may be held across the prune
+    /// `.await` without tripping clippy's `await_holding_lock`.
+    fn retention_env_guard() -> &'static tokio::sync::Mutex<()> {
+        static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// `now` far enough in the future that a just-created container reads as
+    /// `hours` old.
+    fn now_plus_hours(hours: u64) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(hours * 3600)
+    }
+
+    #[tokio::test]
+    async fn prune_respects_retention_boundary() {
+        let _g = retention_env_guard().lock().await;
+        // A fresh `.spawn-*` container younger than the window is KEPT; the same
+        // container viewed past the window is REMOVED.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+        assert!(prepared.container_path.exists());
+
+        let empty: HashSet<PathBuf> = HashSet::new();
+
+        // 24h old, default 48h window → kept.
+        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(24)).await;
+        assert!(
+            prepared.container_path.exists(),
+            "container younger than retention must be kept"
+        );
+        assert!(r.removed.is_empty());
+        assert_eq!(r.kept.len(), 1);
+
+        // 49h old, default 48h window → removed (clean worktree, single window).
+        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(49)).await;
+        assert!(
+            !prepared.container_path.exists(),
+            "container older than retention must be removed; still present: {:?}",
+            prepared.container_path
+        );
+        assert_eq!(r.removed.len(), 1);
+        assert!(
+            !root.join(".spawn-HEAD").exists(),
+            "the named container dir must be gone after prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_excludes_active_build_container() {
+        let _g = retention_env_guard().lock().await;
+        // An aged container that is in the active-build set is KEPT regardless
+        // of age.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        let mut active: HashSet<PathBuf> = HashSet::new();
+        active.insert(prepared.container_path.clone());
+
+        // 999h old but active → kept.
+        let r = prune_spawn_worktrees(&src_tauri, &active, now_plus_hours(999)).await;
+        assert!(
+            prepared.container_path.exists(),
+            "active-build container must never be pruned"
+        );
+        assert!(r.removed.is_empty());
+        assert!(
+            r.kept
+                .iter()
+                .any(|(p, why)| p == &prepared.container_path && why.contains("active build")),
+            "kept reason must cite the active build; got {:?}",
+            r.kept
+        );
+
+        // cleanup
+        let schemas_repo = _root.join("qontinui-schemas");
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &prepared.container_path,
+            &prepared.worktree_path,
+            Some(&schemas_repo),
+            Some(&prepared.schemas_path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_leaves_non_spawn_dirs_untouched() {
+        let _g = retention_env_guard().lock().await;
+        // A sibling dir that does NOT start with `.spawn-` is never touched,
+        // even when very old.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+
+        // A decoy dir adjacent to where spawn containers live.
+        let decoy = root.join("important-checkout");
+        std::fs::create_dir_all(decoy.join("src")).expect("mkdir decoy");
+        std::fs::write(decoy.join("src").join("keep.txt"), "do not delete").expect("write decoy");
+        // And a near-miss that starts with `.spawn` but not `.spawn-`.
+        let near_miss = root.join(".spawning");
+        std::fs::create_dir_all(&near_miss).expect("mkdir near miss");
+
+        let empty: HashSet<PathBuf> = HashSet::new();
+        let _ = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+
+        assert!(decoy.exists(), "non-spawn dir must be untouched");
+        assert!(
+            decoy.join("src").join("keep.txt").exists(),
+            "non-spawn dir contents must be untouched"
+        );
+        assert!(
+            near_miss.exists(),
+            "a `.spawning` dir (not `.spawn-`) must be untouched"
+        );
+        // The two real sibling repos must also survive.
+        assert!(root.join("qontinui-runner").exists());
+        assert!(root.join("qontinui-schemas").exists());
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_dirty_worktree_until_double_retention() {
+        let _g = retention_env_guard().lock().await;
+        // A container whose runner worktree has uncommitted changes is kept
+        // past the single window but removed past DOUBLE the window.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        // Dirty the runner worktree: add an untracked file (porcelain reports it).
+        std::fs::write(
+            prepared.worktree_path.join("src-tauri").join("DIRTY.txt"),
+            "peer edit",
+        )
+        .expect("write dirty file");
+
+        let empty: HashSet<PathBuf> = HashSet::new();
+
+        // 50h old: past single 48h window but a dirty tree needs 96h → kept.
+        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(50)).await;
+        assert!(
+            prepared.container_path.exists(),
+            "dirty container past single window but under double must be kept"
+        );
+        assert!(
+            r.kept
+                .iter()
+                .any(|(p, why)| p == &prepared.container_path && why.contains("dirty")),
+            "kept reason must cite the dirty double-retention rule; got {:?}",
+            r.kept
+        );
+
+        // 97h old: past double 96h window → removed even though dirty.
+        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(97)).await;
+        assert!(
+            !prepared.container_path.exists(),
+            "dirty container past double window must be removed"
+        );
+        assert_eq!(r.removed.len(), 1);
+        let _ = root; // root used above
+    }
+
+    #[tokio::test]
+    async fn prune_broken_worktree_fallback_dir_delete() {
+        let _g = retention_env_guard().lock().await;
+        // A `.spawn-*` container that is NOT a registered git worktree (broken /
+        // never-registered) must still be removed via the directory-delete
+        // fallback path, once aged out.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+
+        // Hand-build a fake spawn container with NO git worktree registration:
+        // just directories that look like the nested layout, no `.git`.
+        let broken = root.join(".spawn-broken");
+        std::fs::create_dir_all(broken.join("qontinui-runner").join("src-tauri"))
+            .expect("mkdir broken runner");
+        std::fs::create_dir_all(broken.join("qontinui-schemas").join("rust"))
+            .expect("mkdir broken schemas");
+        std::fs::write(broken.join("qontinui-runner").join("marker"), "x").expect("write marker");
+        assert!(broken.exists());
+
+        let empty: HashSet<PathBuf> = HashSet::new();
+        // Aged well past retention → the `git worktree remove` no-ops (not a
+        // registered worktree) and the dir delete fallback removes it.
+        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+        assert!(
+            !broken.exists(),
+            "broken/unregistered spawn container must be removed via dir-delete fallback"
+        );
+        assert!(
+            r.removed.iter().any(|p| p == &broken),
+            "report must list the broken container as removed; got {:?}",
+            r.removed
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_retention_env_override_zero_prunes_idle_immediately() {
+        let _g = retention_env_guard().lock().await;
+        // QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS=0 prunes an idle clean
+        // container even at age ~0. The env guard serializes against the other
+        // prune tests so this `set_var("0")` can't bleed into their default-window
+        // reads.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        let empty: HashSet<PathBuf> = HashSet::new();
+
+        // With a 0h window, a brand-new (age ~0) clean container is prunable.
+        std::env::set_var(SPAWN_RETENTION_ENV, "0");
+        let r = prune_spawn_worktrees(&src_tauri, &empty, SystemTime::now()).await;
+        std::env::remove_var(SPAWN_RETENTION_ENV);
+
+        assert!(
+            !prepared.container_path.exists(),
+            "with retention=0 an idle clean container must be pruned immediately"
+        );
+        assert_eq!(r.removed.len(), 1);
     }
 }

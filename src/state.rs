@@ -311,6 +311,19 @@ pub struct SupervisorState {
     /// off a duplicate build. Cleared/overwritten when a new rebuild is started
     /// (the previous id having reached terminal). `None` until the first rebuild.
     pub fix_and_rebuild_inflight: RwLock<Option<uuid::Uuid>>,
+    /// Spawn-worktree containers (`<workspace_root>/.spawn-<ref>/`) that are
+    /// currently being built. A `git_ref` spawn-test materializes such a
+    /// container, then holds a build-pool slot while compiling the tree inside
+    /// it. The container is the supervisor's to delete once idle, but it is
+    /// NEVER safe to remove while that build is in flight.
+    ///
+    /// [`crate::routes::runners::spawn_test`] inserts the container path before
+    /// the build and removes it after (success or failure). The spawn-worktree
+    /// pruner ([`crate::spawn_worktree::prune_spawn_worktrees`]) consults this
+    /// set as its active-build exclusion: any candidate present here is skipped,
+    /// regardless of age. Keyed by the canonical container path string so the
+    /// pruner's directory enumeration and the build wiring agree on identity.
+    pub active_spawn_worktrees: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -1009,6 +1022,7 @@ impl SupervisorState {
             synthetic_build_id_tx,
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
+            active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
