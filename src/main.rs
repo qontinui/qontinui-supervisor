@@ -365,6 +365,39 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // One-shot startup sweep of stale `.spawn-*` scratch worktree containers
+    // (deferred #64 Phase 4). Non-blocking — spawned as its own task so a slow
+    // `git worktree remove` of a GB-scale checkout never delays serving. No
+    // build is active at startup, so the active-container exclusion set is
+    // empty. Best-effort: the pruner logs + swallows every failure internally.
+    {
+        let state_for_prune = state.clone();
+        tokio::spawn(async move {
+            let active = std::collections::HashSet::new();
+            let report = spawn_worktree::prune_spawn_worktrees(
+                &state_for_prune.config.project_dir,
+                &active,
+                std::time::SystemTime::now(),
+            )
+            .await;
+            if !report.removed.is_empty() || !report.failed.is_empty() {
+                state_for_prune
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "startup spawn-worktree prune: removed {} stale scratch worktree(s), kept {}, {} failed",
+                            report.removed.len(),
+                            report.kept.len(),
+                            report.failed.len()
+                        ),
+                    )
+                    .await;
+            }
+        });
+    }
+
     // Serve with graceful shutdown (no global timeout — eval benchmarks can run for hours)
     let serve_future =
         axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(state.clone()));

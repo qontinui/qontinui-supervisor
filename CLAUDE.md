@@ -72,6 +72,24 @@ cargo clippy -- -D warnings    # Lint
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
 
+## Restarting the supervisor
+
+THE restart path is the checked-in `scripts/restart-supervisor.ps1` — use it
+instead of ad-hoc per-session PowerShell. It stops the running instance
+(graceful `POST /supervisor/shutdown`, falling back to `Stop-Process`), waits
+for the port to free, copies `target\debug\qontinui-supervisor.exe` to
+`target\debug\copies\`, relaunches it, and polls `/health`.
+
+```powershell
+# from the repo root
+.\scripts\restart-supervisor.ps1 -Build   # -Build runs cargo build first
+```
+
+It launches the copy in a **visible** window on purpose: Windows Defender's
+`PowhidSubExec.B` heuristic kills hidden (`-WindowStyle Hidden` +
+`-ExecutionPolicy Bypass`) launches of the unsigned exe (2026-06-05 incident).
+Params: `-Build`, `-Port` (9875), `-ProjectDir`, `-LogFile`, `-Watchdog`.
+
 ## Persistent Logs
 
 The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, ~30 min of activity at default) in its in-memory circular buffer, which is not enough to diagnose a crash-loop after the fact. Pass `--log-dir` (or `--log-file`) to tee every entry into an append-only file on disk.
