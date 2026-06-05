@@ -1393,6 +1393,20 @@ async fn start_exe_mode_for_runner(
     // a worse failure mode later.
     let exe_path = {
         let copy_path = state.config.runner_exe_copy_path(&managed.config);
+        // Ensure the copy target's parent dir exists. Supervisor-managed trees
+        // only ever materialize `target-pool/`; a tree that has never had a
+        // default `cargo build` won't have `target/debug/`, so the copy below
+        // would fail with `os error 3` (path not found) and 500 the spawn.
+        // Create it up-front, propagating any failure as the same
+        // `SupervisorError::Process` kind the copy failure would produce.
+        if let Some(parent) = copy_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(SupervisorError::Process(format!(
+                    "Failed to create runner exe copy directory {:?} for '{}': {}",
+                    parent, managed.config.name, e
+                )));
+            }
+        }
         match std::fs::copy(&source_exe, &copy_path) {
             Ok(_) => {
                 info!(
@@ -2894,6 +2908,54 @@ mod tests {
         std::fs::create_dir_all(&debug).expect("mkdir debug");
         std::fs::write(debug.join(SLOT_PROVENANCE_SIDECAR_FILENAME), b"   \n\t  ").expect("write");
         assert!(read_slot_provenance(dir.path()).is_none());
+    }
+
+    // =========================================================================
+    // exe-copy parent-dir creation (start_exe_mode_for_runner copy step)
+    // =========================================================================
+
+    /// The copy-never-run-from-slot step in `start_exe_mode_for_runner` must
+    /// create `target/debug/` before copying the slot/LKG exe into it.
+    /// Supervisor-managed trees only ever materialize `target-pool/`, so a
+    /// tree that has never had a default `cargo build` won't have
+    /// `target/debug/` and the copy would fail with `os error 3`
+    /// (path not found). Mirrors the inline mkdir-then-copy step at the same
+    /// abstraction level (the copy itself lives inside the async
+    /// process-spawning `start_exe_mode_for_runner`, which isn't unit-testable
+    /// without launching a real process).
+    #[test]
+    fn exe_copy_creates_missing_target_debug_parent() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+
+        // Source exe lives where a build slot would have put it.
+        let slot_debug = root.path().join("target-pool").join("slot-0").join("debug");
+        std::fs::create_dir_all(&slot_debug).expect("mkdir slot debug");
+        let source_exe = slot_debug.join("qontinui-runner.exe");
+        std::fs::write(&source_exe, b"fake-exe-bytes").expect("write source exe");
+
+        // Copy target's parent (`target/debug/`) deliberately does NOT exist.
+        let copy_path = root
+            .path()
+            .join("target")
+            .join("debug")
+            .join("qontinui-runner-test-9877.exe");
+        let parent = copy_path.parent().expect("copy_path has a parent");
+        assert!(
+            !parent.exists(),
+            "precondition: target/debug must be absent"
+        );
+
+        // The fix: create_dir_all(parent) before the copy.
+        std::fs::create_dir_all(parent).expect("create_dir_all must succeed");
+        assert!(parent.is_dir(), "target/debug should now exist");
+
+        // And the copy then succeeds (previously failed with os error 3).
+        std::fs::copy(&source_exe, &copy_path).expect("copy into freshly-created dir");
+        assert!(copy_path.exists(), "exe copy should land in the new dir");
+        assert_eq!(
+            std::fs::read(&copy_path).expect("read copy"),
+            b"fake-exe-bytes"
+        );
     }
 
     // =========================================================================
