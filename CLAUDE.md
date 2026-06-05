@@ -12,6 +12,20 @@ The supervisor manages lifecycle for **temp runners** (`test-*`) and **named run
 
 **First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not auto-restart, does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0).
 
+## Per-instance settings (runner registry isolation)
+
+The runner registry + AI config persist to a **per-supervisor-instance** path, NOT a flat file. `settings::settings_path` returns:
+
+```
+<dev_logs_dir>/instances/<instance-key>/supervisor-settings.json
+```
+
+where `<instance-key>` = `<project-dir-basename>-<8-hex>`, the 8-hex being a stable SHA-256 of the **canonicalized absolute `project_dir`** (best-effort canonicalize; never panics). The basename is human-readable, the hash is collision-proofing for two same-named project dirs under different parents. Examples: the live instance → `qontinui-runner-<hash>`; an isolated E2E worktree → `qontinui-runner-wt-e2e-<hash>`. **Logs stay shared** in `.dev-logs/` (intentional, operator-friendly); only mutable STATE is namespaced.
+
+**Why:** `dev_logs_dir` is `project_dir.parent().parent()/.dev-logs`, so a test supervisor under `D:\qontinui-root\qontinui-runner-wt-e2e\src-tauri` computed the same grandparent `.dev-logs` as the live instance and its runner registrations bled into (and persisted in) the live `:9875` registry (observed 2026-06-05).
+
+**Legacy migration (one-shot, best-effort):** on first `settings_path` call, if no per-instance file exists but the legacy flat `<dev_logs_dir>/supervisor-settings.json` does, it is **copied** into the per-instance path — but ONLY when this instance's basename is the historical default `qontinui-runner` (the legacy file's contents belong to the live instance). Every other instance starts with a **fresh empty registry** rather than inheriting the live one's runners (inheriting is exactly the bug). The legacy file is left in place (older binaries keep reading it) with a `supervisor-settings.json.migrated-to-<key>` breadcrumb marker next to it. So on first post-deploy boot the live instance KEEPS all its runners via this migration.
+
 ## Architecture
 
 Standalone Axum HTTP server:
