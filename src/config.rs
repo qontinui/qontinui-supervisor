@@ -498,9 +498,9 @@ impl SupervisorConfig {
         self.lkg_dir().join("qontinui-runner.exe")
     }
 
-    /// Path to the LKG metadata sidecar (`built_at`, `source_slot`, `exe_size`).
-    /// Loaded at supervisor startup so the in-memory `last_known_good` field
-    /// survives restarts.
+    /// Path to the LKG metadata sidecar (`built_at`, `source_slot`, `exe_size`,
+    /// `sha`, `source`). Loaded at supervisor startup so the in-memory
+    /// `last_known_good` field survives restarts.
     pub fn lkg_metadata_path(&self) -> PathBuf {
         self.lkg_dir().join("lkg.json")
     }

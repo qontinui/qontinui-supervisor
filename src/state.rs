@@ -599,11 +599,36 @@ pub struct BuildSlot {
 /// just before the exe was copied into the LKG dir. `source_slot` is the
 /// pool slot the build ran on. `exe_size` is the byte size of the LKG exe
 /// — useful for spotting truncated or partial copies after a crash.
+///
+/// `sha` and `source` record the [`BuildProvenance`](crate::process::manager::BuildProvenance)
+/// of the build that produced this LKG. Since the LKG promotion gate skips
+/// override builds, `source` is always [`BuildSource::LiveTree`] for any LKG
+/// written from this code forward — it is recorded from provenance (not
+/// hard-coded) so the record is honest by construction. Both fields are
+/// `#[serde(default)]` so legacy `lkg.json` files predating this change still
+/// hydrate: their `sha` reads back as `None` and `source` defaults to
+/// `LiveTree` (the only kind of build that has ever been deployed from LKG).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct LkgInfo {
     pub built_at: DateTime<Utc>,
     pub source_slot: usize,
     pub exe_size: u64,
+    /// Git SHA of the tree that was built, or `None` when the git probe failed
+    /// (or when hydrated from a legacy sidecar without this field).
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// Which tree the LKG exe was built from. Always `LiveTree` going forward
+    /// (override builds never reach LKG promotion); defaults to `LiveTree` when
+    /// hydrated from a legacy sidecar without this field.
+    #[serde(default = "default_lkg_source")]
+    pub source: crate::process::manager::BuildSource,
+}
+
+/// Default `source` for an `LkgInfo` hydrated from a legacy `lkg.json` that
+/// predates the provenance fields. LKG has only ever held live-tree deploys,
+/// so `LiveTree` is the honest assumption for those records.
+fn default_lkg_source() -> crate::process::manager::BuildSource {
+    crate::process::manager::BuildSource::LiveTree
 }
 
 /// Pool of parallel build slots.
