@@ -25,6 +25,11 @@
       5. Start-Process the COPY with --project-dir / --watchdog / --log-file,
          working dir = repo root, NO -WindowStyle Hidden.
       6. Poll `GET /health` up to 60s; exit 0 on HTTP 200, non-zero otherwise.
+      7. When -Watchdog: poll `GET /runners` (up to 120s) until the `primary`
+         entry reports `running: true` - the supervisor boot-starts it under
+         --watchdog/--auto-start. Exit 0 with the primary's pid/port once it
+         is up; exit 3 (distinct: the supervisor itself IS healthy) if it
+         never comes up within the window.
 
 .PARAMETER Build
     Run `cargo build` first. Abort the whole restart if the build fails.
@@ -41,8 +46,10 @@
     Default D:\qontinui-root\.dev-logs\runner-tauri.log.
 
 .PARAMETER Watchdog
-    Pass --watchdog (observe-only health monitoring, implies auto-start).
-    On by default; pass -Watchdog:$false to omit.
+    Pass --watchdog (observe-only health monitoring, implies --auto-start).
+    With --auto-start the supervisor boot-starts the PRIMARY runner once, so
+    this script additionally verifies the primary returns (step 7). On by
+    default; pass -Watchdog:$false to omit (and skip the primary check).
 
 .EXAMPLE
     .\scripts\restart-supervisor.ps1 -Build
@@ -194,11 +201,58 @@ for ($i = 0; $i -lt 60; $i++) {
     Start-Sleep -Seconds 1
 }
 
-if ($healthy) {
-    Write-Step "supervisor healthy on port $Port. Done."
-    exit 0
-} else {
+if (-not $healthy) {
     Write-Fail "supervisor did not report healthy on $base/health within 60s."
     Write-Fail "Check the window it launched in, and $LogFile."
     exit 2
+}
+Write-Step "supervisor healthy on port $Port."
+
+# --- 7. Verify the primary runner boot-starts (only under --watchdog) ------
+# Under --watchdog/--auto-start the supervisor boot-starts the PRIMARY runner
+# once. Tonight's incident: a restart left the primary DOWN until a human
+# manually started it. Verify it actually returns; exit 3 (distinct from the
+# supervisor-unhealthy exit 2) if it doesn't - the supervisor IS healthy, only
+# the primary boot-start failed.
+if (-not $Watchdog) {
+    Write-Step "-Watchdog:`$false - no primary auto-start expected; skipping primary check. Done."
+    exit 0
+}
+
+Write-Step "verifying primary runner boot-starts ($base/runners) up to 120s..."
+$primaryUp = $false
+$primaryInfo = $null
+for ($i = 0; $i -lt 40; $i++) {
+    try {
+        $runners = Invoke-RestMethod -Method Get -Uri "$base/runners" -TimeoutSec 5
+        # /runners may return an array directly or an object with a .runners
+        # array - normalize to the list before searching.
+        $list = $runners
+        if ($runners -and ($runners.PSObject.Properties.Name -contains 'runners')) {
+            $list = $runners.runners
+        }
+        $primary = $list | Where-Object { $_.id -eq 'primary' } | Select-Object -First 1
+        if ($primary -and $primary.running -eq $true) {
+            $primaryUp = $true
+            $primaryInfo = $primary
+            break
+        }
+    } catch {
+        # supervisor may briefly 5xx /runners while state settles; retry.
+    }
+    Start-Sleep -Seconds 3
+}
+
+if ($primaryUp) {
+    $pidText  = if ($primaryInfo.PSObject.Properties.Name -contains 'pid')  { $primaryInfo.pid }  else { '?' }
+    $portText = if ($primaryInfo.PSObject.Properties.Name -contains 'port') { $primaryInfo.port } else { '?' }
+    Write-Step "primary runner is running (pid=$pidText port=$portText). Done."
+    exit 0
+} else {
+    Write-Fail "primary runner did not reach running:true within 120s, though the supervisor is healthy."
+    Write-Fail "Likely causes:"
+    Write-Fail "  - the #65 provenance start gate refused the slot binary (check the supervisor window / $LogFile for an 'Auto-start of primary runner ... failed' WARN);"
+    Write-Fail "  - no runner binary is built yet (build the runner via POST /runners/spawn-test {rebuild:true} or check target-pool/ slots)."
+    Write-Fail "Start it manually with: Invoke-RestMethod -Method Post -Uri $base/runners/primary/start"
+    exit 3
 }
