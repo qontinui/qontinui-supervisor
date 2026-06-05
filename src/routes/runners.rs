@@ -3553,8 +3553,10 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
     // Cross-slot SHA snapshot — what resolve_source_exe would pick now,
     // each slot's sidecar SHA (None when absent), and the drift warning.
     let freshness = crate::process::manager::compute_slot_freshness(&state).await;
-    let sha_by_slot: std::collections::HashMap<usize, Option<String>> =
-        freshness.slot_shas.iter().cloned().collect();
+    let provenance_by_slot: std::collections::HashMap<
+        usize,
+        crate::process::manager::SlotProvenanceKey,
+    > = freshness.slot_provenance.iter().cloned().collect();
 
     let mut any_slot_has_stale_frontend = false;
     for slot in &state.build_pool.slots {
@@ -3592,7 +3594,16 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             "last_error_log": history_snapshot.last_error_log,
         });
 
-        let slot_git_sha = sha_by_slot.get(&slot.id).cloned().flatten();
+        let (slot_git_sha, slot_source) = match provenance_by_slot.get(&slot.id) {
+            Some((sha, src)) => (
+                sha.clone(),
+                src.as_ref().map(|s| match s {
+                    crate::process::manager::BuildSource::LiveTree => "live_tree",
+                    crate::process::manager::BuildSource::Override => "override",
+                }),
+            ),
+            None => (None, None),
+        };
         let slot_json = match info_opt {
             Some(ref i) => {
                 let elapsed = (now - i.started_at).num_seconds().max(0);
@@ -3616,6 +3627,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                     "rebuild_kind": i.rebuild_kind,
                     "frontend_stale": frontend_stale,
                     "git_sha": slot_git_sha,
+                    "source": slot_source,
                     "history": history_json,
                 })
             }
@@ -3625,6 +3637,7 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
                 "state": "idle",
                 "frontend_stale": frontend_stale,
                 "git_sha": slot_git_sha,
+                "source": slot_source,
                 "history": history_json,
             }),
         };
@@ -3672,12 +3685,18 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
             })
         });
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
+        let source_label = |s: &crate::process::manager::BuildSource| match s {
+            crate::process::manager::BuildSource::LiveTree => "live_tree",
+            crate::process::manager::BuildSource::Override => "override",
+        };
         json!({
             "picked_slot_id": d.picked_slot_id,
             "picked_sha": d.picked_sha,
-            "conflicting": d.conflicting.iter().map(|(id, sha)| json!({
+            "picked_source": source_label(&d.picked_source),
+            "conflicting": d.conflicting.iter().map(|(id, sha, src)| json!({
                 "slot_id": id,
                 "sha": sha,
+                "source": src.as_ref().map(source_label),
             })).collect::<Vec<_>>(),
             "message": crate::process::manager::format_drift_warning(d),
         })

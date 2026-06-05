@@ -11,6 +11,7 @@ use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::manager::{BuildProvenance, BuildSource};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
     cleanup_orphaned_build_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
@@ -262,11 +263,22 @@ pub async fn run_cargo_build_with_dir(
         *last = Some(slot.id);
         drop(last);
 
-        // Stamp the slot's exe with the HEAD SHA so resolve_source_exe and
+        // Compute the provenance of THIS build ONCE — the SHA of the tree that
+        // was actually compiled (the override worktree root when
+        // `build_dir_override` is set, else the live tree), whether the source
+        // was the live tree or an override, the absolute dir built, and the
+        // build time. This is the root fix for the 2026-06-05 incident: the
+        // legacy sidecar always probed the live tree's HEAD and so recorded
+        // the wrong SHA for an override build. The value is in scope for the
+        // sidecar write below AND for the `update_lkg_after_success` call
+        // (Phase 2's LKG gate consumes it).
+        let provenance = compute_build_provenance(state, build_dir_override.as_deref()).await;
+
+        // Stamp the slot's exe with this provenance so resolve_source_exe and
         // /builds can detect drift across slots (a fresh exe staged into one
-        // slot while a stale exe lingers in another). Best-effort: no git, no
-        // sidecar, no warning surface — but the build still succeeded.
-        write_slot_sha_sidecar(state, &slot).await;
+        // slot while a stale or foreign exe lingers in another). Best-effort:
+        // a write failure is logged but the build still succeeded.
+        write_slot_provenance_sidecar(state, &slot, &provenance).await;
 
         // Capture this exe as the new last-known-good. Survives subsequent
         // failed builds that overwrite or delete the slot's exe; agents
@@ -1203,50 +1215,112 @@ async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Stamp the slot's freshly-built runner exe with the HEAD SHA in a sidecar
-/// file (`<slot>/debug/qontinui-runner.exe.git_sha`). Best-effort — every
-/// failure path is logged at debug and ignored. The build still counts as
-/// succeeded; the sidecar is observability for cross-slot drift detection.
+/// Pure selection of `(source, tree_root)` for provenance: which tree root to
+/// probe and how to label the source.
 ///
-/// Sidecar format: plain UTF-8, single line, exactly the SHA, no trailing
-/// newline. Read back by [`crate::process::manager::read_slot_sha`].
-async fn write_slot_sha_sidecar(state: &SharedState, slot: &Arc<BuildSlot>) {
+/// `build_dir_override` and `project_dir` both point at a runner `src-tauri`
+/// dir, so the tree root is `.parent()` in both cases (the same relationship).
+/// On the degenerate no-parent case we fall back to the dir itself rather than
+/// panic — the SHA probe will then just fail and record `sha: None`.
+fn provenance_tree_root(
+    project_dir: &std::path::Path,
+    build_dir_override: Option<&std::path::Path>,
+) -> (BuildSource, PathBuf) {
+    match build_dir_override {
+        Some(src_tauri) => (
+            BuildSource::Override,
+            src_tauri
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| src_tauri.to_path_buf()),
+        ),
+        None => (
+            BuildSource::LiveTree,
+            project_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| project_dir.to_path_buf()),
+        ),
+    }
+}
+
+/// Compute the [`BuildProvenance`] of a just-completed successful build.
+///
+/// The SHA is probed from the *tree that was actually built*:
+/// - `build_dir_override` set ⇒ the override worktree root
+///   (`build_dir_override.parent()`, since `build_dir_override` points at the
+///   tree's `src-tauri` dir — the same `dir.parent()` relationship the live
+///   tree uses via `project_dir.parent()`), `source = Override`.
+/// - `build_dir_override` `None` ⇒ the live tree root
+///   (`project_dir.parent()`), `source = LiveTree`.
+///
+/// The git probe is best-effort and mirrors the legacy posture: a probe
+/// failure yields `sha: None` (logged as a warning) and the build still
+/// succeeds. `built_from` always records the absolute tree root that was
+/// probed, even when the SHA probe fails, so the forensic trail survives.
+async fn compute_build_provenance(
+    state: &SharedState,
+    build_dir_override: Option<&std::path::Path>,
+) -> BuildProvenance {
+    let (source, tree_root) = provenance_tree_root(&state.config.project_dir, build_dir_override);
+
+    let sha = match rev_parse_head(&tree_root).await {
+        Some(s) => Some(s),
+        None => {
+            warn!(
+                "Build provenance: git rev-parse HEAD failed or returned empty in {:?} \
+                 (source={:?}); recording sha=null. Build still succeeded.",
+                tree_root, source
+            );
+            None
+        }
+    };
+
+    BuildProvenance {
+        sha,
+        source,
+        built_from: tree_root.to_string_lossy().to_string(),
+        built_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// Stamp the slot's freshly-built runner exe with its [`BuildProvenance`] in a
+/// JSON sidecar (`<slot>/debug/qontinui-runner.exe.provenance.json`).
+/// Best-effort — a write failure is logged but the build still counts as
+/// succeeded; the sidecar is observability for cross-slot drift detection and
+/// (Phase 2) the LKG promotion gate.
+///
+/// Read back by [`crate::process::manager::read_slot_provenance`].
+async fn write_slot_provenance_sidecar(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    provenance: &BuildProvenance,
+) {
     use tracing::debug;
-    let project_dir = &state.config.project_dir;
-    let git_dir = match project_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            debug!(
-                "Slot {} sha sidecar: project_dir has no parent ({:?}); skipping",
-                slot.id, project_dir
-            );
-            return;
-        }
-    };
-    let sha = match rev_parse_head(&git_dir).await {
-        Some(s) => s,
-        None => {
-            debug!(
-                "Slot {} sha sidecar: git rev-parse HEAD failed or returned empty in {:?}; skipping",
-                slot.id, git_dir
-            );
-            return;
-        }
-    };
     let exe_path = state.config.runner_exe_path_for_slot(slot.id);
     let sidecar = match exe_path.parent() {
-        Some(dir) => dir.join(crate::process::manager::SLOT_SHA_SIDECAR_FILENAME),
+        Some(dir) => dir.join(crate::process::manager::SLOT_PROVENANCE_SIDECAR_FILENAME),
         None => {
             debug!(
-                "Slot {} sha sidecar: exe path {:?} has no parent dir; skipping",
+                "Slot {} provenance sidecar: exe path {:?} has no parent dir; skipping",
                 slot.id, exe_path
             );
             return;
         }
     };
-    if let Err(e) = std::fs::write(&sidecar, sha.as_bytes()) {
+    let json = match serde_json::to_string(provenance) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(
+                "Slot {} provenance sidecar: serialize failed: {}",
+                slot.id, e
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&sidecar, json.as_bytes()) {
         debug!(
-            "Slot {} sha sidecar: write failed for {:?}: {}",
+            "Slot {} provenance sidecar: write failed for {:?}: {}",
             slot.id, sidecar, e
         );
     }
@@ -1961,9 +2035,109 @@ mod tests {
     //! Regression tests for the post-`npm exit 0` defense-in-depth `dist/`
     //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
     //! the bug these guard against.
-    use super::{dist_index_ok, needs_frontend_prebuild, verify_frontend_built};
+    use super::{
+        dist_index_ok, needs_frontend_prebuild, provenance_tree_root, rev_parse_head,
+        verify_frontend_built, BuildSource,
+    };
     use std::fs;
     use tempfile::TempDir;
+
+    /// `git init` a real repo at `dir` with one commit, returning its HEAD SHA.
+    /// Mirrors the temp-repo fixture pattern in `spawn_worktree.rs` tests.
+    fn init_git_repo_one_commit(dir: &std::path::Path, seed_name: &str) -> String {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        fs::write(dir.join(seed_name), seed_name.as_bytes()).expect("seed");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "initial"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        String::from_utf8_lossy(&head.stdout).trim().to_string()
+    }
+
+    /// `provenance_tree_root` selects `.parent()` of the live `project_dir`
+    /// and labels it `LiveTree` when there's no override.
+    #[test]
+    fn provenance_tree_root_live_tree() {
+        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
+        let (source, root) = provenance_tree_root(project_dir, None);
+        assert_eq!(source, BuildSource::LiveTree);
+        assert_eq!(root, std::path::Path::new("/ws/qontinui-runner"));
+    }
+
+    /// `provenance_tree_root` selects `.parent()` of the OVERRIDE src-tauri and
+    /// labels it `Override` — ignoring `project_dir` entirely.
+    #[test]
+    fn provenance_tree_root_override() {
+        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
+        let over = std::path::Path::new("/ws/.spawn-feat/qontinui-runner/src-tauri");
+        let (source, root) = provenance_tree_root(project_dir, Some(over));
+        assert_eq!(source, BuildSource::Override);
+        assert_eq!(
+            root,
+            std::path::Path::new("/ws/.spawn-feat/qontinui-runner")
+        );
+    }
+
+    /// The motivating-incident guard: with two distinct git repos (the "live"
+    /// tree and an "override" worktree at a DIFFERENT HEAD), the SHA probed for
+    /// an override build is the OVERRIDE tree's HEAD, not the live tree's.
+    #[tokio::test]
+    async fn override_build_probes_override_tree_sha_not_live() {
+        let base = TempDir::new().expect("tempdir");
+
+        // Live tree: <base>/live/qontinui-runner with src-tauri.
+        let live_root = base.path().join("live").join("qontinui-runner");
+        let live_src_tauri = live_root.join("src-tauri");
+        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
+        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
+
+        // Override tree: <base>/override/qontinui-runner with src-tauri, a
+        // DIFFERENT repo with a different HEAD.
+        let over_root = base.path().join("override").join("qontinui-runner");
+        let over_src_tauri = over_root.join("src-tauri");
+        fs::create_dir_all(&over_src_tauri).expect("mkdir override");
+        let over_sha = init_git_repo_one_commit(&over_root, "override-seed");
+
+        assert_ne!(live_sha, over_sha, "fixture must produce distinct HEADs");
+
+        // Live-tree selection probes the live tree's HEAD.
+        let (live_source, live_probe_root) = provenance_tree_root(&live_src_tauri, None);
+        assert_eq!(live_source, BuildSource::LiveTree);
+        assert_eq!(
+            rev_parse_head(&live_probe_root).await,
+            Some(live_sha.clone())
+        );
+
+        // Override selection probes the OVERRIDE tree's HEAD — the bug fix.
+        let (over_source, over_probe_root) =
+            provenance_tree_root(&live_src_tauri, Some(over_src_tauri.as_path()));
+        assert_eq!(over_source, BuildSource::Override);
+        assert_eq!(
+            rev_parse_head(&over_probe_root).await,
+            Some(over_sha.clone()),
+            "override build must record the override tree's sha, not the live tree's"
+        );
+        assert_ne!(
+            rev_parse_head(&over_probe_root).await,
+            Some(live_sha),
+            "override probe must NOT return the live tree's sha"
+        );
+    }
 
     /// Filename of the pnpm bin stub. `.cmd` on Windows (where pnpm installs
     /// `.bin/<tool>.cmd` shims), bare elsewhere. Mirrors the platform check

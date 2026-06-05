@@ -224,72 +224,138 @@ pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, 
     Ok(p)
 }
 
-/// Filename of the sidecar that records which git SHA a slot's exe was built
-/// from. Written by `build_monitor::run_cargo_build` after a successful build;
-/// read by [`resolve_source_exe`] and `GET /builds` to detect cross-slot drift.
-pub const SLOT_SHA_SIDECAR_FILENAME: &str = "qontinui-runner.exe.git_sha";
-
-/// Read the sidecar file recording which git SHA the slot's exe was built from.
-/// Returns `None` if the sidecar is missing, unreadable, or empty after trimming.
+/// Filename of the sidecar that records the provenance of a slot's exe — the
+/// git SHA of the tree it was actually built from, whether that tree was the
+/// live runner working tree or a `build_dir_override` (spawn-test) tree, the
+/// absolute dir built, and the build timestamp. Written by
+/// `build_monitor::run_cargo_build_with_dir` after a successful build; read by
+/// [`resolve_source_exe`] and `GET /builds` to detect cross-slot drift.
 ///
-/// Absence is "unknown SHA" — never an error.
-pub fn read_slot_sha(slot_target_dir: &std::path::Path) -> Option<String> {
-    let p = slot_target_dir
-        .join("debug")
-        .join(SLOT_SHA_SIDECAR_FILENAME);
-    let content = std::fs::read_to_string(&p).ok()?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+/// This replaces the legacy plain-SHA sidecar (`qontinui-runner.exe.git_sha`),
+/// which only ever recorded the live tree's HEAD and therefore lied when an
+/// override tree was built. Legacy files are ignored (read as absent) and
+/// self-heal on the next build.
+pub const SLOT_PROVENANCE_SIDECAR_FILENAME: &str = "qontinui-runner.exe.provenance.json";
+
+/// Which source tree a slot's exe was built from.
+///
+/// Binary by design — `live_tree` (cargo's `current_dir` was the live runner
+/// working tree, `build_dir_override == None`) vs `override` (a caller-supplied
+/// `build_dir_override`, i.e. a spawn-test `git_ref` / `worktree_path` tree).
+/// The forensic detail of *which* override tree is carried by
+/// [`BuildProvenance::built_from`]. This is deliberately NOT the response
+/// layer's three-way `source` split (`live_tree` / `worktree` / `worktree_path`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSource {
+    /// Built from the live runner working tree (`state.config.project_dir`).
+    LiveTree,
+    /// Built from a `build_dir_override` tree (spawn-test override path).
+    #[serde(rename = "override")]
+    Override,
 }
 
+/// Provenance of a slot's freshly-built runner exe — computed once in the
+/// success block of `run_cargo_build_with_dir` and written to the slot's
+/// provenance sidecar. Records the tree that was *actually* built, so a
+/// later reader (drift check, LKG gate, `GET /builds`) can tell whether a
+/// slot's exe came from the live tree or a foreign override tree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildProvenance {
+    /// 40-hex git SHA of the tree that was built, or `None` when the git probe
+    /// failed (git missing, not a repo, detached HEAD, etc.). Best-effort —
+    /// probe failure does not fail the build.
+    pub sha: Option<String>,
+    /// Whether the built tree was the live runner tree or an override tree.
+    pub source: BuildSource,
+    /// Absolute path of the tree root that was probed/built (the live tree
+    /// root, or the override worktree root). Forensic detail for the binary
+    /// `source`.
+    pub built_from: String,
+    /// RFC3339 timestamp of when the build completed.
+    pub built_at: String,
+}
+
+/// Read the provenance sidecar recording how the slot's exe was built.
+/// Returns `None` if the sidecar is missing, unreadable, or unparseable
+/// (including a legacy plain-SHA file, which is not valid provenance JSON).
+///
+/// Absence is "unknown provenance" — never an error. Slots self-heal on the
+/// next successful build, which rewrites the sidecar.
+pub fn read_slot_provenance(slot_target_dir: &std::path::Path) -> Option<BuildProvenance> {
+    let p = slot_target_dir
+        .join("debug")
+        .join(SLOT_PROVENANCE_SIDECAR_FILENAME);
+    let content = std::fs::read_to_string(&p).ok()?;
+    serde_json::from_str::<BuildProvenance>(&content).ok()
+}
+
+/// Convenience: the slot's recorded build SHA (`None` when no provenance
+/// sidecar or its `sha` field is null). Test-only — production code reads the
+/// full [`read_slot_provenance`] so it can compare `(sha, source)`.
+#[cfg(test)]
+pub fn read_slot_sha(slot_target_dir: &std::path::Path) -> Option<String> {
+    read_slot_provenance(slot_target_dir).and_then(|p| p.sha)
+}
+
+/// A slot's provenance identity for drift comparison: its recorded build SHA
+/// (`None` when unknown) and the source tree it was built from (`None` when no
+/// provenance sidecar at all). Two slots "drift" when these pairs differ.
+pub type SlotProvenanceKey = (Option<String>, Option<BuildSource>);
+
 /// Structured warning produced when [`resolve_source_exe`] picks a slot whose
-/// sidecar SHA differs from at least one other slot's sidecar SHA. Pure data
-/// — emitted to logs and `/builds`; never alters resolution.
+/// `(sha, source)` provenance differs from at least one other slot's. Pure
+/// data — emitted to logs and `/builds`; never alters resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotShaDrift {
     pub picked_slot_id: usize,
     pub picked_sha: String,
-    /// Other slots with a sidecar SHA distinct from `picked_sha`. Sorted by
-    /// slot id for deterministic output.
-    pub conflicting: Vec<(usize, String)>,
+    pub picked_source: BuildSource,
+    /// Other slots whose `(sha, source)` differs from the picked slot's. Sorted
+    /// by slot id for deterministic output. The string is the conflicting SHA
+    /// ("(none)" when that slot has no SHA) for the human-readable warning.
+    pub conflicting: Vec<(usize, String, Option<BuildSource>)>,
 }
 
-/// Compute SHA drift across the build pool. Returns `Some` only when both:
-/// - the picked slot has a sidecar SHA, AND
-/// - at least one other slot has a sidecar SHA distinct from the picked one.
+/// Compute provenance drift across the build pool. Returns `Some` only when
+/// both:
+/// - the picked slot has a provenance sidecar (a `source`), AND
+/// - at least one other slot has a provenance sidecar whose `(sha, source)`
+///   pair differs from the picked one.
 ///
-/// Slots without sidecars are treated as unknown — they don't trigger drift.
+/// Slots without a provenance sidecar are treated as unknown — they don't
+/// trigger drift. A slot built from an *override* tree at the same SHA as a
+/// live-tree slot still drifts, because the bytes came from a different tree.
 pub fn detect_slot_sha_drift(
     picked_slot_id: usize,
-    picked_sha: Option<&str>,
-    all_slot_shas: &[(usize, Option<String>)],
+    picked: &SlotProvenanceKey,
+    all_slots: &[(usize, SlotProvenanceKey)],
 ) -> Option<SlotShaDrift> {
-    let picked = picked_sha?;
-    let mut conflicting: Vec<(usize, String)> = all_slot_shas
+    let picked_source = picked.1?;
+    let picked_sha = picked.0.clone();
+    let mut conflicting: Vec<(usize, String, Option<BuildSource>)> = all_slots
         .iter()
-        .filter_map(|(id, sha)| {
+        .filter_map(|(id, key)| {
             if *id == picked_slot_id {
                 return None;
             }
-            let s = sha.as_ref()?;
-            if s != picked {
-                Some((*id, s.clone()))
-            } else {
-                None
+            // Only slots that have provenance participate.
+            key.1?;
+            if *key == (picked_sha.clone(), Some(picked_source)) {
+                return None;
             }
+            let sha_str = key.0.clone().unwrap_or_else(|| "(none)".to_string());
+            Some((*id, sha_str, key.1))
         })
         .collect();
     if conflicting.is_empty() {
         return None;
     }
-    conflicting.sort_by_key(|(id, _)| *id);
+    conflicting.sort_by_key(|(id, _, _)| *id);
     Some(SlotShaDrift {
         picked_slot_id,
-        picked_sha: picked.to_string(),
+        picked_sha: picked_sha.unwrap_or_else(|| "(none)".to_string()),
+        picked_source,
         conflicting,
     })
 }
@@ -299,21 +365,32 @@ fn sha_short(s: &str) -> &str {
     &s[..cut]
 }
 
+fn source_label(src: BuildSource) -> &'static str {
+    match src {
+        BuildSource::LiveTree => "live_tree",
+        BuildSource::Override => "override",
+    }
+}
+
 /// Format a [`SlotShaDrift`] as a human-readable warning line.
 pub fn format_drift_warning(d: &SlotShaDrift) -> String {
     let others: Vec<String> = d
         .conflicting
         .iter()
-        .map(|(id, sha)| format!("slot {} (sha {})", id, sha_short(sha)))
+        .map(|(id, sha, src)| {
+            let src_label = src.map(source_label).unwrap_or("unknown");
+            format!("slot {} (sha {}, source {})", id, sha_short(sha), src_label)
+        })
         .collect();
     let plural = if d.conflicting.len() > 1 { "s" } else { "" };
     format!(
-        "resolve_source_exe: picked slot {} (sha {}) but {} carries distinct sha{}. \
-         If newer, spawn-test {{rebuild:false}} will return a stale binary. Stage \
-         fresh exe into slot {} or set last_successful_slot. See \
+        "resolve_source_exe: picked slot {} (sha {}, source {}) but {} carries distinct \
+         provenance{}. If newer, spawn-test {{rebuild:false}} will return a stale or \
+         foreign binary. Stage fresh exe into slot {} or set last_successful_slot. See \
          proj_supervisor_slot_resolution_order.",
         d.picked_slot_id,
         sha_short(&d.picked_sha),
+        source_label(d.picked_source),
         others.join(", "),
         plural,
         d.picked_slot_id,
@@ -369,7 +446,10 @@ pub async fn pick_slot_for_resolution(state: &SharedState) -> Option<usize> {
 /// each slot's sidecar SHA (`None` when absent), and the drift warning (if any).
 pub struct SlotFreshness {
     pub picked_slot_id: Option<usize>,
-    pub slot_shas: Vec<(usize, Option<String>)>,
+    /// Per-slot provenance: `(slot_id, (sha, source))`. `source` is `None` when
+    /// the slot has no provenance sidecar; `sha` is `None` when the build's
+    /// git probe failed. Used by `GET /builds` to surface `git_sha` + `source`.
+    pub slot_provenance: Vec<(usize, SlotProvenanceKey)>,
     pub drift: Option<SlotShaDrift>,
     /// Sibling warning: a stale exe at the legacy `target/debug/` location
     /// that operators sometimes produce by running `cargo build` from the
@@ -383,24 +463,32 @@ pub struct SlotFreshness {
 /// Compute the cross-slot SHA snapshot. Used by both `resolve_source_exe`
 /// (which emits the warning) and `GET /builds` (which surfaces it as JSON).
 pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
-    let slot_shas: Vec<(usize, Option<String>)> = state
+    let slot_provenance: Vec<(usize, SlotProvenanceKey)> = state
         .build_pool
         .slots
         .iter()
-        .map(|s| (s.id, read_slot_sha(&s.target_dir)))
+        .map(|s| {
+            let prov = read_slot_provenance(&s.target_dir);
+            let key: SlotProvenanceKey = match prov {
+                Some(p) => (p.sha, Some(p.source)),
+                None => (None, None),
+            };
+            (s.id, key)
+        })
         .collect();
     let picked_slot_id = pick_slot_for_resolution(state).await;
     let drift = picked_slot_id.and_then(|pid| {
-        let picked_sha = slot_shas
+        let picked = slot_provenance
             .iter()
             .find(|(id, _)| *id == pid)
-            .and_then(|(_, s)| s.clone());
-        detect_slot_sha_drift(pid, picked_sha.as_deref(), &slot_shas)
+            .map(|(_, k)| k.clone())
+            .unwrap_or((None, None));
+        detect_slot_sha_drift(pid, &picked, &slot_provenance)
     });
     let target_debug_staleness = compute_target_debug_staleness_for_state(state);
     SlotFreshness {
         picked_slot_id,
-        slot_shas,
+        slot_provenance,
         drift,
         target_debug_staleness,
     }
@@ -555,17 +643,24 @@ pub async fn resolve_source_exe(
         let picked_path = state.config.runner_exe_path_for_slot(picked_id);
 
         // Drift check after pick — observability only, does NOT change which slot wins.
-        let slot_shas: Vec<(usize, Option<String>)> = state
+        let slot_provenance: Vec<(usize, SlotProvenanceKey)> = state
             .build_pool
             .slots
             .iter()
-            .map(|s| (s.id, read_slot_sha(&s.target_dir)))
+            .map(|s| {
+                let key: SlotProvenanceKey = match read_slot_provenance(&s.target_dir) {
+                    Some(p) => (p.sha, Some(p.source)),
+                    None => (None, None),
+                };
+                (s.id, key)
+            })
             .collect();
-        let picked_sha = slot_shas
+        let picked = slot_provenance
             .iter()
             .find(|(id, _)| *id == picked_id)
-            .and_then(|(_, s)| s.clone());
-        if let Some(drift) = detect_slot_sha_drift(picked_id, picked_sha.as_deref(), &slot_shas) {
+            .map(|(_, k)| k.clone())
+            .unwrap_or((None, None));
+        if let Some(drift) = detect_slot_sha_drift(picked_id, &picked, &slot_provenance) {
             let msg = format_drift_warning(&drift);
             warn!("{}", msg);
             state
@@ -2407,51 +2502,85 @@ mod tests {
         "c".repeat(40)
     }
 
+    /// Build a `(sha, source)` provenance key for a live-tree build.
+    fn live(sha: String) -> SlotProvenanceKey {
+        (Some(sha), Some(BuildSource::LiveTree))
+    }
+    /// Build a `(sha, source)` provenance key for an override build.
+    fn over(sha: String) -> SlotProvenanceKey {
+        (Some(sha), Some(BuildSource::Override))
+    }
+    /// A slot with no provenance sidecar at all.
+    fn absent() -> SlotProvenanceKey {
+        (None, None)
+    }
+
     /// Distinct SHAs across multiple slots — drift surfaces.
     #[test]
     fn drift_fires_when_two_slots_disagree() {
-        let all = vec![(0usize, Some(sha_a())), (1usize, Some(sha_b()))];
-        let d = detect_slot_sha_drift(0, Some(&sha_a()), &all)
+        let all = vec![(0usize, live(sha_a())), (1usize, live(sha_b()))];
+        let d = detect_slot_sha_drift(0, &live(sha_a()), &all)
             .expect("distinct SHAs must surface drift");
         assert_eq!(d.picked_slot_id, 0);
         assert_eq!(d.picked_sha, sha_a());
-        assert_eq!(d.conflicting, vec![(1usize, sha_b())]);
+        assert_eq!(d.picked_source, BuildSource::LiveTree);
+        assert_eq!(d.conflicting.len(), 1);
+        assert_eq!(d.conflicting[0].0, 1);
+        assert_eq!(d.conflicting[0].1, sha_b());
+        assert_eq!(d.conflicting[0].2, Some(BuildSource::LiveTree));
     }
 
-    /// All sidecar-present slots share a SHA — no drift.
+    /// Same SHA but DIFFERENT source tree (live vs override) — still drift,
+    /// because the bytes came from a different tree. This is the core 2026-06-05
+    /// incident guard.
+    #[test]
+    fn drift_fires_on_same_sha_different_source() {
+        let all = vec![(0usize, live(sha_a())), (1usize, over(sha_a()))];
+        let d = detect_slot_sha_drift(0, &live(sha_a()), &all)
+            .expect("same sha, different source must surface drift");
+        assert_eq!(d.conflicting.len(), 1);
+        assert_eq!(d.conflicting[0].0, 1);
+        assert_eq!(d.conflicting[0].2, Some(BuildSource::Override));
+    }
+
+    /// All sidecar-present slots share the same `(sha, source)` — no drift.
     #[test]
     fn drift_silent_when_all_slots_agree() {
         let all = vec![
-            (0usize, Some(sha_a())),
-            (1usize, Some(sha_a())),
-            (2usize, Some(sha_a())),
+            (0usize, live(sha_a())),
+            (1usize, live(sha_a())),
+            (2usize, live(sha_a())),
         ];
-        assert!(detect_slot_sha_drift(0, Some(&sha_a()), &all).is_none());
+        assert!(detect_slot_sha_drift(0, &live(sha_a()), &all).is_none());
     }
 
-    /// Picked slot has no sidecar — drift is silent (unknown SHA can't compare).
+    /// Picked slot has no sidecar — drift is silent (unknown provenance can't compare).
     #[test]
-    fn drift_silent_when_picked_sha_missing() {
-        let all = vec![(0usize, None), (1usize, Some(sha_b()))];
-        assert!(detect_slot_sha_drift(0, None, &all).is_none());
+    fn drift_silent_when_picked_provenance_missing() {
+        let all = vec![(0usize, absent()), (1usize, live(sha_b()))];
+        assert!(detect_slot_sha_drift(0, &absent(), &all).is_none());
     }
 
     /// Other slots have no sidecar — drift is silent (no conflict to surface).
     #[test]
     fn drift_silent_when_other_slots_have_no_sidecar() {
-        let all = vec![(0usize, Some(sha_a())), (1usize, None), (2usize, None)];
-        assert!(detect_slot_sha_drift(0, Some(&sha_a()), &all).is_none());
+        let all = vec![
+            (0usize, live(sha_a())),
+            (1usize, absent()),
+            (2usize, absent()),
+        ];
+        assert!(detect_slot_sha_drift(0, &live(sha_a()), &all).is_none());
     }
 
-    /// Three slots, two carry distinct SHAs — both surface in `conflicting`.
+    /// Three slots, two carry distinct provenance — both surface in `conflicting`.
     #[test]
     fn drift_collects_all_distinct_others() {
         let all = vec![
-            (0usize, Some(sha_a())),
-            (1usize, Some(sha_b())),
-            (2usize, Some(sha_c())),
+            (0usize, live(sha_a())),
+            (1usize, live(sha_b())),
+            (2usize, live(sha_c())),
         ];
-        let d = detect_slot_sha_drift(0, Some(&sha_a()), &all)
+        let d = detect_slot_sha_drift(0, &live(sha_a()), &all)
             .expect("two distinct others must surface");
         assert_eq!(d.conflicting.len(), 2);
         // Sorted by slot id deterministically.
@@ -2460,19 +2589,22 @@ mod tests {
     }
 
     /// `format_drift_warning` includes the picked slot id, abbreviated SHA,
-    /// and the conflict count.
+    /// the source label, and the conflict count.
     #[test]
     fn drift_warning_message_shape() {
         let d = SlotShaDrift {
             picked_slot_id: 0,
             picked_sha: sha_a(),
-            conflicting: vec![(1, sha_b())],
+            picked_source: BuildSource::LiveTree,
+            conflicting: vec![(1, sha_b(), Some(BuildSource::Override))],
         };
         let msg = format_drift_warning(&d);
         assert!(msg.contains("picked slot 0"));
         assert!(msg.contains("aaaaaaaaaaaa"), "{}", msg);
         assert!(msg.contains("slot 1"), "{}", msg);
         assert!(msg.contains("bbbbbbbbbbbb"), "{}", msg);
+        assert!(msg.contains("source live_tree"), "{}", msg);
+        assert!(msg.contains("source override"), "{}", msg);
         assert!(
             msg.contains("proj_supervisor_slot_resolution_order"),
             "warning must point operator at the relevant memory: {}",
@@ -2480,61 +2612,128 @@ mod tests {
         );
     }
 
-    /// Pluralization: multiple conflicting slots produce "shas", not "sha".
+    /// Pluralization: multiple conflicting slots produce "provenances", not "provenance".
     #[test]
     fn drift_warning_pluralizes_multiple_conflicts() {
         let d = SlotShaDrift {
             picked_slot_id: 0,
             picked_sha: sha_a(),
-            conflicting: vec![(1, sha_b()), (2, sha_c())],
+            picked_source: BuildSource::LiveTree,
+            conflicting: vec![
+                (1, sha_b(), Some(BuildSource::LiveTree)),
+                (2, sha_c(), Some(BuildSource::LiveTree)),
+            ],
         };
         let msg = format_drift_warning(&d);
-        assert!(msg.contains("distinct shas"), "{}", msg);
+        assert!(msg.contains("distinct provenances"), "{}", msg);
     }
 
     // =========================================================================
-    // Sidecar IO (read_slot_sha)
+    // Provenance sidecar IO (read_slot_provenance / read_slot_sha)
     // =========================================================================
 
-    /// Round-trip: write SHA bytes, read returns the same SHA trimmed.
-    #[test]
-    fn read_slot_sha_round_trip() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let debug = dir.path().join("debug");
+    fn write_provenance(dir: &std::path::Path, p: &BuildProvenance) {
+        let debug = dir.join("debug");
         std::fs::create_dir_all(&debug).expect("mkdir debug");
-        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
-        std::fs::write(&sidecar, sha_a().as_bytes()).expect("write");
-        let got = read_slot_sha(dir.path()).expect("must read");
-        assert_eq!(got, sha_a());
+        let sidecar = debug.join(SLOT_PROVENANCE_SIDECAR_FILENAME);
+        std::fs::write(&sidecar, serde_json::to_string(p).expect("serialize")).expect("write");
+    }
+
+    /// Round-trip: write provenance JSON, read returns the identical struct,
+    /// and the serialized `source` uses the wire labels `live_tree`/`override`.
+    #[test]
+    fn read_slot_provenance_round_trip() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let prov = BuildProvenance {
+            sha: Some(sha_a()),
+            source: BuildSource::Override,
+            built_from: "/some/abs/worktree".to_string(),
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+        };
+        write_provenance(dir.path(), &prov);
+
+        // Raw JSON carries the wire shape we promised consumers.
+        let raw = std::fs::read_to_string(
+            dir.path()
+                .join("debug")
+                .join(SLOT_PROVENANCE_SIDECAR_FILENAME),
+        )
+        .expect("read raw");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse raw");
+        assert_eq!(v["sha"], serde_json::json!(sha_a()));
+        assert_eq!(v["source"], serde_json::json!("override"));
+        assert_eq!(v["built_from"], serde_json::json!("/some/abs/worktree"));
+
+        let got = read_slot_provenance(dir.path()).expect("must read");
+        assert_eq!(got, prov);
+        // The convenience SHA accessor mirrors the provenance sha.
+        assert_eq!(read_slot_sha(dir.path()), Some(sha_a()));
+    }
+
+    /// A `live_tree` source serializes to `"live_tree"`.
+    #[test]
+    fn provenance_live_tree_source_wire_label() {
+        let prov = BuildProvenance {
+            sha: Some(sha_a()),
+            source: BuildSource::LiveTree,
+            built_from: "/live/tree".to_string(),
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&prov).unwrap()).unwrap();
+        assert_eq!(v["source"], serde_json::json!("live_tree"));
+    }
+
+    /// `sha: null` round-trips (the git probe failed at build time).
+    #[test]
+    fn read_slot_provenance_null_sha() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let prov = BuildProvenance {
+            sha: None,
+            source: BuildSource::LiveTree,
+            built_from: "/live/tree".to_string(),
+            built_at: "2026-06-05T12:00:00+00:00".to_string(),
+        };
+        write_provenance(dir.path(), &prov);
+        let got = read_slot_provenance(dir.path()).expect("must read");
+        assert_eq!(got.sha, None);
+        assert_eq!(read_slot_sha(dir.path()), None);
     }
 
     /// Missing sidecar — no error, returns None.
     #[test]
-    fn read_slot_sha_missing_returns_none() {
+    fn read_slot_provenance_missing_returns_none() {
         let dir = tempfile::TempDir::new().expect("tempdir");
+        assert!(read_slot_provenance(dir.path()).is_none());
         assert!(read_slot_sha(dir.path()).is_none());
     }
 
-    /// Empty / whitespace-only sidecar — returns None (treated as unknown).
+    /// A legacy plain-SHA file (the old `qontinui-runner.exe.git_sha` content,
+    /// or any non-JSON) under the new filename is unparseable → treated as
+    /// absent. Slots self-heal on the next build.
     #[test]
-    fn read_slot_sha_blank_returns_none() {
+    fn read_slot_provenance_legacy_plain_sha_returns_none() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let debug = dir.path().join("debug");
         std::fs::create_dir_all(&debug).expect("mkdir debug");
-        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
-        std::fs::write(&sidecar, b"   \n\t  ").expect("write");
+        // Old format: a bare 40-hex SHA, no JSON.
+        std::fs::write(
+            debug.join(SLOT_PROVENANCE_SIDECAR_FILENAME),
+            sha_a().as_bytes(),
+        )
+        .expect("write");
+        assert!(read_slot_provenance(dir.path()).is_none());
         assert!(read_slot_sha(dir.path()).is_none());
     }
 
-    /// Sidecar with leading/trailing whitespace — returns trimmed SHA.
+    /// Empty / whitespace-only sidecar — returns None (unparseable).
     #[test]
-    fn read_slot_sha_trims_whitespace() {
+    fn read_slot_provenance_blank_returns_none() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let debug = dir.path().join("debug");
         std::fs::create_dir_all(&debug).expect("mkdir debug");
-        let sidecar = debug.join(SLOT_SHA_SIDECAR_FILENAME);
-        std::fs::write(&sidecar, format!("  {}\n", sha_a()).as_bytes()).expect("write");
-        assert_eq!(read_slot_sha(dir.path()), Some(sha_a()));
+        std::fs::write(debug.join(SLOT_PROVENANCE_SIDECAR_FILENAME), b"   \n\t  ").expect("write");
+        assert!(read_slot_provenance(dir.path()).is_none());
     }
 
     // =========================================================================
