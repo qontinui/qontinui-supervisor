@@ -266,7 +266,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint) |
 | POST | `/runner/restart` | Restart runner (legacy single-runner endpoint) |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
-| POST | `/runner/fix-and-rebuild` | Fix errors and rebuild (legacy single-runner endpoint) |
+| POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll}` immediately; the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
 
 ### Debug endpoints (gated)
 

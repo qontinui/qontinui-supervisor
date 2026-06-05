@@ -302,6 +302,15 @@ pub struct SupervisorState {
     /// `ci_runner_probe::ci_runner_probe_loop`. Read by the fleet
     /// heartbeat to include CI runner info in the budget POST.
     pub ci_runner_state: RwLock<CiRunnerState>,
+    /// Submission id of the most recent in-flight `POST /runner/fix-and-rebuild`
+    /// detached rebuild, if any. `fix-and-rebuild` rebuilds the *single* live
+    /// runner tree into the build-pool slots; two concurrent ones would race the
+    /// same slots + LKG bookkeeping. The handler reads this under the lock: if it
+    /// points at a still-non-terminal submission, the second request is an
+    /// idempotent accept (returns the existing submission id) instead of kicking
+    /// off a duplicate build. Cleared/overwritten when a new rebuild is started
+    /// (the previous id having reached terminal). `None` until the first rebuild.
+    pub fix_and_rebuild_inflight: RwLock<Option<uuid::Uuid>>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -999,6 +1008,7 @@ impl SupervisorState {
             supervisor_started_at: std::time::SystemTime::now(),
             synthetic_build_id_tx,
             ci_runner_state: RwLock::new(CiRunnerState::default()),
+            fix_and_rebuild_inflight: RwLock::new(None),
         }
     }
 
