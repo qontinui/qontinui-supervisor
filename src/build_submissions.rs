@@ -151,6 +151,28 @@ pub struct BuildSubmission {
     /// `2026-06-03-ui-bridge-verification-friction-improvements`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawn: Option<SpawnOutcome>,
+    /// Terminal outcome of a *detached* HTTP-action submission created via
+    /// [`submit_detached`] — the same state-machine seam as [`submit_spawn`] but
+    /// with no runner/port. Used by `POST /runner/fix-and-rebuild` so a 10-20min
+    /// live-tree rebuild survives the caller disconnecting: the handler returns
+    /// 202 with this submission's id, the build runs to completion (provenance
+    /// sidecar + LKG promotion + slot state) in a detached task, and the result
+    /// is recoverable via `GET /build/:id/status`. `None` for spawn/cargo
+    /// submissions and until the action reaches a terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detached: Option<DetachedOutcome>,
+}
+
+/// Terminal outcome of a detached HTTP-action submission ([`submit_detached`]).
+/// Mirrors [`SpawnOutcome`] minus the runner port — carries the exact HTTP
+/// status + body the synchronous handler would have returned, recoverable via
+/// `GET /build/:id/status` after the caller's connection is gone.
+#[derive(Debug, Clone, Serialize)]
+pub struct DetachedOutcome {
+    /// HTTP status the synchronous path would have returned (200, 500, …).
+    pub http_status: u16,
+    /// The full response body.
+    pub body: serde_json::Value,
 }
 
 /// Terminal outcome of a spawn-test build submission. Mirrors the
@@ -263,6 +285,7 @@ pub async fn submit(
         stdout_tail: Vec::new(),
         stderr_tail: Vec::new(),
         spawn: None,
+        detached: None,
     };
 
     let store = state.build_submissions.clone();
@@ -327,6 +350,7 @@ where
         stdout_tail: Vec::new(),
         stderr_tail: Vec::new(),
         spawn: None,
+        detached: None,
     };
 
     // Insert synchronously-enough: callers await this fn (it's not async, so
@@ -389,6 +413,111 @@ where
                 .or_else(|| body.get("message").and_then(|m| m.as_str()))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("spawn-test returned HTTP {http_status}"));
+            BuildStatus::Failed {
+                started_at,
+                finished_at,
+                duration_secs,
+                exit_code: None,
+                error: reason,
+            }
+        };
+    });
+
+    (id, arc_ret)
+}
+
+/// Register a *detached* HTTP-action submission and drive it through the SAME
+/// state machine as [`submit_spawn`] / `/build/submit`, but without a runner or
+/// port. Used by `POST /runner/fix-and-rebuild`: the `exec` future is the full
+/// live-tree rebuild (cargo build + provenance sidecar + LKG promotion + slot
+/// bookkeeping) and runs in a *detached* background task so a client disconnect
+/// (E2E timeout, `curl -m 30`, Ctrl-C) can no longer cancel it mid-flight.
+///
+/// The submission moves `Queued → Running → Succeeded/Failed` exactly like
+/// [`submit_spawn`]: the future is awaited under `Running`, a `2xx` http_status
+/// records `Succeeded`, anything else `Failed` with a short reason pulled from
+/// the body. The `(http_status, body)` result is stored under
+/// [`BuildSubmission::detached`] and recoverable via `GET /build/:id/status`.
+///
+/// Returns the submission id + Arc immediately. The handler returns a 202 with
+/// the id; there is intentionally no synchronous await path (the whole point is
+/// detachment), but callers that want to block can [`await_terminal`] the Arc.
+pub fn submit_detached<F>(
+    store: Arc<BuildSubmissionStore>,
+    worktree_path: PathBuf,
+    agent_id: Option<String>,
+    exec: F,
+) -> (Uuid, Arc<RwLock<BuildSubmission>>)
+where
+    F: std::future::Future<Output = (u16, serde_json::Value)> + Send + 'static,
+{
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let submission = BuildSubmission {
+        id,
+        worktree_path,
+        build_kind: BuildKind::Build,
+        agent_id,
+        package: None,
+        features: vec!["custom-protocol".to_string()],
+        base_ref: None,
+        submitted_at: now,
+        status: BuildStatus::Queued,
+        cache_key: None,
+        cache_outcome: None,
+        cache_hit: false,
+        stdout_tail: Vec::new(),
+        stderr_tail: Vec::new(),
+        spawn: None,
+        detached: None,
+    };
+
+    let arc = Arc::new(RwLock::new(submission));
+    let arc_ret = arc.clone();
+    let store_bg = store.clone();
+    tokio::spawn(async move {
+        // Register in the store so `GET /build/:id/status` can find it.
+        {
+            let mut map = store_bg.submissions.write().await;
+            map.insert(id, arc.clone());
+        }
+        let started_at = Utc::now();
+        {
+            let mut sub = arc.write().await;
+            sub.status = BuildStatus::Running { started_at };
+        }
+
+        let (http_status, mut body) = exec.await;
+        // Inject `build_id` = submission id so the stored body self-identifies,
+        // mirroring submit_spawn.
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "build_id".to_string(),
+                serde_json::Value::String(id.to_string()),
+            );
+        }
+        let finished_at = Utc::now();
+        let duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+        let succeeded = (200..300).contains(&http_status);
+
+        let mut sub = arc.write().await;
+        sub.detached = Some(DetachedOutcome {
+            http_status,
+            body: body.clone(),
+        });
+        sub.status = if succeeded {
+            BuildStatus::Succeeded {
+                started_at,
+                finished_at,
+                duration_secs,
+            }
+        } else {
+            let reason = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .or_else(|| body.get("message").and_then(|m| m.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("detached action returned HTTP {http_status}"));
             BuildStatus::Failed {
                 started_at,
                 finished_at,
@@ -959,6 +1088,7 @@ mod tests {
             stdout_tail: vec![],
             stderr_tail: vec![],
             spawn: None,
+            detached: None,
         };
         store.insert(sub).await;
         let found = store.get(&id).await;
@@ -991,6 +1121,7 @@ mod tests {
                 stdout_tail: vec![],
                 stderr_tail: vec![],
                 spawn: None,
+                detached: None,
             };
             store.insert(sub).await;
         }
@@ -1022,6 +1153,7 @@ mod tests {
                 stdout_tail: vec![],
                 stderr_tail: vec![],
                 spawn: None,
+                detached: None,
             };
             store.insert(sub).await;
         }
@@ -1043,6 +1175,7 @@ mod tests {
             stdout_tail: vec![],
             stderr_tail: vec![],
             spawn: None,
+            detached: None,
         };
         store.insert(extra).await;
         // 17 entries, all in-flight — no evictions possible.
@@ -1161,6 +1294,7 @@ mod tests {
             stdout_tail: vec![],
             stderr_tail: vec![],
             spawn: None,
+            detached: None,
         };
         let v = serde_json::to_value(&cargo).unwrap();
         assert!(
@@ -1177,5 +1311,139 @@ mod tests {
         let v = serde_json::to_value(&spawn_sub).unwrap();
         assert_eq!(v["spawn"]["http_status"], 200);
         assert_eq!(v["spawn"]["port"], 9881);
+    }
+
+    // ---------- detached submission state machine (fix-and-rebuild) ----------
+
+    #[tokio::test]
+    async fn submit_detached_reaches_terminal_succeeded_and_stores_outcome() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (id, arc) = submit_detached(
+            store.clone(),
+            PathBuf::from("/tmp/runner/src-tauri"),
+            Some("agent-y".into()),
+            async {
+                (
+                    200,
+                    serde_json::json!({"status": "ok", "message": "Runner rebuilt"}),
+                )
+            },
+        );
+
+        await_terminal(&arc).await;
+        let found = store
+            .get(&id)
+            .await
+            .expect("detached submission registered in store");
+        let sub = found.read().await;
+        assert!(matches!(sub.status, BuildStatus::Succeeded { .. }));
+        let outcome = sub.detached.as_ref().expect("detached outcome recorded");
+        assert_eq!(outcome.http_status, 200);
+        assert_eq!(outcome.body["status"], "ok");
+        // build_id injected = submission id.
+        assert_eq!(outcome.body["build_id"], id.to_string());
+        // A detached submission carries no spawn outcome.
+        assert!(sub.spawn.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_detached_non_2xx_records_failed_with_reason() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (_id, arc) =
+            submit_detached(store.clone(), PathBuf::from("/tmp/runner"), None, async {
+                (
+                    500,
+                    serde_json::json!({"status": "error", "error": "cargo exited with status 101"}),
+                )
+            });
+
+        await_terminal(&arc).await;
+        let sub = arc.read().await;
+        match &sub.status {
+            BuildStatus::Failed { error, .. } => assert!(
+                error.contains("cargo exited"),
+                "failed status must carry the error reason; got {error}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(sub.detached.as_ref().unwrap().http_status, 500);
+    }
+
+    /// The whole point of detachment: the exec future runs to completion even
+    /// when the caller drops the returned Arc immediately (simulating an HTTP
+    /// client disconnect — nothing awaits the build). A side-channel flag is set
+    /// from inside the exec future; after a brief yield it must be observed set.
+    #[tokio::test]
+    async fn submit_detached_completes_after_caller_drops_handle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in = ran.clone();
+        let (id, arc) = submit_detached(
+            store.clone(),
+            PathBuf::from("/tmp/runner"),
+            None,
+            async move {
+                ran_in.store(true, Ordering::SeqCst);
+                (200, serde_json::json!({"status": "ok"}))
+            },
+        );
+        // Drop the handle the handler would have returned — as if the HTTP
+        // connection went away. The detached task is independent.
+        drop(arc);
+
+        // Poll the store (not the dropped Arc) until terminal. The bg task
+        // registers the submission as its first step, so retry briefly until it
+        // appears — registration is concurrent with this read.
+        let mut stored = None;
+        for _ in 0..200 {
+            if let Some(a) = store.get(&id).await {
+                stored = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let stored = stored.expect("submission registered in store despite dropped handle");
+        await_terminal(&stored).await;
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "detached exec future must run to completion even with no awaiter"
+        );
+        assert!(stored.read().await.status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn detached_outcome_serializes_only_when_present() {
+        let mut sub = BuildSubmission {
+            id: Uuid::new_v4(),
+            worktree_path: PathBuf::from("/tmp/x"),
+            build_kind: BuildKind::Build,
+            agent_id: None,
+            package: None,
+            features: vec![],
+            base_ref: None,
+            submitted_at: Utc::now(),
+            status: BuildStatus::Queued,
+            cache_key: None,
+            cache_outcome: None,
+            cache_hit: false,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+            spawn: None,
+            detached: None,
+        };
+        let v = serde_json::to_value(&sub).unwrap();
+        assert!(
+            v.get("detached").is_none(),
+            "must omit `detached` when None"
+        );
+
+        sub.detached = Some(DetachedOutcome {
+            http_status: 200,
+            body: serde_json::json!({"status": "ok"}),
+        });
+        let v = serde_json::to_value(&sub).unwrap();
+        assert_eq!(v["detached"]["http_status"], 200);
+        assert_eq!(v["detached"]["body"]["status"], "ok");
     }
 }

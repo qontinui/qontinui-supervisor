@@ -283,25 +283,122 @@ pub async fn reset_build(
     })))
 }
 
-/// POST /runner/fix-and-rebuild — Rebuild the runner.
+/// POST /runner/fix-and-rebuild — Rebuild the live runner tree, detached from
+/// the HTTP connection.
+///
+/// **Why detached.** The rebuild is a full `cargo build` of the live runner
+/// tree (~10-20 min). Previously this ran *inside* the request handler future,
+/// so when the HTTP client disconnected (E2E timeout, `curl -m 30`, Ctrl-C)
+/// axum dropped the handler future and cancelled the build mid-flight — twice
+/// today this left a slot with a bare exe and no provenance sidecar / LKG
+/// bookkeeping because the post-build steps never ran. The route is the
+/// documented recovery path in the #65 start-gate refusal, so its success can't
+/// depend on the caller's TCP patience.
+///
+/// **New contract.** The build is submitted to the #63 build-submissions state
+/// machine ([`submit_detached`]) and runs in a background task independent of
+/// this handler's future. The handler returns **202 Accepted** immediately with
+/// the submission id; callers poll `GET /build/{id}/status` for the terminal
+/// outcome. `run_cargo_build` runs to completion regardless of the connection,
+/// so the provenance sidecar + LKG promotion + slot state are always written.
+///
+/// **Idempotent accept.** If a previous fix-and-rebuild submission is still
+/// in-flight (non-terminal), a second request returns that same submission id
+/// (202) instead of kicking off a duplicate live-tree build that would race the
+/// same slots + LKG.
 pub async fn fix_and_rebuild(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    // Idempotent accept: if a prior rebuild is still running, return it.
+    {
+        let inflight = state.fix_and_rebuild_inflight.read().await;
+        if let Some(existing_id) = *inflight {
+            if let Some(arc) = state.build_submissions.get(&existing_id).await {
+                if !arc.read().await.status.is_terminal() {
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Info,
+                            format!(
+                                "Fix & Rebuild: rebuild {existing_id} already in flight — \
+                                 returning existing submission (idempotent accept)"
+                            ),
+                        )
+                        .await;
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({
+                            "status": "accepted",
+                            "build_id": existing_id.to_string(),
+                            "submission_id": existing_id.to_string(),
+                            "poll": format!("/build/{existing_id}/status"),
+                            "deduplicated": true,
+                            "message": "fix-and-rebuild already in flight; \
+                                        poll GET /build/{id}/status for the terminal outcome",
+                        })),
+                    )
+                        .into_response());
+                }
+            }
+        }
+    }
+
     state
         .logs
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
-            "Fix & Rebuild: rebuilding runner",
+            "Fix & Rebuild: submitting detached runner rebuild",
         )
         .await;
 
-    crate::build_monitor::run_cargo_build(&state).await?;
+    // Submit the live-tree rebuild to the build-submissions state machine. The
+    // exec future runs in a detached background task — a client disconnect can
+    // no longer cancel it, so the post-build provenance/LKG steps always run.
+    let exec_state = state.clone();
+    let (submission_id, _arc) = crate::build_submissions::submit_detached(
+        state.build_submissions.clone(),
+        state.config.project_dir.clone(),
+        None,
+        async move {
+            match crate::build_monitor::run_cargo_build(&exec_state).await {
+                Ok(()) => (
+                    StatusCode::OK.as_u16(),
+                    serde_json::json!({
+                        "status": "ok",
+                        "message": "Runner rebuilt (restart manually to apply)"
+                    }),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string(),
+                    }),
+                ),
+            }
+        },
+    );
 
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "message": "Runner rebuilt (restart manually to apply)"
-    })))
+    // Record the new in-flight submission id for idempotent-accept dedup.
+    {
+        let mut inflight = state.fix_and_rebuild_inflight.write().await;
+        *inflight = Some(submission_id);
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "accepted",
+            "build_id": submission_id.to_string(),
+            "submission_id": submission_id.to_string(),
+            "poll": format!("/build/{submission_id}/status"),
+            "message": "fix-and-rebuild submitted; the build runs detached from this \
+                        connection — poll GET /build/{id}/status for the terminal outcome",
+        })),
+    )
+        .into_response())
 }
 
 /// Trigger a graceful shutdown of the supervisor.
@@ -406,5 +503,109 @@ pub async fn supervisor_restart(
             "Failed to spawn replacement supervisor: {}",
             e
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build_submissions::{BuildKind, BuildStatus, BuildSubmission};
+    use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+    use crate::state::{SharedState, SupervisorState};
+    use axum::extract::State;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_state(root: &std::path::Path) -> SharedState {
+        let config = SupervisorConfig {
+            project_dir: root.join("src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 8081,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: true,
+            no_webview: true,
+        };
+        Arc::new(SupervisorState::new(config))
+    }
+
+    fn queued_submission(id: uuid::Uuid) -> BuildSubmission {
+        BuildSubmission {
+            id,
+            worktree_path: PathBuf::from("/tmp/runner/src-tauri"),
+            build_kind: BuildKind::Build,
+            agent_id: None,
+            package: None,
+            features: vec![],
+            base_ref: None,
+            submitted_at: chrono::Utc::now(),
+            status: BuildStatus::Running {
+                started_at: chrono::Utc::now(),
+            },
+            cache_key: None,
+            cache_outcome: None,
+            cache_hit: false,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+            spawn: None,
+            detached: None,
+        }
+    }
+
+    async fn body_json(resp: axum::response::Response) -> (u16, serde_json::Value) {
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response body must be JSON");
+        (status, v)
+    }
+
+    /// A second fix-and-rebuild while one is still in flight is an idempotent
+    /// accept: returns the EXISTING submission id (202, `deduplicated: true`)
+    /// without kicking off a duplicate live-tree build. This path never calls
+    /// `run_cargo_build`, so it's deterministic.
+    #[tokio::test]
+    async fn fix_and_rebuild_idempotent_accept_returns_existing_inflight() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+
+        // Seed a still-running submission + point the in-flight tracker at it.
+        let existing_id = uuid::Uuid::new_v4();
+        state
+            .build_submissions
+            .insert(queued_submission(existing_id))
+            .await;
+        *state.fix_and_rebuild_inflight.write().await = Some(existing_id);
+
+        let resp = fix_and_rebuild(State(state.clone()))
+            .await
+            .expect("handler ok")
+            .into_response();
+        let (status, body) = body_json(resp).await;
+
+        assert_eq!(status, 202, "idempotent accept must be 202");
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(
+            body["build_id"],
+            existing_id.to_string(),
+            "must return the EXISTING submission id, not a fresh one"
+        );
+        // The tracker is unchanged — still the original submission.
+        assert_eq!(
+            *state.fix_and_rebuild_inflight.read().await,
+            Some(existing_id)
+        );
     }
 }
