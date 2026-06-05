@@ -6,6 +6,8 @@ Rust-based build server and fleet dashboard for qontinui-runner. Provides parall
 
 The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health but never starts, stops, or restarts them unprompted.
 
+With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it still never restarts a primary that crashes later, and never auto-starts named/temp/external runners.
+
 - **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners.
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor observes health only.
