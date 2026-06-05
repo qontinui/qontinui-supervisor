@@ -8,7 +8,7 @@
 //! - `GET  /ci-runner/status`  — current CI runner state from the probe loop
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,10 @@ use tracing::{info, warn};
 
 use crate::ci_runner_lifecycle;
 use crate::state::SharedState;
+
+/// Reject absurdly large `Authorization` header values before touching reqwest.
+/// Mirrors the bound used by the web-fleet proxy.
+const MAX_HEADER_VALUE_LEN: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Coord integration: resolve coord base URL from ~/.qontinui/profiles.json
@@ -114,22 +118,85 @@ fn action_err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Fetch a CI runner registration token from coord.
-async fn fetch_registration_token() -> Result<String, String> {
-    let base = coord_http_base()
-        .ok_or_else(|| "could not resolve coord URL from ~/.qontinui/profiles.json".to_string())?;
+/// Extract and validate the caller's `Authorization` header.
+///
+/// The supervisor holds NO credential of its own — the CI-runner lifecycle
+/// endpoints are pure forwarders, so a device credential is mandatory. Returns
+/// the header value to forward verbatim, or a `(status, message)` pair the
+/// caller turns into an actionable `401`/`400` response. (We return the small
+/// pair rather than a full `Response` to avoid clippy's `result_large_err`.)
+fn require_authorization(headers: &HeaderMap) -> Result<HeaderValue, (StatusCode, &'static str)> {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .filter(|v| !v.as_bytes().is_empty())
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "CI-runner management requires a device credential — pair this runner first",
+        ))?;
+
+    if auth.as_bytes().len() > MAX_HEADER_VALUE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Authorization header exceeds maximum accepted length",
+        ));
+    }
+
+    Ok(auth.clone())
+}
+
+/// Why fetching a registration token from coord failed.
+///
+/// Distinguishes a coord-side credential rejection (401/403 — the forwarded
+/// device-JWT is bad) from a transient/unreachable-coord error so the handler
+/// can surface an actionable, non-conflated message. There is NO silent
+/// fallback to anonymous.
+enum FetchTokenError {
+    /// coord rejected the forwarded device credential (HTTP 401/403).
+    CredentialRejected(String),
+    /// coord was unreachable, misconfigured, or returned some other failure.
+    Unreachable(String),
+}
+
+impl FetchTokenError {
+    /// Map to the HTTP response surfaced to the dashboard caller.
+    fn into_response(self) -> Response {
+        match self {
+            FetchTokenError::CredentialRejected(detail) => action_err(
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "coord rejected the forwarded device credential — the runner's \
+                     device-JWT may be expired or unpaired ({detail})"
+                ),
+            ),
+            FetchTokenError::Unreachable(detail) => action_err(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to get registration token from coord: {detail}"),
+            ),
+        }
+    }
+}
+
+/// Fetch a CI runner registration token from coord, forwarding the caller's
+/// `Authorization` value verbatim. The supervisor adds no credential of its own.
+async fn fetch_registration_token(auth: &HeaderValue) -> Result<String, FetchTokenError> {
+    let base = coord_http_base().ok_or_else(|| {
+        FetchTokenError::Unreachable(
+            "could not resolve coord URL from ~/.qontinui/profiles.json".to_string(),
+        )
+    })?;
 
     let url = format!("{base}/coord/ci-runner/registration-token");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+        .map_err(|e| FetchTokenError::Unreachable(format!("failed to create HTTP client: {e}")))?;
 
     let resp = client
         .get(&url)
+        .header(axum::http::header::AUTHORIZATION, auth)
         .send()
         .await
-        .map_err(|e| format!("coord request failed: {e}"))?;
+        .map_err(|e| FetchTokenError::Unreachable(format!("coord request failed: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -137,14 +204,19 @@ async fn fetch_registration_token() -> Result<String, String> {
             .text()
             .await
             .unwrap_or_else(|_| "<no body>".to_string());
-        return Err(format!("coord returned {status} from {url}: {body}"));
+        let detail = format!("coord returned {status} from {url}: {body}");
+        // 401/403 = the forwarded device credential was rejected; everything
+        // else is a transient/unreachable-coord failure.
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(FetchTokenError::CredentialRejected(detail));
+        }
+        return Err(FetchTokenError::Unreachable(detail));
     }
 
     // Expect JSON `{ "token": "..." }` or plain-text token.
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("failed to read coord response body: {e}"))?;
+    let body = resp.text().await.map_err(|e| {
+        FetchTokenError::Unreachable(format!("failed to read coord response body: {e}"))
+    })?;
 
     // Try JSON first.
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -156,7 +228,9 @@ async fn fetch_registration_token() -> Result<String, String> {
     // Fall back to treating the whole body as the token.
     let trimmed = body.trim().to_string();
     if trimmed.is_empty() {
-        return Err("coord returned empty registration token".to_string());
+        return Err(FetchTokenError::Unreachable(
+            "coord returned empty registration token".to_string(),
+        ));
     }
     Ok(trimmed)
 }
@@ -189,19 +263,31 @@ fn resolve_runner_name() -> String {
 /// 4. Installs and starts the systemd service.
 pub async fn enable(
     State(_state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<EnableRequest>,
 ) -> Response {
     info!("POST /ci-runner/enable: starting CI runner setup");
 
-    // 1. Get registration token from coord.
-    let token = match fetch_registration_token().await {
+    // Require a device credential. The supervisor forwards it verbatim to
+    // coord and holds none of its own.
+    let auth = match require_authorization(&headers) {
+        Ok(v) => v,
+        Err((status, msg)) => return action_err(status, msg),
+    };
+
+    // 1. Get registration token from coord, forwarding the device credential.
+    let token = match fetch_registration_token(&auth).await {
         Ok(t) => t,
         Err(e) => {
-            warn!("POST /ci-runner/enable: failed to get registration token: {e}");
-            return action_err(
-                StatusCode::BAD_GATEWAY,
-                format!("failed to get registration token from coord: {e}"),
-            );
+            match &e {
+                FetchTokenError::CredentialRejected(detail) => {
+                    warn!("POST /ci-runner/enable: coord rejected device credential: {detail}");
+                }
+                FetchTokenError::Unreachable(detail) => {
+                    warn!("POST /ci-runner/enable: failed to get registration token: {detail}");
+                }
+            }
+            return e.into_response();
         }
     };
 
@@ -231,20 +317,34 @@ pub async fn enable(
 /// `POST /ci-runner/disable` — Stop and deregister the CI runner.
 pub async fn disable(
     State(_state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<DisableRequest>,
 ) -> Response {
     info!("POST /ci-runner/disable: removing CI runner");
 
+    // Require a device credential even when a token is supplied: the contract
+    // is uniform across enable/disable and coord enforces FleetPrincipal.
+    let auth = match require_authorization(&headers) {
+        Ok(v) => v,
+        Err((status, msg)) => return action_err(status, msg),
+    };
+
     let token = match body.token {
         Some(t) => t,
-        None => match fetch_registration_token().await {
+        None => match fetch_registration_token(&auth).await {
             Ok(t) => t,
             Err(e) => {
-                warn!("POST /ci-runner/disable: failed to get removal token: {e}");
-                return action_err(
-                    StatusCode::BAD_GATEWAY,
-                    format!("failed to get removal token from coord: {e}"),
-                );
+                match &e {
+                    FetchTokenError::CredentialRejected(detail) => {
+                        warn!(
+                            "POST /ci-runner/disable: coord rejected device credential: {detail}"
+                        );
+                    }
+                    FetchTokenError::Unreachable(detail) => {
+                        warn!("POST /ci-runner/disable: failed to get removal token: {detail}");
+                    }
+                }
+                return e.into_response();
             }
         },
     };
@@ -309,4 +409,88 @@ pub async fn status(State(state): State<SharedState>) -> Json<CiRunnerStatusResp
         service_names: ci_state.service_names.clone(),
         installed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read a `Response` body into a UTF-8 string for assertions.
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    #[test]
+    fn require_authorization_rejects_missing_header() {
+        let headers = HeaderMap::new();
+        let (status, msg) =
+            require_authorization(&headers).expect_err("missing header must be rejected");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            msg.contains("requires a device credential"),
+            "actionable message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn require_authorization_rejects_empty_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static(""),
+        );
+        let (status, _) =
+            require_authorization(&headers).expect_err("empty header must be rejected");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_authorization_rejects_oversized_header() {
+        let mut headers = HeaderMap::new();
+        let huge = "Bearer ".to_string() + &"a".repeat(MAX_HEADER_VALUE_LEN + 1);
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&huge).unwrap(),
+        );
+        let (status, _) =
+            require_authorization(&headers).expect_err("oversized header must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn require_authorization_accepts_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer device-jwt-token"),
+        );
+        let got = require_authorization(&headers).expect("valid bearer accepted");
+        assert_eq!(got.to_str().unwrap(), "Bearer device-jwt-token");
+    }
+
+    #[tokio::test]
+    async fn fetch_token_credential_rejected_maps_to_401() {
+        let resp =
+            FetchTokenError::CredentialRejected("coord returned 403".to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("coord rejected the forwarded device credential"),
+            "distinct rejection message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_token_unreachable_maps_to_502() {
+        let resp = FetchTokenError::Unreachable("connection refused".to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("failed to get registration token from coord"),
+            "distinct unreachable message, got: {body}"
+        );
+    }
 }
