@@ -90,6 +90,35 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt_layer)
         .with(velocity)
         .init();
+
+    // Route EVERY panic through tracing (in addition to the default stderr
+    // hook), so a panic in a detached `tokio::spawn` build task — whose
+    // `JoinError` nobody observes — is never silent in supervisor.log. The
+    // build-pipeline silent-wedge regression (a panic in the Windows spawn
+    // path unwinding the inline/detached build task, leaving the slot idle
+    // with no log and no timeout) is invisible without this. Chains the
+    // previous hook so the standard panic message + backtrace still print.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            error!(
+                target: "qontinui_supervisor::panic",
+                "PANIC at {location}: {payload}"
+            );
+            default_hook(info);
+        }));
+    }
+
     info!(
         "Starting qontinui-supervisor v{}",
         env!("CARGO_PKG_VERSION")

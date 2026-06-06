@@ -1,16 +1,14 @@
 use regex::Regex;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tracing::{error, info, warn};
 
 use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
 use crate::process::manager::{BuildProvenance, BuildSource};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
@@ -259,6 +257,10 @@ pub async fn run_cargo_build_with_dir(
     // If this build succeeded, record the slot as the most recent successful one.
     // Readers of `rebuild: false` use this to locate the exe to copy.
     if result.is_ok() {
+        info!(
+            "GCMD: build succeeded, promoting slot {} to last_successful_slot + computing provenance/LKG",
+            slot.id
+        );
         let mut last = state.build_pool.last_successful_slot.write().await;
         *last = Some(slot.id);
         drop(last);
@@ -545,6 +547,11 @@ async fn run_build_inner(
     // on the spawn response. See qontinui-supervisor#21.
     warn_if_working_tree_off_main(state, slot.id).await;
 
+    info!(
+        "GCMD: frontend step returned, starting cargo (slot={})",
+        slot.id
+    );
+
     // Always pass --features custom-protocol so Tauri embeds the frontend from
     // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
     // from devUrl (localhost:1420), which isn't running.
@@ -556,122 +563,137 @@ async fn run_build_inner(
         "custom-protocol",
     ];
 
-    #[cfg(windows)]
-    let mut child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mut cmd = Command::new("cargo");
-        cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(cargo_cwd)
-            // Redirect cargo output to this slot's isolated target dir so
-            // concurrent builds on other slots don't contend on the same target/.
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
-    };
-
-    #[cfg(not(windows))]
-    let mut child = {
-        let mut cmd = Command::new("cargo");
-        cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(cargo_cwd)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
-    };
-
     // Reset the per-slot full-build log at the start of each build so a reader
     // hitting `GET /builds/{slot_id}/log` while a build is in flight doesn't
     // see a confusing mix of "old log + still building". `None` = "no log
     // captured yet for the current build attempt".
     *slot.last_build_log.write().await = None;
 
-    // Stream stderr (cargo outputs to stderr)
-    let stderr = child.stderr.take();
+    // Run cargo through GuardedCommand: it spawns the child, assigns it to a
+    // kill-on-close JobObject (Windows) so the wall-clock timeout reliably
+    // tears down the WHOLE build tree (cargo → rustc → linker grandchildren),
+    // and bounds the post-exit pipe drain so a pipe-holding grandchild can't
+    // silently wedge the build. We attach a per-build broadcast channel via
+    // `stream_lines` and process each stderr line live (error classification
+    // + `state.logs.emit` + fanout to the slot's SSE sender + collection),
+    // preserving the exact live-logging behavior of the legacy reader task.
+    let timeout_secs = build_timeout_secs();
+    info!(
+        "GCMD: cargo start slot={} cwd={:?} target={:?} timeout={}s",
+        slot.id, cargo_cwd, slot.target_dir, timeout_secs
+    );
 
-    let stderr_handle = if let Some(stderr) = stderr {
+    // Per-build line bus. `stream_lines` forwards cargo's merged stderr lines
+    // here as they're read; the consumer task below mirrors the legacy
+    // classification + emit + SSE-fanout + collection.
+    let (line_tx, mut line_rx) = tokio::sync::broadcast::channel::<String>(4096);
+    let consumer = {
         let state_clone = state.clone();
-        // Snapshot the slot's broadcast sender once outside the per-line loop.
-        // `broadcast::Sender::send` returns `Err` when there are no
-        // subscribers — that's the expected steady-state (nobody is
-        // currently `GET /builds/{slot_id}/log/stream`ing), so the error
-        // is intentionally swallowed via `let _ =`. Keeping the sender on
-        // the slot (rather than per-build) means SSE clients connected
-        // mid-build naturally pick up subsequent builds without re-handshake.
         let log_stream = slot.log_stream.clone();
-        Some(tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
+        tokio::spawn(async move {
             let mut error_lines = Vec::new();
             let mut all_lines = Vec::new();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&line));
-                let level = if is_error {
-                    LogLevel::Error
-                } else {
-                    LogLevel::Info
-                };
-
-                state_clone.logs.emit(LogSource::Build, level, &line).await;
-                // Fanout to per-slot SSE subscribers. Err == no subscribers,
-                // which is the common case — drop silently.
-                let _ = log_stream.send(line.clone());
-                all_lines.push(line.clone());
-
-                if is_error {
-                    error_lines.push(line);
+            loop {
+                match line_rx.recv().await {
+                    Ok(line) => {
+                        let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&line));
+                        let level = if is_error {
+                            LogLevel::Error
+                        } else {
+                            LogLevel::Info
+                        };
+                        state_clone.logs.emit(LogSource::Build, level, &line).await;
+                        // Fanout to per-slot SSE subscribers. Err == no
+                        // subscribers (common case) — drop silently.
+                        let _ = log_stream.send(line.clone());
+                        all_lines.push(line.clone());
+                        if is_error {
+                            error_lines.push(line);
+                        }
+                    }
+                    // Sender dropped (run finished) → done. `Lagged` means we
+                    // fell behind the bounded channel; skip the dropped frames
+                    // and keep going so we still collect the tail.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("GCMD: cargo line consumer lagged, dropped {} lines", n);
+                    }
                 }
             }
-
             (error_lines, all_lines)
-        }))
-    } else {
-        None
+        })
     };
 
-    // Wait with timeout
-    let timeout_secs = build_timeout_secs();
-    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    let guarded = GuardedCommand::new("cargo", Duration::from_secs(timeout_secs))
+        .args(CARGO_BUILD_ARGS)
+        .current_dir(cargo_cwd)
+        // Redirect cargo output to this slot's isolated target dir so
+        // concurrent builds on other slots don't contend on the same target/.
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .job_guarded(true)
+        .stream_lines(line_tx);
 
-    let status = match wait_result {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
+    let outcome = guarded.run().await;
+    // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
+    // moved into the command and is dropped when `run` returns, closing the
+    // consumer's channel so it terminates.
+    let (status, captured_stderr_bytes): (std::process::ExitStatus, Vec<u8>) = match outcome {
+        Ok(GuardedOutcome::Exited(output)) => {
+            info!(
+                "GCMD: cargo step returned status={} slot={}",
+                output.status, slot.id
+            );
+            (output.status, output.stderr)
+        }
+        Ok(GuardedOutcome::TimedOut { after, partial }) => {
+            warn!(
+                "GCMD: cargo TimedOut after {}s, killing — slot={}",
+                after.as_secs(),
+                slot.id
+            );
+            // Make sure the consumer terminates even though we early-return.
+            let _ = consumer.await;
+            let _ = partial; // partial stderr already streamed live to logs
+            return Err(SupervisorError::Timeout(format!(
+                "Build timed out after {}s",
+                after.as_secs()
+            )));
+        }
+        Ok(GuardedOutcome::Cancelled { .. }) => {
+            warn!("GCMD: cargo Cancelled — slot={}", slot.id);
+            let _ = consumer.await;
+            return Err(SupervisorError::Process("Build cancelled".to_string()));
+        }
+        Err(e) => {
+            warn!("GCMD: cargo run() returned err={} slot={}", e, slot.id);
+            let _ = consumer.await;
             return Err(SupervisorError::Process(format!(
-                "Build process error: {}",
+                "Failed to run cargo build: {}",
                 e
             )));
         }
-        Err(_) => {
-            warn!("Build timed out after {}s, killing", timeout_secs);
-            let _ = child.kill().await;
-            return Err(SupervisorError::Timeout(format!(
-                "Build timed out after {}s",
-                timeout_secs
-            )));
-        }
     };
 
-    // Collect any remaining error output.  Give the stderr reader a few seconds
-    // to finish — on Windows, orphaned grandchild processes (rustc, linker) can
-    // keep the pipe open long after cargo itself exits, causing an indefinite hang.
-    let (error_lines, all_stderr_lines) = if let Some(handle) = stderr_handle {
-        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+    // The live consumer task has the authoritative classified line vectors
+    // (it mirrors the legacy reader). Join it under a short bound — the sender
+    // is already dropped, so it should close promptly.
+    let (error_lines, all_stderr_lines) =
+        match tokio::time::timeout(Duration::from_secs(5), consumer).await {
             Ok(Ok(result)) => result,
             _ => {
-                warn!("Timed out waiting for build stderr reader, proceeding without full output");
-                (Vec::new(), Vec::new())
+                warn!("Timed out waiting for build line consumer, falling back to captured bytes");
+                // Fallback: reconstruct from the captured stderr bytes so we
+                // never lose the build output entirely.
+                let text = String::from_utf8_lossy(&captured_stderr_bytes);
+                let all: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                let errs: Vec<String> = all
+                    .iter()
+                    .filter(|l| BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(l)))
+                    .cloned()
+                    .collect();
+                (errs, all)
             }
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+        };
 
     // Store full stderr for smart rebuild AI fix prompt
     let joined_stderr = all_stderr_lines.join("\n");
@@ -743,6 +765,10 @@ async fn run_build_inner(
             )
             .await;
         info!("Build completed successfully");
+        info!(
+            "GCMD: cargo step returned status=success, run_build_inner returning Ok (slot={})",
+            slot.id
+        );
         Ok(())
     } else {
         // Reuse `joined_stderr` from above; identical to `all_stderr_lines.join("\n")`.
@@ -1079,32 +1105,66 @@ async fn run_pnpm_command(
     cwd: &std::path::Path,
     args: &str,
 ) -> Result<std::process::Output, std::io::Error> {
+    let timeout_secs = crate::config::pnpm_timeout_secs();
+    info!(
+        "GCMD: pnpm start args={:?} cwd={:?} timeout={}s",
+        args, cwd, timeout_secs
+    );
+
+    // Build the GuardedCommand. On Windows pnpm ships as a `.cmd` shim, so it
+    // must be invoked via `cmd /C pnpm.cmd <args>` exactly as the legacy
+    // invocation did. On POSIX call `pnpm` directly with split argv tokens.
     #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
-        Command::new("cmd")
-            .args(["/C", &format!("pnpm.cmd {}", args)])
-            .current_dir(cwd)
-            // Match the live-tree invocation: vite.config.ts gates the
-            // build target on TAURI_PLATFORM=windows.
-            .env("TAURI_PLATFORM", "windows")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW_)
-            .output()
-            .await
-    }
+    let guarded = GuardedCommand::new("cmd", Duration::from_secs(timeout_secs))
+        .args(["/C", &format!("pnpm.cmd {}", args)])
+        .current_dir(cwd)
+        // Match the live-tree invocation: vite.config.ts gates the build
+        // target on TAURI_PLATFORM=windows.
+        .env("TAURI_PLATFORM", "windows")
+        .job_guarded(true);
+
     #[cfg(not(windows))]
-    {
-        // Split the args string so tokens land as separate argv entries.
+    let guarded = {
         let split_args: Vec<&str> = args.split_whitespace().collect();
-        Command::new("pnpm")
-            .args(&split_args)
+        GuardedCommand::new("pnpm", Duration::from_secs(timeout_secs))
+            .args(split_args)
             .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
+            .job_guarded(true)
+    };
+
+    let outcome = guarded.run().await?;
+
+    match outcome {
+        GuardedOutcome::Exited(output) => {
+            info!(
+                "GCMD: pnpm done outcome=Exited exit={} args={:?}",
+                output.status, args
+            );
+            Ok(output)
+        }
+        GuardedOutcome::TimedOut { after, .. } => {
+            warn!(
+                "GCMD: pnpm done outcome=TimedOut after={}s args={:?}",
+                after.as_secs(),
+                args
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "pnpm '{}' timed out after {}s in {:?}",
+                    args,
+                    after.as_secs(),
+                    cwd
+                ),
+            ))
+        }
+        GuardedOutcome::Cancelled { .. } => {
+            warn!("GCMD: pnpm done outcome=Cancelled args={:?}", args);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("pnpm '{}' cancelled in {:?}", args, cwd),
+            ))
+        }
     }
 }
 
@@ -1154,14 +1214,25 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
     };
 
     async fn run_git(args: &[&str], cwd: &std::path::Path) -> Option<String> {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .ok()?;
+        // git rev-parse is a fast leaf process that never forks a pipe-holding
+        // grandchild, so `job_guarded(false)` — the wall-clock timeout +
+        // direct-child kill is sufficient and we avoid a JobObject per probe.
+        let outcome = GuardedCommand::new(
+            "git",
+            Duration::from_secs(crate::config::git_timeout_secs()),
+        )
+        .args(args)
+        .current_dir(cwd)
+        .job_guarded(false)
+        .run()
+        .await
+        .ok()?;
+        let out = match outcome {
+            GuardedOutcome::Exited(out) => out,
+            // A wedged git probe times out (or is cancelled) → treat as
+            // "couldn't determine", same as a non-zero exit.
+            _ => return None,
+        };
         if !out.status.success() {
             return None;
         }
@@ -1202,14 +1273,20 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
 /// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
 /// (git missing, not a repo, detached HEAD with no SHA, etc.). Best-effort.
 async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(git_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .ok()?;
+    let outcome = GuardedCommand::new(
+        "git",
+        Duration::from_secs(crate::config::git_timeout_secs()),
+    )
+    .args(["rev-parse", "HEAD"])
+    .current_dir(git_dir)
+    .job_guarded(false)
+    .run()
+    .await
+    .ok()?;
+    let out = match outcome {
+        GuardedOutcome::Exited(out) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
@@ -1831,56 +1908,55 @@ async fn prewarm_single_slot(
         "custom-protocol",
     ];
 
-    #[cfg(windows)]
-    let child_result = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(&state.config.project_dir)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .spawn()
-    };
-
-    #[cfg(not(windows))]
-    let child_result = {
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(&state.config.project_dir)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-    };
-
-    let mut child = child_result.map_err(|e| {
-        SupervisorError::Process(format!("Failed to spawn prewarm cargo check: {}", e))
-    })?;
-
-    // Stream stderr to logs
-    if let Some(stderr) = child.stderr.take() {
+    // Per-build line bus so prewarm stderr lines stream to logs live (mirrors
+    // the legacy reader task) while GuardedCommand owns the pipe + JobObject.
+    let (line_tx, mut line_rx) = tokio::sync::broadcast::channel::<String>(4096);
+    {
         let state_clone = state.clone();
         let slot_id = slot.id;
         tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                state_clone
-                    .logs
-                    .emit(
-                        LogSource::Build,
-                        LogLevel::Info,
-                        format!("[prewarm slot {}] {}", slot_id, line),
-                    )
-                    .await;
+            loop {
+                match line_rx.recv().await {
+                    Ok(line) => {
+                        state_clone
+                            .logs
+                            .emit(
+                                LogSource::Build,
+                                LogLevel::Info,
+                                format!("[prewarm slot {}] {}", slot_id, line),
+                            )
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
             }
         });
     }
 
-    match tokio::time::timeout(Duration::from_secs(PREWARM_TIMEOUT_SECS), child.wait()).await {
+    info!(
+        "GCMD: prewarm cargo check start slot={} timeout={}s",
+        slot.id, PREWARM_TIMEOUT_SECS
+    );
+    let outcome = GuardedCommand::new("cargo", Duration::from_secs(PREWARM_TIMEOUT_SECS))
+        .args(args)
+        .current_dir(&state.config.project_dir)
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .job_guarded(true)
+        .stream_lines(line_tx)
+        .run()
+        .await;
+
+    // Map the GuardedOutcome back onto the legacy match shape: `Ok(Ok(status))`
+    // for a clean exit, the timeout arm for TimedOut/Cancelled, and a process
+    // error for a spawn failure.
+    let wait_result: Result<Result<std::process::ExitStatus, std::io::Error>, ()> = match outcome {
+        Ok(GuardedOutcome::Exited(out)) => Ok(Ok(out.status)),
+        Ok(GuardedOutcome::TimedOut { .. }) | Ok(GuardedOutcome::Cancelled { .. }) => Err(()),
+        Err(e) => Ok(Err(e)),
+    };
+
+    match wait_result {
         Ok(Ok(status)) if status.success() => {
             let ms = start.elapsed().as_millis();
             info!("Prewarmed slot {} in {}ms", slot.id, ms);
@@ -1914,11 +1990,13 @@ async fn prewarm_single_slot(
             e
         ))),
         Err(_) => {
+            // GuardedCommand already killed the (whole) process tree on its
+            // timeout/cancel arm before returning, so there's nothing left to
+            // kill here.
             warn!(
-                "Prewarm of slot {} timed out after {}s, killing",
+                "Prewarm of slot {} timed out after {}s (tree killed by GuardedCommand)",
                 slot.id, PREWARM_TIMEOUT_SECS
             );
-            let _ = child.kill().await;
             Err(SupervisorError::Timeout(format!(
                 "Prewarm timed out after {}s",
                 PREWARM_TIMEOUT_SECS

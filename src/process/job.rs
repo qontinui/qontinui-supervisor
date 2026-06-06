@@ -33,6 +33,54 @@ mod imp {
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
+    /// Assign a running process (by pid) to an already-created job handle.
+    ///
+    /// Used by [`RunnerJob::assign`] (the supervisor's process-lifetime runner
+    /// job). Uses minimum-privilege `PROCESS_SET_QUOTA | PROCESS_TERMINATE`
+    /// rather than `PROCESS_ALL_ACCESS`. (The per-build tree-kill job is now
+    /// provided by the `process-wrap` crate's `JobObject` wrapper inside
+    /// [`crate::process::guarded_command`], not by a hand-rolled job here.)
+    ///
+    /// `job` must be a valid job handle owned by the caller; `pid` must name a
+    /// process owned by the current user (or the supervisor must be admin).
+    pub(super) fn assign_pid_to(job: HANDLE, pid: u32) -> Result<()> {
+        // SAFETY: OpenProcess with these access rights is documented as safe
+        // for any PID owned by the current user (or with admin).
+        let proc_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if proc_handle.is_null() {
+            // SAFETY: GetLastError is always safe to call.
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!(
+                "OpenProcess(pid={}) failed (GetLastError = {})",
+                pid,
+                err
+            ))
+            .with_context(|| format!("assign_pid_to(pid = {pid})"));
+        }
+
+        // SAFETY: both handles are valid kernel handles owned by us.
+        let ok = unsafe { AssignProcessToJobObject(job, proc_handle) };
+
+        // Always close the per-process handle — the assignment is recorded by
+        // the kernel and does not depend on us holding the duplicate handle.
+        //
+        // SAFETY: proc_handle is a valid open handle.
+        unsafe {
+            CloseHandle(proc_handle);
+        }
+
+        if ok == 0 {
+            // SAFETY: GetLastError is always safe to call.
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!(
+                "AssignProcessToJobObject(pid={}) failed (GetLastError = {})",
+                pid,
+                err
+            ));
+        }
+        Ok(())
+    }
+
     /// LimitFlags applied to the supervisor's runner job.
     ///
     /// - `KILL_ON_JOB_CLOSE`: the kernel terminates every assigned process when
@@ -134,42 +182,7 @@ mod imp {
         /// Uses minimum-privilege `PROCESS_SET_QUOTA | PROCESS_TERMINATE`
         /// rather than `PROCESS_ALL_ACCESS`.
         pub fn assign(&self, pid: u32) -> Result<()> {
-            // SAFETY: OpenProcess with these access rights is documented as
-            // safe for any PID owned by the current user (or with admin).
-            let proc_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-            if proc_handle.is_null() {
-                // SAFETY: GetLastError is always safe to call.
-                let err = unsafe { GetLastError() };
-                return Err(anyhow!(
-                    "OpenProcess(pid={}) failed (GetLastError = {})",
-                    pid,
-                    err
-                ))
-                .with_context(|| format!("RunnerJob::assign(pid = {pid})"));
-            }
-
-            // SAFETY: both handles are valid kernel handles owned by us.
-            let ok = unsafe { AssignProcessToJobObject(self.handle.0, proc_handle) };
-
-            // Always close the per-process handle — the assignment is
-            // recorded by the kernel and does not depend on us holding
-            // the duplicate handle. Failing to close it would leak.
-            //
-            // SAFETY: proc_handle is a valid open handle.
-            unsafe {
-                CloseHandle(proc_handle);
-            }
-
-            if ok == 0 {
-                // SAFETY: GetLastError is always safe to call.
-                let err = unsafe { GetLastError() };
-                return Err(anyhow!(
-                    "AssignProcessToJobObject(pid={}) failed (GetLastError = {})",
-                    pid,
-                    err
-                ));
-            }
-            Ok(())
+            assign_pid_to(self.handle.0, pid)
         }
     }
 
@@ -216,4 +229,8 @@ mod imp {
     }
 }
 
+// `RunnerJob` spans the supervisor lifetime and keeps spawned runners alive
+// until the supervisor exits (kill-on-job-close). The per-build tree-kill job
+// is provided by the `process-wrap` crate's `JobObject`/`ProcessGroup` wrappers
+// inside `guarded_command::GuardedCommand`, not by a hand-rolled job here.
 pub use imp::RunnerJob;

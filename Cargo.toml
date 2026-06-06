@@ -20,6 +20,9 @@ path = "src/bin/symbol_watcher.rs"
 [dependencies]
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio = { version = "1", features = ["full"] }
+# CancellationToken for build cancellation (per-slot cancel of an in-flight
+# `GuardedCommand::run`). `rt` is the feature gate for the sync primitives.
+tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,6 +57,16 @@ url = "2"
 sha2 = "0.10"
 hex = "0.4"
 bytes = "1"
+
+# Process tree-kill + async wait for build subprocesses (cargo/pnpm/git). The
+# maintained successor to `command-group`, by the watchexec author. Provides a
+# tokio async child wrapped in a Windows JobObject (whole-tree kill) on Windows
+# and a process group on Unix, with async `.wait()` / `.kill()`. We spawn with
+# stdout/stderr redirected to files (never pipes) so reading output can't starve
+# the runtime, and use the crate's JobObject wrap for whole-tree teardown on
+# timeout/cancel. Default features cover creation-flags + job-object +
+# process-group; `tokio1` enables the async (tokio) command/child surface.
+process-wrap = { version = "9", features = ["tokio1"] }
 
 # Row 9 Phase 5 — OpenTelemetry distributed tracing. Versions match
 # the runner's pin (`qontinui-runner/src-tauri/Cargo.toml`) and coord's
@@ -110,3 +123,9 @@ windows-sys = { version = "0.59", features = [
 # Windows-only: the supervisor never targets anything else.
 wry = "0.54"
 tao = "0.34"
+# The `windows` crate (distinct from `windows-sys`) is pulled in transitively by
+# `process-wrap`'s job-object/creation-flags features; we use its
+# `PROCESS_CREATION_FLAGS` newtype to pass `CREATE_NO_WINDOW` into the crate's
+# `CreationFlags` wrapper alongside `JobObject`. Pinned to match process-wrap's
+# transitive selection (0.62).
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
