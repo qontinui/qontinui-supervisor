@@ -41,6 +41,13 @@ pub enum SupervisorError {
     #[error("Timeout: {0}")]
     Timeout(String),
 
+    /// A build was cancelled — typically because a newer restart targeting the
+    /// same runner pre-empted the in-flight build via its per-slot
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). Mapped to
+    /// `409 CONFLICT`: the request didn't fail, it was deliberately superseded.
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -94,6 +101,7 @@ impl SupervisorError {
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            SupervisorError::Cancelled(_) => StatusCode::CONFLICT,
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
             SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,6 +143,7 @@ impl IntoResponse for SupervisorError {
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            SupervisorError::Cancelled(_) => StatusCode::CONFLICT,
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
             SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,

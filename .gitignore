@@ -1,5 +1,6 @@
 /target
 /target-test
+/target-check
 /target-pool
 Cargo.lock
 *.exe

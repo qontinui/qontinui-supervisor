@@ -1,16 +1,15 @@
 use regex::Regex;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
     cleanup_orphaned_build_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
@@ -36,25 +35,38 @@ struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        // Path 1 (sync, fast): try to clear the slot in-place.
-        let cleared_inline = if let Ok(mut busy) = self.slot.busy.try_write() {
+        // Path 1 (sync, fast): try to clear the slot in-place. Clear BOTH the
+        // busy marker and the per-slot cancel token (same try-write-then-spawn
+        // pattern), so a stale token from this build can never pre-empt the
+        // NEXT build that lands on this slot.
+        let cleared_busy_inline = if let Ok(mut busy) = self.slot.busy.try_write() {
             *busy = None;
             true
         } else {
             false
         };
+        let cleared_cancel_inline = if let Ok(mut cancel) = self.slot.cancel.try_write() {
+            *cancel = None;
+            true
+        } else {
+            false
+        };
 
-        // Path 2 (async fallback): if we couldn't take the slot lock here,
-        // OR after we've cleared it, schedule a task that recomputes the
-        // global flag from authoritative slot state. Spawn unconditionally
-        // so the recompute always runs — `any_slot_busy(state)` requires
-        // async access to every slot's RwLock, which we can't do from Drop.
+        // Path 2 (async fallback): if we couldn't take a lock here, OR after
+        // we've cleared it, schedule a task that recomputes the global flag
+        // from authoritative slot state. Spawn unconditionally so the recompute
+        // always runs — `any_slot_busy(state)` requires async access to every
+        // slot's RwLock, which we can't do from Drop.
         let slot = self.slot.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
-            if !cleared_inline {
+            if !cleared_busy_inline {
                 let mut busy = slot.busy.write().await;
                 *busy = None;
+            }
+            if !cleared_cancel_inline {
+                let mut cancel = slot.cancel.write().await;
+                *cancel = None;
             }
             // Reconcile the global legacy flag. Authoritative source is
             // `any_slot_busy` — never trust the cached flag during recovery.
@@ -62,6 +74,81 @@ impl Drop for SlotGuard {
             let mut build = state.build.write().await;
             build.build_in_progress = any_busy;
         });
+    }
+}
+
+/// RAII lease over one build-pool slot: a held semaphore permit + a claimed
+/// idle slot (marked busy with the caller's [`BuildInfo`]) + a freshly-minted
+/// per-slot [`CancellationToken`]. Bundles the permit acquisition, slot claim,
+/// cancel-token publish, and the [`SlotGuard`] cleanup that both the runner
+/// build (`run_cargo_build_with_dir`) and the generalized
+/// `/build/submit` path (`build_submissions::run_submission`) need, so the
+/// slot accounting that `GET /builds` derives from `slot.busy` is identical for
+/// both — there is ONE slot-accounting path, not two.
+///
+/// Drop order matters: the [`SlotGuard`] frees `busy`/`cancel` first, then the
+/// permit is released for the next waiter.
+pub struct BuildSlotLease {
+    pub slot: Arc<BuildSlot>,
+    /// The cancel token published on `slot.cancel`. Hand this to
+    /// `GuardedCommand::cancel_token` so a `cancel_slot`/`cancel_builds_for_*`
+    /// call pre-empts this build.
+    pub cancel: CancellationToken,
+    // Dropped LAST: releases the semaphore permit after the guard clears the
+    // slot. Field order in a struct = drop order, so `_guard` must precede
+    // `_permit`.
+    _guard: SlotGuard,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl BuildSlotLease {
+    /// Acquire a permit (blocking until a slot frees, bumping `queue_depth`
+    /// while waiting), claim an idle slot with `info`, mint + publish a cancel
+    /// token, and arm the [`SlotGuard`]. The returned lease keeps the slot busy
+    /// for `GET /builds` visibility until it is dropped.
+    pub async fn acquire(state: &SharedState, info: BuildInfo) -> Result<Self, SupervisorError> {
+        state
+            .build_pool
+            .queue_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let permit_result = state.build_pool.permits.clone().acquire_owned().await;
+        state
+            .build_pool
+            .queue_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let permit = permit_result
+            .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
+
+        let slot = state.build_pool.claim_idle_slot(info).await;
+        let cancel = CancellationToken::new();
+        {
+            let mut guard = slot.cancel.write().await;
+            *guard = Some(cancel.clone());
+        }
+        let guard = SlotGuard {
+            slot: slot.clone(),
+            state: state.clone(),
+        };
+        Ok(Self {
+            slot,
+            cancel,
+            _guard: guard,
+            _permit: permit,
+        })
+    }
+
+    /// Split the lease into its two RAII pieces so a caller can control their
+    /// drop timing independently. `run_cargo_build_with_dir` needs to release
+    /// the [`SlotGuard`] (clearing `slot.busy`/`slot.cancel`) BEFORE it
+    /// recomputes `any_slot_busy` for the legacy `build_in_progress` flag, yet
+    /// hold the semaphore permit until ALL post-build bookkeeping (LKG capture,
+    /// `last_successful_slot`, sha sidecar) has finished — otherwise a queued
+    /// build could grab a permit, `claim_idle_slot` this very slot, and start
+    /// overwriting its exe mid-`update_lkg_after_success` copy. Returning the
+    /// guard first and the permit second documents (and the binding order
+    /// enforces) that drop ordering at the call site.
+    fn into_parts(self) -> (SlotGuard, tokio::sync::OwnedSemaphorePermit) {
+        (self._guard, self._permit)
     }
 }
 
@@ -127,34 +214,23 @@ pub async fn run_cargo_build_with_dir(
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
-    // Acquire a permit from the build pool. Blocks until a slot is free.
-    // Queue depth counter lets `GET /builds` report how many callers are waiting.
-    state
-        .build_pool
-        .queue_depth
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let permit_result = state.build_pool.permits.clone().acquire_owned().await;
-    state
-        .build_pool
-        .queue_depth
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let _permit = permit_result
-        .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
-
-    // Claim a slot and mark it busy with our BuildInfo.
+    // Acquire a build-pool lease: a permit (blocking until a slot frees) + a
+    // claimed idle slot marked busy with our BuildInfo + a published cancel
+    // token + the SlotGuard cleanup. ONE slot-accounting path, shared with
+    // `/build/submit` (see [`BuildSlotLease`]). The guard clears
+    // `slot.busy`/`slot.cancel` and reconciles the global `build_in_progress`
+    // flag on every exit path (happy path, `?`, panic, task cancellation).
     let info = BuildInfo {
         started_at: chrono::Utc::now(),
         requester_id,
         rebuild_kind: "exe".to_string(),
     };
-    let slot = state.build_pool.claim_idle_slot(info).await;
-    // RAII guard: clears `slot.busy = None` AND reconciles the global
-    // `build_in_progress` flag on every exit path (happy path, `?`, panic,
-    // task cancellation). Prevents permanently-stuck slots and stale flags.
-    let _slot_guard = SlotGuard {
-        slot: slot.clone(),
-        state: state.clone(),
-    };
+    let lease = BuildSlotLease::acquire(state, info).await?;
+    let slot = lease.slot.clone();
+    // Split the lease so we can drop the slot guard (clearing busy/cancel)
+    // before the `any_slot_busy` recompute, while holding the permit until the
+    // end so no queued build can re-claim this slot mid post-build bookkeeping.
+    let (slot_guard, build_permit) = lease.into_parts();
 
     // Update legacy build flag for external consumers (health API, smart rebuild,
     // overnight watchdog). Flag is true whenever any slot is busy.
@@ -253,7 +329,7 @@ pub async fn run_cargo_build_with_dir(
 
     // Release the slot via the RAII guard. Explicit drop so the slot is
     // cleared before we recompute `any_slot_busy` below.
-    drop(_slot_guard);
+    drop(slot_guard);
 
     // If this build succeeded, record the slot as the most recent successful one.
     // Readers of `rebuild: false` use this to locate the exe to copy.
@@ -313,7 +389,7 @@ pub async fn run_cargo_build_with_dir(
     state.notify_health_change();
 
     // Permit drops here, releasing the slot for the next waiter.
-    drop(_permit);
+    drop(build_permit);
 
     result
 }
@@ -326,6 +402,75 @@ async fn any_slot_busy(state: &SharedState) -> bool {
         }
     }
     false
+}
+
+/// Cancel the in-flight build occupying `slot_id`, if any.
+///
+/// Fires the slot's [`CancellationToken`]. The occupying build's
+/// `GuardedCommand::run` observes the token, drops its `CommandJob` (the kernel
+/// kills the whole subprocess tree), and returns `GuardedOutcome::Cancelled`;
+/// its `SlotGuard` then frees `busy` + `cancel` and the npm lock on the normal
+/// exit path. No-op if the slot is idle or out of range. Returns true if a
+/// token was fired.
+#[allow(dead_code)]
+pub async fn cancel_slot(state: &SharedState, slot_id: usize) -> bool {
+    let Some(slot) = state.build_pool.slots.get(slot_id) else {
+        return false;
+    };
+    let token = slot.cancel.read().await.clone();
+    match token {
+        Some(token) => {
+            token.cancel();
+            state
+                .logs
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Info,
+                    format!("Cancelled in-flight build on slot {}", slot_id),
+                )
+                .await;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Cancel every in-flight build whose `requester_id` contains `needle`.
+///
+/// Used by the rebuild-and-restart flow to pre-empt a prior build targeting the
+/// SAME runner before claiming a fresh slot — so a rapid second restart doesn't
+/// pile a second cargo build on top of the first (its tree is killed, its slot
+/// + npm lock are freed). Returns the number of builds cancelled.
+pub async fn cancel_builds_for_requester(state: &SharedState, needle: &str) -> usize {
+    let mut cancelled = 0;
+    for slot in &state.build_pool.slots {
+        let matches = {
+            let busy = slot.busy.read().await;
+            busy.as_ref()
+                .and_then(|info| info.requester_id.as_deref())
+                .map(|r| r.contains(needle))
+                .unwrap_or(false)
+        };
+        if matches {
+            let token = slot.cancel.read().await.clone();
+            if let Some(token) = token {
+                token.cancel();
+                cancelled += 1;
+                state
+                    .logs
+                    .emit(
+                        LogSource::Build,
+                        LogLevel::Info,
+                        format!(
+                            "Cancelled in-flight build on slot {} (requester contains {:?})",
+                            slot.id, needle
+                        ),
+                    )
+                    .await;
+            }
+        }
+    }
+    cancelled
 }
 
 async fn run_build_inner(
@@ -400,7 +545,8 @@ async fn run_build_inner(
             .await;
         info!("Slot {}: building frontend in {:?}", slot.id, npm_dir);
 
-        let npm_result = run_pnpm_command(&npm_dir, "run build").await;
+        let npm_cancel = slot.cancel.read().await.clone();
+        let npm_result = run_pnpm_command(&npm_dir, "run build", npm_cancel).await;
 
         match npm_result {
             Ok(output) if output.status.success() => {
@@ -538,122 +684,86 @@ async fn run_build_inner(
         "custom-protocol",
     ];
 
-    #[cfg(windows)]
-    let mut child = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mut cmd = Command::new("cargo");
-        cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(cargo_cwd)
-            // Redirect cargo output to this slot's isolated target dir so
-            // concurrent builds on other slots don't contend on the same target/.
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
-    };
-
-    #[cfg(not(windows))]
-    let mut child = {
-        let mut cmd = Command::new("cargo");
-        cmd.args(CARGO_BUILD_ARGS)
-            .current_dir(cargo_cwd)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.spawn()
-            .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?
-    };
-
     // Reset the per-slot full-build log at the start of each build so a reader
     // hitting `GET /builds/{slot_id}/log` while a build is in flight doesn't
     // see a confusing mix of "old log + still building". `None` = "no log
     // captured yet for the current build attempt".
     *slot.last_build_log.write().await = None;
 
-    // Stream stderr (cargo outputs to stderr)
-    let stderr = child.stderr.take();
+    // Route cargo through the job-guarded runner: it spawns cargo in a
+    // kill-on-close Windows JobObject so a timeout/cancel kills the WHOLE tree
+    // (rustc, the linker, any grandchild holding the pipe open) instead of just
+    // the direct child — the Bug-1 hang this consolidation closes. Merged
+    // stderr lines stream to this slot's SSE broadcast sender as they're read.
+    let cancel = slot.cancel.read().await.clone();
+    let mut guarded = GuardedCommand::new("cargo", Duration::from_secs(build_timeout_secs()))
+        .args(CARGO_BUILD_ARGS)
+        .current_dir(cargo_cwd)
+        // Redirect cargo output to this slot's isolated target dir so
+        // concurrent builds on other slots don't contend on the same target/.
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .stream_lines(slot.log_stream.clone());
+    if let Some(token) = cancel {
+        guarded = guarded.cancel_token(token);
+    }
 
-    let stderr_handle = if let Some(stderr) = stderr {
-        let state_clone = state.clone();
-        // Snapshot the slot's broadcast sender once outside the per-line loop.
-        // `broadcast::Sender::send` returns `Err` when there are no
-        // subscribers — that's the expected steady-state (nobody is
-        // currently `GET /builds/{slot_id}/log/stream`ing), so the error
-        // is intentionally swallowed via `let _ =`. Keeping the sender on
-        // the slot (rather than per-build) means SSE clients connected
-        // mid-build naturally pick up subsequent builds without re-handshake.
-        let log_stream = slot.log_stream.clone();
-        Some(tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            let mut error_lines = Vec::new();
-            let mut all_lines = Vec::new();
+    let outcome = guarded
+        .run()
+        .await
+        .map_err(|e| SupervisorError::Process(format!("Failed to spawn cargo build: {}", e)))?;
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(&line));
-                let level = if is_error {
-                    LogLevel::Error
-                } else {
-                    LogLevel::Info
-                };
-
-                state_clone.logs.emit(LogSource::Build, level, &line).await;
-                // Fanout to per-slot SSE subscribers. Err == no subscribers,
-                // which is the common case — drop silently.
-                let _ = log_stream.send(line.clone());
-                all_lines.push(line.clone());
-
-                if is_error {
-                    error_lines.push(line);
-                }
-            }
-
-            (error_lines, all_lines)
-        }))
-    } else {
-        None
-    };
-
-    // Wait with timeout
-    let timeout_secs = build_timeout_secs();
-    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-
-    let status = match wait_result {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
-            return Err(SupervisorError::Process(format!(
-                "Build process error: {}",
-                e
-            )));
+    // Convert the guarded outcome into (status, captured stderr lines). The
+    // SSE/log emission that the legacy manual stderr task did per-line is now
+    // handled below in one pass over the captured bytes; `stream_lines` already
+    // fanned the lines out to SSE subscribers live.
+    let (status, all_stderr_lines): (std::process::ExitStatus, Vec<String>) = match outcome {
+        GuardedOutcome::Exited(output) => {
+            let lines: Vec<String> = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            (output.status, lines)
         }
-        Err(_) => {
-            warn!("Build timed out after {}s, killing", timeout_secs);
-            let _ = child.kill().await;
+        GuardedOutcome::TimedOut { after, partial } => {
+            let timeout_secs = after.as_secs();
+            let tail = tail_bytes_keep_utf8(
+                &String::from_utf8_lossy(&partial.stderr),
+                LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+            );
+            warn!(
+                "Build timed out after {}s, killed the cargo tree. stderr tail: {}",
+                timeout_secs, tail
+            );
             return Err(SupervisorError::Timeout(format!(
-                "Build timed out after {}s",
-                timeout_secs
+                "Build timed out after {}s. stderr tail: {}",
+                timeout_secs, tail
+            )));
+        }
+        GuardedOutcome::Cancelled { .. } => {
+            warn!("Slot {}: cargo build cancelled (superseded)", slot.id);
+            return Err(SupervisorError::Cancelled(format!(
+                "Slot {} cargo build cancelled (superseded by a newer build)",
+                slot.id
             )));
         }
     };
 
-    // Collect any remaining error output.  Give the stderr reader a few seconds
-    // to finish — on Windows, orphaned grandchild processes (rustc, linker) can
-    // keep the pipe open long after cargo itself exits, causing an indefinite hang.
-    let (error_lines, all_stderr_lines) = if let Some(handle) = stderr_handle {
-        match tokio::time::timeout(Duration::from_secs(5), handle).await {
-            Ok(Ok(result)) => result,
-            _ => {
-                warn!("Timed out waiting for build stderr reader, proceeding without full output");
-                (Vec::new(), Vec::new())
-            }
+    // Mirror the captured lines into the supervisor log buffer (the live SSE
+    // fanout already happened via `stream_lines` during the build). Classify
+    // error lines for the failure summary.
+    let mut error_lines: Vec<String> = Vec::new();
+    for line in &all_stderr_lines {
+        let is_error = BUILD_ERROR_PATTERNS.iter().any(|p| p.is_match(line));
+        let level = if is_error {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        };
+        state.logs.emit(LogSource::Build, level, line).await;
+        if is_error {
+            error_lines.push(line.clone());
         }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    }
 
     // Store full stderr for smart rebuild AI fix prompt
     let joined_stderr = all_stderr_lines.join("\n");
@@ -881,12 +991,15 @@ async fn prebuild_worktree_frontend(
             .await;
 
         let install_started = std::time::Instant::now();
-        let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
-            SupervisorError::BuildFailed(format!(
-                "pnpm {} failed to spawn in spawn worktree {:?}: {}",
-                install_args, wt_root, e
-            ))
-        })?;
+        let install_cancel = slot.cancel.read().await.clone();
+        let install_output = run_pnpm_command(wt_root, install_args, install_cancel)
+            .await
+            .map_err(|e| {
+                SupervisorError::BuildFailed(format!(
+                    "pnpm {} failed to spawn in spawn worktree {:?}: {}",
+                    install_args, wt_root, e
+                ))
+            })?;
         if !install_output.status.success() {
             let stderr_tail = tail_bytes_keep_utf8(
                 &String::from_utf8_lossy(&install_output.stderr),
@@ -943,12 +1056,15 @@ async fn prebuild_worktree_frontend(
         .await;
 
     let build_started = std::time::Instant::now();
-    let build_output = run_pnpm_command(wt_root, "run build").await.map_err(|e| {
-        SupervisorError::BuildFailed(format!(
-            "pnpm run build failed to spawn in spawn worktree {:?}: {}",
-            wt_root, e
-        ))
-    })?;
+    let build_cancel = slot.cancel.read().await.clone();
+    let build_output = run_pnpm_command(wt_root, "run build", build_cancel)
+        .await
+        .map_err(|e| {
+            SupervisorError::BuildFailed(format!(
+                "pnpm run build failed to spawn in spawn worktree {:?}: {}",
+                wt_root, e
+            ))
+        })?;
     if !build_output.status.success() {
         let stderr_tail = tail_bytes_keep_utf8(
             &String::from_utf8_lossy(&build_output.stderr),
@@ -1057,36 +1173,84 @@ fn verify_frontend_built(wt_root: &std::path::Path) -> Result<(), SupervisorErro
 /// `requiredElements` type mismatch and an unresolved `graphql-ws` import.
 /// pnpm's symlinked store reproduces the exact layout CI validates, so the
 /// supervisor must use pnpm too.
+/// Run `pnpm <args>` through the job-guarded runner so a wedged pnpm/vite/tsc
+/// subprocess (or a grandchild holding the stdout/stderr pipe open) is killed
+/// at [`pnpm_timeout_secs`] rather than hanging the build forever — the HIGH
+/// bug this consolidation closes. The frontend build previously had NO timeout
+/// at all.
+///
+/// On a clean exit returns the captured [`std::process::Output`] (status +
+/// stdout + stderr), exactly like the legacy `.output()` call so the 3 call
+/// sites' success/failure logic is unchanged. On timeout/cancel returns an
+/// `io::Error` of kind `TimedOut` so those call sites surface it through their
+/// existing `.map_err(...)` paths.
 async fn run_pnpm_command(
     cwd: &std::path::Path,
     args: &str,
+    cancel: Option<CancellationToken>,
 ) -> Result<std::process::Output, std::io::Error> {
+    use crate::config::pnpm_timeout_secs;
+    use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
+
+    let timeout = Duration::from_secs(pnpm_timeout_secs());
+
     #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW_: u32 = 0x0800_0000;
-        Command::new("cmd")
+    let mut guarded = {
+        // pnpm ships as a `.cmd` shim; invoke via `cmd /C "pnpm.cmd <args>"`.
+        GuardedCommand::new("cmd", timeout)
             .args(["/C", &format!("pnpm.cmd {}", args)])
             .current_dir(cwd)
-            // Match the live-tree invocation: vite.config.ts gates the
-            // build target on TAURI_PLATFORM=windows.
+            // Match the live-tree invocation: vite.config.ts gates the build
+            // target on TAURI_PLATFORM=windows.
             .env("TAURI_PLATFORM", "windows")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW_)
-            .output()
-            .await
-    }
+    };
     #[cfg(not(windows))]
-    {
+    let mut guarded = {
         // Split the args string so tokens land as separate argv entries.
         let split_args: Vec<&str> = args.split_whitespace().collect();
-        Command::new("pnpm")
+        GuardedCommand::new("pnpm", timeout)
             .args(&split_args)
             .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
+    };
+
+    // When a per-slot cancel token is supplied (live-tree + worktree builds),
+    // a superseding restart kills the pnpm subprocess tree and frees the global
+    // npm lock immediately instead of blocking the new build's pnpm behind a
+    // doomed one. git/prewarm callers pass `None`.
+    if let Some(token) = cancel {
+        guarded = guarded.cancel_token(token);
+    }
+
+    match guarded.run().await? {
+        GuardedOutcome::Exited(output) => Ok(output),
+        GuardedOutcome::TimedOut { after, partial } => {
+            let tail = tail_bytes_keep_utf8(
+                &String::from_utf8_lossy(&partial.stderr),
+                LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "pnpm {} timed out after {}s (killed the pnpm subprocess tree). stderr tail: {}",
+                    args,
+                    after.as_secs(),
+                    tail
+                ),
+            ))
+        }
+        GuardedOutcome::Cancelled { partial } => {
+            let tail = tail_bytes_keep_utf8(
+                &String::from_utf8_lossy(&partial.stderr),
+                LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "pnpm {} cancelled (superseded by a newer build). stderr tail: {}",
+                    args, tail
+                ),
+            ))
+        }
     }
 }
 
@@ -1136,18 +1300,7 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
     };
 
     async fn run_git(args: &[&str], cwd: &std::path::Path) -> Option<String> {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        guarded_git(args, cwd).await
     }
 
     let head = match run_git(&["rev-parse", "HEAD"], &git_dir).await {
@@ -1181,21 +1334,33 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
     state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
 }
 
-/// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
-/// (git missing, not a repo, detached HEAD with no SHA, etc.). Best-effort.
-async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(git_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+/// Run a best-effort `git <args>` in `cwd` through the job-guarded runner with
+/// the [`git_timeout_secs`](crate::config::git_timeout_secs) bound, returning
+/// the trimmed stdout on a clean zero-exit and `None` on ANY failure (git
+/// missing, non-zero exit, timeout, cancel). Callers already treat git as
+/// advisory, so a wedged git silently yields `None` instead of hanging the
+/// build.
+async fn guarded_git(args: &[&str], cwd: &std::path::Path) -> Option<String> {
+    use crate::config::git_timeout_secs;
+    let outcome = GuardedCommand::new("git", Duration::from_secs(git_timeout_secs()))
+        .args(args)
+        .current_dir(cwd)
+        .run()
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
+    match outcome {
+        GuardedOutcome::Exited(out) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        _ => None,
     }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+}
+
+/// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
+/// (git missing, not a repo, detached HEAD with no SHA, timeout, etc.).
+/// Best-effort.
+async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
+    let sha = guarded_git(&["rev-parse", "HEAD"], git_dir).await?;
     if sha.is_empty() {
         None
     } else {
@@ -1751,57 +1916,35 @@ async fn prewarm_single_slot(
         "custom-protocol",
     ];
 
-    #[cfg(windows)]
-    let child_result = {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(&state.config.project_dir)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .spawn()
-    };
+    // Route the prewarm `cargo check` through the job-guarded runner too, so a
+    // wedged check (rustc grandchild holding the pipe) is killed at the prewarm
+    // timeout rather than hanging the slot. Stream stderr lines to the slot's
+    // SSE sender (same as a real build) and the supervisor log.
+    let outcome = GuardedCommand::new("cargo", Duration::from_secs(PREWARM_TIMEOUT_SECS))
+        .args(&args)
+        .current_dir(&state.config.project_dir)
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .stream_lines(slot.log_stream.clone())
+        .run()
+        .await
+        .map_err(|e| {
+            SupervisorError::Process(format!("Failed to spawn prewarm cargo check: {}", e))
+        })?;
 
-    #[cfg(not(windows))]
-    let child_result = {
-        Command::new("cargo")
-            .args(&args)
-            .current_dir(&state.config.project_dir)
-            .env("CARGO_TARGET_DIR", &slot.target_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-    };
-
-    let mut child = child_result.map_err(|e| {
-        SupervisorError::Process(format!("Failed to spawn prewarm cargo check: {}", e))
-    })?;
-
-    // Stream stderr to logs
-    if let Some(stderr) = child.stderr.take() {
-        let state_clone = state.clone();
-        let slot_id = slot.id;
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                state_clone
+    match outcome {
+        GuardedOutcome::Exited(output) if output.status.success() => {
+            // Mirror captured stderr into the supervisor log for parity with
+            // the old per-line emission.
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                state
                     .logs
                     .emit(
                         LogSource::Build,
                         LogLevel::Info,
-                        format!("[prewarm slot {}] {}", slot_id, line),
+                        format!("[prewarm slot {}] {}", slot.id, line),
                     )
                     .await;
             }
-        });
-    }
-
-    match tokio::time::timeout(Duration::from_secs(PREWARM_TIMEOUT_SECS), child.wait()).await {
-        Ok(Ok(status)) if status.success() => {
             let ms = start.elapsed().as_millis();
             info!("Prewarmed slot {} in {}ms", slot.id, ms);
             state
@@ -1819,31 +1962,31 @@ async fn prewarm_single_slot(
             }
             Ok(())
         }
-        Ok(Ok(status)) => {
+        GuardedOutcome::Exited(output) => {
             warn!(
                 "Prewarm cargo check for slot {} exited with {}",
-                slot.id, status
+                slot.id, output.status
             );
             Err(SupervisorError::BuildFailed(format!(
                 "Prewarm exited with {}",
-                status
+                output.status
             )))
         }
-        Ok(Err(e)) => Err(SupervisorError::Process(format!(
-            "Prewarm process error: {}",
-            e
-        ))),
-        Err(_) => {
+        GuardedOutcome::TimedOut { after, .. } => {
             warn!(
-                "Prewarm of slot {} timed out after {}s, killing",
-                slot.id, PREWARM_TIMEOUT_SECS
+                "Prewarm of slot {} timed out after {}s, killed the check tree",
+                slot.id,
+                after.as_secs()
             );
-            let _ = child.kill().await;
             Err(SupervisorError::Timeout(format!(
                 "Prewarm timed out after {}s",
-                PREWARM_TIMEOUT_SECS
+                after.as_secs()
             )))
         }
+        GuardedOutcome::Cancelled { .. } => Err(SupervisorError::Cancelled(format!(
+            "Prewarm of slot {} cancelled",
+            slot.id
+        ))),
     }
 }
 

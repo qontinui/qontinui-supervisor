@@ -2172,6 +2172,30 @@ pub async fn rebuild_and_restart_by_id(
     }
 
     // Step 2: rebuild.
+    // First pre-empt any prior in-flight build targeting THIS runner so a rapid
+    // second restart cancels the first instead of queueing behind it (the first
+    // build's GuardedCommand observes the cancel, kills its subprocess tree, and
+    // frees its slot + npm lock). The requester string below is the same one we
+    // pass to the build, so the substring match is exact for this runner.
+    let cancelled = crate::build_monitor::cancel_builds_for_requester(
+        state,
+        &format!("rebuild-and-restart:{}", runner_id),
+    )
+    .await;
+    if cancelled > 0 {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "rebuild-and-restart: pre-empted {} prior in-flight build(s) for runner '{}'",
+                    cancelled, runner_name
+                ),
+            )
+            .await;
+    }
+
     let rebuilt_at = chrono::Utc::now();
     let build_outcome = crate::build_monitor::run_cargo_build_with_requester(
         state,

@@ -580,6 +580,18 @@ pub struct BuildSlot {
     /// builds — receivers from a previous build naturally start seeing the
     /// next build's lines, which is the desired "tail -f" semantics.
     pub log_stream: tokio::sync::broadcast::Sender<String>,
+    /// Cancellation token for the build currently occupying this slot, if any.
+    ///
+    /// Minted in `with_build_slot` when the slot is claimed and stored here so
+    /// an out-of-band caller (a new restart targeting the same runner) can
+    /// pre-empt the in-flight build via [`cancel_slot`]. The build's
+    /// `GuardedCommand::run` observes the token, drops its `CommandJob` (the
+    /// kernel kills the whole subprocess tree), and returns
+    /// `GuardedOutcome::Cancelled`. Nulled by `SlotGuard::drop` on every exit
+    /// path, exactly like `busy`.
+    ///
+    /// [`cancel_slot`]: crate::build_monitor::cancel_slot
+    pub cancel: RwLock<Option<tokio_util::sync::CancellationToken>>,
 }
 
 /// Metadata for the last-known-good (LKG) runner binary preserved at
@@ -664,6 +676,7 @@ impl BuildPool {
                 last_build_stderr_capture: RwLock::new(None),
                 last_build_log: RwLock::new(None),
                 log_stream: log_tx,
+                cancel: RwLock::new(None),
             }));
         }
         // Try to hydrate LKG metadata from the on-disk sidecar. We do this

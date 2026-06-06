@@ -1,5 +1,6 @@
 pub mod early_log;
 pub mod env_forwarders;
+pub mod guarded_command;
 pub mod health_probe;
 pub mod job;
 pub mod manager;

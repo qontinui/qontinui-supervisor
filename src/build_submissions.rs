@@ -35,19 +35,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::cache_key::{self, CanonicalDiffKey};
 use crate::cache_telemetry::CacheEvent;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
 use crate::reapi::{ActionResult, Digest as ReapiDigest, OutputFile};
 use crate::state::SharedState;
 
@@ -488,20 +486,29 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
         }
     }
 
-    // Acquire permit on the shared build pool. Held across the entire
-    // cargo invocation. Released on drop at the end of this fn.
-    state
-        .build_pool
-        .queue_depth
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let permit_result = state.build_pool.permits.clone().acquire_owned().await;
-    state
-        .build_pool
-        .queue_depth
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let _permit = match permit_result {
-        Ok(p) => p,
-        Err(_) => {
+    // Claim a build-pool slot via the SHARED lease helper so `/builds` reflects
+    // this in-flight submission in its per-slot view (slot.busy), exactly like a
+    // spawn-test cargo build — ONE slot-accounting path, not two. The slot's
+    // isolated `CARGO_TARGET_DIR` is deliberately NOT used: a submission builds
+    // a caller-owned worktree with its own `target/` (see module docs). The slot
+    // claim is purely for accounting + the published cancel token; cargo's
+    // `current_dir` is the worktree and we don't override `CARGO_TARGET_DIR`.
+    // Held across the entire cargo invocation; released on drop at fn end.
+    let lease = match crate::build_monitor::BuildSlotLease::acquire(
+        &state,
+        crate::state::BuildInfo {
+            started_at: Utc::now(),
+            requester_id: agent_id
+                .clone()
+                .map(|a| format!("build-submit:{a}"))
+                .or_else(|| Some("build-submit".to_string())),
+            rebuild_kind: format!("submit:{}", cargo_subcommand_label(build_kind)),
+        },
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
             let mut sub = sub_arc.write().await;
             let now = Utc::now();
             sub.status = BuildStatus::Failed {
@@ -509,11 +516,14 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
                 finished_at: now,
                 duration_secs: 0.0,
                 exit_code: None,
-                error: "build pool semaphore closed".to_string(),
+                error: format!("failed to acquire build slot: {e}"),
             };
             return;
         }
     };
+    // Cancel token published on the slot; a superseding restart targeting this
+    // submission's slot kills the cargo subprocess tree.
+    let cancel = lease.cancel.clone();
 
     let started_at = Utc::now();
     {
@@ -548,103 +558,101 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
     }
     args.push("--locked".to_string());
 
+    // Route the foreign-worktree cargo through the job-guarded runner so a
+    // timeout/cancel kills the WHOLE process tree (rustc, linker, any
+    // pipe-holding grandchild) instead of just the direct cargo child — the
+    // same Bug-1 hang the spawn-test path closes. Inherits the supervisor's env
+    // (sccache, .cargo/config.toml --remap-path-prefix) since GuardedCommand
+    // layers only the envs we add on top of the inherited set.
     let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut cmd = Command::new(&cargo_bin);
-    cmd.args(&args)
-        .current_dir(&worktree_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let guarded = GuardedCommand::new(
+        &cargo_bin,
+        std::time::Duration::from_secs(crate::config::build_timeout_secs()),
+    )
+    .args(&args)
+    .current_dir(&worktree_path)
+    .cancel_token(cancel);
 
-    // Inherit sccache + path-remap env from the supervisor's shell. The
-    // .cargo/config.toml inside the worktree adds --remap-path-prefix
-    // (Row 2 Phase 3) automatically; this command path doesn't override it.
-
-    let spawn_result = cmd.spawn();
-    let mut child = match spawn_result {
-        Ok(c) => c,
-        Err(e) => {
-            let now = Utc::now();
-            let mut sub = sub_arc.write().await;
-            sub.status = BuildStatus::Failed {
-                started_at,
-                finished_at: now,
-                duration_secs: (now - started_at).num_milliseconds() as f64 / 1000.0,
-                exit_code: None,
-                error: format!("failed to spawn cargo: {e}"),
-            };
-            return;
-        }
-    };
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    // Bounded ring buffers (~500 lines each) for tail capture.
-    const TAIL_CAP: usize = 500;
-    let stdout_handle = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(TAIL_CAP);
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if buf.len() == TAIL_CAP {
-                buf.remove(0);
-            }
-            buf.push(line);
-        }
-        buf
-    });
-    let stderr_handle = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(TAIL_CAP);
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if buf.len() == TAIL_CAP {
-                buf.remove(0);
-            }
-            buf.push(line);
-        }
-        buf
-    });
-
-    let exit_status = child.wait().await;
-    let stdout_tail = stdout_handle.await.unwrap_or_default();
-    let stderr_tail = stderr_handle.await.unwrap_or_default();
-
-    let finished_at = Utc::now();
-    let duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+    let finished_at;
+    let duration_secs;
     let succeeded;
-    {
-        let mut sub = sub_arc.write().await;
-        sub.stdout_tail = stdout_tail;
-        sub.stderr_tail = stderr_tail;
-        sub.status = match exit_status {
-            Ok(s) if s.success() => {
+    let stdout_tail: Vec<String>;
+    let stderr_tail: Vec<String>;
+    let status = match guarded.run().await {
+        Ok(GuardedOutcome::Exited(output)) => {
+            stdout_tail = tail_lines(&output.stdout);
+            stderr_tail = tail_lines(&output.stderr);
+            finished_at = Utc::now();
+            duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+            if output.status.success() {
                 succeeded = true;
                 BuildStatus::Succeeded {
                     started_at,
                     finished_at,
                     duration_secs,
                 }
-            }
-            Ok(s) => {
+            } else {
                 succeeded = false;
                 BuildStatus::Failed {
                     started_at,
                     finished_at,
                     duration_secs,
-                    exit_code: s.code(),
-                    error: format!("cargo exited with status {s}"),
+                    exit_code: output.status.code(),
+                    error: format!("cargo exited with status {}", output.status),
                 }
             }
-            Err(e) => {
-                succeeded = false;
-                BuildStatus::Failed {
-                    started_at,
-                    finished_at,
-                    duration_secs,
-                    exit_code: None,
-                    error: format!("failed to await cargo: {e}"),
-                }
+        }
+        Ok(GuardedOutcome::TimedOut { after, partial }) => {
+            stdout_tail = tail_lines(&partial.stdout);
+            stderr_tail = tail_lines(&partial.stderr);
+            finished_at = Utc::now();
+            duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+            succeeded = false;
+            BuildStatus::Failed {
+                started_at,
+                finished_at,
+                duration_secs,
+                exit_code: None,
+                error: format!(
+                    "cargo build timed out after {}s (killed the subprocess tree)",
+                    after.as_secs()
+                ),
             }
-        };
+        }
+        Ok(GuardedOutcome::Cancelled { partial }) => {
+            stdout_tail = tail_lines(&partial.stdout);
+            stderr_tail = tail_lines(&partial.stderr);
+            finished_at = Utc::now();
+            duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+            succeeded = false;
+            BuildStatus::Failed {
+                started_at,
+                finished_at,
+                duration_secs,
+                exit_code: None,
+                error: "cargo build cancelled (superseded by a newer build)".to_string(),
+            }
+        }
+        Err(e) => {
+            stdout_tail = Vec::new();
+            stderr_tail = Vec::new();
+            finished_at = Utc::now();
+            duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+            succeeded = false;
+            BuildStatus::Failed {
+                started_at,
+                finished_at,
+                duration_secs,
+                exit_code: None,
+                error: format!("failed to spawn cargo: {e}"),
+            }
+        }
+    };
+    {
+        let mut sub = sub_arc.write().await;
+        sub.stdout_tail = stdout_tail;
+        sub.stderr_tail = stderr_tail;
+        sub.status = status;
     }
 
     // ---- Row 10 Item 7: populate the content-addressed cache. ------
@@ -690,6 +698,29 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
                 timestamp_would_reuse: false,
             })
             .await;
+    }
+}
+
+/// Last ~500 lines of a captured byte buffer, decoded lossily. Mirrors the
+/// prior per-stream ring-buffer tail behavior now that `GuardedCommand` returns
+/// the whole buffer in one shot — cargo's actionable output is near the end, so
+/// we keep the tail.
+fn tail_lines(bytes: &[u8]) -> Vec<String> {
+    const TAIL_CAP: usize = 500;
+    let text = String::from_utf8_lossy(bytes);
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(TAIL_CAP);
+    all[start..].iter().map(|s| s.to_string()).collect()
+}
+
+/// Short cargo-subcommand label for the slot's `rebuild_kind` (visible in
+/// `GET /builds`): `check` | `build` | `release` | `test`.
+fn cargo_subcommand_label(kind: BuildKind) -> &'static str {
+    match kind {
+        BuildKind::Check => "check",
+        BuildKind::Build => "build",
+        BuildKind::Release => "release",
+        BuildKind::Test => "test",
     }
 }
 
