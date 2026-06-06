@@ -298,7 +298,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | GET/POST/DELETE | `/test-login` | Get/set/clear test login credentials for runner spawning |
 | GET | `/ws` | WebSocket endpoint |
 | POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint) |
-| POST | `/runner/restart` | Restart runner (legacy single-runner endpoint) |
+| POST | `/runner/restart` | Restart runner (legacy single-runner endpoint). Body `{rebuild?, force?}`. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"rebuilding", build_id, poll:"/builds"}` immediately and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll}` immediately; the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
 

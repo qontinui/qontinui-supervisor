@@ -94,7 +94,117 @@ pub async fn restart_runner(
         )
         .await;
 
-    manager::restart_runner(&state, rebuild, RestartSource::Manual, body.force).await?;
+    // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
+    //
+    // A `rebuild: true` restart runs a full `cargo build` of the live runner
+    // tree (~10-20 min) followed by a start. Previously the whole stop → build
+    // → start sequence ran *inside* this handler future, so when the client
+    // disconnected (short `curl -m N`, E2E timeout, Ctrl-C) axum dropped the
+    // future and the in-flight build was abandoned mid-flight (process-wrap's
+    // KillOnDrop killed the cargo tree) — the "rebuild wedge": the runner never
+    // restarted and the slot was left with a partial exe and no post-build
+    // bookkeeping.
+    //
+    // The build+restart now runs detached via the #63 build-submissions state
+    // machine ([`submit_detached`], same seam `/runner/fix-and-rebuild` uses).
+    // The detached task owns its own `SharedState` clone, so it survives this
+    // handler future being dropped. We return 202 immediately; callers poll
+    // `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome.
+    if rebuild {
+        let exec_state = state.clone();
+        let force = body.force;
+        let do_health_wait = wait_q.wait;
+        let (submission_id, _arc) = crate::build_submissions::submit_detached(
+            state.build_submissions.clone(),
+            state.config.project_dir.clone(),
+            None,
+            async move {
+                // The exact stop → build → start sequence the handler used to
+                // await inline. Errors are surfaced in the (status, body)
+                // result so they land in /builds AND are logged below — never
+                // silently dropped.
+                if let Err(e) =
+                    manager::restart_runner(&exec_state, true, RestartSource::Manual, force).await
+                {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Error,
+                            format!("Detached rebuild-restart failed: {}", e),
+                        )
+                        .await;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
+
+                // Port-bind verification (the manager call returns once the OS
+                // process spawns; the runner may still be pre-bind or hung).
+                // `wait=false` opts out (legacy behavior).
+                if do_health_wait {
+                    if let Some(primary) = exec_state.get_primary().await {
+                        let runner_id = primary.config.id.clone();
+                        if let Err(failure) =
+                            wait_for_runner_healthy_default(&exec_state, &runner_id).await
+                        {
+                            exec_state
+                                .logs
+                                .emit(
+                                    LogSource::Supervisor,
+                                    LogLevel::Warn,
+                                    format!(
+                                        "Runner '{}' did not become healthy {}ms after \
+                                         detached rebuild-restart",
+                                        runner_id, failure.elapsed_ms
+                                    ),
+                                )
+                                .await;
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                                serde_json::json!({
+                                    "status": "unhealthy_after_start",
+                                    "error": "runner_unhealthy_after_start",
+                                    "runner_id": runner_id,
+                                    "elapsed_ms": failure.elapsed_ms,
+                                    "recent_logs": failure.recent_logs,
+                                }),
+                            );
+                        }
+                    }
+                }
+
+                (
+                    StatusCode::OK.as_u16(),
+                    serde_json::json!({
+                        "status": "restarted",
+                        "message": "Runner restarted successfully (with rebuild)",
+                    }),
+                )
+            },
+        );
+
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "rebuilding",
+                "build_id": submission_id.to_string(),
+                "submission_id": submission_id.to_string(),
+                "poll": "/builds",
+                "message": "rebuild-restart submitted; the build+restart runs detached from \
+                            this connection — poll GET /builds (or GET /build/{id}/status) \
+                            for the terminal outcome",
+            })),
+        )
+            .into_response());
+    }
+
+    // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
+    manager::restart_runner(&state, false, RestartSource::Manual, body.force).await?;
 
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
@@ -125,7 +235,7 @@ pub async fn restart_runner(
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
-        "message": format!("Runner restarted successfully{}", if rebuild { " (with rebuild)" } else { "" })
+        "message": "Runner restarted successfully"
     }))
     .into_response())
 }
@@ -606,6 +716,85 @@ mod tests {
         assert_eq!(
             *state.fix_and_rebuild_inflight.read().await,
             Some(existing_id)
+        );
+    }
+
+    /// `POST /runner/restart {"rebuild": true}` must DETACH: the handler returns
+    /// 202 quickly (without awaiting the ~10-20min build) and registers a build
+    /// submission so progress is observable via `GET /builds`. The detached task
+    /// owns its own state clone, so it survives the handler future being dropped
+    /// — the whole point of the change. We close the build-pool semaphore up
+    /// front so the detached `run_cargo_build` fails fast (semaphore closed)
+    /// instead of attempting a real cargo build in the sandbox — that keeps the
+    /// detached task deterministic and short-lived while still exercising the
+    /// full submit_detached → terminal-status path.
+    #[tokio::test]
+    async fn restart_rebuild_true_detaches_returns_202_and_registers_build() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+
+        // Make the detached build fail fast rather than spawn real cargo.
+        state.build_pool.permits.close();
+
+        let started = std::time::Instant::now();
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let elapsed = started.elapsed();
+        let (status, body) = body_json(resp).await;
+
+        assert_eq!(status, 202, "rebuild:true must return 202 (detached)");
+        assert_eq!(body["status"], "rebuilding");
+        assert_eq!(body["poll"], "/builds");
+        assert!(
+            body["build_id"].is_string(),
+            "must carry a submission id for /builds correlation"
+        );
+        // The handler must NOT block on the build — it returns near-instantly.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "handler should return fast (detached), took {:?}",
+            elapsed
+        );
+
+        // submit_detached registers the submission on a spawned task; give it a
+        // beat to insert, then confirm a new build is observable via the store
+        // that backs GET /builds / GET /build/{id}/status.
+        let build_id = body["build_id"].as_str().unwrap().to_string();
+        let target = uuid::Uuid::parse_str(&build_id).expect("build_id is a uuid");
+        let mut arc = None;
+        for _ in 0..100 {
+            if let Some(a) = state.build_submissions.get(&target).await {
+                arc = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let arc = arc.expect("the detached rebuild must register a build submission");
+
+        // The detached task runs independently of this (already-returned)
+        // handler. With the pool semaphore closed it fails fast and the
+        // submission reaches a terminal status — proving the task ran to
+        // completion on its own.
+        let mut terminal = false;
+        for _ in 0..100 {
+            if arc.read().await.status.is_terminal() {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            terminal,
+            "the detached task must run to a terminal status independently of the handler"
         );
     }
 }
