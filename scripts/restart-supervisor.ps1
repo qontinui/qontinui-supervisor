@@ -151,6 +151,48 @@ if (-not $gracefulOk) {
     }
 }
 
+# --- 2b. Wait for the OLD PROCESS to exit (not just the port) -------------
+# A graceful shutdown releases the listener socket BEFORE process teardown
+# finishes, so "port free" does NOT mean "process gone". On 2026-06-06 a
+# restart hit exactly this: the port freed, but the old process still held
+# the copies\ exe lock and the Copy-Item below failed, leaving the
+# supervisor DOWN. Wait for the matching process to actually exit; escalate
+# to Stop-Process -Force if it lingers.
+function Get-SupervisorPids {
+    $found = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = '$ExeName'" -ErrorAction Stop
+        foreach ($p in $procs) {
+            if ($p.ExecutablePath -and ($p.ExecutablePath -ieq $runningPath)) {
+                $found += $p.ProcessId
+            }
+        }
+    } catch {
+        # enumeration failure -> treat as none found (best effort)
+    }
+    return $found
+}
+
+Write-Step "waiting for the old supervisor process to exit..."
+$procGone = $false
+for ($i = 0; $i -lt 40; $i++) {
+    $pids = Get-SupervisorPids
+    if (-not $pids -or $pids.Count -eq 0) { $procGone = $true; break }
+    if ($i -eq 20) {
+        # ~10s grace expired -> escalate to force kill
+        foreach ($zpid in $pids) {
+            Write-Step "old process PID $zpid still alive after grace; Stop-Process -Force"
+            Stop-Process -Id $zpid -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $procGone) {
+    Write-Fail "old supervisor process still alive after 20s (incl. force kill); aborting before the exe copy would fail."
+    exit 1
+}
+Write-Step "old process exited."
+
 # --- 3. Wait for the port to free -----------------------------------------
 Write-Step "waiting for port $Port to free..."
 $portFree = $false
