@@ -367,16 +367,52 @@ impl GuardedCommand {
         let (stdout_task, stderr_task) = spawn_readers(&mut child, self.stream_lines.clone());
         info!("GCMD: readers spawned");
 
+        // Acquire a tokio-reaper-INDEPENDENT exit wait handle. tokio's
+        // `child.wait()` does NOT resolve for a `cmd /C pnpm.cmd …` tree even
+        // after the whole tree has exited (observed live: dead PID, stuck 12+
+        // min in the select). We wait on a raw OS handle via WaitForSingleObject
+        // instead, which fires as soon as the OS signals the process handle.
+        //
+        // Preferred path: DuplicateHandle off the child's own handle. Fallback
+        // (handle already reaped / dup failed): OpenProcess by PID. Either way
+        // `child` is NEVER moved/borrowed into the exit future, so the
+        // timeout/cancel arms retain full ownership for `start_kill()`. The
+        // duplicated/opened handle is owned + closed by the blocking task.
+        let pid = child.id();
+        let exit_handle = acquire_exit_handle(&child, pid);
+        let exit_mechanism = if exit_handle.is_some() {
+            "handle-wait"
+        } else {
+            "no-handle"
+        };
+
         let timeout = self.timeout;
         let cancel = self.cancel.clone();
         let select_start = std::time::Instant::now();
 
-        info!("GCMD: select enter timeout={}s", timeout.as_secs());
+        info!(
+            "GCMD: select enter timeout={}s exit_mechanism={}",
+            timeout.as_secs(),
+            exit_mechanism
+        );
+        // Exit future: the OS-handle wait. If no handle could be acquired (a
+        // degenerate case — child already fully reaped before we got here), this
+        // arm never resolves and the timeout arm governs instead, which is
+        // strictly safer than tokio's hang-forever `child.wait()`.
+        let exit_fut = async move {
+            match exit_handle {
+                Some(h) => wait_for_exit_windows(h).await,
+                None => std::future::pending::<Result<ExitStatus, std::io::Error>>().await,
+            }
+        };
+        tokio::pin!(exit_fut);
+
         tokio::select! {
-            wait_res = child.wait() => {
+            wait_res = &mut exit_fut => {
                 let status = wait_res?;
                 info!(
-                    "GCMD: child exited status={} elapsed={}ms",
+                    "GCMD: child exited ({}) status={} elapsed={}ms",
+                    exit_mechanism,
                     status,
                     select_start.elapsed().as_millis()
                 );
@@ -473,6 +509,150 @@ async fn wait_for_cancel(cancel: Option<CancellationToken>) {
         Some(token) => token.cancelled().await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// A raw Windows `HANDLE` that we own and may move across threads (into a
+/// `spawn_blocking` closure). The handle is a duplicate we created with
+/// `DuplicateHandle`, so it is independent of tokio's `Child` and we are
+/// responsible for closing it exactly once (the blocking wait does so).
+///
+/// SAFETY: Win32 kernel-object handles are process-wide and safe to use from
+/// any thread for the calls we make (`WaitForSingleObject`, `GetExitCodeProcess`,
+/// `CloseHandle`). We never share this handle — it is moved into exactly one
+/// blocking task which owns it for its whole lifetime and closes it.
+#[cfg(windows)]
+struct OwnedWaitHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: see OwnedWaitHandle docs above.
+#[cfg(windows)]
+unsafe impl Send for OwnedWaitHandle {}
+
+/// Acquire a process handle owned by us (independent of tokio's `Child`) on
+/// which to `WaitForSingleObject`. tokio's process reaper does NOT resolve
+/// `child.wait()` for a `cmd /C pnpm.cmd …` tree even after the whole tree has
+/// exited (observed live: dead PID, stuck in the select 12+ min). A dead PID
+/// means the OS has signaled the process handle, so a direct `WaitForSingleObject`
+/// on our own handle fires where tokio's `child.wait()` does not.
+///
+/// Preferred: `DuplicateHandle` off `child.raw_handle()`. Fallback:
+/// `OpenProcess(SYNCHRONIZE | QUERY_LIMITED_INFORMATION, pid)` — sufficient for
+/// `WaitForSingleObject` + `GetExitCodeProcess`. Either way `child` itself is
+/// never consumed, so `drive()` keeps it for `start_kill()` on the
+/// timeout/cancel arms. Returns `None` only if both routes fail (degenerate;
+/// the caller then lets the timeout govern rather than hanging).
+#[cfg(windows)]
+fn acquire_exit_handle(child: &tokio::process::Child, pid: Option<u32>) -> Option<OwnedWaitHandle> {
+    if let Some(h) = duplicate_child_handle(child) {
+        return Some(h);
+    }
+    // Fallback: open by pid.
+    let pid = pid?;
+    open_process_for_wait(pid)
+}
+
+/// Duplicate the child's OS process handle into one we own and close ourselves.
+#[cfg(windows)]
+fn duplicate_child_handle(child: &tokio::process::Child) -> Option<OwnedWaitHandle> {
+    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // tokio re-exports the child's OS process handle on Windows.
+    let src = child.raw_handle()? as windows_sys::Win32::Foundation::HANDLE;
+
+    let mut dup: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close;
+    // `src` is a live handle owned by tokio's Child; `&mut dup` is a valid out
+    // ptr. DUPLICATE_SAME_ACCESS copies the access rights of `src`.
+    let ok = unsafe {
+        let cur = GetCurrentProcess();
+        DuplicateHandle(cur, src, cur, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        warn!("GCMD: DuplicateHandle failed ({err}) — trying OpenProcess fallback");
+        return None;
+    }
+    Some(OwnedWaitHandle(dup))
+}
+
+/// Fallback handle acquisition: open the process by pid with just the rights
+/// needed for `WaitForSingleObject` + `GetExitCodeProcess`.
+#[cfg(windows)]
+fn open_process_for_wait(pid: u32) -> Option<OwnedWaitHandle> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: documented call; bInheritHandle = 0. Null return => could not open.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let err = std::io::Error::last_os_error();
+        warn!("GCMD: OpenProcess(pid={pid}) for wait failed ({err}) — no exit handle");
+        return None;
+    }
+    Some(OwnedWaitHandle(handle))
+}
+
+/// Wait for a child process to exit using a raw OS-handle wait, independent of
+/// tokio's process reaper. Runs `WaitForSingleObject(INFINITE)` on a blocking
+/// thread, reads the exit code with `GetExitCodeProcess`, closes the duplicated
+/// handle, and reconstructs an `ExitStatus` from the raw code.
+///
+/// This is the Windows exit arm of [`GuardedCommand::drive`]'s `select!`,
+/// replacing `child.wait()` which can hang forever for a `cmd /C`-wrapped tree.
+#[cfg(windows)]
+async fn wait_for_exit_windows(dup: OwnedWaitHandle) -> Result<ExitStatus, std::io::Error> {
+    use std::os::windows::process::ExitStatusExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+    };
+
+    tokio::task::spawn_blocking(move || {
+        // Force whole-struct capture of the (Send) `OwnedWaitHandle` rather than
+        // Rust 2021 disjoint-field capture of the raw `*mut c_void` (which is
+        // NOT Send and would break the `spawn_blocking` bound).
+        let dup = dup;
+        // Move the handle into this closure so it is owned + closed here.
+        let handle = dup.0;
+        // SAFETY: `handle` is a valid duplicated process handle we own.
+        let wait_res = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait_res == WAIT_FAILED {
+            let err = std::io::Error::last_os_error();
+            // SAFETY: handle is valid; close before returning.
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(err);
+        }
+        let mut code: u32 = 0;
+        // SAFETY: handle is valid; `&mut code` is a valid out ptr.
+        let got = unsafe { GetExitCodeProcess(handle, &mut code) };
+        let exit_err = if got == 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        // SAFETY: handle is a valid open handle; close it exactly once here.
+        unsafe {
+            CloseHandle(handle);
+        }
+        match exit_err {
+            Some(e) => Err(e),
+            None => Ok(ExitStatus::from_raw(code)),
+        }
+    })
+    .await
+    .map_err(|join_err| {
+        std::io::Error::other(format!(
+            "handle-wait blocking task panicked/cancelled: {join_err}"
+        ))
+    })?
 }
 
 type ReaderTask = tokio::task::JoinHandle<Vec<u8>>;
@@ -970,6 +1150,48 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(8),
             "cancel should fire promptly, well under both the 60s sleep and 60s timeout; took {elapsed:?}"
+        );
+    }
+
+    /// Handle-wait regression: a `cmd /C` wrapper that spawns a short-lived
+    /// grandchild and then exits must be detected as exited via the OS-handle
+    /// wait (`WaitForSingleObject`), returning the correct exit code WITHOUT
+    /// hanging. This exercises the exact shape that wedged tokio's
+    /// `child.wait()` in production (`cmd /C pnpm.cmd run build`): a cmd wrapper
+    /// over a process that forks a grandchild. The headline is that we return
+    /// `Exited` promptly with the cmd's real exit code, not a timeout / hang.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_wrapper_with_grandchild_exits_via_handle_wait() {
+        // `cmd /C "<grandchild> & exit 7"`:
+        //   - spawn a detached short-lived grandchild (`start /b ping -n 2`),
+        //   - then the cmd itself exits with code 7.
+        // The grandchild finishes within ~1s; the cmd exits ~immediately. We
+        // assert the handle-wait detected exit AND captured exit code 7, all
+        // well under the 30s timeout.
+        let start = std::time::Instant::now();
+        let outcome = GuardedCommand::new("cmd", Duration::from_secs(30))
+            .args(["/C", "start /b ping -n 2 127.0.0.1 >nul & exit /b 7"])
+            .run()
+            .await
+            .expect("run() should not error");
+        let elapsed = start.elapsed();
+
+        match outcome {
+            GuardedOutcome::Exited(out) => {
+                assert_eq!(
+                    out.status.code(),
+                    Some(7),
+                    "handle-wait must report the cmd's real exit code (7), got {:?}",
+                    out.status.code()
+                );
+            }
+            other => panic!("expected Exited via handle-wait, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "handle-wait must resolve promptly, well under the 30s timeout; took {elapsed:?} \
+             (a hang here is the tokio-reaper wedge this fix targets)"
         );
     }
 
