@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::FutureExt; // catch_unwind on futures
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -269,10 +270,33 @@ pub async fn submit(
     // Background task: acquire permit, run cargo, update submission.
     // Independent of the HTTP handler's task — the handler returns
     // immediately with the id.
+    //
+    // The task's `Result` MUST be observed: a detached `tokio::spawn` whose
+    // future panics drops its `JoinHandle` silently, leaving the submission
+    // stuck in `Running` forever (the silent-wedge class this PR closes). We
+    // `catch_unwind` the body and, on panic, force a `Failed` terminal state +
+    // log so the submission can never wedge unobserved.
     let state_bg = state.clone();
     let arc_bg = arc.clone();
     tokio::spawn(async move {
-        run_submission(state_bg, arc_bg).await;
+        let result = std::panic::AssertUnwindSafe(run_submission(state_bg.clone(), arc_bg.clone()))
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(()) => {
+                tracing::debug!(submission_id = %id, "build submission task completed");
+            }
+            Err(panic) => {
+                let msg = panic_message(&panic);
+                tracing::error!(
+                    submission_id = %id,
+                    "build submission task PANICKED: {msg} — forcing Failed terminal state so the \
+                     submission does not wedge in Running"
+                );
+                force_failed_terminal(&state_bg, &arc_bg, &format!("build task panicked: {msg}"))
+                    .await;
+            }
+        }
     });
 
     Ok(id)
@@ -348,7 +372,29 @@ where
             sub.status = BuildStatus::Running { started_at };
         }
 
-        let (http_status, mut body) = exec.await;
+        // Observe the spawn-build future's outcome, INCLUDING a panic. A panic
+        // here would otherwise unwind this detached task silently, leaving the
+        // submission stuck in `Running` forever — `await_terminal` (the
+        // synchronous spawn-test path) would then poll without end. Catch it,
+        // record a terminal `Failed`, and log so the wedge is impossible.
+        let exec_result = std::panic::AssertUnwindSafe(exec).catch_unwind().await;
+        let (http_status, mut body) = match exec_result {
+            Ok(pair) => pair,
+            Err(panic) => {
+                let msg = panic_message(&panic);
+                tracing::error!(
+                    submission_id = %id,
+                    port,
+                    "spawn-test build task PANICKED: {msg} — recording Failed terminal state"
+                );
+                (
+                    500u16,
+                    serde_json::json!({
+                        "error": format!("spawn-test build task panicked: {msg}"),
+                    }),
+                )
+            }
+        };
         // `build_id` = this submission's id. Inject it into the stored outcome
         // body so BOTH the sync path (which returns this stored body) and the
         // async poll (`GET /build/:id/status`) expose `build_id` = submission_id
@@ -412,6 +458,46 @@ pub async fn await_terminal(sub: &Arc<RwLock<BuildSubmission>>) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+/// Panics in Rust carry either a `&str` or a `String`; anything else is
+/// reported as an opaque non-string payload.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Force a submission into a `Failed` terminal state with `error`, but only if
+/// it has not ALREADY reached a terminal state. Used by the detached-task panic
+/// guards so a panicked build task can never leave a submission stuck in
+/// `Running` (which would make `await_terminal` poll forever).
+async fn force_failed_terminal(
+    _state: &SharedState,
+    sub_arc: &Arc<RwLock<BuildSubmission>>,
+    error: &str,
+) {
+    let mut sub = sub_arc.write().await;
+    if sub.status.is_terminal() {
+        return;
+    }
+    let now = Utc::now();
+    let started_at = match &sub.status {
+        BuildStatus::Running { started_at } => *started_at,
+        _ => now,
+    };
+    sub.status = BuildStatus::Failed {
+        started_at,
+        finished_at: now,
+        duration_secs: (now - started_at).num_milliseconds() as f64 / 1000.0,
+        exit_code: None,
+        error: error.to_string(),
+    };
 }
 
 async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>>) {
@@ -1170,6 +1256,43 @@ mod tests {
             .as_ref()
             .expect("spawn outcome recorded even on failure");
         assert_eq!(outcome.http_status, 500);
+    }
+
+    /// Requirement #3 regression: if the spawn-build future PANICS, the detached
+    /// task must still drive the submission to a terminal `Failed` state (the
+    /// panic is caught + logged) — never leave it stuck in `Running`, which would
+    /// make `await_terminal` (the synchronous spawn-test path) poll forever.
+    /// Before the panic guard, this test would hang in `await_terminal`.
+    #[tokio::test]
+    async fn submit_spawn_panic_records_failed_terminal() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (_id, arc) = submit_spawn(
+            store.clone(),
+            PathBuf::from("/tmp/runner/src-tauri"),
+            None,
+            9883,
+            async {
+                panic!("synthetic spawn-build panic");
+                #[allow(unreachable_code)]
+                (200u16, serde_json::json!({}))
+            },
+        );
+
+        // Must reach terminal despite the panic (would hang forever pre-fix).
+        tokio::time::timeout(std::time::Duration::from_secs(10), await_terminal(&arc))
+            .await
+            .expect("submission must reach terminal state after a panic — not wedge in Running");
+
+        let sub = arc.read().await;
+        match &sub.status {
+            BuildStatus::Failed { error, .. } => {
+                assert!(
+                    error.contains("panic"),
+                    "failed status should mention the panic; got {error}"
+                );
+            }
+            other => panic!("expected Failed after panic, got {other:?}"),
+        }
     }
 
     #[tokio::test]

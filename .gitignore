@@ -10,3 +10,5 @@ Cargo.lock
 /frontend/node_modules
 .worktrees/
 /target-agent
+/target-dbg
+/target-clippy

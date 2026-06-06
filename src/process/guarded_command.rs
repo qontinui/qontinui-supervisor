@@ -57,6 +57,41 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// pipes are closing; this is just a bound against a pathological hang.
 const READER_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long to wait for the stdout/stderr reader tasks to reach EOF after the
+/// DIRECT child has exited cleanly (the `wait` arm of the select).
+///
+/// This guards the original wedge this whole module exists to kill: on Windows
+/// a build grandchild (a detached vite/esbuild/node worker, or a lingering pnpm
+/// daemon) can inherit and keep the stdout/stderr pipe write-handle open *after*
+/// the direct `cmd.exe` child has already exited. `child.wait()` then resolves,
+/// but the reader tasks never see EOF — `lines().next_line()` blocks forever on
+/// the still-open pipe. Because the `select!` already resolved on the `wait`
+/// arm, the wall-clock timeout is no longer armed, so an unbounded
+/// `join_readers` here hangs the build silently (no timeout, no panic, no
+/// completion) — exactly the production silent-wedge.
+///
+/// We bound the post-exit drain: if the readers don't reach EOF within this
+/// budget, the surviving grandchild is holding the pipe. We force the pipe
+/// closed by killing the leftover tree (drop the kill-on-close job on Windows;
+/// kill the process group on POSIX), then return the captured-so-far output
+/// with the real exit status. Generous because a clean build legitimately
+/// flushes a few MB of vite output through the pipe at process teardown.
+const POST_EXIT_READER_DRAIN_BUDGET_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Resolve the post-exit reader-drain budget. Reads
+/// `QONTINUI_SUPERVISOR_POST_EXIT_DRAIN_SECS` (clamped to [1, 600]) at each
+/// call so regression tests can shorten the slow-path wait without a 30s hang;
+/// production never sets it and gets [`POST_EXIT_READER_DRAIN_BUDGET_DEFAULT`].
+fn post_exit_reader_drain_budget() -> Duration {
+    match std::env::var("QONTINUI_SUPERVISOR_POST_EXIT_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) => Duration::from_secs(n.clamp(1, 600)),
+        None => POST_EXIT_READER_DRAIN_BUDGET_DEFAULT,
+    }
+}
+
 /// Outcome of a [`GuardedCommand::run`].
 #[derive(Debug)]
 pub enum GuardedOutcome {
@@ -264,7 +299,15 @@ impl GuardedCommand {
         tokio::select! {
             wait_res = child.wait() => {
                 let status = wait_res?;
-                let (out, err) = join_readers(stdout_task, stderr_task).await;
+                // BOUNDED drain. The direct child has exited, but a build
+                // grandchild may still hold the pipe open (the original silent
+                // wedge). If the readers don't reach EOF within the budget,
+                // drop the job → the kernel kills the leftover tree → the pipe
+                // write-handle closes → the readers reach EOF. We then collect
+                // whatever they captured. `job` is moved into the helper so it
+                // is only dropped on the slow path.
+                let (out, err) =
+                    join_readers_bounded_windows(stdout_task, stderr_task, job).await;
                 Ok(GuardedOutcome::Exited(make_output(status, out, err)))
             }
             _ = tokio::time::sleep(timeout) => {
@@ -301,7 +344,12 @@ impl GuardedCommand {
         tokio::select! {
             wait_res = child.wait() => {
                 let status = wait_res?;
-                let (out, err) = join_readers(stdout_task, stderr_task).await;
+                // BOUNDED drain (see the Windows arm). A grandchild in the same
+                // process group can keep the pipe open after the direct child
+                // exits; on budget expiry we group-kill the leftover tree to
+                // force EOF, then collect the captured-so-far output.
+                let (out, err) =
+                    join_readers_bounded_posix(stdout_task, stderr_task, &mut child, pid).await;
                 Ok(GuardedOutcome::Exited(make_output(status, out, err)))
             }
             _ = tokio::time::sleep(timeout) => {
@@ -369,12 +417,111 @@ fn spawn_readers(
     (stdout_task, stderr_task)
 }
 
-/// Await both reader tasks to completion (used on the clean-exit arm, where the
-/// pipes close naturally). A panicked reader yields empty bytes.
+/// Await both reader tasks to completion (used by the bounded join helpers on
+/// the fast path, where the pipes close naturally). A panicked reader yields
+/// empty bytes.
 async fn join_readers(stdout_task: ReaderTask, stderr_task: ReaderTask) -> (Vec<u8>, Vec<u8>) {
     let out = stdout_task.await.unwrap_or_default();
     let err = stderr_task.await.unwrap_or_default();
     (out, err)
+}
+
+/// Windows clean-exit drain. The direct child has already exited; await the
+/// readers reaching EOF under [`post_exit_reader_drain_budget`]. On the fast
+/// path the pipe closes promptly and we drop the (now-superfluous) `job` after
+/// collecting the output. On the slow path a build grandchild is still holding
+/// the pipe open — the original silent wedge — so we drop the kill-on-close
+/// `job` to terminate the leftover tree, which closes the pipe write-handle and
+/// lets the readers reach EOF; we then collect whatever they captured.
+#[cfg(windows)]
+async fn join_readers_bounded_windows(
+    mut stdout_task: ReaderTask,
+    mut stderr_task: ReaderTask,
+    job: Option<crate::process::job::CommandJob>,
+) -> (Vec<u8>, Vec<u8>) {
+    let budget = post_exit_reader_drain_budget();
+    match tokio::time::timeout(budget, join_readers_mut(&mut stdout_task, &mut stderr_task)).await {
+        Ok(pair) => {
+            // Fast path: EOF reached on its own. Drop the job (nothing left to
+            // kill) and return.
+            drop(job);
+            pair
+        }
+        Err(_) => {
+            warn!(
+                "GuardedCommand: child exited but stdout/stderr did not reach EOF within {:?} — \
+                 a build grandchild is holding the pipe open; killing the leftover tree to \
+                 unblock (returning captured-so-far output)",
+                budget
+            );
+            // Drop the kill-on-close job → kernel kills the leftover tree →
+            // the pipe write-handle closes → readers reach EOF.
+            drop(job);
+            // Bound the post-kill join too, so a pathological reader can never
+            // hang us even after the tree is dead.
+            drain_to_pair(stdout_task, stderr_task).await
+        }
+    }
+}
+
+/// POSIX clean-exit drain. Mirror of [`join_readers_bounded_windows`]: on
+/// budget expiry, group-kill the leftover tree (a grandchild in the same
+/// process group is holding the pipe open) to force EOF, then collect output.
+#[cfg(not(windows))]
+async fn join_readers_bounded_posix(
+    mut stdout_task: ReaderTask,
+    mut stderr_task: ReaderTask,
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+) -> (Vec<u8>, Vec<u8>) {
+    let budget = post_exit_reader_drain_budget();
+    match tokio::time::timeout(budget, join_readers_mut(&mut stdout_task, &mut stderr_task)).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            warn!(
+                "GuardedCommand: child exited but stdout/stderr did not reach EOF within {:?} — \
+                 a build grandchild is holding the pipe open; killing the leftover process group \
+                 to unblock (returning captured-so-far output)",
+                budget
+            );
+            kill_posix_tree(child, pid).await;
+            drain_to_pair(stdout_task, stderr_task).await
+        }
+    }
+}
+
+/// Await both reader tasks via `&mut` borrows so the caller retains ownership of
+/// the [`JoinHandle`]s for the slow path. `JoinHandle` is `Unpin` and `Future`,
+/// so `&mut handle` is itself a `Future` resolving to the task's `Result`.
+/// Wrapping this in a `tokio::time::timeout` and letting the timeout win does
+/// NOT abort the underlying reader tasks — they keep running on their own tokio
+/// tasks, which is exactly what lets the slow path collect their output once the
+/// pipe is force-closed by the tree kill.
+///
+/// [`JoinHandle`]: tokio::task::JoinHandle
+async fn join_readers_mut(
+    stdout_task: &mut ReaderTask,
+    stderr_task: &mut ReaderTask,
+) -> (Vec<u8>, Vec<u8>) {
+    let (out, err) = tokio::join!(&mut *stdout_task, &mut *stderr_task);
+    (out.unwrap_or_default(), err.unwrap_or_default())
+}
+
+/// Final bounded collection after the tree has been killed: join the readers
+/// under [`READER_DRAIN_BUDGET`] (the writers are gone, so EOF is imminent) and
+/// return whatever bytes they captured. Never hangs.
+async fn drain_to_pair(stdout_task: ReaderTask, stderr_task: ReaderTask) -> (Vec<u8>, Vec<u8>) {
+    match tokio::time::timeout(READER_DRAIN_BUDGET, join_readers(stdout_task, stderr_task)).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            warn!(
+                "GuardedCommand: readers did not reach EOF within {:?} even after the tree was \
+                 killed — returning empty captured output",
+                READER_DRAIN_BUDGET
+            );
+            (Vec::new(), Vec::new())
+        }
+    }
 }
 
 /// Join the reader tasks under [`READER_DRAIN_BUDGET`] (used on the
@@ -708,5 +855,102 @@ mod tests {
             }
             other => panic!("expected Exited, got {other:?}"),
         }
+    }
+
+    /// Large-output clean-exit: a `cmd /C` wrapper that emits a lot of stdout and
+    /// exits 0 must return `Exited(success)` with the WHOLE output intact —
+    /// catches the large-output / exit-capture class. (`cmd /C` is the exact
+    /// shape `run_pnpm_command` uses, and vite's real output is multi-MB.)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_wrapper_large_output_exits_with_full_capture() {
+        // `for /L %i in (1,1,5000) do @echo line-%i` prints 5000 lines through
+        // the pipe, then cmd exits 0. The reader must capture every line.
+        let outcome = GuardedCommand::new("cmd", Duration::from_secs(60))
+            .args(["/C", "for /L %i in (1,1,5000) do @echo qontinui-line-%i"])
+            .run()
+            .await
+            .expect("run() should not error");
+
+        match outcome {
+            GuardedOutcome::Exited(out) => {
+                assert!(out.status.success(), "should exit 0");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let count = stdout.matches("qontinui-line-").count();
+                assert_eq!(count, 5000, "all 5000 lines must be captured; got {count}");
+                assert!(stdout.contains("qontinui-line-1"));
+                assert!(stdout.contains("qontinui-line-5000"));
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    /// HEADLINE regression for the production silent-wedge: the DIRECT child
+    /// exits 0 but leaves a detached GRANDCHILD that keeps the inherited
+    /// stdout/stderr pipe open (the exact mechanism the PR's own diagnosis
+    /// named). `child.wait()` resolves, but the reader tasks never see EOF.
+    /// Before the fix, the clean-exit arm awaited `join_readers` unbounded with
+    /// the wall-clock timeout already disarmed → permanent silent hang. After
+    /// the fix, the post-exit drain budget elapses, the leftover tree is killed
+    /// to force EOF, and we return `Exited(success)` with the parent's captured
+    /// output — promptly, not after the grandchild's 60s sleep.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clean_exit_with_pipe_holding_grandchild_does_not_wedge() {
+        // Shorten the post-exit drain so the test doesn't wait the full 30s.
+        std::env::set_var("QONTINUI_SUPERVISOR_POST_EXIT_DRAIN_SECS", "3");
+        let _restore = scopeguard::guard((), |_| {
+            std::env::remove_var("QONTINUI_SUPERVISOR_POST_EXIT_DRAIN_SECS");
+        });
+
+        // The DIRECT child (powershell) prints a marker line, launches a
+        // GRANDCHILD that INHERITS the stdout handle and sleeps 60s (holding the
+        // pipe open), then the direct child exits 0 immediately. `-PassThru`
+        // with default (no `-WindowStyle`) keeps the grandchild attached to the
+        // same console/pipe so it really holds the write-handle open.
+        let script = "Write-Output 'qontinui-parent-marker'; \
+             Start-Process powershell -NoNewWindow \
+             -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60'; \
+             exit 0";
+
+        let start = std::time::Instant::now();
+        let outcome = GuardedCommand::new("powershell", Duration::from_secs(120))
+            .args(["-NoProfile", "-Command", script])
+            .run()
+            .await
+            .expect("run() must not error — and must NOT hang");
+        let elapsed = start.elapsed();
+
+        // Must return on the clean-exit arm (the direct child exited 0), NOT via
+        // the wall-clock timeout (120s) or a hang.
+        match &outcome {
+            GuardedOutcome::Exited(out) => {
+                assert!(
+                    out.status.success(),
+                    "direct child exited 0; status should be success, got {:?}",
+                    out.status
+                );
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    stdout.contains("qontinui-parent-marker"),
+                    "parent's captured stdout must survive the bounded drain; got {stdout:?}"
+                );
+            }
+            other => panic!("expected Exited (clean-exit arm), got {other:?}"),
+        }
+
+        // Headline: it returned promptly — bounded by the ~3s post-exit drain
+        // (+ scheduling), FAR under the grandchild's 60s sleep. A hang or a
+        // fall-through to the 120s wall-clock timeout is the regression.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "clean-exit-with-pipe-holding-grandchild must return within the post-exit drain \
+             budget, not wait out the grandchild's 60s sleep; took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "should have actually waited out the ~3s post-exit drain (proving the slow path \
+             was exercised), not returned instantly; took {elapsed:?}"
+        );
     }
 }
