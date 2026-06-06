@@ -24,17 +24,13 @@ mod imp {
     use std::mem::{size_of, zeroed};
     use tracing::warn;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, OpenThread, ResumeThread, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-        THREAD_SUSPEND_RESUME,
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
     /// Assign a running process (by pid) to an already-created job handle.
@@ -82,82 +78,6 @@ mod imp {
             ));
         }
         Ok(())
-    }
-
-    /// Resume the primary (and every) thread of a `CREATE_SUSPENDED` process.
-    ///
-    /// We spawn build subprocesses suspended so we can assign them to a
-    /// kill-on-close [`CommandJob`] *before* their first instruction runs —
-    /// guaranteeing that any grandchild (rustc, linker, vite, esbuild) is
-    /// captured by the job and cannot break away. Once assignment is recorded
-    /// the process must be resumed or it would hang suspended forever.
-    ///
-    /// A freshly `CREATE_SUSPENDED` process has exactly one thread (the main
-    /// thread, suspend count 1), but we resume every thread owned by the pid
-    /// for robustness. Each `ResumeThread` decrements the suspend count; a
-    /// thread that was never suspended is left untouched (its count returns 0
-    /// → it was already running). Best-effort per-thread: a single failed
-    /// `OpenThread`/`ResumeThread` is logged and skipped rather than aborting
-    /// the whole resume (which would wedge the build).
-    ///
-    /// Returns the number of threads successfully resumed, or an error only if
-    /// the toolhelp snapshot itself could not be created.
-    pub(crate) fn resume_process_main_thread(pid: u32) -> Result<u32> {
-        // SAFETY: CreateToolhelp32Snapshot with TH32CS_SNAPTHREAD + pid 0
-        // snapshots all threads system-wide; we filter by owner pid below.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
-            // SAFETY: GetLastError is always safe to call.
-            let err = unsafe { GetLastError() };
-            return Err(anyhow!(
-                "CreateToolhelp32Snapshot failed (GetLastError = {})",
-                err
-            ));
-        }
-
-        // SAFETY: zeroed THREADENTRY32 is a valid initial state. dwSize MUST
-        // be set to the struct size before Thread32First or the call fails.
-        let mut entry: THREADENTRY32 = unsafe { zeroed() };
-        entry.dwSize = size_of::<THREADENTRY32>() as u32;
-
-        let mut resumed: u32 = 0;
-        // SAFETY: snapshot is a valid handle; entry is a properly-sized,
-        // zero-initialized THREADENTRY32 with dwSize set.
-        let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
-        while ok != 0 {
-            if entry.th32OwnerProcessID == pid {
-                // SAFETY: documented call; bInheritHandle = 0.
-                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if !thread.is_null() {
-                    // SAFETY: thread is a valid open handle with
-                    // THREAD_SUSPEND_RESUME. ResumeThread returns the prior
-                    // suspend count, or u32::MAX (-1) on failure.
-                    let prev = unsafe { ResumeThread(thread) };
-                    // SAFETY: thread is a valid open handle.
-                    unsafe {
-                        CloseHandle(thread);
-                    }
-                    if prev != u32::MAX {
-                        resumed += 1;
-                    } else {
-                        // SAFETY: GetLastError is always safe to call.
-                        let err = unsafe { GetLastError() };
-                        warn!(
-                            "ResumeThread(tid={}, pid={}) failed (GetLastError = {})",
-                            entry.th32ThreadID, pid, err
-                        );
-                    }
-                }
-            }
-            // SAFETY: snapshot + entry remain valid for the duration of the loop.
-            ok = unsafe { Thread32Next(snapshot, &mut entry) };
-        }
-
-        // SAFETY: snapshot is a valid handle we created and have not closed.
-        unsafe {
-            CloseHandle(snapshot);
-        }
-        Ok(resumed)
     }
 
     /// LimitFlags applied to the supervisor's runner job.
@@ -425,13 +345,6 @@ mod imp {
             Ok(())
         }
     }
-
-    /// No-op stub: there is no `CREATE_SUSPENDED` on non-Windows, so nothing
-    /// needs resuming. Returns 0 (threads resumed).
-    pub(crate) fn resume_process_main_thread(_pid: u32) -> Result<u32> {
-        Ok(0)
-    }
 }
 
-pub(crate) use imp::resume_process_main_thread;
 pub use imp::{CommandJob, RunnerJob};

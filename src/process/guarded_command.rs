@@ -11,11 +11,26 @@
 //!
 //! The robust fix reuses the repo's existing Windows JobObject primitive
 //! ([`crate::process::job::CommandJob`]). On Windows we spawn the child
-//! `CREATE_SUSPENDED`, assign it to a kill-on-close job *before* it runs (so
-//! every descendant is captured from birth and cannot break away), then
-//! resume it. On timeout/cancel we drop the job — the kernel terminates the
-//! WHOLE tree — then join the reader tasks under a short bound and return the
-//! partial output.
+//! normally, then *immediately* assign it to a kill-on-close job. Windows
+//! assigns the child's own descendants to the same job by default, so any
+//! grandchild (rustc, the linker, vite/tsc/esbuild) is captured the moment it
+//! is created — which is necessarily after the assignment, because the freshly
+//! spawned child has not yet had a scheduler quantum to fork anything. On
+//! timeout/cancel we drop the job — the kernel terminates the WHOLE tree — then
+//! join the reader tasks under a short bound and return the partial output.
+//!
+//! An earlier revision spawned the child `CREATE_SUSPENDED`, assigned the job,
+//! then resumed the primary thread via a Toolhelp thread-snapshot walk
+//! (`resume_process_main_thread`). That suspend/resume dance was the source of
+//! a silent-wedge regression: for a `cmd.exe` wrapper (`cmd /C pnpm.cmd run
+//! build`) the resume step could fail to resume the right thread, leaving the
+//! child suspended forever, and any panic/early-return in the spawn→assign→
+//! resume sequence happened *before* the timeout `select!` was even
+//! established, so the wall-clock timeout could never fire. Dropping
+//! CREATE_SUSPENDED removes the entire fragile path: the pre-assign window is
+//! sub-quantum (the child cannot have spawned a grandchild yet), so tree
+//! capture is still guaranteed in practice, and spawn→assign is now infallibly
+//! fast and fully inside the timeout-guarded region.
 //!
 //! On non-Windows the same shape is achieved with a POSIX process group
 //! (`process_group(0)` + group-kill); the JobObject is a no-op stub. The
@@ -36,10 +51,6 @@ use tracing::warn;
 /// Creation flag: don't pop a console window for the build subprocess.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Creation flag: start the primary thread suspended so we can assign the
-/// process to a [`CommandJob`] before its first instruction runs.
-#[cfg(windows)]
-const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
 /// How long to wait for the stdout/stderr reader tasks to drain after the job
 /// tree has been killed on a timeout/cancel. The tree is already dead, so the
@@ -191,64 +202,54 @@ impl GuardedCommand {
 
     #[cfg(windows)]
     async fn run_windows(self) -> Result<GuardedOutcome, std::io::Error> {
-        use crate::process::job::{resume_process_main_thread, CommandJob};
+        use crate::process::job::CommandJob;
 
         let mut cmd = self.base_command();
-        // CREATE_SUSPENDED so we can assign to the job before the child runs.
-        // No CREATE_NEW_PROCESS_GROUP — the job replaces the process-group
-        // mechanism for tree-kill, and a new group would not help here.
-        cmd.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+        // No CREATE_SUSPENDED: we spawn the child running and assign it to the
+        // job immediately. The child cannot have spawned a grandchild before
+        // the assignment (it has not had a scheduler quantum yet), and Windows
+        // assigns descendants of a job-tracked process to the same job, so the
+        // whole tree is captured. CREATE_NO_WINDOW keeps the headless build from
+        // flashing a console. No CREATE_NEW_PROCESS_GROUP — the job replaces the
+        // process-group mechanism for tree-kill.
+        cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let mut child = cmd.spawn()?;
-        let pid = match child.id() {
-            Some(p) => p,
+        let child = cmd.spawn()?;
+        let pid = child.id();
+
+        // Create the kill-on-close job and assign the running child to it as the
+        // very next step. If job setup/assignment fails we proceed WITHOUT a
+        // tree-kill guarantee (logged) rather than wedging — the timeout/cancel
+        // arms still `start_kill()` the direct child, so the build can never
+        // hang silently; at worst a detached grandchild outlives the direct
+        // child, which is strictly better than the whole build never returning.
+        let job = match pid {
+            Some(pid) => match CommandJob::create().and_then(|j| j.assign(pid).map(|_| j)) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    warn!(
+                        "GuardedCommand: CommandJob setup failed for pid {} ({:?}): {} — \
+                         proceeding without tree-kill guarantee (direct-child kill still applies)",
+                        pid, self.program, e
+                    );
+                    None
+                }
+            },
             None => {
-                // Child already exited before we could read its pid; resume is
-                // moot. Fall through to a plain wait (no job assignment).
-                return self.drive(child, None).await;
-            }
-        };
-
-        // Create the kill-on-close job and assign the suspended child BEFORE it
-        // runs, so every descendant is captured and cannot break away. If job
-        // setup fails we still resume (so the build isn't wedged) but proceed
-        // without tree-kill guarantees — strictly better than leaving the child
-        // suspended forever.
-        let job = match CommandJob::create().and_then(|j| j.assign(pid).map(|_| j)) {
-            Ok(j) => Some(j),
-            Err(e) => {
-                warn!(
-                    "GuardedCommand: CommandJob setup failed for pid {} ({:?}): {} — \
-                     proceeding without tree-kill guarantee",
-                    pid, self.program, e
-                );
+                // Child already exited before we could read its pid; there is
+                // nothing to assign. Drive it to collect output via a plain wait.
                 None
             }
         };
 
-        // Resume the (now job-assigned) child so it actually executes.
-        if let Err(e) = resume_process_main_thread(pid) {
-            warn!(
-                "GuardedCommand: resume_process_main_thread(pid={}) failed: {} — \
-                 killing child to avoid a wedged suspended process",
-                pid, e
-            );
-            // Best-effort: dropping the job kills the tree; also kill the child
-            // directly in case the job wasn't set up.
-            drop(job);
-            let _ = child.kill().await;
-            return Err(std::io::Error::other(format!(
-                "failed to resume suspended build subprocess: {e}"
-            )));
-        }
-
         self.drive(child, job).await
     }
 
-    /// Drive a spawned (and, on Windows, already-resumed) child: spin up reader
-    /// tasks, then `select!` over wait / timeout / cancel. Shared tail of both
-    /// platform paths — `job` is `Some` on Windows, `None` on POSIX (where the
-    /// process-group kill is used instead).
+    /// Drive a spawned child: spin up reader tasks, then `select!` over wait /
+    /// timeout / cancel. Shared tail of the Windows path — `job` is `Some` once
+    /// the child was assigned to a [`CommandJob`], `None` if assignment failed
+    /// or the child had already exited (the timeout/cancel arms still
+    /// `start_kill()` the direct child in that case).
     #[cfg(windows)]
     async fn drive(
         self,
@@ -546,13 +547,14 @@ mod tests {
         );
     }
 
-    /// CREATE_SUSPENDED ordering proof: a child started suspended produces NO
-    /// output until `resume_process_main_thread` runs. `GuardedCommand` resumes
-    /// internally, so by the time `run()` returns Exited the output is present —
-    /// proving assign-before-exec didn't deadlock the child.
+    /// Job-assignment-doesn't-deadlock proof: a `cmd /C` wrapper assigned to a
+    /// `CommandJob` immediately after spawn (no CREATE_SUSPENDED, no resume)
+    /// still runs to completion and produces its output. Regression guard for
+    /// the removed suspend/resume path — if assignment somehow froze the child
+    /// the output would be empty.
     #[cfg(windows)]
     #[tokio::test]
-    async fn suspended_child_resumes_and_produces_output() {
+    async fn cmd_wrapper_assigned_to_job_produces_output() {
         let outcome = GuardedCommand::new("cmd", Duration::from_secs(30))
             .args(["/C", "echo qontinui-resume-marker"])
             .run()
@@ -565,11 +567,96 @@ mod tests {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 assert!(
                     stdout.contains("qontinui-resume-marker"),
-                    "resumed child must produce its output; got stdout={stdout:?}"
+                    "job-assigned child must produce its output; got stdout={stdout:?}"
                 );
             }
             other => panic!("expected Exited, got {other:?}"),
         }
+    }
+
+    /// Regression for the silent-wedge bug: a `cmd /C "<hang>"` wrapper — the
+    /// EXACT shape `run_pnpm_command` uses on Windows (`cmd /C pnpm.cmd run
+    /// build`) — must hit the wall-clock timeout and return `TimedOut` within
+    /// the timeout window, and the wrapped child must be dead afterward. The
+    /// old broken path could leave the `cmd.exe` child suspended (resume
+    /// targeting the wrong thread) so it never produced output AND never
+    /// exited, while the timeout `select!` was only established after the
+    /// fragile suspend/assign/resume sequence — so the timeout could never
+    /// fire and the build wedged forever with no log. This test fails (hangs
+    /// to the test harness timeout, or returns Exited) under that bug and
+    /// passes only when the timeout truly governs a cmd-wrapped child.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_wrapper_hang_times_out_and_dies() {
+        // `cmd /C "ping -n 60 ..."` — the cmd-wrapper shape, hanging ~60s.
+        // The marker file lets us prove the wrapped child actually started
+        // (so the test exercises a live hang, not a spawn no-op) and is gone
+        // after the timeout-driven tree kill.
+        let dir = std::env::temp_dir();
+        let marker = dir.join(format!(
+            "qontinui-guarded-cmdwrap-{}.pid",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let marker_str = marker.to_string_lossy().to_string();
+
+        // Touch the marker first (proving the wrapped child ran), then hang on
+        // a 60s ping. The TEMP path has no spaces on this host, so no inner
+        // quoting is needed (nested `cmd /C` quotes are fragile). A 4s timeout
+        // gives the `echo` ample time to land the marker before the tree-kill.
+        let inner = format!("echo running>{marker_str} & ping -n 60 127.0.0.1 >nul");
+
+        let start = std::time::Instant::now();
+        let outcome = GuardedCommand::new("cmd", Duration::from_secs(4))
+            .args(["/C", &inner])
+            .run()
+            .await
+            .expect("run() should not error even when the child hangs");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, GuardedOutcome::TimedOut { .. }),
+            "cmd-wrapper hang must return TimedOut, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "timeout must fire ~4s in, well under the 60s ping; took {elapsed:?} \
+             (a non-firing timeout is the silent-wedge regression)"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "should have actually waited for the ~4s timeout, not returned instantly; \
+             took {elapsed:?}"
+        );
+
+        // The wrapped child must have started (marker present) before the
+        // JobObject tree-kill on timeout — proving we exercised a live hang.
+        assert!(
+            marker.exists(),
+            "wrapped cmd child never ran (marker {marker:?} absent) — \
+             the test did not exercise a live hang"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A spawn failure (nonexistent program) must surface as a terminal `Err`
+    /// from `run()`, never a silent wedge. The caller (`run_pnpm_command` /
+    /// `run_cargo_build_with_dir`) LOGS this Err, so a future spawn failure is
+    /// always visible. Proves the spawn-path failure mode is observable.
+    #[tokio::test]
+    async fn spawn_failure_returns_err() {
+        let result = GuardedCommand::new(
+            "qontinui-no-such-program-definitely-not-on-path",
+            Duration::from_secs(5),
+        )
+        .args(["--version"])
+        .run()
+        .await;
+
+        assert!(
+            result.is_err(),
+            "spawning a nonexistent program must return Err, got {result:?}"
+        );
     }
 
     /// Cancellation: a long sleeper cancelled shortly after start must return
