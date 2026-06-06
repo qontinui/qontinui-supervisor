@@ -252,6 +252,70 @@ pub fn build_timeout_secs() -> u64 {
         }
     })
 }
+const DEFAULT_PNPM_TIMEOUT_SECS: u64 = 1200; // 20 minutes — cold pnpm install + frontend build
+const DEFAULT_GIT_TIMEOUT_SECS: u64 = 30; // git rev-parse / diff are fast; a hang means trouble
+
+/// Resolved frontend (pnpm) build timeout in seconds, read from
+/// `QONTINUI_SUPERVISOR_PNPM_TIMEOUT_SECS` at first access. Clamped to
+/// [30, 3600], defaults to 1200 (20 minutes). Distinct from
+/// [`build_timeout_secs`] (cargo) because pnpm install+build has a very
+/// different runtime profile; the frontend build had NO timeout before the
+/// build-pipeline consolidation, which is exactly the hang this guards.
+// wired into the build path in a follow-up (see PR #74)
+#[allow(dead_code)]
+pub fn pnpm_timeout_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        let raw = std::env::var("QONTINUI_SUPERVISOR_PNPM_TIMEOUT_SECS").ok();
+        match raw {
+            None => DEFAULT_PNPM_TIMEOUT_SECS,
+            Some(ref s) => match s.parse::<u64>() {
+                Ok(n) => n.clamp(30, 3600),
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = "QONTINUI_SUPERVISOR_PNPM_TIMEOUT_SECS",
+                        value = s.as_str(),
+                        default = DEFAULT_PNPM_TIMEOUT_SECS,
+                        "invalid value for env var, using default"
+                    );
+                    DEFAULT_PNPM_TIMEOUT_SECS
+                }
+            },
+        }
+    })
+}
+
+/// Resolved git-subprocess timeout in seconds, read from
+/// `QONTINUI_SUPERVISOR_GIT_TIMEOUT_SECS` at first access. Clamped to
+/// [5, 300], defaults to 30. Used for the best-effort `git rev-parse` calls
+/// in `build_monitor` so a wedged git (network filesystem, lock contention)
+/// can't hang a build forever.
+// wired into the build path in a follow-up (see PR #74)
+#[allow(dead_code)]
+pub fn git_timeout_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        let raw = std::env::var("QONTINUI_SUPERVISOR_GIT_TIMEOUT_SECS").ok();
+        match raw {
+            None => DEFAULT_GIT_TIMEOUT_SECS,
+            Some(ref s) => match s.parse::<u64>() {
+                Ok(n) => n.clamp(5, 300),
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = "QONTINUI_SUPERVISOR_GIT_TIMEOUT_SECS",
+                        value = s.as_str(),
+                        default = DEFAULT_GIT_TIMEOUT_SECS,
+                        "invalid value for env var, using default"
+                    );
+                    DEFAULT_GIT_TIMEOUT_SECS
+                }
+            },
+        }
+    })
+}
+
 #[allow(dead_code)]
 pub const PORT_WAIT_TIMEOUT_SECS: u64 = 120;
 pub const PORT_CHECK_INTERVAL_MS: u64 = 500;

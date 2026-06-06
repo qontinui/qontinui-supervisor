@@ -20,6 +20,9 @@ path = "src/bin/symbol_watcher.rs"
 [dependencies]
 axum = { version = "0.8", features = ["json", "ws"] }
 tokio = { version = "1", features = ["full"] }
+# CancellationToken for build cancellation (per-slot cancel of an in-flight
+# `GuardedCommand::run`). `rt` is the feature gate for the sync primitives.
+tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

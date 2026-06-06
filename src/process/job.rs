@@ -33,6 +33,53 @@ mod imp {
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
+    /// Assign a running process (by pid) to an already-created job handle.
+    ///
+    /// Factored out of [`RunnerJob::assign`] so both the supervisor's
+    /// process-lifetime runner job and the per-build [`CommandJob`] share one
+    /// audited implementation. Uses minimum-privilege
+    /// `PROCESS_SET_QUOTA | PROCESS_TERMINATE` rather than `PROCESS_ALL_ACCESS`.
+    ///
+    /// `job` must be a valid job handle owned by the caller; `pid` must name a
+    /// process owned by the current user (or the supervisor must be admin).
+    pub(super) fn assign_pid_to(job: HANDLE, pid: u32) -> Result<()> {
+        // SAFETY: OpenProcess with these access rights is documented as safe
+        // for any PID owned by the current user (or with admin).
+        let proc_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if proc_handle.is_null() {
+            // SAFETY: GetLastError is always safe to call.
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!(
+                "OpenProcess(pid={}) failed (GetLastError = {})",
+                pid,
+                err
+            ))
+            .with_context(|| format!("assign_pid_to(pid = {pid})"));
+        }
+
+        // SAFETY: both handles are valid kernel handles owned by us.
+        let ok = unsafe { AssignProcessToJobObject(job, proc_handle) };
+
+        // Always close the per-process handle — the assignment is recorded by
+        // the kernel and does not depend on us holding the duplicate handle.
+        //
+        // SAFETY: proc_handle is a valid open handle.
+        unsafe {
+            CloseHandle(proc_handle);
+        }
+
+        if ok == 0 {
+            // SAFETY: GetLastError is always safe to call.
+            let err = unsafe { GetLastError() };
+            return Err(anyhow!(
+                "AssignProcessToJobObject(pid={}) failed (GetLastError = {})",
+                pid,
+                err
+            ));
+        }
+        Ok(())
+    }
+
     /// LimitFlags applied to the supervisor's runner job.
     ///
     /// - `KILL_ON_JOB_CLOSE`: the kernel terminates every assigned process when
@@ -134,42 +181,7 @@ mod imp {
         /// Uses minimum-privilege `PROCESS_SET_QUOTA | PROCESS_TERMINATE`
         /// rather than `PROCESS_ALL_ACCESS`.
         pub fn assign(&self, pid: u32) -> Result<()> {
-            // SAFETY: OpenProcess with these access rights is documented as
-            // safe for any PID owned by the current user (or with admin).
-            let proc_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-            if proc_handle.is_null() {
-                // SAFETY: GetLastError is always safe to call.
-                let err = unsafe { GetLastError() };
-                return Err(anyhow!(
-                    "OpenProcess(pid={}) failed (GetLastError = {})",
-                    pid,
-                    err
-                ))
-                .with_context(|| format!("RunnerJob::assign(pid = {pid})"));
-            }
-
-            // SAFETY: both handles are valid kernel handles owned by us.
-            let ok = unsafe { AssignProcessToJobObject(self.handle.0, proc_handle) };
-
-            // Always close the per-process handle — the assignment is
-            // recorded by the kernel and does not depend on us holding
-            // the duplicate handle. Failing to close it would leak.
-            //
-            // SAFETY: proc_handle is a valid open handle.
-            unsafe {
-                CloseHandle(proc_handle);
-            }
-
-            if ok == 0 {
-                // SAFETY: GetLastError is always safe to call.
-                let err = unsafe { GetLastError() };
-                return Err(anyhow!(
-                    "AssignProcessToJobObject(pid={}) failed (GetLastError = {})",
-                    pid,
-                    err
-                ));
-            }
-            Ok(())
+            assign_pid_to(self.handle.0, pid)
         }
     }
 
@@ -188,6 +200,112 @@ mod imp {
                 warn!(
                     "RunnerJob::drop: CloseHandle failed (GetLastError = {}) — \
                      spawned runners may not be killed",
+                    err
+                );
+            }
+        }
+    }
+
+    /// A short-lived JobObject scoped to a single build subprocess (and its
+    /// whole descendant tree).
+    ///
+    /// Unlike [`RunnerJob`] (which spans the supervisor's whole lifetime and
+    /// keeps runners alive), a `CommandJob` owns exactly one cargo/pnpm/git
+    /// invocation. The build subprocess is spawned `CREATE_SUSPENDED`, assigned
+    /// to this job, then resumed — so every grandchild it spawns (rustc, the
+    /// linker, vite/tsc/esbuild) is captured by the job from birth.
+    ///
+    /// When the [`GuardedCommand`] runner hits a timeout or cancellation it
+    /// simply drops the `CommandJob`. Because we hold the only handle and the
+    /// job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the kernel terminates
+    /// the ENTIRE tree — including the pipe-holding grandchildren that would
+    /// otherwise keep the stdout/stderr pipe open forever and hang the build.
+    ///
+    /// Crucially this job does **not** set `JOB_OBJECT_LIMIT_BREAKAWAY_OK`: a
+    /// child must not be able to opt its descendants out of the kill-on-close
+    /// tree. (`RunnerJob` sets it so a deliberately-detached runner could break
+    /// away; for a build tree the opposite is what we want.)
+    ///
+    /// [`GuardedCommand`]: crate::process::guarded_command::GuardedCommand
+    // wired into the build path in a follow-up (see PR #74)
+    #[allow(dead_code)]
+    pub struct CommandJob {
+        handle: SendSyncHandle,
+    }
+
+    #[allow(dead_code)]
+    impl CommandJob {
+        /// Create a kill-on-close job with NO breakaway. See [`CommandJob`].
+        pub fn create() -> Result<Self> {
+            // SAFETY: passing nulls for both attributes (default security) and
+            // name (unnamed job). Returns NULL on failure.
+            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                // SAFETY: GetLastError is always safe to call.
+                let err = unsafe { GetLastError() };
+                return Err(anyhow!(
+                    "CreateJobObjectW (CommandJob) failed (GetLastError = {})",
+                    err
+                ));
+            }
+
+            // SAFETY: zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION is a valid
+            // "no limits" initial state.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            // KILL_ON_JOB_CLOSE only — deliberately omit BREAKAWAY_OK so build
+            // grandchildren are auto-captured and cannot escape the tree.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+            // SAFETY: handle is freshly created and owned; info is a properly
+            // sized stack struct of the declared info class.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    raw,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                // SAFETY: GetLastError is always safe to call.
+                let err = unsafe { GetLastError() };
+                // SAFETY: raw is the handle we just created and have not closed.
+                unsafe {
+                    CloseHandle(raw);
+                }
+                return Err(anyhow!(
+                    "SetInformationJobObject (CommandJob) failed (GetLastError = {})",
+                    err
+                ));
+            }
+
+            Ok(Self {
+                handle: SendSyncHandle(raw),
+            })
+        }
+
+        /// Assign a process (by pid) to this job. The process should be the
+        /// freshly-spawned, still-suspended build child; assigning before it
+        /// runs guarantees descendant capture.
+        pub fn assign(&self, pid: u32) -> Result<()> {
+            assign_pid_to(self.handle.0, pid)
+        }
+    }
+
+    impl Drop for CommandJob {
+        /// Closes the job handle, which (since we hold the only handle and the
+        /// job is `KILL_ON_JOB_CLOSE`) terminates the whole build subprocess
+        /// tree. This is the mechanism by which a timed-out/cancelled build
+        /// kills its pipe-holding grandchildren.
+        fn drop(&mut self) {
+            // SAFETY: handle was created in `create()` and not closed elsewhere.
+            let ok = unsafe { CloseHandle(self.handle.0) };
+            if ok == 0 {
+                // SAFETY: GetLastError is always safe to call.
+                let err = unsafe { GetLastError() };
+                warn!(
+                    "CommandJob::drop: CloseHandle failed (GetLastError = {}) — \
+                     build subprocess tree may not be killed",
                     err
                 );
             }
@@ -214,6 +332,29 @@ mod imp {
             Ok(())
         }
     }
+
+    /// No-op stub mirror of the Windows [`CommandJob`](super). On non-Windows
+    /// platforms the [`GuardedCommand`](crate::process::guarded_command)
+    /// runner relies on POSIX process groups instead of a JobObject, so this
+    /// type does nothing but satisfy the cross-platform compile.
+    // wired into the build path in a follow-up (see PR #74)
+    #[allow(dead_code)]
+    pub struct CommandJob;
+
+    #[allow(dead_code)]
+    impl CommandJob {
+        pub fn create() -> Result<Self> {
+            Ok(Self)
+        }
+
+        pub fn assign(&self, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
 }
 
-pub use imp::RunnerJob;
+// CommandJob is the per-build JobObject primitive; not yet wired into the
+// build path (used by guarded_command + its tests). Re-export it so the
+// follow-up wiring (see PR #74) can consume it without a churny diff here.
+#[allow(unused_imports)]
+pub use imp::{CommandJob, RunnerJob};
