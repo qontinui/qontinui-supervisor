@@ -37,11 +37,6 @@
 //! supervisor only runs on Windows in practice, but the module compiles and
 //! behaves correctly cross-platform so `cargo check`/tests work from any host.
 
-// The GuardedCommand primitive is not yet wired into the build path; it is
-// exercised by this module's own regression tests but otherwise unused in
-// non-test builds. Wired into the build path in a follow-up (see PR #74).
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
@@ -51,7 +46,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Creation flag: don't pop a console window for the build subprocess.
 #[cfg(windows)]
@@ -111,7 +106,14 @@ pub enum GuardedOutcome {
     },
     /// The cancellation token fired; the process tree was killed. `partial` is
     /// whatever was captured before the kill.
-    Cancelled { partial: PartialOutput },
+    ///
+    /// `partial` is part of the complete primitive surface (tests + future
+    /// cancel-aware callers); the current build call sites early-return on
+    /// cancel without reading it, hence the allow.
+    Cancelled {
+        #[allow(dead_code)]
+        partial: PartialOutput,
+    },
 }
 
 /// Captured stdout/stderr bytes from a killed (timed-out / cancelled) command.
@@ -123,6 +125,10 @@ pub struct PartialOutput {
     /// need it.
     #[allow(dead_code)]
     pub stdout: Vec<u8>,
+    /// Captured stderr before the kill. Part of the complete primitive surface;
+    /// the current build call sites stream stderr live and early-return on
+    /// timeout/cancel without reading the partial blob, hence the allow.
+    #[allow(dead_code)]
     pub stderr: Vec<u8>,
 }
 
@@ -136,6 +142,15 @@ pub struct GuardedCommand {
     envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     timeout: Duration,
     cancel: Option<CancellationToken>,
+    /// Whether to assign the spawned child to a kill-on-close [`CommandJob`]
+    /// (Windows) / process group (POSIX) so a timeout/cancel tears down the
+    /// WHOLE descendant tree. Defaults to `true` — the correct posture for
+    /// long-lived build subprocesses (cargo/pnpm spawn rustc/linker/vite
+    /// grandchildren that can hold the stdout pipe open). Set to `false` for
+    /// short, leaf subprocesses (git rev-parse) that never fork a pipe-holding
+    /// grandchild: the wall-clock timeout + direct-child kill is sufficient and
+    /// we avoid creating a JobObject per invocation.
+    job_guarded: bool,
     /// When set, every merged stderr line is forwarded to this broadcast
     /// sender as it is read (replaces the manual per-slot SSE stderr task in
     /// `build_monitor`). Lines are sent untagged; SSE framing is the
@@ -154,8 +169,17 @@ impl GuardedCommand {
             envs: Vec::new(),
             timeout,
             cancel: None,
+            job_guarded: true,
             stream_lines: None,
         }
+    }
+
+    /// Control whether the spawned child is assigned to a kill-on-close job /
+    /// process group (default `true`). Pass `false` for short leaf subprocesses
+    /// (e.g. `git rev-parse`) that never spawn a pipe-holding grandchild.
+    pub fn job_guarded(mut self, guarded: bool) -> Self {
+        self.job_guarded = guarded;
+        self
     }
 
     /// Append a single argument. (Companion to [`args`](Self::args); part of
@@ -194,6 +218,11 @@ impl GuardedCommand {
 
     /// Attach a cancellation token. When it fires, [`run`](Self::run) kills the
     /// process tree and returns [`GuardedOutcome::Cancelled`].
+    ///
+    /// Part of the complete builder surface and exercised by the cancellation
+    /// regression test; no build call site wires a cancel token yet (builds run
+    /// to completion or the wall-clock timeout), hence the allow.
+    #[allow(dead_code)]
     pub fn cancel_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -213,14 +242,32 @@ impl GuardedCommand {
     /// joined under [`READER_DRAIN_BUDGET`] so a wedged pipe can't hang the
     /// supervisor. The captured-so-far bytes ride along in the `partial` field.
     pub async fn run(self) -> Result<GuardedOutcome, std::io::Error> {
-        #[cfg(windows)]
-        {
-            self.run_windows().await
+        let flavor = format!("{:?}", tokio::runtime::Handle::current().runtime_flavor());
+        info!(
+            "GCMD: run begin program={:?} args={:?} cwd={:?} timeout={}s job_guarded={} runtime_flavor={} thread={:?}",
+            self.program,
+            self.args,
+            self.cwd,
+            self.timeout.as_secs(),
+            self.job_guarded,
+            flavor,
+            std::thread::current().id(),
+        );
+        let result = {
+            #[cfg(windows)]
+            {
+                self.run_windows().await
+            }
+            #[cfg(not(windows))]
+            {
+                self.run_posix().await
+            }
+        };
+        match &result {
+            Ok(outcome) => info!("GCMD: run return outcome={}", outcome_label(outcome)),
+            Err(e) => info!("GCMD: run return err={}", e),
         }
-        #[cfg(not(windows))]
-        {
-            self.run_posix().await
-        }
+        result
     }
 
     /// Build the base `tokio::process::Command` shared by both platforms
@@ -256,6 +303,7 @@ impl GuardedCommand {
 
         let child = cmd.spawn()?;
         let pid = child.id();
+        info!("GCMD: spawned pid={:?} program={:?}", pid, self.program);
 
         // Create the kill-on-close job and assign the running child to it as the
         // very next step. If job setup/assignment fails we proceed WITHOUT a
@@ -263,25 +311,45 @@ impl GuardedCommand {
         // arms still `start_kill()` the direct child, so the build can never
         // hang silently; at worst a detached grandchild outlives the direct
         // child, which is strictly better than the whole build never returning.
-        let job = match pid {
-            Some(pid) => match CommandJob::create().and_then(|j| j.assign(pid).map(|_| j)) {
-                Ok(j) => Some(j),
-                Err(e) => {
-                    warn!(
-                        "GuardedCommand: CommandJob setup failed for pid {} ({:?}): {} — \
-                         proceeding without tree-kill guarantee (direct-child kill still applies)",
-                        pid, self.program, e
-                    );
+        //
+        // Skipped entirely when `job_guarded == false` (short leaf subprocesses
+        // like `git rev-parse` that never fork a pipe-holding grandchild).
+        let job = if !self.job_guarded {
+            info!("GCMD: job assign skipped (job_guarded=false) pid={:?}", pid);
+            None
+        } else {
+            match pid {
+                Some(pid) => {
+                    // Log the ACTUAL assign result (Ok/Err) — never swallow it.
+                    // A silently-failed assign is a prime suspect for the live
+                    // wedge, so this line localizes that case.
+                    let assigned = CommandJob::create().and_then(|j| j.assign(pid).map(|_| j));
+                    match assigned {
+                        Ok(j) => {
+                            info!("GCMD: job assign pid={} result=Ok", pid);
+                            Some(j)
+                        }
+                        Err(e) => {
+                            info!("GCMD: job assign pid={} result=Err({})", pid, e);
+                            warn!(
+                                "GuardedCommand: CommandJob setup failed for pid {} ({:?}): {} — \
+                                 proceeding without tree-kill guarantee (direct-child kill still applies)",
+                                pid, self.program, e
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    // Child already exited before we could read its pid; there is
+                    // nothing to assign. Drive it to collect output via a plain wait.
+                    info!("GCMD: job assign skipped (child had no pid — already exited)");
                     None
                 }
-            },
-            None => {
-                // Child already exited before we could read its pid; there is
-                // nothing to assign. Drive it to collect output via a plain wait.
-                None
             }
         };
 
+        info!("GCMD: entering drive pid={:?}", pid);
         self.drive(child, job).await
     }
 
@@ -297,13 +365,21 @@ impl GuardedCommand {
         job: Option<crate::process::job::CommandJob>,
     ) -> Result<GuardedOutcome, std::io::Error> {
         let (stdout_task, stderr_task) = spawn_readers(&mut child, self.stream_lines.clone());
+        info!("GCMD: readers spawned");
 
         let timeout = self.timeout;
         let cancel = self.cancel.clone();
+        let select_start = std::time::Instant::now();
 
+        info!("GCMD: select enter timeout={}s", timeout.as_secs());
         tokio::select! {
             wait_res = child.wait() => {
                 let status = wait_res?;
+                info!(
+                    "GCMD: child exited status={} elapsed={}ms",
+                    status,
+                    select_start.elapsed().as_millis()
+                );
                 // BOUNDED drain. The direct child has exited, but a build
                 // grandchild may still hold the pipe open (the original silent
                 // wedge). If the readers don't reach EOF within the budget,
@@ -316,6 +392,10 @@ impl GuardedCommand {
                 Ok(GuardedOutcome::Exited(make_output(status, out, err)))
             }
             _ = tokio::time::sleep(timeout) => {
+                warn!(
+                    "GCMD: TIMEOUT after {}s — killing tree",
+                    timeout.as_secs()
+                );
                 // Drop the job → kernel kills the whole tree.
                 drop(job);
                 let _ = child.start_kill();
@@ -323,6 +403,7 @@ impl GuardedCommand {
                 Ok(GuardedOutcome::TimedOut { after: timeout, partial })
             }
             _ = wait_for_cancel(cancel) => {
+                info!("GCMD: cancelled — killing tree");
                 drop(job);
                 let _ = child.start_kill();
                 let partial = drain_readers(stdout_task, stderr_task).await;
@@ -335,20 +416,33 @@ impl GuardedCommand {
     async fn run_posix(self) -> Result<GuardedOutcome, std::io::Error> {
         let mut cmd = self.base_command();
         // New process group so a timeout/cancel can kill the whole tree via a
-        // negative-pid group signal. JobObject is a no-op stub here.
-        cmd.process_group(0);
+        // negative-pid group signal. JobObject is a no-op stub here. When
+        // `job_guarded == false` we skip the new process group — the leaf
+        // subprocess (git) is killed directly on timeout.
+        if self.job_guarded {
+            cmd.process_group(0);
+        }
 
         let mut child = cmd.spawn()?;
         let pid = child.id();
+        info!("GCMD: spawned pid={:?} program={:?}", pid, self.program);
 
         let (stdout_task, stderr_task) = spawn_readers(&mut child, self.stream_lines.clone());
+        info!("GCMD: readers spawned");
 
         let timeout = self.timeout;
         let cancel = self.cancel.clone();
+        let select_start = std::time::Instant::now();
 
+        info!("GCMD: select enter timeout={}s", timeout.as_secs());
         tokio::select! {
             wait_res = child.wait() => {
                 let status = wait_res?;
+                info!(
+                    "GCMD: child exited status={} elapsed={}ms",
+                    status,
+                    select_start.elapsed().as_millis()
+                );
                 // BOUNDED drain (see the Windows arm). A grandchild in the same
                 // process group can keep the pipe open after the direct child
                 // exits; on budget expiry we group-kill the leftover tree to
@@ -358,11 +452,13 @@ impl GuardedCommand {
                 Ok(GuardedOutcome::Exited(make_output(status, out, err)))
             }
             _ = tokio::time::sleep(timeout) => {
+                warn!("GCMD: TIMEOUT after {}s — killing tree", timeout.as_secs());
                 kill_posix_tree(&mut child, pid).await;
                 let partial = drain_readers(stdout_task, stderr_task).await;
                 Ok(GuardedOutcome::TimedOut { after: timeout, partial })
             }
             _ = wait_for_cancel(cancel) => {
+                info!("GCMD: cancelled — killing tree");
                 kill_posix_tree(&mut child, pid).await;
                 let partial = drain_readers(stdout_task, stderr_task).await;
                 Ok(GuardedOutcome::Cancelled { partial })
@@ -445,14 +541,26 @@ async fn join_readers_bounded_windows(
     job: Option<crate::process::job::CommandJob>,
 ) -> (Vec<u8>, Vec<u8>) {
     let budget = post_exit_reader_drain_budget();
+    let drain_start = std::time::Instant::now();
+    info!(
+        "GCMD: drain begin (clean-exit) budget={}s",
+        budget.as_secs()
+    );
     match tokio::time::timeout(budget, join_readers_mut(&mut stdout_task, &mut stderr_task)).await {
         Ok(pair) => {
             // Fast path: EOF reached on its own. Drop the job (nothing left to
             // kill) and return.
+            info!(
+                "GCMD: drain done elapsed={}ms out={}B err={}B",
+                drain_start.elapsed().as_millis(),
+                pair.0.len(),
+                pair.1.len()
+            );
             drop(job);
             pair
         }
         Err(_) => {
+            warn!("GCMD: drain TIMED OUT after budget — killing tree");
             warn!(
                 "GuardedCommand: child exited but stdout/stderr did not reach EOF within {:?} — \
                  a build grandchild is holding the pipe open; killing the leftover tree to \
@@ -480,9 +588,23 @@ async fn join_readers_bounded_posix(
     pid: Option<u32>,
 ) -> (Vec<u8>, Vec<u8>) {
     let budget = post_exit_reader_drain_budget();
+    let drain_start = std::time::Instant::now();
+    info!(
+        "GCMD: drain begin (clean-exit) budget={}s",
+        budget.as_secs()
+    );
     match tokio::time::timeout(budget, join_readers_mut(&mut stdout_task, &mut stderr_task)).await {
-        Ok(pair) => pair,
+        Ok(pair) => {
+            info!(
+                "GCMD: drain done elapsed={}ms out={}B err={}B",
+                drain_start.elapsed().as_millis(),
+                pair.0.len(),
+                pair.1.len()
+            );
+            pair
+        }
         Err(_) => {
+            warn!("GCMD: drain TIMED OUT after budget — killing tree");
             warn!(
                 "GuardedCommand: child exited but stdout/stderr did not reach EOF within {:?} — \
                  a build grandchild is holding the pipe open; killing the leftover process group \
@@ -550,6 +672,15 @@ async fn drain_readers(stdout_task: ReaderTask, stderr_task: ReaderTask) -> Part
             );
             PartialOutput::default()
         }
+    }
+}
+
+/// Short greppable label for a [`GuardedOutcome`] used in `GCMD:` tracing.
+fn outcome_label(outcome: &GuardedOutcome) -> String {
+    match outcome {
+        GuardedOutcome::Exited(out) => format!("Exited(exit={})", out.status),
+        GuardedOutcome::TimedOut { after, .. } => format!("TimedOut({}s)", after.as_secs()),
+        GuardedOutcome::Cancelled { .. } => "Cancelled".to_string(),
     }
 }
 

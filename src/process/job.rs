@@ -227,13 +227,10 @@ mod imp {
     /// away; for a build tree the opposite is what we want.)
     ///
     /// [`GuardedCommand`]: crate::process::guarded_command::GuardedCommand
-    // wired into the build path in a follow-up (see PR #74)
-    #[allow(dead_code)]
     pub struct CommandJob {
         handle: SendSyncHandle,
     }
 
-    #[allow(dead_code)]
     impl CommandJob {
         /// Create a kill-on-close job with NO breakaway. See [`CommandJob`].
         pub fn create() -> Result<Self> {
@@ -337,11 +334,8 @@ mod imp {
     /// platforms the [`GuardedCommand`](crate::process::guarded_command)
     /// runner relies on POSIX process groups instead of a JobObject, so this
     /// type does nothing but satisfy the cross-platform compile.
-    // wired into the build path in a follow-up (see PR #74)
-    #[allow(dead_code)]
     pub struct CommandJob;
 
-    #[allow(dead_code)]
     impl CommandJob {
         pub fn create() -> Result<Self> {
             Ok(Self)
@@ -353,8 +347,7 @@ mod imp {
     }
 }
 
-// CommandJob is the per-build JobObject primitive; not yet wired into the
-// build path (used by guarded_command + its tests). Re-export it so the
-// follow-up wiring (see PR #74) can consume it without a churny diff here.
-#[allow(unused_imports)]
+// `CommandJob` is the per-build JobObject primitive consumed by
+// `guarded_command::GuardedCommand` (which the build path now uses for cargo /
+// pnpm); `RunnerJob` spans the supervisor lifetime and keeps runners alive.
 pub use imp::{CommandJob, RunnerJob};

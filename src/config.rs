@@ -261,8 +261,6 @@ const DEFAULT_GIT_TIMEOUT_SECS: u64 = 30; // git rev-parse / diff are fast; a ha
 /// [`build_timeout_secs`] (cargo) because pnpm install+build has a very
 /// different runtime profile; the frontend build had NO timeout before the
 /// build-pipeline consolidation, which is exactly the hang this guards.
-// wired into the build path in a follow-up (see PR #74)
-#[allow(dead_code)]
 pub fn pnpm_timeout_secs() -> u64 {
     use std::sync::OnceLock;
     static SECS: OnceLock<u64> = OnceLock::new();
@@ -291,8 +289,6 @@ pub fn pnpm_timeout_secs() -> u64 {
 /// [5, 300], defaults to 30. Used for the best-effort `git rev-parse` calls
 /// in `build_monitor` so a wedged git (network filesystem, lock contention)
 /// can't hang a build forever.
-// wired into the build path in a follow-up (see PR #74)
-#[allow(dead_code)]
 pub fn git_timeout_secs() -> u64 {
     use std::sync::OnceLock;
     static SECS: OnceLock<u64> = OnceLock::new();
