@@ -210,10 +210,42 @@ pub async fn run_cargo_build_with_dir(
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
+    // Thin wrapper: discard the per-attempt detail (slot id / full stderr) that
+    // only the spawn-test self-heal path consumes, preserving the legacy
+    // `Result<(), _>` contract for every other caller.
+    run_cargo_build_with_dir_detailed(
+        state,
+        requester_id,
+        build_dir_override,
+        force_frontend_build,
+    )
+    .await
+    .map(|_attempt| ())
+    .map_err(|(e, _attempt)| e)
+}
+
+/// Same as [`run_cargo_build_with_dir`] but additionally returns a
+/// [`BuildAttempt`] on BOTH the success and failure paths — the slot id the
+/// build ran on, plus the FULL cargo stderr on failure. The spawn-test handler
+/// uses this to (a) feed the real compiler error into the build submission's
+/// `stderr_tail` (Issue 3 fix part 1) and (b) clean + retry exactly that slot
+/// when the failure is environmental, not a compiler diagnostic (fix part 2).
+///
+/// On the error path the `BuildAttempt` is returned alongside the
+/// `SupervisorError` so the caller has the slot id + full stderr without
+/// re-deriving them.
+pub async fn run_cargo_build_with_dir_detailed(
+    state: &SharedState,
+    requester_id: Option<String>,
+    build_dir_override: Option<PathBuf>,
+    force_frontend_build: bool,
+) -> Result<BuildAttempt, (SupervisorError, BuildAttempt)> {
     // Pre-permit disk guard (Phase 2): refuse a doomed build BEFORE consuming a
     // permit/slot when free disk is below the configured floor. The refusal
     // embeds the cached footprint + prune-endpoint hints so the caller can act.
-    check_disk_guard(state).await?;
+    if let Err(e) = check_disk_guard(state).await {
+        return Err((e, BuildAttempt::default()));
+    }
 
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -226,8 +258,15 @@ pub async fn run_cargo_build_with_dir(
         .build_pool
         .queue_depth
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let _permit = permit_result
-        .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
+    let _permit = match permit_result {
+        Ok(p) => p,
+        Err(_) => {
+            return Err((
+                SupervisorError::Other("Build pool semaphore closed".to_string()),
+                BuildAttempt::default(),
+            ));
+        }
+    };
 
     // Claim a slot and mark it busy with our BuildInfo.
     let info = BuildInfo {
@@ -317,6 +356,28 @@ pub async fn run_cargo_build_with_dir(
     )
     .await;
     let duration_secs = build_start.elapsed().as_secs_f64();
+
+    // Slot id this attempt ran on — surfaced in the BuildAttempt so the caller
+    // can clean + retry exactly this slot when the failure is environmental
+    // (Issue 3 fix part 2).
+    let attempt_slot_id = slot.id;
+
+    // On failure, read the FULL persisted cargo stderr from the slot's
+    // `last-build.stderr` sidecar (written by `run_build_inner`) so the caller
+    // can surface a generous tail through `GET /build/{id}/status` instead of
+    // the 2 KB inline `last_error` cap (Issue 3 fix part 1). Best-effort: a
+    // missing/unreadable sidecar yields `None` and the caller falls back to the
+    // error string. Read BEFORE the slot is released so a concurrent build on
+    // the same slot can't overwrite the sidecar mid-read.
+    let attempt_full_stderr: Option<String> = if result.is_err() {
+        let stderr_path = slot.target_dir.join("last-build.stderr");
+        match tokio::fs::read_to_string(&stderr_path).await {
+            Ok(s) if !s.is_empty() => Some(s),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Pull any captured cargo stderr the inner build deposited so it can be
     // recorded alongside the rolling history entry.
@@ -424,7 +485,14 @@ pub async fn run_cargo_build_with_dir(
     // Permit drops here, releasing the slot for the next waiter.
     drop(_permit);
 
-    result
+    let attempt = BuildAttempt {
+        slot_id: Some(attempt_slot_id),
+        full_stderr: attempt_full_stderr,
+    };
+    match result {
+        Ok(()) => Ok(attempt),
+        Err(e) => Err((e, attempt)),
+    }
 }
 
 /// Scan slots and return true if any has `busy.is_some()`.
@@ -1507,6 +1575,82 @@ const LAST_BUILD_STDERR_DETAIL_BYTES: usize = 4 * 1024;
 /// Cap on the inline tail appended to the user-visible build error string.
 const LAST_BUILD_STDERR_SHORT_TAIL_BYTES: usize = 2 * 1024;
 
+/// Cap on the generous stderr tail surfaced through `GET /build/{id}/status`'s
+/// `stderr_tail` on a cargo-pool build failure. Much larger than the 2 KB
+/// inline `last_error` cap so the real compiler diagnostic (which often lives
+/// far above cargo's terminal "could not compile" summary) is recoverable from
+/// the build submission without trawling `last-build.stderr` on disk. Issue 3.
+const LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES: usize = 16 * 1024;
+
+/// Classification of a failed cargo build's stderr — does it carry a genuine
+/// Rust compiler diagnostic, or is it environmental noise (a poisoned slot,
+/// stale fingerprint, linker hiccup) that a clean retry would clear?
+///
+/// Drives the spawn-test poisoned-slot self-heal (Issue 3, fix part 2): only
+/// `Environmental` failures are worth a single cleaned-slot retry. A
+/// `CompilerDiagnostic` is the user's code error — retrying is wasteful and
+/// must return immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrClass {
+    /// Contains a genuine compiler diagnostic (`error[E####]` or cargo's
+    /// `could not compile` summary). The failure is in the *code*; a retry
+    /// would just reproduce it.
+    CompilerDiagnostic,
+    /// No compiler diagnostic detected — the failure is almost certainly slot
+    /// state corruption (poisoned incremental/fingerprint state, a transient
+    /// linker/IO error). Worth one retry in a cleaned slot.
+    Environmental,
+}
+
+/// Matches a real rustc diagnostic code `error[E0432]` (the `E` followed by at
+/// least one digit, inside the brackets cargo prints). Deliberately strict:
+/// a bare `error:` line (which cargo also prints for environmental failures
+/// like "could not find `Cargo.toml`") must NOT count as a compiler
+/// diagnostic, or every environmental failure would suppress the self-heal.
+static COMPILER_ERROR_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"error\[E\d+\]").expect("static regex compiles"));
+
+/// Classify a failed cargo build's stderr. Returns [`StderrClass::CompilerDiagnostic`]
+/// iff the text contains an `error[E####]` diagnostic code OR cargo's
+/// `could not compile` terminal summary — both unambiguous signals that the
+/// build failed on the *code*. Everything else (linker errors, fingerprint
+/// corruption, "Compiling …" noise with no diagnostic) is
+/// [`StderrClass::Environmental`] and eligible for a cleaned-slot retry.
+pub fn classify_build_stderr(stderr: &str) -> StderrClass {
+    if COMPILER_ERROR_CODE.is_match(stderr) || stderr.contains("could not compile") {
+        StderrClass::CompilerDiagnostic
+    } else {
+        StderrClass::Environmental
+    }
+}
+
+/// Outcome detail of a single cargo build attempt, returned by
+/// [`run_cargo_build_with_dir_detailed`] alongside the `Result`. Carries the
+/// slot id the build actually ran on (so the caller can clean + retry exactly
+/// that slot — Issue 3 fix part 2) and, on failure, the FULL captured cargo
+/// stderr (so the caller can surface it through `GET /build/{id}/status` rather
+/// than the 2 KB inline `last_error` cap — Issue 3 fix part 1).
+#[derive(Debug, Clone, Default)]
+pub struct BuildAttempt {
+    /// The build-pool slot id this attempt claimed, when one was claimed. `None`
+    /// only when the build was refused before claiming a slot (disk guard /
+    /// semaphore closed).
+    pub slot_id: Option<usize>,
+    /// Full cargo stderr captured for this attempt, when a slot ran cargo and
+    /// the `last-build.stderr` sidecar was readable. `None` on success or when
+    /// the failure happened before/around cargo (no stderr produced).
+    pub full_stderr: Option<String>,
+}
+
+/// Generous tail of a failed build's full cargo stderr, capped at
+/// [`LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES`] (16 KB) for surfacing through
+/// `GET /build/{id}/status`'s `stderr_tail`. Much larger than the 2 KB inline
+/// `last_error` cap so the real compiler diagnostic survives even when cargo
+/// prints a lot of "Compiling …" noise after it. Issue 3 fix part 1.
+pub fn stderr_submission_tail(full_stderr: &str) -> String {
+    tail_bytes_keep_utf8(full_stderr, LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES)
+}
+
 /// Return the last `max_bytes` bytes of `s`, snapped forward to a UTF-8
 /// character boundary so the result is always valid UTF-8. Returns `s`
 /// unchanged when it's already shorter than `max_bytes`.
@@ -1519,6 +1663,32 @@ fn tail_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
         cut += 1;
     }
     s[cut..].to_string()
+}
+
+/// Clear a single build-pool slot's incremental/fingerprint state by emptying
+/// its `target_dir`, then recreating the (now empty) dir so the next build
+/// finds it present (matching how `BuildPool::new` provisions slots eagerly).
+///
+/// This is the cleaned-slot primitive the spawn-test poisoned-slot self-heal
+/// (Issue 3 fix part 2) calls before retrying an environmentally-failed build:
+/// wiping the slot's `CARGO_TARGET_DIR` discards the poisoned incremental
+/// fingerprints that made an otherwise-clean tree fail to compile. Returns the
+/// number of bytes freed (best-effort; 0 on a fresh/missing dir). A
+/// `NotFound`-on-remove is treated as already-empty (Ok); any other remove
+/// error is returned so the caller can decide whether the retry is still worth
+/// attempting.
+pub async fn clean_slot_target(slot: &Arc<BuildSlot>) -> Result<u64, std::io::Error> {
+    let bytes_before = crate::footprint::dir_size_bytes(&slot.target_dir);
+    match tokio::fs::remove_dir_all(&slot.target_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // Recreate the empty dir; a failure here is non-fatal (the next build's
+    // CARGO_TARGET_DIR handling recreates it) but worth surfacing as an error.
+    tokio::fs::create_dir_all(&slot.target_dir).await?;
+    let bytes_after = crate::footprint::dir_size_bytes(&slot.target_dir);
+    Ok(bytes_before.saturating_sub(bytes_after))
 }
 
 /// Check-only holder detection for a slot exe (Phase 3, `POST
@@ -2279,8 +2449,9 @@ mod tests {
     //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
     //! the bug these guard against.
     use super::{
-        dist_index_ok, needs_frontend_prebuild, provenance_tree_root, rev_parse_head,
-        update_lkg_after_success, verify_frontend_built, BuildProvenance, BuildSource,
+        classify_build_stderr, dist_index_ok, needs_frontend_prebuild, provenance_tree_root,
+        rev_parse_head, stderr_submission_tail, update_lkg_after_success, verify_frontend_built,
+        BuildProvenance, BuildSource, StderrClass, LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::state::{SharedState, SupervisorState};
@@ -2754,6 +2925,75 @@ mod tests {
         assert!(
             state.build_pool.last_known_good.read().await.is_none(),
             "override build must NOT populate the last_known_good lock"
+        );
+    }
+
+    // ---------- Issue 3: stderr classifier + submission tail ----------
+
+    /// A stderr carrying a real `error[E####]` diagnostic code classifies as a
+    /// compiler diagnostic — the user's code is broken, no poisoned-slot retry.
+    #[test]
+    fn classify_compiler_error_code_is_diagnostic() {
+        let stderr = "   Compiling qontinui-runner v0.1.0\n\
+             error[E0432]: unresolved import `crate::does_not_exist`\n\
+              --> src/main.rs:3:5\n\
+             error: aborting due to previous error\n";
+        assert_eq!(
+            classify_build_stderr(stderr),
+            StderrClass::CompilerDiagnostic
+        );
+    }
+
+    /// Cargo's terminal `could not compile` summary also classifies as a
+    /// compiler diagnostic even if the `error[E####]` line was truncated off
+    /// the captured tail.
+    #[test]
+    fn classify_could_not_compile_is_diagnostic() {
+        let stderr = "   Compiling qontinui-runner v0.1.0\n\
+             error: could not compile `qontinui-runner` (bin \"qontinui-runner\") due to 1 previous error\n";
+        assert_eq!(
+            classify_build_stderr(stderr),
+            StderrClass::CompilerDiagnostic
+        );
+    }
+
+    /// A failure with ONLY "Compiling …" progress noise + a linker/fingerprint
+    /// error and NO compiler diagnostic classifies as environmental — the
+    /// poisoned-slot self-heal should fire and retry in a cleaned slot. This is
+    /// the exact 2 KB-tail surface the user saw (`Compiling qontinui-runner …`).
+    #[test]
+    fn classify_environmental_noise_is_environmental() {
+        let stderr =
+            "   Compiling qontinui-runner v0.1.0 (D:\\qontinui-root\\qontinui-runner\\src-tauri)\n\
+             error: linking with `link.exe` failed: exit code: 1104\n\
+             LINK : fatal error LNK1104: cannot open file 'qontinui_runner.exe'\n";
+        assert_eq!(classify_build_stderr(stderr), StderrClass::Environmental);
+    }
+
+    /// A bare `error:` line (no `error[E####]`, no `could not compile`) — e.g. a
+    /// "could not find Cargo.toml" environmental failure — must NOT be misread
+    /// as a compiler diagnostic, or the self-heal would never fire.
+    #[test]
+    fn classify_bare_error_line_is_environmental() {
+        let stderr = "error: could not find `Cargo.toml` in `/tmp/x` or any parent directory\n";
+        assert_eq!(classify_build_stderr(stderr), StderrClass::Environmental);
+    }
+
+    /// The submission tail returns the input unchanged when it's under the cap,
+    /// and a boundary-safe tail (≤ cap bytes, preserving the END where cargo's
+    /// real error lives) when it's over.
+    #[test]
+    fn stderr_submission_tail_caps_and_keeps_tail() {
+        let small = "error[E0277]: trait bound not satisfied";
+        assert_eq!(stderr_submission_tail(small), small);
+
+        let big =
+            "x".repeat(LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES * 2) + "\nerror[E0599]: tail marker";
+        let tail = stderr_submission_tail(&big);
+        assert!(tail.len() <= LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES);
+        assert!(
+            tail.ends_with("error[E0599]: tail marker"),
+            "tail must preserve the END of the stderr where the real error lives"
         );
     }
 }

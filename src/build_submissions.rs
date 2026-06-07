@@ -330,7 +330,7 @@ pub fn submit_spawn<F>(
     exec: F,
 ) -> (Uuid, Arc<RwLock<BuildSubmission>>)
 where
-    F: std::future::Future<Output = (u16, serde_json::Value)> + Send + 'static,
+    F: std::future::Future<Output = (u16, serde_json::Value, Vec<String>)> + Send + 'static,
 {
     let id = Uuid::new_v4();
     let now = Utc::now();
@@ -374,7 +374,7 @@ where
             sub.status = BuildStatus::Running { started_at };
         }
 
-        let (http_status, mut body) = exec.await;
+        let (http_status, mut body, stderr_tail) = exec.await;
         // `build_id` = this submission's id. Inject it into the stored outcome
         // body so BOTH the sync path (which returns this stored body) and the
         // async poll (`GET /build/:id/status`) expose `build_id` = submission_id
@@ -391,6 +391,12 @@ where
         let succeeded = (200..300).contains(&http_status);
 
         let mut sub = arc.write().await;
+        // Issue 3 fix part 1: the spawn build's full cargo stderr (split into
+        // lines by the exec future) flows into the submission's `stderr_tail`
+        // so `GET /build/:id/status` returns the REAL compiler error on a
+        // cargo-pool build failure — the cargo-pool path previously never fed
+        // this field, leaving it empty (`stderr_tail: []`).
+        sub.stderr_tail = stderr_tail;
         sub.spawn = Some(SpawnOutcome {
             http_status,
             port,
@@ -1208,6 +1214,7 @@ mod tests {
                         "status": "started",
                         "build_result": { "state": "built", "succeeded": true },
                     }),
+                    Vec::new(),
                 )
             },
         );
@@ -1252,6 +1259,10 @@ mod tests {
                             "error": "error[E0277]: trait bound not satisfied",
                         },
                     }),
+                    vec![
+                        "   Compiling qontinui-runner v0.1.0".to_string(),
+                        "error[E0277]: trait bound not satisfied".to_string(),
+                    ],
                 )
             },
         );
@@ -1272,6 +1283,13 @@ mod tests {
             .as_ref()
             .expect("spawn outcome recorded even on failure");
         assert_eq!(outcome.http_status, 500);
+        // Issue 3 fix part 1: the full stderr the exec future surfaced lands in
+        // the submission's `stderr_tail` (was empty on the cargo-pool path).
+        assert!(
+            sub.stderr_tail.iter().any(|l| l.contains("E0277")),
+            "spawn failure must populate stderr_tail with the real cargo stderr; got {:?}",
+            sub.stderr_tail
+        );
     }
 
     #[tokio::test]
