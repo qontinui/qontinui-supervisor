@@ -867,6 +867,17 @@ pub fn build_router(state: SharedState) -> Router {
         )
         // Web Fleet proxy (forwards to the user-supplied qontinui-web backend)
         .route("/web-fleet", get(crate::routes::web_fleet::list_web_fleet))
+        // Commit ↔ session lineage proxy (forwards to coord /coord/lineage/*)
+        .route("/lineage/recent", get(crate::routes::lineage::recent))
+        .route("/lineage/stats", get(crate::routes::lineage::stats))
+        .route(
+            "/lineage/sessions/{id}/commits",
+            get(crate::routes::lineage::session_commits),
+        )
+        .route(
+            "/lineage/commits/{sha}/session",
+            get(crate::routes::lineage::commit_session),
+        )
         // WebSocket
         .route("/ws", get(crate::routes::ws::ws_handler))
         // Diagnostics
