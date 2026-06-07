@@ -4,6 +4,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
+use crate::dev_action::{
+    evaluate_all, spawn_attribution_watcher, ActionKind, ActionRecord, AttributionTargets,
+    SlotResolution,
+};
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -42,6 +46,62 @@ pub(crate) fn unhealthy_after_start_response(
         "recent_logs": failure.recent_logs,
     });
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// Mint a dev-action snapshot for a primary-runner action (restart / build),
+/// evaluate the active dev-state set at execution time, store the record, and
+/// spawn the detached attribution watcher.
+///
+/// State evaluation includes `LEGACY_EXE_FALLBACK` via a cheap
+/// `resolve_source_exe_with_slot` probe — the `None` slot id is the
+/// genuinely-new signal (§2 of the plan) that the legacy `target/debug` exe
+/// (no embedded assets) is what would deploy. Resolution is a read of facts
+/// already in memory, so this stays off the blocking green path (§8 criterion
+/// 6). Returns `(action_id, states_active)` for stamping into the ACK.
+async fn mint_primary_action(
+    state: &SharedState,
+    kind: ActionKind,
+    params_digest: String,
+    requester_id: Option<String>,
+    build_duration: Option<std::time::Duration>,
+) -> (uuid::Uuid, Vec<&'static str>) {
+    // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
+    // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
+    // unevaluated so the state surfaces as `Unknown`, never a false `False`.
+    let slot_resolution = match manager::resolve_source_exe_with_slot(state).await {
+        Ok((slot_id, _)) => SlotResolution::Resolved(slot_id),
+        Err(_) => SlotResolution::NotEvaluated,
+    };
+    let states = evaluate_all(state, slot_resolution).await;
+    let record = ActionRecord::new(kind, requester_id, params_digest, &states);
+    let action_id = record.action_id;
+    let states_active = record.states_active.clone();
+    let arc = state.dev_actions.write().await.insert(record);
+
+    // The watcher targets the primary's early-log + cached health. The
+    // early-log path is read at window close (it may not be set until the
+    // restart spawns the runner); capture the runner id now so the health scan
+    // can find the right cached snapshot.
+    let (early_log_path, runner_id) = match state.get_primary().await {
+        Some(primary) => (
+            primary.early_log_path.read().await.clone(),
+            Some(primary.config.id.clone()),
+        ),
+        None => (None, None),
+    };
+    spawn_attribution_watcher(
+        state.clone(),
+        arc,
+        AttributionTargets {
+            early_log_path,
+            managed: None,
+            panic_log_path: None,
+            runner_id,
+        },
+        build_duration,
+    );
+
+    (action_id, states_active)
 }
 
 #[derive(Deserialize)]
@@ -93,6 +153,26 @@ pub async fn restart_runner(
             format!("Restart requested (rebuild: {})", rebuild),
         )
         .await;
+
+    // Mint a dev-action snapshot + evaluate the active dev-state set BEFORE the
+    // restart runs (the facts are in memory at resolve time). A rebuild-restart
+    // is a `build`-kind action (its outcome lands after the ~10-20min build),
+    // an in-place restart is a `restart`-kind action. The attribution watcher
+    // (spawned inside `mint_primary_action`) folds the verdict in after the
+    // per-kind window and writes it back for `GET /actions/{id}/outcome`.
+    let action_kind = if rebuild {
+        ActionKind::Build
+    } else {
+        ActionKind::Restart
+    };
+    let (action_id, states_active) = mint_primary_action(
+        &state,
+        action_kind,
+        format!("rebuild={};force={}", rebuild, body.force),
+        None,
+        None,
+    )
+    .await;
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     //
@@ -195,6 +275,9 @@ pub async fn restart_runner(
                 "build_id": submission_id.to_string(),
                 "submission_id": submission_id.to_string(),
                 "poll": "/builds",
+                "action_id": action_id.to_string(),
+                "states_active": states_active,
+                "outcome_url": format!("/actions/{}/outcome", action_id),
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
                             for the terminal outcome",
@@ -235,7 +318,10 @@ pub async fn restart_runner(
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
-        "message": "Runner restarted successfully"
+        "message": "Runner restarted successfully",
+        "action_id": action_id.to_string(),
+        "states_active": states_active,
+        "outcome_url": format!("/actions/{}/outcome", action_id),
     }))
     .into_response())
 }
@@ -463,6 +549,21 @@ pub async fn fix_and_rebuild(
         )
         .await;
 
+    // Mint a `build`-kind dev-action snapshot at submission. The window is
+    // build-duration + 30s; the exact build duration isn't known at submission
+    // time, so the watcher uses the 30s tail (the build's own time is bounded
+    // by the build-submissions state machine — Phase 3's coord ingest will
+    // thread the precise duration). State eval captures the cause-side context
+    // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
+    let (action_id, states_active) = mint_primary_action(
+        &state,
+        ActionKind::Build,
+        "fix_and_rebuild".to_string(),
+        None,
+        None,
+    )
+    .await;
+
     // Submit the live-tree rebuild to the build-submissions state machine. The
     // exec future runs in a detached background task — a client disconnect can
     // no longer cancel it, so the post-build provenance/LKG steps always run.
@@ -504,6 +605,9 @@ pub async fn fix_and_rebuild(
             "build_id": submission_id.to_string(),
             "submission_id": submission_id.to_string(),
             "poll": format!("/build/{submission_id}/status"),
+            "action_id": action_id.to_string(),
+            "states_active": states_active,
+            "outcome_url": format!("/actions/{}/outcome", action_id),
             "message": "fix-and-rebuild submitted; the build runs detached from this \
                         connection — poll GET /build/{id}/status for the terminal outcome",
         })),

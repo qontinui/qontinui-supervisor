@@ -9,6 +9,7 @@ pub mod cache_telemetry;
 pub mod ci_runner_lifecycle;
 pub mod ci_runner_probe;
 pub mod config;
+pub mod dev_action;
 pub mod diagnostics;
 pub mod error;
 pub mod evaluation;

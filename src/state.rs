@@ -190,6 +190,14 @@ pub struct SupervisorState {
     pub ai: RwLock<AiState>,
     pub expo: RwLock<ExpoState>,
     pub diagnostics: RwLock<DiagnosticsState>,
+    /// In-memory capped store of dev-action snapshots (Phase 1 of the
+    /// dev-event cause-effect ledger,
+    /// `plans/2026-06-07-twin-dev-event-cause-effect-ledger.md`). Mirrors
+    /// `diagnostics`'s ring discipline: keyed by `action_id`, oldest-evicted.
+    /// Written by the action routes (restart/spawn/build) at mint time and by
+    /// the detached attribution watcher at window close; read by
+    /// `GET /actions/{id}/outcome`. Coord persistence is Phase 3.
+    pub dev_actions: RwLock<crate::dev_action::ActionStore>,
     pub evaluation: RwLock<EvaluationState>,
     pub velocity_tests: RwLock<VelocityTestState>,
     pub velocity_improvement: RwLock<VelocityImprovementState>,
@@ -1007,6 +1015,7 @@ impl SupervisorState {
             ai: RwLock::new(AiState::new(auto_debug)),
             expo: RwLock::new(ExpoState::new(expo_port)),
             diagnostics: RwLock::new(DiagnosticsState::new()),
+            dev_actions: RwLock::new(crate::dev_action::ActionStore::new()),
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
