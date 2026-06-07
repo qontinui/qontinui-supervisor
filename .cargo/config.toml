@@ -17,6 +17,11 @@ SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
 SCCACHE_REGION = { value = "us-east-1", force = false }
 SCCACHE_S3_USE_SSL = { value = "off", force = false }
 SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
+# Ξ_sccache: Docker/WSL hold sccache's default port 4226 on the build hosts;
+# clients that land there wedge ("version mismatch") + respawn. Pin off 4226 so
+# every cargo-spawned sccache client agrees on the port regardless of OS-env
+# inheritance (the User-env value was not inherited by all contexts).
+SCCACHE_SERVER_PORT = { value = "4230", force = false }
 
 # Repro flags for content-addressed cache compatibility (Row 10 Wave 0).
 #
