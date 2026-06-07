@@ -324,6 +324,15 @@ pub struct SupervisorState {
     /// regardless of age. Keyed by the canonical container path string so the
     /// pruner's directory enumeration and the build wiring agree on identity.
     pub active_spawn_worktrees: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// Cached build-artifact footprint snapshot (plan
+    /// `2026-06-05-supervisor-build-artifact-footprint`). Walking the GB-scale
+    /// `target-pool/slot-*` + `.spawn-*` trees is minutes-slow, so the snapshot
+    /// is computed off the hot path: a background timer refreshes it (default
+    /// 15 min) and `GET /builds?refresh_footprint=1` forces a synchronous
+    /// recompute. The prune endpoints invalidate it after freeing bytes.
+    /// `None` until the first refresh completes. Each snapshot carries its own
+    /// `computed_at` so readers can judge staleness.
+    pub footprint: RwLock<Option<crate::footprint::FootprintSnapshot>>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -1023,7 +1032,26 @@ impl SupervisorState {
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
             active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
+            footprint: RwLock::new(None),
         }
+    }
+
+    /// Recompute the build-artifact footprint snapshot and store it on
+    /// `self.footprint`. The walk is CPU/IO-bound and slow on real trees, so it
+    /// runs inside `spawn_blocking`; the only async work is taking the write
+    /// lock to publish the result. Best-effort: returns the fresh snapshot to
+    /// the caller as well (so the on-demand `?refresh_footprint=1` path can
+    /// serialize it immediately without a re-read).
+    pub async fn refresh_footprint(
+        self: &std::sync::Arc<Self>,
+    ) -> crate::footprint::FootprintSnapshot {
+        let this = self.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || crate::footprint::compute_snapshot(&this.config))
+                .await
+                .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
+        *self.footprint.write().await = Some(snapshot.clone());
+        snapshot
     }
 
     /// Drain `pending_startup_logs` into `state.logs`.

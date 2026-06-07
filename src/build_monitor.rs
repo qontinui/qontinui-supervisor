@@ -17,6 +17,90 @@ use crate::process::windows::{
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
 
+/// Pure threshold check for the pre-permit disk guard (plan
+/// `2026-06-05-supervisor-build-artifact-footprint`, Phase 2).
+///
+/// Returns `true` when a build is allowed to proceed, `false` when free disk
+/// is below the required minimum. Split out as a pure function so the policy is
+/// unit-testable without touching the filesystem or any global state.
+///
+/// - `min_free_gb == 0` ⇒ guard disabled, always allow.
+/// - `disk_free_bytes == None` ⇒ we could not read the disk; FAIL OPEN (allow)
+///   rather than wedge every build on a probe failure. The motivating incident
+///   was a disk that was demonstrably near-full; a probe that returns *nothing*
+///   is a different (rare) failure and blocking all builds on it is worse than
+///   the status quo.
+pub fn disk_guard_allows(disk_free_bytes: Option<u64>, min_free_gb: u64) -> bool {
+    if min_free_gb == 0 {
+        return true;
+    }
+    match disk_free_bytes {
+        None => true,
+        Some(free) => {
+            let required = min_free_gb.saturating_mul(1024 * 1024 * 1024);
+            free >= required
+        }
+    }
+}
+
+/// Pre-permit disk guard. Called BEFORE acquiring a build-pool permit/slot at
+/// every build-spawning site so a doomed build never consumes a slot. When
+/// free disk is below `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`, returns
+/// `Err(SupervisorError::InsufficientDisk { .. })` whose body embeds the cached
+/// footprint snapshot and names both prune endpoints. `Ok(())` when the build
+/// may proceed.
+///
+/// Uses the CACHED footprint snapshot's `disk_free_bytes` if it is fresh enough
+/// to be useful; otherwise probes the disk directly (cheap — a single sysinfo
+/// `Disks` enumeration, not a tree walk). The embedded snapshot is whatever is
+/// cached (may be `None` if no refresh has run yet — the caller still gets the
+/// numeric free/required bytes and the prune-endpoint hints).
+pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError> {
+    let min_free_gb = crate::config::min_free_disk_gb();
+    if min_free_gb == 0 {
+        return Ok(());
+    }
+
+    // Probe disk free directly (fast) for the pool root so the decision is on
+    // current reality, not a possibly-stale cached number.
+    let pool_root = state.config.runner_npm_dir().join("target-pool");
+    let probe = if pool_root.exists() {
+        pool_root
+    } else {
+        state.config.runner_npm_dir()
+    };
+    let free = crate::footprint::disk_free_bytes_for(&probe);
+
+    if disk_guard_allows(free, min_free_gb) {
+        return Ok(());
+    }
+
+    let required_bytes = min_free_gb.saturating_mul(1024 * 1024 * 1024);
+    let free_bytes = free.unwrap_or(0);
+    let footprint = state
+        .footprint
+        .read()
+        .await
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+
+    let msg = format!(
+        "Pre-permit disk guard: refusing build — {} GB free, need at least {} GB \
+         (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB). Reclaim space via \
+         DELETE /spawn-worktrees or POST /builds/slots/{{id}}/clean.",
+        free_bytes / (1024 * 1024 * 1024),
+        min_free_gb,
+    );
+    warn!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+
+    Err(SupervisorError::InsufficientDisk {
+        free_bytes,
+        required_bytes,
+        footprint: Box::new(footprint),
+    })
+}
+
 /// RAII guard that clears a `BuildSlot::busy` field on drop AND reconciles
 /// the global `state.build.build_in_progress` legacy flag.
 ///
@@ -126,6 +210,11 @@ pub async fn run_cargo_build_with_dir(
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
+    // Pre-permit disk guard (Phase 2): refuse a doomed build BEFORE consuming a
+    // permit/slot when free disk is below the configured floor. The refusal
+    // embeds the cached footprint + prune-endpoint hints so the caller can act.
+    check_disk_guard(state).await?;
+
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
     state
@@ -1432,6 +1521,28 @@ fn tail_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
     s[cut..].to_string()
 }
 
+/// Check-only holder detection for a slot exe (Phase 3, `POST
+/// /builds/slots/{id}/clean`). Returns the PIDs of live processes whose image
+/// is `exe_path`. Reuses the same `find_pids_holding_exe` machinery
+/// [`free_slot_exe`] uses, but performs NO kills — the clean endpoint only
+/// needs to know whether it's safe to delete. Empty on non-Windows (no
+/// image-path holder concept for a stalled file lock) and when the exe is
+/// absent.
+pub async fn slot_exe_holders(exe_path: &std::path::Path) -> Vec<u32> {
+    if !exe_path.exists() {
+        return Vec::new();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        find_pids_holding_exe(exe_path).await
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = exe_path;
+        Vec::new()
+    }
+}
+
 /// Wait for the runner exe in a specific slot's target dir to be writable
 /// (unlocked) before building. On Windows, the OS can hold file locks briefly
 /// after a process is killed.
@@ -1845,6 +1956,12 @@ async fn prewarm_single_slot(
     state: &crate::state::SharedState,
     slot: &Arc<BuildSlot>,
 ) -> Result<(), SupervisorError> {
+    // Pre-permit disk guard (Phase 2): the prewarm `cargo check` also writes
+    // GBs into a slot, so it is gated by the same disk floor as a real build.
+    // Guarding ONLY the real-build path would let prewarm fill a near-full
+    // disk (a vet-flagged defect) — both permit-acquisition sites are covered.
+    check_disk_guard(state).await?;
+
     // Acquire a permit so concurrent spawn-test calls see this slot as busy.
     state
         .build_pool

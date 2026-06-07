@@ -14,6 +14,7 @@ mod diagnostics;
 mod error;
 mod evaluation;
 mod expo;
+mod footprint;
 // Row 2 Phase 1 (fleet topology): detects CPU/RAM/disk and POSTs
 // `max_concurrent_builds` to coord on startup. See
 // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
@@ -507,6 +508,29 @@ async fn main() -> anyhow::Result<()> {
                         ),
                     )
                     .await;
+            }
+        });
+    }
+
+    // Background footprint refresh (plan
+    // 2026-06-05-supervisor-build-artifact-footprint, Phase 1). Walks the
+    // GB-scale `target-pool/slot-*` + `.spawn-*` trees off the hot path and
+    // publishes a cached snapshot on `state.footprint`, consumed by
+    // `GET /builds` and the pre-permit disk guard. An immediate first refresh
+    // populates the cache at boot; thereafter on a timer (default 15 min,
+    // override `QONTINUI_SUPERVISOR_FOOTPRINT_REFRESH_SECS`).
+    {
+        let state_for_footprint = state.clone();
+        tokio::spawn(async move {
+            let interval_secs = std::env::var("QONTINUI_SUPERVISOR_FOOTPRINT_REFRESH_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(900);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+                let _ = state_for_footprint.refresh_footprint().await;
             }
         });
     }
