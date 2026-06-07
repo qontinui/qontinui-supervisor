@@ -113,6 +113,19 @@ pub struct RestartRequest {
     pub rebuild: bool,
     #[serde(default)]
     pub force: bool,
+    /// Phase B escape hatch. Only meaningful with `rebuild: true`.
+    ///
+    /// - `false` (DEFAULT) — the rebuild materializes a fresh `origin/main`
+    ///   worktree and compiles THAT (provenance `origin_main`), so the primary
+    ///   always runs latest-green-main and never touches the contested working
+    ///   checkout. This is the canonical path.
+    /// - `true` — legacy behavior: compile the live working tree
+    ///   (`project_dir`, provenance `live_tree`), for the rare case the operator
+    ///   deliberately wants the primary to run uncommitted local changes. The
+    ///   canonical WIP-test path is a temp runner via spawn-test, NOT the
+    ///   primary.
+    #[serde(default)]
+    pub from_working_tree: bool,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +209,7 @@ pub async fn restart_runner(
     if rebuild {
         let exec_state = state.clone();
         let force = body.force;
+        let from_working_tree = body.from_working_tree;
         let do_health_wait = wait_q.wait;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
@@ -206,8 +220,14 @@ pub async fn restart_runner(
                 // await inline. Errors are surfaced in the (status, body)
                 // result so they land in /builds AND are logged below — never
                 // silently dropped.
-                if let Err(e) =
-                    manager::restart_runner(&exec_state, true, RestartSource::Manual, force).await
+                if let Err(e) = manager::restart_runner(
+                    &exec_state,
+                    true,
+                    RestartSource::Manual,
+                    force,
+                    from_working_tree,
+                )
+                .await
                 {
                     exec_state
                         .logs
@@ -344,7 +364,16 @@ pub async fn restart_runner(
     }
 
     // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
-    manager::restart_runner(&state, false, RestartSource::Manual, body.force).await?;
+    // `from_working_tree` only affects the build (no build here), so it's
+    // forwarded for signature consistency and has no effect when rebuild=false.
+    manager::restart_runner(
+        &state,
+        false,
+        RestartSource::Manual,
+        body.force,
+        body.from_working_tree,
+    )
+    .await?;
 
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
@@ -904,6 +933,10 @@ mod tests {
             Json(RestartRequest {
                 rebuild: true,
                 force: false,
+                // Legacy live-tree path so the closed-semaphore fast-fail is
+                // exercised deterministically without a network fetch /
+                // origin/main worktree materialization in the sandbox.
+                from_working_tree: true,
             }),
         )
         .await

@@ -239,10 +239,18 @@ pub const SLOT_PROVENANCE_SIDECAR_FILENAME: &str = "qontinui-runner.exe.provenan
 
 /// Which source tree a slot's exe was built from.
 ///
-/// Binary by design — `live_tree` (cargo's `current_dir` was the live runner
-/// working tree, `build_dir_override == None`) vs `override` (a caller-supplied
-/// `build_dir_override`, i.e. a spawn-test `git_ref` / `worktree_path` tree).
-/// The forensic detail of *which* override tree is carried by
+/// Three-way by design:
+/// - `live_tree` — cargo's `current_dir` was the live runner working tree
+///   (`build_dir_override == None`); the contested working checkout.
+/// - `origin_main` — cargo's `current_dir` was a supervisor-materialized
+///   `origin/main` worktree (the default primary rebuild path, Phase B). This
+///   is canonical merged truth: it is LKG-eligible and may start a non-temp
+///   runner, exactly like a live-tree build.
+/// - `override` — a foreign `build_dir_override` tree the supervisor does NOT
+///   vouch for (a spawn-test `git_ref` / `worktree_path` tree). It is excluded
+///   from LKG promotion and refused for non-temp starts.
+///
+/// The forensic detail of *which* tree is carried by
 /// [`BuildProvenance::built_from`]. This is deliberately NOT the response
 /// layer's three-way `source` split (`live_tree` / `worktree` / `worktree_path`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -250,9 +258,31 @@ pub const SLOT_PROVENANCE_SIDECAR_FILENAME: &str = "qontinui-runner.exe.provenan
 pub enum BuildSource {
     /// Built from the live runner working tree (`state.config.project_dir`).
     LiveTree,
+    /// Built from a supervisor-materialized `origin/main` worktree (the default
+    /// primary rebuild path). Canonical merged truth — LKG-eligible and
+    /// startable as a non-temp runner.
+    OriginMain,
     /// Built from a `build_dir_override` tree (spawn-test override path).
     #[serde(rename = "override")]
     Override,
+}
+
+impl BuildSource {
+    /// Is a build from this source eligible for LKG promotion and to start a
+    /// non-temp (primary/named) runner?
+    ///
+    /// `LiveTree` and `OriginMain` are both vouched-for trees the supervisor
+    /// produced from a known checkout; `Override` is a foreign tree the
+    /// supervisor does not vouch for (spawn-test `git_ref` / `worktree_path`)
+    /// and is excluded. This is the single predicate behind both the LKG
+    /// promotion gate ([`crate::build_monitor::update_lkg_after_success`]) and
+    /// the non-temp start gate ([`start_provenance_gate`]).
+    pub fn is_vouched(self) -> bool {
+        match self {
+            BuildSource::LiveTree | BuildSource::OriginMain => true,
+            BuildSource::Override => false,
+        }
+    }
 }
 
 /// Provenance of a slot's freshly-built runner exe — computed once in the
@@ -368,6 +398,7 @@ fn sha_short(s: &str) -> &str {
 fn source_label(src: BuildSource) -> &'static str {
     match src {
         BuildSource::LiveTree => "live_tree",
+        BuildSource::OriginMain => "origin_main",
         BuildSource::Override => "override",
     }
 }
@@ -435,14 +466,19 @@ pub fn legacy_exe_provenance_warning(exe: &std::path::Path) -> StartProvenanceWa
 /// - **non-temp + `Some(source == Override)`** → `Err` naming the slot, the
 ///   provenance (`built_from` + `sha`), and the recovery
 ///   (`POST /runner/fix-and-rebuild`, then start). Positive evidence of a
-///   foreign exe — refuse.
+///   foreign exe — refuse. `Override` is the ONLY refused source.
 /// - **non-temp + `None`** (no sidecar / unreadable — pre-upgrade slot, write
 ///   failure, legacy file) → `Ok(Some(warning))`. Warn-and-proceed: absence is
 ///   "unknown", not "wrong". Degrades to pre-Phase-3 behavior.
-/// - **non-temp + `Some(source == LiveTree)`** → `Ok(None)`, regardless of
-///   whether `sha == HEAD`. Main advancing between build and start is staleness,
-///   NOT a provenance lie; existing slot-drift / `target/debug` staleness
-///   warnings already cover it. We deliberately do NOT gate on sha.
+/// - **non-temp + `Some(source == LiveTree | OriginMain)`** → `Ok(None)`,
+///   regardless of whether `sha == HEAD`. Both are vouched-for trees the
+///   supervisor produced (`BuildSource::is_vouched`). `OriginMain` is the
+///   default primary rebuild path (Phase B) — canonical merged truth, so it
+///   MUST be allowed to start as a non-temp runner; folding it into the
+///   `Override` refusal would brick every primary start. Main advancing between
+///   build and start is staleness, NOT a provenance lie; existing slot-drift /
+///   `target/debug` staleness warnings already cover it. We deliberately do NOT
+///   gate on sha.
 ///
 /// Pure (no I/O / no state) so it is unit-testable without a live `SharedState`,
 /// mirroring [`provenance_rebuild_guard`].
@@ -470,8 +506,9 @@ pub fn start_provenance_gate(
                 prov.built_from,
             )))
         }
-        // Positive live-tree evidence — allow. sha-vs-HEAD staleness is covered
-        // by the existing drift warnings, not this gate.
+        // Positive vouched-tree evidence (LiveTree or OriginMain) — allow.
+        // sha-vs-HEAD staleness is covered by the existing drift warnings, not
+        // this gate. Only `Override` (handled above) is refused.
         Some(_) => Ok(None),
         // No positive evidence either way — warn and proceed (pre-upgrade
         // sidecar, write failure, legacy file). Never brick a start on unknown.
@@ -2178,6 +2215,45 @@ pub async fn stop_runner_by_id(
     Ok(())
 }
 
+/// Phase B: build the primary from a fresh `origin/main` worktree.
+///
+/// Materializes (or refreshes) a managed `origin/main` worktree via
+/// [`crate::spawn_worktree::prepare_worktree`] — which fetches origin itself and
+/// pins the `qontinui-schemas` sibling to `origin/main`, handling the
+/// shared-path-dep-drift hazard for the primary too — then compiles its
+/// `src-tauri` with an explicit [`BuildSourceKind::OriginMain`] carrying the
+/// worktree's resolved SHA. The result is provenance-classified `origin_main`:
+/// LKG-eligible and startable as the primary, unlike a spawn-test `Override`.
+///
+/// The chosen source + resolved sha are logged before the (long) build so the
+/// next operator restart self-documents which commit the primary will run
+/// (Phase B verification is deferred to that real restart — it can't be
+/// exercised against the live primary from a session).
+async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), SupervisorError> {
+    let prepared =
+        crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
+
+    let msg = format!(
+        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}). \
+         This is the default Phase B path — the primary runs latest-green-main, not the working \
+         checkout. Pass from_working_tree:true to compile the live tree instead.",
+        prepared.resolved_sha, prepared.src_tauri
+    );
+    info!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+
+    crate::build_monitor::run_cargo_build_with_dir(
+        state,
+        Some("primary-rebuild:origin/main".to_string()),
+        Some(prepared.src_tauri.clone()),
+        false,
+        crate::build_monitor::BuildSourceKind::OriginMain {
+            resolved_sha: prepared.resolved_sha.clone(),
+        },
+    )
+    .await
+}
+
 /// Restart a specific runner by ID.
 /// Automated sources (watchdog, workflow loop, smart rebuild) are rejected for
 /// non-temp runners — only manual API calls can restart user runners.
@@ -2187,6 +2263,7 @@ pub async fn restart_runner_by_id(
     rebuild: bool,
     source: RestartSource,
     _force: bool,
+    from_working_tree: bool,
 ) -> Result<(), SupervisorError> {
     if !is_temp_runner(runner_id) && !source.is_manual() {
         let msg = format!(
@@ -2238,10 +2315,24 @@ pub async fn restart_runner_by_id(
         }
     }
 
-    // Rebuild if requested (global — single binary)
+    // Rebuild if requested (global — single binary).
+    //
+    // Phase B: the PRIMARY rebuild defaults to building a fresh `origin/main`
+    // worktree (provenance `origin_main`) so the primary always runs
+    // latest-green-main and never compiles the contested working checkout.
+    // `from_working_tree: true` is the escape hatch back to the legacy
+    // live-tree build. Non-primary runners (named/temp) keep the legacy
+    // live-tree build unconditionally — origin/main pinning is a
+    // primary-only policy.
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
-        if let Err(e) = crate::build_monitor::run_cargo_build(state).await {
+        let build_origin_main = managed.config.kind().is_primary() && !from_working_tree;
+        let build_outcome = if build_origin_main {
+            primary_rebuild_from_origin_main(state).await
+        } else {
+            crate::build_monitor::run_cargo_build(state).await
+        };
+        if let Err(e) = build_outcome {
             state
                 .diagnostics
                 .write()
@@ -2371,18 +2462,33 @@ pub async fn stop_runner(state: &SharedState, _force: bool) -> Result<(), Superv
 
 /// Legacy restart wrapper — targets the primary runner.
 /// Only manual restarts are allowed; automated sources are rejected.
+///
+/// `from_working_tree` (Phase B): when `false` (default) a `rebuild` materializes
+/// a fresh `origin/main` worktree and compiles THAT (provenance `origin_main`)
+/// so the primary always runs latest-green-main; when `true` it compiles the
+/// live working tree (legacy `live_tree` behavior). Only consulted on the
+/// primary rebuild path inside [`restart_runner_by_id`].
 pub async fn restart_runner(
     state: &SharedState,
     rebuild: bool,
     source: RestartSource,
     force: bool,
+    from_working_tree: bool,
 ) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    restart_runner_by_id(state, &primary.config.id, rebuild, source, force).await
+    restart_runner_by_id(
+        state,
+        &primary.config.id,
+        rebuild,
+        source,
+        force,
+        from_working_tree,
+    )
+    .await
 }
 
 /// Implementation backing `POST /runners/{id}/rebuild-and-restart` (Item E
@@ -2979,6 +3085,34 @@ mod tests {
             built_at: "2026-06-05T12:00:00+00:00".to_string(),
         }
     }
+    fn origin_main_prov(sha: Option<String>) -> BuildProvenance {
+        BuildProvenance {
+            sha,
+            source: BuildSource::OriginMain,
+            built_from: "/ws/.spawn-origin-main/qontinui-runner".to_string(),
+            built_at: "2026-06-07T12:00:00+00:00".to_string(),
+        }
+    }
+
+    /// LKG-eligibility / start-eligibility predicate: `LiveTree` AND `OriginMain`
+    /// are vouched (true); `Override` is not (false). This is the single
+    /// predicate behind both the LKG promotion gate and the non-temp start gate
+    /// — Phase B widens it to include `OriginMain`.
+    #[test]
+    fn build_source_is_vouched_predicate() {
+        assert!(
+            BuildSource::LiveTree.is_vouched(),
+            "live tree must be vouched"
+        );
+        assert!(
+            BuildSource::OriginMain.is_vouched(),
+            "origin/main must be vouched (LKG-eligible + startable as primary)"
+        );
+        assert!(
+            !BuildSource::Override.is_vouched(),
+            "override must NOT be vouched"
+        );
+    }
 
     /// Temp runner: always allowed, regardless of provenance. Temp runners
     /// exist to run foreign refs.
@@ -3060,6 +3194,28 @@ mod tests {
         // Even a null sha live-tree build is allowed.
         assert_eq!(
             start_provenance_gate(false, 0, Some(&live_prov(None))).unwrap(),
+            None
+        );
+    }
+
+    /// Non-temp + origin/main provenance: ALLOWED (Phase B). An origin/main
+    /// worktree build is canonical merged truth — folding it into the Override
+    /// refusal would brick every primary start. Allowed regardless of sha,
+    /// exactly like live-tree.
+    #[test]
+    fn start_gate_non_temp_origin_main_ok() {
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&origin_main_prov(Some(sha_a())))).unwrap(),
+            None
+        );
+        // A different sha is still fine — no sha gating.
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&origin_main_prov(Some(sha_c())))).unwrap(),
+            None
+        );
+        // Even a null sha origin/main build is allowed.
+        assert_eq!(
+            start_provenance_gate(false, 0, Some(&origin_main_prov(None))).unwrap(),
             None
         );
     }

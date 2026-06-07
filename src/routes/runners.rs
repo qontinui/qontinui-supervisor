@@ -955,9 +955,20 @@ pub async fn restart_runner(
                 // The exact stop → build → start sequence the handler used to
                 // await inline. Errors are surfaced in the (status, body)
                 // result so they land in /builds — never silently dropped.
-                if let Err(e) =
-                    manager::restart_runner_by_id(&exec_state, &runner_id, true, source, force)
-                        .await
+                // `/runners/{id}/restart` targets named/temp runners; the
+                // origin/main primary policy does not apply — keep the legacy
+                // live-tree build (from_working_tree:true). `restart_runner_by_id`
+                // also no-ops the origin/main path for non-primary runners, but
+                // be explicit.
+                if let Err(e) = manager::restart_runner_by_id(
+                    &exec_state,
+                    &runner_id,
+                    true,
+                    source,
+                    force,
+                    true,
+                )
+                .await
                 {
                     exec_state
                         .logs
@@ -1003,7 +1014,7 @@ pub async fn restart_runner(
     }
 
     // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
-    manager::restart_runner_by_id(&state, &id, false, source, body.force).await?;
+    manager::restart_runner_by_id(&state, &id, false, source, body.force, true).await?;
 
     Ok(Json(json!({
         "status": "restarted",
@@ -2276,11 +2287,22 @@ async fn execute_spawn_build_inner(
         let run_detailed = |override_dir: Option<std::path::PathBuf>| {
             let requester = requester_id.clone();
             async move {
+                // spawn-test never builds origin/main: an override dir
+                // (git_ref / worktree_path) is a foreign tree → Override; no
+                // override → the live tree → LiveTree. This preserves the exact
+                // pre-Phase-B classification for this path (OriginMain is only
+                // ever produced by the primary rebuild path in routes/runner.rs).
+                let source_kind = if override_dir.is_some() {
+                    crate::build_monitor::BuildSourceKind::Override
+                } else {
+                    crate::build_monitor::BuildSourceKind::LiveTree
+                };
                 let fut = crate::build_monitor::run_cargo_build_with_dir_detailed(
                     state,
                     requester,
                     override_dir,
                     frontend_only,
+                    source_kind,
                 );
                 match queue_timeout_secs {
                     Some(secs) => {
@@ -4057,6 +4079,7 @@ pub async fn list_builds(
                 sha.clone(),
                 src.as_ref().map(|s| match s {
                     crate::process::manager::BuildSource::LiveTree => "live_tree",
+                    crate::process::manager::BuildSource::OriginMain => "origin_main",
                     crate::process::manager::BuildSource::Override => "override",
                 }),
             ),
@@ -4184,6 +4207,7 @@ pub async fn list_builds(
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
         let source_label = |s: &crate::process::manager::BuildSource| match s {
             crate::process::manager::BuildSource::LiveTree => "live_tree",
+            crate::process::manager::BuildSource::OriginMain => "origin_main",
             crate::process::manager::BuildSource::Override => "override",
         };
         json!({
