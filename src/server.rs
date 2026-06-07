@@ -889,6 +889,15 @@ pub fn build_router(state: SharedState) -> Router {
             "/diagnostics/clear",
             post(crate::routes::diagnostics::clear_diagnostics),
         )
+        // Dev-action snapshots (Phase 1 of the dev-event cause-effect ledger).
+        // `GET /actions/{id}/outcome` is the one-call restart-archeology
+        // replacement; `GET /actions` is a cheap recent list. axum 0.8
+        // path-param syntax is `{id}`.
+        .route(
+            "/actions/{id}/outcome",
+            get(crate::routes::dev_action::get_action_outcome),
+        )
+        .route("/actions", get(crate::routes::dev_action::list_actions))
         // CI runner lifecycle (Phase 4b)
         .route("/ci-runner/enable", post(crate::routes::ci_runner::enable))
         .route(

@@ -16,6 +16,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
+use crate::dev_action::{
+    evaluate_all, spawn_attribution_watcher, ActionKind, ActionRecord, AttributionTargets,
+    SlotResolution,
+};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
@@ -1665,6 +1669,48 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
     Ok(())
 }
 
+/// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
+///
+/// Evaluates the active dev-state set, stores the record, and spawns the
+/// attribution watcher targeting the spawned runner. The early-log is read
+/// lazily via the managed runner because its path is only set during the
+/// build, after mint. Returns the action id and active-state ids for stamping
+/// into the spawn ACK.
+async fn mint_spawn_action(
+    state: &SharedState,
+    params_digest: String,
+    requester_id: Option<String>,
+    managed: Arc<ManagedRunner>,
+) -> (uuid::Uuid, Vec<&'static str>) {
+    // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
+    // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
+    // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
+    let slot_resolution = match manager::resolve_source_exe_with_slot(state).await {
+        Ok((slot_id, _)) => SlotResolution::Resolved(slot_id),
+        Err(_) => SlotResolution::NotEvaluated,
+    };
+    let states = evaluate_all(state, slot_resolution).await;
+    let record = ActionRecord::new(ActionKind::Spawn, requester_id, params_digest, &states);
+    let action_id = record.action_id;
+    let states_active = record.states_active.clone();
+    let arc = state.dev_actions.write().await.insert(record);
+
+    let runner_id = managed.config.id.clone();
+    spawn_attribution_watcher(
+        state.clone(),
+        arc,
+        AttributionTargets {
+            early_log_path: None,
+            managed: Some(managed),
+            panic_log_path: None,
+            runner_id: Some(runner_id),
+        },
+        None,
+    );
+
+    (action_id, states_active)
+}
+
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
 ///
 /// Automatically picks a free port (9877-9899), creates a temporary runner,
@@ -1810,6 +1856,24 @@ pub async fn spawn_test(
         });
     }
 
+    // Mint a `spawn`-kind dev-action snapshot. State eval captures the
+    // cause-side context (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at
+    // spawn time; the attribution watcher (30s window) folds the verdict in by
+    // scanning the SPAWNED runner's early-log (read lazily via the managed
+    // runner — its path is set during the build, after this mint) + cached
+    // health. Reuses the request's `requester_id` as the snapshot requester
+    // (Q8 — no new identity system).
+    let (action_id, action_states_active) = mint_spawn_action(
+        &state,
+        format!(
+            "rebuild={};use_lkg={};git_ref={:?}",
+            body.rebuild, body.use_lkg, body.git_ref
+        ),
+        body.requester_id.clone(),
+        managed.clone(),
+    )
+    .await;
+
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
     // extracted `execute_spawn_build` future in a background task; its
@@ -1842,6 +1906,9 @@ pub async fn spawn_test(
                 "port": port,
                 "api_url": format!("http://localhost:{}", port),
                 "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+                "action_id": action_id.to_string(),
+                "states_active": action_states_active,
+                "outcome_url": format!("/actions/{}/outcome", action_id),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
                     "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
@@ -1871,7 +1938,20 @@ pub async fn spawn_test(
                 .get("frontend_stale")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let mut response = (status, Json(o.body)).into_response();
+            // Enrich the stored spawn outcome body with the dev-action snapshot
+            // fields so the synchronous ACK carries the action_id + active
+            // dev-state set + outcome readback URL (in-place edit per §6.1; no
+            // new route). The watcher was already spawned at mint time.
+            let mut body = o.body;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("action_id".to_string(), json!(action_id.to_string()));
+                obj.insert("states_active".to_string(), json!(action_states_active));
+                obj.insert(
+                    "outcome_url".to_string(),
+                    json!(format!("/actions/{}/outcome", action_id)),
+                );
+            }
+            let mut response = (status, Json(body)).into_response();
             if frontend_stale {
                 response
                     .headers_mut()
@@ -3519,6 +3599,16 @@ pub async fn spawn_named(
         (id, port, managed)
     };
 
+    // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
+    // as spawn-test). Stamped into the success response below.
+    let (action_id, action_states_active) = mint_spawn_action(
+        &state,
+        format!("named={};rebuild={}", name, body.rebuild),
+        body.requester_id.clone(),
+        managed.clone(),
+    )
+    .await;
+
     // Item A — build_result tracking (mirror of spawn_test).
     let mut build_attempted = false;
     let mut build_succeeded: Option<bool> = None;
@@ -3818,6 +3908,10 @@ pub async fn spawn_named(
         resp["binary_mtime"] = json!(meta.binary_mtime);
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
     }
+    // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
+    resp["action_id"] = json!(action_id.to_string());
+    resp["states_active"] = json!(action_states_active);
+    resp["outcome_url"] = json!(format!("/actions/{}/outcome", action_id));
 
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a
     // diagnostic `frontend_stale_reason` when set. (Named runners don't get

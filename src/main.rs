@@ -10,6 +10,7 @@ mod cache_telemetry;
 mod ci_runner_lifecycle;
 mod ci_runner_probe;
 mod config;
+mod dev_action;
 mod diagnostics;
 mod error;
 mod evaluation;
