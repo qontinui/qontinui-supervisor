@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useUIElement } from '@qontinui/ui-bridge/react';
 import { api, LineageRow, LineageStats } from '../lib/api';
 import { SessionChip } from '../components/SessionChip';
+import { LS_JWT_KEY, loadFromStorage, saveToStorage } from './Fleet';
 
 const GITHUB = 'https://github.com';
 
@@ -19,35 +20,66 @@ function formatTs(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+/** Heuristic: a leading 401/403 in a proxy error means the JWT was missing,
+ *  expired, or rejected by coord — an auth problem, not coord-unreachable. */
+function isAuthError(msg: string): boolean {
+  return /^\s*40[13]\b/.test(msg);
+}
+
 export default function Lineage() {
+  // Reuse the Fleet tab's operator-JWT key so one paste serves both pages.
+  const [jwt, setJwt] = useState<string>(() => loadFromStorage(LS_JWT_KEY));
   const [stats, setStats] = useState<LineageStats | null>(null);
   const [rows, setRows] = useState<LineageRow[]>(EMPTY_ROWS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // True when the failure is specifically a missing/rejected credential — the
+  // page then prompts for a JWT rather than showing a "coord unavailable" banner.
+  const [authError, setAuthError] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState<string | null>(null);
+  const [hasFetched, setHasFetched] = useState(false);
+
+  const hasJwt = jwt.trim() !== '';
+
+  // Persist the JWT to the shared key so a paste here also satisfies Fleet.
+  useEffect(() => {
+    saveToStorage(LS_JWT_KEY, jwt);
+  }, [jwt]);
 
   const loadData = useCallback(async () => {
+    const token = jwt.trim();
+    if (!token) {
+      // No credential — don't hit coord; the empty-state prompt handles this.
+      setError(null);
+      setAuthError(false);
+      return;
+    }
     setLoading(true);
     setError(null);
+    setAuthError(false);
     try {
       const [s, r] = await Promise.all([
-        api.lineageStats().catch(() => null),
-        api.lineageRecent(100).catch(() => EMPTY_ROWS),
+        api.lineageStats(token).catch(() => null),
+        api.lineageRecent(100, token).catch(() => EMPTY_ROWS),
       ]);
       setStats(s);
       setRows(Array.isArray(r) && r.length > 0 ? r : EMPTY_ROWS);
       setLastFetchedAt(new Date().toISOString());
-      // Surface a hard error only when BOTH calls failed (coord unreachable).
+      setHasFetched(true);
+      // Surface a hard error only when BOTH calls failed; re-probe once for a
+      // real message and classify it as auth vs coord-unreachable.
       if (s === null && (!Array.isArray(r) || r.length === 0)) {
-        // Probe once for a real error message rather than silently empty.
-        await api.lineageStats();
+        await api.lineageStats(token);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setAuthError(isAuthError(msg));
+      setHasFetched(true);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [jwt]);
 
   useEffect(() => {
     loadData();
@@ -58,6 +90,11 @@ export default function Lineage() {
     type: 'button',
     label: 'Refresh lineage data',
     actions: ['click'],
+  });
+  const { ref: jwtRef } = useUIElement({
+    id: 'lineage-jwt',
+    type: 'input',
+    label: 'Operator JWT input',
   });
 
   const totals = stats?.totals;
@@ -78,7 +115,7 @@ export default function Lineage() {
             ref={refreshBtnRef as React.RefCallback<HTMLButtonElement>}
             className="btn btn-primary"
             onClick={loadData}
-            disabled={loading}
+            disabled={loading || !hasJwt}
           >
             {loading ? 'Loading…' : 'Refresh'}
           </button>
@@ -89,7 +126,70 @@ export default function Lineage() {
         orchestrator + trailer backfill). Click a session chip to see all of its commits.
       </p>
 
-      {error && (
+      {/* Credential card — coord's lineage reads are operator-scoped. Reuses the
+          SAME JWT the Fleet tab stores, so a paste on either page serves both. */}
+      <div className="card" style={{ marginBottom: '1rem' }}>
+        <div className="card-header">
+          <span className="card-title">Operator credential</span>
+          {hasJwt && (
+            <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
+              JWT set
+            </span>
+          )}
+        </div>
+        <label className="text-muted" style={{ fontSize: '0.75rem', display: 'block' }}>
+          Operator JWT (same token as the Fleet tab)
+          <input
+            ref={jwtRef as React.RefCallback<HTMLInputElement>}
+            type="password"
+            className="log-filter"
+            style={{
+              display: 'block',
+              width: '100%',
+              marginTop: '0.2rem',
+              padding: '0.4rem',
+              fontFamily: 'var(--font-mono)',
+            }}
+            placeholder="eyJhbGciOiJIUzI1NiIs…"
+            value={jwt}
+            onChange={(e) => setJwt(e.target.value)}
+            spellCheck={false}
+            autoComplete="new-password"
+            data-form-type="other"
+            data-1p-ignore
+            data-lpignore="true"
+            name="lineage-jwt-token"
+          />
+        </label>
+        {!hasJwt && (
+          <div className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.78rem' }}>
+            Paste an operator JWT (same as the Fleet tab) to view lineage. Coord's lineage reads are
+            operator-scoped and reject anonymous requests.
+          </div>
+        )}
+      </div>
+
+      {/* Auth error — credential present but rejected (expired/invalid/wrong scope). */}
+      {error && authError && (
+        <div className="card" style={{ marginBottom: '1rem', borderColor: 'var(--danger)' }}>
+          <div className="card-header">
+            <span className="card-title text-danger">Credential rejected</span>
+          </div>
+          <div
+            className="text-mono text-danger"
+            style={{ fontSize: '0.8rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+          >
+            {error}
+          </div>
+          <div className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.78rem' }}>
+            Coord returned 401/403. The JWT is missing the operator scope, has expired, or is for a
+            different backend. Paste a fresh operator JWT above (same token the Fleet tab uses).
+          </div>
+        </div>
+      )}
+
+      {/* Coord-unreachable / transport error — distinct from the auth case. */}
+      {error && !authError && (
         <div className="card" style={{ marginBottom: '1rem', borderColor: 'var(--danger)' }}>
           <div className="card-header">
             <span className="card-title text-danger">Coord unavailable</span>
@@ -108,6 +208,14 @@ export default function Lineage() {
         </div>
       )}
 
+      {!hasJwt ? (
+        <div className="card">
+          <div className="text-muted" style={{ fontSize: '0.85rem' }}>
+            Paste an operator JWT above to load commit lineage from coord.
+          </div>
+        </div>
+      ) : (
+        <>
       {/* Stats tiles */}
       <div className="card-grid" style={{ marginBottom: '1rem' }}>
         <div className="card">
@@ -165,7 +273,11 @@ export default function Lineage() {
                 {stats.top_sessions.map((s) => (
                   <tr key={s.agent_session_id}>
                     <td>
-                      <SessionChip sessionId={s.agent_session_id} sessionName={s.session_name} />
+                      <SessionChip
+                        sessionId={s.agent_session_id}
+                        sessionName={s.session_name}
+                        jwt={jwt}
+                      />
                     </td>
                     <td>{s.commits}</td>
                     <td>{formatTs(s.last_commit_at)}</td>
@@ -219,7 +331,11 @@ export default function Lineage() {
                     <td className="text-mono">{r.branch ?? '—'}</td>
                     <td>{r.pr_number != null ? `#${r.pr_number}` : '—'}</td>
                     <td>
-                      <SessionChip sessionId={r.agent_session_id} sessionName={r.session_name} />
+                      <SessionChip
+                        sessionId={r.agent_session_id}
+                        sessionName={r.session_name}
+                        jwt={jwt}
+                      />
                     </td>
                     <td>
                       <span
@@ -237,10 +353,18 @@ export default function Lineage() {
           </div>
         ) : (
           <div className="text-muted" style={{ marginTop: '0.5rem' }}>
-            {loading ? 'Loading…' : 'No lineage rows. Coord may have no recorded commits yet.'}
+            {loading
+              ? 'Loading…'
+              : error
+                ? 'Could not load lineage — see the banner above.'
+                : hasFetched
+                  ? 'No lineage rows. Coord is reachable but has no recorded commits yet.'
+                  : 'Press Refresh to load lineage.'}
           </div>
         )}
       </div>
+        </>
+      )}
     </div>
   );
 }
