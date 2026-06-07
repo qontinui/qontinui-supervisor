@@ -4148,6 +4148,39 @@ pub async fn list_builds(
                 "source": info.source,
             })
         });
+    // Phase A: origin/main drift for the LKG sha — turns the silent stale-build
+    // (the 2026-06-07 incident) into a surfaced signal. Computed only when the
+    // LKG records a sha; `null` when up-to-date, unknown, or not computable
+    // (no remote / not a repo). The git repo root is `project_dir.parent()`
+    // (project_dir is `qontinui-runner/src-tauri`). Best-effort: a probe
+    // failure reads as not-computable and yields `null`.
+    let lkg_sha: Option<String> = state
+        .build_pool
+        .last_known_good
+        .read()
+        .await
+        .as_ref()
+        .and_then(|info| info.sha.clone());
+    let origin_main_drift = match (&lkg_sha, state.config.project_dir.parent()) {
+        (Some(sha), Some(repo_root)) => {
+            let drift = crate::git_provenance::origin_main_drift(repo_root, sha).await;
+            // Null when up-to-date or not computable; surface only real drift,
+            // matching the null-when-fine convention of the `*_warning` siblings.
+            if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
+                None
+            } else {
+                Some(json!({
+                    "built_sha": drift.built_sha,
+                    "origin_main_sha": drift.origin_main_sha,
+                    "behind_count": drift.behind_count,
+                    "is_ancestor": drift.is_ancestor,
+                    "diverged": drift.is_diverged(),
+                    "fetched": drift.fetched,
+                }))
+            }
+        }
+        _ => None,
+    };
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
         let source_label = |s: &crate::process::manager::BuildSource| match s {
             crate::process::manager::BuildSource::LiveTree => "live_tree",
@@ -4202,6 +4235,11 @@ pub async fn list_builds(
         // Invariant: `pool_size == available_permits + active_builds.len()`.
         "active_builds": active_builds,
         "lkg": lkg_json,
+        // Phase A: drift of the LKG sha vs origin/main. `null` when up-to-date,
+        // unknown, or not computable; otherwise carries behind_count + a
+        // `diverged` flag (is_ancestor == false). The loud counterpart to the
+        // silent stale-build incident (2026-06-07).
+        "origin_main_drift": origin_main_drift,
         "slot_freshness_warning": slot_freshness_warning,
         "legacy_target_debug_warning": legacy_target_debug_warning,
         // Build-artifact footprint snapshot (plan
