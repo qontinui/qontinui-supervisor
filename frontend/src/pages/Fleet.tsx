@@ -7,9 +7,11 @@ import { api, WebFleetRunner } from '../lib/api';
 // it just proxies each request with the Authorization header the dashboard
 // attaches.
 const LS_BACKEND_URL_KEY = 'qontinui.supervisor.web.backend_url';
-const LS_JWT_KEY = 'qontinui.supervisor.web.jwt';
+// Exported so the Lineage page reuses the SAME operator-JWT key — paste once
+// on either page and both authorize. Do NOT introduce a second JWT key.
+export const LS_JWT_KEY = 'qontinui.supervisor.web.jwt';
 
-function loadFromStorage(key: string): string {
+export function loadFromStorage(key: string): string {
   try {
     return localStorage.getItem(key) ?? '';
   } catch {
@@ -17,7 +19,7 @@ function loadFromStorage(key: string): string {
   }
 }
 
-function saveToStorage(key: string, value: string) {
+export function saveToStorage(key: string, value: string) {
   try {
     if (value) {
       localStorage.setItem(key, value);

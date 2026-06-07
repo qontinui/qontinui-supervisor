@@ -30,6 +30,8 @@ function formatTs(iso: string | null): string {
 interface SessionDrawerProps {
   sessionId: string;
   sessionName: string | null;
+  /** Operator JWT forwarded to coord — the lineage reads are operator-scoped. */
+  jwt?: string;
   onClose: () => void;
 }
 
@@ -37,7 +39,7 @@ interface SessionDrawerProps {
  * Slide-in drawer listing every commit a session produced. Fetches
  * `/lineage/sessions/{id}/commits` lazily on open.
  */
-function SessionDrawer({ sessionId, sessionName, onClose }: SessionDrawerProps) {
+function SessionDrawer({ sessionId, sessionName, jwt, onClose }: SessionDrawerProps) {
   const [rows, setRows] = useState<LineageRow[]>(EMPTY_ROWS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +48,7 @@ function SessionDrawer({ sessionId, sessionName, onClose }: SessionDrawerProps) 
     setLoading(true);
     setError(null);
     try {
-      const result = await api.lineageSessionCommits(sessionId);
+      const result = await api.lineageSessionCommits(sessionId, jwt);
       setRows(Array.isArray(result) && result.length > 0 ? result : EMPTY_ROWS);
     } catch (e) {
       setRows(EMPTY_ROWS);
@@ -54,7 +56,7 @@ function SessionDrawer({ sessionId, sessionName, onClose }: SessionDrawerProps) 
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, jwt]);
 
   useEffect(() => {
     load();
@@ -173,6 +175,8 @@ export interface SessionChipProps {
   sessionId: string | null | undefined;
   /** Human session name; falls back to first 8 of the uuid. */
   sessionName?: string | null;
+  /** Operator JWT forwarded to coord for the drawer's commit fetch. */
+  jwt?: string;
 }
 
 /**
@@ -180,7 +184,7 @@ export interface SessionChipProps {
  * drawer listing that session's commits. Exported so future pages can reuse it.
  * Renders an inert "unattributed" pill when no session id is present.
  */
-export function SessionChip({ sessionId, sessionName }: SessionChipProps) {
+export function SessionChip({ sessionId, sessionName, jwt }: SessionChipProps) {
   const [open, setOpen] = useState(false);
 
   if (!sessionId || !sessionId.trim()) {
@@ -218,6 +222,7 @@ export function SessionChip({ sessionId, sessionName }: SessionChipProps) {
         <SessionDrawer
           sessionId={sessionId}
           sessionName={sessionName ?? null}
+          jwt={jwt}
           onClose={() => setOpen(false)}
         />
       )}

@@ -1,5 +1,16 @@
 const BASE = '';
 
+/**
+ * Build an `Authorization: Bearer <jwt>` headers object for an authenticated
+ * proxy request, or `undefined` when no JWT is supplied. The supervisor holds
+ * no coord/web credential; callers attach the operator JWT per-request (the
+ * lineage + web-fleet proxies forward it verbatim to coord/qontinui-web).
+ */
+function bearer(jwt: string | undefined): RequestInit | undefined {
+  const t = jwt?.trim();
+  return t ? { headers: { Authorization: `Bearer ${t}` } } : undefined;
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
   if (!res.ok) {
@@ -950,13 +961,17 @@ export const api = {
     }
   },
 
-  // Commit ↔ session lineage (proxied to coord)
-  lineageRecent: (limit = 100) => fetchJson<LineageRow[]>(`/lineage/recent?limit=${limit}`),
-  lineageStats: () => fetchJson<LineageStats>('/lineage/stats'),
-  lineageSessionCommits: (id: string) =>
-    fetchJson<LineageRow[]>(`/lineage/sessions/${encodeURIComponent(id)}/commits`),
-  lineageCommitSession: (sha: string) =>
-    fetchJson<CommitSession>(`/lineage/commits/${encodeURIComponent(sha)}/session`),
+  // Commit ↔ session lineage (proxied to coord). Coord's lineage reads are
+  // FleetPrincipal-scoped (operator branch), so each call attaches the operator
+  // JWT as `Authorization: Bearer <jwt>` — the same credential the Fleet tab
+  // uses (shared localStorage key). The supervisor proxy forwards it verbatim.
+  lineageRecent: (limit = 100, jwt?: string) =>
+    fetchJson<LineageRow[]>(`/lineage/recent?limit=${limit}`, bearer(jwt)),
+  lineageStats: (jwt?: string) => fetchJson<LineageStats>('/lineage/stats', bearer(jwt)),
+  lineageSessionCommits: (id: string, jwt?: string) =>
+    fetchJson<LineageRow[]>(`/lineage/sessions/${encodeURIComponent(id)}/commits`, bearer(jwt)),
+  lineageCommitSession: (sha: string, jwt?: string) =>
+    fetchJson<CommitSession>(`/lineage/commits/${encodeURIComponent(sha)}/session`, bearer(jwt)),
 
   // Expo
   expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
