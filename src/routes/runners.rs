@@ -17,8 +17,8 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    evaluate_all, spawn_attribution_watcher, ActionKind, ActionRecord, AttributionTargets,
-    SlotResolution,
+    evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind, ActionRecord,
+    AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1685,14 +1685,19 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
 /// Evaluates the active dev-state set, stores the record, and spawns the
 /// attribution watcher targeting the spawned runner. The early-log is read
 /// lazily via the managed runner because its path is only set during the
-/// build, after mint. Returns the action id and active-state ids for stamping
-/// into the spawn ACK.
+/// build, after mint.
+///
+/// Returns `(action_id, states_active, predicted)` for stamping into the spawn
+/// ACK. Phase 4: `predicted` is coord's state-conditioned expectations for this
+/// `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
+/// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
+/// is unreachable / has no history (fail-open; never blocks the spawn).
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
     requester_id: Option<String>,
     managed: Arc<ManagedRunner>,
-) -> (uuid::Uuid, Vec<&'static str>) {
+) -> (uuid::Uuid, Vec<&'static str>, Vec<PredictedSignature>) {
     // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
     // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
     // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
@@ -1707,6 +1712,12 @@ async fn mint_spawn_action(
     // `DevState`; the ACK wire form is the canonical-id array, unchanged).
     let states_active: Vec<&'static str> =
         record.states_active.iter().map(|s| s.as_str()).collect();
+
+    // Phase 4: fetch coord's state-conditioned expectations for this
+    // (spawn, states) so the ACK warns the agent before the spawn completes.
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
+    let predicted = fetch_expectations(ActionKind::Spawn.as_str(), &states_active, 5).await;
+
     let arc = state.dev_actions.write().await.insert(record);
 
     let runner_id = managed.config.id.clone();
@@ -1722,7 +1733,7 @@ async fn mint_spawn_action(
         None,
     );
 
-    (action_id, states_active)
+    (action_id, states_active, predicted)
 }
 
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
@@ -1877,7 +1888,7 @@ pub async fn spawn_test(
     // runner — its path is set during the build, after this mint) + cached
     // health. Reuses the request's `requester_id` as the snapshot requester
     // (Q8 — no new identity system).
-    let (action_id, action_states_active) = mint_spawn_action(
+    let (action_id, action_states_active, action_predicted) = mint_spawn_action(
         &state,
         format!(
             "rebuild={};use_lkg={};git_ref={:?}",
@@ -1922,6 +1933,7 @@ pub async fn spawn_test(
                 "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
                 "action_id": action_id.to_string(),
                 "states_active": action_states_active,
+                "predicted": action_predicted,
                 "outcome_url": format!("/actions/{}/outcome", action_id),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
@@ -1960,6 +1972,7 @@ pub async fn spawn_test(
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("action_id".to_string(), json!(action_id.to_string()));
                 obj.insert("states_active".to_string(), json!(action_states_active));
+                obj.insert("predicted".to_string(), json!(action_predicted));
                 obj.insert(
                     "outcome_url".to_string(),
                     json!(format!("/actions/{}/outcome", action_id)),
@@ -3626,7 +3639,7 @@ pub async fn spawn_named(
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
     // as spawn-test). Stamped into the success response below.
-    let (action_id, action_states_active) = mint_spawn_action(
+    let (action_id, action_states_active, action_predicted) = mint_spawn_action(
         &state,
         format!("named={};rebuild={}", name, body.rebuild),
         body.requester_id.clone(),
@@ -3936,6 +3949,7 @@ pub async fn spawn_named(
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
     resp["action_id"] = json!(action_id.to_string());
     resp["states_active"] = json!(action_states_active);
+    resp["predicted"] = json!(action_predicted);
     resp["outcome_url"] = json!(format!("/actions/{}/outcome", action_id));
 
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a

@@ -5,8 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    evaluate_all, spawn_attribution_watcher, ActionKind, ActionRecord, AttributionTargets,
-    SlotResolution,
+    evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind, ActionRecord,
+    AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -57,14 +57,20 @@ pub(crate) fn unhealthy_after_start_response(
 /// genuinely-new signal (§2 of the plan) that the legacy `target/debug` exe
 /// (no embedded assets) is what would deploy. Resolution is a read of facts
 /// already in memory, so this stays off the blocking green path (§8 criterion
-/// 6). Returns `(action_id, states_active)` for stamping into the ACK.
+/// 6).
+///
+/// Returns `(action_id, states_active, predicted)` for stamping into the ACK.
+/// Phase 4: `predicted` is coord's state-conditioned expectations for this
+/// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
+/// initiating agent is warned BEFORE the action completes. An empty vec when
+/// coord is unreachable / has no history (fail-open; never blocks the action).
 async fn mint_primary_action(
     state: &SharedState,
     kind: ActionKind,
     params_digest: String,
     requester_id: Option<String>,
     build_duration: Option<std::time::Duration>,
-) -> (uuid::Uuid, Vec<&'static str>) {
+) -> (uuid::Uuid, Vec<&'static str>, Vec<PredictedSignature>) {
     // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
     // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
     // unevaluated so the state surfaces as `Unknown`, never a false `False`.
@@ -79,6 +85,12 @@ async fn mint_primary_action(
     // `DevState`; the ACK wire form is the canonical-id array, unchanged).
     let states_active: Vec<&'static str> =
         record.states_active.iter().map(|s| s.as_str()).collect();
+
+    // Phase 4: fetch coord's state-conditioned expectations for this
+    // (kind, states) so the ACK warns the agent before the action completes.
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
+    let predicted = fetch_expectations(kind.as_str(), &states_active, 5).await;
+
     let arc = state.dev_actions.write().await.insert(record);
 
     // The watcher targets the primary's early-log + cached health. The
@@ -104,7 +116,7 @@ async fn mint_primary_action(
         build_duration,
     );
 
-    (action_id, states_active)
+    (action_id, states_active, predicted)
 }
 
 #[derive(Deserialize)]
@@ -181,7 +193,7 @@ pub async fn restart_runner(
     } else {
         ActionKind::Restart
     };
-    let (action_id, states_active) = mint_primary_action(
+    let (action_id, states_active, predicted) = mint_primary_action(
         &state,
         action_kind,
         format!("rebuild={};force={}", rebuild, body.force),
@@ -354,6 +366,7 @@ pub async fn restart_runner(
                 "poll": "/builds",
                 "action_id": action_id.to_string(),
                 "states_active": states_active,
+                "predicted": predicted,
                 "outcome_url": format!("/actions/{}/outcome", action_id),
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
@@ -407,6 +420,7 @@ pub async fn restart_runner(
         "message": "Runner restarted successfully",
         "action_id": action_id.to_string(),
         "states_active": states_active,
+        "predicted": predicted,
         "outcome_url": format!("/actions/{}/outcome", action_id),
     }))
     .into_response())
@@ -641,7 +655,7 @@ pub async fn fix_and_rebuild(
     // by the build-submissions state machine — Phase 3's coord ingest will
     // thread the precise duration). State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
-    let (action_id, states_active) = mint_primary_action(
+    let (action_id, states_active, predicted) = mint_primary_action(
         &state,
         ActionKind::Build,
         "fix_and_rebuild".to_string(),
@@ -693,6 +707,7 @@ pub async fn fix_and_rebuild(
             "poll": format!("/build/{submission_id}/status"),
             "action_id": action_id.to_string(),
             "states_active": states_active,
+            "predicted": predicted,
             "outcome_url": format!("/actions/{}/outcome", action_id),
             "message": "fix-and-rebuild submitted; the build runs detached from this \
                         connection — poll GET /build/{id}/status for the terminal outcome",

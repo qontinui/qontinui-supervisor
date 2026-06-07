@@ -18,11 +18,13 @@
 //! handled in [`crate::routes::dev_action`].
 
 pub mod attribution;
+pub mod expectations;
 pub mod ingest;
 pub mod record;
 pub mod states;
 
 pub use attribution::{spawn_attribution_watcher, AttributionTargets};
+pub use expectations::{fetch_expectations, PredictedSignature};
 pub use ingest::post_snapshot_to_coord;
 pub use record::{ActionKind, ActionRecord, ActionStore};
 pub use states::{evaluate_all, SlotResolution};
