@@ -75,7 +75,10 @@ async fn mint_primary_action(
     let states = evaluate_all(state, slot_resolution).await;
     let record = ActionRecord::new(kind, requester_id, params_digest, &states);
     let action_id = record.action_id;
-    let states_active = record.states_active.clone();
+    // Stamp the ACK with the canonical string ids (Phase-2b stores typed
+    // `DevState`; the ACK wire form is the canonical-id array, unchanged).
+    let states_active: Vec<&'static str> =
+        record.states_active.iter().map(|s| s.as_str()).collect();
     let arc = state.dev_actions.write().await.insert(record);
 
     // The watcher targets the primary's early-log + cached health. The

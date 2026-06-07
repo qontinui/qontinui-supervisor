@@ -29,8 +29,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
+use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
+
+// Phase-2b: the cause-side (`DevState`/`Eval`/`DevStateEval`) and effect-side
+// (`D3Category`) vocabularies now live in the shared `qontinui-types` registries
+// (`qontinui_types::dev_states` / `::dev_signatures`). Phase 1 hardcoded local
+// copies of these; this re-export keeps the in-crate import paths
+// (`crate::dev_action::record::{D3Category, Eval, DevState, DevStateEval}`) and
+// the wire format byte-identical while sourcing the types from the registry.
+pub use qontinui_types::dev_signatures::D3Category;
+pub use qontinui_types::dev_states::{DevState, DevStateEval, Eval};
 
 /// Cap on the in-memory action-record ring. Sized to match
 /// [`crate::diagnostics::DiagnosticsState`]'s 200-entry buffer — a few hundred
@@ -65,51 +75,6 @@ impl ActionKind {
             ActionKind::Build => "build",
         }
     }
-}
-
-/// The D3 outcome category for an action — the five `outcome_category` values
-/// the coord calibration flywheel already keys on
-/// (`OutcomeCounts{confirmed,surprise,failure,contradiction,partial}`). The
-/// `snake_case` serde rename guarantees this serializes to exactly those five
-/// strings, which is what makes the Phase-4 calibration key compatible without
-/// a translation layer (guarded by a serde round-trip test below).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum D3Category {
-    /// The action did exactly what the ACK claimed (clean window).
-    Confirmed,
-    /// An unexpected-but-not-failing signal appeared (reserved; Phase 1
-    /// classifies into the other four).
-    Surprise,
-    /// The action's own machinery failed (panic on startup, port bind fail).
-    Failure,
-    /// The ACK claimed success but observation refutes it — the motivating
-    /// 2026-06-07 case (a "restarted successfully" ACK over an asset-missing
-    /// white screen).
-    Contradiction,
-    /// A partial / mixed outcome (reserved for Phase 1).
-    Partial,
-}
-
-/// The truth value of a single dev-state predicate evaluation. A state that
-/// *could not* be evaluated is [`Eval::Unknown`] — never silently absent (D4
-/// blind-spot honesty, §5.1 / success criterion 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Eval {
-    True,
-    False,
-    Unknown,
-}
-
-/// One dev-state predicate evaluation: the state's stable id + its truth value
-/// at action time. State ids are `&'static str` because the Phase-1 seed set is
-/// hardcoded in [`crate::dev_action::states`] (the shared `qontinui-types`
-/// registry is Phase 2).
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct DevStateEval {
-    pub id: &'static str,
-    pub value: Eval,
 }
 
 /// The recorded outcome of an action, folded in by the attribution watcher
@@ -150,11 +115,18 @@ pub struct ActionRecord {
     /// the snapshot stays small; the durable ledger (Phase 3) carries the full
     /// param set.
     pub params_digest: String,
-    /// Ids of the dev-states evaluated `True` at action time.
-    pub states_active: Vec<&'static str>,
-    /// Ids of the dev-states that could not be evaluated (`Unknown`). Recorded
-    /// explicitly so a blind spot is never mistaken for a `False`.
-    pub states_unknown: Vec<&'static str>,
+    /// The dev-states evaluated `True` at action time. Stored as the typed
+    /// shared [`DevState`] enum (Phase 2b) but serialized by canonical id via
+    /// [`serialize_states_as_ids`] so the wire form stays an array of canonical
+    /// string ids (`["LKG_STALE", ...]`) — byte-identical to the Phase-1 form
+    /// the live API emits.
+    #[serde(serialize_with = "serialize_states_as_ids")]
+    pub states_active: Vec<DevState>,
+    /// The dev-states that could not be evaluated (`Unknown`) at action time.
+    /// Recorded explicitly so a blind spot is never mistaken for a `False`.
+    /// Same canonical-id wire form as [`Self::states_active`].
+    #[serde(serialize_with = "serialize_states_as_ids")]
+    pub states_unknown: Vec<DevState>,
     pub started_at: DateTime<Utc>,
     /// The folded outcome, or `None` while the attribution window is still
     /// open. Serializes inline as `outcome: null | {..}` via the custom
@@ -183,6 +155,24 @@ where
     }
 }
 
+/// Serialize a `Vec<DevState>` as an array of canonical string ids
+/// (`DevState::as_str`, e.g. `"LKG_STALE"`) rather than via the enum's derived
+/// serde (which would emit the variant name `"LkgStale"`). The Action Snapshot
+/// records states "by id only" (the paper's `S_Ξ^h`), and the live API's wire
+/// form is the canonical-id array — this serializer pins that form so the
+/// Phase-2b type swap (`Vec<&'static str>` → `Vec<DevState>`) does not move a
+/// byte on the wire. Guarded by `states_serialize_to_canonical_id_arrays`.
+fn serialize_states_as_ids<S>(states: &[DevState], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(states.len()))?;
+    for state in states {
+        seq.serialize_element(state.as_str())?;
+    }
+    seq.end()
+}
+
 impl ActionRecord {
     /// Mint a fresh record at action time. `states` is the full evaluated set;
     /// it is split into the active (`True`) and unknown id lists here so the
@@ -199,12 +189,12 @@ impl ActionRecord {
         let states_active = states
             .iter()
             .filter(|s| s.value == Eval::True)
-            .map(|s| s.id)
+            .map(|s| s.state)
             .collect();
         let states_unknown = states
             .iter()
             .filter(|s| s.value == Eval::Unknown)
-            .map(|s| s.id)
+            .map(|s| s.state)
             .collect();
         Self {
             action_id: Uuid::new_v4(),
@@ -327,25 +317,53 @@ mod tests {
     #[test]
     fn record_new_splits_active_and_unknown_drops_false() {
         let states = [
-            DevStateEval {
-                id: "SLOTS_EMPTY",
-                value: Eval::True,
-            },
-            DevStateEval {
-                id: "LKG_STALE",
-                value: Eval::False,
-            },
-            DevStateEval {
-                id: "DIST_STALE",
-                value: Eval::Unknown,
-            },
+            DevStateEval::new(DevState::SlotsEmpty, Eval::True),
+            DevStateEval::new(DevState::LkgStale, Eval::False),
+            DevStateEval::new(DevState::DistStale, Eval::Unknown),
         ];
         let rec = ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &states);
-        assert_eq!(rec.states_active, vec!["SLOTS_EMPTY"]);
-        assert_eq!(rec.states_unknown, vec!["DIST_STALE"]);
+        assert_eq!(rec.states_active, vec![DevState::SlotsEmpty]);
+        assert_eq!(rec.states_unknown, vec![DevState::DistStale]);
         // The `False` state carries no signal and is dropped from the snapshot.
-        assert!(!rec.states_active.contains(&"LKG_STALE"));
-        assert!(!rec.states_unknown.contains(&"LKG_STALE"));
+        assert!(!rec.states_active.contains(&DevState::LkgStale));
+        assert!(!rec.states_unknown.contains(&DevState::LkgStale));
+    }
+
+    /// REQUIRED Phase-2b wire-format guard. The Phase-2b type swap stores
+    /// `Vec<DevState>` instead of `Vec<&'static str>`, but the serialized form
+    /// MUST stay byte-identical to the live API: `states_active` /
+    /// `states_unknown` serialize as arrays of the canonical string ids (NOT the
+    /// enum variant names `"LkgStale"`), and `outcome.category` as the
+    /// snake_case string. This pins the exact strings the live API emits today
+    /// (verified `["LKG_STALE","DIST_STALE"]`).
+    #[test]
+    fn states_serialize_to_canonical_id_arrays() {
+        // LKG_STALE active, DIST_STALE unknown — the exact pair the live API
+        // emitted on 2026-06-07.
+        let states = [
+            DevStateEval::new(DevState::LkgStale, Eval::True),
+            DevStateEval::new(DevState::DistStale, Eval::Unknown),
+        ];
+        let rec = ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &states);
+        let json = serde_json::to_value(&rec).expect("serialize");
+
+        // states_active is the canonical-id array, NOT variant names.
+        assert_eq!(json["states_active"], serde_json::json!(["LKG_STALE"]));
+        assert_eq!(json["states_unknown"], serde_json::json!(["DIST_STALE"]));
+
+        // Fold a Contradiction outcome and confirm the snake_case category +
+        // canonical signature strings are preserved on the wire.
+        *rec.outcome.write().unwrap() = Some(ActionOutcome {
+            category: D3Category::Contradiction,
+            signatures: vec!["DEV-TAURI-ASSET-MISSING".into()],
+            ended_at: Utc::now(),
+            duration_ms: 30_000,
+            evidence_ref: None,
+            late_signatures: vec![],
+        });
+        let json = serde_json::to_value(&rec).expect("serialize folded");
+        assert_eq!(json["outcome"]["category"], "contradiction");
+        assert_eq!(json["outcome"]["signatures"][0], "DEV-TAURI-ASSET-MISSING");
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Seed dev-state predicate evaluators (supervisor-scoped).
 //!
 //! Dev-states are *predicates over live observations* — evaluated, never
-//! inferred (the paper's `s ∩ E_Ξ ≠ ∅`, §5.1 of the plan). Phase 1 hardcodes
-//! the supervisor-scoped seed set here; the shared `qontinui-types` registry is
-//! Phase 2. Each evaluator returns [`Eval::True`] / [`Eval::False`] /
+//! inferred (the paper's `s ∩ E_Ξ ≠ ∅`, §5.1 of the plan). Phase 2b sources the
+//! state vocabulary from the shared [`qontinui_types::dev_states`] registry
+//! (`DevState` / `Eval` / `DevStateEval`); the supervisor-scoped subset is
+//! evaluated here. Each evaluator returns [`Eval::True`] / [`Eval::False`] /
 //! [`Eval::Unknown`] — a state that *could not* be evaluated (a missing path, a
 //! probe that didn't run) is `Unknown`, never silently absent (D4 blind-spot
 //! honesty, success criterion 7).
@@ -23,31 +24,14 @@
 //! Each predicate that touches the filesystem has a pure inner function taking
 //! explicit paths/mtimes so it is unit-testable against a `tempfile` tree with
 //! no env mutation and no `SharedState`. [`evaluate_all`] gathers the live facts
-//! off `SharedState` and calls those cores. The state ids are `&'static str`.
+//! off `SharedState` and calls those cores. The seeded states are the shared
+//! [`DevState`] supervisor-scoped variants.
 
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::dev_action::record::{DevStateEval, Eval};
+use crate::dev_action::record::{DevState, DevStateEval, Eval};
 use crate::state::SharedState;
-
-/// No slot exe present in the build pool (`target-pool/slot-*/debug/`) — a
-/// fresh checkout or a wiped pool where resolution must fall back to LKG or the
-/// legacy exe.
-pub const SLOTS_EMPTY: &str = "SLOTS_EMPTY";
-/// Resolution fell back to the legacy `target/debug` exe (no build-pool slot).
-/// Evaluated from `resolve_source_exe_with_slot` returning a `None` slot id.
-pub const LEGACY_EXE_FALLBACK: &str = "LEGACY_EXE_FALLBACK";
-/// The LKG exe was built before the newest source mtime — pinning to it would
-/// run stale code.
-pub const LKG_STALE: &str = "LKG_STALE";
-/// `dist/index.html` exists but is older than the newest frontend source — the
-/// embedded UI does not reflect current source.
-pub const DIST_STALE: &str = "DIST_STALE";
-/// `dist/index.html` is absent or empty.
-pub const DIST_MISSING: &str = "DIST_MISSING";
-/// The primary runner is not responding to its `/health` probe.
-pub const PRIMARY_DOWN: &str = "PRIMARY_DOWN";
 
 /// Convert a bool to an [`Eval`] (`True`/`False`). For predicates where a
 /// missing input must surface as `Unknown`, the evaluator returns the variant
@@ -216,30 +200,12 @@ pub async fn evaluate_all(state: &SharedState, slot_id: SlotResolution) -> Vec<D
     };
 
     vec![
-        DevStateEval {
-            id: SLOTS_EMPTY,
-            value: slots_empty,
-        },
-        DevStateEval {
-            id: LEGACY_EXE_FALLBACK,
-            value: legacy_fallback,
-        },
-        DevStateEval {
-            id: LKG_STALE,
-            value: lkg_stale,
-        },
-        DevStateEval {
-            id: DIST_STALE,
-            value: dist_stale,
-        },
-        DevStateEval {
-            id: DIST_MISSING,
-            value: dist_missing,
-        },
-        DevStateEval {
-            id: PRIMARY_DOWN,
-            value: primary_down,
-        },
+        DevStateEval::new(DevState::SlotsEmpty, slots_empty),
+        DevStateEval::new(DevState::LegacyExeFallback, legacy_fallback),
+        DevStateEval::new(DevState::LkgStale, lkg_stale),
+        DevStateEval::new(DevState::DistStale, dist_stale),
+        DevStateEval::new(DevState::DistMissing, dist_missing),
+        DevStateEval::new(DevState::PrimaryDown, primary_down),
     ]
 }
 
