@@ -28,24 +28,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use qontinui_types::dev_signatures::DevSignature;
 
 use crate::dev_action::record::{ActionKind, ActionOutcome, ActionRecord, D3Category};
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::panic_log;
 use crate::state::SharedState;
 
-// ── `DEV-*` outcome signatures (Phase-1 hardcoded; shared registry is Phase 2). ──
-
-/// Tauri loaded a binary with no embedded `dist/` (the 2026-06-07 white screen).
-pub const DEV_TAURI_ASSET_MISSING: &str = "DEV-TAURI-ASSET-MISSING";
-/// The webview could not reach its frontend (dev-mode binary, no Vite server).
-pub const DEV_WEBVIEW_CONN_REFUSED: &str = "DEV-WEBVIEW-CONN-REFUSED";
-/// The runner failed to bind its port (address already in use / bind failure).
-pub const DEV_PORT_BIND_FAIL: &str = "DEV-PORT-BIND-FAIL";
-/// A fresh startup panic was recorded within the attribution window.
-pub const DEV_PANIC_STARTUP: &str = "DEV-PANIC-STARTUP";
-/// The runner's React error boundary tripped (health `ui_error` / errored).
-pub const DEV_UI_ERROR_BOUNDARY: &str = "DEV-UI-ERROR-BOUNDARY";
+// ── `DEV-*` outcome signatures (Phase-2b: the shared `qontinui-types` ──
+//    `DevSignature` registry; the Phase-1 hardcoded consts are gone). Each
+//    matcher below produces a `DevSignature`; the outcome stores its canonical
+//    `as_str()` so the wire form (`Vec<String>` of `DEV-*` codes) is unchanged.
 
 // ── Per-kind attribution windows (Q6). Read from this const map so they are ──
 //    tunable without a schema change.
@@ -67,21 +60,31 @@ pub fn window_for(kind: ActionKind, build_duration: Option<Duration>) -> Duratio
     }
 }
 
-/// Classify a verdict from the observed signatures. The mapping (§6.1):
-/// asset-missing / webview-refused / ui_error ⇒ **Contradiction** (the ACK
-/// claimed success but the surface refutes it); panic / port-bind ⇒
-/// **Failure** (the action's own machinery failed); a clean window ⇒
+/// Classify a verdict from the observed signatures. Each signature carries its
+/// **default D3 category** in the shared registry
+/// ([`DevSignature::default_category`]): asset-missing / webview-refused /
+/// ui_error default to **Contradiction** (the ACK claimed success but the
+/// surface refutes it); panic / port-bind / compile-flake default to
+/// **Failure** (the action's own machinery failed). Phase-2b derives the verdict
+/// from those defaults instead of re-listing the mapping here. A clean window ⇒
 /// **Confirmed**. When multiple classes are present, Contradiction wins over
 /// Failure (a white screen behind a "success" ACK is the more misleading
-/// outcome and the one the operator most needs surfaced).
-pub fn classify(signatures: &[String]) -> D3Category {
-    let has = |sig: &str| signatures.iter().any(|s| s == sig);
-    let contradiction =
-        has(DEV_TAURI_ASSET_MISSING) || has(DEV_WEBVIEW_CONN_REFUSED) || has(DEV_UI_ERROR_BOUNDARY);
-    let failure = has(DEV_PANIC_STARTUP) || has(DEV_PORT_BIND_FAIL);
-    if contradiction {
+/// outcome and the one the operator most needs surfaced) — the precedence is
+/// applied here, since the registry only carries each signature's own default.
+pub fn classify(signatures: &[DevSignature]) -> D3Category {
+    let mut has_contradiction = false;
+    let mut has_failure = false;
+    for sig in signatures {
+        match sig.default_category() {
+            D3Category::Contradiction => has_contradiction = true,
+            D3Category::Failure => has_failure = true,
+            // No Phase-1 signature defaults to these; ignore for the verdict.
+            D3Category::Confirmed | D3Category::Surprise | D3Category::Partial => {}
+        }
+    }
+    if has_contradiction {
         D3Category::Contradiction
-    } else if failure {
+    } else if has_failure {
         D3Category::Failure
     } else {
         D3Category::Confirmed
@@ -92,18 +95,19 @@ pub fn classify(signatures: &[String]) -> D3Category {
 /// the caller supplies the already-read log text, so this is unit-testable
 /// against a fixture string with no IO. Returns the signatures in a stable
 /// order. Also returns a short evidence excerpt (the first matching line).
-pub fn scan_log_content(content: &str) -> (Vec<String>, Option<String>) {
-    let mut sigs = Vec::new();
+pub fn scan_log_content(content: &str) -> (Vec<DevSignature>, Option<String>) {
+    let mut sigs: Vec<DevSignature> = Vec::new();
     let mut evidence: Option<String> = None;
 
-    let note = |sig: &str, line: &str, sigs: &mut Vec<String>, ev: &mut Option<String>| {
-        if !sigs.iter().any(|s| s == sig) {
-            sigs.push(sig.to_string());
-        }
-        if ev.is_none() {
-            *ev = Some(line.trim().chars().take(200).collect());
-        }
-    };
+    let note =
+        |sig: DevSignature, line: &str, sigs: &mut Vec<DevSignature>, ev: &mut Option<String>| {
+            if !sigs.contains(&sig) {
+                sigs.push(sig);
+            }
+            if ev.is_none() {
+                *ev = Some(line.trim().chars().take(200).collect());
+            }
+        };
 
     for line in content.lines() {
         // DEV-TAURI-ASSET-MISSING: `tauri::manager` + `asset not found`. The
@@ -111,10 +115,20 @@ pub fn scan_log_content(content: &str) -> (Vec<String>, Option<String>) {
         // found: index.html`. Match on the substring pair so a future format
         // tweak in either token still fires.
         if line.contains("tauri::manager") && line.contains("asset not found") {
-            note(DEV_TAURI_ASSET_MISSING, line, &mut sigs, &mut evidence);
+            note(
+                DevSignature::DevTauriAssetMissing,
+                line,
+                &mut sigs,
+                &mut evidence,
+            );
         }
         if line.contains("ERR_CONNECTION_REFUSED") {
-            note(DEV_WEBVIEW_CONN_REFUSED, line, &mut sigs, &mut evidence);
+            note(
+                DevSignature::DevWebviewConnRefused,
+                line,
+                &mut sigs,
+                &mut evidence,
+            );
         }
         // Port bind failure: Rust's std surfaces this as `AddrInUse`; tauri /
         // axum bind errors also say "address already in use" / "failed to
@@ -124,7 +138,12 @@ pub fn scan_log_content(content: &str) -> (Vec<String>, Option<String>) {
             || lower.contains("address already in use")
             || lower.contains("failed to bind")
         {
-            note(DEV_PORT_BIND_FAIL, line, &mut sigs, &mut evidence);
+            note(
+                DevSignature::DevPortBindFail,
+                line,
+                &mut sigs,
+                &mut evidence,
+            );
         }
     }
 
@@ -133,7 +152,7 @@ pub fn scan_log_content(content: &str) -> (Vec<String>, Option<String>) {
 
 /// Read the early-log file (best-effort) and scan it. Returns empty when the
 /// path is `None` or the file can't be read.
-fn scan_early_log(path: Option<&Path>) -> (Vec<String>, Option<String>) {
+fn scan_early_log(path: Option<&Path>) -> (Vec<DevSignature>, Option<String>) {
     let Some(path) = path else {
         return (Vec::new(), None);
     };
@@ -149,7 +168,7 @@ fn scan_early_log(path: Option<&Path>) -> (Vec<String>, Option<String>) {
 fn scan_panic(
     panic_log_path: Option<&Path>,
     window_open_at: chrono::DateTime<Utc>,
-) -> (Vec<String>, Option<String>) {
+) -> (Vec<DevSignature>, Option<String>) {
     let path = match panic_log_path {
         Some(p) => p.to_path_buf(),
         None => panic_log::resolve_panic_log_path(None),
@@ -163,7 +182,7 @@ fn scan_panic(
                 "panic: {}",
                 parsed.payload.lines().next().unwrap_or("").trim()
             );
-            return (vec![DEV_PANIC_STARTUP.to_string()], Some(excerpt));
+            return (vec![DevSignature::DevPanicStartup], Some(excerpt));
         }
     }
     (Vec::new(), None)
@@ -175,7 +194,7 @@ fn scan_panic(
 async fn scan_health(
     state: &SharedState,
     runner_id: Option<&str>,
-) -> (Vec<String>, Option<String>) {
+) -> (Vec<DevSignature>, Option<String>) {
     let Some(runner_id) = runner_id else {
         return (Vec::new(), None);
     };
@@ -184,7 +203,7 @@ async fn scan_health(
         if snap.id == runner_id {
             if let Some(ui_err) = snap.ui_error.as_ref() {
                 return (
-                    vec![DEV_UI_ERROR_BOUNDARY.to_string()],
+                    vec![DevSignature::DevUiErrorBoundary],
                     Some(format!(
                         "ui_error: {}",
                         ui_err.message.chars().take(160).collect::<String>()
@@ -196,7 +215,7 @@ async fn scan_health(
                 crate::health_cache::RunnerStatus::Errored { .. }
             ) {
                 return (
-                    vec![DEV_UI_ERROR_BOUNDARY.to_string()],
+                    vec![DevSignature::DevUiErrorBoundary],
                     Some("derived_status=errored".to_string()),
                 );
             }
@@ -269,9 +288,13 @@ pub fn spawn_attribution_watcher(
         let ended_at = Utc::now();
         let duration_ms = (ended_at - record.started_at).num_milliseconds();
 
+        // The outcome's wire form carries the canonical `DEV-*` id strings.
+        let signature_ids: Vec<String> =
+            signatures.iter().map(|s| s.as_str().to_string()).collect();
+
         let outcome = ActionOutcome {
             category,
-            signatures: signatures.clone(),
+            signatures: signature_ids.clone(),
             ended_at,
             duration_ms,
             evidence_ref: evidence,
@@ -296,7 +319,7 @@ pub fn spawn_attribution_watcher(
                     record.action_id,
                     kind.as_str(),
                     category,
-                    signatures
+                    signature_ids
                 ),
             )
             .await;
@@ -310,13 +333,13 @@ pub fn spawn_attribution_watcher(
 /// Merge a secondary `(signatures, evidence)` scan into the primary, preserving
 /// signature order/uniqueness and keeping the first evidence excerpt.
 fn merge(
-    primary_sigs: &mut Vec<String>,
+    primary_sigs: &mut Vec<DevSignature>,
     primary_ev: &mut Option<String>,
-    extra_sigs: Vec<String>,
+    extra_sigs: Vec<DevSignature>,
     extra_ev: Option<String>,
 ) {
     for s in extra_sigs {
-        if !primary_sigs.iter().any(|p| p == &s) {
+        if !primary_sigs.contains(&s) {
             primary_sigs.push(s);
         }
     }
@@ -336,7 +359,7 @@ mod tests {
                    ERROR tauri::manager: asset not found: index.html\n\
                    INFO window created\n";
         let (sigs, evidence) = scan_log_content(log);
-        assert!(sigs.contains(&DEV_TAURI_ASSET_MISSING.to_string()));
+        assert!(sigs.contains(&DevSignature::DevTauriAssetMissing));
         assert_eq!(classify(&sigs), D3Category::Contradiction);
         assert!(evidence.unwrap().contains("asset not found"));
     }
@@ -345,7 +368,7 @@ mod tests {
     fn webview_conn_refused_yields_contradiction() {
         let log = "ERROR webview: net::ERR_CONNECTION_REFUSED at http://localhost:1420\n";
         let (sigs, _) = scan_log_content(log);
-        assert!(sigs.contains(&DEV_WEBVIEW_CONN_REFUSED.to_string()));
+        assert!(sigs.contains(&DevSignature::DevWebviewConnRefused));
         assert_eq!(classify(&sigs), D3Category::Contradiction);
     }
 
@@ -357,7 +380,7 @@ mod tests {
         ] {
             let (sigs, _) = scan_log_content(line);
             assert!(
-                sigs.contains(&DEV_PORT_BIND_FAIL.to_string()),
+                sigs.contains(&DevSignature::DevPortBindFail),
                 "line: {line}"
             );
             assert_eq!(classify(&sigs), D3Category::Failure, "line: {line}");
@@ -376,21 +399,21 @@ mod tests {
     #[test]
     fn contradiction_wins_over_failure_when_both_present() {
         let sigs = vec![
-            DEV_PORT_BIND_FAIL.to_string(),
-            DEV_TAURI_ASSET_MISSING.to_string(),
+            DevSignature::DevPortBindFail,
+            DevSignature::DevTauriAssetMissing,
         ];
         assert_eq!(classify(&sigs), D3Category::Contradiction);
     }
 
     #[test]
     fn ui_error_boundary_classifies_as_contradiction() {
-        let sigs = vec![DEV_UI_ERROR_BOUNDARY.to_string()];
+        let sigs = vec![DevSignature::DevUiErrorBoundary];
         assert_eq!(classify(&sigs), D3Category::Contradiction);
     }
 
     #[test]
     fn panic_signature_classifies_as_failure() {
-        let sigs = vec![DEV_PANIC_STARTUP.to_string()];
+        let sigs = vec![DevSignature::DevPanicStartup];
         assert_eq!(classify(&sigs), D3Category::Failure);
     }
 
@@ -420,7 +443,7 @@ mod tests {
         )
         .unwrap();
         let (sigs, evidence) = scan_early_log(Some(&path));
-        assert!(sigs.contains(&DEV_TAURI_ASSET_MISSING.to_string()));
+        assert!(sigs.contains(&DevSignature::DevTauriAssetMissing));
         assert_eq!(classify(&sigs), D3Category::Contradiction);
         assert!(evidence.is_some());
     }
@@ -456,7 +479,7 @@ mod tests {
         // `late_signatures` and must not flip `category`.
         outcome
             .late_signatures
-            .push(DEV_UI_ERROR_BOUNDARY.to_string());
+            .push(DevSignature::DevUiErrorBoundary.as_str().to_string());
         assert_eq!(
             outcome.category,
             D3Category::Confirmed,
