@@ -35,6 +35,19 @@ pub enum SupervisorError {
     #[error("Build failed: {0}")]
     BuildFailed(String),
 
+    /// The pre-permit disk guard refused a build because free disk fell below
+    /// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`. Mapped to `507 Insufficient
+    /// Storage`. The body embeds the cached footprint snapshot and names both
+    /// prune endpoints so the caller can reclaim space and retry. No build-pool
+    /// permit / slot is consumed — the refusal happens BEFORE acquisition.
+    #[error("Insufficient disk: {free_bytes} bytes free, need at least {required_bytes}")]
+    InsufficientDisk {
+        free_bytes: u64,
+        required_bytes: u64,
+        /// Cached footprint snapshot (may be `null` if no snapshot computed yet).
+        footprint: Box<Option<serde_json::Value>>,
+    },
+
     #[error("Process error: {0}")]
     Process(String),
 
@@ -93,12 +106,34 @@ impl SupervisorError {
             return (StatusCode::SERVICE_UNAVAILABLE, body);
         }
 
+        if let SupervisorError::InsufficientDisk {
+            free_bytes,
+            required_bytes,
+            footprint,
+        } = self
+        {
+            let body = serde_json::json!({
+                "error": "insufficient_disk",
+                "message": self.to_string(),
+                "free_bytes": free_bytes,
+                "required_bytes": required_bytes,
+                "footprint": footprint.as_ref().clone(),
+                // Name both prune endpoints so the caller can reclaim space.
+                "prune_endpoints": [
+                    "DELETE /spawn-worktrees?older_than_hours=<h>",
+                    "POST /builds/slots/{id}/clean",
+                ],
+            });
+            return (StatusCode::INSUFFICIENT_STORAGE, body);
+        }
+
         let status = match self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -115,46 +150,9 @@ impl SupervisorError {
 
 impl IntoResponse for SupervisorError {
     fn into_response(self) -> Response {
-        if let SupervisorError::BuildPoolFull {
-            queue_position,
-            active_builds,
-            estimated_wait_secs,
-        } = &self
-        {
-            let mut body = serde_json::json!({
-                "error": "build_pool_full",
-                "message": self.to_string(),
-                "queue_position": queue_position,
-                "active_builds": active_builds,
-            });
-            if let Some(w) = estimated_wait_secs {
-                body.as_object_mut()
-                    .unwrap()
-                    .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
-            }
-            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-        }
-
-        let status = match &self {
-            SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
-            SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
-            SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
-            SupervisorError::BuildInProgress => StatusCode::CONFLICT,
-            SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
-            SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            SupervisorError::Cancelled(_) => StatusCode::CONFLICT,
-            SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
-            SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-
-        let body = serde_json::json!({
-            "error": self.to_string(),
-        });
-
+        // Delegate to `to_status_body` so the wire shape can never drift
+        // between the two paths.
+        let (status, body) = self.to_status_body();
         (status, axum::Json(body)).into_response()
     }
 }

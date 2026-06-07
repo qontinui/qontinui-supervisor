@@ -938,6 +938,16 @@ pub fn build_router(state: SharedState) -> Router {
             get(crate::routes::build_submit::get_status),
         )
         .route("/builds", get(crate::routes::runners::list_builds))
+        // Build-artifact prune endpoints (plan
+        // 2026-06-05-supervisor-build-artifact-footprint, Phase 3).
+        .route(
+            "/spawn-worktrees",
+            delete(crate::routes::runners::prune_spawn_worktrees_endpoint),
+        )
+        .route(
+            "/builds/slots/{id}/clean",
+            post(crate::routes::runners::clean_slot_endpoint),
+        )
         .route(
             "/builds/cache-stats",
             get(crate::routes::build_submit::get_cache_stats),

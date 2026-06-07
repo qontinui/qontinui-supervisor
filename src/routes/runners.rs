@@ -3602,8 +3602,45 @@ pub async fn spawn_named(
 /// Returns the pool size, the state of each slot, and the number of callers
 /// currently waiting in the queue. Agents use this to decide whether a
 /// rebuild request will be quick or will have to wait.
-pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse {
+///
+/// Build-artifact footprint (plan
+/// `2026-06-05-supervisor-build-artifact-footprint`): the response carries a
+/// `footprint` object (per-slot bytes, lkg bytes, `.spawn-*` containers, exe
+/// copies, disk free) with its own `computed_at` so staleness is explicit. By
+/// default it serves the CACHED snapshot (background-refreshed every 15 min)
+/// because walking GB-scale trees is minutes-slow. Pass
+/// `?refresh_footprint=1` to force a synchronous recompute before responding.
+#[derive(Deserialize, Default)]
+pub struct ListBuildsQuery {
+    /// When truthy (`1`/`true`), recompute the footprint snapshot synchronously
+    /// before responding instead of serving the cached one.
+    #[serde(default)]
+    pub refresh_footprint: Option<String>,
+}
+
+fn is_truthy_flag(v: &Option<String>) -> bool {
+    matches!(
+        v.as_deref().map(|s| s.trim()),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+pub async fn list_builds(
+    State(state): State<SharedState>,
+    Query(query): Query<ListBuildsQuery>,
+) -> impl IntoResponse {
     let now = chrono::Utc::now();
+
+    // Footprint: force a synchronous recompute when asked, else serve cache.
+    let footprint_json: serde_json::Value = if is_truthy_flag(&query.refresh_footprint) {
+        let snap = state.refresh_footprint().await;
+        serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)
+    } else {
+        match state.footprint.read().await.as_ref() {
+            Some(snap) => serde_json::to_value(snap).unwrap_or(serde_json::Value::Null),
+            None => serde_json::Value::Null,
+        }
+    };
     let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(state.build_pool.slots.len());
     let mut global_sum: f64 = 0.0;
     let mut global_count: usize = 0;
@@ -3814,7 +3851,248 @@ pub async fn list_builds(State(state): State<SharedState>) -> impl IntoResponse 
         "lkg": lkg_json,
         "slot_freshness_warning": slot_freshness_warning,
         "legacy_target_debug_warning": legacy_target_debug_warning,
+        // Build-artifact footprint snapshot (plan
+        // 2026-06-05-supervisor-build-artifact-footprint). `null` until the
+        // first refresh; carries its own `computed_at` for staleness. Force a
+        // fresh walk with `?refresh_footprint=1`.
+        "footprint": footprint_json,
     }))
+}
+
+// --- Build-artifact prune endpoints (Phase 3) ---
+
+#[derive(Deserialize, Default)]
+pub struct PruneSpawnQuery {
+    /// Retention window override in hours. A container is prunable once its
+    /// mtime is older than this (dirty registered worktrees need DOUBLE). When
+    /// omitted, the engine resolves the window from
+    /// `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS` / its 48h default.
+    #[serde(default)]
+    pub older_than_hours: Option<u64>,
+}
+
+/// DELETE /spawn-worktrees?older_than_hours=<h> — prune stale `.spawn-*`
+/// scratch-worktree containers.
+///
+/// Thin wrapper over the existing engine
+/// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
+/// owns ALL selection + safety (prefix-under-root filter, active-build
+/// exclusion, age + dirty double-retention). This handler only:
+///   1. passes the LIVE active-container set from state (same source the
+///      opportunistic sweep uses),
+///   2. forwards the optional `older_than_hours` window override,
+///   3. measures container sizes BEFORE the delete so it can report
+///      `bytes_freed`,
+///   4. refreshes the footprint cache afterward.
+pub async fn prune_spawn_worktrees_endpoint(
+    State(state): State<SharedState>,
+    Query(query): Query<PruneSpawnQuery>,
+) -> impl IntoResponse {
+    // Snapshot sizes of every `.spawn-*` container up front (the engine deletes
+    // them, so we can't measure after). Best-effort: failures yield 0.
+    let pre_sizes: std::collections::HashMap<std::path::PathBuf, u64> =
+        match crate::spawn_worktree::derive_workspace_root(&state.config.project_dir) {
+            Ok(ws) => {
+                let mut map = std::collections::HashMap::new();
+                if let Ok(entries) = std::fs::read_dir(&ws) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with(crate::spawn_worktree::SPAWN_DIR_PREFIX)
+                            && entry.path().is_dir()
+                        {
+                            let p = entry.path();
+                            let size = crate::footprint::dir_size_bytes(&p);
+                            map.insert(p, size);
+                        }
+                    }
+                }
+                map
+            }
+            Err(_) => std::collections::HashMap::new(),
+        };
+
+    // Live active-build container set — mirror the opportunistic sweep.
+    let active_now: std::collections::HashSet<std::path::PathBuf> =
+        state.active_spawn_worktrees.lock().unwrap().clone();
+
+    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
+        &state.config.project_dir,
+        &active_now,
+        std::time::SystemTime::now(),
+        query.older_than_hours,
+    )
+    .await;
+
+    let bytes_freed: u64 = report
+        .removed
+        .iter()
+        .map(|p| pre_sizes.get(p).copied().unwrap_or(0))
+        .fold(0u64, |a, b| a.saturating_add(b));
+
+    let removed: Vec<String> = report
+        .removed
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let kept: Vec<serde_json::Value> = report
+        .kept
+        .iter()
+        .map(|(p, reason)| json!({ "path": p.to_string_lossy(), "reason": reason }))
+        .collect();
+    let failed: Vec<serde_json::Value> = report
+        .failed
+        .iter()
+        .map(|(p, err)| json!({ "path": p.to_string_lossy(), "error": err }))
+        .collect();
+
+    if !report.removed.is_empty() {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "DELETE /spawn-worktrees: removed {} container(s), freed {} bytes",
+                    report.removed.len(),
+                    bytes_freed
+                ),
+            )
+            .await;
+        // Bytes were freed — invalidate + refresh the footprint cache.
+        let _ = state.refresh_footprint().await;
+    }
+
+    Json(json!({
+        "removed": removed,
+        "kept": kept,
+        "failed": failed,
+        "bytes_freed": bytes_freed,
+        "window_hours": query.older_than_hours,
+    }))
+}
+
+/// POST /builds/slots/{id}/clean — empty a single build-pool slot's target dir.
+///
+/// Refuses (409, structured) when the slot has an active build OR when its exe
+/// is held open by a live process (reuses the holder-detection machinery used
+/// by `free_slot_exe`). On success, deletes the slot's `target_dir` contents,
+/// reports `bytes_freed`, and refreshes the footprint cache.
+pub async fn clean_slot_endpoint(
+    State(state): State<SharedState>,
+    Path(slot_id): Path<usize>,
+) -> impl IntoResponse {
+    let slot = match state.build_pool.slots.get(slot_id) {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "slot_not_found",
+                    "slot_id": slot_id,
+                    "pool_size": state.build_pool.slots.len(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Refusal 1: an active build owns this slot.
+    let busy = {
+        match slot.busy.try_read() {
+            Ok(g) => g.clone(),
+            Err(_) => slot.busy.read().await.clone(),
+        }
+    };
+    if let Some(info) = busy {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({
+                "error": "slot_busy",
+                "message": "Slot has an active build; refusing to clean.",
+                "slot_id": slot_id,
+                "started_at": info.started_at.to_rfc3339(),
+                "requester_id": info.requester_id,
+                "rebuild_kind": info.rebuild_kind,
+            })),
+        )
+            .into_response();
+    }
+
+    // Refusal 2: the slot exe is held open by a live process. Holder detection
+    // is Windows-only (sysinfo image-path match); on other platforms there is
+    // no holder concept for a stalled file lock, so the check is a no-op.
+    let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+    let holders = crate::build_monitor::slot_exe_holders(&exe_path).await;
+    if !holders.is_empty() {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({
+                "error": "slot_exe_held",
+                "message": "Slot exe is held open by a live process; refusing to clean.",
+                "slot_id": slot_id,
+                "exe_path": exe_path.to_string_lossy(),
+                "holder_pids": holders,
+            })),
+        )
+            .into_response();
+    }
+
+    // Measure before deleting.
+    let bytes_before = crate::footprint::dir_size_bytes(&slot.target_dir);
+
+    // Empty the slot target dir. Remove + recreate so subsequent builds find an
+    // existing (empty) dir, matching how `BuildPool::new` creates them eagerly.
+    let remove_result = tokio::fs::remove_dir_all(&slot.target_dir).await;
+    if let Err(e) = &remove_result {
+        // ENOENT is fine (already empty); any other error is a real failure.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "clean_failed",
+                    "message": format!("failed to remove slot target dir: {}", e),
+                    "slot_id": slot_id,
+                    "target_dir": slot.target_dir.to_string_lossy(),
+                })),
+            )
+                .into_response();
+        }
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&slot.target_dir).await {
+        warn!(
+            "clean-slot: removed slot {} dir but failed to recreate it: {}",
+            slot_id, e
+        );
+    }
+
+    let bytes_freed = crate::footprint::dir_size_bytes(&slot.target_dir);
+    let bytes_freed = bytes_before.saturating_sub(bytes_freed);
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "POST /builds/slots/{}/clean: freed {} bytes",
+                slot_id, bytes_freed
+            ),
+        )
+        .await;
+
+    // Bytes were freed (or the slot was already empty) — refresh footprint.
+    let _ = state.refresh_footprint().await;
+
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "slot_id": slot_id,
+            "target_dir": slot.target_dir.to_string_lossy(),
+            "bytes_freed": bytes_freed,
+        })),
+    )
+        .into_response()
 }
 
 /// GET /builds/{slot_id}/log — return the in-memory combined log of the

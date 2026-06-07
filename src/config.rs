@@ -118,6 +118,25 @@ impl Default for BuildPoolConfig {
     }
 }
 
+/// Default minimum free disk (GB) below which the pre-permit disk guard
+/// refuses a build. See [`min_free_disk_gb`].
+pub const DEFAULT_MIN_FREE_DISK_GB: u64 = 30;
+
+/// Env var overriding the pre-permit disk guard threshold, in GB.
+pub const MIN_FREE_DISK_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB";
+
+/// Minimum free disk (in GB) required before a build may acquire a build-pool
+/// permit. Resolved from [`MIN_FREE_DISK_GB_ENV`], falling back to
+/// [`DEFAULT_MIN_FREE_DISK_GB`]. Parse-with-default exactly like
+/// [`BuildPoolConfig::default`]: a malformed value yields the default. A `0`
+/// disables the guard entirely (treat every disk state as sufficient).
+pub fn min_free_disk_gb() -> u64 {
+    std::env::var(MIN_FREE_DISK_GB_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
+}
+
 /// Configuration for a single managed runner instance.
 ///
 /// The canonical discriminator is the `kind` field (a [`RunnerKind`]).

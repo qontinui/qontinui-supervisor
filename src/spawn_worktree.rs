@@ -860,6 +860,30 @@ pub async fn prune_spawn_worktrees(
     active_containers: &std::collections::HashSet<PathBuf>,
     now: std::time::SystemTime,
 ) -> PruneReport {
+    // Delegate to the window-parameterized inner fn with no override, so the
+    // engine resolves the retention window from env exactly as before. Existing
+    // callers (startup sweep, opportunistic sweep) are unchanged.
+    prune_spawn_worktrees_with_window(project_dir, active_containers, now, None).await
+}
+
+/// Same as [`prune_spawn_worktrees`] but with an explicit retention-window
+/// override (in hours). `window_hours_override`:
+/// - `None` ⇒ resolve the window from [`SPAWN_RETENTION_ENV`] / the default
+///   (the behavior of [`prune_spawn_worktrees`]);
+/// - `Some(h)` ⇒ use `h` hours as the single retention window (and `2*h` as the
+///   dirty-worktree double-retention window). `Some(0)` prunes every idle
+///   container immediately, subject to the dirty double-retention rule.
+///
+/// Exists so the `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint can
+/// pass an operator-chosen window WITHOUT changing the env-derived default for
+/// the background sweeps. All selection/safety invariants are identical — only
+/// the window source differs.
+pub async fn prune_spawn_worktrees_with_window(
+    project_dir: &Path,
+    active_containers: &std::collections::HashSet<PathBuf>,
+    now: std::time::SystemTime,
+    window_hours_override: Option<u64>,
+) -> PruneReport {
     let mut report = PruneReport::default();
 
     // Derive the workspace root + owning repos exactly as `prepare_worktree`
@@ -895,7 +919,8 @@ pub async fn prune_spawn_worktrees(
         }
     };
 
-    let retention = std::time::Duration::from_secs(retention_hours().saturating_mul(3600));
+    let window_hours = window_hours_override.unwrap_or_else(retention_hours);
+    let retention = std::time::Duration::from_secs(window_hours.saturating_mul(3600));
     let double_retention = retention.saturating_mul(2);
 
     // Enumerate `.spawn-*` dirs directly under the workspace root. Anything
@@ -1620,6 +1645,36 @@ mod tests {
             !root.join(".spawn-HEAD").exists(),
             "the named container dir must be gone after prune"
         );
+    }
+
+    #[tokio::test]
+    async fn prune_window_override_maps_to_age_window() {
+        let _g = retention_env_guard().lock().await;
+        // With an explicit `Some(window_hours)` override, the env-derived
+        // default (48h) is ignored. A 12h-old container is KEPT under a 24h
+        // override and REMOVED under a 6h override — same container, same env.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+        let empty: HashSet<PathBuf> = HashSet::new();
+
+        // 12h old, override 24h → kept (younger than the override window).
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(24))
+            .await;
+        assert!(
+            prepared.container_path.exists(),
+            "12h container must be kept under a 24h override window"
+        );
+        assert!(r.removed.is_empty());
+
+        // 12h old, override 6h → removed (older than the override window).
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(6))
+            .await;
+        assert!(
+            !prepared.container_path.exists(),
+            "12h container must be removed under a 6h override window"
+        );
+        assert_eq!(r.removed.len(), 1);
     }
 
     #[tokio::test]

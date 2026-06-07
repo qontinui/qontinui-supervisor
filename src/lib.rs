@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod evaluation;
 pub mod expo;
+pub mod footprint;
 pub mod fs_atomic;
 pub mod health_cache;
 pub mod log_capture;
