@@ -32,7 +32,16 @@
          never comes up within the window.
 
 .PARAMETER Build
-    Run `cargo build` first. Abort the whole restart if the build fails.
+    Build the frontend (`npm run build` in frontend\, producing the repo-root
+    dist\ that Tauri's rust-embed bundles) AND `cargo build`, in that order.
+    Abort the whole restart if either build fails. The frontend MUST build
+    first: the supervisor embeds dist\ at cargo-build time via rust-embed
+    (`#[folder = "dist/"]` in src\routes\dashboard.rs), so a cargo-only build
+    silently ships whatever stale dist\ already exists on disk.
+
+.PARAMETER SkipFrontend
+    With -Build, skip the frontend `npm run build` and run cargo only. Use ONLY
+    when you know dist\ is already fresh (e.g. you just built it by hand).
 
 .PARAMETER Port
     Supervisor HTTP port. Default 9875.
@@ -60,6 +69,7 @@
 [CmdletBinding()]
 param(
     [switch]$Build,
+    [switch]$SkipFrontend,
     [int]$Port = 9875,
     [string]$ProjectDir = 'D:\qontinui-root\qontinui-runner\src-tauri',
     [string]$LogFile = 'D:\qontinui-root\.dev-logs\runner-tauri.log',
@@ -81,7 +91,41 @@ function Write-Step($msg)  { Write-Host "[restart-supervisor] $msg" }
 function Write-Fail($msg)  { Write-Host "[restart-supervisor] ERROR: $msg" -ForegroundColor Red }
 
 # --- 1. Optional build ----------------------------------------------------
+# Frontend FIRST, then cargo: the supervisor embeds the repo-root dist\ at
+# cargo-build time via rust-embed (#[folder = "dist/"] in
+# src\routes\dashboard.rs). If we only ran cargo, it would silently re-embed
+# whatever stale dist\ already exists, shipping an old frontend even though the
+# Rust recompiled (the 2026-06-07 Lineage-page-auth stale-embed incident).
 if ($Build) {
+    if (-not $SkipFrontend) {
+        $FrontendDir = Join-Path $RepoRoot 'frontend'
+        Write-Step "npm run build (frontend, in $FrontendDir) -> repo-root dist\ ..."
+        Push-Location $FrontendDir
+        try {
+            # Install deps only if missing (fast no-op when node_modules is present).
+            if (-not (Test-Path (Join-Path $FrontendDir 'node_modules'))) {
+                Write-Step "node_modules missing; running npm ci..."
+                & npm ci
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Fail "npm ci failed (exit $LASTEXITCODE); aborting restart."
+                    Pop-Location
+                    exit 1
+                }
+            }
+            & npm run build
+            $feExit = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+        if ($feExit -ne 0) {
+            Write-Fail "frontend build failed (exit $feExit); aborting restart (would embed stale dist\)."
+            exit 1
+        }
+        Write-Step "frontend build ok (dist\ refreshed)."
+    } else {
+        Write-Step "-SkipFrontend: skipping frontend build (using existing dist\)."
+    }
+
     Write-Step "cargo build (in $RepoRoot)..."
     Push-Location $RepoRoot
     try {

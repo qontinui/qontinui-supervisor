@@ -965,11 +965,23 @@ export const api = {
   // FleetPrincipal-scoped (operator branch), so each call attaches the operator
   // JWT as `Authorization: Bearer <jwt>` — the same credential the Fleet tab
   // uses (shared localStorage key). The supervisor proxy forwards it verbatim.
+  //
+  // Coord wraps the list responses in an envelope (`/lineage/recent` →
+  // `{count, limit, rows: [...]}`, `/lineage/sessions/{id}/commits` →
+  // `{commits: [...]}`); the page consumes a bare `LineageRow[]`, so unwrap the
+  // envelope here. (Without this the page showed empty recent-commits + empty
+  // session drawers even though coord returned 200 with rows.)
   lineageRecent: (limit = 100, jwt?: string) =>
-    fetchJson<LineageRow[]>(`/lineage/recent?limit=${limit}`, bearer(jwt)),
+    fetchJson<{ rows?: LineageRow[] } | LineageRow[]>(
+      `/lineage/recent?limit=${limit}`,
+      bearer(jwt),
+    ).then((r) => (Array.isArray(r) ? r : (r?.rows ?? []))),
   lineageStats: (jwt?: string) => fetchJson<LineageStats>('/lineage/stats', bearer(jwt)),
   lineageSessionCommits: (id: string, jwt?: string) =>
-    fetchJson<LineageRow[]>(`/lineage/sessions/${encodeURIComponent(id)}/commits`, bearer(jwt)),
+    fetchJson<{ commits?: LineageRow[] } | LineageRow[]>(
+      `/lineage/sessions/${encodeURIComponent(id)}/commits`,
+      bearer(jwt),
+    ).then((r) => (Array.isArray(r) ? r : (r?.commits ?? []))),
   lineageCommitSession: (sha: string, jwt?: string) =>
     fetchJson<CommitSession>(`/lineage/commits/${encodeURIComponent(sha)}/session`, bearer(jwt)),
 
