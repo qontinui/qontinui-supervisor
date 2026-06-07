@@ -302,8 +302,28 @@ pub fn spawn_attribution_watcher(
         };
 
         if let Ok(mut guard) = record.outcome.write() {
-            *guard = Some(outcome);
+            *guard = Some(outcome.clone());
         }
+
+        // Phase 3: persist the completed snapshot to coord for durable storage.
+        // Best-effort + fail-open — `post_snapshot_to_coord` swallows every
+        // error into a single `warn!`, so this can never block or fail the
+        // watcher. Detached via `tokio::spawn` so even the 5s ingest timeout
+        // can't delay the dashboard nudge below. device_id / tenant_id come from
+        // `~/.qontinui/machine.json` (the same `machine_id` field `fleet.rs`
+        // reads for the device id).
+        let device_id = crate::dev_action::ingest::resolve_device_id();
+        let tenant_id = crate::dev_action::ingest::resolve_tenant_id();
+        let ingest_record = Arc::clone(&record);
+        tokio::spawn(async move {
+            crate::dev_action::post_snapshot_to_coord(
+                &ingest_record,
+                &outcome,
+                device_id,
+                tenant_id,
+            )
+            .await;
+        });
 
         let level = match category {
             D3Category::Contradiction | D3Category::Failure => LogLevel::Warn,
