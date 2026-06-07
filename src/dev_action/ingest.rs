@@ -107,7 +107,11 @@ fn profiles_path() -> Option<PathBuf> {
 /// Duplicated from [`crate::routes::lineage`]'s module-private `coord_http_base`
 /// (preferred over `fleet.rs`'s copy because that one ignores `COORD_HTTP_URL`).
 /// Kept local rather than refactoring both call sites into a shared helper.
-fn coord_http_base() -> Option<String> {
+///
+/// `pub(crate)` so the Phase-4 expectations fetcher
+/// ([`crate::dev_action::expectations`]) reuses this single resolver rather than
+/// adding a third copy.
+pub(crate) fn coord_http_base() -> Option<String> {
     if let Ok(env_url) = std::env::var("COORD_HTTP_URL") {
         let trimmed = env_url.trim();
         if !trimmed.is_empty() {
