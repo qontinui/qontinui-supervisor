@@ -160,6 +160,51 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
+/// Explicit caller intent for how a build's tree should be classified into a
+/// [`BuildSource`] — the signal the build path previously could not derive.
+///
+/// Before Phase B, provenance was inferred purely from
+/// `build_dir_override.is_some()` ([`provenance_tree_root`]): `None` ⇒
+/// `LiveTree`, `Some(_)` ⇒ `Override`. That conflated TWO different
+/// `Some(src_tauri)` builds — a default primary rebuild from a
+/// supervisor-materialized `origin/main` worktree, and a spawn-test
+/// `git_ref` / `worktree_path` preview of a foreign tree — both of which
+/// arrive as `Some(src_tauri)`. They must classify differently
+/// (`OriginMain` is LKG-eligible and startable as primary; `Override` is
+/// neither), so the caller now passes this explicit kind rather than letting
+/// the build infer it from the path.
+///
+/// The kind is the SINGLE source of the resulting [`BuildSource`] AND, for
+/// `OriginMain`, the SHA written into provenance (`resolved_sha` from
+/// `prepare_worktree`, NOT a re-probe of the override dir).
+#[derive(Debug, Clone)]
+pub enum BuildSourceKind {
+    /// The live runner working tree (`state.config.project_dir`,
+    /// `build_dir_override == None`). Legacy default. SHA probed from the live
+    /// tree root.
+    LiveTree,
+    /// A supervisor-materialized `origin/main` worktree (the default primary
+    /// rebuild path). `build_dir_override` is the worktree's `src-tauri`; the
+    /// SHA is `prepare_worktree`'s `resolved_sha` (the exact origin/main commit
+    /// that was checked out), carried here so provenance records merged truth
+    /// rather than re-probing.
+    OriginMain { resolved_sha: String },
+    /// A foreign override tree the supervisor does not vouch for (spawn-test
+    /// `git_ref` / `worktree_path`). `build_dir_override` is its `src-tauri`;
+    /// SHA probed from that tree root. Excluded from LKG + non-temp start.
+    Override,
+}
+
+impl BuildSourceKind {
+    fn build_source(&self) -> BuildSource {
+        match self {
+            BuildSourceKind::LiveTree => BuildSource::LiveTree,
+            BuildSourceKind::OriginMain { .. } => BuildSource::OriginMain,
+            BuildSourceKind::Override => BuildSource::Override,
+        }
+    }
+}
+
 /// Run `cargo build` for the runner project.
 ///
 /// Claims a slot from the build pool (blocking on the semaphore if all slots
@@ -182,7 +227,7 @@ pub async fn run_cargo_build_with_requester(
     state: &SharedState,
     requester_id: Option<String>,
 ) -> Result<(), SupervisorError> {
-    run_cargo_build_with_dir(state, requester_id, None, false).await
+    run_cargo_build_with_dir(state, requester_id, None, false, BuildSourceKind::LiveTree).await
 }
 
 /// Run a cargo build, optionally compiling a source tree other than
@@ -204,11 +249,21 @@ pub async fn run_cargo_build_with_requester(
 /// serving the stale dist. `pnpm install` is still skipped when the
 /// `node_modules` marker is present. No effect on a live-tree build (no
 /// override).
+///
+/// `source_kind` (Phase B): the EXPLICIT provenance classification for the
+/// build, supplied by the caller rather than inferred from
+/// `build_dir_override`. It must be consistent with `build_dir_override`:
+/// `LiveTree` ⇔ `None`; `OriginMain { resolved_sha }` / `Override` ⇔
+/// `Some(src_tauri)`. The kind alone decides the recorded [`BuildSource`] and
+/// (for `OriginMain`) the recorded SHA — disambiguating a primary
+/// origin/main build from a spawn-test foreign override, which were
+/// indistinguishable by path alone.
 pub async fn run_cargo_build_with_dir(
     state: &SharedState,
     requester_id: Option<String>,
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
+    source_kind: BuildSourceKind,
 ) -> Result<(), SupervisorError> {
     // Thin wrapper: discard the per-attempt detail (slot id / full stderr) that
     // only the spawn-test self-heal path consumes, preserving the legacy
@@ -218,6 +273,7 @@ pub async fn run_cargo_build_with_dir(
         requester_id,
         build_dir_override,
         force_frontend_build,
+        source_kind,
     )
     .await
     .map(|_attempt| ())
@@ -239,6 +295,7 @@ pub async fn run_cargo_build_with_dir_detailed(
     requester_id: Option<String>,
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
+    source_kind: BuildSourceKind,
 ) -> Result<BuildAttempt, (SupervisorError, BuildAttempt)> {
     // Pre-permit disk guard (Phase 2): refuse a doomed build BEFORE consuming a
     // permit/slot when free disk is below the configured floor. The refusal
@@ -417,14 +474,17 @@ pub async fn run_cargo_build_with_dir_detailed(
 
         // Compute the provenance of THIS build ONCE — the SHA of the tree that
         // was actually compiled (the override worktree root when
-        // `build_dir_override` is set, else the live tree), whether the source
-        // was the live tree or an override, the absolute dir built, and the
-        // build time. This is the root fix for the 2026-06-05 incident: the
-        // legacy sidecar always probed the live tree's HEAD and so recorded
-        // the wrong SHA for an override build. The value is in scope for the
-        // sidecar write below AND for the `update_lkg_after_success` call
-        // (Phase 2's LKG gate consumes it).
-        let provenance = compute_build_provenance(state, build_dir_override.as_deref()).await;
+        // `build_dir_override` is set, else the live tree), classified by the
+        // caller's explicit `source_kind` (LiveTree / OriginMain / Override),
+        // the absolute dir built, and the build time. This is the root fix for
+        // the 2026-06-05 incident: the legacy sidecar always probed the live
+        // tree's HEAD and so recorded the wrong SHA for an override build; and
+        // (Phase B) the explicit kind disambiguates a primary origin/main build
+        // from a spawn-test foreign override, which share a `Some(src_tauri)`.
+        // The value is in scope for the sidecar write below AND for the
+        // `update_lkg_after_success` call (Phase 2's LKG gate consumes it).
+        let provenance =
+            compute_build_provenance(state, build_dir_override.as_deref(), &source_kind).await;
 
         // Stamp the slot's exe with this provenance so resolve_source_exe and
         // /builds can detect drift across slots (a fresh exe staged into one
@@ -1482,64 +1542,71 @@ pub(crate) async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> 
     }
 }
 
-/// Pure selection of `(source, tree_root)` for provenance: which tree root to
-/// probe and how to label the source.
+/// Pure selection of the tree ROOT to probe for provenance — which directory
+/// was actually compiled.
 ///
 /// `build_dir_override` and `project_dir` both point at a runner `src-tauri`
 /// dir, so the tree root is `.parent()` in both cases (the same relationship).
 /// On the degenerate no-parent case we fall back to the dir itself rather than
 /// panic — the SHA probe will then just fail and record `sha: None`.
+///
+/// NOTE: this no longer decides the [`BuildSource`]. The source classification
+/// is now carried explicitly by [`BuildSourceKind`] from the caller, because a
+/// `Some(src_tauri)` override can be either an `OriginMain` primary build or a
+/// foreign `Override` spawn-test — indistinguishable by path alone.
 fn provenance_tree_root(
     project_dir: &std::path::Path,
     build_dir_override: Option<&std::path::Path>,
-) -> (BuildSource, PathBuf) {
-    match build_dir_override {
-        Some(src_tauri) => (
-            BuildSource::Override,
-            src_tauri
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| src_tauri.to_path_buf()),
-        ),
-        None => (
-            BuildSource::LiveTree,
-            project_dir
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| project_dir.to_path_buf()),
-        ),
-    }
+) -> PathBuf {
+    let src_tauri = build_dir_override.unwrap_or(project_dir);
+    src_tauri
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| src_tauri.to_path_buf())
 }
 
 /// Compute the [`BuildProvenance`] of a just-completed successful build.
 ///
-/// The SHA is probed from the *tree that was actually built*:
-/// - `build_dir_override` set ⇒ the override worktree root
-///   (`build_dir_override.parent()`, since `build_dir_override` points at the
-///   tree's `src-tauri` dir — the same `dir.parent()` relationship the live
-///   tree uses via `project_dir.parent()`), `source = Override`.
-/// - `build_dir_override` `None` ⇒ the live tree root
-///   (`project_dir.parent()`), `source = LiveTree`.
+/// The recorded [`BuildSource`] comes from the caller's explicit `source_kind`
+/// (NOT inferred from `build_dir_override`), so a primary `OriginMain` build is
+/// distinguished from a spawn-test `Override` even though both carry a
+/// `Some(src_tauri)`.
 ///
-/// The git probe is best-effort and mirrors the legacy posture: a probe
-/// failure yields `sha: None` (logged as a warning) and the build still
-/// succeeds. `built_from` always records the absolute tree root that was
-/// probed, even when the SHA probe fails, so the forensic trail survives.
+/// The SHA:
+/// - `OriginMain { resolved_sha }` ⇒ the exact `origin/main` commit
+///   `prepare_worktree` checked out, recorded verbatim (no re-probe — the
+///   worktree's HEAD is already known and authoritative).
+/// - `LiveTree` / `Override` ⇒ probed from the tree root that was built
+///   (`build_dir_override.parent()` or `project_dir.parent()`). Best-effort,
+///   mirroring the legacy posture: a probe failure yields `sha: None` (logged
+///   as a warning) and the build still succeeds.
+///
+/// `built_from` always records the absolute tree root that was probed/built,
+/// even when the SHA probe fails, so the forensic trail survives.
 async fn compute_build_provenance(
     state: &SharedState,
     build_dir_override: Option<&std::path::Path>,
+    source_kind: &BuildSourceKind,
 ) -> BuildProvenance {
-    let (source, tree_root) = provenance_tree_root(&state.config.project_dir, build_dir_override);
+    let source = source_kind.build_source();
+    let tree_root = provenance_tree_root(&state.config.project_dir, build_dir_override);
 
-    let sha = match rev_parse_head(&tree_root).await {
-        Some(s) => Some(s),
-        None => {
-            warn!(
-                "Build provenance: git rev-parse HEAD failed or returned empty in {:?} \
-                 (source={:?}); recording sha=null. Build still succeeded.",
-                tree_root, source
-            );
-            None
+    let sha = match source_kind {
+        // origin/main worktree: the resolved SHA is already authoritative.
+        BuildSourceKind::OriginMain { resolved_sha } => Some(resolved_sha.clone()),
+        // live tree / foreign override: probe the built tree's HEAD.
+        BuildSourceKind::LiveTree | BuildSourceKind::Override => {
+            match rev_parse_head(&tree_root).await {
+                Some(s) => Some(s),
+                None => {
+                    warn!(
+                        "Build provenance: git rev-parse HEAD failed or returned empty in {:?} \
+                         (source={:?}); recording sha=null. Build still succeeded.",
+                        tree_root, source
+                    );
+                    None
+                }
+            }
         }
     };
 
@@ -2333,10 +2400,13 @@ async fn prewarm_single_slot(
 /// the LKG exe or sidecar. This is the root fix for the 2026-06-05 incident
 /// where a branch build was promoted to LKG and a restart deployed it to the
 /// primary. Because the gate consumes the same `provenance` value the slot
-/// sidecar was written from, the writer and the gate can never disagree.
-/// Consequently every `lkg.json` written here records `source: "live_tree"`
-/// — taken from `provenance.source`, not hard-coded, so the record is honest
-/// by construction.
+/// sidecar was written from, the writer and the gate can never disagree. The
+/// gate is `BuildSource::is_vouched()` — `LiveTree` AND `OriginMain` are both
+/// promoted (an origin/main primary build SHOULD advance LKG); only `Override`
+/// is skipped. Consequently every `lkg.json` written here records
+/// `source: "live_tree"` or `source: "origin_main"` — taken from
+/// `provenance.source`, not hard-coded, so the record is honest by
+/// construction.
 ///
 /// Both writes go through a temp-file + atomic rename so a crash partway
 /// through cannot leave the LKG dir holding a torn binary or a sidecar that
@@ -2354,7 +2424,9 @@ async fn update_lkg_after_success(
     // LKG promotion gate: an override build of a foreign tree must never
     // become the deploy fallback. The slot sidecar was still written by the
     // caller (Phase 1 behavior unchanged) — only LKG promotion is skipped.
-    if provenance.source == BuildSource::Override {
+    // `is_vouched()` promotes both LiveTree and OriginMain (a default primary
+    // origin/main build SHOULD advance LKG); only Override is excluded.
+    if !provenance.source.is_vouched() {
         info!(
             "skipping LKG promotion (override build of {})",
             provenance.built_from
@@ -2478,7 +2550,8 @@ mod tests {
     use super::{
         classify_build_stderr, dist_index_ok, needs_frontend_prebuild, provenance_tree_root,
         rev_parse_head, stderr_submission_tail, update_lkg_after_success, verify_frontend_built,
-        BuildProvenance, BuildSource, StderrClass, LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
+        BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
+        LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::state::{SharedState, SupervisorState};
@@ -2514,23 +2587,22 @@ mod tests {
     }
 
     /// `provenance_tree_root` selects `.parent()` of the live `project_dir`
-    /// and labels it `LiveTree` when there's no override.
+    /// when there's no override. (Source classification is no longer the
+    /// function's job — it comes from `BuildSourceKind`.)
     #[test]
     fn provenance_tree_root_live_tree() {
         let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
-        let (source, root) = provenance_tree_root(project_dir, None);
-        assert_eq!(source, BuildSource::LiveTree);
+        let root = provenance_tree_root(project_dir, None);
         assert_eq!(root, std::path::Path::new("/ws/qontinui-runner"));
     }
 
-    /// `provenance_tree_root` selects `.parent()` of the OVERRIDE src-tauri and
-    /// labels it `Override` — ignoring `project_dir` entirely.
+    /// `provenance_tree_root` selects `.parent()` of the OVERRIDE src-tauri,
+    /// ignoring `project_dir` entirely.
     #[test]
     fn provenance_tree_root_override() {
         let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
         let over = std::path::Path::new("/ws/.spawn-feat/qontinui-runner/src-tauri");
-        let (source, root) = provenance_tree_root(project_dir, Some(over));
-        assert_eq!(source, BuildSource::Override);
+        let root = provenance_tree_root(project_dir, Some(over));
         assert_eq!(
             root,
             std::path::Path::new("/ws/.spawn-feat/qontinui-runner")
@@ -2560,17 +2632,14 @@ mod tests {
         assert_ne!(live_sha, over_sha, "fixture must produce distinct HEADs");
 
         // Live-tree selection probes the live tree's HEAD.
-        let (live_source, live_probe_root) = provenance_tree_root(&live_src_tauri, None);
-        assert_eq!(live_source, BuildSource::LiveTree);
+        let live_probe_root = provenance_tree_root(&live_src_tauri, None);
         assert_eq!(
             rev_parse_head(&live_probe_root).await,
             Some(live_sha.clone())
         );
 
         // Override selection probes the OVERRIDE tree's HEAD — the bug fix.
-        let (over_source, over_probe_root) =
-            provenance_tree_root(&live_src_tauri, Some(over_src_tauri.as_path()));
-        assert_eq!(over_source, BuildSource::Override);
+        let over_probe_root = provenance_tree_root(&live_src_tauri, Some(over_src_tauri.as_path()));
         assert_eq!(
             rev_parse_head(&over_probe_root).await,
             Some(over_sha.clone()),
@@ -2837,6 +2906,15 @@ mod tests {
         }
     }
 
+    fn origin_main_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
+        BuildProvenance {
+            sha: sha.map(str::to_string),
+            source: BuildSource::OriginMain,
+            built_from: built_from.to_string(),
+            built_at: "2026-06-07T00:00:00Z".to_string(),
+        }
+    }
+
     /// Live-tree build promotes: the LKG exe is written with the slot's bytes
     /// and `lkg.json` records `sha` + `"source":"live_tree"`. Also asserts the
     /// in-memory `last_known_good` lock is populated from the same provenance.
@@ -2953,6 +3031,90 @@ mod tests {
             state.build_pool.last_known_good.read().await.is_none(),
             "override build must NOT populate the last_known_good lock"
         );
+    }
+
+    /// Phase B: an `origin_main` build IS promoted to LKG (it is vouched, unlike
+    /// `override`). The LKG exe carries the slot bytes and `lkg.json` records
+    /// `"source":"origin_main"` + the resolved sha. This is the fix for the
+    /// stale-LKG symptom: an origin/main primary build SHOULD advance LKG.
+    #[tokio::test]
+    async fn origin_main_build_promotes_to_lkg() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon root");
+        let state = lkg_test_state(&root);
+        stage_slot0_exe(&state, b"fresh-origin-main-bytes");
+
+        let slot = state.build_pool.slots[0].clone();
+        let prov = origin_main_provenance(
+            Some("0a1b2c3d4e5f"),
+            "/ws/.spawn-origin-main/qontinui-runner",
+        );
+
+        update_lkg_after_success(&state, &slot, &prov)
+            .await
+            .expect("origin/main build must promote to LKG");
+
+        // Exe promoted with the slot's bytes.
+        let lkg_exe = state.config.lkg_exe_path();
+        assert_eq!(
+            fs::read(&lkg_exe).expect("read lkg exe"),
+            b"fresh-origin-main-bytes",
+            "LKG exe must carry the promoted origin/main slot bytes"
+        );
+
+        // Sidecar records sha + source=origin_main from provenance.
+        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
+        assert_eq!(meta["sha"], "0a1b2c3d4e5f", "lkg.json must record sha");
+        assert_eq!(
+            meta["source"], "origin_main",
+            "lkg.json must record source=origin_main, got {meta_raw}"
+        );
+
+        // In-memory lock hydrated from the same provenance.
+        let lkg = state.build_pool.last_known_good.read().await.clone();
+        let lkg = lkg.expect("last_known_good must be populated after origin/main promote");
+        assert_eq!(lkg.sha.as_deref(), Some("0a1b2c3d4e5f"));
+        assert_eq!(lkg.source, BuildSource::OriginMain);
+    }
+
+    /// The `from_working_tree` flag selects the build's source classification:
+    /// the working-tree path uses `BuildSourceKind::LiveTree` ⇒ `live_tree`;
+    /// the default origin/main path uses
+    /// `BuildSourceKind::OriginMain { resolved_sha }` ⇒ `origin_main`. This is
+    /// the pure classification seam the primary rebuild path threads — the kind
+    /// alone decides the recorded `BuildSource`, disambiguating an origin/main
+    /// primary build from a spawn-test override (both `Some(src_tauri)`).
+    #[test]
+    fn build_source_kind_classifies_working_tree_vs_origin_main() {
+        // from_working_tree:true → live tree.
+        assert_eq!(
+            BuildSourceKind::LiveTree.build_source(),
+            BuildSource::LiveTree
+        );
+        // from_working_tree:false (default) → origin/main.
+        assert_eq!(
+            BuildSourceKind::OriginMain {
+                resolved_sha: "deadbeef".to_string(),
+            }
+            .build_source(),
+            BuildSource::OriginMain
+        );
+        // spawn-test foreign override stays Override (unchanged).
+        assert_eq!(
+            BuildSourceKind::Override.build_source(),
+            BuildSource::Override
+        );
+
+        // The vouched predicate: working-tree + origin/main promote; override
+        // does not.
+        assert!(BuildSourceKind::LiveTree.build_source().is_vouched());
+        assert!(BuildSourceKind::OriginMain {
+            resolved_sha: "x".to_string()
+        }
+        .build_source()
+        .is_vouched());
+        assert!(!BuildSourceKind::Override.build_source().is_vouched());
     }
 
     // ---------- Issue 3: stderr classifier + submission tail ----------
