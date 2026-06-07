@@ -1400,12 +1400,21 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         Some(s) if !s.is_empty() => s,
         _ => return,
     };
-    let origin_main = match run_git(&["rev-parse", "origin/main"], &git_dir).await {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
-    };
 
-    if head == origin_main {
+    // Phase A: compute the full drift (behind-count + ancestor test) rather
+    // than the old short-sha equality. `origin_main_drift` fetches origin first
+    // (best-effort, offline-tolerant) so the origin/main ref is fresh — a stale
+    // local origin/main is exactly how the 2026-06-07 incident hid the
+    // regression.
+    let drift = crate::git_provenance::origin_main_drift(&git_dir, &head).await;
+
+    // Not computable (no remote / no origin/main / not a repo) ⇒ skip silently,
+    // preserving the legacy best-effort tolerance.
+    if drift.origin_main_sha.is_empty() {
+        return;
+    }
+    // Up to date ⇒ nothing to warn about.
+    if drift.is_up_to_date() {
         return;
     }
 
@@ -1414,14 +1423,29 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(unknown)".to_string());
 
-    let head_short: String = head.chars().take(12).collect();
-    let main_short: String = origin_main.chars().take(12).collect();
+    let head_short: String = drift.built_sha.chars().take(12).collect();
+    let main_short: String = drift.origin_main_sha.chars().take(12).collect();
 
+    // `is_ancestor == false` is the more dangerous case (diverged / parked on a
+    // feature branch); `is_ancestor == true && behind_count > 0` is the
+    // clean-but-stale incident shape.
+    let drift_kind = if drift.is_diverged() {
+        "DIVERGED from"
+    } else {
+        "behind"
+    };
     let msg = format!(
-        "Slot {}: working tree HEAD ({}, branch={}) differs from origin/main ({}). \
-         This build will compile {}, NOT main. Read `git_sha` from the spawn response \
-         to confirm what actually ran. See qontinui-supervisor#21.",
-        slot_id, head_short, branch, main_short, head_short
+        "Slot {}: working tree HEAD ({}, branch={}) is {} origin/main ({}) by {} commit(s) \
+         (diverged={}). This build will compile {}, NOT main. Read `git_sha` from the spawn \
+         response to confirm what actually ran. See qontinui-supervisor#21.",
+        slot_id,
+        head_short,
+        branch,
+        drift_kind,
+        main_short,
+        drift.behind_count,
+        drift.is_diverged(),
+        head_short
     );
     warn!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
@@ -1429,7 +1453,10 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
 
 /// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
 /// (git missing, not a repo, detached HEAD with no SHA, etc.). Best-effort.
-async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
+///
+/// `pub(crate)` so the detached rebuild path (`routes/runner.rs`, Phase A4) can
+/// resolve the just-built primary sha to evaluate origin/main drift against it.
+pub(crate) async fn rev_parse_head(git_dir: &std::path::Path) -> Option<String> {
     let outcome = GuardedCommand::new(
         "git",
         Duration::from_secs(crate::config::git_timeout_secs()),

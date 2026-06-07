@@ -258,11 +258,65 @@ pub async fn restart_runner(
                     }
                 }
 
+                // Phase A4: the rebuild is detached, so the resolved built sha
+                // does not exist when the 202 was sent. Evaluate origin/main
+                // drift HERE (on the live-tree HEAD that was just built) and
+                // attach it to the recorded outcome body — it surfaces via
+                // `GET /build/{id}/status` and seeds the next `GET /builds`.
+                // `warn!` is the loud signal for the rebuild path. Best-effort:
+                // a non-repo / missing remote yields `null` and never fails the
+                // restart.
+                let drift_json = match exec_state.config.project_dir.parent() {
+                    Some(repo_root) => {
+                        let head = crate::build_monitor::rev_parse_head(repo_root).await;
+                        match head {
+                            Some(sha) => {
+                                let drift =
+                                    crate::git_provenance::origin_main_drift(repo_root, &sha).await;
+                                if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
+                                    serde_json::Value::Null
+                                } else {
+                                    let msg = format!(
+                                        "Detached rebuild-restart: the just-built primary sha {} \
+                                         is {} origin/main ({}) by {} commit(s) (diverged={}). \
+                                         The primary may NOT be running latest main.",
+                                        drift.built_sha.chars().take(12).collect::<String>(),
+                                        if drift.is_diverged() {
+                                            "DIVERGED from"
+                                        } else {
+                                            "behind"
+                                        },
+                                        drift.origin_main_sha.chars().take(12).collect::<String>(),
+                                        drift.behind_count,
+                                        drift.is_diverged(),
+                                    );
+                                    tracing::warn!("{}", msg);
+                                    exec_state
+                                        .logs
+                                        .emit(LogSource::Build, LogLevel::Warn, msg)
+                                        .await;
+                                    serde_json::json!({
+                                        "built_sha": drift.built_sha,
+                                        "origin_main_sha": drift.origin_main_sha,
+                                        "behind_count": drift.behind_count,
+                                        "is_ancestor": drift.is_ancestor,
+                                        "diverged": drift.is_diverged(),
+                                        "fetched": drift.fetched,
+                                    })
+                                }
+                            }
+                            None => serde_json::Value::Null,
+                        }
+                    }
+                    None => serde_json::Value::Null,
+                };
+
                 (
                     StatusCode::OK.as_u16(),
                     serde_json::json!({
                         "status": "restarted",
                         "message": "Runner restarted successfully (with rebuild)",
+                        "origin_main_drift": drift_json,
                     }),
                 )
             },

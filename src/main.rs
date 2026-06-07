@@ -26,6 +26,7 @@ mod fleet;
 // (returns 404 → warn-once + skip). See `src/flywheel.rs`.
 mod flywheel;
 mod fs_atomic;
+mod git_provenance;
 mod health_cache;
 mod log_capture;
 mod otel;
