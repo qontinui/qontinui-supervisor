@@ -10,6 +10,7 @@ import VelocityTest from './pages/VelocityTest';
 import VelocityImprovement from './pages/VelocityImprovement';
 import RunnerMonitor from './pages/RunnerMonitor';
 import Fleet from './pages/Fleet';
+import Lineage from './pages/Lineage';
 import {
   UIBridgeProvider,
   AutoRegisterProvider,
@@ -77,6 +78,11 @@ export default function App() {
                 </NavLink>
               </li>
               <li>
+                <NavLink to="/lineage" className={({ isActive }) => (isActive ? 'active' : '')}>
+                  Lineage
+                </NavLink>
+              </li>
+              <li>
                 <NavLink to="/evaluation" className={({ isActive }) => (isActive ? 'active' : '')}>
                   Evaluation
                 </NavLink>
@@ -109,6 +115,7 @@ export default function App() {
               <Route path="/velocity/trace" element={<VelocityTrace />} />
               <Route path="/runner-monitor" element={<RunnerMonitor />} />
               <Route path="/fleet" element={<Fleet />} />
+              <Route path="/lineage" element={<Lineage />} />
               <Route path="/evaluation" element={<Evaluation />} />
               <Route path="/evaluation/run/:id" element={<EvalRunDetail />} />
               <Route path="/velocity-tests" element={<VelocityTest />} />

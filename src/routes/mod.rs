@@ -8,6 +8,7 @@ pub mod evaluation;
 pub mod expo;
 pub mod graphql_proxy;
 pub mod health;
+pub mod lineage;
 pub mod lkg_coverage;
 pub mod logs;
 pub mod runner;

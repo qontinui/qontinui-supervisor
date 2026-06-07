@@ -639,6 +639,46 @@ export interface WebFleetRunner {
   created_at: string;
 }
 
+// Commit ↔ session lineage types. Proxied through the supervisor to coord's
+// /coord/lineage/* endpoints (see src/routes/lineage.rs). Field names are
+// snake_case on the wire (coord serializes with default serde). The contract
+// is FIXED by the coord-side parallel agent — code against it as listed.
+export interface LineageRow {
+  commit_sha: string;
+  repo: string;
+  branch: string | null;
+  pr_number: number | null;
+  agent_session_id: string | null;
+  session_name: string | null;
+  source: string;
+  recorded_at: string;
+}
+
+export interface LineageStats {
+  totals: {
+    commits: number;
+    attributed: number;
+    sessions: number;
+    repos: number;
+  };
+  by_source: { source: string; commits: number }[];
+  top_sessions: {
+    agent_session_id: string;
+    session_name: string | null;
+    commits: number;
+    last_commit_at: string | null;
+  }[];
+  by_repo_day: { repo: string; day: string; commits: number; sessions: number }[];
+}
+
+// `GET /coord/commits/{sha}/session` — the single session that produced a SHA.
+export interface CommitSession {
+  agent_session_id: string | null;
+  session_name: string | null;
+  source: string | null;
+  [key: string]: unknown;
+}
+
 // Runner Monitor types
 export interface RunnerTaskRun {
   id: string;
@@ -877,10 +917,9 @@ export const api = {
   // (e.g. "401 invalid signature", "404 user not found") rather than just the
   // HTTP status line.
   webFleet: async (backendUrl: string, jwt: string): Promise<WebFleetRunner[]> => {
-    const res = await fetch(
-      `/web-fleet?backend_url=${encodeURIComponent(backendUrl)}`,
-      { headers: { Authorization: `Bearer ${jwt}` } },
-    );
+    const res = await fetch(`/web-fleet?backend_url=${encodeURIComponent(backendUrl)}`, {
+      headers: { Authorization: `Bearer ${jwt}` },
+    });
     const text = await res.text();
     if (!res.ok) {
       // Try to extract `error` from JSON body; fall back to plain text or
@@ -910,6 +949,14 @@ export const api = {
       );
     }
   },
+
+  // Commit ↔ session lineage (proxied to coord)
+  lineageRecent: (limit = 100) => fetchJson<LineageRow[]>(`/lineage/recent?limit=${limit}`),
+  lineageStats: () => fetchJson<LineageStats>('/lineage/stats'),
+  lineageSessionCommits: (id: string) =>
+    fetchJson<LineageRow[]>(`/lineage/sessions/${encodeURIComponent(id)}/commits`),
+  lineageCommitSession: (sha: string) =>
+    fetchJson<CommitSession>(`/lineage/commits/${encodeURIComponent(sha)}/session`),
 
   // Expo
   expoStart: () => fetchJson<unknown>('/expo/start', { method: 'POST' }),
