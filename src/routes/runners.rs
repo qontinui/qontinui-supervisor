@@ -1827,9 +1827,9 @@ pub async fn spawn_test(
     let worktree_label = state.config.project_dir.clone();
     let (submission_id, sub_arc) =
         crate::build_submissions::submit_spawn(store, worktree_label, agent_id, port, async move {
-            let (status, body_json) =
+            let (status, body_json, stderr_tail) =
                 execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
-            (status.as_u16(), body_json)
+            (status.as_u16(), body_json, stderr_tail)
         });
 
     if want_async {
@@ -1908,10 +1908,29 @@ async fn execute_spawn_build(
     port: u16,
     managed: Arc<ManagedRunner>,
     no_wait: bool,
-) -> (axum::http::StatusCode, serde_json::Value) {
-    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait).await {
-        Ok((status, body)) => (status, body),
-        Err(e) => e.to_status_body(),
+) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
+    // Issue 3 fix part 1: `execute_spawn_build_inner` writes the FULL cargo
+    // stderr of a failed build pool invocation here (a generous tail, split
+    // into lines) so it can be threaded onto the build submission's
+    // `stderr_tail` and recovered via `GET /build/{id}/status`. Empty when the
+    // build succeeded or there was no cargo failure.
+    let mut build_stderr_tail: Vec<String> = Vec::new();
+    match execute_spawn_build_inner(
+        &state,
+        body,
+        &id,
+        port,
+        &managed,
+        no_wait,
+        &mut build_stderr_tail,
+    )
+    .await
+    {
+        Ok((status, body)) => (status, body, build_stderr_tail),
+        Err(e) => {
+            let (status, body) = e.to_status_body();
+            (status, body, build_stderr_tail)
+        }
     }
 }
 
@@ -1925,6 +1944,7 @@ async fn execute_spawn_build_inner(
     port: u16,
     managed: &Arc<ManagedRunner>,
     no_wait: bool,
+    build_stderr_tail: &mut Vec<String>,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
@@ -2162,31 +2182,141 @@ async fn execute_spawn_build_inner(
         // silently embed stale dist). Only meaningful for an override tree —
         // it was already guarded to require a provenance selector, and the
         // build below only carries an override when git_ref/worktree_path set.
-        let build_fut = crate::build_monitor::run_cargo_build_with_dir(
-            state,
-            body.requester_id.clone(),
-            build_dir_override,
-            body.frontend_only,
-        );
-        let build_result = match body.queue_timeout_secs {
-            Some(secs) => {
-                let timeout = std::time::Duration::from_secs(secs);
-                match tokio::time::timeout(timeout, build_fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(SupervisorError::Timeout(format!(
-                        "Build queue timeout: waited {}s for a build slot",
-                        secs
-                    ))),
+        // Issue 3: drive the build through the detailed entry point so a
+        // FAILURE returns the slot id + full cargo stderr alongside the error.
+        // This powers (1) surfacing the real compiler error through
+        // `GET /build/{id}/status` and (2) a poisoned-slot self-heal retry.
+        // `build_dir_override` is cloned so it survives a retry invocation.
+        let requester_id = body.requester_id.clone();
+        let frontend_only = body.frontend_only;
+        let queue_timeout_secs = body.queue_timeout_secs;
+        let run_detailed = |override_dir: Option<std::path::PathBuf>| {
+            let requester = requester_id.clone();
+            async move {
+                let fut = crate::build_monitor::run_cargo_build_with_dir_detailed(
+                    state,
+                    requester,
+                    override_dir,
+                    frontend_only,
+                );
+                match queue_timeout_secs {
+                    Some(secs) => {
+                        let timeout = std::time::Duration::from_secs(secs);
+                        match tokio::time::timeout(timeout, fut).await {
+                            Ok(r) => r,
+                            Err(_) => Err((
+                                SupervisorError::Timeout(format!(
+                                    "Build queue timeout: waited {}s for a build slot",
+                                    secs
+                                )),
+                                crate::build_monitor::BuildAttempt::default(),
+                            )),
+                        }
+                    }
+                    None => fut.await,
                 }
             }
-            None => build_fut.await,
         };
+
+        let mut build_result = run_detailed(build_dir_override.clone()).await;
+
+        // Poisoned-slot self-heal (Issue 3 fix part 2). On a build FAILURE
+        // whose stderr is NOT a genuine compiler diagnostic (no `error[E####]`,
+        // no `could not compile`), the failure is almost certainly stale/
+        // poisoned incremental state in the claimed slot — NOT a code error.
+        // An isolated clean `cargo build` of the same tree succeeds. Clean that
+        // exact slot's `CARGO_TARGET_DIR` and retry the build ONCE before
+        // surfacing the 500. A genuine compiler error returns immediately (no
+        // wasteful retry). Both outcomes are logged via `tracing`.
+        if let Err((_, ref attempt)) = build_result {
+            let stderr_for_class = attempt.full_stderr.clone().unwrap_or_default();
+            let class = crate::build_monitor::classify_build_stderr(&stderr_for_class);
+            if class == crate::build_monitor::StderrClass::Environmental {
+                if let Some(slot_id) = attempt.slot_id {
+                    if let Some(slot) = state.build_pool.slots.get(slot_id).cloned() {
+                        tracing::warn!(
+                            slot_id,
+                            "spawn-test build failed with no compiler diagnostic in stderr; \
+                             treating as a poisoned slot and retrying ONCE in a cleaned slot \
+                             (requester={:?}, git_ref={:?})",
+                            body.requester_id,
+                            body.git_ref
+                        );
+                        state
+                            .logs
+                            .emit(
+                                LogSource::Supervisor,
+                                LogLevel::Warn,
+                                format!(
+                                    "spawn-test: slot {} build failure is environmental (no compiler diagnostic); cleaning slot + retrying once",
+                                    slot_id
+                                ),
+                            )
+                            .await;
+                        match crate::build_monitor::clean_slot_target(&slot).await {
+                            Ok(freed) => tracing::info!(
+                                slot_id,
+                                bytes_freed = freed,
+                                "cleaned poisoned slot before spawn-test retry"
+                            ),
+                            Err(e) => tracing::warn!(
+                                slot_id,
+                                "failed to clean poisoned slot {} before retry: {} (retrying anyway)",
+                                slot_id,
+                                e
+                            ),
+                        }
+                        let retry = run_detailed(build_dir_override.clone()).await;
+                        match &retry {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "spawn-test poisoned-slot retry SUCCEEDED after cleaning slot {}",
+                                    slot_id
+                                );
+                                state
+                                    .logs
+                                    .emit(
+                                        LogSource::Supervisor,
+                                        LogLevel::Info,
+                                        format!(
+                                            "spawn-test: poisoned-slot retry succeeded after cleaning slot {}",
+                                            slot_id
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err((e, _)) => {
+                                tracing::warn!(
+                                    "spawn-test poisoned-slot retry FAILED after cleaning slot {}: {}",
+                                    slot_id,
+                                    e
+                                );
+                            }
+                        }
+                        build_result = retry;
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "spawn-test build failed with a compiler diagnostic; returning immediately (no poisoned-slot retry)"
+                );
+            }
+        }
+
         match build_result {
-            Ok(()) => {
+            Ok(_attempt) => {
                 build_attempted = true;
                 build_succeeded = Some(true);
             }
-            Err(mut e) => {
+            Err((mut e, attempt)) => {
+                // Issue 3 fix part 1: surface the FULL cargo stderr (a generous
+                // tail, split into lines) onto the build submission's
+                // `stderr_tail` so `GET /build/{id}/status` returns the real
+                // compiler error instead of an empty/2KB-truncated tail.
+                if let Some(full) = &attempt.full_stderr {
+                    let tail = crate::build_monitor::stderr_submission_tail(full);
+                    *build_stderr_tail = tail.lines().map(|l| l.to_string()).collect();
+                }
                 // Item 1(b) — drift diagnostic. With pinned-schemas isolation
                 // a build failure should reference only files inside the spawn
                 // container. If the cargo error references a path OUTSIDE the
