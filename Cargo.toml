@@ -44,6 +44,16 @@ glob = "0.3"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
+# Phase 5 (`plans/2026-06-07-twin-dev-event-cause-effect-ledger.md` §11):
+# seedable RNG for the dev-action mock replay executor
+# (`dev_action::mock::MockActionExecutor`). `StdRng` + `SeedableRng` give a
+# byte-reproducible candidate-selection sequence from a fixed seed so CI mock
+# runs are deterministic. Version pinned to the workspace's already-resolved
+# 0.9 line (see Cargo.lock) to avoid pulling a second major. Default features
+# (std + the `thread_rng`/`os_rng` machinery) are unused by the seeded path but
+# harmless; `MockActionExecutor` is a non-test public item so this must be a
+# normal dependency, not dev-only.
+rand = "0.9"
 qontinui-types = { path = "../qontinui-schemas/rust", version = ">=0.1.2, <2.0.0" }
 qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client", version = ">=0.1.1, <2.0.0" }
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
