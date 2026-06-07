@@ -20,6 +20,7 @@
 pub mod attribution;
 pub mod expectations;
 pub mod ingest;
+pub mod mock;
 pub mod record;
 pub mod states;
 
