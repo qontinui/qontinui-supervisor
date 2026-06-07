@@ -918,22 +918,94 @@ pub async fn stop_runner(
 
 /// POST /runners/{id}/restart — restart a specific runner.
 /// Protected runners require `force: true` in the request body.
+///
+/// **`rebuild: true` is detached from the HTTP connection** (mirrors the
+/// primary `/runner/restart` path in `routes/runner.rs`). A per-id rebuild runs
+/// a full `cargo build` (~10-30 min when cold/wedged); running it inline blocked
+/// the HTTP request for the whole build and a client disconnect could abandon it
+/// mid-flight. The stop → build → start sequence now runs detached via the
+/// #63 build-submissions state machine ([`submit_detached`], same seam
+/// `/runner/fix-and-rebuild` uses). We return **202** + a `build_id` in ~1s;
+/// callers poll `GET /builds` (or `GET /build/{id}/status`) for the terminal
+/// outcome, and the existing detached completion logic triggers the restart.
 pub async fn restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(body): Json<RestartRunnerRequest>,
-) -> Result<impl IntoResponse, SupervisorError> {
+) -> Result<axum::response::Response, SupervisorError> {
     let source = match body.source.as_str() {
         "watchdog" => crate::diagnostics::RestartSource::Watchdog,
         _ => crate::diagnostics::RestartSource::Manual,
     };
 
-    manager::restart_runner_by_id(&state, &id, body.rebuild, source, body.force).await?;
+    // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
+    if body.rebuild {
+        let exec_state = state.clone();
+        let force = body.force;
+        let runner_id = id.clone();
+        let (submission_id, _arc) = crate::build_submissions::submit_detached(
+            state.build_submissions.clone(),
+            state.config.project_dir.clone(),
+            None,
+            async move {
+                // The exact stop → build → start sequence the handler used to
+                // await inline. Errors are surfaced in the (status, body)
+                // result so they land in /builds — never silently dropped.
+                if let Err(e) =
+                    manager::restart_runner_by_id(&exec_state, &runner_id, true, source, force)
+                        .await
+                {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Error,
+                            format!("Detached rebuild-restart of '{}' failed: {}", runner_id, e),
+                        )
+                        .await;
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                            "runner_id": runner_id,
+                        }),
+                    );
+                }
+
+                (
+                    axum::http::StatusCode::OK.as_u16(),
+                    json!({
+                        "status": "restarted",
+                        "message": format!("Runner '{}' restarted (with rebuild)", runner_id),
+                    }),
+                )
+            },
+        );
+
+        return Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "rebuilding",
+                "build_id": submission_id.to_string(),
+                "submission_id": submission_id.to_string(),
+                "poll": "/builds",
+                "message": "rebuild-restart submitted; the build+restart runs detached from \
+                            this connection — poll GET /builds (or GET /build/{id}/status) \
+                            for the terminal outcome",
+            })),
+        )
+            .into_response());
+    }
+
+    // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
+    manager::restart_runner_by_id(&state, &id, false, source, body.force).await?;
 
     Ok(Json(json!({
         "status": "restarted",
         "message": format!("Runner '{}' restarted", id)
-    })))
+    }))
+    .into_response())
 }
 
 /// POST /runners/{id}/rebuild-and-restart — stop → cargo build → start, in
@@ -943,13 +1015,67 @@ pub async fn restart_runner(
 /// cargo error directly (no automatic stale-fallback — callers who want
 /// that should pair `spawn-test {allow_stale_fallback: true}` with their
 /// own restart logic).
+///
+/// **Detached from the HTTP connection** (mirrors the primary `/runner/restart`
+/// rebuild path). The cargo build is ~10-30 min; running it inline blocked the
+/// request for the whole build and a client disconnect could abandon it
+/// mid-flight. The stop → build → start sequence now runs detached via the
+/// #63 build-submissions state machine ([`submit_detached`]). We return **202**
+/// and a `build_id` immediately; callers poll `GET /builds` (or `GET
+/// /build/{id}/status`) for the terminal outcome (which carries the full
+/// `build_result` body the inline path used to return synchronously).
 pub async fn rebuild_and_restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(body): Json<RebuildAndRestartRequest>,
-) -> Result<Json<serde_json::Value>, SupervisorError> {
-    let outcome = manager::rebuild_and_restart_by_id(&state, &id, body).await?;
-    Ok(Json(outcome))
+) -> Result<axum::response::Response, SupervisorError> {
+    let exec_state = state.clone();
+    let runner_id = id.clone();
+    let (submission_id, _arc) = crate::build_submissions::submit_detached(
+        state.build_submissions.clone(),
+        state.config.project_dir.clone(),
+        None,
+        async move {
+            match manager::rebuild_and_restart_by_id(&exec_state, &runner_id, body).await {
+                Ok(outcome) => (axum::http::StatusCode::OK.as_u16(), outcome),
+                Err(e) => {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Error,
+                            format!(
+                                "Detached rebuild-and-restart of '{}' failed: {}",
+                                runner_id, e
+                            ),
+                        )
+                        .await;
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                            "runner_id": runner_id,
+                        }),
+                    )
+                }
+            }
+        },
+    );
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "rebuilding",
+            "build_id": submission_id.to_string(),
+            "submission_id": submission_id.to_string(),
+            "poll": "/builds",
+            "message": "rebuild-and-restart submitted; the build+restart runs detached from \
+                        this connection — poll GET /builds (or GET /build/{id}/status) for the \
+                        terminal outcome",
+        })),
+    )
+        .into_response())
 }
 
 /// POST /runners/{id}/watchdog — control per-runner watchdog.

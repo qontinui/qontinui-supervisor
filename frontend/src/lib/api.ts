@@ -263,6 +263,31 @@ export interface LogFileResponse {
   lines: number;
 }
 
+/// 202 body returned by the detached rebuild paths
+/// (`/runner/restart {rebuild:true}`, `/runners/{id}/restart {rebuild:true}`,
+/// `/runners/{id}/rebuild-and-restart`). The build+restart runs detached; poll
+/// `build_id` via `GET /build/{id}/status` for the terminal outcome.
+export interface DetachedBuildResponse {
+  status: string; // "rebuilding" for the 202, "restarted" for the sync no-rebuild path
+  build_id?: string;
+  submission_id?: string;
+  poll?: string;
+  message?: string;
+}
+
+/// `GET /build/{id}/status` body. `status.state` discriminates the lifecycle.
+export interface BuildSubmissionStatus {
+  id: string;
+  status: {
+    state: 'queued' | 'running' | 'succeeded' | 'failed';
+    started_at?: string;
+    finished_at?: string;
+    duration_secs?: number;
+    exit_code?: number | null;
+    error?: string;
+  };
+}
+
 export interface ExpoStatus {
   running: boolean;
   pid: number | null;
@@ -728,7 +753,7 @@ export const api = {
   // Supervisor
   health: () => fetchJson<HealthResponse>('/health'),
   runnerRestart: (rebuild: boolean) =>
-    fetchJson<unknown>('/runner/restart', {
+    fetchJson<DetachedBuildResponse>('/runner/restart', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rebuild }),
@@ -775,11 +800,15 @@ export const api = {
   stopRunner: (id: string) =>
     fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
   restartRunnerById: (id: string, rebuild: boolean) =>
-    fetchJson<unknown>(`/runners/${encodeURIComponent(id)}/restart`, {
+    fetchJson<DetachedBuildResponse>(`/runners/${encodeURIComponent(id)}/restart`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rebuild, source: 'manual' }),
     }),
+  // GET /build/:id/status — poll a detached build submission's state.
+  // `status.state` is one of queued | running | succeeded | failed.
+  buildStatus: (id: string) =>
+    fetchJson<BuildSubmissionStatus>(`/build/${encodeURIComponent(id)}/status`),
   removeRunner: (id: string) =>
     fetchJson<unknown>(`/runners/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   spawnInstance: (name: string, port: number) =>

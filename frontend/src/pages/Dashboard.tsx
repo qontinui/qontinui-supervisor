@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useUIElement } from '@qontinui/ui-bridge/react';
 import {
   api,
+  DetachedBuildResponse,
   HealthResponse,
   DevStartResponse,
   ExpoStatus,
@@ -539,6 +540,11 @@ function StaleBinaryBadge({
 interface RunnerRowProps {
   runner: RunnerInstance;
   busy: string | null;
+  /// Live build phase label while a detached rebuild is in flight for this
+  /// runner (e.g. "Building...", "Build queued..."). Null when not building.
+  /// Driven off `GET /build/{id}/status` polling, NOT the synchronous HTTP
+  /// call (which now returns 202 in ~1s).
+  buildingLabel?: string | null;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -550,6 +556,7 @@ interface RunnerRowProps {
 function RunnerRow({
   runner: r,
   busy,
+  buildingLabel,
   onStart,
   onStop,
   onRestart,
@@ -559,6 +566,11 @@ function RunnerRow({
 }: RunnerRowProps) {
   const isUp = r.running || r.api_responding;
   const isPrimary = r.kind.type === 'primary';
+  // A detached rebuild for this runner is in flight (driven off /build/:id/status
+  // polling). While building, every action button stays disabled and the Rebuild
+  // button shows the live phase label instead of freezing on "Rebuilding...".
+  const isBuilding = !!buildingLabel;
+  const actionsDisabled = busy !== null || isBuilding;
 
   // Register per-row action buttons with UI Bridge. Keep IDs stable per
   // runner id (matches the F5 spec: `runner-<id>-<action>`).
@@ -650,7 +662,7 @@ function RunnerRow({
               stale={r.stale_binary}
               runnerName={r.name}
               onRestart={onRestart}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
             />
           )}
         </div>
@@ -662,7 +674,7 @@ function RunnerRow({
               ref={startBtnRef as React.RefCallback<HTMLButtonElement>}
               className="btn"
               style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
               onClick={onStart}
             >
               {busy === `Start ${r.name}` ? 'Starting...' : 'Start'}
@@ -673,7 +685,7 @@ function RunnerRow({
               ref={stopBtnRef as React.RefCallback<HTMLButtonElement>}
               className="btn"
               style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
               onClick={onStop}
             >
               {busy === `Stop ${r.name}` ? 'Stopping...' : 'Stop'}
@@ -684,7 +696,7 @@ function RunnerRow({
               ref={restartBtnRef as React.RefCallback<HTMLButtonElement>}
               className="btn"
               style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
               onClick={onRestart}
               title="Stop and start the runner using the existing binary"
             >
@@ -695,11 +707,29 @@ function RunnerRow({
             ref={rebuildBtnRef as React.RefCallback<HTMLButtonElement>}
             className="btn"
             style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
-            disabled={busy !== null}
+            disabled={actionsDisabled}
             onClick={onRebuild}
-            title="Rebuild the runner binary, then restart (blocks until build finishes)"
+            title="Rebuild the runner binary, then restart. The build runs detached on the supervisor (~1-30 min); this button shows live build progress and re-enables when the build finishes."
           >
-            {busy === `Rebuild ${r.name}` ? 'Rebuilding...' : 'Rebuild'}
+            {isBuilding ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                <span
+                  style={{
+                    display: 'inline-block',
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    background: 'currentColor',
+                    animation: 'pulse 1s ease-in-out infinite',
+                  }}
+                />
+                {buildingLabel}
+              </span>
+            ) : busy === `Rebuild ${r.name}` ? (
+              'Submitting...'
+            ) : (
+              'Rebuild'
+            )}
           </button>
           {!isPrimary && (
             <button
@@ -711,7 +741,7 @@ function RunnerRow({
                 color: r.protected ? 'var(--success, #2e7d32)' : 'var(--warning, #c77700)',
                 borderColor: r.protected ? 'var(--success, #2e7d32)' : 'var(--warning, #c77700)',
               }}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
               onClick={onProtect}
               title={
                 r.protected
@@ -738,7 +768,7 @@ function RunnerRow({
                 color: 'var(--danger)',
                 borderColor: 'var(--danger)',
               }}
-              disabled={busy !== null}
+              disabled={actionsDisabled}
               onClick={onRemove}
             >
               Remove
@@ -753,6 +783,11 @@ function RunnerRow({
 function RunnerInstancesPanel() {
   const [runners, setRunners] = useState<RunnerInstance[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  // Per-runner live build phase label, keyed by runner id. Set after a detached
+  // rebuild returns 202 and driven by polling `GET /build/{id}/status` until the
+  // build reaches a terminal state. Replaces the old "frozen Rebuilding... button"
+  // behavior now that the HTTP call returns in ~1s instead of blocking the build.
+  const [building, setBuilding] = useState<Record<string, string>>({});
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
   const [newPort, setNewPort] = useState('');
@@ -793,6 +828,86 @@ function RunnerInstancesPanel() {
     }
     setBusy(null);
     refresh();
+  };
+
+  // Drive the per-runner "Building..." indicator off the detached build's
+  // /build/{id}/status until it reaches a terminal state. The HTTP rebuild call
+  // now returns 202 in ~1s with a build_id; this poll is what keeps the button
+  // live instead of frozen. Best-effort — a transient poll error keeps the
+  // last-known label and retries on the next tick; only a terminal state (or the
+  // submission disappearing) clears the indicator.
+  const pollBuild = useCallback(
+    async (runnerId: string, runnerName: string, buildId: string) => {
+      setBuilding((prev) => ({ ...prev, [runnerId]: 'Build queued...' }));
+      const POLL_MS = 2000;
+      // Safety cap so a stuck/evicted build can't pin the indicator forever
+      // (build timeout is 30 min on the backend; cap a little above that).
+      const deadline = Date.now() + 35 * 60 * 1000;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((res) => setTimeout(res, POLL_MS));
+        let terminal = false;
+        try {
+          const s = await api.buildStatus(buildId);
+          const state = s.status.state;
+          if (state === 'queued') {
+            setBuilding((prev) => ({ ...prev, [runnerId]: 'Build queued...' }));
+          } else if (state === 'running') {
+            setBuilding((prev) => ({ ...prev, [runnerId]: 'Building...' }));
+          } else if (state === 'succeeded') {
+            addToast(`Rebuild ${runnerName} succeeded`, 'info');
+            terminal = true;
+          } else if (state === 'failed') {
+            addToast(
+              `Rebuild ${runnerName} failed${s.status.error ? `: ${s.status.error}` : ''}`,
+              'error',
+            );
+            terminal = true;
+          }
+        } catch {
+          // 404 once the submission is evicted from the store, or a transient
+          // network blip. If it's gone for good, the deadline below clears it.
+        }
+        if (terminal || Date.now() > deadline) {
+          setBuilding((prev) => {
+            const next = { ...prev };
+            delete next[runnerId];
+            return next;
+          });
+          refresh();
+          return;
+        }
+      }
+    },
+    [refresh],
+  );
+
+  // Submit a detached rebuild (202 + build_id) and hand off to pollBuild.
+  // Returns once the 202 lands (~1s) — the build itself is tracked async.
+  const submitRebuild = async (
+    runnerId: string,
+    runnerName: string,
+    submit: () => Promise<DetachedBuildResponse>,
+  ) => {
+    setBusy(`Rebuild ${runnerName}`);
+    try {
+      const resp = await submit();
+      const buildId = resp.build_id ?? resp.submission_id;
+      if (buildId) {
+        // Fire-and-forget: the poll loop owns the indicator from here.
+        void pollBuild(runnerId, runnerName, buildId);
+      } else {
+        // No build_id (e.g. synchronous no-rebuild path) — treat as done.
+        addToast(`Rebuild ${runnerName} submitted`, 'info');
+        refresh();
+      }
+    } catch (e) {
+      addToast(
+        `Rebuild ${runnerName} failed: ${e instanceof Error ? e.message : 'unknown'}`,
+        'error',
+      );
+    }
+    setBusy(null);
   };
 
   const handleSpawn = async () => {
@@ -940,6 +1055,7 @@ function RunnerInstancesPanel() {
                     key={r.id}
                     runner={r}
                     busy={busy}
+                    buildingLabel={building[r.id] ?? null}
                     onStart={() => doAction(`Start ${r.name}`, () => api.startRunner(r.id))}
                     onStop={() => doAction(`Stop ${r.name}`, () => api.stopRunner(r.id))}
                     onRestart={() =>
@@ -953,17 +1069,19 @@ function RunnerInstancesPanel() {
                         await doRestart(false);
                       })
                     }
-                    onRebuild={() =>
-                      doAction(`Rebuild ${r.name}`, async () => {
-                        if (isPrimary) {
-                          await confirm(
-                            'Rebuild primary runner',
-                            `Rebuild and restart "${r.name}"? This takes 1-3 minutes and any active work in the runner window will be lost.`,
-                          );
-                        }
-                        await doRestart(true);
-                      })
-                    }
+                    onRebuild={async () => {
+                      // Confirm BEFORE submitting the detached build. The build
+                      // itself now runs async (202 in ~1s), with live progress
+                      // surfaced on the Rebuild button via pollBuild.
+                      if (isPrimary) {
+                        const ok = await confirm(
+                          'Rebuild primary runner',
+                          `Rebuild and restart "${r.name}"? The build runs in the background (~1-30 min) and any active work in the runner window will be lost.`,
+                        );
+                        if (!ok) return;
+                      }
+                      await submitRebuild(r.id, r.name, () => doRestart(true));
+                    }}
                     onRemove={() =>
                       doAction(`Remove ${r.name}`, async () => {
                         await confirm('Remove runner', `Remove "${r.name}" from the supervisor?`);
