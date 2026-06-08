@@ -16,9 +16,9 @@
 //!     --watch-dir D:/qontinui-root/qontinui-supervisor
 //! ```
 //!
-//! `~/.qontinui/machine.json` provides the machine_id. If missing,
-//! the daemon runs in NO-COORD mode (extracts + logs symbols, never
-//! POSTs).
+//! `~/.qontinui/machine.json` provides the device id (`device_id`, with a
+//! legacy `machine_id` fallback). If missing, the daemon runs in NO-COORD
+//! mode (extracts + logs symbols, never POSTs).
 
 use clap::Parser;
 use qontinui_supervisor::symbol_watcher::{SymbolWatcher, WatcherConfig};

@@ -4,7 +4,8 @@
 //! On startup the daemon:
 //!
 //! 1. Reads its config (env vars + sensible defaults — see [`WatcherConfig`]).
-//! 2. Resolves the local `machine_id` from `~/.qontinui/machine.json`.
+//! 2. Resolves the local device id from `~/.qontinui/machine.json`'s
+//!    `device_id` (canonical), falling back to the legacy `machine_id`.
 //!    If missing, runs in NO-COORD mode (extracts + logs, never POSTs).
 //! 3. Spawns one `notify::RecommendedWatcher` per configured watch_dir.
 //! 4. Loops: for each filtered save event, re-extracts symbols with
@@ -81,19 +82,38 @@ impl WatcherConfig {
     }
 }
 
+/// Minimal subset of `~/.qontinui/machine.json` the watcher needs.
+///
+/// The canonical post-unified-devices field is `device_id`; the live file
+/// carries `device_id`, NOT `machine_id` (older hosts used `machine_id`).
+/// BOTH fields are `Option` so deserialization does not fail outright on a
+/// `device_id`-only file — a required-`machine_id` struct previously made
+/// `load_machine_id` return `None` and silently dropped the watcher into
+/// NO-COORD mode on every modern host (fixed 2026-06-08, matching the
+/// `fleet.rs` #90 / `dev_action/ingest.rs` #89 pattern).
 #[derive(Debug, Clone, Deserialize)]
 struct MachineFile {
-    machine_id: String,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    machine_id: Option<String>,
 }
 
-/// Read `~/.qontinui/machine.json` and return the machine_id (UUID
-/// string). Returns `None` if the file is missing/unreadable/malformed —
-/// caller falls back to NO-COORD mode.
+/// Read `~/.qontinui/machine.json` and return the device id (UUID string).
+/// Prefers the canonical `device_id`, falling back to the legacy
+/// `machine_id`. Returns `None` if the file is missing/unreadable/malformed
+/// or carries neither field — caller falls back to NO-COORD mode.
 pub fn load_machine_id() -> Option<String> {
     let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(&path).ok()?;
+    read_machine_id(&path)
+}
+
+/// Path-parameterized core of [`load_machine_id`] (testable without touching
+/// the real home directory). Prefers `device_id`, falls back to `machine_id`.
+fn read_machine_id(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
     let parsed: MachineFile = serde_json::from_slice(&bytes).ok()?;
-    Some(parsed.machine_id)
+    parsed.device_id.or(parsed.machine_id)
 }
 
 /// Walk up the directory tree from `start` looking for a `.git` directory

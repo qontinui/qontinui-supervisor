@@ -3,7 +3,7 @@
 
 use super::coord_client::{ClaimRequestWire, MockTransport};
 use super::file_watch::SaveEvent;
-use super::{find_repo_root, make_resource_key, SymbolWatcher, WatcherConfig};
+use super::{find_repo_root, make_resource_key, read_machine_id, SymbolWatcher, WatcherConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -330,4 +330,61 @@ fn claim_request_for_symbol_serializes_to_coord_wire() {
     assert_eq!(s["machine_id"], "abc");
     assert_eq!(s["resource_key"], "qontinui-supervisor:src/main.rs:foo");
     assert_eq!(s["ttl_seconds"], 300);
+}
+
+/// The live post-unified-devices `machine.json` carries `device_id`; the
+/// watcher must read it (not the absent `machine_id`) or it silently runs in
+/// NO-COORD mode on every modern host.
+#[test]
+fn read_machine_id_prefers_device_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    std::fs::write(
+        &path,
+        r#"{"device_id":"11111111-1111-4111-8111-111111111111","hostname":"spaceship"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        read_machine_id(&path).as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+}
+
+/// A pre-unified-devices file using the legacy `machine_id` field still
+/// resolves via the fallback.
+#[test]
+fn read_machine_id_falls_back_to_legacy_machine_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    std::fs::write(
+        &path,
+        r#"{"machine_id":"22222222-2222-4222-8222-222222222222","hostname":"old-host"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        read_machine_id(&path).as_deref(),
+        Some("22222222-2222-4222-8222-222222222222")
+    );
+}
+
+/// `device_id` wins when both keys are present.
+#[test]
+fn read_machine_id_device_id_wins_over_machine_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    std::fs::write(
+        &path,
+        r#"{"device_id":"device-wins","machine_id":"legacy-loses"}"#,
+    )
+    .unwrap();
+    assert_eq!(read_machine_id(&path).as_deref(), Some("device-wins"));
+}
+
+/// Neither key present → `None` (caller falls back to NO-COORD mode).
+#[test]
+fn read_machine_id_none_when_neither_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    std::fs::write(&path, r#"{"hostname":"no-id-host"}"#).unwrap();
+    assert_eq!(read_machine_id(&path), None);
 }
