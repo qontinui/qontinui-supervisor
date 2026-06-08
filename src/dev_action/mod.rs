@@ -21,11 +21,13 @@ pub mod attribution;
 pub mod expectations;
 pub mod ingest;
 pub mod mock;
+pub mod policy;
 pub mod record;
 pub mod states;
 
 pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 pub use expectations::{fetch_expectations, PredictedSignature};
 pub use ingest::post_snapshot_to_coord;
+pub use policy::{assess_action_risk, ActionRisk};
 pub use record::{ActionKind, ActionRecord, ActionStore};
 pub use states::{evaluate_all, SlotResolution};
