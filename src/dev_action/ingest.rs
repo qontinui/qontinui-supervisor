@@ -25,8 +25,8 @@
 //!   [`crate::routes::lineage`] (that one is module-private). The lineage variant
 //!   is preferred over `fleet.rs`'s because it honors the `COORD_HTTP_URL`
 //!   override; this duplicates ~20 lines rather than refactoring broadly.
-//! - **device_id**: read from `~/.qontinui/machine.json`'s `machine_id`, the
-//!   same field `fleet.rs::publish_budget` parses as the device id.
+//! - **device_id**: read from `~/.qontinui/machine.json`'s `device_id`
+//!   (canonical), falling back to legacy `machine_id`.
 //! - **tenant_id**: best-effort from `~/.qontinui/machine.json`'s
 //!   `active_tenant_id` if present; `None` otherwise (no new config system).
 
@@ -47,11 +47,13 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 // machine.json — device_id + tenant_id
 // ---------------------------------------------------------------------------
 
-/// Minimal subset of `~/.qontinui/machine.json` we need. `machine_id` is the
-/// device id (same field `fleet.rs` reads); `active_tenant_id` is optional and
-/// only present on hosts that pin a tenant.
+/// Minimal subset of `~/.qontinui/machine.json` we need. The canonical
+/// post-unified-devices field is `device_id`; `machine_id` is accepted as a
+/// legacy fallback (older hosts / `fleet.rs`'s historical field name).
+/// `active_tenant_id` is optional and only present on hosts that pin a tenant.
 #[derive(Debug, Clone, Deserialize)]
 struct MachineFile {
+    device_id: Option<String>,
     machine_id: Option<String>,
     active_tenant_id: Option<String>,
 }
@@ -65,12 +67,15 @@ fn load_machine_file() -> Option<MachineFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Resolve this supervisor's device id from `machine.json`'s `machine_id`
-/// (the same field `fleet.rs::publish_budget` uses). `None` if the file is
-/// missing / unparseable / the id is not a UUID.
+/// Resolve this supervisor's device id from `machine.json`'s `device_id`
+/// (canonical post-unified-devices field), falling back to the legacy
+/// `machine_id`. `None` if the file is missing / unparseable / neither field
+/// is a UUID. (The live `machine.json` carries `device_id`, not `machine_id`,
+/// so reading only `machine_id` silently yielded a null device on every
+/// snapshot — fixed 2026-06-08.)
 pub fn resolve_device_id() -> Option<Uuid> {
     let machine = load_machine_file()?;
-    let raw = machine.machine_id?;
+    let raw = machine.device_id.or(machine.machine_id)?;
     Uuid::parse_str(&raw).ok()
 }
 
