@@ -17,8 +17,8 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind, ActionRecord,
-    AttributionTargets, PredictedSignature, SlotResolution,
+    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
+    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1687,17 +1687,27 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
 /// lazily via the managed runner because its path is only set during the
 /// build, after mint.
 ///
-/// Returns `(action_id, states_active, predicted)` for stamping into the spawn
-/// ACK. Phase 4: `predicted` is coord's state-conditioned expectations for this
-/// `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
+/// Returns `(action_id, states_active, predicted, risk)` for stamping into the
+/// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
+/// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
 /// is unreachable / has no history (fail-open; never blocks the spawn).
+///
+/// "Act on predictions": `risk` is the pure [`assess_action_risk`] verdict over
+/// `predicted` + `states_active`. spawn-test/named is a *testing* surface, so we
+/// do NOT auto-route it to LKG — we only SURFACE the assessment (stamp it into
+/// the ACK + a loud warn) so the caller sees the risk before the spawn completes.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
     requester_id: Option<String>,
     managed: Arc<ManagedRunner>,
-) -> (uuid::Uuid, Vec<&'static str>, Vec<PredictedSignature>) {
+) -> (
+    uuid::Uuid,
+    Vec<&'static str>,
+    Vec<PredictedSignature>,
+    ActionRisk,
+) {
     // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
     // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
     // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
@@ -1718,6 +1728,19 @@ async fn mint_spawn_action(
     // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
     let predicted = fetch_expectations(ActionKind::Spawn.as_str(), &states_active, 5).await;
 
+    // "Act on predictions" (surface-only for spawns): assess the prediction set
+    // and, when high-risk, warn loudly so the caller sees it before the spawn
+    // completes. spawn-test/named is a testing surface — we never auto-route it
+    // to LKG; the ACK `risk` field carries the advisory for the caller to act on.
+    let risk = assess_action_risk(&predicted, &states_active);
+    if let Some(warn) = risk.warn.as_deref() {
+        tracing::warn!(action_id = %action_id, kind = "spawn", "{warn}");
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
+            .await;
+    }
+
     let arc = state.dev_actions.write().await.insert(record);
 
     let runner_id = managed.config.id.clone();
@@ -1733,7 +1756,22 @@ async fn mint_spawn_action(
         None,
     );
 
-    (action_id, states_active, predicted)
+    (action_id, states_active, predicted, risk)
+}
+
+/// Render an [`ActionRisk`] as the spawn ACK's `risk` field: `null` when there
+/// is no actionable risk, otherwise the `route_lkg` advice (always surfaced —
+/// spawns don't auto-route, the caller decides), the human-readable `warning`,
+/// and the `top_signature` evidence.
+fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
+    if !risk.is_actionable() {
+        return serde_json::Value::Null;
+    }
+    json!({
+        "route_lkg": risk.route_lkg,
+        "warning": risk.warn,
+        "top_signature": risk.top_signature,
+    })
 }
 
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
@@ -1888,7 +1926,7 @@ pub async fn spawn_test(
     // runner — its path is set during the build, after this mint) + cached
     // health. Reuses the request's `requester_id` as the snapshot requester
     // (Q8 — no new identity system).
-    let (action_id, action_states_active, action_predicted) = mint_spawn_action(
+    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
         &state,
         format!(
             "rebuild={};use_lkg={};git_ref={:?}",
@@ -1898,6 +1936,7 @@ pub async fn spawn_test(
         managed.clone(),
     )
     .await;
+    let action_risk_json = spawn_risk_ack_json(&action_risk);
 
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
@@ -1934,6 +1973,7 @@ pub async fn spawn_test(
                 "action_id": action_id.to_string(),
                 "states_active": action_states_active,
                 "predicted": action_predicted,
+                "risk": action_risk_json,
                 "outcome_url": format!("/actions/{}/outcome", action_id),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
@@ -1973,6 +2013,7 @@ pub async fn spawn_test(
                 obj.insert("action_id".to_string(), json!(action_id.to_string()));
                 obj.insert("states_active".to_string(), json!(action_states_active));
                 obj.insert("predicted".to_string(), json!(action_predicted));
+                obj.insert("risk".to_string(), action_risk_json.clone());
                 obj.insert(
                     "outcome_url".to_string(),
                     json!(format!("/actions/{}/outcome", action_id)),
@@ -3639,13 +3680,14 @@ pub async fn spawn_named(
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
     // as spawn-test). Stamped into the success response below.
-    let (action_id, action_states_active, action_predicted) = mint_spawn_action(
+    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
         &state,
         format!("named={};rebuild={}", name, body.rebuild),
         body.requester_id.clone(),
         managed.clone(),
     )
     .await;
+    let action_risk_json = spawn_risk_ack_json(&action_risk);
 
     // Item A — build_result tracking (mirror of spawn_test).
     let mut build_attempted = false;
@@ -3950,6 +3992,7 @@ pub async fn spawn_named(
     resp["action_id"] = json!(action_id.to_string());
     resp["states_active"] = json!(action_states_active);
     resp["predicted"] = json!(action_predicted);
+    resp["risk"] = action_risk_json;
     resp["outcome_url"] = json!(format!("/actions/{}/outcome", action_id));
 
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a

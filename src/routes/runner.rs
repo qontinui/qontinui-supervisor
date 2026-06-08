@@ -5,8 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind, ActionRecord,
-    AttributionTargets, PredictedSignature, SlotResolution,
+    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
+    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -48,6 +48,21 @@ pub(crate) fn unhealthy_after_start_response(
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
+/// Render an [`ActionRisk`] as the `risk` ACK field: `null` when there is no
+/// actionable risk (healthy / no-history case), otherwise an object carrying the
+/// `route_lkg` advice, the human-readable `warning`, and the `top_signature`
+/// evidence so the initiator sees exactly what tripped the assessment.
+fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
+    if !risk.is_actionable() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "route_lkg": risk.route_lkg,
+        "warning": risk.warn,
+        "top_signature": risk.top_signature,
+    })
+}
+
 /// Mint a dev-action snapshot for a primary-runner action (restart / build),
 /// evaluate the active dev-state set at execution time, store the record, and
 /// spawn the detached attribution watcher.
@@ -59,18 +74,30 @@ pub(crate) fn unhealthy_after_start_response(
 /// already in memory, so this stays off the blocking green path (§8 criterion
 /// 6).
 ///
-/// Returns `(action_id, states_active, predicted)` for stamping into the ACK.
-/// Phase 4: `predicted` is coord's state-conditioned expectations for this
+/// Returns `(action_id, states_active, predicted, risk)` for stamping into the
+/// ACK. Phase 4: `predicted` is coord's state-conditioned expectations for this
 /// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the action completes. An empty vec when
 /// coord is unreachable / has no history (fail-open; never blocks the action).
+///
+/// "Act on predictions": `risk` is the pure
+/// [`assess_action_risk`] verdict over `predicted` + `states_active`. It is
+/// [`ActionRisk::none`] in the common healthy / no-history case (behavior
+/// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
+/// signature clears the threshold. The caller decides what to do with it
+/// (the restart path biases toward LKG + warns; never refuses).
 async fn mint_primary_action(
     state: &SharedState,
     kind: ActionKind,
     params_digest: String,
     requester_id: Option<String>,
     build_duration: Option<std::time::Duration>,
-) -> (uuid::Uuid, Vec<&'static str>, Vec<PredictedSignature>) {
+) -> (
+    uuid::Uuid,
+    Vec<&'static str>,
+    Vec<PredictedSignature>,
+    ActionRisk,
+) {
     // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
     // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
     // unevaluated so the state surfaces as `Unknown`, never a false `False`.
@@ -90,6 +117,21 @@ async fn mint_primary_action(
     // (kind, states) so the ACK warns the agent before the action completes.
     // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
     let predicted = fetch_expectations(kind.as_str(), &states_active, 5).await;
+
+    // "Act on predictions": assess the prediction set against the active states.
+    // Pure + fail-open — `none()` in the healthy case. `route_lkg` + `warn` only
+    // when a boot-failure-class signature clears the threshold. Emit the warning
+    // here (loud `tracing::warn!` + a Supervisor log entry) so the risk is
+    // visible BEFORE the action's outcome lands, regardless of how the caller
+    // uses the advice.
+    let risk = assess_action_risk(&predicted, &states_active);
+    if let Some(warn) = risk.warn.as_deref() {
+        tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
+            .await;
+    }
 
     let arc = state.dev_actions.write().await.insert(record);
 
@@ -116,7 +158,7 @@ async fn mint_primary_action(
         build_duration,
     );
 
-    (action_id, states_active, predicted)
+    (action_id, states_active, predicted, risk)
 }
 
 #[derive(Deserialize)]
@@ -138,6 +180,26 @@ pub struct RestartRequest {
     ///   primary.
     #[serde(default)]
     pub from_working_tree: bool,
+    /// "Act on predictions" opt-out / explicit exe selector for the NON-rebuild
+    /// restart path.
+    ///
+    /// - `None` (DEFAULT) — no explicit operator choice. The supervisor is free
+    ///   to AUTO-bias toward the last-known-good binary when
+    ///   [`assess_action_risk`] flags this restart as high-risk (a
+    ///   boot-failure-class prediction under the active states), instead of the
+    ///   freshest slot exe that history says white-screens. The restart is never
+    ///   refused — only biased — and the risk is warned loudly.
+    /// - `Some(true)` — explicitly pin this restart to the LKG binary (same
+    ///   effect the auto-bias would apply, but operator-requested).
+    /// - `Some(false)` — explicitly OPT OUT of the auto-LKG bias: run the
+    ///   freshest slot exe even when the prediction is high-risk. The risk is
+    ///   still warned, but the supervisor respects the explicit choice and does
+    ///   NOT route to LKG.
+    ///
+    /// Only meaningful on the `rebuild: false` restart (the rebuild path
+    /// compiles a fresh exe, so an LKG pin would be self-defeating).
+    #[serde(default)]
+    pub use_lkg: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -193,7 +255,7 @@ pub async fn restart_runner(
     } else {
         ActionKind::Restart
     };
-    let (action_id, states_active, predicted) = mint_primary_action(
+    let (action_id, states_active, predicted, risk) = mint_primary_action(
         &state,
         action_kind,
         format!("rebuild={};force={}", rebuild, body.force),
@@ -201,6 +263,7 @@ pub async fn restart_runner(
         None,
     )
     .await;
+    let risk_json = risk_ack_json(&risk);
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     //
@@ -367,6 +430,7 @@ pub async fn restart_runner(
                 "action_id": action_id.to_string(),
                 "states_active": states_active,
                 "predicted": predicted,
+                "risk": risk_json,
                 "outcome_url": format!("/actions/{}/outcome", action_id),
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
@@ -379,14 +443,85 @@ pub async fn restart_runner(
     // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
     // `from_working_tree` only affects the build (no build here), so it's
     // forwarded for signature consistency and has no effect when rebuild=false.
-    manager::restart_runner(
+    //
+    // "Act on predictions": when the risk assessment flagged this restart as
+    // high-risk (a boot-failure-class prediction under the active states), bias
+    // the exe pick toward the last-known-good binary instead of the freshest
+    // slot exe that history says white-screens — the prevention this whole
+    // feature exists for. We NEVER refuse the restart (a refused restart could
+    // strand the operator); we only bias, and only when the operator did NOT
+    // make an explicit choice:
+    //   - `use_lkg: Some(false)` ⇒ explicit opt-OUT: run the freshest slot exe
+    //     even under high risk (the risk is still warned).
+    //   - `use_lkg: Some(true)`  ⇒ explicit opt-IN: always pin to LKG.
+    //   - `use_lkg: None`        ⇒ auto: bias to LKG iff `risk.route_lkg`.
+    // The bias only applies when the LKG exe actually exists on disk; otherwise
+    // it is a no-op (fail-open) and the normal slot resolution runs.
+    let want_lkg = match body.use_lkg {
+        Some(explicit) => explicit,
+        None => risk.route_lkg,
+    };
+    // Track whether we set a transient override so we can clear it after the
+    // restart, keeping the bias scoped to THIS restart (later restarts re-decide
+    // from fresh predictions rather than inheriting a sticky pin).
+    let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+    if want_lkg {
+        let lkg_exe = state.config.lkg_exe_path();
+        if lkg_exe.exists() {
+            if let Some(primary) = state.get_primary().await {
+                *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                let reason = if body.use_lkg == Some(true) {
+                    "operator-requested (use_lkg:true)"
+                } else {
+                    "high-risk prediction (auto-bias)"
+                };
+                let msg = format!(
+                    "Restart biased to last-known-good binary {lkg_exe:?} — {reason}; \
+                     pass use_lkg:false to opt out"
+                );
+                tracing::warn!("{msg}");
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                    .await;
+                biased_primary = Some(primary);
+            }
+        } else if risk.route_lkg || body.use_lkg == Some(true) {
+            // Wanted LKG but none exists — surface it rather than silently
+            // running the freshest slot exe under known high risk.
+            let msg = format!(
+                "Restart wanted the last-known-good binary (risk_route_lkg={}, \
+                 use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
+                 freshest slot exe",
+                risk.route_lkg,
+                body.use_lkg,
+                state.config.lkg_exe_path()
+            );
+            tracing::warn!("{msg}");
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+    }
+
+    let restart_result = manager::restart_runner(
         &state,
         false,
         RestartSource::Manual,
         body.force,
         body.from_working_tree,
     )
-    .await?;
+    .await;
+
+    // Clear the transient LKG override so the bias does not leak into the next
+    // restart (which re-evaluates risk from fresh predictions). The runner has
+    // already resolved + copied its exe by the time `restart_runner` returns, so
+    // clearing now does not affect the just-started process.
+    if let Some(primary) = biased_primary {
+        *primary.source_exe_override.write().await = None;
+    }
+    restart_result?;
 
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
@@ -421,6 +556,8 @@ pub async fn restart_runner(
         "action_id": action_id.to_string(),
         "states_active": states_active,
         "predicted": predicted,
+        "risk": risk_json,
+        "routed_lkg": want_lkg,
         "outcome_url": format!("/actions/{}/outcome", action_id),
     }))
     .into_response())
@@ -655,7 +792,7 @@ pub async fn fix_and_rebuild(
     // by the build-submissions state machine — Phase 3's coord ingest will
     // thread the precise duration). State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
-    let (action_id, states_active, predicted) = mint_primary_action(
+    let (action_id, states_active, predicted, risk) = mint_primary_action(
         &state,
         ActionKind::Build,
         "fix_and_rebuild".to_string(),
@@ -663,6 +800,7 @@ pub async fn fix_and_rebuild(
         None,
     )
     .await;
+    let risk_json = risk_ack_json(&risk);
 
     // Submit the live-tree rebuild to the build-submissions state machine. The
     // exec future runs in a detached background task — a client disconnect can
@@ -708,6 +846,7 @@ pub async fn fix_and_rebuild(
             "action_id": action_id.to_string(),
             "states_active": states_active,
             "predicted": predicted,
+            "risk": risk_json,
             "outcome_url": format!("/actions/{}/outcome", action_id),
             "message": "fix-and-rebuild submitted; the build runs detached from this \
                         connection — poll GET /build/{id}/status for the terminal outcome",
@@ -952,6 +1091,7 @@ mod tests {
                 // exercised deterministically without a network fetch /
                 // origin/main worktree materialization in the sandbox.
                 from_working_tree: true,
+                use_lkg: None,
             }),
         )
         .await
