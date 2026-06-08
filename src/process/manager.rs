@@ -1909,6 +1909,71 @@ async fn check_and_record_panic_log(
 /// removes adb forwards). Best-effort: any error — including a hung
 /// endpoint — is swallowed at debug level, and the caller falls through
 /// to child.kill() after the wait window elapses.
+/// Best-effort, bounded pre-stop drain (Phase 2 of
+/// `2026-06-06-runner-dev-loop-and-restart-resilience`).
+///
+/// POST `http://127.0.0.1:<port>/drain` BEFORE the graceful close-request +
+/// taskkill so the runner flushes in-flight AI turns to `output_log`, stashes
+/// each session's dirty worktree to `refs/wip/*`, and heartbeats coord claims.
+/// The runner-side `/drain` is itself hard-bounded (default 25s) and idempotent
+/// with its own exit-seam drain. This call adds a short client-side timeout on
+/// top so a wedged runner can NEVER block the restart — on any error/timeout we
+/// log and fall through to the existing close-request + kill.
+async fn request_drain(state: &SharedState, port: u16, runner_name: &str) {
+    // Client-side cap. Generous enough to let the runner's bounded drain finish
+    // a normal turn-flush + stash, but it never blocks the restart: on timeout
+    // we proceed straight to the close-request + kill below.
+    const DRAIN_REQUEST_TIMEOUT_SECS: u64 = 30;
+    let url = format!("http://127.0.0.1:{}/drain", port);
+    let result = state
+        .http_client
+        .post(&url)
+        .timeout(Duration::from_secs(DRAIN_REQUEST_TIMEOUT_SECS))
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            let msg = format!(
+                "Drained runner '{}' (port {}) before stop: {}",
+                runner_name, port, body
+            );
+            info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+        }
+        Ok(resp) => {
+            // Non-2xx (e.g. an older runner with no /drain route → 404). Not
+            // fatal — the runner either drains on its own exit seam or there's
+            // nothing to drain. Proceed to the close-request + kill.
+            let msg = format!(
+                "Pre-stop drain for runner '{}' (port {}) returned {} — proceeding to stop",
+                runner_name,
+                port,
+                resp.status()
+            );
+            debug!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+                .await;
+        }
+        Err(e) => {
+            let msg = format!(
+                "Pre-stop drain for runner '{}' (port {}) failed: {} — proceeding to stop",
+                runner_name, port, e
+            );
+            debug!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+                .await;
+        }
+    }
+}
+
 async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str) {
     let url = format!(
         "http://127.0.0.1:{}/ui-bridge/control/page/close-request",
@@ -2031,6 +2096,13 @@ pub async fn stop_runner_by_id(
             }
         }
     }
+
+    // 0. Pre-stop drain (Phase 2): give the runner a bounded chance to flush
+    //    in-flight AI turns, stash dirty worktrees to refs/wip/*, and persist
+    //    coord claims BEFORE we close/kill it. Best-effort + hard-bounded — a
+    //    wedged runner never blocks the stop; we fall straight through to the
+    //    close-request + kill on any error/timeout.
+    request_drain(state, port, &runner_name).await;
 
     // 1. Graceful-first: ask the runner to close itself via the same endpoint
     //    the UI uses, so WindowEvent::CloseRequested fires and its teardown
