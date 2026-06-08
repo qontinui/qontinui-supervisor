@@ -88,8 +88,25 @@ pub fn detect_resources() -> Resources {
 
 #[derive(Debug, Clone, Deserialize)]
 struct MachineFile {
-    machine_id: String,
+    /// Canonical post-unified-devices field. The live `machine.json` carries
+    /// `device_id`; older hosts used `machine_id`. Accept either (prefer
+    /// `device_id`) — making both optional is REQUIRED so deserialization
+    /// doesn't fail outright on a `device_id`-only file (which previously made
+    /// `load_machine_file` return `None` and silently skipped all budget
+    /// publishing — fixed 2026-06-08).
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    machine_id: Option<String>,
     hostname: String,
+}
+
+impl MachineFile {
+    /// The device id, preferring the canonical `device_id` over legacy
+    /// `machine_id`.
+    fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref().or(self.machine_id.as_deref())
+    }
 }
 
 /// `~/.qontinui/profiles.json` — minimum subset we need (the active
@@ -200,10 +217,18 @@ pub async fn publish_budget_with_ci(
             return Ok(());
         }
     };
-    let device_id = match uuid::Uuid::parse_str(&machine.machine_id) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!("fleet::publish_budget: machine.json machine_id not a UUID ({e}). Skipping.");
+    let device_id = match machine.device_id() {
+        Some(raw) => match uuid::Uuid::parse_str(raw) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("fleet::publish_budget: machine.json device_id not a UUID ({e}). Skipping.");
+                return Ok(());
+            }
+        },
+        None => {
+            warn!(
+                "fleet::publish_budget: machine.json has neither device_id nor machine_id. Skipping."
+            );
             return Ok(());
         }
     };
