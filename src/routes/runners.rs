@@ -2126,6 +2126,14 @@ async fn execute_spawn_build_inner(
     // worktree_path builds (no supervisor-owned scratch container involved).
     let mut active_spawn_container: Option<std::path::PathBuf> = None;
 
+    // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
+    // runner root of the tree that was actually built. The spawned exe embeds
+    // THAT tree's `dist/` (rust-embed at cargo build time), so the frontend
+    // staleness check below must inspect this tree — checking the live tree
+    // for a worktree build produces false `src_newer_than_dist` warnings (and
+    // spurious 503s under `frontend_strict`). `None` = live-tree build.
+    let mut built_root: Option<std::path::PathBuf> = None;
+
     // Rebuild if requested
     if body.rebuild {
         // If caller opted out of waiting AND all slots are currently busy,
@@ -2240,6 +2248,12 @@ async fn execute_spawn_build_inner(
                             active.insert(wt.container_path.clone());
                         }
                         active_spawn_container = Some(wt.container_path.clone());
+                        // The staleness check must inspect the tree whose
+                        // dist/ the spawned exe embeds. That is the runner
+                        // worktree root (`<ws>/.spawn-<ref>/qontinui-runner`),
+                        // NOT `wt.container_path` (no src/dist there — it
+                        // would spuriously hard-fail DistMissing).
+                        built_root = Some(wt.worktree_path.clone());
                         Some(wt.src_tauri)
                     }
                     Err(e) => {
@@ -2293,6 +2307,9 @@ async fn execute_spawn_build_inner(
                                 )
                                 .await;
                             let src_tauri = validated.src_tauri.clone();
+                            // Staleness check must inspect the caller-owned
+                            // tree whose dist/ the spawned exe embeds.
+                            built_root = Some(validated.worktree_path.clone());
                             worktree_path_info = Some(validated);
                             Some(src_tauri)
                         }
@@ -2942,8 +2959,15 @@ async fn execute_spawn_build_inner(
     // baked in (build failure) OR if `src/` is newer than `dist/index.html`
     // (someone forgot to `npm run build`). Either way, the runner ships with
     // a UI that doesn't reflect current source.
-    let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(state).await;
+    //
+    // Invariant: the staleness check must inspect the tree whose dist/ the
+    // spawned exe embeds — the provenance build tree (`built_root`) when a
+    // `git_ref`/`worktree_path` build happened, the live tree otherwise.
+    let (frontend_stale, stale_reason, stale_slot_id) = resolve_frontend_stale_for_spawn(
+        state,
+        built_root.as_deref().or(state.config.project_dir.parent()),
+    )
+    .await;
 
     // Short-circuit with 503 before reporting success when the spawned
     // runner would serve a broken or stale UI. Two triggers:
@@ -3286,10 +3310,18 @@ impl FrontendStaleReason {
 /// 1. The slot-level `frontend_stale` flag (set by `build_monitor` when the
 ///    most recent `npm run build` for that slot errored). Prefers
 ///    `last_successful_slot`; falls back to "any slot stale" otherwise.
-/// 2. mtime drift: the newest mtime under `qontinui-runner/src/` is greater
-///    than `qontinui-runner/dist/index.html`'s mtime. This catches the common
+/// 2. mtime drift: the newest mtime under `<built_root>/src/` is greater
+///    than `<built_root>/dist/index.html`'s mtime. This catches the common
 ///    case where someone edited a `.tsx` file but never ran `npm run build`,
 ///    so the dist on disk doesn't reflect current source.
+///
+/// `built_root` is the runner root of the tree whose `dist/` the spawned exe
+/// embeds — the live tree for default builds, the materialized/caller-owned
+/// worktree for `git_ref`/`worktree_path` provenance builds. Checking any
+/// other tree produces false `SrcDrift` verdicts (the live tree's drift says
+/// nothing about a worktree build). `None` (no resolvable root) skips the
+/// on-disk check entirely; the slot-level build-failure check still runs
+/// first regardless, since it reads slot state, not a tree.
 ///
 /// `reason` distinguishes the two for diagnostic surfaces. `BuildFailed` wins
 /// when both are true (the error is more actionable than the drift). `slot_id`
@@ -3297,6 +3329,7 @@ impl FrontendStaleReason {
 /// not per-slot.
 async fn resolve_frontend_stale_for_spawn(
     state: &SharedState,
+    built_root: Option<&std::path::Path>,
 ) -> (bool, Option<FrontendStaleReason>, Option<usize>) {
     // (1) Build-failure flag first — most actionable signal.
     let last_successful = *state.build_pool.last_successful_slot.read().await;
@@ -3314,15 +3347,13 @@ async fn resolve_frontend_stale_for_spawn(
     //   - `dist/index.html` is missing entirely (the silent-success bug:
     //     prior to 2026-05-11 this returned "not stale" and the runner
     //     went on to serve `asset not found: index.html`).
-    //   - mtime drift: newest mtime under `qontinui-runner/src/` is later
-    //     than `qontinui-runner/dist/index.html`.
-    // project_dir is `qontinui-runner/src-tauri/`, so the runner root is
-    // its parent.
-    let runner_root = match state.config.project_dir.parent() {
-        Some(p) => p.to_path_buf(),
+    //   - mtime drift: newest mtime under `<built_root>/src/` is later
+    //     than `<built_root>/dist/index.html`.
+    let runner_root = match built_root {
+        Some(p) => p,
         None => return (false, None, None),
     };
-    if let Some(reason) = check_dist_freshness(&runner_root).await {
+    if let Some(reason) = check_dist_freshness(runner_root).await {
         return (true, Some(reason), None);
     }
 
@@ -3918,8 +3949,10 @@ pub async fn spawn_named(
         .ok()
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
+    // spawn-named has no provenance selectors — it always builds the live
+    // tree, so the live tree IS the built tree here.
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state).await;
+        resolve_frontend_stale_for_spawn(&state, state.config.project_dir.parent()).await;
 
     // DistMissing hard-fail (symmetric with spawn_test). A missing
     // `dist/index.html` means the runner embeds NO frontend and serves a
@@ -5514,6 +5547,51 @@ mod tests {
         assert_eq!(
             result, None,
             "non-source extensions must not trigger SrcDrift"
+        );
+    }
+
+    /// Pins the built-tree fix: the freshness verdict follows the root you
+    /// pass, not some implicitly-derived live tree. A `git_ref` /
+    /// `worktree_path` spawn-test build embeds the BUILT tree's `dist/`, so
+    /// `resolve_frontend_stale_for_spawn` must hand `check_dist_freshness`
+    /// that tree — checking a stale live tree instead produced false
+    /// `src_newer_than_dist` warnings (and spurious 503s under
+    /// `frontend_strict`) for perfectly fresh worktree builds.
+    #[tokio::test]
+    async fn freshness_verdict_follows_the_root_passed_not_the_live_tree() {
+        let tmp = TempDir::new().expect("tempdir");
+        let live_root = tmp.path().join("live");
+        let worktree_root = tmp.path().join("worktree");
+
+        // Live tree: dist built first, then src edited → stale (SrcDrift).
+        write_file(&live_root.join("dist").join("index.html"), b"<old/>");
+        // Worktree: src written first, dist built after → fresh.
+        write_file(
+            &worktree_root.join("src").join("App.tsx"),
+            b"export const App = () => 'worktree';",
+        );
+
+        // Coarse-mtime safety margin (FAT = 2s), same as the other tests.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+
+        write_file(
+            &live_root.join("src").join("App.tsx"),
+            b"export const App = () => 'edited after build';",
+        );
+        write_file(
+            &worktree_root.join("dist").join("index.html"),
+            b"<!doctype html><html/>",
+        );
+
+        assert_eq!(
+            check_dist_freshness(&worktree_root).await,
+            None,
+            "fresh worktree build must not be flagged stale just because the live tree drifted"
+        );
+        assert_eq!(
+            check_dist_freshness(&live_root).await,
+            Some(FrontendStaleReason::SrcDrift),
+            "the live tree really is stale — the verdict must follow the root passed"
         );
     }
 
