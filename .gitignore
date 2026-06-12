@@ -10,3 +10,4 @@ Cargo.lock
 .worktrees/
 /target-agent
 /target-substrate
+agent-worktrees/
