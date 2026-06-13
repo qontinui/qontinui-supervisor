@@ -2420,25 +2420,41 @@ async fn execute_spawn_build_inner(
                 } else {
                     crate::build_monitor::BuildSourceKind::LiveTree
                 };
+                // Shared phase marker the build future advances
+                // (AwaitingSlot → AwaitingNpmLock → BuildingFrontend →
+                // Compiling). On a queue timeout the future is cancelled
+                // mid-flight and returns no `BuildAttempt`, so reading this
+                // marker is the ONLY way to compose a phase-accurate message —
+                // it reflects exactly what the cancelled future was doing.
+                let phase_marker = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                    crate::build_monitor::BuildPhase::AwaitingSlot.as_u8(),
+                ));
                 let fut = crate::build_monitor::run_cargo_build_with_dir_detailed(
                     state,
                     requester,
                     override_dir,
                     frontend_only,
                     source_kind,
+                    phase_marker.clone(),
                 );
                 match queue_timeout_secs {
                     Some(secs) => {
                         let timeout = std::time::Duration::from_secs(secs);
                         match tokio::time::timeout(timeout, fut).await {
                             Ok(r) => r,
-                            Err(_) => Err((
-                                SupervisorError::Timeout(format!(
-                                    "Build queue timeout: waited {}s for a build slot",
-                                    secs
-                                )),
-                                crate::build_monitor::BuildAttempt::default(),
-                            )),
+                            Err(_) => {
+                                let phase = crate::build_monitor::BuildPhase::from_u8(
+                                    phase_marker.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                                let available_permits =
+                                    state.build_pool.permits.available_permits();
+                                Err((
+                                    SupervisorError::Timeout(
+                                        phase.timeout_message(secs, available_permits),
+                                    ),
+                                    crate::build_monitor::BuildAttempt::default(),
+                                ))
+                            }
                         }
                     }
                     None => fut.await,
@@ -4282,6 +4298,17 @@ pub async fn list_builds(
         .build_pool
         .queue_depth
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Frontend (pnpm) lock contention. `npm_lock_held` is a best-effort sample
+    // (`try_lock` fails ⇒ a build holds it right now); `npm_lock_waiters` is the
+    // bracketed counter incremented around the lock acquire in
+    // `build_monitor::run_build_inner`. Together they distinguish frontend-lock
+    // starvation (free cargo permits + held npm lock + waiters) from genuine
+    // cargo-slot exhaustion — the mis-attribution this surface targets.
+    let npm_lock_held = state.build_pool.npm_lock.try_lock().is_err();
+    let npm_lock_waiters = state
+        .build_pool
+        .npm_lock_waiters
+        .load(std::sync::atomic::Ordering::Relaxed);
     let last_successful = *state.build_pool.last_successful_slot.read().await;
     // Derive `available_permits` from per-slot busy counts rather than the
     // semaphore. The semaphore permit is dropped in `run_cargo_build_with_dir`
@@ -4392,6 +4419,13 @@ pub async fn list_builds(
         // `available` is derived). Useful for debugging stuck-build reports.
         "semaphore_permits": semaphore_permits,
         "queued": queued,
+        // Frontend (pnpm) lock contention surface. `npm_lock_held` is a
+        // best-effort `try_lock` sample; `npm_lock_waiters` counts spawns
+        // blocked on the frontend lock right now. Free `available_permits` with
+        // `npm_lock_held: true` and `npm_lock_waiters >= 1` = a spawn-test is
+        // starving on the serialized frontend build, NOT slot exhaustion.
+        "npm_lock_held": npm_lock_held,
+        "npm_lock_waiters": npm_lock_waiters,
         "last_successful_slot": last_successful,
         // The slot resolve_source_exe would pick right now. Differs from
         // last_successful_slot when that slot's exe is gone (supervisor restart,

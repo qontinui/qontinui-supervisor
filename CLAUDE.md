@@ -458,7 +458,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 **Timeouts:**
 - **Build timeout:** 30 minutes default (override via `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS`, clamped [60, 7200]). If cargo exceeds this, the build process is killed.
-- **Queue timeout:** configurable via `queue_timeout_secs`. Returns 504 after the specified seconds if all slots are busy.
+- **Queue timeout:** configurable via `queue_timeout_secs`. **It bounds the WHOLE build (cargo permit wait + frontend `pnpm run build` + cargo compile), not just slot acquisition.** A spawn can therefore time out while `GET /builds` shows free cargo permits, because the frontend build is serialized behind `npm_lock` and a concurrent `pnpm run build` (this supervisor's other slots, or an EXTERNAL build on a multi-agent machine) can hold that lock with all cargo slots idle. The timeout message now NAMES the blocked phase — "waited Ns, blocked on the frontend (pnpm) lock with M cargo permits free" vs "waited Ns for a cargo build slot" — so the error itself tells you whether it was slot exhaustion or frontend serialization. `GET /builds` surfaces the same contention via `npm_lock_held` (bool, best-effort sample) and `npm_lock_waiters` (count of spawns blocked on the frontend lock); free `available_permits` with `npm_lock_held: true` does NOT guarantee a prompt start. A spawn waiting >60s on the frontend lock while cargo permits are free emits a `tracing::warn!` in supervisor.log.
 - **Wait timeout:** configurable via `wait_timeout_secs` (default 120s). Only applies when `wait: true`. Returns successfully even if the runner doesn't become healthy — `status` field will say `"timeout"`.
 - **No-wait mode:** pass `X-Queue-Mode: no-wait` header for immediate 503 with queue info instead of blocking.
 
