@@ -1666,6 +1666,47 @@ fn decide_first_healthy(
     FirstHealthyDecision::Wait
 }
 
+/// Outcome of the post-kill port-confirmation reap inside
+/// [`stop_runner_by_id`]. Extracted as a pure decision so the escalation
+/// ladder (plain kill → tree kill → kill-by-port) can be asserted by unit
+/// tests without spawning a process or touching a real port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReapOutcome {
+    /// The port is free (or never had a known holder) — the stop is
+    /// confirmed and may return success.
+    Confirmed,
+    /// The port is still held — escalate by killing the holder's whole
+    /// process tree, then re-confirm.
+    EscalateTree,
+    /// Tree-kill already attempted and the port is still held — escalate to
+    /// a blind kill-by-port (kills anything listening regardless of PID),
+    /// then re-confirm.
+    EscalatePort,
+    /// Every escalation was tried and the port is still in use — the stop
+    /// must NOT report success.
+    StillHeld,
+}
+
+/// Decide the next reap action given the current attempt index and whether
+/// the port is still in use.
+///
+/// `attempt` is 0-based and counts escalations already performed:
+///   * 0 → after the initial graceful + PID kill, port still held: tree-kill.
+///   * 1 → after the tree-kill, port still held: blind kill-by-port.
+///   * ≥2 → both escalations exhausted: give up (StillHeld).
+///
+/// A free port at any attempt short-circuits to `Confirmed`.
+fn decide_stop_reap(attempt: u32, port_in_use: bool) -> StopReapOutcome {
+    if !port_in_use {
+        return StopReapOutcome::Confirmed;
+    }
+    match attempt {
+        0 => StopReapOutcome::EscalateTree,
+        1 => StopReapOutcome::EscalatePort,
+        _ => StopReapOutcome::StillHeld,
+    }
+}
+
 /// Watchdog for a newly-spawned runner. If its HTTP API doesn't respond
 /// within `first_healthy_timeout_secs()`, the process is considered
 /// wedged (alive but hung during startup — e.g. stuck on a DDL, on
@@ -2156,15 +2197,84 @@ pub async fn stop_runner_by_id(
         let _ = pid;
     }
 
-    // 3. Clean up the runner's port
-    let port_free = wait_for_port_free(port, 5).await;
-    if !port_free {
-        warn!(
-            "Port {} still in use after stopping runner '{}', force-killing",
-            port, runner_name
-        );
-        #[cfg(target_os = "windows")]
-        let _ = kill_by_port(port).await;
+    // 4. Confirm the process is actually gone before reporting success.
+    //
+    // Returning "stopped" while the OS process survives and keeps the port
+    // held was an observed failure. The reap below gates success on a
+    // confirmed port-free check (poll up to ~5s) and escalates the kill if
+    // a survivor lingers:
+    //   attempt 0 → wait_for_port_free; if still held, tree-kill the PID
+    //               (`/F /T`) so the runner's *child* processes — which a
+    //               plain `kill_by_pid` (`/F`, no `/T`) leaves alive — die
+    //               too and release the port;
+    //   attempt 1 → blind kill-by-port (kills whatever is LISTENING,
+    //               regardless of PID — covers a re-parented orphan whose
+    //               PID we never tracked);
+    //   attempt 2 → give up and surface a `Process` error so the caller does
+    //               NOT believe the runner stopped.
+    // Each escalation re-confirms via `wait_for_port_free` before deciding
+    // the next step, so a kill that lands late still resolves to success.
+    {
+        let mut attempt: u32 = 0;
+        loop {
+            // Confirm-first: poll the port for up to 5s. A graceful exit or a
+            // prior kill that lands late resolves here without escalation.
+            let port_free = wait_for_port_free(port, 5).await;
+            match decide_stop_reap(attempt, !port_free) {
+                StopReapOutcome::Confirmed => break,
+                StopReapOutcome::EscalateTree => {
+                    warn!(
+                        "Port {} still in use after stopping runner '{}', \
+                         escalating to tree-kill (attempt {})",
+                        port, runner_name, attempt
+                    );
+                    #[cfg(target_os = "windows")]
+                    {
+                        if let Some(pid) = pid_to_kill {
+                            let _ = crate::process::windows::kill_by_pid_tree(pid).await;
+                        }
+                        // Also catch a survivor whose PID we never tracked
+                        // (orphan adopted on a port we knew but no PID for).
+                        if let Some(live_pid) =
+                            crate::process::windows::find_pid_on_port(port).await
+                        {
+                            let _ = crate::process::windows::kill_by_pid_tree(live_pid).await;
+                        }
+                    }
+                }
+                StopReapOutcome::EscalatePort => {
+                    warn!(
+                        "Port {} STILL in use for runner '{}' after tree-kill, \
+                         escalating to kill-by-port (attempt {})",
+                        port, runner_name, attempt
+                    );
+                    #[cfg(target_os = "windows")]
+                    let _ = kill_by_port(port).await;
+                }
+                StopReapOutcome::StillHeld => {
+                    let msg = format!(
+                        "Runner '{}' stop could not be confirmed: port {} is still in \
+                         use after PID kill, tree-kill, and kill-by-port — refusing to \
+                         report success",
+                        runner_name, port
+                    );
+                    warn!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg.clone())
+                        .await;
+                    // Leave the runner in the registry (not removed, not marked
+                    // stopped) so the caller and the dashboard see it as still
+                    // present rather than a phantom "stopped" entry holding a port.
+                    {
+                        let mut runner = managed.runner.write().await;
+                        runner.stop_requested = false;
+                    }
+                    return Err(SupervisorError::Process(msg));
+                }
+            }
+            attempt += 1;
+        }
     }
 
     // Snapshot the runner's state for post-mortem cache BEFORE clearing
@@ -2358,10 +2468,30 @@ pub async fn restart_runner_by_id(
             rebuild,
         });
 
-    let managed = state
-        .get_runner(runner_id)
-        .await
-        .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+    // Up-front existence check (option (b) for already-removed ids). A
+    // `test-*` runner is auto-removed from `state.runners` when it stops, so
+    // a restart on an already-stopped temp id finds nothing here. Reject it
+    // cleanly WITHOUT killing or touching anything (we never had a process to
+    // act on) and with a message that names the auto-remove so the caller
+    // knows to spawn a fresh temp runner rather than restart this dead id.
+    let managed = match state.get_runner(runner_id).await {
+        Some(m) => m,
+        None => {
+            // `RunnerNotFound`'s Display prepends "Runner not found: ", so we
+            // pass only the descriptive suffix for the temp case and the bare
+            // id for the non-temp case to avoid a doubled prefix.
+            let detail = if is_temp_runner(runner_id) {
+                format!(
+                    "{} — ephemeral test runners are auto-removed when stopped and \
+                     cannot be restarted; spawn a new one via POST /runners/spawn-test",
+                    runner_id
+                )
+            } else {
+                runner_id.to_string()
+            };
+            return Err(SupervisorError::RunnerNotFound(detail));
+        }
+    };
 
     {
         let mut runner = managed.runner.write().await;
@@ -2420,8 +2550,17 @@ pub async fn restart_runner_by_id(
         None
     };
 
-    // Start
-    if let Err(e) = start_runner_by_id(state, runner_id).await {
+    // Start.
+    //
+    // Use the `managed` Arc we already hold rather than re-looking-up by id:
+    // stopping a `test-*` runner auto-removes its id from `state.runners`, so
+    // `start_runner_by_id(runner_id)` would 404 with "Runner not found" even
+    // though we have the full config in hand. `start_managed_runner`
+    // re-inserts the id into the registry (its defensive `or_insert`), so a
+    // restart of a *running* temp runner re-spawns on the SAME port instead
+    // of stranding it. For non-temp runners the id was never removed, so this
+    // is equivalent to the by-id path.
+    if let Err(e) = start_managed_runner(state, &managed).await {
         state
             .diagnostics
             .write()
@@ -2838,6 +2977,101 @@ mod tests {
             decide_first_healthy(true, false, false),
             FirstHealthyDecision::Wait
         );
+    }
+
+    // =========================================================================
+    // Stop-reap escalation decision tests (Item 2: confirmed port-free stop)
+    // =========================================================================
+
+    /// Port free on the very first check — no escalation, stop confirmed.
+    #[test]
+    fn stop_reap_confirmed_when_port_free() {
+        assert_eq!(decide_stop_reap(0, false), StopReapOutcome::Confirmed);
+        // A free port short-circuits at every attempt index, even after
+        // escalations have run.
+        assert_eq!(decide_stop_reap(1, false), StopReapOutcome::Confirmed);
+        assert_eq!(decide_stop_reap(2, false), StopReapOutcome::Confirmed);
+    }
+
+    /// First attempt with the port still held escalates to a tree-kill
+    /// (kills the runner's child processes a plain `/F` PID kill leaves alive).
+    #[test]
+    fn stop_reap_first_held_escalates_to_tree() {
+        assert_eq!(decide_stop_reap(0, true), StopReapOutcome::EscalateTree);
+    }
+
+    /// Second attempt still held escalates to a blind kill-by-port.
+    #[test]
+    fn stop_reap_second_held_escalates_to_port() {
+        assert_eq!(decide_stop_reap(1, true), StopReapOutcome::EscalatePort);
+    }
+
+    /// Every escalation exhausted and still held — stop must NOT be confirmed.
+    #[test]
+    fn stop_reap_exhausted_is_still_held() {
+        assert_eq!(decide_stop_reap(2, true), StopReapOutcome::StillHeld);
+        // Any attempt beyond the ladder also reports StillHeld (never loops
+        // back to a kill it already tried).
+        assert_eq!(decide_stop_reap(3, true), StopReapOutcome::StillHeld);
+        assert_eq!(decide_stop_reap(99, true), StopReapOutcome::StillHeld);
+    }
+
+    /// The full escalation ladder visits each rung exactly once before
+    /// giving up — guards against an infinite reap loop on a wedged survivor.
+    #[test]
+    fn stop_reap_ladder_terminates() {
+        // Simulate a survivor that never releases the port: the loop must
+        // walk Tree → Port → StillHeld and stop.
+        assert_eq!(decide_stop_reap(0, true), StopReapOutcome::EscalateTree);
+        assert_eq!(decide_stop_reap(1, true), StopReapOutcome::EscalatePort);
+        assert_eq!(decide_stop_reap(2, true), StopReapOutcome::StillHeld);
+    }
+
+    // =========================================================================
+    // Restart-of-stopped-test-id rejection (Item 3)
+    // =========================================================================
+
+    /// A `test-*` id is classified as a temp runner, so the restart-not-found
+    /// branch emits the "auto-removed, spawn a new one" guidance rather than a
+    /// bare "Runner not found". (The restart path itself needs SharedState, so
+    /// we assert the classification predicate that drives the message choice.)
+    #[test]
+    fn restart_temp_id_is_temp_runner() {
+        assert!(
+            is_temp_runner("test-abc123"),
+            "test-* ids must classify as temp so restart returns the \
+             auto-removed guidance"
+        );
+    }
+
+    /// A non-temp id (primary / named) is NOT a temp runner, so the
+    /// restart-not-found branch falls back to the bare id (no auto-remove
+    /// guidance, and no doubled Display prefix).
+    #[test]
+    fn restart_non_temp_id_is_not_temp_runner() {
+        assert!(!is_temp_runner("primary"));
+        assert!(!is_temp_runner("named-staging"));
+    }
+
+    /// The temp-not-found error renders with a single "Runner not found:"
+    /// prefix (from the variant's Display) plus the spawn-test guidance —
+    /// guards against the doubled-prefix regression.
+    #[test]
+    fn restart_temp_not_found_message_shape() {
+        let detail = format!(
+            "{} — ephemeral test runners are auto-removed when stopped and \
+             cannot be restarted; spawn a new one via POST /runners/spawn-test",
+            "test-xyz"
+        );
+        let err = SupervisorError::RunnerNotFound(detail);
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("Runner not found: test-xyz"));
+        assert_eq!(
+            rendered.matches("Runner not found").count(),
+            1,
+            "must not double the 'Runner not found' prefix"
+        );
+        assert!(rendered.contains("spawn-test"));
     }
 
     // =========================================================================

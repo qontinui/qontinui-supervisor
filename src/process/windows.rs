@@ -268,6 +268,33 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
     Ok(success)
 }
 
+/// Kill a PID **and its entire child process tree** (`taskkill /F /T`).
+///
+/// `kill_by_pid` only kills the named PID; if the runner spawned child
+/// processes (it does — e.g. claude CLI panes, helper subprocesses) those
+/// survive and can keep the API port held open after the parent is gone.
+/// The tree variant is the escalation used by `stop_runner_by_id` when a
+/// plain PID kill leaves the port in use.
+pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
+    let output = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let success = output.status.success();
+    if success {
+        info!("taskkill: killed PID {} and its child tree", pid);
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("taskkill /T PID {}: {}", pid, stderr.trim());
+    }
+
+    Ok(success)
+}
+
 /// Return the WebView2 user data folder for a given runner id.
 ///
 /// - The primary runner uses the default path `com.qontinui.runner\EBWebView`
