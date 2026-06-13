@@ -43,6 +43,84 @@ pub fn disk_guard_allows(disk_free_bytes: Option<u64>, min_free_gb: u64) -> bool
     }
 }
 
+/// The phase a `spawn-test` build future is in, tracked via a shared
+/// `Arc<AtomicU8>` so the route-level `tokio::time::timeout` wrapper can read
+/// the LIVE phase at the instant it fires and compose a phase-accurate timeout
+/// message. The single timeout wraps the WHOLE
+/// `run_cargo_build_with_dir_detailed` future, and the future is cancelled
+/// mid-flight on timeout (so no `BuildAttempt` is returned to the route) — the
+/// only way the route can tell which phase actually blocked is to observe this
+/// marker, which the build future advances monotonically as it progresses.
+///
+/// Ordering (see `run_cargo_build_with_dir_detailed` / `run_build_inner`):
+/// `AwaitingSlot` (cargo permit acquire) → `AwaitingNpmLock` (frontend lock
+/// acquire) → `BuildingFrontend` (`pnpm run build`) → `Compiling` (cargo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BuildPhase {
+    /// Waiting on `permits.acquire_owned()` — the genuine "build slot" wait.
+    AwaitingSlot = 0,
+    /// Slot held; waiting on `npm_lock.lock_owned()` (frontend serialization).
+    AwaitingNpmLock = 1,
+    /// npm_lock held; running `pnpm run build`.
+    BuildingFrontend = 2,
+    /// Frontend done (or skipped); running `cargo build`.
+    Compiling = 3,
+}
+
+impl BuildPhase {
+    /// Reconstruct a phase from the atomic marker. Any out-of-range value is
+    /// treated as `AwaitingSlot` (the conservative default at attempt start).
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => BuildPhase::AwaitingNpmLock,
+            2 => BuildPhase::BuildingFrontend,
+            3 => BuildPhase::Compiling,
+            _ => BuildPhase::AwaitingSlot,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Store this phase into the shared marker (Relaxed — the marker is a
+    /// single-writer observability hint, not a synchronization point).
+    pub fn store(self, marker: &std::sync::atomic::AtomicU8) {
+        marker.store(self.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Compose a phase-accurate `spawn-test` queue-timeout message. `secs` is
+    /// the configured `queue_timeout_secs`; `available_permits` is the live
+    /// cargo-permit count at the instant of timeout (so the operator can see
+    /// that permits were free while the frontend lock starved the build).
+    pub fn timeout_message(self, secs: u64, available_permits: usize) -> String {
+        match self {
+            BuildPhase::AwaitingSlot => {
+                format!(
+                    "Build queue timeout: waited {}s for a cargo build slot",
+                    secs
+                )
+            }
+            BuildPhase::AwaitingNpmLock => format!(
+                "Build queue timeout: waited {}s, blocked on the frontend (pnpm) lock \
+                 with {} cargo permits free",
+                secs, available_permits
+            ),
+            BuildPhase::BuildingFrontend => format!(
+                "Build queue timeout: waited {}s, still running the frontend (pnpm) build \
+                 with {} cargo permits free",
+                secs, available_permits
+            ),
+            BuildPhase::Compiling => format!(
+                "Build queue timeout: waited {}s while compiling (cargo); the slot was \
+                 already held — not a slot wait",
+                secs
+            ),
+        }
+    }
+}
+
 /// Pre-permit disk guard. Called BEFORE acquiring a build-pool permit/slot at
 /// every build-spawning site so a doomed build never consumes a slot. When
 /// free disk is below `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`, returns
@@ -268,12 +346,19 @@ pub async fn run_cargo_build_with_dir(
     // Thin wrapper: discard the per-attempt detail (slot id / full stderr) that
     // only the spawn-test self-heal path consumes, preserving the legacy
     // `Result<(), _>` contract for every other caller.
+    // Callers that don't observe build phase still need a marker to thread
+    // through; a throwaway atomic satisfies the signature with zero behavior
+    // change.
+    let phase = Arc::new(std::sync::atomic::AtomicU8::new(
+        BuildPhase::AwaitingSlot.as_u8(),
+    ));
     run_cargo_build_with_dir_detailed(
         state,
         requester_id,
         build_dir_override,
         force_frontend_build,
         source_kind,
+        phase,
     )
     .await
     .map(|_attempt| ())
@@ -296,6 +381,10 @@ pub async fn run_cargo_build_with_dir_detailed(
     build_dir_override: Option<PathBuf>,
     force_frontend_build: bool,
     source_kind: BuildSourceKind,
+    // Shared phase marker advanced as the build progresses so a route-level
+    // `tokio::time::timeout` wrapper can read the LIVE phase on the timeout
+    // branch (the cancelled future returns no `BuildAttempt`). See [`BuildPhase`].
+    phase: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<BuildAttempt, (SupervisorError, BuildAttempt)> {
     // Pre-permit disk guard (Phase 2): refuse a doomed build BEFORE consuming a
     // permit/slot when free disk is below the configured floor. The refusal
@@ -306,6 +395,7 @@ pub async fn run_cargo_build_with_dir_detailed(
 
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
+    BuildPhase::AwaitingSlot.store(&phase);
     state
         .build_pool
         .queue_depth
@@ -399,6 +489,7 @@ pub async fn run_cargo_build_with_dir_detailed(
                 &slot,
                 build_dir_override.as_deref(),
                 force_frontend_build,
+                &phase,
             )
             .await
         }
@@ -410,6 +501,7 @@ pub async fn run_cargo_build_with_dir_detailed(
         &slot,
         build_dir_override.as_deref(),
         force_frontend_build,
+        &phase,
     )
     .await;
     let duration_secs = build_start.elapsed().as_secs_f64();
@@ -570,6 +662,9 @@ async fn run_build_inner(
     slot: &Arc<BuildSlot>,
     build_dir_override: Option<&std::path::Path>,
     force_frontend_build: bool,
+    // Phase marker advanced through the npm-lock wait, frontend build, and
+    // cargo compile so a route-level timeout can attribute the blocked phase.
+    phase: &std::sync::atomic::AtomicU8,
 ) -> Result<(), SupervisorError> {
     // Source tree cargo will compile. `None` ⇒ the live project dir (legacy);
     // `Some(dir)` ⇒ a detached git-ref worktree's `src-tauri`.
@@ -625,8 +720,40 @@ async fn run_build_inner(
             )
             .await;
 
+        // Entering the frontend (pnpm) lock wait. Bracket the acquire with the
+        // `npm_lock_waiters` counter EXACTLY as `queue_depth` brackets the
+        // permit acquire above, so `GET /builds` can attribute a starving
+        // spawn-test to npm-lock contention while cargo permits are free.
+        BuildPhase::AwaitingNpmLock.store(phase);
+        state
+            .build_pool
+            .npm_lock_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let npm_wait_start = std::time::Instant::now();
         let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+        state
+            .build_pool
+            .npm_lock_waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
+        // (c) Highest-signal starvation diagnostic: we waited a long time on the
+        // frontend lock while cargo slots were free — the exact mis-attributed
+        // wait this surfacing targets. `available_permits() > 0` proves it was
+        // NOT slot exhaustion.
+        let npm_wait_secs = npm_wait_start.elapsed().as_secs();
+        let free_permits = state.build_pool.permits.available_permits();
+        if npm_wait_secs > 60 && free_permits > 0 {
+            warn!(
+                slot_id = slot.id,
+                npm_wait_secs,
+                free_cargo_permits = free_permits,
+                "spawn-test waited >60s on the frontend (pnpm) lock while cargo build \
+                 permits were free — frontend serialization is starving the build, not slot \
+                 exhaustion (check for a concurrent `pnpm run build`)"
+            );
+        }
+
+        BuildPhase::BuildingFrontend.store(phase);
         state
             .logs
             .emit(
@@ -755,6 +882,9 @@ async fn run_build_inner(
         }
         // npm_guard drops here, releasing the frontend build lock before cargo starts.
     }
+
+    // Frontend phase done (or skipped); the remainder is the cargo compile.
+    BuildPhase::Compiling.store(phase);
 
     // Diagnostic-only: emit a WARN if the runner working tree isn't on
     // origin/main. Multi-agent flow can leave the tree on a feature branch
@@ -2550,7 +2680,7 @@ mod tests {
     use super::{
         classify_build_stderr, dist_index_ok, needs_frontend_prebuild, provenance_tree_root,
         rev_parse_head, stderr_submission_tail, update_lkg_after_success, verify_frontend_built,
-        BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
+        BuildPhase, BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
         LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
@@ -2558,6 +2688,62 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// The phase marker must round-trip through `as_u8`/`from_u8` and produce a
+    /// phase-accurate queue-timeout message for each phase. This guards the
+    /// attribution against regression with no live build (plan
+    /// 2026-06-13-spawn-test-queue-timeout-attribution Verification).
+    #[test]
+    fn build_phase_round_trips_and_maps_to_message() {
+        for phase in [
+            BuildPhase::AwaitingSlot,
+            BuildPhase::AwaitingNpmLock,
+            BuildPhase::BuildingFrontend,
+            BuildPhase::Compiling,
+        ] {
+            // u8 round-trip.
+            assert_eq!(BuildPhase::from_u8(phase.as_u8()), phase);
+        }
+
+        // AwaitingSlot is the only phase whose message names a cargo build slot
+        // (the genuine slot wait). Permit count is irrelevant here.
+        let slot_msg = BuildPhase::AwaitingSlot.timeout_message(30, 3);
+        assert!(slot_msg.contains("cargo build slot"), "{slot_msg}");
+        assert!(slot_msg.contains("30s"), "{slot_msg}");
+
+        // AwaitingNpmLock attributes the wait to the frontend lock and reports
+        // the free cargo permits — the exact mis-attributed starvation case.
+        let npm_msg = BuildPhase::AwaitingNpmLock.timeout_message(30, 3);
+        assert!(npm_msg.contains("frontend (pnpm) lock"), "{npm_msg}");
+        assert!(npm_msg.contains("3 cargo permits free"), "{npm_msg}");
+        assert!(
+            !npm_msg.contains("build slot"),
+            "npm-lock message must NOT claim a slot wait: {npm_msg}"
+        );
+
+        // BuildingFrontend names the frontend build, still reporting free permits.
+        let fe_msg = BuildPhase::BuildingFrontend.timeout_message(45, 2);
+        assert!(fe_msg.contains("frontend (pnpm) build"), "{fe_msg}");
+        assert!(fe_msg.contains("2 cargo permits free"), "{fe_msg}");
+        assert!(!fe_msg.contains("build slot"), "{fe_msg}");
+
+        // Compiling makes clear the slot was already held (not a slot wait).
+        let compile_msg = BuildPhase::Compiling.timeout_message(60, 0);
+        assert!(compile_msg.contains("compiling (cargo)"), "{compile_msg}");
+        assert!(
+            !compile_msg.contains("for a cargo build slot"),
+            "{compile_msg}"
+        );
+    }
+
+    /// An out-of-range marker value decodes to the conservative `AwaitingSlot`
+    /// default (an attempt that never advanced the marker reads as the initial
+    /// slot wait, not a panic).
+    #[test]
+    fn build_phase_from_u8_out_of_range_defaults_to_awaiting_slot() {
+        assert_eq!(BuildPhase::from_u8(7), BuildPhase::AwaitingSlot);
+        assert_eq!(BuildPhase::from_u8(255), BuildPhase::AwaitingSlot);
+    }
 
     /// `git init` a real repo at `dir` with one commit, returning its HEAD SHA.
     /// Mirrors the temp-repo fixture pattern in `spawn_worktree.rs` tests.

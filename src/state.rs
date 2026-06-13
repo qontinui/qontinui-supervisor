@@ -691,6 +691,14 @@ pub struct BuildPool {
     /// Incremented by `spawn-test` handler before awaiting, decremented after
     /// acquiring or timing out.
     pub queue_depth: Arc<AtomicUsize>,
+    /// Number of callers currently waiting on `npm_lock.lock_owned()` (the
+    /// serialized frontend `pnpm run build` step). Bracketed around the lock
+    /// acquire in `build_monitor::run_build_inner` exactly as `queue_depth`
+    /// brackets the permit acquire — `npm_lock` is a bare `Mutex<()>` with no
+    /// native waiter accounting, so this counter is what lets `GET /builds`
+    /// surface frontend-lock contention (`npm_lock_waiters`) and distinguish
+    /// frontend starvation from cargo-slot exhaustion.
+    pub npm_lock_waiters: Arc<AtomicUsize>,
     /// The slot id whose target dir holds the most recently successfully built
     /// binary. Used by `spawn-test {rebuild: false}` to locate the exe to copy.
     /// `None` at startup until the first successful build.
@@ -742,6 +750,7 @@ impl BuildPool {
             permits: Arc::new(Semaphore::new(pool_size)),
             npm_lock: Arc::new(tokio::sync::Mutex::new(())),
             queue_depth: Arc::new(AtomicUsize::new(0)),
+            npm_lock_waiters: Arc::new(AtomicUsize::new(0)),
             last_successful_slot: RwLock::new(None),
             last_known_good: RwLock::new(lkg),
         }
