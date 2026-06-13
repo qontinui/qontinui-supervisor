@@ -66,6 +66,16 @@ pub struct StopRunnerRequest {
     pub force: bool,
 }
 
+/// Body for `POST /runners/purge-stale`. All fields optional so a body-less
+/// POST still deserializes (the historical contract).
+#[derive(Deserialize, Default)]
+pub struct PurgeStaleRequest {
+    /// When set, only purge stale runners owned by this requester. When absent,
+    /// purge every stale test runner (legacy behavior). (friction-1.)
+    #[serde(default)]
+    pub requester_id: Option<String>,
+}
+
 /// Body for `POST /runners/{id}/rebuild-and-restart` (Item E).
 ///
 /// The rebuild-and-restart cycle is one round-trip for callers that today
@@ -377,10 +387,15 @@ pub async fn list_runners(
         // listing.
         let stale_binary = manager::stale_binary_for_runner(&state, &managed.config).await;
 
+        // friction-1: surface the owning requester so a session can pin its own
+        // runner by stable id rather than by the reusable port.
+        let requester_id = managed.requester_id.read().await.clone();
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
+            "requester_id": requester_id,
             "kind": managed.config.kind(),
             "protected": is_protected,
             "running": effectively_running,
@@ -665,11 +680,19 @@ pub async fn remove_runner(
 /// This endpoint finds every `test-*` runner that is not currently running and
 /// removes it, freeing its port for reuse. Also kills any orphaned process still
 /// bound to the port.
+///
+/// Optional body `{ "requester_id": "<id>" }` scopes the purge to runners owned
+/// by that requester (friction-1) — a session can reclaim its own dead ports
+/// without risking a sibling session's runners. A body-less POST (or `{}`)
+/// purges every stale test runner, preserving the historical behavior.
 pub async fn purge_stale(
     State(state): State<SharedState>,
+    body: Option<Json<PurgeStaleRequest>>,
 ) -> Result<impl IntoResponse, SupervisorError> {
+    let only_requester = body.and_then(|Json(b)| b.requester_id);
     // Explicit user request — purge regardless of build-pool state.
-    let purged_triples = purge_stale_test_runners_core(&state, false).await;
+    let purged_triples =
+        purge_stale_test_runners_core(&state, false, only_requester.as_deref()).await;
     let count = purged_triples.len();
     let purged: Vec<serde_json::Value> = purged_triples
         .iter()
@@ -709,9 +732,20 @@ pub async fn purge_stale(
 ///   Cold cargo builds can run 10-15 min on a fresh checkout, far longer
 ///   than the sweep cadence; reaping the placeholder mid-build leaves the
 ///   build orphaned and the spawn-test request without a runner.
+///
+/// `only_requester`:
+/// - `None` — purge every stale test runner regardless of owner (the periodic
+///   sweep and the default `POST /runners/purge-stale` both pass `None`).
+/// - `Some(req)` — restrict the purge to runners owned by `req`. A runner whose
+///   stamped `requester_id` differs from `req` is skipped even when its process
+///   looks dead, so one session's purge can never evict another session's
+///   runner. Runners with no owner (`requester_id == None`) are also skipped
+///   under a scoped purge — an unowned runner is never "this requester's" to
+///   reap. (friction-1: requester-scoped reaping.)
 pub async fn purge_stale_test_runners_core(
     state: &SharedState,
     respect_active_builds: bool,
+    only_requester: Option<&str>,
 ) -> Vec<(String, String, u16)> {
     let any_build_active = if respect_active_builds {
         state
@@ -729,6 +763,15 @@ pub async fn purge_stale_test_runners_core(
     for managed in &runners {
         if !manager::is_temp_runner(&managed.config.id) {
             continue;
+        }
+        // friction-1: requester-scoped reaping. Under a scoped purge, never
+        // touch a runner that isn't owned by the requesting session — a
+        // different owner, or no owner at all, is off-limits.
+        if let Some(req) = only_requester {
+            let owner = managed.requester_id.read().await.clone();
+            if owner.as_deref() != Some(req) {
+                continue;
+            }
         }
         let is_running = {
             let runner = managed.runner.read().await;
@@ -1901,6 +1944,15 @@ pub async fn spawn_test(
         runners.insert(id.clone(), managed.clone());
         (id, port, managed)
     };
+
+    // friction-1: stamp the owning requester onto the runner so `GET /runners`
+    // can surface ownership (pin-by-id) and the reaper can scope purges to a
+    // single requester. Set unconditionally — `None` for callers that omitted
+    // the hint — right after registry insertion so a concurrent purge-stale
+    // sweep observes the owner as soon as the runner is reapable.
+    if body.requester_id.is_some() {
+        *managed.requester_id.write().await = body.requester_id.clone();
+    }
 
     // Track 2 (UI-Bridge preview-verification): if this spawn is a preview for
     // an autonomous-dev work unit, record the (unit_id, attempt_id) correlation
@@ -3708,6 +3760,11 @@ pub async fn spawn_named(
         runners.insert(id.clone(), managed.clone());
         (id, port, managed)
     };
+
+    // friction-1: stamp the owning requester (mirror of spawn_test).
+    if body.requester_id.is_some() {
+        *managed.requester_id.write().await = body.requester_id.clone();
+    }
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
     // as spawn-test). Stamped into the success response below.
@@ -6104,5 +6161,147 @@ mod tests {
             0,
             "unknown unit returns [] (a queryable answer), never 404"
         );
+    }
+
+    // ----- friction-1: per-requester pinning + requester-scoped reaping -----
+
+    /// Insert a temp-runner placeholder owned by `requester` (or unowned when
+    /// `None`). Mirrors the spawn-test registry-insert + requester stamp. The
+    /// runner is left `running=false` so the reaper treats it as a reapable
+    /// placeholder (the spawn-test pre-build state).
+    async fn insert_temp_runner_owned(
+        state: &crate::state::SharedState,
+        port: u16,
+        requester: Option<&str>,
+    ) -> String {
+        let id = format!("test-{}", port);
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = id.clone();
+        config.name = id.clone();
+        config.port = port;
+        config.kind = super::RunnerKind::Temp { id: id.clone() };
+        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+            config, false, None,
+        ));
+        if let Some(r) = requester {
+            *managed.requester_id.write().await = Some(r.to_string());
+        }
+        state.runners.write().await.insert(id.clone(), managed);
+        id
+    }
+
+    #[tokio::test]
+    async fn get_runners_surfaces_requester_id() {
+        use axum::extract::State;
+        let state = make_state();
+        insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
+        insert_temp_runner_owned(&state, 9878, None).await;
+
+        let resp = super::list_runners(State(state.clone()))
+            .await
+            .expect("list must succeed");
+        let arr = resp.0.as_array().expect("array body").clone();
+
+        let r_a = arr
+            .iter()
+            .find(|r| r["port"] == 9877)
+            .expect("9877 present");
+        assert_eq!(
+            r_a["requester_id"], "session-A",
+            "owner must be surfaced so a session can pin by id, not port"
+        );
+        let r_b = arr
+            .iter()
+            .find(|r| r["port"] == 9878)
+            .expect("9878 present");
+        assert!(
+            r_b["requester_id"].is_null(),
+            "an unowned runner reports requester_id: null"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_purge_never_evicts_another_requesters_runner() {
+        // Two sessions each own a placeholder; both look dead (running=false).
+        // Session-A purges scoped to itself — only A's runner is reaped, B's
+        // (and an unowned third) survive untouched.
+        let state = make_state();
+        let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
+        let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
+        let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+
+        let purged = super::purge_stale_test_runners_core(&state, false, Some("session-A")).await;
+
+        let purged_ids: std::collections::HashSet<String> =
+            purged.into_iter().map(|(id, _, _)| id).collect();
+        assert!(
+            purged_ids.contains(&id_a),
+            "session-A's own stale runner must be reaped"
+        );
+        assert!(
+            !purged_ids.contains(&id_b),
+            "session-B's runner must NOT be reaped by session-A's scoped purge"
+        );
+        assert!(
+            !purged_ids.contains(&id_unowned),
+            "an unowned runner is not 'this requester's' and must not be reaped under a scoped purge"
+        );
+
+        let registry = state.runners.read().await;
+        assert!(!registry.contains_key(&id_a), "A removed from registry");
+        assert!(registry.contains_key(&id_b), "B survives in registry");
+        assert!(
+            registry.contains_key(&id_unowned),
+            "unowned survives in registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_purge_reaps_all_stale_runners() {
+        // The periodic sweep / body-less purge-stale passes None and reaps
+        // every stale test runner regardless of owner (legacy behavior).
+        let state = make_state();
+        let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
+        let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
+        let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+
+        let purged = super::purge_stale_test_runners_core(&state, false, None).await;
+        let purged_ids: std::collections::HashSet<String> =
+            purged.into_iter().map(|(id, _, _)| id).collect();
+
+        for id in [&id_a, &id_b, &id_unowned] {
+            assert!(purged_ids.contains(id), "unscoped purge reaps {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn temp_runner_port_is_stable_for_its_lifetime() {
+        // A runner's port lives on its immutable RunnerConfig and the allocator
+        // only ever picks ports NOT already held by a runner in the registry —
+        // so no concurrent spawn can be handed a live runner's port, and a
+        // runner's own port never changes while it is registered.
+        let state = make_state();
+        let id = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
+
+        // The allocator's used-port set (the exact expression spawn_test uses).
+        let used_ports: std::collections::HashSet<u16> = {
+            let runners = state.runners.read().await;
+            runners.values().map(|r| r.config.port).collect()
+        };
+        let next = (9877..=9899)
+            .find(|p| !used_ports.contains(p))
+            .expect("a free port exists");
+        assert_ne!(
+            next, 9877,
+            "the next allocation must skip the live runner's port"
+        );
+
+        // The live runner's port is unchanged after the (hypothetical) sibling
+        // allocation — config.port is set once at insert and never reassigned.
+        let port_now = {
+            let runners = state.runners.read().await;
+            runners.get(&id).expect("still registered").config.port
+        };
+        assert_eq!(port_now, 9877, "a live runner's port is immutable");
     }
 }

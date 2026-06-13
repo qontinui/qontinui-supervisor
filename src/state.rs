@@ -72,6 +72,16 @@ pub struct ManagedRunner {
     /// resolvable via `GET /runners/by-unit/{unit_id}`. `None` for ordinary
     /// (non-preview) runners.
     pub preview_binding: RwLock<Option<PreviewBinding>>,
+    /// Identity of the caller that spawned this runner (the `requester_id`
+    /// passed to `spawn-test` / `spawn-named`). `None` for runners with no
+    /// declared owner (primary, user-imported registry entries, or callers
+    /// that omitted the hint).
+    ///
+    /// Used to (a) surface ownership in `GET /runners` so a session can pin a
+    /// runner by id rather than by its (reusable) port, and (b) scope the
+    /// `purge-stale` reaper to a single requester so one session's purge can
+    /// never evict another session's runner.
+    pub requester_id: RwLock<Option<String>>,
 }
 
 /// Work-unit → preview correlation for a runner spawned as an attempt's
@@ -153,6 +163,7 @@ impl ManagedRunner {
             source_exe_override: RwLock::new(None),
             last_auth_result: RwLock::new(None),
             preview_binding: RwLock::new(None),
+            requester_id: RwLock::new(None),
         }
     }
 
