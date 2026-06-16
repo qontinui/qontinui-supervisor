@@ -150,9 +150,16 @@ fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Match `qontinui-runner-<id>.exe` (the per-runner copies), excluding
-        // the bare `qontinui-runner.exe`.
-        if name.starts_with("qontinui-runner-") && name.ends_with(".exe") {
+        // Match the per-runner copies `qontinui-runner-<id>[.exe]`, excluding the
+        // bare build output (`qontinui-runner[.exe]`, no `-<id>`). Windows copies
+        // carry a `.exe` extension; on macOS/Linux the copy is a bare Mach-O/ELF
+        // with no extension — so require `.exe` on Windows and no extension
+        // elsewhere (a `.json`/`.d`/`.pdb` sidecar is never an exe copy).
+        let is_exe_copy = name.starts_with("qontinui-runner-")
+            && std::path::Path::new(name.as_ref())
+                .extension()
+                .map_or(cfg!(not(windows)), |ext| ext == "exe");
+        if is_exe_copy {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     out.count += 1;
