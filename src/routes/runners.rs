@@ -4618,7 +4618,10 @@ pub async fn clean_slot_endpoint(
     // Refusal 2: the slot exe is held open by a live process. Holder detection
     // is Windows-only (sysinfo image-path match); on other platforms there is
     // no holder concept for a stalled file lock, so the check is a no-op.
-    let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+    let exe_path = slot
+        .target_dir
+        .join("debug")
+        .join(crate::config::RUNNER_BIN_NAME);
     let holders = crate::build_monitor::slot_exe_holders(&exe_path).await;
     if !holders.is_empty() {
         return (

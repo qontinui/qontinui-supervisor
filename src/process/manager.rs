@@ -123,7 +123,7 @@ pub fn running_binary_mtime(
 pub async fn newest_slot_binary_mtime(state: &SharedState) -> Option<(u8, std::time::SystemTime)> {
     let mut best: Option<(u8, std::time::SystemTime)> = None;
     for slot in &state.build_pool.slots {
-        let path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        let path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -235,7 +235,10 @@ pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, 
 /// which only ever recorded the live tree's HEAD and therefore lied when an
 /// override tree was built. Legacy files are ignored (read as absent) and
 /// self-heal on the next build.
+#[cfg(windows)]
 pub const SLOT_PROVENANCE_SIDECAR_FILENAME: &str = "qontinui-runner.exe.provenance.json";
+#[cfg(not(windows))]
+pub const SLOT_PROVENANCE_SIDECAR_FILENAME: &str = "qontinui-runner.provenance.json";
 
 /// Which source tree a slot's exe was built from.
 ///
@@ -562,7 +565,7 @@ pub async fn pick_slot_for_resolution(state: &SharedState) -> Option<usize> {
         .build_pool
         .slots
         .iter()
-        .map(|s| (s.id, s.target_dir.join("debug").join("qontinui-runner.exe")))
+        .map(|s| (s.id, s.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME)))
         .collect();
     pick_slot_decision(last, &slots, |p| p.exists())
 }
@@ -740,7 +743,7 @@ fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<Targe
         .build_pool
         .slots
         .iter()
-        .map(|s| (s.id, s.target_dir.join("debug").join("qontinui-runner.exe")))
+        .map(|s| (s.id, s.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME)))
         .collect();
     let slot_refs: Vec<(usize, &std::path::Path)> = slot_paths
         .iter()
