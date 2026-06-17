@@ -118,6 +118,13 @@ tower = { version = "0.5", features = ["util"] }
 # Used for env-override scoping in tests.
 scopeguard = "1.2"
 
+# Unix process-kill primitives (kill_by_pid / kill_by_port / process-group
+# tree-kill) used by the reaper, stop path, and first-healthy watchdog so a
+# temp runner's OS process is terminated as its registry record is dropped
+# (orphan-leak fix D7). Windows uses the `windows`/`windows-sys` crates below.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
