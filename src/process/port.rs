@@ -25,6 +25,19 @@ use crate::config::{PORT_CHECK_INTERVAL_MS, PORT_WAIT_TIMEOUT_SECS};
 /// The probe socket is bound but never listened/connected, so dropping it
 /// creates no TIME_WAIT state of its own.
 ///
+/// **Correct on Unix too, which the connect-based ancestor was not.** The
+/// original probe did a *nonblocking* connect and recognised only the Windows
+/// "in progress" codes (`WSAEWOULDBLOCK` 10035 / `WSAEISCONN` 10056) as
+/// "listening"; on macOS/Linux a nonblocking localhost connect returns
+/// `EINPROGRESS` regardless of whether anything is listening, so the function
+/// **always returned `false` there**. That silently broke every caller that
+/// gates on it: the stop path's port-free confirmation, the reaper's crash
+/// detection, and the reconcile sweep's orphan detection (the D7 orphan-leak
+/// surface). The bind probe has no such asymmetry — a `bind(2)` against a port
+/// a live listener holds fails with `EADDRINUSE` on Unix exactly as it fails
+/// with `WSAEADDRINUSE` on Windows — so it fixes the Unix bug *and* the
+/// TIME_WAIT false positive with one mechanism.
+///
 /// For "is a runner actually serving HTTP?" use [`is_runner_responding`] —
 /// that is an application-level question, not a port-occupancy one.
 pub fn is_port_listening(port: u16) -> bool {
@@ -41,8 +54,9 @@ pub fn is_port_listening(port: u16) -> bool {
 
     // Deliberately no SO_REUSEADDR: the default-bind semantics above are
     // exactly what makes this probe ignore TIME_WAIT but fail against a
-    // live listener. Any bind error (WSAEADDRINUSE, or WSAEACCES when the
-    // holder bound exclusively) means a live socket owns the port.
+    // live listener. Any bind error (WSAEADDRINUSE / EADDRINUSE, or
+    // WSAEACCES when the holder bound exclusively) means a live socket owns
+    // the port.
     socket.bind(&addr.into()).is_err()
 }
 

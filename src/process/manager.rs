@@ -11,15 +11,14 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::env_forwarders;
 use crate::process::instance_config_dir;
 use crate::process::port::wait_for_port_free;
-use crate::process::stop_ledger::{resolve_stop_target, StopLedger, StopStrategy, StopTarget};
-#[cfg(target_os = "windows")]
 use crate::process::stop_ledger::{
-    verify_target_image, PidSource, TargetVerification as StopVerification,
+    resolve_stop_target, verify_target_image, PidSource, StopLedger, StopStrategy, StopTarget,
+    TargetVerification as StopVerification,
 };
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
-    kill_by_pid, kill_by_port, remove_instance_config_dir, remove_runner_app_data_dirs,
-    remove_webview2_user_data_folder, webview2_user_data_folder,
+    remove_instance_config_dir, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
+    webview2_user_data_folder,
 };
 use crate::state::{ManagedRunner, SharedState};
 
@@ -171,7 +170,10 @@ pub fn running_binary_mtime(
 pub async fn newest_slot_binary_mtime(state: &SharedState) -> Option<(u8, std::time::SystemTime)> {
     let mut best: Option<(u8, std::time::SystemTime)> = None;
     for slot in &state.build_pool.slots {
-        let path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
+        let path = slot
+            .target_dir
+            .join("debug")
+            .join(crate::config::RUNNER_BIN_NAME);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -613,7 +615,14 @@ pub async fn pick_slot_for_resolution(state: &SharedState) -> Option<usize> {
         .build_pool
         .slots
         .iter()
-        .map(|s| (s.id, s.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME)))
+        .map(|s| {
+            (
+                s.id,
+                s.target_dir
+                    .join("debug")
+                    .join(crate::config::RUNNER_BIN_NAME),
+            )
+        })
         .collect();
     pick_slot_decision(last, &slots, |p| p.exists())
 }
@@ -791,7 +800,14 @@ fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<Targe
         .build_pool
         .slots
         .iter()
-        .map(|s| (s.id, s.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME)))
+        .map(|s| {
+            (
+                s.id,
+                s.target_dir
+                    .join("debug")
+                    .join(crate::config::RUNNER_BIN_NAME),
+            )
+        })
         .collect();
     let slot_refs: Vec<(usize, &std::path::Path)> = slot_paths
         .iter()
@@ -935,17 +951,13 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
         }
     }
 
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut killed_any = false;
-    #[cfg(target_os = "windows")]
     for &port in &ports {
-        if let Ok(true) = kill_by_port(port).await {
+        if let Ok(true) = crate::process::proc_kill::kill_by_port(port).await {
             info!("Killed orphaned temp runner on port {}", port);
             killed_any = true;
         }
     }
-    #[cfg(not(target_os = "windows"))]
-    let _ = ports;
 
     // Remove stale test runner entries from the in-memory registry.
     if !stale_ids.is_empty() {
@@ -1048,14 +1060,43 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             let id = managed.config.id.clone();
             let name = managed.config.name.clone();
             let port = managed.config.port;
+            let pid = {
+                let runner = managed.runner.read().await;
+                runner.pid
+            };
 
+            // ── Terminate the owned process ATOMICALLY with record removal. ──
+            // This used to be a Windows-only `kill_by_port`, so on macOS/Linux
+            // the reaper dropped the registry record while the OS process
+            // stayed alive — the orphan leak (D7): `POST /stop` then 404'd
+            // while the runner kept serving its port. We now (1) tree-kill the
+            // tracked PID (reaps the runner's child panes/helpers too),
+            // (2) backstop with kill-by-port for a re-parented orphan whose PID
+            // we lost, and (3) confirm the port is free before we forget the
+            // record. All three go through the cross-platform `proc_kill`
+            // facade, so every platform gets a real kill.
+            if let Some(pid) = pid {
+                let _ = crate::process::proc_kill::kill_by_pid_tree(pid).await;
+            }
             // `Err` is UNKNOWN, not "port idle" — say so rather than
-            // swallowing it (contract on `find_pids_on_port`).
-            #[cfg(target_os = "windows")]
-            if let Err(e) = kill_by_port(port).await {
+            // swallowing it (contract on `proc_kill::find_pid_on_port`).
+            if let Err(e) = crate::process::proc_kill::kill_by_port(port).await {
                 warn!(
-                    "Stale-test-runner reap: listener probe on port {} could not answer \n                     ({}) — nothing was killed by port",
+                    "Stale-test-runner reap: listener probe on port {} could not answer \
+                     ({}) — nothing was killed by port",
                     port, e
+                );
+            }
+            // Confirm the process actually released the port. If it didn't, log
+            // loudly but still drop the record — leaving it would re-trip the
+            // same reap next cycle; the reconcile sweep will re-kill any
+            // survivor by port. Bounded so a wedged process never stalls the
+            // reaper loop.
+            if !crate::process::port::wait_for_port_free(port, 5).await {
+                warn!(
+                    "reaper: port {} still in use after killing stale test runner '{}' \
+                     (pid {:?}); dropping record anyway — reconcile sweep will re-kill by port",
+                    port, name, pid
                 );
             }
 
@@ -1102,6 +1143,101 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                 )
                 .await;
         }
+
+        // Reconcile sweep: catch ALREADY-orphaned temp-runner processes whose
+        // registry record is gone (e.g. reaped by an older binary that didn't
+        // kill the process, or a stop that 404'd while the process survived).
+        // This is the safety net for the D7 orphan leak — even if a record was
+        // dropped without a kill, the next sweep frees the port.
+        reconcile_orphaned_temp_runners(&state).await;
+    }
+}
+
+/// Temp-runner port range (mirrors the `9877..=9899` allocation in
+/// `routes::runners`). Kept here so the reconcile sweep scans exactly the
+/// ports the spawner hands out — never the primary (9876) or supervisor
+/// (9875) ports.
+const TEMP_RUNNER_PORT_RANGE: std::ops::RangeInclusive<u16> = 9877..=9899;
+
+/// Reconcile sweep: kill orphaned `qontinui-runner` processes that are
+/// LISTENING on a temp-runner port (9877-9899) but have NO matching record in
+/// the registry. Frees ports leaked by a record-removed-but-process-alive
+/// event (the D7 bug, or a record dropped by a prior supervisor binary).
+///
+/// Safety: only kills a PID that (a) is listening on a temp-range port, (b) is
+/// NOT claimed by any registered runner, AND (c) is confirmed to be a
+/// `qontinui-runner` image via [`proc_kill::is_qontinui_runner_pid`]. An
+/// unrelated process that grabbed a temp-range port is left untouched. The
+/// primary (9876) is outside the swept range and can never be hit.
+async fn reconcile_orphaned_temp_runners(state: &SharedState) {
+    // Ports currently claimed by a registered runner — never sweep these.
+    let claimed_ports: std::collections::HashSet<u16> = state
+        .get_all_runners()
+        .await
+        .iter()
+        .map(|r| r.config.port)
+        .collect();
+
+    let mut freed = 0u32;
+    for port in TEMP_RUNNER_PORT_RANGE {
+        if claimed_ports.contains(&port) {
+            continue;
+        }
+        if !crate::process::port::is_port_listening(port) {
+            continue;
+        }
+        // Something is on an unclaimed temp port. Confirm it's a runner of
+        // ours before killing. A probe that could not RUN is UNKNOWN — skip,
+        // never kill blind (the sweep re-runs next cycle).
+        let pid = match crate::process::proc_kill::find_pid_on_port(port).await {
+            Ok(Some(pid)) => pid,
+            Ok(None) => continue,
+            Err(e) => {
+                debug!(
+                    "reconcile sweep: listener probe on port {} could not answer ({}); \
+                     leaving it alone this pass",
+                    port, e
+                );
+                continue;
+            }
+        };
+        if !crate::process::proc_kill::is_qontinui_runner_pid(pid) {
+            debug!(
+                "reconcile sweep: port {} held by non-runner PID {}; leaving alone",
+                port, pid
+            );
+            continue;
+        }
+
+        warn!(
+            "reconcile sweep: killing orphaned qontinui-runner PID {} on unclaimed \
+             temp port {} (no registry record)",
+            pid, port
+        );
+        let _ = crate::process::proc_kill::kill_by_pid_tree(pid).await;
+        let _ = crate::process::proc_kill::kill_by_port(port).await;
+        if crate::process::port::wait_for_port_free(port, 5).await {
+            freed += 1;
+        } else {
+            warn!(
+                "reconcile sweep: port {} still in use after killing orphan PID {}",
+                port, pid
+            );
+        }
+    }
+
+    if freed > 0 {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "Reconcile sweep: killed {} orphaned temp-runner process(es) and freed their port(s)",
+                    freed
+                ),
+            )
+            .await;
     }
 }
 
@@ -2416,30 +2552,21 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
                     .emit(LogSource::Supervisor, LogLevel::Error, msg)
                     .await;
 
-                #[cfg(target_os = "windows")]
-                {
-                    match crate::process::windows::kill_by_pid(pid).await {
-                        Ok(true) => info!(
-                            "First-healthy watchdog killed wedged runner '{}' PID {}",
-                            runner_name, pid
-                        ),
-                        Ok(false) => warn!(
-                            "First-healthy watchdog: PID {} for runner '{}' no longer present",
-                            pid, runner_name
-                        ),
-                        Err(e) => error!(
-                            "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
-                            pid, runner_name, e
-                        ),
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    warn!(
-                        "First-healthy watchdog: kill_by_pid not implemented on non-Windows; \
-                         leaving wedged runner '{}' PID {} in place",
+                // Tree-kill so the wedged runner's child processes release the
+                // port too — cross-platform via the proc_kill facade.
+                match crate::process::proc_kill::kill_by_pid_tree(pid).await {
+                    Ok(true) => info!(
+                        "First-healthy watchdog killed wedged runner '{}' PID {}",
                         runner_name, pid
-                    );
+                    ),
+                    Ok(false) => warn!(
+                        "First-healthy watchdog: PID {} for runner '{}' no longer present",
+                        pid, runner_name
+                    ),
+                    Err(e) => error!(
+                        "First-healthy watchdog: failed to kill PID {} for runner '{}': {}",
+                        pid, runner_name, e
+                    ),
                 }
                 return;
             }
@@ -2778,32 +2905,23 @@ async fn resolve_stop_target_for(
         return resolve_stop_target(Some(pid), Ok(None), &[]);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        let listener = crate::process::windows::find_pid_on_port(port)
-            .await
-            .map_err(|e| e.to_string());
-        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
-        let by_exe = crate::process::windows::find_pids_holding_exe(&exe_copy).await;
-        resolve_stop_target(None, listener, &by_exe)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (state, managed, port);
-        // NOT `Ok(None)`: neither probe was compiled in, so claiming they ran
-        // and found nothing would be exactly the false assertion this module
-        // exists to eliminate.
-        resolve_stop_target(
-            None,
-            Err("this build has no Windows process probes compiled in".to_string()),
-            &[],
-        )
-    }
+    // Both probes go through the cross-platform `proc_kill` facade. They used
+    // to be Windows-only, with the non-Windows arm hard-coding "this build has
+    // no Windows process probes compiled in" — honest, but it meant macOS/Linux
+    // could never identify a stop target and so never killed anything (D7).
+    // `Err` still means UNKNOWN, never "the port was idle".
+    let listener = crate::process::proc_kill::find_pid_on_port(port)
+        .await
+        .map_err(|e| e.to_string());
+    let exe_copy = state.config.runner_exe_copy_path(&managed.config);
+    let by_exe = crate::process::proc_kill::find_pids_holding_exe(&exe_copy).await;
+    resolve_stop_target(None, listener, &by_exe)
 }
 
-/// Windows adapter for [`verify_target_image`]: read the target's live image
-/// path and compare it with the runner's own exe copy.
-#[cfg(target_os = "windows")]
+/// Adapter for [`verify_target_image`]: read the target's live image path and
+/// compare it with the runner's own exe copy. sysinfo reads the image path on
+/// every platform, so the pre-kill identity re-check guards the Unix kill path
+/// too rather than only the Windows one.
 async fn verify_kill_target(
     state: &SharedState,
     managed: &ManagedRunner,
@@ -2817,7 +2935,7 @@ async fn verify_kill_target(
         StopTarget::NotFound { .. } => PidSource::ListenerProbe,
     };
     let expected = state.config.runner_exe_copy_path(&managed.config);
-    let observed = crate::process::windows::pid_exe_path(pid).await;
+    let observed = crate::process::proc_kill::pid_exe_path(pid).await;
     verify_target_image(&source, observed.as_deref(), &expected)
 }
 
@@ -2894,10 +3012,7 @@ pub async fn stop_runner_by_id(
     let stop_target = resolve_stop_target_for(state, &managed, port, registry_pid).await;
 
     // `mut` because the pre-kill identity re-check below can retract the
-    // target. That re-check is Windows-only, so on other targets nothing ever
-    // reassigns it — hence the allow, which would otherwise fail the
-    // Linux-only `clippy -D warnings` gate.
-    #[allow(unused_mut)]
+    // target.
     let mut pid_to_kill = match &stop_target {
         StopTarget::Found { pid, source } => {
             if registry_pid.is_none() {
@@ -2913,9 +3028,11 @@ pub async fn stop_runner_by_id(
                     .await;
                 // Publish it so the dashboard, the exit monitor and any racing
                 // health probe all see the same process we are about to stop.
-                let mut runner = managed.runner.write().await;
-                if runner.pid.is_none() {
-                    runner.pid = Some(*pid);
+                {
+                    let mut runner = managed.runner.write().await;
+                    if runner.pid.is_none() {
+                        runner.pid = Some(*pid);
+                    }
                 }
             }
             Some(*pid)
@@ -2935,7 +3052,6 @@ pub async fn stop_runner_by_id(
     // otherwise the tree-kill rung would render "DID NOT RUN ()" with an
     // empty parenthesis, which is the content-free message this whole change
     // exists to remove.
-    #[allow(unused_mut)]
     let mut no_target_why = match &stop_target {
         StopTarget::Found { .. } => String::new(),
         StopTarget::NotFound { why } => why.clone(),
@@ -3003,46 +3119,41 @@ pub async fn stop_runner_by_id(
     // Re-verified immediately before firing: identification happened up to
     // ~34s ago (drain + close-request + graceful poll), and a probe-derived
     // PID was only ever a candidate. See `stop_ledger::verify_target_image`.
+    // The kill itself goes through the cross-platform `proc_kill` facade — it
+    // used to be Windows-only, with the non-Windows arm recording "not a
+    // Windows host" and killing nothing, which is the D7 orphan leak.
     match pid_to_kill {
-        Some(pid) => {
-            #[cfg(target_os = "windows")]
-            {
-                match verify_kill_target(state, &managed, &stop_target, pid).await {
-                    StopVerification::Proceed { note } => {
-                        if let Some(note) = note {
-                            warn!("Runner '{}' stop: PID {} — {}", runner_name, pid, note);
-                        }
-                        let killed = kill_by_pid(pid).await.unwrap_or(false);
-                        ledger.ran(StopStrategy::PidKill, format!("PID {}", pid), killed);
-                    }
-                    StopVerification::Refuse { why } => {
-                        warn!(
-                            "Runner '{}' stop: REFUSING to kill PID {} — {}",
-                            runner_name, pid, why
-                        );
-                        state
-                            .logs
-                            .emit(
-                                LogSource::Supervisor,
-                                LogLevel::Warn,
-                                format!(
-                                    "Runner '{}' stop: refused to kill PID {} — {}",
-                                    runner_name, pid, why
-                                ),
-                            )
-                            .await;
-                        ledger.no_target(StopStrategy::PidKill, why.clone());
-                        no_target_why = why;
-                        pid_to_kill = None;
-                    }
+        Some(pid) => match verify_kill_target(state, &managed, &stop_target, pid).await {
+            StopVerification::Proceed { note } => {
+                if let Some(note) = note {
+                    warn!("Runner '{}' stop: PID {} — {}", runner_name, pid, note);
                 }
+                let killed = crate::process::proc_kill::kill_by_pid(pid)
+                    .await
+                    .unwrap_or(false);
+                ledger.ran(StopStrategy::PidKill, format!("PID {}", pid), killed);
             }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = pid;
-                ledger.no_target(StopStrategy::PidKill, "not a Windows host");
+            StopVerification::Refuse { why } => {
+                warn!(
+                    "Runner '{}' stop: REFUSING to kill PID {} — {}",
+                    runner_name, pid, why
+                );
+                state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Warn,
+                        format!(
+                            "Runner '{}' stop: refused to kill PID {} — {}",
+                            runner_name, pid, why
+                        ),
+                    )
+                    .await;
+                ledger.no_target(StopStrategy::PidKill, why.clone());
+                no_target_why = why;
+                pid_to_kill = None;
             }
-        }
+        },
         None => ledger.no_target(StopStrategy::PidKill, no_target_why.clone()),
     }
 
@@ -3077,11 +3188,10 @@ pub async fn stop_runner_by_id(
                          escalating to tree-kill (attempt {})",
                         port, runner_name, attempt
                     );
-                    #[cfg(target_os = "windows")]
                     {
                         match pid_to_kill {
                             Some(pid) => {
-                                let killed = crate::process::windows::kill_by_pid_tree(pid)
+                                let killed = crate::process::proc_kill::kill_by_pid_tree(pid)
                                     .await
                                     .unwrap_or(false);
                                 ledger.ran(
@@ -3096,9 +3206,9 @@ pub async fn stop_runner_by_id(
                         // (orphan adopted on a port we knew but no PID for).
                         // A probe that could not RUN is UNKNOWN — never a
                         // kill; the next escalation step re-confirms anyway.
-                        match crate::process::windows::find_pid_on_port(port).await {
+                        match crate::process::proc_kill::find_pid_on_port(port).await {
                             Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
-                                let killed = crate::process::windows::kill_by_pid_tree(live_pid)
+                                let killed = crate::process::proc_kill::kill_by_pid_tree(live_pid)
                                     .await
                                     .unwrap_or(false);
                                 ledger.ran(
@@ -3122,8 +3232,7 @@ pub async fn stop_runner_by_id(
                          escalating to kill-by-port (attempt {})",
                         port, runner_name, attempt
                     );
-                    #[cfg(target_os = "windows")]
-                    match kill_by_port(port).await {
+                    match crate::process::proc_kill::kill_by_port(port).await {
                         Ok(killed) => {
                             ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
                         }
