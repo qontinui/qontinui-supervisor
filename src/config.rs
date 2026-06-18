@@ -3,6 +3,17 @@ use qontinui_types::wire::runner_kind::RunnerKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Runner binary filename for the current platform: `qontinui-runner.exe` on
+/// Windows, `qontinui-runner` on Unix. Build/spawn/LKG/footprint paths must use
+/// this (or [`std::env::consts::EXE_SUFFIX`] for derived names) instead of a
+/// hardcoded `.exe`. The runner artifact has no extension on macOS/Linux, so the
+/// old literal made the supervisor fail to locate a freshly-built runner there
+/// (LKG promotion + `resolve_source_exe` both came up empty).
+#[cfg(windows)]
+pub const RUNNER_BIN_NAME: &str = "qontinui-runner.exe";
+#[cfg(not(windows))]
+pub const RUNNER_BIN_NAME: &str = "qontinui-runner";
+
 /// Qontinui Supervisor — manages the qontinui-runner process lifecycle.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "qontinui-supervisor")]
@@ -560,7 +571,7 @@ impl SupervisorConfig {
     pub fn runner_exe_path_for_slot(&self, slot_id: usize) -> PathBuf {
         self.runner_slot_target_dir(slot_id)
             .join("debug")
-            .join("qontinui-runner.exe")
+            .join(RUNNER_BIN_NAME)
     }
 
     /// Last-known-good directory under the build pool. Holds a copy of the
@@ -574,7 +585,7 @@ impl SupervisorConfig {
     /// Path to the LKG runner exe. The file is replaced atomically on every
     /// successful build via copy-to-temp + rename.
     pub fn lkg_exe_path(&self) -> PathBuf {
-        self.lkg_dir().join("qontinui-runner.exe")
+        self.lkg_dir().join(RUNNER_BIN_NAME)
     }
 
     /// Path to the LKG metadata sidecar (`built_at`, `source_slot`, `exe_size`,
@@ -596,7 +607,7 @@ impl SupervisorConfig {
         self.runner_npm_dir()
             .join("target")
             .join("debug")
-            .join("qontinui-runner.exe")
+            .join(RUNNER_BIN_NAME)
     }
 
     /// Path to a copied runner executable for non-primary runners.
@@ -619,15 +630,16 @@ impl SupervisorConfig {
     /// already a stable `"primary"`, and external runners are user-managed
     /// (the supervisor only observes them).
     pub fn runner_exe_copy_path(&self, config: &RunnerConfig) -> PathBuf {
+        let sfx = std::env::consts::EXE_SUFFIX;
         let filename = match &config.kind {
-            RunnerKind::Temp { .. } => format!("qontinui-runner-test-{}.exe", config.port),
-            RunnerKind::Named { .. } => format!("qontinui-runner-named-{}.exe", config.port),
-            RunnerKind::Primary => format!("qontinui-runner-{}.exe", config.id),
+            RunnerKind::Temp { .. } => format!("qontinui-runner-test-{}{}", config.port, sfx),
+            RunnerKind::Named { .. } => format!("qontinui-runner-named-{}{}", config.port, sfx),
+            RunnerKind::Primary => format!("qontinui-runner-{}{}", config.id, sfx),
             // `External` and any future `RunnerKind` variants (the enum is
             // `#[non_exhaustive]`) — fall back to the id-based name so
             // user-managed runners that the supervisor only observes keep
             // working without supervisor changes.
-            _ => format!("qontinui-runner-{}.exe", config.id),
+            _ => format!("qontinui-runner-{}{}", config.id, sfx),
         };
         self.runner_npm_dir()
             .join("target")
@@ -854,10 +866,7 @@ mod tests {
         let args = make_test_args(false, false);
         let config = SupervisorConfig::from_args(args);
         let exe_path = config.runner_exe_path();
-        assert!(
-            exe_path.ends_with("target/debug/qontinui-runner.exe")
-                || exe_path.ends_with("target\\debug\\qontinui-runner.exe")
-        );
+        assert!(exe_path.ends_with(format!("target/debug/{}", RUNNER_BIN_NAME)));
     }
 
     #[test]

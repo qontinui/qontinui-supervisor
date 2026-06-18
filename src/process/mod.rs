@@ -7,7 +7,10 @@ pub mod manager;
 pub mod orphan_scan;
 pub mod panic_log;
 pub mod port;
+pub mod proc_kill;
 pub mod restate_port;
 pub mod stopped_cache;
+#[cfg(not(target_os = "windows"))]
+pub mod unix_kill;
 #[cfg(target_os = "windows")]
 pub mod windows;

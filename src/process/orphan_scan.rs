@@ -114,7 +114,10 @@ fn path_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
 async fn freshest_source_mtime(state: &SharedState) -> Option<DateTime<Utc>> {
     let mut best: Option<DateTime<Utc>> = None;
     for slot in &state.build_pool.slots {
-        let p = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        let p = slot
+            .target_dir
+            .join("debug")
+            .join(crate::config::RUNNER_BIN_NAME);
         if let Some(mt) = path_mtime_utc(&p) {
             best = Some(match best {
                 Some(b) if b >= mt => b,

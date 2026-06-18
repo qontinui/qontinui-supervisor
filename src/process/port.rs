@@ -5,7 +5,25 @@ use tracing::debug;
 
 use crate::config::{PORT_CHECK_INTERVAL_MS, PORT_WAIT_TIMEOUT_SECS};
 
-/// Check if a TCP port is currently in use by attempting to bind to it.
+/// Short bound on the synchronous connect probe in [`is_port_in_use`]. A
+/// localhost connect either completes or is refused effectively instantly;
+/// the timeout only guards a pathological backlog-full listener.
+const PORT_PROBE_TIMEOUT_MS: u64 = 250;
+
+/// Check if a TCP port is currently in use (something LISTENING on
+/// `127.0.0.1:port`).
+///
+/// Uses a **blocking** connect with a short timeout via
+/// [`socket2::Socket::connect_timeout`]. The previous implementation used a
+/// nonblocking connect and only recognised the Windows "in progress" error
+/// codes (10035/10056) as "listening" — on Unix a nonblocking localhost
+/// connect returns `EINPROGRESS` (errno 36) regardless of whether anything is
+/// listening, so the function **always returned `false` on macOS/Linux**.
+/// That silently broke every caller that gates on it: the stop path's
+/// port-free confirmation, the reaper's crash detection, and the reconcile
+/// sweep's orphan detection (the D7 orphan-leak surface). A synchronous
+/// connect is unambiguous on all platforms: it succeeds when a listener
+/// accepts, and is refused (`ECONNREFUSED`) when the port is free.
 pub fn is_port_in_use(port: u16) -> bool {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let socket = match socket2::Socket::new(
@@ -17,17 +35,11 @@ pub fn is_port_in_use(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    // Try to connect — if it succeeds, something is listening
-    socket.set_nonblocking(true).ok();
-    match socket.connect(&addr.into()) {
-        Ok(()) => true,
-        Err(e) => {
-            // On Windows, WSAEWOULDBLOCK (10035) means connection is in progress
-            // which means something is listening
-            let code = e.raw_os_error().unwrap_or(0);
-            code == 10035 || code == 10056 // WSAEWOULDBLOCK or WSAEISCONN
-        }
-    }
+    // Blocking connect with a short timeout. Ok => a listener accepted =>
+    // port in use. Err (connection refused / timeout) => nothing listening.
+    socket
+        .connect_timeout(&addr.into(), Duration::from_millis(PORT_PROBE_TIMEOUT_MS))
+        .is_ok()
 }
 
 /// Check if an HTTP health endpoint is responding at the given port and path.
