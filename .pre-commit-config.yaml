@@ -29,12 +29,6 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      - id: block-claude-attribution
-        name: Block Claude Attribution
-        entry: .pre-commit-hooks/block-claude-attribution.sh
-        language: script
-        stages: [commit-msg]
-
 ci:
   autofix_prs: true
   autofix_commit_msg: "chore: pre-commit auto fixes"
