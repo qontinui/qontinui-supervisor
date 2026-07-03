@@ -119,6 +119,11 @@ tower = { version = "0.5", features = ["util"] }
 scopeguard = "1.2"
 
 [target.'cfg(windows)'.dependencies]
+# Fresh HKCU\Environment reads at runner-spawn time (PlanAdapterEnv in
+# env_forwarders.rs) — a long-lived supervisor's process-env snapshot goes
+# stale the moment the operator `setx`es, so persisted values are re-read
+# from the registry at each spawn.
+winreg = "0.55"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

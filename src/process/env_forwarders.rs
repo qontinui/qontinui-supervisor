@@ -64,6 +64,7 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
         Box::new(WindowPositionEnv),
         Box::new(RestateEnv),
         Box::new(RunnerTierEnv),
+        Box::new(PlanAdapterEnv),
         Box::new(PanicLogEnv),
         Box::new(ExtraEnv),
     ]
@@ -592,6 +593,101 @@ impl EnvForwarder for RunnerTierEnv {
 }
 
 // =============================================================================
+// PlanAdapterEnv
+// =============================================================================
+
+/// Forwards the plan→work-unit adapter configuration
+/// (`QONTINUI_PLAN_ADAPTER_DIR`, `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS`) to the
+/// **primary** runner, reading the persisted user environment fresh at each
+/// spawn.
+///
+/// The runner's adapter (`plan_workunit_adapter::trigger::spawn_if_configured`)
+/// is gated at boot on `QONTINUI_PLAN_ADAPTER_DIR` in the runner's process
+/// env. A spawned runner inherits the SUPERVISOR's env snapshot, and the
+/// supervisor is long-lived — an operator `setx` after the supervisor started
+/// is invisible to every later runner respawn, so the adapter silently stays
+/// dormant across primary rebuilds (observed 2026-07-03). Reading
+/// `HKCU\Environment` at spawn time makes `setx` + runner restart sufficient;
+/// no supervisor restart required.
+///
+/// Resolution per variable (first non-blank wins):
+/// 1. `HKCU\Environment` (Windows) — the persisted store `setx` writes;
+///    always current, unlike this process's env snapshot.
+/// 2. The supervisor's process env — non-Windows platforms, and supervisors
+///    deliberately launched with the variable set.
+///
+/// **Primary-only.** The adapter mirrors the operator's plans dir into coord;
+/// one reconcile writer is the intent — temp/named runners must not each start
+/// a competing scan of the same dir. A test that wants the adapter on a temp
+/// runner can still inject via `extra_env` ([`ExtraEnv`] runs last and
+/// overrides anything set here).
+pub struct PlanAdapterEnv;
+
+const PLAN_ADAPTER_VARS: [&str; 2] = [
+    "QONTINUI_PLAN_ADAPTER_DIR",
+    "QONTINUI_PLAN_ADAPTER_INTERVAL_SECS",
+];
+
+impl EnvForwarder for PlanAdapterEnv {
+    fn name(&self) -> &'static str {
+        "plan_adapter"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        _state: &'a SharedState,
+        runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if !runner.config.kind().is_primary() {
+                return;
+            }
+            for var in PLAN_ADAPTER_VARS {
+                if let Some(value) = resolve_plan_adapter_value(
+                    read_persisted_user_env(var),
+                    std::env::var(var).ok(),
+                ) {
+                    cmd.env(var, value);
+                }
+            }
+        })
+    }
+}
+
+/// Pick the value to forward: the persisted user env (read fresh) beats the
+/// supervisor's process-env snapshot (stale by definition on a long-lived
+/// supervisor); blank/whitespace values count as unset at both levels, so a
+/// blanked-out registry entry cannot mask a real process-env value.
+fn resolve_plan_adapter_value(
+    persisted: Option<String>,
+    process: Option<String>,
+) -> Option<String> {
+    persisted
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| process.filter(|v| !v.trim().is_empty()))
+}
+
+/// Read `name` from `HKCU\Environment` — the store `setx` writes — so the
+/// value reflects the operator's latest persist rather than the env snapshot
+/// this process was started with.
+#[cfg(windows)]
+fn read_persisted_user_env(name: &str) -> Option<String> {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey("Environment")
+        .ok()?
+        .get_value::<String, _>(name)
+        .ok()
+}
+
+/// Non-Windows: there is no persisted user-env store; process env is the
+/// only source.
+#[cfg(not(windows))]
+fn read_persisted_user_env(_name: &str) -> Option<String> {
+    None
+}
+
+// =============================================================================
 // PanicLogEnv
 // =============================================================================
 
@@ -684,7 +780,7 @@ impl EnvForwarder for ExtraEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_worktree_mode;
+    use super::{resolve_plan_adapter_value, resolve_worktree_mode};
 
     #[test]
     fn default_on_when_nothing_set() {
@@ -746,6 +842,44 @@ mod tests {
         assert_eq!(
             resolve_worktree_mode(None, Some("verbose")),
             Some("verbose".to_string())
+        );
+    }
+
+    #[test]
+    fn plan_adapter_persisted_beats_process_snapshot() {
+        // The freshly-read persisted value wins over the (possibly stale)
+        // process-env snapshot — the whole point of reading at spawn time.
+        assert_eq!(
+            resolve_plan_adapter_value(
+                Some("D:/plans-new".to_string()),
+                Some("D:/plans-old".to_string())
+            ),
+            Some("D:/plans-new".to_string())
+        );
+    }
+
+    #[test]
+    fn plan_adapter_process_env_is_fallback() {
+        // No persisted value (non-Windows, or never setx'd) → the supervisor's
+        // process env still works, so explicit launches keep functioning.
+        assert_eq!(
+            resolve_plan_adapter_value(None, Some("D:/plans".to_string())),
+            Some("D:/plans".to_string())
+        );
+        assert_eq!(resolve_plan_adapter_value(None, None), None);
+    }
+
+    #[test]
+    fn plan_adapter_blank_values_count_as_unset() {
+        // A blank registry entry must not mask a real process-env value, and
+        // blank-everywhere resolves to no injection at all.
+        assert_eq!(
+            resolve_plan_adapter_value(Some("  ".to_string()), Some("D:/plans".to_string())),
+            Some("D:/plans".to_string())
+        );
+        assert_eq!(
+            resolve_plan_adapter_value(Some(String::new()), Some(String::new())),
+            None
         );
     }
 }
