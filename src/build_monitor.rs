@@ -1962,7 +1962,7 @@ pub async fn slot_exe_holders(exe_path: &std::path::Path) -> Vec<u32> {
 ///   prevent it from recurring.)
 #[cfg(target_os = "windows")]
 async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
-    let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+    let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
     if !exe_path.exists() {
         return Ok(());
     }
@@ -2298,7 +2298,7 @@ async fn check_slot_fingerprint(slot: &Arc<BuildSlot>) {
     let fingerprint = slot.target_dir.join("debug").join(".fingerprint");
     let exists = tokio::fs::metadata(&fingerprint).await.is_ok();
     if !exists {
-        let exe = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        let exe = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
         if tokio::fs::metadata(&exe).await.is_ok() {
             warn!(
                 "Slot {}: target/debug/.fingerprint missing but exe is present at {:?}; \
@@ -2326,7 +2326,7 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
     info!("Pre-warming {} build slot(s)...", slots.len());
 
     for slot in slots {
-        let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+        let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
         if exe_path.exists() {
             info!("Slot {} already has a binary, skipping prewarm", slot.id);
             continue;
@@ -2370,7 +2370,7 @@ async fn prewarm_single_slot(
         .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
     // Re-check after acquiring: another caller may have populated this slot.
-    let exe_path = slot.target_dir.join("debug").join("qontinui-runner.exe");
+    let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
     if exe_path.exists() {
         info!(
             "Slot {} populated while waiting for permit, skipping prewarm",
@@ -2596,7 +2596,11 @@ async fn update_lkg_after_success(
     // clobber each other's in-flight copies. Without the suffix, slot 0's
     // remove_file would race slot 1's copy/rename and the final exe could
     // end up holding one slot's bytes while the sidecar claims the other's.
-    let tmp_exe = lkg_dir.join(format!("qontinui-runner.exe.tmp.{}", slot.id));
+    let tmp_exe = lkg_dir.join(format!(
+        "qontinui-runner{}.tmp.{}",
+        std::env::consts::EXE_SUFFIX,
+        slot.id
+    ));
     // Best-effort cleanup of any leftover tmp file from a previous crash on
     // THIS slot — slot ids are stable across builds so a stale file from
     // last session is still ours to clean.
