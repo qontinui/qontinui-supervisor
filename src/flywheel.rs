@@ -565,6 +565,9 @@ mod tests {
             display_name: format!("Mock {}", app_id),
             created_at_ms: 0,
             last_seen_at_ms: 0,
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
         }
     }
 
