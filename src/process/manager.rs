@@ -1308,6 +1308,104 @@ pub async fn start_managed_runner(
     Ok(())
 }
 
+/// Outcome of the fail-open `qontinui-shim.exe` sidecar deploy step in
+/// [`start_exe_mode_for_runner`]. Pure enough to unit-test with tempdirs —
+/// the caller only maps variants to log lines.
+///
+/// The runner materializes each terminal's identity shim from the stub
+/// sitting NEXT TO ITS OWN EXE (`current_exe().parent()` — `locate_stub_exe`
+/// in the runner's `shim_materializer.rs`), so the stub must ride along with
+/// every runner-exe deploy. Skipping it re-materializes whatever stale stub
+/// already sits next to the copy (the 2026-07-03 incident). See
+/// [`crate::build_monitor::SHIM_EXE_FILENAME`] for the full placement
+/// contract.
+#[derive(Debug)]
+pub(crate) enum ShimSidecarDeploy {
+    /// Sidecar copied next to the runner exe copy.
+    Copied { to: std::path::PathBuf },
+    /// Source and destination exes share a directory (the legacy
+    /// `target/debug/` fallback resolution) — nothing to copy; whatever shim
+    /// sits there is already "next to" the deployed exe.
+    SameDir,
+    /// No shim next to the source exe (a slot/LKG predating the sidecar
+    /// build, or the fail-open shim build failed). Identity shims will be
+    /// stale for runners started from this source.
+    SourceMissing { expected: std::path::PathBuf },
+    /// The copy/replace itself failed.
+    CopyFailed {
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+        error: String,
+    },
+}
+
+/// Copy the `qontinui-shim.exe` sidecar from next to `source_exe` to next to
+/// `dest_exe` (the per-runner exe copy). Fail-open by contract: this returns
+/// an outcome for the caller to log — it must never fail the runner start.
+///
+/// The copy goes through a tmp file + atomic rename (keyed by the dest exe's
+/// file stem so concurrent spawns of different runners can't clobber each
+/// other's tmp) because the destination `target/debug/qontinui-shim.exe` is
+/// SHARED by every runner copy in that dir and a concurrently-starting
+/// runner's materializer could otherwise read a torn stub mid-copy.
+pub(crate) fn deploy_shim_sidecar(
+    source_exe: &std::path::Path,
+    dest_exe: &std::path::Path,
+) -> ShimSidecarDeploy {
+    let shim_name = crate::build_monitor::SHIM_EXE_FILENAME;
+    let (src_dir, dst_dir) = match (source_exe.parent(), dest_exe.parent()) {
+        (Some(s), Some(d)) => (s, d),
+        // Pathological (no parent dir) — treat as nothing-to-do rather than
+        // inventing a failure for a case the exe copy itself already handled.
+        _ => return ShimSidecarDeploy::SameDir,
+    };
+    if src_dir == dst_dir {
+        return ShimSidecarDeploy::SameDir;
+    }
+
+    let shim_src = src_dir.join(shim_name);
+    if !shim_src.exists() {
+        return ShimSidecarDeploy::SourceMissing { expected: shim_src };
+    }
+    let shim_dst = dst_dir.join(shim_name);
+
+    let stem = dest_exe
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "runner".to_string());
+    let shim_tmp = dst_dir.join(format!("{}.tmp-{}", shim_name, stem));
+    let _ = std::fs::remove_file(&shim_tmp);
+
+    let result = std::fs::copy(&shim_src, &shim_tmp)
+        .map_err(|e| format!("copy to tmp: {}", e))
+        .and_then(|_| {
+            std::fs::rename(&shim_tmp, &shim_dst).or_else(|first_err| {
+                // Windows can refuse the replace while another process holds
+                // the dest open; drop the dest and retry once (mirrors the
+                // exe-copy retry above).
+                let _ = std::fs::remove_file(&shim_dst);
+                std::fs::rename(&shim_tmp, &shim_dst).map_err(|retry_err| {
+                    format!(
+                        "rename into place: {}; retry after remove: {}",
+                        first_err, retry_err
+                    )
+                })
+            })
+        });
+
+    match result {
+        Ok(()) => ShimSidecarDeploy::Copied { to: shim_dst },
+        Err(error) => {
+            let _ = std::fs::remove_file(&shim_tmp);
+            ShimSidecarDeploy::CopyFailed {
+                from: shim_src,
+                to: shim_dst,
+                error,
+            }
+        }
+    }
+}
+
 /// Result of spawning a runner in exe mode.
 struct SpawnResult {
     child: tokio::process::Child,
@@ -1482,6 +1580,47 @@ async fn start_exe_mode_for_runner(
             }
         }
     };
+
+    // Deploy the `qontinui-shim.exe` sidecar next to the exe copy, in
+    // lockstep with the exe itself. The runner materializes terminal identity
+    // shims from the stub next to its own exe, so a runner started without a
+    // fresh sidecar propagates a stale stub into every terminal's shim dir
+    // (2026-07-03 incident). FAIL-OPEN: a missing/uncopyable stub logs one
+    // WARN and never fails the runner start.
+    match deploy_shim_sidecar(&source_exe, &exe_path) {
+        ShimSidecarDeploy::Copied { to } => {
+            info!(
+                "Copied qontinui-shim sidecar for '{}' to {:?}",
+                managed.config.name, to
+            );
+        }
+        ShimSidecarDeploy::SameDir => {}
+        ShimSidecarDeploy::SourceMissing { expected } => {
+            let msg = format!(
+                "No qontinui-shim.exe next to the source exe for '{}' (expected {:?}) — \
+                 identity shims will be stale; rebuild (POST /runner/restart {{rebuild:true}} \
+                 or spawn-test {{rebuild:true}}) to produce the sidecar",
+                managed.config.name, expected
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+        ShimSidecarDeploy::CopyFailed { from, to, error } => {
+            let msg = format!(
+                "Failed to copy qontinui-shim sidecar for '{}' from {:?} to {:?} ({}) — \
+                 identity shims will be stale until a later runner start succeeds in copying it",
+                managed.config.name, from, to, error
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+    }
 
     info!(
         "Starting runner '{}' in exe mode from {:?} on port {}",
@@ -3367,6 +3506,113 @@ mod tests {
         assert_eq!(
             std::fs::read(&copy_path).expect("read copy"),
             b"fake-exe-bytes"
+        );
+    }
+
+    // =========================================================================
+    // qontinui-shim sidecar deploy (start_exe_mode_for_runner copy step).
+    // The runner materializes identity shims from the stub next to its OWN
+    // exe, so the stub must ride along with every exe copy — 2026-07-03
+    // incident: a stale stub was re-materialized into every terminal.
+    // =========================================================================
+
+    /// Happy path: shim next to the slot exe is copied next to the per-runner
+    /// exe copy, replacing any stale stub already there.
+    #[test]
+    fn shim_sidecar_copies_next_to_dest_exe_and_replaces_stale() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+
+        let slot_debug = root.path().join("target-pool").join("slot-0").join("debug");
+        std::fs::create_dir_all(&slot_debug).expect("mkdir slot debug");
+        let source_exe = slot_debug.join("qontinui-runner.exe");
+        std::fs::write(&source_exe, b"exe").expect("write exe");
+        std::fs::write(
+            slot_debug.join(crate::build_monitor::SHIM_EXE_FILENAME),
+            b"fresh-shim",
+        )
+        .expect("write shim");
+
+        let target_debug = root.path().join("target").join("debug");
+        std::fs::create_dir_all(&target_debug).expect("mkdir target debug");
+        let dest_exe = target_debug.join("qontinui-runner-test-9877.exe");
+        std::fs::write(&dest_exe, b"exe-copy").expect("write exe copy");
+        // Pre-existing STALE stub — the exact incident artifact.
+        let dest_shim = target_debug.join(crate::build_monitor::SHIM_EXE_FILENAME);
+        std::fs::write(&dest_shim, b"stale-shim").expect("write stale shim");
+
+        match deploy_shim_sidecar(&source_exe, &dest_exe) {
+            ShimSidecarDeploy::Copied { to } => assert_eq!(to, dest_shim),
+            other => panic!("expected Copied, got {:?}", other),
+        }
+        assert_eq!(
+            std::fs::read(&dest_shim).expect("read deployed shim"),
+            b"fresh-shim",
+            "the stale stub must be replaced by the source's shim"
+        );
+        // No tmp litter left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&target_debug)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left: {:?}", leftovers);
+    }
+
+    /// Legacy fallback resolution (`target/debug/qontinui-runner.exe`): source
+    /// and dest share a dir, so there is nothing to copy — and critically no
+    /// self-copy that could truncate the stub in place.
+    #[test]
+    fn shim_sidecar_same_dir_is_noop() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let debug = root.path().join("target").join("debug");
+        std::fs::create_dir_all(&debug).expect("mkdir");
+        let source_exe = debug.join("qontinui-runner.exe");
+        std::fs::write(&source_exe, b"exe").expect("write");
+        let shim = debug.join(crate::build_monitor::SHIM_EXE_FILENAME);
+        std::fs::write(&shim, b"shim-bytes").expect("write shim");
+        let dest_exe = debug.join("qontinui-runner-primary.exe");
+
+        assert!(matches!(
+            deploy_shim_sidecar(&source_exe, &dest_exe),
+            ShimSidecarDeploy::SameDir
+        ));
+        assert_eq!(
+            std::fs::read(&shim).expect("read shim"),
+            b"shim-bytes",
+            "the in-place stub must be untouched"
+        );
+    }
+
+    /// Source without a shim (pre-sidecar slot/LKG, or the fail-open shim
+    /// build failed): reports SourceMissing naming the expected path, and
+    /// leaves the destination dir untouched. The caller logs the
+    /// "identity shims will be stale" WARN — the start itself proceeds.
+    #[test]
+    fn shim_sidecar_missing_source_reports_and_writes_nothing() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let slot_debug = root.path().join("target-pool").join("slot-1").join("debug");
+        std::fs::create_dir_all(&slot_debug).expect("mkdir");
+        let source_exe = slot_debug.join("qontinui-runner.exe");
+        std::fs::write(&source_exe, b"exe").expect("write");
+
+        let target_debug = root.path().join("target").join("debug");
+        std::fs::create_dir_all(&target_debug).expect("mkdir");
+        let dest_exe = target_debug.join("qontinui-runner-primary.exe");
+
+        match deploy_shim_sidecar(&source_exe, &dest_exe) {
+            ShimSidecarDeploy::SourceMissing { expected } => {
+                assert_eq!(
+                    expected,
+                    slot_debug.join(crate::build_monitor::SHIM_EXE_FILENAME)
+                );
+            }
+            other => panic!("expected SourceMissing, got {:?}", other),
+        }
+        assert!(
+            !target_debug
+                .join(crate::build_monitor::SHIM_EXE_FILENAME)
+                .exists(),
+            "no shim must be fabricated at the destination"
         );
     }
 

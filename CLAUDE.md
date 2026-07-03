@@ -374,6 +374,11 @@ npm run build
 cd src-tauri
 CARGO_TARGET_DIR=../target-pool/slot-0 \
     cargo build --bin qontinui-runner --features custom-protocol
+# 3. Also build the qontinui-shim sidecar into the same slot (seconds on the
+#    warm target dir). The runner materializes terminal identity shims from
+#    the stub next to its own exe; skipping this deploys a stale stub.
+CARGO_TARGET_DIR=../target-pool/slot-0 \
+    cargo build --bin qontinui-shim --features custom-protocol
 ```
 
 **Why `--features custom-protocol` is mandatory:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. No Vite dev server is running, so the webview would show `ERR_CONNECTION_REFUSED`.
@@ -399,7 +404,7 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 2. Any `target-pool/slot-{k}/debug/qontinui-runner.exe` that exists on disk
 3. `target/debug/qontinui-runner.exe` — legacy fallback
 
-Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process.
+Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process. The `qontinui-shim.exe` sidecar rides along on every start: the supervisor builds it into the same slot right after the runner build (fail-open), preserves it in the LKG dir, and copies it from next to the source exe to next to the exe copy (`deploy_shim_sidecar` in `src/process/manager.rs`). The runner materializes terminal identity shims from the stub next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed shim build/copy logs a WARN ("identity shims will be stale") but never fails the build or start.
 
 ### Last-known-good (LKG) fallback for agents
 

@@ -902,6 +902,11 @@ async fn run_build_inner(
     // Always pass --features custom-protocol so Tauri embeds the frontend from
     // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
     // from devUrl (localhost:1420), which isn't running.
+    //
+    // NOTE: after this build succeeds, `build_shim_sidecar` runs a second,
+    // fail-open `cargo build --bin qontinui-shim` on the same warm target dir
+    // so the install-interception stub is produced in lockstep with the runner
+    // exe (see [`SHIM_EXE_FILENAME`] for the placement contract).
     const CARGO_BUILD_ARGS: &[&str] = &[
         "build",
         "--bin",
@@ -1112,6 +1117,13 @@ async fn run_build_inner(
             )
             .await;
         info!("Build completed successfully");
+
+        // Lockstep sidecar: also produce `qontinui-shim.exe` in this slot's
+        // debug dir so the deploy/placement steps can carry it alongside the
+        // runner exe. Fail-open — a shim build failure logs one WARN and never
+        // fails the (already successful) runner build.
+        build_shim_sidecar(state, slot, cargo_cwd).await;
+
         info!(
             "GCMD: cargo step returned status=success, run_build_inner returning Ok (slot={})",
             slot.id
@@ -1160,6 +1172,121 @@ async fn run_build_inner(
             .emit(LogSource::Build, LogLevel::Error, &error_summary)
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
+    }
+}
+
+/// Filename of the install-interception shadow-stub sidecar binary built
+/// alongside the runner (`[[bin]] name = "qontinui-shim"` in the runner's
+/// `src-tauri/Cargo.toml`).
+///
+/// PLACEMENT CONTRACT: every runner resolves this stub via
+/// `current_exe().parent()` (`locate_stub_exe` in the runner's
+/// `shim_materializer.rs`) and materializes it into each terminal's identity
+/// shim dir. The stub must therefore be deployed IN LOCKSTEP with the runner
+/// exe:
+///   1. built into the same slot `debug/` dir right after the runner build
+///      ([`build_shim_sidecar`], called from `run_build_inner`);
+///   2. carried into `target-pool/lkg/` by [`update_lkg_after_success`];
+///   3. copied next to the per-runner exe copy in `target/debug/` by
+///      `process::manager::start_exe_mode_for_runner` (the single deploy
+///      funnel for primary, named, and temp runners).
+///
+/// A runner deployed without a fresh sidecar materializes whatever stale stub
+/// happens to sit next to it — the 2026-07-03 incident where a 3-week-old
+/// stub (predating identity mode) silently exited 0 and broke every pane
+/// claude launch until it was hand-swapped.
+pub const SHIM_EXE_FILENAME: &str = "qontinui-shim.exe";
+
+/// Wall-clock budget for the fail-open `cargo build --bin qontinui-shim`
+/// sidecar step. It runs right after the main runner build succeeded on the
+/// SAME warm `CARGO_TARGET_DIR` with the SAME feature set, so every shared
+/// dependency is already compiled — the shim itself is a small,
+/// dependency-light bin that compiles + links in seconds. 10 minutes is a
+/// generous ceiling for a heavily contended machine.
+const SHIM_BUILD_TIMEOUT_SECS: u64 = 600;
+
+/// Build the `qontinui-shim` sidecar into the slot's target dir, right after
+/// a successful runner build (see [`SHIM_EXE_FILENAME`] for the contract).
+///
+/// FAIL-OPEN by design: the sidecar is a lockstep rider on the runner deploy,
+/// not a gate on it. Any failure (spawn error, timeout, non-zero exit, exe
+/// missing afterwards) logs a single actionable WARN and returns — it never
+/// fails the runner build/restart. The cost of a missing sidecar is stale
+/// identity shims; the cost of failing the build would be no runner at all.
+async fn build_shim_sidecar(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    cargo_cwd: &std::path::Path,
+) {
+    // Same feature set as the runner build so cargo reuses the warm
+    // fingerprints instead of recompiling shared deps under a different
+    // feature resolution.
+    const SHIM_BUILD_ARGS: &[&str] = &[
+        "build",
+        "--bin",
+        "qontinui-shim",
+        "--features",
+        "custom-protocol",
+    ];
+
+    let shim_exe = slot.target_dir.join("debug").join(SHIM_EXE_FILENAME);
+    let warn_stale = |detail: String| {
+        format!(
+            "qontinui-shim sidecar build failed on slot {} — identity shims will be stale \
+             until a rebuild produces {:?} (runner build itself succeeded; deploy continues): {}",
+            slot.id, shim_exe, detail
+        )
+    };
+
+    info!(
+        "Slot {}: building qontinui-shim sidecar (warm target {:?})",
+        slot.id, slot.target_dir
+    );
+
+    let guarded = GuardedCommand::new("cargo", Duration::from_secs(SHIM_BUILD_TIMEOUT_SECS))
+        .args(SHIM_BUILD_ARGS)
+        .current_dir(cargo_cwd)
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .job_guarded(true);
+
+    let failure = match guarded.run().await {
+        Ok(GuardedOutcome::Exited(output)) if output.status.success() => {
+            if shim_exe.exists() {
+                None
+            } else {
+                Some(warn_stale(format!(
+                    "cargo exited 0 but {:?} is missing",
+                    shim_exe
+                )))
+            }
+        }
+        Ok(GuardedOutcome::Exited(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+            Some(warn_stale(format!(
+                "cargo exit {}: {}",
+                output.status,
+                tail.replace('\n', " | ")
+            )))
+        }
+        Ok(GuardedOutcome::TimedOut { after, .. }) => {
+            Some(warn_stale(format!("timed out after {}s", after.as_secs())))
+        }
+        Ok(GuardedOutcome::Cancelled { .. }) => Some(warn_stale("cancelled".to_string())),
+        Err(e) => Some(warn_stale(format!("failed to spawn cargo: {}", e))),
+    };
+
+    match failure {
+        None => {
+            info!(
+                "Slot {}: qontinui-shim sidecar built at {:?}",
+                slot.id, shim_exe
+            );
+        }
+        Some(msg) => {
+            warn!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+        }
     }
 }
 
@@ -2624,6 +2751,39 @@ async fn update_lkg_after_success(
             tmp_exe, final_exe, e
         ))
     })?;
+
+    // Carry the `qontinui-shim.exe` sidecar into the LKG dir alongside the
+    // exe (same tmp+rename dance) so an LKG-pinned start (spawn-test
+    // {use_lkg: true}) deploys a matching stub, not whatever stale one sits
+    // in `target/debug/`. See [`SHIM_EXE_FILENAME`] for the placement
+    // contract. Fail-open: the exe promotion above already succeeded; a
+    // missing or uncopyable shim logs one WARN and never fails the build.
+    {
+        let shim_src = source_exe.with_file_name(SHIM_EXE_FILENAME);
+        let shim_dst = lkg_dir.join(SHIM_EXE_FILENAME);
+        let shim_tmp = lkg_dir.join(format!("{}.tmp.{}", SHIM_EXE_FILENAME, slot.id));
+        let shim_result: Result<(), String> = if !shim_src.exists() {
+            Err(format!("{:?} not found next to the slot exe", shim_src))
+        } else {
+            let _ = std::fs::remove_file(&shim_tmp);
+            std::fs::copy(&shim_src, &shim_tmp)
+                .map_err(|e| format!("copy {:?} -> {:?}: {}", shim_src, shim_tmp, e))
+                .and_then(|_| {
+                    std::fs::rename(&shim_tmp, &shim_dst)
+                        .map_err(|e| format!("rename {:?} -> {:?}: {}", shim_tmp, shim_dst, e))
+                })
+        };
+        if let Err(detail) = shim_result {
+            let _ = std::fs::remove_file(&shim_tmp);
+            let msg = format!(
+                "LKG shim sidecar capture failed (slot {}) — identity shims will be stale \
+                 on LKG-pinned starts until a rebuild refreshes {:?}: {}",
+                slot.id, shim_dst, detail
+            );
+            warn!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+        }
+    }
 
     let info = LkgInfo {
         built_at: chrono::Utc::now(),
