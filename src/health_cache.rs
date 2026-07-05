@@ -116,6 +116,10 @@ pub struct CachedRunnerHealth {
     /// Supervisor-derived status. Combines runner process state with the
     /// runner's own `derived_status` + `ui_error` + `recent_crash` signals.
     pub derived_status: RunnerStatus,
+    /// Snapshot of the runner's crash-only watchdog state, so sync SSE
+    /// consumers can surface live values without touching the per-runner
+    /// `WatchdogState` lock.
+    pub watchdog: crate::routes::health::WatchdogHealth,
 }
 
 /// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
@@ -254,7 +258,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let kind = managed.config.kind();
                 let is_primary = kind.is_primary();
 
-                let runner_port_open = port::is_port_in_use(runner_port);
+                let runner_port_open = port::is_port_listening(runner_port);
                 let runner_responding = port::is_runner_responding(runner_port).await;
 
                 let new_health = CachedPortHealth {
@@ -314,6 +318,12 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let ui_error = health_body.as_ref().and_then(|b| b.ui_error.clone());
                 let recent_crash = health_body.as_ref().and_then(|b| b.recent_crash.clone());
 
+                // Snapshot the crash-only watchdog state for SSE consumers.
+                let watchdog = {
+                    let wd = managed.watchdog.read().await;
+                    crate::routes::health::WatchdogHealth::from_state(&wd)
+                };
+
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;
                 let derived_status = derive_runner_status(
@@ -332,6 +342,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     ui_error,
                     recent_crash,
                     derived_status,
+                    watchdog,
                 });
                 drop(runner_state);
 
@@ -350,7 +361,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let runner_port = crate::config::RUNNER_API_PORT;
 
                 primary_health = CachedPortHealth {
-                    runner_port_open: port::is_port_in_use(runner_port),
+                    runner_port_open: port::is_port_listening(runner_port),
                     runner_responding: port::is_runner_responding(runner_port).await,
                 };
             }

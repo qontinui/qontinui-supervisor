@@ -529,9 +529,11 @@ pub async fn add_runner(
             extra_env: Default::default(),
         };
 
+        // External runners are never crash-auto-restarted (the supervisor
+        // has no spawn provenance for them) — watchdog defaults off.
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config.clone(),
-            state.config.watchdog_enabled_at_start,
+            false,
             state.config.log_dir.as_deref(),
         ));
         runners.insert(id.clone(), managed);
@@ -788,7 +790,7 @@ pub async fn purge_stale_test_runners_core(
         if is_running {
             // Try to detect zombie: process is gone but state says running.
             // If nothing is actually listening on the port, treat it as stale.
-            let port_alive = crate::process::port::is_port_in_use(managed.config.port);
+            let port_alive = crate::process::port::is_port_listening(managed.config.port);
             if port_alive {
                 continue; // genuinely running, skip
             }
