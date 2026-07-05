@@ -6,13 +6,24 @@ Rust-based build server and fleet dashboard for qontinui-runner. Provides parall
 
 The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health but never starts, stops, or restarts them unprompted.
 
-With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it still never restarts a primary that crashes later, and never auto-starts named/temp/external runners.
+With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it never auto-starts named/temp/external runners.
+
+**Crash-only ambient watchdog** (plan `2026-07-03-primary-runner-crash-resilience`, Phase 1). Under `--watchdog`, a supervisor-spawned runner whose process **crashes** (exits non-zero / dies unexpectedly) is auto-restarted through the same `start_runner_by_id` funnel (provenance start gate applies). Hard rules:
+
+- **Never restarts a *running* runner** — this is exit-observation only, not health-based resurrection.
+- **Never restarts on operator stop.** Every operator-facing stop path latches `stop_requested` before the kill; the exit monitor reads it when the exit is observed. The flag is cleared on the next *start* (not at stop completion), so the marker is race-free — a failed stop (`StillHeld`) whose process dies later still counts as operator-intended.
+- **Never restarts a clean exit** (code 0 — window close, internal shutdown).
+- **Never restarts external/user-started runners** — restart requires the spawn provenance of a supervisor-held Child handle.
+- **Scope: primary only by default.** Under `--watchdog` the primary's per-runner `WatchdogState.enabled` defaults true; named/temp/external default false. Arm any runner explicitly via `POST /runners/{id}/watchdog {"enabled": true}`.
+- **Crash-loop guard:** exponential backoff 5s → 30s → 120s between attempts; max 3 auto-restarts per rolling 30 minutes, then the watchdog disarms itself (`disabled_reason: "crash loop — operator required"`, `enabled` left true so intent stays visible) with an ERROR log + diagnostics event. Reset via `POST /runners/{id}/watchdog {"enabled": true, "reset_attempts": true}`.
+- **Kill-switch:** env `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all crash auto-restarts without a rebuild.
+- **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream.
 
 - **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners.
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor observes health only.
 
-**First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not auto-restart, does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0).
+**First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0). Note: on a crash-watchdog-armed runner, the first-healthy kill reads as a crash (non-zero exit, no stop intent) — the crash-only watchdog will retry the start up to its loop-guard budget, then disarm.
 
 ## Per-instance settings (runner registry isolation)
 
@@ -66,7 +77,7 @@ cargo clippy -- -D warnings    # Lint
 | Flag | Description |
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
-| `-w, --watchdog` | Enable health monitoring (observe-only, implies `--auto-start`) |
+| `-w, --watchdog` | Enable health monitoring + crash-only auto-restart of the primary (implies `--auto-start`; see "Crash-only ambient watchdog"). Kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`. |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--expo-dir` | Path to Expo/React Native project directory |
 | `-l, --log-file` | Append the in-memory log buffer to this file (persistent supervisor log, no rotation). Overrides `<log-dir>/supervisor.log`. |
@@ -495,6 +506,7 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
 | Temp runner port range | 9877-9899 |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
+| Crash-restart backoff ladder | 5s → 30s → 120s; max 3 auto-restarts per rolling 30min, then disarm (kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`) |
 
 ## Diagnosing failed runner spawns
 

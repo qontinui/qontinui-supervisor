@@ -874,10 +874,10 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
                 );
                 let mut runner = r.runner.write().await;
                 runner.running = true;
-            } else if crate::process::port::is_port_in_use(r.config.port) {
+            } else if crate::process::port::is_port_listening(r.config.port) {
                 warn!(
-                    "Runner '{}' port {} is occupied but /health is not responding — \
-                     treating as offline (likely a stale socket from a just-killed process)",
+                    "Runner '{}' port {} has a live socket but /health is not responding — \
+                     treating as offline (process may be wedged mid-startup or mid-teardown)",
                     r.config.name, r.config.port
                 );
             }
@@ -983,7 +983,7 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                 continue;
             }
             if is_running {
-                if crate::process::port::is_port_in_use(managed.config.port) {
+                if crate::process::port::is_port_listening(managed.config.port) {
                     continue; // genuinely alive
                 }
                 // Port free but state says running — crashed
@@ -1255,13 +1255,18 @@ pub async fn start_managed_runner(
         );
     }
 
-    // Update per-runner state
+    // Update per-runner state. Clearing `stop_requested` HERE (rather than
+    // at stop completion) makes the operator-stop marker race-free for the
+    // exit monitor: the flag can only transition true→false through a
+    // subsequent start, so any process exit observed after a stop request
+    // always reads `stop_requested == true`.
     {
         let mut runner = managed.runner.write().await;
         runner.process = Some(child);
         runner.running = true;
         runner.started_at = Some(chrono::Utc::now());
         runner.pid = pid;
+        runner.stop_requested = false;
     }
 
     // If this is the primary runner, also update legacy state for backward compat
@@ -1270,6 +1275,7 @@ pub async fn start_managed_runner(
         runner.running = true;
         runner.started_at = Some(chrono::Utc::now());
         runner.pid = pid;
+        runner.stop_requested = false;
         // process stays None in legacy — managed runner owns it
     }
 
@@ -1679,13 +1685,22 @@ enum StopReapOutcome {
     /// process tree, then re-confirm.
     EscalateTree,
     /// Tree-kill already attempted and the port is still held — escalate to
-    /// a blind kill-by-port (kills anything listening regardless of PID),
-    /// then re-confirm.
+    /// a blind kill-by-port (kills whatever holds the port regardless of
+    /// PID), then re-confirm.
     EscalatePort,
-    /// Every escalation was tried and the port is still in use — the stop
-    /// must NOT report success.
+    /// Both kill escalations were tried and the port is still held — take
+    /// no further action, wait one bounded backoff, and re-confirm once
+    /// more. Covers a kill that landed but whose socket teardown is slow to
+    /// be reflected by the OS.
+    RetryAfterBackoff,
+    /// Every escalation (and the backoff retry) was tried and the port is
+    /// still in use — the stop must NOT report success.
     StillHeld,
 }
+
+/// Extra bounded wait before the final re-confirmation of the stop reap
+/// (see [`StopReapOutcome::RetryAfterBackoff`]).
+const STOP_REAP_BACKOFF_SECS: u64 = 4;
 
 /// Decide the next reap action given the current attempt index and whether
 /// the port is still in use.
@@ -1693,7 +1708,8 @@ enum StopReapOutcome {
 /// `attempt` is 0-based and counts escalations already performed:
 ///   * 0 → after the initial graceful + PID kill, port still held: tree-kill.
 ///   * 1 → after the tree-kill, port still held: blind kill-by-port.
-///   * ≥2 → both escalations exhausted: give up (StillHeld).
+///   * 2 → both escalations exhausted: one bounded backoff, then re-confirm.
+///   * ≥3 → backoff retry exhausted too: give up (StillHeld).
 ///
 /// A free port at any attempt short-circuits to `Confirmed`.
 fn decide_stop_reap(attempt: u32, port_in_use: bool) -> StopReapOutcome {
@@ -1703,7 +1719,292 @@ fn decide_stop_reap(attempt: u32, port_in_use: bool) -> StopReapOutcome {
     match attempt {
         0 => StopReapOutcome::EscalateTree,
         1 => StopReapOutcome::EscalatePort,
+        2 => StopReapOutcome::RetryAfterBackoff,
         _ => StopReapOutcome::StillHeld,
+    }
+}
+
+// =============================================================================
+// Crash-Only Ambient Watchdog
+// =============================================================================
+
+/// Exponential backoff before each auto-restart attempt within one rolling
+/// crash window: 5s → 30s → 120s.
+const CRASH_RESTART_BACKOFF_SECS: [u64; 3] = [5, 30, 120];
+
+/// Maximum auto-restarts per rolling [`CRASH_RESTART_WINDOW_SECS`] window
+/// before the watchdog disarms itself and demands an operator.
+const CRASH_RESTART_MAX_PER_WINDOW: usize = 3;
+
+/// Rolling window (seconds) over which [`CRASH_RESTART_MAX_PER_WINDOW`] is
+/// evaluated, using `WatchdogState::crash_history` timestamps.
+const CRASH_RESTART_WINDOW_SECS: i64 = 30 * 60;
+
+/// `disabled_reason` set when the crash-loop guard trips. `enabled` stays
+/// true so the operator's intent remains visible — the reason field is what
+/// blocks further restarts until an operator clears it (via
+/// `POST /runners/{id}/watchdog {reset_attempts: true}`).
+pub const CRASH_LOOP_DISABLED_REASON: &str = "crash loop — operator required";
+
+/// Env kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all
+/// crash-only auto-restarts without a rebuild or code change.
+fn crash_restart_env_disabled() -> bool {
+    std::env::var("QONTINUI_SUPERVISOR_NO_CRASH_RESTART")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Outcome of the crash-only watchdog decision for one observed exit.
+/// Extracted as a pure function (like [`decide_first_healthy`] /
+/// [`decide_stop_reap`]) so the priority, backoff, and rolling-window rules
+/// can be asserted by unit tests without processes or SharedState.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashRestartDecision {
+    /// Schedule an auto-restart after `delay_secs` of backoff. `attempt` is
+    /// 1-based within the current rolling window (for the "attempt N/3" log).
+    Restart { attempt: u32, delay_secs: u64 },
+    /// Crash budget exhausted for the rolling window — set
+    /// [`CRASH_LOOP_DISABLED_REASON`] and stop restarting.
+    Disarm,
+    /// No Child handle was ever held — the supervisor did not spawn this
+    /// process, so it has no provenance to restart it.
+    SkipNoChildHandle,
+    /// The exit followed an operator stop request (`stop_requested` latched
+    /// true) — never restart.
+    SkipOperatorStop,
+    /// The process exited cleanly (code 0) — a deliberate shutdown (window
+    /// close, internal exit), not a crash.
+    SkipCleanExit,
+    /// Crash-restart is not globally armed (`--watchdog` absent, or the
+    /// `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` kill-switch is set).
+    SkipNotArmed,
+    /// Per-runner `WatchdogState.enabled` is false.
+    SkipDisabled,
+    /// The watchdog already disarmed itself (`disabled_reason` set) — an
+    /// operator must reset it before restarts resume.
+    SkipDisarmed,
+}
+
+/// Decide whether an observed runner exit warrants a crash auto-restart.
+/// Priority is intentional: provenance and operator intent always win over
+/// arming state, and the crash-loop guard is evaluated last so `Disarm`
+/// only fires for an exit that would otherwise have restarted.
+fn decide_crash_restart(
+    had_child_handle: bool,
+    stop_requested: bool,
+    clean_exit: bool,
+    globally_armed: bool,
+    per_runner_enabled: bool,
+    already_disarmed: bool,
+    restarts_in_window: usize,
+) -> CrashRestartDecision {
+    if !had_child_handle {
+        return CrashRestartDecision::SkipNoChildHandle;
+    }
+    if stop_requested {
+        return CrashRestartDecision::SkipOperatorStop;
+    }
+    if clean_exit {
+        return CrashRestartDecision::SkipCleanExit;
+    }
+    if !globally_armed {
+        return CrashRestartDecision::SkipNotArmed;
+    }
+    if !per_runner_enabled {
+        return CrashRestartDecision::SkipDisabled;
+    }
+    if already_disarmed {
+        return CrashRestartDecision::SkipDisarmed;
+    }
+    if restarts_in_window >= CRASH_RESTART_MAX_PER_WINDOW {
+        return CrashRestartDecision::Disarm;
+    }
+    CrashRestartDecision::Restart {
+        attempt: restarts_in_window as u32 + 1,
+        delay_secs: CRASH_RESTART_BACKOFF_SECS[restarts_in_window],
+    }
+}
+
+/// Crash-only ambient watchdog hook, called by `monitor_runner_process_exit`
+/// after every observed exit of a supervisor-spawned runner. Evaluates
+/// [`decide_crash_restart`], does the `WatchdogState` bookkeeping, and — for
+/// a `Restart` — spawns a detached task that waits out the backoff and
+/// funnels through [`start_runner_by_id`] (so the provenance start gate
+/// applies). Never blocks the exit monitor.
+async fn maybe_crash_restart(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    had_child_handle: bool,
+    stop_requested_at_exit: bool,
+    clean_exit: bool,
+) {
+    let runner_id = managed.config.id.clone();
+    let runner_name = managed.config.name.clone();
+    let globally_armed = state.config.watchdog_enabled_at_start && !crash_restart_env_disabled();
+    let now = chrono::Utc::now();
+
+    // Decide + bookkeep under one watchdog write lock so two exits can't
+    // both observe the same window count.
+    let decision = {
+        let mut wd = managed.watchdog.write().await;
+        // Prune history that fell out of the rolling window; keeps the vec
+        // bounded and makes `len()` the window count.
+        wd.crash_history
+            .retain(|t| (now - *t).num_seconds() < CRASH_RESTART_WINDOW_SECS);
+        let decision = decide_crash_restart(
+            had_child_handle,
+            stop_requested_at_exit,
+            clean_exit,
+            globally_armed,
+            wd.enabled,
+            wd.disabled_reason.is_some(),
+            wd.crash_history.len(),
+        );
+        match decision {
+            CrashRestartDecision::Restart { .. } => {
+                wd.restart_attempts += 1;
+                wd.last_restart_at = Some(now);
+                wd.crash_history.push(now);
+            }
+            CrashRestartDecision::Disarm => {
+                wd.disabled_reason = Some(CRASH_LOOP_DISABLED_REASON.to_string());
+            }
+            _ => {}
+        }
+        decision
+    };
+
+    match decision {
+        CrashRestartDecision::Restart {
+            attempt,
+            delay_secs,
+        } => {
+            let msg = format!(
+                "crash-only watchdog restarting runner '{}' (attempt {}/{}) after {}s backoff",
+                runner_name, attempt, CRASH_RESTART_MAX_PER_WINDOW, delay_secs
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+            state.notify_health_change();
+
+            let state = state.clone();
+            let managed = managed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+                // Re-check intent right before starting: the operator may
+                // have stopped, started, or disabled the runner during the
+                // backoff window.
+                {
+                    let runner = managed.runner.read().await;
+                    if runner.running || runner.stop_requested {
+                        info!(
+                            "crash-only watchdog: skipping restart of runner '{}' — \
+                             state changed during backoff (running={}, stop_requested={})",
+                            runner_name, runner.running, runner.stop_requested
+                        );
+                        return;
+                    }
+                }
+                {
+                    let wd = managed.watchdog.read().await;
+                    if !wd.enabled || wd.disabled_reason.is_some() {
+                        info!(
+                            "crash-only watchdog: skipping restart of runner '{}' — \
+                             watchdog disabled during backoff",
+                            runner_name
+                        );
+                        return;
+                    }
+                }
+
+                state
+                    .diagnostics
+                    .write()
+                    .await
+                    .emit(DiagnosticEventKind::RestartStarted {
+                        source: RestartSource::Watchdog,
+                        rebuild: false,
+                    });
+                let started = std::time::Instant::now();
+                match start_runner_by_id(&state, &runner_id).await {
+                    Ok(()) => {
+                        let msg = format!(
+                            "crash-only watchdog restarted runner '{}' (attempt {}/{})",
+                            runner_name, attempt, CRASH_RESTART_MAX_PER_WINDOW
+                        );
+                        info!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                            .await;
+                        state.diagnostics.write().await.emit(
+                            DiagnosticEventKind::RestartCompleted {
+                                source: RestartSource::Watchdog,
+                                rebuild: false,
+                                duration_secs: started.elapsed().as_secs_f64(),
+                                build_duration_secs: None,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "crash-only watchdog FAILED to restart runner '{}' \
+                             (attempt {}/{}): {}",
+                            runner_name, attempt, CRASH_RESTART_MAX_PER_WINDOW, e
+                        );
+                        error!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                            .await;
+                        state
+                            .diagnostics
+                            .write()
+                            .await
+                            .emit(DiagnosticEventKind::RestartFailed {
+                                source: RestartSource::Watchdog,
+                                error: e.to_string(),
+                            });
+                    }
+                }
+            });
+        }
+        CrashRestartDecision::Disarm => {
+            let msg = format!(
+                "crash-only watchdog DISARMED for runner '{}': {} auto-restarts within \
+                 {} minutes — {}. Clear with POST /runners/{}/watchdog \
+                 {{\"enabled\": true, \"reset_attempts\": true}}",
+                runner_name,
+                CRASH_RESTART_MAX_PER_WINDOW,
+                CRASH_RESTART_WINDOW_SECS / 60,
+                CRASH_LOOP_DISABLED_REASON,
+                runner_id
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg.clone())
+                .await;
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartFailed {
+                    source: RestartSource::Watchdog,
+                    error: msg,
+                });
+            state.notify_health_change();
+        }
+        skip => {
+            debug!(
+                "crash-only watchdog: no restart for runner '{}' exit ({:?})",
+                runner_name, skip
+            );
+        }
     }
 }
 
@@ -1807,7 +2108,24 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
 }
 
 /// Monitor a specific runner's process for exit.
-async fn monitor_runner_process_exit(
+///
+/// Returns a concrete `BoxFuture` (not an `async fn` opaque type) on
+/// purpose: the crash-only watchdog makes this function transitively
+/// self-referential (`start_managed_runner` spawns this monitor → the
+/// monitor calls [`maybe_crash_restart`] → which spawns a task calling
+/// [`start_runner_by_id`] → which calls `start_managed_runner`). With an
+/// opaque `async fn` future the compiler cannot resolve the cyclic hidden
+/// type; boxing at this edge makes the spawn argument inside
+/// `start_managed_runner` a concrete `Send` type and breaks the cycle.
+fn monitor_runner_process_exit(
+    state: SharedState,
+    managed: Arc<ManagedRunner>,
+    runner_id: String,
+) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(monitor_runner_process_exit_inner(state, managed, runner_id))
+}
+
+async fn monitor_runner_process_exit_inner(
     state: SharedState,
     managed: Arc<ManagedRunner>,
     _runner_id: String,
@@ -1821,6 +2139,12 @@ async fn monitor_runner_process_exit(
         runner.process.take()
     };
 
+    // Provenance: a Some(child) here means WE spawned this process via
+    // `start_managed_runner` — the only place that stores a Child. The
+    // crash-only watchdog must never restart a runner the supervisor didn't
+    // spawn, so this is threaded into the restart decision.
+    let had_child_handle = child.is_some();
+
     let exit_status = if let Some(mut child) = child {
         match child.wait().await {
             Ok(status) => Some(status),
@@ -1833,13 +2157,20 @@ async fn monitor_runner_process_exit(
         None
     };
 
-    // Update per-runner state
-    {
+    // Update per-runner state. Latch `stop_requested` in the same critical
+    // section, BEFORE publishing `running = false`: the operator stop path
+    // (`stop_runner_by_id`) only proceeds past its graceful-wait once it
+    // observes `running == false`, and the flag is only ever cleared by a
+    // subsequent start — so the value read here is exactly the operator's
+    // intent for THIS exit, race-free.
+    let stop_requested_at_exit = {
         let mut runner = managed.runner.write().await;
+        let latched = runner.stop_requested;
         runner.running = false;
         runner.process = None;
         runner.pid = None;
-    }
+        latched
+    };
 
     // Update legacy state for primary
     if is_primary {
@@ -1887,6 +2218,22 @@ async fn monitor_runner_process_exit(
         // almost certainly the cause.
         check_and_record_panic_log(&state, &managed, &runner_name).await;
     }
+
+    // Crash-only ambient watchdog: if this exit was a crash (not an
+    // operator stop, not a clean exit) and the watchdog is armed for this
+    // runner, schedule an auto-restart with exponential backoff + a
+    // crash-loop guard. A wait() error (exit_status == None) on a child we
+    // actually spawned is treated as a crash — the process is gone and we
+    // can't prove it exited cleanly.
+    let clean_exit = exit_status.map(|s| s.success()).unwrap_or(false);
+    maybe_crash_restart(
+        &state,
+        &managed,
+        had_child_handle,
+        stop_requested_at_exit,
+        clean_exit,
+    )
+    .await;
 }
 
 /// Look for `<panic_log_dir>/runner-panic.log`; if it exists and its
@@ -2251,12 +2598,21 @@ pub async fn stop_runner_by_id(
                     #[cfg(target_os = "windows")]
                     let _ = kill_by_port(port).await;
                 }
+                StopReapOutcome::RetryAfterBackoff => {
+                    warn!(
+                        "Port {} still in use for runner '{}' after every kill \
+                         escalation — waiting {}s and re-confirming once before \
+                         giving up (attempt {})",
+                        port, runner_name, STOP_REAP_BACKOFF_SECS, attempt
+                    );
+                    tokio::time::sleep(Duration::from_secs(STOP_REAP_BACKOFF_SECS)).await;
+                }
                 StopReapOutcome::StillHeld => {
                     let msg = format!(
                         "Runner '{}' stop could not be confirmed: port {} is still in \
-                         use after PID kill, tree-kill, and kill-by-port — refusing to \
-                         report success",
-                        runner_name, port
+                         use after PID kill, tree-kill, kill-by-port, and a {}s backoff \
+                         re-check — refusing to report success",
+                        runner_name, port, STOP_REAP_BACKOFF_SECS
                     );
                     warn!("{}", msg);
                     state
@@ -2265,11 +2621,14 @@ pub async fn stop_runner_by_id(
                         .await;
                     // Leave the runner in the registry (not removed, not marked
                     // stopped) so the caller and the dashboard see it as still
-                    // present rather than a phantom "stopped" entry holding a port.
-                    {
-                        let mut runner = managed.runner.write().await;
-                        runner.stop_requested = false;
-                    }
+                    // present rather than a phantom "stopped" entry holding a
+                    // port. `stop_requested` deliberately stays LATCHED (true):
+                    // the operator asked for a stop that we could not confirm —
+                    // if the process dies moments later of its own accord, the
+                    // exit monitor must still classify that death as
+                    // operator-intended, NOT as a crash to auto-restart. The
+                    // flag is cleared on the next start (see
+                    // `start_managed_runner`).
                     return Err(SupervisorError::Process(msg));
                 }
             }
@@ -2298,14 +2657,21 @@ pub async fn stop_runner_by_id(
         None
     };
 
-    // 4. Update per-runner state
+    // 4. Update per-runner state.
+    //
+    // `stop_requested` deliberately stays TRUE here. Its lifecycle is
+    // "latched on stop request, cleared on next start" (see
+    // `start_managed_runner`): the exit monitor reads it to distinguish an
+    // operator-initiated stop from a crash, and clearing it at stop
+    // *completion* raced the monitor's read (set → kill → child.wait()
+    // returns → port-confirm → reset) — a lost race would auto-restart a
+    // runner the operator deliberately stopped.
     {
         let mut runner = managed.runner.write().await;
         runner.process = None;
         runner.running = false;
         runner.started_at = None;
         runner.pid = None;
-        runner.stop_requested = false;
     }
 
     // Update legacy state for primary
@@ -2315,7 +2681,6 @@ pub async fn stop_runner_by_id(
         runner.running = false;
         runner.started_at = None;
         runner.pid = None;
-        runner.stop_requested = false;
     }
 
     state
@@ -3006,13 +3371,25 @@ mod tests {
         assert_eq!(decide_stop_reap(1, true), StopReapOutcome::EscalatePort);
     }
 
-    /// Every escalation exhausted and still held — stop must NOT be confirmed.
+    /// Both kill escalations exhausted — one bounded backoff retry before
+    /// giving up (covers a kill that landed but whose socket teardown was
+    /// slow to be reflected by the OS).
+    #[test]
+    fn stop_reap_third_held_retries_after_backoff() {
+        assert_eq!(
+            decide_stop_reap(2, true),
+            StopReapOutcome::RetryAfterBackoff
+        );
+    }
+
+    /// Every escalation (and the backoff retry) exhausted and still held —
+    /// stop must NOT be confirmed.
     #[test]
     fn stop_reap_exhausted_is_still_held() {
-        assert_eq!(decide_stop_reap(2, true), StopReapOutcome::StillHeld);
+        assert_eq!(decide_stop_reap(3, true), StopReapOutcome::StillHeld);
         // Any attempt beyond the ladder also reports StillHeld (never loops
         // back to a kill it already tried).
-        assert_eq!(decide_stop_reap(3, true), StopReapOutcome::StillHeld);
+        assert_eq!(decide_stop_reap(4, true), StopReapOutcome::StillHeld);
         assert_eq!(decide_stop_reap(99, true), StopReapOutcome::StillHeld);
     }
 
@@ -3021,10 +3398,128 @@ mod tests {
     #[test]
     fn stop_reap_ladder_terminates() {
         // Simulate a survivor that never releases the port: the loop must
-        // walk Tree → Port → StillHeld and stop.
+        // walk Tree → Port → RetryAfterBackoff → StillHeld and stop.
         assert_eq!(decide_stop_reap(0, true), StopReapOutcome::EscalateTree);
         assert_eq!(decide_stop_reap(1, true), StopReapOutcome::EscalatePort);
-        assert_eq!(decide_stop_reap(2, true), StopReapOutcome::StillHeld);
+        assert_eq!(
+            decide_stop_reap(2, true),
+            StopReapOutcome::RetryAfterBackoff
+        );
+        assert_eq!(decide_stop_reap(3, true), StopReapOutcome::StillHeld);
+    }
+
+    // =========================================================================
+    // Crash-only ambient watchdog decision tests (Phase 1,
+    // plans/2026-07-03-primary-runner-crash-resilience.md)
+    // =========================================================================
+
+    /// Baseline crash: supervisor-spawned child, no stop intent, non-zero
+    /// exit, everything armed, empty window → restart attempt 1 after 5s.
+    #[test]
+    fn crash_restart_first_crash_restarts_after_5s() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, false, 0),
+            CrashRestartDecision::Restart {
+                attempt: 1,
+                delay_secs: 5
+            }
+        );
+    }
+
+    /// Exponential backoff ladder: 5s → 30s → 120s across the rolling window.
+    #[test]
+    fn crash_restart_backoff_is_exponential() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, false, 1),
+            CrashRestartDecision::Restart {
+                attempt: 2,
+                delay_secs: 30
+            }
+        );
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, false, 2),
+            CrashRestartDecision::Restart {
+                attempt: 3,
+                delay_secs: 120
+            }
+        );
+    }
+
+    /// Rolling-window budget exhausted (3 restarts already) → disarm, loudly.
+    #[test]
+    fn crash_restart_window_exhausted_disarms() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, false, 3),
+            CrashRestartDecision::Disarm
+        );
+        // Even further past the budget it stays Disarm, never Restart.
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, false, 7),
+            CrashRestartDecision::Disarm
+        );
+    }
+
+    /// Operator stop intent wins over everything else armed — never restart
+    /// a runner the operator deliberately stopped.
+    #[test]
+    fn crash_restart_operator_stop_never_restarts() {
+        assert_eq!(
+            decide_crash_restart(true, true, false, true, true, false, 0),
+            CrashRestartDecision::SkipOperatorStop
+        );
+        // Even a non-clean exit after a stop request (taskkill path) skips.
+        assert_eq!(
+            decide_crash_restart(true, true, true, true, true, false, 0),
+            CrashRestartDecision::SkipOperatorStop
+        );
+    }
+
+    /// A clean exit (code 0) is a deliberate shutdown (window close,
+    /// internal exit) — crash-only means we never restart it.
+    #[test]
+    fn crash_restart_clean_exit_skips() {
+        assert_eq!(
+            decide_crash_restart(true, false, true, true, true, false, 0),
+            CrashRestartDecision::SkipCleanExit
+        );
+    }
+
+    /// No Child handle → the supervisor never spawned this process; no
+    /// provenance to restart it.
+    #[test]
+    fn crash_restart_requires_spawn_provenance() {
+        assert_eq!(
+            decide_crash_restart(false, false, false, true, true, false, 0),
+            CrashRestartDecision::SkipNoChildHandle
+        );
+    }
+
+    /// Global arm off (no --watchdog, or the env kill-switch) → skip.
+    #[test]
+    fn crash_restart_global_arm_gates() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, false, true, false, 0),
+            CrashRestartDecision::SkipNotArmed
+        );
+    }
+
+    /// Per-runner enabled=false (default for named/temp/external) → skip.
+    #[test]
+    fn crash_restart_per_runner_enabled_gates() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, false, false, 0),
+            CrashRestartDecision::SkipDisabled
+        );
+    }
+
+    /// Once disarmed (`disabled_reason` set), restarts stay off until an
+    /// operator resets — even with a fresh (pruned) window.
+    #[test]
+    fn crash_restart_disarmed_latch_holds() {
+        assert_eq!(
+            decide_crash_restart(true, false, false, true, true, true, 0),
+            CrashRestartDecision::SkipDisarmed
+        );
     }
 
     // =========================================================================

@@ -114,7 +114,7 @@ pub struct PortStatus {
     pub in_use: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct WatchdogHealth {
     pub enabled: bool,
     pub restart_attempts: u32,
@@ -124,21 +124,27 @@ pub struct WatchdogHealth {
 }
 
 impl WatchdogHealth {
-    /// Return a static "disabled" value for the ambient auto-restart
-    /// watchdog. That module was removed; the supervisor no longer tries to
-    /// resurrect a runner that has gone unhealthy. A separate first-healthy
-    /// watchdog (see `process::manager::watch_first_healthy`) runs per spawn
-    /// and kills children that never bind their HTTP API — it does not
-    /// surface here because it's ephemeral per-start, not ambient.
-    /// This keeps the JSON shape stable for API consumers.
-    pub fn disabled() -> Self {
+    /// Snapshot the live per-runner crash-only watchdog state (see
+    /// `process::manager::maybe_crash_restart` for who maintains it).
+    pub fn from_state(wd: &crate::state::WatchdogState) -> Self {
+        Self {
+            enabled: wd.enabled,
+            restart_attempts: wd.restart_attempts,
+            last_restart_at: wd.last_restart_at.map(|t| t.to_rfc3339()),
+            disabled_reason: wd.disabled_reason.clone(),
+            crash_count: wd.crash_history.len(),
+        }
+    }
+
+    /// Fallback value when no live `WatchdogState` is reachable: no managed
+    /// primary exists, or (on the sync SSE path) the lock was contended
+    /// this tick. Keeps the JSON shape stable for API consumers.
+    pub fn unavailable() -> Self {
         Self {
             enabled: false,
             restart_attempts: 0,
             last_restart_at: None,
-            disabled_reason: Some(
-                "no ambient auto-restart (first-healthy watchdog runs per spawn)".to_string(),
-            ),
+            disabled_reason: Some("watchdog state unavailable".to_string()),
             crash_count: 0,
         }
     }
@@ -234,7 +240,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 pid: r.pid,
                 started_at: None, // Not cached — use GET /runners for full detail
                 api_responding: r.api_responding,
-                watchdog_status: WatchdogHealth::disabled(),
+                watchdog_status: r.watchdog.clone(),
                 ui_error: r.ui_error.clone(),
                 recent_crash: r.recent_crash.clone(),
                 derived_status: r.derived_status.clone(),
@@ -274,22 +280,31 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
 
     // Use primary ManagedRunner state (not the legacy state.runner which is never
     // updated for user-managed runners, causing "stopped" even when the runner is UP).
-    let (primary_running, primary_pid, primary_started_at) =
+    let (primary_running, primary_pid, primary_started_at, primary_watchdog) =
         if let Some(primary) = state.get_primary().await {
+            let watchdog = {
+                let wd = primary.watchdog.read().await;
+                WatchdogHealth::from_state(&wd)
+            };
             let pr = primary.runner.read().await;
-            (pr.running, pr.pid, pr.started_at)
+            (pr.running, pr.pid, pr.started_at, watchdog)
         } else {
             // Fallback to legacy state.runner if no managed primary exists
             let runner = state.runner.read().await;
-            (runner.running, runner.pid, runner.started_at)
+            (
+                runner.running,
+                runner.pid,
+                runner.started_at,
+                WatchdogHealth::unavailable(),
+            )
         };
 
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
 
-    // Build multi-runner status array. The `watchdog_status` field reports the
-    // ambient auto-restart watchdog, which was removed; the first-healthy
-    // watchdog in `process::manager` is per-spawn and not surfaced here.
+    // Build multi-runner status array. The `watchdog_status` field reports
+    // the per-runner crash-only watchdog (`WatchdogState`, maintained by
+    // `process::manager::maybe_crash_restart`).
     //
     // ui_error + derived_status come from the background health-cache refresher
     // (which GETs each runner's /health every 2s). We index into that snapshot
@@ -298,6 +313,10 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let cached_snapshots = state.cached_runner_health.read().await;
     let mut runners_health = Vec::new();
     for managed in &managed_runners {
+        let watchdog_status = {
+            let wd = managed.watchdog.read().await;
+            WatchdogHealth::from_state(&wd)
+        };
         let mr = managed.runner.read().await;
         let mc = managed.cached_health.read().await;
         let cached = cached_snapshots.iter().find(|c| c.id == managed.config.id);
@@ -310,7 +329,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pid: mr.pid,
             started_at: mr.started_at.map(|t| t.to_rfc3339()),
             api_responding: mc.runner_responding,
-            watchdog_status: WatchdogHealth::disabled(),
+            watchdog_status,
             ui_error: cached.and_then(|c| c.ui_error.clone()),
             recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
@@ -332,7 +351,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
                 in_use: api_in_use,
             },
         },
-        watchdog: WatchdogHealth::disabled(),
+        watchdog: primary_watchdog,
         build: BuildHealth {
             in_progress: build.build_in_progress,
             available_slots: state.build_pool.permits.available_permits(),
@@ -410,6 +429,9 @@ fn try_build_sse_health(
             }
         }
     };
+    let primary_watchdog = primary_snapshot
+        .map(|p| p.watchdog.clone())
+        .unwrap_or_else(WatchdogHealth::unavailable);
 
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
@@ -443,7 +465,7 @@ fn try_build_sse_health(
                 in_use: api_in_use,
             },
         },
-        watchdog: WatchdogHealth::disabled(),
+        watchdog: primary_watchdog,
         build: BuildHealth {
             in_progress: build.build_in_progress,
             available_slots: state.build_pool.permits.available_permits(),
