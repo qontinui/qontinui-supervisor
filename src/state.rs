@@ -969,12 +969,17 @@ impl SupervisorState {
         // Build multi-runner map from config. Thread the optional log dir
         // through so each ManagedRunner's LogState gets a per-runner append
         // file at <log_dir>/<runner_id>.log.
+        //
+        // Crash-only watchdog default scope: under `--watchdog` only the
+        // PRIMARY is armed for crash auto-restart. Named/temp/external
+        // runners default off (cheap to respawn, often killed deliberately
+        // by agents) — arm one explicitly via `POST /runners/{id}/watchdog`.
         let log_dir = config.log_dir.as_deref();
         let mut runners_map = HashMap::new();
         for rc in &config.runners {
             let managed = Arc::new(ManagedRunner::new_with_log_dir(
                 rc.clone(),
-                watchdog_enabled,
+                watchdog_enabled && rc.kind().is_primary(),
                 log_dir,
             ));
             runners_map.insert(rc.id.clone(), managed);
