@@ -48,6 +48,28 @@ pub fn is_temp_runner(runner_id: &str) -> bool {
     runner_kind(runner_id).is_temp()
 }
 
+/// Decide the `QONTINUI_API_URL` value to set on a spawned runner child.
+///
+/// Policy (plan 2026-07-08-runner-relay-honor-persisted-backend-url):
+///   - An explicit supervisor `QONTINUI_API_URL` (`explicit_env`) is forwarded
+///     to EVERY runner — highest precedence in the runner's `get_api_base_url`
+///     (operator / CI / local-E2E override; unchanged behavior).
+///   - With no explicit env: **secondaries** (temp/named) are pinned to the
+///     local backend so a shared prod `settings.json` can never route a local
+///     build-test runner off-box; the **primary** is left UNSET (`None`) so the
+///     runner's `get_api_base_url` falls through to the persisted paired backend
+///     (`web_integration.backend_url`) — the backend the user signed into and
+///     where its device JWT is verifiable.
+///
+/// Returns `Some(url)` to set the var, `None` to leave it unset.
+fn resolve_child_api_url(explicit_env: Option<String>, is_primary: bool) -> Option<String> {
+    match explicit_env {
+        Some(url) => Some(url),
+        None if is_primary => None,
+        None => Some("http://127.0.0.1:8000".to_string()),
+    }
+}
+
 /// Binary metadata for diagnostics — lets callers detect stale binaries.
 #[derive(Clone, serde::Serialize)]
 pub struct BinaryMeta {
@@ -1638,12 +1660,17 @@ async fn start_exe_mode_for_runner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("CLAUDECODE")
-        .env("QONTINUI_PORT", managed.config.port.to_string())
-        .env(
-            "QONTINUI_API_URL",
-            std::env::var("QONTINUI_API_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string()),
-        );
+        .env("QONTINUI_PORT", managed.config.port.to_string());
+
+    // QONTINUI_API_URL policy (plan 2026-07-08). Decision factored into the pure
+    // `resolve_child_api_url` helper so the primary/secondary/explicit branches
+    // are unit-testable without spawning a process.
+    if let Some(api_url) = resolve_child_api_url(
+        std::env::var("QONTINUI_API_URL").ok(),
+        managed.config.kind().is_primary(),
+    ) {
+        cmd.env("QONTINUI_API_URL", api_url);
+    }
 
     if let Ok(tier) = std::env::var("QONTINUI_RUNNER_TIER") {
         cmd.env("QONTINUI_RUNNER_TIER", tier);
@@ -3347,6 +3374,32 @@ pub async fn rebuild_and_restart_by_id(
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // QONTINUI_API_URL child-env policy (plan 2026-07-08).
+
+    #[test]
+    fn child_api_url_primary_no_env_is_unset() {
+        // Primary with no explicit supervisor QONTINUI_API_URL → leave it unset
+        // so the runner resolves via its persisted paired backend.
+        assert_eq!(resolve_child_api_url(None, true), None);
+    }
+
+    #[test]
+    fn child_api_url_secondary_no_env_pins_local() {
+        // Temp/named with no explicit env → pinned to the local backend.
+        assert_eq!(
+            resolve_child_api_url(None, false),
+            Some("http://127.0.0.1:8000".to_string())
+        );
+    }
+
+    #[test]
+    fn child_api_url_explicit_env_forwarded_to_all() {
+        // An explicit supervisor QONTINUI_API_URL wins for every runner kind.
+        let explicit = || Some("https://api.qontinui.io".to_string());
+        assert_eq!(resolve_child_api_url(explicit(), true), explicit());
+        assert_eq!(resolve_child_api_url(explicit(), false), explicit());
+    }
 
     /// A slot freshly built 5 minutes after the running copy is "stale".
     #[test]
