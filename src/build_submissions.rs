@@ -116,7 +116,26 @@ impl BuildStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildSubmission {
     pub id: Uuid,
+    /// The build's ACTUAL cargo source root — the directory cargo compiled
+    /// (`current_dir` / `build_dir_override`), not the supervisor's live
+    /// `project_dir`.
+    ///
+    /// For a spawn-test this is set from the request's provenance selector, so
+    /// a `git_ref` build reports its `.spawn-<ref>/qontinui-runner/src-tauri`
+    /// container path and a `worktree_path` build reports the caller's checkout.
+    /// It previously ALWAYS reported `state.config.project_dir` regardless of
+    /// provenance, which made a worktree-spawned build look like it came from
+    /// the live tree — a misleading field on exactly the endpoint an operator
+    /// polls to answer "what did this build actually compile?".
     pub worktree_path: PathBuf,
+    /// Provenance label for `worktree_path`, using the SAME vocabulary as the
+    /// `POST /runners/spawn-test` response `source` field: `"live_tree"` |
+    /// `"worktree"` (a managed `git_ref` container) | `"worktree_path"` (a
+    /// caller-owned checkout). `None` for plain `/build/submit` cargo
+    /// submissions and detached actions, where `worktree_path` is whatever the
+    /// caller passed and no spawn provenance applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub build_kind: BuildKind,
     pub agent_id: Option<String>,
     pub package: Option<String>,
@@ -272,6 +291,9 @@ pub async fn submit(
     let submission = BuildSubmission {
         id,
         worktree_path: worktree_path.clone(),
+        // Plain cargo submission: `worktree_path` is exactly what the caller
+        // passed, so there is no spawn provenance to label.
+        source: None,
         build_kind,
         agent_id: agent_id.clone(),
         package: package.clone(),
@@ -322,9 +344,16 @@ pub async fn submit(
 /// Returns the submission id immediately. The async spawn-test path returns a
 /// 202 with this id + `port`; the sync path awaits terminal via
 /// [`await_terminal`] and unwraps `spawn`.
+/// `worktree_path` MUST be the build's ACTUAL cargo source root (the
+/// `.spawn-<ref>` container for a `git_ref` build, the caller's checkout for a
+/// `worktree_path` build, the live `project_dir` otherwise) and `source` its
+/// label in the spawn-test `source` vocabulary — see
+/// [`BuildSubmission::worktree_path`] / [`BuildSubmission::source`]. Callers
+/// derive both via `routes::runners::resolve_spawn_source`.
 pub fn submit_spawn<F>(
     store: Arc<BuildSubmissionStore>,
     worktree_path: PathBuf,
+    source: String,
     agent_id: Option<String>,
     port: u16,
     exec: F,
@@ -337,6 +366,7 @@ where
     let submission = BuildSubmission {
         id,
         worktree_path,
+        source: Some(source),
         build_kind: BuildKind::Build,
         agent_id,
         package: None,
@@ -462,6 +492,9 @@ where
     let submission = BuildSubmission {
         id,
         worktree_path,
+        // Detached HTTP action (`/runner/fix-and-rebuild`): no spawn-test
+        // provenance selector applies.
+        source: None,
         build_kind: BuildKind::Build,
         agent_id,
         package: None,
@@ -1081,6 +1114,7 @@ mod tests {
         let sub = BuildSubmission {
             id,
             worktree_path: PathBuf::from("/tmp/x"),
+            source: None,
             build_kind: BuildKind::Check,
             agent_id: None,
             package: None,
@@ -1110,6 +1144,7 @@ mod tests {
             let sub = BuildSubmission {
                 id: Uuid::new_v4(),
                 worktree_path: PathBuf::from("/tmp/x"),
+                source: None,
                 build_kind: BuildKind::Check,
                 agent_id: None,
                 package: None,
@@ -1146,6 +1181,7 @@ mod tests {
             let sub = BuildSubmission {
                 id,
                 worktree_path: PathBuf::from("/tmp/x"),
+                source: None,
                 build_kind: BuildKind::Check,
                 agent_id: None,
                 package: None,
@@ -1168,6 +1204,7 @@ mod tests {
         let extra = BuildSubmission {
             id: Uuid::new_v4(),
             worktree_path: PathBuf::from("/tmp/x"),
+            source: None,
             build_kind: BuildKind::Check,
             agent_id: None,
             package: None,
@@ -1203,6 +1240,7 @@ mod tests {
         let (id, arc) = submit_spawn(
             store.clone(),
             PathBuf::from("/tmp/runner/src-tauri"),
+            "live_tree".to_string(),
             Some("agent-x".into()),
             9881,
             async {
@@ -1247,6 +1285,7 @@ mod tests {
         let (_id, arc) = submit_spawn(
             store.clone(),
             PathBuf::from("/tmp/runner/src-tauri"),
+            "live_tree".to_string(),
             None,
             9882,
             async {
@@ -1299,6 +1338,7 @@ mod tests {
         let cargo = BuildSubmission {
             id: Uuid::new_v4(),
             worktree_path: PathBuf::from("/tmp/x"),
+            source: None,
             build_kind: BuildKind::Build,
             agent_id: None,
             package: None,
@@ -1435,6 +1475,7 @@ mod tests {
         let mut sub = BuildSubmission {
             id: Uuid::new_v4(),
             worktree_path: PathBuf::from("/tmp/x"),
+            source: None,
             build_kind: BuildKind::Build,
             agent_id: None,
             package: None,

@@ -511,6 +511,37 @@ fn is_old_flat_layout(container: &Path) -> bool {
     container.join("src-tauri").exists() && !container.join("qontinui-runner").exists()
 }
 
+/// The `.spawn-<sanitized_ref>` container dir [`prepare_worktree`] materializes
+/// for `git_ref` — `<workspace_root>/.spawn-<sanitized_ref>/`.
+///
+/// Names the container WITHOUT touching git or creating anything (the only I/O
+/// is [`derive_workspace_root`]'s sibling-dir probe), so a caller can label a
+/// build with its true source root before the worktree exists.
+/// `prepare_worktree` itself derives the container through this function, so the
+/// two can never disagree.
+pub fn container_path_for_ref(
+    project_dir: &Path,
+    git_ref: &str,
+) -> Result<PathBuf, SupervisorError> {
+    if git_ref.trim().is_empty() {
+        return Err(SupervisorError::Validation(
+            "git_ref must be a non-empty git ref".to_string(),
+        ));
+    }
+    let workspace_root = derive_workspace_root(project_dir)?;
+    Ok(workspace_root.join(format!("{}{}", SPAWN_DIR_PREFIX, sanitize_ref(git_ref))))
+}
+
+/// The runner worktree root inside the container for `git_ref` —
+/// `<workspace_root>/.spawn-<sanitized_ref>/qontinui-runner/`. Parent of the
+/// `src-tauri` dir cargo compiles. See [`container_path_for_ref`].
+pub fn runner_worktree_path_for_ref(
+    project_dir: &Path,
+    git_ref: &str,
+) -> Result<PathBuf, SupervisorError> {
+    Ok(container_path_for_ref(project_dir, git_ref)?.join("qontinui-runner"))
+}
+
 /// Ensure a managed, *isolated* detached worktree set for `git_ref` exists.
 /// Idempotent: a subsequent call for the same ref reuses the existing
 /// container, force-resets the runner worktree to the ref, and re-pins the
@@ -548,11 +579,14 @@ pub async fn prepare_worktree(
     let repo_root = find_repo_root(project_dir)?;
     let workspace_root = derive_workspace_root(project_dir)?;
     let schemas_repo_root = workspace_root.join("qontinui-schemas");
-    let sanitized = sanitize_ref(git_ref);
 
-    // Per-ref container holding both nested worktrees.
-    let container: PathBuf = workspace_root.join(format!("{}{}", SPAWN_DIR_PREFIX, sanitized));
-    let runner_wt: PathBuf = container.join("qontinui-runner");
+    // Per-ref container holding both nested worktrees. Derived through the
+    // shared helper so the ONE place that knows the layout formula is
+    // [`container_path_for_ref`] — callers that need to name the container
+    // before it is materialized (e.g. the spawn-test handler labelling a build
+    // submission's source root) cannot drift from what this function creates.
+    let container: PathBuf = container_path_for_ref(project_dir, git_ref)?;
+    let runner_wt: PathBuf = runner_worktree_path_for_ref(project_dir, git_ref)?;
     let schemas_wt: PathBuf = container.join("qontinui-schemas");
 
     // Best-effort fetch on the runner repo so the ref is resolvable even if it

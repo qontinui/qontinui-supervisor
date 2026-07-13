@@ -1690,6 +1690,53 @@ fn provenance_rebuild_guard(
     Ok(())
 }
 
+/// Resolve a spawn-test request's provenance into `(source_label, source_root)`
+/// — the pair recorded on the build submission and surfaced by
+/// `GET /build/{id}/status`.
+///
+/// `source_label` reuses the EXACT vocabulary of the spawn-test response
+/// `source` field, so one word means one thing everywhere:
+///
+/// | selector        | label            | source root                                       |
+/// |-----------------|------------------|---------------------------------------------------|
+/// | `git_ref`       | `worktree`       | `<ws>/.spawn-<ref>/qontinui-runner/src-tauri`      |
+/// | `worktree_path` | `worktree_path`  | `<caller-checkout>/src-tauri`                      |
+/// | neither         | `live_tree`      | `project_dir` (the live tree's `src-tauri`)        |
+///
+/// The root is always the **cargo source root** (the `current_dir` cargo is
+/// handed, i.e. the `build_dir_override`), so it is directly comparable to the
+/// `live_tree` value the field has always carried — same granularity, honest
+/// provenance. The `git_ref` container path is derived through
+/// [`crate::spawn_worktree::runner_worktree_path_for_ref`], the same helper
+/// `prepare_worktree` uses to CREATE the container, so the label cannot drift
+/// from the tree the build actually compiles.
+///
+/// Cheap — path arithmetic plus the `derive_workspace_root` sibling probe, no
+/// git and no network — so it runs in the handler BEFORE the (slow) worktree
+/// materialization and the field is honest even while the build is still in
+/// flight. If the workspace root cannot be derived (malformed layout), it
+/// degrades to `project_dir` rather than failing the spawn: the build itself
+/// will surface the real error.
+fn resolve_spawn_source(
+    project_dir: &std::path::Path,
+    git_ref: Option<&str>,
+    worktree_path: Option<&str>,
+) -> (String, std::path::PathBuf) {
+    if let Some(git_ref) = git_ref {
+        return match crate::spawn_worktree::runner_worktree_path_for_ref(project_dir, git_ref) {
+            Ok(wt_root) => ("worktree".to_string(), wt_root.join("src-tauri")),
+            Err(_) => ("worktree".to_string(), project_dir.to_path_buf()),
+        };
+    }
+    if let Some(wt) = worktree_path {
+        return (
+            "worktree_path".to_string(),
+            std::path::Path::new(wt).join("src-tauri"),
+        );
+    }
+    ("live_tree".to_string(), project_dir.to_path_buf())
+}
+
 /// Detect known aliases of the real provenance params in a raw spawn-test JSON
 /// body. spawn-test carries many optional fields so a blanket
 /// `deny_unknown_fields` is too blunt; instead this targets the three keys the
@@ -2006,13 +2053,30 @@ pub async fn spawn_test(
     let exec_managed = managed.clone();
     let exec_id = id.clone();
     let agent_id = body.requester_id.clone();
-    let worktree_label = state.config.project_dir.clone();
-    let (submission_id, sub_arc) =
-        crate::build_submissions::submit_spawn(store, worktree_label, agent_id, port, async move {
+    // S3: label the submission with the build's ACTUAL source root, not the
+    // supervisor's live `project_dir`. Derived from the request's provenance
+    // selector (already validated above: a `git_ref`/`worktree_path` without
+    // `rebuild:true` was rejected with a 400, and the two are mutually
+    // exclusive), so `GET /build/{id}/status` answers "what tree did this
+    // compile?" honestly for every spawn — including while it is still in
+    // flight.
+    let (source_label, worktree_label) = resolve_spawn_source(
+        &state.config.project_dir,
+        body.git_ref.as_deref(),
+        body.worktree_path.as_deref(),
+    );
+    let (submission_id, sub_arc) = crate::build_submissions::submit_spawn(
+        store,
+        worktree_label,
+        source_label,
+        agent_id,
+        port,
+        async move {
             let (status, body_json, stderr_tail) =
                 execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
             (status.as_u16(), body_json, stderr_tail)
-        });
+        },
+    );
 
     if want_async {
         return Ok((
@@ -6054,6 +6118,91 @@ mod tests {
         assert!(r(&serde_json::json!({})).is_ok());
         // A non-object body short-circuits ok (typed deserialize handles it).
         assert!(r(&serde_json::json!("not-an-object")).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // S3 — `/build/{id}/status` must report the build's ACTUAL source root,
+    // not the supervisor's live `project_dir`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resolve_spawn_source_live_tree_when_no_selector() {
+        let project_dir = std::path::Path::new("D:/ws/qontinui-runner/src-tauri");
+        let (source, root) = super::resolve_spawn_source(project_dir, None, None);
+        assert_eq!(source, "live_tree");
+        assert_eq!(root, project_dir);
+    }
+
+    #[test]
+    fn resolve_spawn_source_git_ref_reports_spawn_container_not_project_dir() {
+        // The misleading-field regression: a git_ref build previously reported
+        // `project_dir`, making a worktree-spawned build look like it came from
+        // the live tree. It must report its own `.spawn-<ref>` container.
+        //
+        // `derive_workspace_root` probes the FS for the
+        // `qontinui-runner/` + `qontinui-schemas/` sibling pair, so the fixture
+        // is a real workspace-shaped tempdir.
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("qontinui-runner").join("src-tauri"))
+            .expect("mkdir runner");
+        std::fs::create_dir_all(ws.join("qontinui-schemas")).expect("mkdir schemas");
+        let project_dir = ws.join("qontinui-runner").join("src-tauri");
+
+        let (source, root) = super::resolve_spawn_source(&project_dir, Some("origin/main"), None);
+
+        assert_eq!(
+            source, "worktree",
+            "must reuse the existing source vocabulary"
+        );
+        let root_s = root.to_string_lossy().replace('\\', "/");
+        assert!(
+            root_s.contains("/.spawn-"),
+            "a git_ref build must report its .spawn-<ref> container; got: {root_s}"
+        );
+        assert!(
+            root_s.ends_with("qontinui-runner/src-tauri"),
+            "the reported root must be the cargo source root inside the container; got: {root_s}"
+        );
+        assert_ne!(
+            root, project_dir,
+            "must NOT report the supervisor's live project_dir"
+        );
+
+        // And it must agree byte-for-byte with the path prepare_worktree
+        // materializes (same helper, single source of truth).
+        let expected =
+            crate::spawn_worktree::runner_worktree_path_for_ref(&project_dir, "origin/main")
+                .expect("derive container")
+                .join("src-tauri");
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn resolve_spawn_source_git_ref_degrades_to_project_dir_on_malformed_layout() {
+        // A workspace root that can't be derived must not fail the spawn — the
+        // build itself surfaces the real error. Degrade to project_dir.
+        let tmp = TempDir::new().expect("tempdir");
+        let project_dir = tmp.path().join("not-a-workspace");
+        let (source, root) = super::resolve_spawn_source(&project_dir, Some("origin/main"), None);
+        assert_eq!(source, "worktree");
+        assert_eq!(root, project_dir);
+    }
+
+    #[test]
+    fn resolve_spawn_source_worktree_path_reports_caller_checkout() {
+        let project_dir = std::path::Path::new("D:/ws/qontinui-runner/src-tauri");
+        let (source, root) = super::resolve_spawn_source(
+            project_dir,
+            None,
+            Some("D:/ws/.spawn-pr370/qontinui-runner"),
+        );
+        assert_eq!(source, "worktree_path");
+        assert_eq!(
+            root,
+            std::path::Path::new("D:/ws/.spawn-pr370/qontinui-runner/src-tauri")
+        );
+        assert_ne!(root, project_dir);
     }
 
     // -------------------------------------------------------------------

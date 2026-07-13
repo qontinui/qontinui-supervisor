@@ -822,10 +822,14 @@ async fn run_build_inner(
                 }
             }
             Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let truncated: String = stderr.chars().take(500).collect();
+                // S2: `tsc`/`vite` write their diagnostics to **stdout**, so the
+                // legacy stderr-only capture printed "frontend build FAILED"
+                // with no `error TS####` anywhere in it. Merge both streams and
+                // keep the TAIL (where the error summary lives), not the head.
+                let merged = merge_process_output(&output);
+                let truncated = tail_bytes_keep_utf8(&merged, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
                 error!(
-                    "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. stderr: {}",
+                    "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. output:\n{}",
                     slot.id, truncated
                 );
                 state
@@ -834,7 +838,7 @@ async fn run_build_inner(
                         LogSource::Build,
                         LogLevel::Error,
                         format!(
-                            "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. stderr: {}",
+                            "Slot {}: frontend build FAILED \u{2014} cargo will proceed with the previous dist/ snapshot, so this binary may embed a stale frontend. Fix tsc errors and rebuild to refresh. output:\n{}",
                             slot.id, truncated
                         ),
                     )
@@ -848,7 +852,7 @@ async fn run_build_inner(
                 {
                     let mut history = slot.history.write().await;
                     history.last_error = Some(format!(
-                        "frontend_stale: pnpm run build failed: {}",
+                        "frontend_stale: pnpm run build failed:\n{}",
                         truncated
                     ));
                 }
@@ -1296,11 +1300,20 @@ async fn build_shim_sidecar(
 /// `node_modules/`, no `dist/`. The next `pnpm run build` would fail because
 /// the dep binaries (`tsc`, `vite`, `ui-bridge-build-ir`, …) aren't
 /// installed, and even if they were, cargo's `tauri::generate_context!`
-/// would panic on the missing `<wt>/dist/index.html`. Idempotent: once both
-/// `<wt>/node_modules/.bin/ui-bridge-build-ir` and `<wt>/dist/index.html`
-/// exist, this returns immediately with the `frontend_prebuild_skipped`
-/// log reason — repeated spawn-test calls on the same ref don't re-pay
-/// the ~30s pnpm install cost.
+/// would panic on the missing `<wt>/dist/index.html`. Idempotent: a repeated
+/// spawn on the same ref whose deps are UNCHANGED returns immediately with the
+/// `frontend_prebuild_skipped` log reason and doesn't re-pay the ~30s pnpm
+/// install cost.
+///
+/// **The dep-install gate is FRESHNESS-gated, not presence-gated** — see
+/// [`dep_install_reason`]. A `.spawn-<ref>` container is REUSED across refs
+/// (`prepare_worktree` force-resets the same dir to the new ref), so a mere
+/// `node_modules/` presence check would happily build the new ref's source
+/// against the OLD ref's installed dependency tree. That is the 2026-07-12
+/// P0: a reused container held `@qontinui/navigation@0.1.5` while the ref
+/// pinned `^0.2.0`, and the resulting `TS2339: Property 'hasOwnPage' does not
+/// exist on type 'NavigationItem'` looked exactly like a red `origin/main`
+/// even though runner `origin/main` built clean.
 ///
 /// The whole prebuild is serialized via `BuildPool.npm_lock` (the same
 /// mutex the live-tree `pnpm run build` uses): `tsc` + `vite` are heavy
@@ -1310,9 +1323,10 @@ async fn build_shim_sidecar(
 ///
 /// On any failure (pnpm install non-zero exit, pnpm build non-zero exit, or
 /// post-build `dist/index.html` still missing) returns
-/// `SupervisorError::BuildFailed` with the cargo-style 2KB stderr tail
-/// embedded so callers see what went wrong without trawling the supervisor
-/// log.
+/// `SupervisorError::BuildFailed` with a 2KB tail of the **merged
+/// stdout+stderr** embedded, and records the same blob on the slot so it
+/// reaches `SlotHistory::last_error_detail` / `last_error_log` and the build
+/// submission's `stderr_tail` (see [`record_frontend_failure`]).
 async fn prebuild_worktree_frontend(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
@@ -1320,23 +1334,27 @@ async fn prebuild_worktree_frontend(
     force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
     // Idempotency gate, split for the Phase 3 `frontend_only` fast path:
-    //   * `needs_install` — the `node_modules/.bin/ui-bridge-build-ir` marker
-    //     is absent, so `pnpm install` must run.
+    //   * `install_reason` — Some(why) when `pnpm install` must run: either the
+    //     `node_modules/.bin/ui-bridge-build-ir` marker is absent, or the
+    //     dependency manifests (`pnpm-lock.yaml` + `package.json`) hash
+    //     differently from the sidecar recorded at the last successful install
+    //     — i.e. the installed tree is STALE relative to the checked-out ref.
     //   * `needs_build`   — `dist/index.html` is absent, so `pnpm run build`
     //     must run.
-    // Default (force_frontend_build=false): if BOTH artifacts already exist,
-    // skip the whole prebuild (the historical behavior — repeated spawns on the
-    // same ref don't re-pay install/build). `frontend_only:true` FORCES
-    // `pnpm run build` regardless of `dist/index.html` presence, because a TS
-    // edit made after the tree's last build would otherwise silently embed the
-    // stale dist — exactly the case frontend_only exists for. `pnpm install`
-    // is still skipped when the marker is present (the "fast" in fast path).
-    let needs_install = frontend_install_marker_missing(wt_root);
+    // Default (force_frontend_build=false): if the installed deps are FRESH and
+    // dist/ exists, skip the whole prebuild (repeated spawns on the same ref
+    // don't re-pay install/build). `frontend_only:true` FORCES `pnpm run build`
+    // regardless of `dist/index.html` presence, because a TS edit made after the
+    // tree's last build would otherwise silently embed the stale dist — exactly
+    // the case frontend_only exists for. `pnpm install` is still skipped when
+    // the deps are provably fresh (the "fast" in fast path).
+    let install_reason = dep_install_reason(wt_root);
+    let needs_install = install_reason.is_some();
     let needs_build = !dist_index_present(wt_root);
 
     if !needs_install && !needs_build && !force_frontend_build {
         info!(
-            "Slot {}: frontend_prebuild_skipped — {:?} already has node_modules + dist/",
+            "Slot {}: frontend_prebuild_skipped — {:?} already has fresh node_modules (dep hash matches) + dist/",
             slot.id, wt_root
         );
         state
@@ -1345,7 +1363,7 @@ async fn prebuild_worktree_frontend(
                 LogSource::Build,
                 LogLevel::Info,
                 format!(
-                    "Slot {}: frontend_prebuild_skipped — {:?} already has node_modules + dist/",
+                    "Slot {}: frontend_prebuild_skipped — {:?} already has fresh node_modules (dep hash matches) + dist/",
                     slot.id, wt_root
                 ),
             )
@@ -1372,9 +1390,13 @@ async fn prebuild_worktree_frontend(
     //    everything else `pnpm run build` needs. Use `--frozen-lockfile`
     //    when a pnpm-lock.yaml exists (reproducible, matches CI's
     //    `pnpm install --frozen-lockfile`); otherwise fall back to a plain
-    //    `pnpm install`. Skipped when the marker already exists (so a
-    //    `frontend_only` re-spawn pays only the `pnpm run build` cost).
-    if needs_install {
+    //    `pnpm install`. Skipped ONLY when the installed dep tree is provably
+    //    FRESH for this checkout (marker present AND the dep-manifest hash
+    //    matches the sidecar written by the last successful install) — so a
+    //    `frontend_only` re-spawn on an unchanged ref pays only the
+    //    `pnpm run build` cost, while a container reused across a dep change
+    //    reinstalls instead of compiling against stale `node_modules`.
+    if let Some(reason) = &install_reason {
         let has_lockfile = wt_root.join("pnpm-lock.yaml").exists();
         let install_args = if has_lockfile {
             "install --frozen-lockfile"
@@ -1383,8 +1405,8 @@ async fn prebuild_worktree_frontend(
         };
 
         info!(
-            "Slot {}: pnpm {} starting in {:?}",
-            slot.id, install_args, wt_root
+            "Slot {}: pnpm {} starting in {:?} — {}",
+            slot.id, install_args, wt_root, reason
         );
         state
             .logs
@@ -1392,8 +1414,8 @@ async fn prebuild_worktree_frontend(
                 LogSource::Build,
                 LogLevel::Info,
                 format!(
-                    "Slot {}: pnpm {} starting in {:?}",
-                    slot.id, install_args, wt_root
+                    "Slot {}: pnpm {} starting in {:?} — {}",
+                    slot.id, install_args, wt_root, reason
                 ),
             )
             .await;
@@ -1406,16 +1428,24 @@ async fn prebuild_worktree_frontend(
             ))
         })?;
         if !install_output.status.success() {
-            let stderr_tail = tail_bytes_keep_utf8(
-                &String::from_utf8_lossy(&install_output.stderr),
-                LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
-            );
+            // S2: pnpm writes resolution/peer-dep diagnostics to BOTH streams —
+            // capture the merged blob, not stderr alone.
+            let merged = merge_process_output(&install_output);
+            let tail = record_frontend_failure(state, slot, &merged).await;
             return Err(SupervisorError::BuildFailed(format!(
-                "pnpm {} failed in spawn worktree {:?} (exit {}): {}",
-                install_args, wt_root, install_output.status, stderr_tail
+                "pnpm {} failed in spawn worktree {:?} (exit {}):\n{}",
+                install_args, wt_root, install_output.status, tail
             )));
         }
         let install_secs = install_started.elapsed().as_secs();
+
+        // Stamp the dep-manifest hash AFTER a successful install: this is the
+        // sidecar the next spawn's freshness gate compares against. Hashing
+        // post-install (not pre-) is deliberate — a non-frozen `pnpm install`
+        // may rewrite `pnpm-lock.yaml`, and it is the POST state that the
+        // installed `node_modules` actually corresponds to.
+        write_dep_hash_sidecar(state, slot, wt_root).await;
+
         info!(
             "Slot {}: pnpm {} completed in {:?} ({}s)",
             slot.id, install_args, wt_root, install_secs
@@ -1433,7 +1463,7 @@ async fn prebuild_worktree_frontend(
             .await;
     } else {
         info!(
-            "Slot {}: pnpm install skipped — node_modules marker present in {:?}",
+            "Slot {}: pnpm install skipped — node_modules is FRESH (dep-manifest hash matches sidecar) in {:?}",
             slot.id, wt_root
         );
         state
@@ -1442,7 +1472,7 @@ async fn prebuild_worktree_frontend(
                 LogSource::Build,
                 LogLevel::Info,
                 format!(
-                    "Slot {}: pnpm install skipped — node_modules marker present in {:?}",
+                    "Slot {}: pnpm install skipped — node_modules is FRESH (dep-manifest hash matches sidecar) in {:?}",
                     slot.id, wt_root
                 ),
             )
@@ -1468,13 +1498,19 @@ async fn prebuild_worktree_frontend(
         ))
     })?;
     if !build_output.status.success() {
-        let stderr_tail = tail_bytes_keep_utf8(
-            &String::from_utf8_lossy(&build_output.stderr),
-            LAST_BUILD_STDERR_SHORT_TAIL_BYTES,
-        );
+        // S2 (the P0's second half): `tsc` and `vite` print their compiler
+        // diagnostics (`error TS2339: …`) to **stdout**; stderr usually holds
+        // only pnpm's own harness noise and is frequently EMPTY. Reading stderr
+        // alone produced a spawn-test error body with no compiler error in it at
+        // all, so the operator saw a failed build with no reason. Merge both
+        // streams and record them on the slot so they reach
+        // `last_error_detail` / `last_error_log` and the submission's
+        // `stderr_tail`.
+        let merged = merge_process_output(&build_output);
+        let tail = record_frontend_failure(state, slot, &merged).await;
         return Err(SupervisorError::BuildFailed(format!(
-            "pnpm run build failed in spawn worktree {:?} (exit {}): {}",
-            wt_root, build_output.status, stderr_tail
+            "pnpm run build failed in spawn worktree {:?} (exit {}):\n{}",
+            wt_root, build_output.status, tail
         )));
     }
     let build_secs = build_started.elapsed().as_secs();
@@ -1525,6 +1561,258 @@ fn frontend_install_marker_missing(wt_root: &std::path::Path) -> bool {
 /// must be re-embedded).
 fn dist_index_present(wt_root: &std::path::Path) -> bool {
     wt_root.join("dist").join("index.html").exists()
+}
+
+// ---------------------------------------------------------------------------
+// S1 — dep-install FRESHNESS gate (lockfile-hash sidecar)
+// ---------------------------------------------------------------------------
+
+/// Files whose CONTENT governs what `pnpm install` resolves into
+/// `node_modules/`, in a fixed order so the hash is stable.
+///
+/// The runner is a **pnpm** workspace: `packageManager: pnpm@…` +
+/// `pnpm-lock.yaml`, and there is no `package-lock.json` anywhere in the tree.
+/// [`run_pnpm_command`] always shells `pnpm`, and `prebuild_worktree_frontend`
+/// passes `--frozen-lockfile` exactly when `pnpm-lock.yaml` exists — so
+/// `pnpm-lock.yaml` is THE lockfile that governs the install. `package.json` is
+/// hashed too because it governs the plain-`pnpm install` fallback used when no
+/// lockfile is present (and because `--frozen-lockfile` cross-checks it, so a
+/// package.json/lockfile disagreement must not be skipped). `pnpm-workspace.yaml`
+/// defines which packages take part in the install graph. `package-lock.json` is
+/// deliberately NOT hashed: pnpm never consumes it, so an npm-written one would
+/// only cause spurious reinstalls.
+const DEP_MANIFEST_FILES: &[&str] = &["pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml"];
+
+/// Sidecar recording the [`dep_manifest_hash`] of the tree as it was at the last
+/// SUCCESSFUL `pnpm install` in this worktree.
+///
+/// Lives INSIDE `node_modules/` on purpose: `node_modules/` is gitignored (so
+/// this never dirties a `.spawn-<ref>` worktree or a caller-owned
+/// `worktree_path` checkout), and it is the exact artifact the hash describes —
+/// `rm -rf node_modules` takes the sidecar with it, which correctly degrades to
+/// "install needed" instead of leaving a hash that vouches for a tree that no
+/// longer exists. Every failure mode of this file (absent, unreadable, pruned by
+/// a future pnpm) degrades toward REINSTALL, never toward a stale skip.
+const DEP_HASH_SIDECAR: &str = ".qontinui-supervisor-dep-hash";
+
+/// SHA-256 over the dependency-governing manifests in `wt_root`
+/// ([`DEP_MANIFEST_FILES`]), hex-encoded.
+///
+/// Absent files are folded in as an explicit `absent` marker so that
+/// *removing* a lockfile changes the hash just as much as editing it. Each
+/// file's name and byte length are mixed in ahead of its bytes so no
+/// concatenation of two files can collide with another pair.
+///
+/// Returns `None` iff NONE of the manifests exist — i.e. the tree is not a JS
+/// project at all and there is nothing for `pnpm install` to govern. Callers
+/// treat that as "cannot reason about freshness" and fall back to the legacy
+/// marker-presence gate rather than forcing a doomed `pnpm install`.
+fn dep_manifest_hash(wt_root: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut any_present = false;
+
+    for name in DEP_MANIFEST_FILES {
+        hasher.update(name.as_bytes());
+        match std::fs::read(wt_root.join(name)) {
+            Ok(bytes) => {
+                any_present = true;
+                hasher.update(b"\x01");
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            }
+            Err(_) => {
+                hasher.update(b"\x00absent");
+            }
+        }
+    }
+
+    if !any_present {
+        return None;
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// Absolute path of the dep-hash sidecar for `wt_root`.
+fn dep_hash_sidecar_path(wt_root: &std::path::Path) -> PathBuf {
+    wt_root.join("node_modules").join(DEP_HASH_SIDECAR)
+}
+
+/// Read the recorded dep-manifest hash for `wt_root`. `None` on any failure
+/// (absent, unreadable, empty) — which the gate treats as "unknown provenance ⇒
+/// reinstall".
+fn read_dep_hash_sidecar(wt_root: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dep_hash_sidecar_path(wt_root)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// THE dep-install gate. `Some(reason)` ⇒ `pnpm install` must run (the reason is
+/// logged and surfaced); `None` ⇒ the installed `node_modules` is provably fresh
+/// for this checkout and the install is skipped.
+///
+/// Freshness-gated, not presence-gated. The predecessor gate asked only "does
+/// `node_modules/.bin/ui-bridge-build-ir` exist?", which is true for a
+/// `.spawn-<ref>` container that was populated for a DIFFERENT ref — the
+/// container is reused and force-reset to the new ref, but `node_modules/` is
+/// not touched. The result was a build of the new ref's TypeScript against the
+/// old ref's dependency tree (2026-07-12: `@qontinui/navigation@0.1.5` installed
+/// against a `^0.2.0` pin ⇒ `TS2339 … 'hasOwnPage' … 'NavigationItem'`), which
+/// is indistinguishable from a genuinely red `origin/main`.
+///
+/// Order matters: the marker check comes first so a wiped/half-installed
+/// `node_modules` always reinstalls even if a stale sidecar somehow survived.
+fn dep_install_reason(wt_root: &std::path::Path) -> Option<String> {
+    if frontend_install_marker_missing(wt_root) {
+        return Some(
+            "node_modules install marker (node_modules/.bin/ui-bridge-build-ir) is absent"
+                .to_string(),
+        );
+    }
+
+    // `None` ⇒ no pnpm-lock.yaml / package.json / pnpm-workspace.yaml at all:
+    // not a JS project, nothing for the install to govern. Preserve the legacy
+    // presence-gate outcome (marker exists ⇒ skip) rather than running a
+    // `pnpm install` that would just fail.
+    let current = dep_manifest_hash(wt_root)?;
+
+    match read_dep_hash_sidecar(wt_root) {
+        None => Some(format!(
+            "dep-manifest hash sidecar (node_modules/{}) is absent — the provenance of the \
+             installed node_modules is UNKNOWN, so it cannot be trusted for this checkout \
+             (expected {})",
+            DEP_HASH_SIDECAR,
+            short_hash(&current),
+        )),
+        Some(recorded) if recorded != current => Some(format!(
+            "dep-manifest hash CHANGED ({} → {}) — node_modules was installed for a different \
+             set of {:?} and is STALE for this checkout",
+            short_hash(&recorded),
+            short_hash(&current),
+            DEP_MANIFEST_FILES,
+        )),
+        Some(_) => None,
+    }
+}
+
+/// First 12 hex chars of a hash, for log-readable reporting.
+fn short_hash(h: &str) -> String {
+    h.chars().take(12).collect()
+}
+
+/// Record the current dep-manifest hash for `wt_root` after a successful
+/// `pnpm install`, so the next spawn on this container can prove freshness.
+///
+/// Best-effort: a write failure logs a WARN and leaves no sidecar, which makes
+/// the next spawn reinstall (slow, correct) rather than skip (fast, wrong). It
+/// never fails the build.
+async fn write_dep_hash_sidecar(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    wt_root: &std::path::Path,
+) {
+    let Some(hash) = dep_manifest_hash(wt_root) else {
+        return;
+    };
+    let path = dep_hash_sidecar_path(wt_root);
+    match tokio::fs::write(&path, hash.as_bytes()).await {
+        Ok(()) => {
+            info!(
+                "Slot {}: dep-manifest hash sidecar written ({} = {})",
+                slot.id,
+                short_hash(&hash),
+                path.display()
+            );
+        }
+        Err(e) => {
+            let msg = format!(
+                "Slot {}: failed to write dep-manifest hash sidecar {:?}: {} — the next spawn on \
+                 this worktree will reinstall dependencies instead of skipping (safe, just slower)",
+                slot.id, path, e
+            );
+            warn!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2 — frontend failures must carry the compiler error (stdout, not just stderr)
+// ---------------------------------------------------------------------------
+
+/// Merge a finished child's stdout AND stderr into one labelled diagnostic blob.
+///
+/// `tsc` and `vite` print their compiler diagnostics (`error TS2339: …`) to
+/// **stdout**; stderr typically carries only pnpm's harness noise and is often
+/// EMPTY. Every caller that reported "the frontend build failed" from
+/// `output.stderr` alone therefore produced an error body with no compiler error
+/// in it. Empty sections are omitted so a stderr-only failure reads cleanly.
+fn merge_process_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut merged = String::with_capacity(stdout.len() + stderr.len() + 32);
+    if !stdout.trim().is_empty() {
+        merged.push_str("--- stdout ---\n");
+        merged.push_str(stdout.trim_end());
+        merged.push('\n');
+    }
+    if !stderr.trim().is_empty() {
+        merged.push_str("--- stderr ---\n");
+        merged.push_str(stderr.trim_end());
+        merged.push('\n');
+    }
+    merged
+}
+
+/// Record a frontend (pnpm) failure blob on the slot so it reaches every
+/// downstream error surface, and return the short tail to embed in the returned
+/// `SupervisorError::BuildFailed` message.
+///
+/// The frontend prebuild fails BEFORE cargo ever runs, so none of the cargo
+/// failure plumbing fires. Without this, `run_cargo_build_with_dir_detailed`
+/// finds no `last-build.stderr` sidecar and no `last_build_stderr_capture`, and
+/// the spawn-test submission comes back with `stderr_tail: []` and
+/// `last_error_detail: null` — a failed build whose reason is invisible. Writing
+/// both surfaces here reuses the EXACT plumbing a cargo failure uses:
+///
+///  * `<slot.target_dir>/last-build.stderr` → read back into
+///    `BuildAttempt::full_stderr` → the submission's `stderr_tail`;
+///  * `slot.last_build_stderr_capture`      → folded into
+///    `SlotHistory::last_error_detail` + `last_error_log`.
+async fn record_frontend_failure(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    merged_output: &str,
+) -> String {
+    let stderr_path = slot.target_dir.join("last-build.stderr");
+    if let Err(e) = tokio::fs::write(&stderr_path, merged_output.as_bytes()).await {
+        warn!(
+            "Failed to persist frontend last-build.stderr for slot {} at {:?}: {}",
+            slot.id, stderr_path, e
+        );
+    }
+
+    let detail_tail = tail_bytes_keep_utf8(merged_output, LAST_BUILD_STDERR_DETAIL_BYTES);
+    *slot.last_build_stderr_capture.write().await = Some(detail_tail);
+
+    let short_tail = tail_bytes_keep_utf8(merged_output, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+    state
+        .logs
+        .emit(
+            LogSource::Build,
+            LogLevel::Error,
+            format!(
+                "Slot {}: frontend (pnpm) step FAILED — captured stdout+stderr:\n{}",
+                slot.id, short_tail
+            ),
+        )
+        .await;
+    short_tail
 }
 
 /// True iff `<wt_root>` is missing EITHER the `pnpm install` marker OR
@@ -2838,7 +3126,8 @@ mod tests {
     //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
     //! the bug these guard against.
     use super::{
-        classify_build_stderr, dist_index_ok, needs_frontend_prebuild, provenance_tree_root,
+        classify_build_stderr, dep_hash_sidecar_path, dep_install_reason, dep_manifest_hash,
+        dist_index_ok, merge_process_output, needs_frontend_prebuild, provenance_tree_root,
         rev_parse_head, stderr_submission_tail, update_lkg_after_success, verify_frontend_built,
         BuildPhase, BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
         LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
@@ -3067,6 +3356,245 @@ mod tests {
             !needs_frontend_prebuild(tmp.path()),
             "fully populated worktree must skip prebuild (idempotent reuse)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S1 — dep-install FRESHNESS gate (lockfile-hash sidecar)
+    //
+    // Regression class: a reused `.spawn-<ref>` container force-reset to a new
+    // ref keeps its `node_modules/` from the PREVIOUS ref. The old
+    // presence-gated check ("does node_modules/.bin/ui-bridge-build-ir exist?")
+    // said "skip install", so the new ref's TypeScript compiled against the old
+    // ref's dependency tree and produced a phantom `TS2339` that looked exactly
+    // like a red origin/main.
+    // -----------------------------------------------------------------------
+
+    /// Populate `wt_root` as an "already installed" worktree: the pnpm bin
+    /// marker + a lockfile + a package.json with the given contents.
+    fn seed_installed_worktree(wt_root: &std::path::Path, lockfile: &str, package_json: &str) {
+        let bin_dir = wt_root.join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir node_modules/.bin");
+        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
+        fs::write(wt_root.join("pnpm-lock.yaml"), lockfile).expect("write lockfile");
+        fs::write(wt_root.join("package.json"), package_json).expect("write package.json");
+    }
+
+    /// Simulate what a successful `pnpm install` leaves behind: the sidecar
+    /// recording the dep-manifest hash AT THAT MOMENT. (The async
+    /// `write_dep_hash_sidecar` needs a live `SharedState`; the file it writes
+    /// is exactly this, so the pure gate is driven directly.)
+    fn stamp_dep_hash_sidecar(wt_root: &std::path::Path) {
+        let hash = dep_manifest_hash(wt_root).expect("fixture has manifests");
+        fs::write(dep_hash_sidecar_path(wt_root), hash).expect("write sidecar");
+    }
+
+    #[test]
+    fn dep_install_reason_none_when_lockfile_unchanged() {
+        // THE skip case: same container, same ref, deps untouched since the
+        // last successful install. Must NOT re-pay the ~30s install.
+        let tmp = TempDir::new().expect("tempdir");
+        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
+        stamp_dep_hash_sidecar(tmp.path());
+
+        assert!(
+            dep_install_reason(tmp.path()).is_none(),
+            "unchanged lockfile + present marker + matching sidecar must SKIP install"
+        );
+    }
+
+    #[test]
+    fn dep_install_reason_some_when_lockfile_changed() {
+        // THE regression: container reused across a ref whose deps moved
+        // (`@qontinui/navigation` 0.1.5 → ^0.2.0). `node_modules` and its
+        // marker are still there — only the lockfile content changed — so the
+        // old presence gate skipped and built against stale deps.
+        let tmp = TempDir::new().expect("tempdir");
+        seed_installed_worktree(
+            tmp.path(),
+            "lockfileVersion: 9\n  '@qontinui/navigation': 0.1.5\n",
+            r#"{"dependencies":{"@qontinui/navigation":"^0.1.0"}}"#,
+        );
+        stamp_dep_hash_sidecar(tmp.path());
+        assert!(
+            dep_install_reason(tmp.path()).is_none(),
+            "precondition: the seeded state must be considered fresh"
+        );
+
+        // The container is force-reset to a ref with different deps. Only the
+        // lockfile/package.json change on disk — node_modules is untouched.
+        fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: 9\n  '@qontinui/navigation': 0.2.0\n",
+        )
+        .expect("rewrite lockfile");
+
+        let reason = dep_install_reason(tmp.path())
+            .expect("a changed lockfile MUST force a reinstall, not a stale-node_modules build");
+        assert!(
+            reason.contains("CHANGED") && reason.contains("STALE"),
+            "reason must name the staleness so the log is self-explaining; got: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn dep_install_reason_some_when_package_json_changed_but_lockfile_stale() {
+        // A dep pin bumped in package.json without the lockfile regenerated
+        // still disagrees with the installed tree (and `--frozen-lockfile`
+        // would reject it). Hashing package.json too catches this.
+        let tmp = TempDir::new().expect("tempdir");
+        seed_installed_worktree(
+            tmp.path(),
+            "lockfileVersion: 9\n",
+            r#"{"dependencies":{"@qontinui/navigation":"^0.1.0"}}"#,
+        );
+        stamp_dep_hash_sidecar(tmp.path());
+
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"@qontinui/navigation":"^0.2.0"}}"#,
+        )
+        .expect("rewrite package.json");
+
+        assert!(
+            dep_install_reason(tmp.path()).is_some(),
+            "a package.json dep change must force a reinstall"
+        );
+    }
+
+    #[test]
+    fn dep_install_reason_some_when_sidecar_absent() {
+        // Pre-existing containers (installed before this gate shipped) have
+        // node_modules but no sidecar. Provenance unknown ⇒ must NOT be trusted.
+        let tmp = TempDir::new().expect("tempdir");
+        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
+        // deliberately no stamp
+
+        let reason = dep_install_reason(tmp.path())
+            .expect("absent sidecar means unknown node_modules provenance ⇒ reinstall");
+        assert!(
+            reason.contains("absent"),
+            "reason must say the sidecar is absent; got: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn dep_install_reason_some_when_marker_absent_even_if_sidecar_matches() {
+        // Someone `rm -rf node_modules/.bin` (or a half-install). A surviving
+        // sidecar must never vouch for a tree that isn't installed — the marker
+        // check is checked FIRST for exactly this reason.
+        let tmp = TempDir::new().expect("tempdir");
+        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
+        stamp_dep_hash_sidecar(tmp.path());
+        fs::remove_file(
+            tmp.path()
+                .join("node_modules")
+                .join(".bin")
+                .join(ui_bridge_build_ir_bin()),
+        )
+        .expect("remove marker");
+
+        let reason =
+            dep_install_reason(tmp.path()).expect("missing install marker must force a reinstall");
+        assert!(
+            reason.contains("marker"),
+            "reason must name the missing marker; got: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn dep_install_reason_none_when_no_manifests_at_all() {
+        // Not a JS project: nothing governs an install, and running one would
+        // just fail. Degrade to the legacy marker-presence outcome.
+        let tmp = TempDir::new().expect("tempdir");
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
+
+        assert!(dep_manifest_hash(tmp.path()).is_none());
+        assert!(
+            dep_install_reason(tmp.path()).is_none(),
+            "no manifests + marker present must preserve the legacy skip"
+        );
+    }
+
+    #[test]
+    fn dep_manifest_hash_is_stable_and_content_sensitive() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::write(tmp.path().join("pnpm-lock.yaml"), "a").expect("w");
+        fs::write(tmp.path().join("package.json"), "b").expect("w");
+        let h1 = dep_manifest_hash(tmp.path()).expect("hash");
+        let h2 = dep_manifest_hash(tmp.path()).expect("hash");
+        assert_eq!(h1, h2, "hash must be deterministic for identical bytes");
+
+        // Removing a lockfile must change the hash (absence is hashed, so a
+        // present→absent flip cannot be mistaken for "unchanged").
+        fs::remove_file(tmp.path().join("pnpm-lock.yaml")).expect("rm");
+        let h3 = dep_manifest_hash(tmp.path()).expect("hash");
+        assert_ne!(h1, h3, "removing the lockfile must change the hash");
+
+        // Swapping content between the two files must not collide (name +
+        // length are mixed in ahead of the bytes).
+        fs::write(tmp.path().join("pnpm-lock.yaml"), "b").expect("w");
+        fs::write(tmp.path().join("package.json"), "a").expect("w");
+        let h4 = dep_manifest_hash(tmp.path()).expect("hash");
+        assert_ne!(h1, h4, "content swap across manifests must not collide");
+    }
+
+    // -----------------------------------------------------------------------
+    // S2 — a frontend failure must carry the COMPILER error (tsc writes to
+    // stdout; the legacy capture read stderr only and came back empty).
+    // -----------------------------------------------------------------------
+
+    /// Build a fake finished-process Output with the given streams.
+    fn fake_output(stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            // Status is irrelevant to the merge; take a default failure-ish one.
+            status: Default::default(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn merge_process_output_keeps_tsc_errors_from_stdout() {
+        // The exact shape of the P0: tsc puts `error TS2339` on stdout and
+        // leaves stderr EMPTY. Reading stderr alone yields "" — a failed build
+        // with no visible reason.
+        let out = fake_output(
+            "src/nav.tsx(12,7): error TS2339: Property 'hasOwnPage' does not exist on type 'NavigationItem'.\n",
+            "",
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).is_empty(),
+            "fixture premise: stderr is empty"
+        );
+
+        let merged = merge_process_output(&out);
+        assert!(
+            merged.contains("error TS2339"),
+            "merged output MUST carry the tsc error from stdout; got: {:?}",
+            merged
+        );
+        assert!(merged.contains("--- stdout ---"));
+        assert!(
+            !merged.contains("--- stderr ---"),
+            "an empty stream must not add an empty labelled section"
+        );
+    }
+
+    #[test]
+    fn merge_process_output_keeps_both_streams() {
+        let merged = merge_process_output(&fake_output("OUT-LINE", "ERR-LINE"));
+        assert!(merged.contains("OUT-LINE") && merged.contains("ERR-LINE"));
+        assert!(merged.contains("--- stdout ---") && merged.contains("--- stderr ---"));
+    }
+
+    #[test]
+    fn merge_process_output_empty_when_both_streams_empty() {
+        assert!(merge_process_output(&fake_output("", "")).is_empty());
     }
 
     #[test]

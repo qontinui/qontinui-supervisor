@@ -996,6 +996,7 @@ mod tests {
         BuildSubmission {
             id,
             worktree_path: PathBuf::from("/tmp/runner/src-tauri"),
+            source: None,
             build_kind: BuildKind::Build,
             agent_id: None,
             package: None,
