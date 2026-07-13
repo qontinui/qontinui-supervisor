@@ -3108,12 +3108,37 @@ async fn execute_spawn_build_inner(
     );
 
     // Item B: assemble the auth_state JSON object.
-    let auto_login_configured = state.test_auto_login.read().await.is_some();
+    //
+    // `auto_login_configured` reports the REAL resolved credential source by
+    // calling the same resolver the spawn actually used
+    // (`env_forwarders::resolve_test_auto_login_for_state`, priority: runtime
+    // `POST /test-login` → runner `.env` VITE_DEV_* → supervisor process env).
+    // It previously read `state.test_auto_login.is_some()` directly, which sees
+    // ONLY priority 1 — so a supervisor that had just forwarded credentials out
+    // of the runner's `.env` (the standard dev setup) still reported `false`.
+    // Sharing the resolver makes the report and the forward structurally
+    // incapable of disagreeing.
+    //
+    // Semantics, precisely: `true` == "the supervisor resolved credentials and
+    // forwarded QONTINUI_TEST_AUTO_LOGIN_* to this runner". It does NOT mean the
+    // runner will be signed in — the runner's dev email/password auto-login was
+    // removed product-wide, so `auto_login_attempted`/`auto_login_succeeded`
+    // (populated only by log-pattern matching on the runner's output) stay null
+    // and the runner boots Tier 0/1 Local. See `TestAutoLoginEnv`.
+    let resolved_login = crate::process::env_forwarders::resolve_test_auto_login_for_state(state)
+        .await
+        .map(|r| r.source);
+    let auto_login_configured = resolved_login.is_some();
+    let auto_login_source = match resolved_login {
+        Some(s) => serde_json::Value::from(s.as_str()),
+        None => serde_json::Value::Null,
+    };
     let auth_state_json = {
         let last_auth = managed.last_auth_result.read().await.clone();
         match last_auth {
             Some(r) => json!({
                 "auto_login_configured": auto_login_configured,
+                "auto_login_source": auto_login_source,
                 "auto_login_attempted": r.attempted,
                 "auto_login_succeeded": r.succeeded,
                 "last_login_attempt_at": r.attempt_at.to_rfc3339(),
@@ -3121,6 +3146,7 @@ async fn execute_spawn_build_inner(
             }),
             None => json!({
                 "auto_login_configured": auto_login_configured,
+                "auto_login_source": auto_login_source,
                 "auto_login_attempted": serde_json::Value::Null,
                 "auto_login_succeeded": serde_json::Value::Null,
                 "last_login_attempt_at": serde_json::Value::Null,
@@ -5517,10 +5543,28 @@ pub async fn set_test_login(
     Json(json!({"success": true, "message": "Auto-login credentials set for temp runners"}))
 }
 
-/// GET /test-login — Check if auto-login credentials are configured.
+/// GET /test-login — Report whether auto-login credentials resolve, and from where.
+///
+/// `configured` answers the question the spawn path actually asks: does
+/// [`crate::process::env_forwarders::resolve_test_auto_login_for_state`] find
+/// credentials to forward? That walks all three sources (runtime `POST
+/// /test-login` → runner `.env` `VITE_DEV_*` → supervisor process env
+/// `QONTINUI_TEST_LOGIN_*`), so it no longer under-reports `false` on a
+/// supervisor that is in fact forwarding `.env` credentials. `source` names the
+/// winner (`runtime_api` | `runner_dotenv` | `supervisor_env`), or is null when
+/// nothing resolves.
+///
+/// Note: "configured" == "credentials will be forwarded", NOT "the runner will
+/// sign in" — see `TestAutoLoginEnv` for why the runner side is inert for login.
 pub async fn get_test_login(State(state): State<SharedState>) -> impl IntoResponse {
-    let configured = state.test_auto_login.read().await.is_some();
-    Json(json!({"configured": configured}))
+    let resolved = crate::process::env_forwarders::resolve_test_auto_login_for_state(&state).await;
+    Json(json!({
+        "configured": resolved.is_some(),
+        "source": match resolved {
+            Some(r) => serde_json::Value::from(r.source.as_str()),
+            None => serde_json::Value::Null,
+        },
+    }))
 }
 
 /// DELETE /test-login — Clear auto-login credentials.

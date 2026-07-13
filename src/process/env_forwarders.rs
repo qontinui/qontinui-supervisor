@@ -74,18 +74,123 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
 // TestAutoLoginEnv
 // =============================================================================
 
-/// Forwards test-auto-login credentials so spawned runners can self-login as
-/// the dev user. Resolves in priority order:
+/// Which of the three credential sources actually resolved, in the priority
+/// order [`resolve_test_auto_login`] walks.
 ///
-/// 1. Runtime credentials set via `POST /test-login` (stored on `SharedState`).
-/// 2. The runner project's `.env` file (`VITE_DEV_EMAIL` / `VITE_DEV_PASSWORD`).
-/// 3. Supervisor process env vars (`QONTINUI_TEST_LOGIN_EMAIL`/`PASSWORD`)
-///    as a CI fallback.
+/// Exists so the spawn-test response (`auth_state.auto_login_source`) and
+/// `GET /test-login` can report the **real** resolved source instead of
+/// guessing. Before this, both endpoints hard-coded a
+/// `state.test_auto_login.is_some()` check — i.e. they only ever saw
+/// priority 1 — so a supervisor that was in fact forwarding credentials from
+/// the runner's `.env` (priority 2, the common dev setup) reported
+/// `auto_login_configured: false`. One resolver, two readers: the drift
+/// cannot come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestAutoLoginSource {
+    /// Runtime credentials set via `POST /test-login` (stored on `SharedState`).
+    RuntimeApi,
+    /// The runner project's `.env` file (`VITE_DEV_EMAIL` / `VITE_DEV_PASSWORD`).
+    RunnerDotEnv,
+    /// Supervisor process env (`QONTINUI_TEST_LOGIN_EMAIL` / `_PASSWORD`).
+    SupervisorEnv,
+}
+
+impl TestAutoLoginSource {
+    /// Stable wire string for the JSON APIs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TestAutoLoginSource::RuntimeApi => "runtime_api",
+            TestAutoLoginSource::RunnerDotEnv => "runner_dotenv",
+            TestAutoLoginSource::SupervisorEnv => "supervisor_env",
+        }
+    }
+}
+
+/// Credentials that actually resolved, plus which source they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTestAutoLogin {
+    pub source: TestAutoLoginSource,
+    pub email: String,
+    pub password: String,
+}
+
+/// THE credential resolver. Pure over its inputs (aside from reading the
+/// runner's `.env` off `project_dir`) so the precedence is unit-testable
+/// without process-global env mutation.
+///
+/// Priority order (first hit wins):
+/// 1. `runtime` — credentials set via `POST /test-login`.
+/// 2. `<project_dir>/../.env` → `VITE_DEV_EMAIL` / `VITE_DEV_PASSWORD`.
+/// 3. `env_email` / `env_password` — the supervisor's own
+///    `QONTINUI_TEST_LOGIN_EMAIL` / `QONTINUI_TEST_LOGIN_PASSWORD` (CI fallback).
+///    Blank values at this level count as unset (matching the pre-existing
+///    non-empty guard).
+pub(crate) fn resolve_test_auto_login(
+    runtime: Option<(String, String)>,
+    project_dir: &std::path::Path,
+    env_email: Option<String>,
+    env_password: Option<String>,
+) -> Option<ResolvedTestAutoLogin> {
+    if let Some((email, password)) = runtime {
+        return Some(ResolvedTestAutoLogin {
+            source: TestAutoLoginSource::RuntimeApi,
+            email,
+            password,
+        });
+    }
+    if let Some((email, password)) = read_runner_env_creds(project_dir) {
+        return Some(ResolvedTestAutoLogin {
+            source: TestAutoLoginSource::RunnerDotEnv,
+            email,
+            password,
+        });
+    }
+    match (env_email, env_password) {
+        (Some(email), Some(password)) if !email.is_empty() && !password.is_empty() => {
+            Some(ResolvedTestAutoLogin {
+                source: TestAutoLoginSource::SupervisorEnv,
+                email,
+                password,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Async wrapper: read the two live inputs off `SharedState` / the process env
+/// and run [`resolve_test_auto_login`]. Shared by [`TestAutoLoginEnv`] (which
+/// forwards the creds) and by the routes that REPORT on them, so the report
+/// can never disagree with what was actually forwarded.
+pub async fn resolve_test_auto_login_for_state(
+    state: &SharedState,
+) -> Option<ResolvedTestAutoLogin> {
+    let runtime = state.test_auto_login.read().await.clone();
+    resolve_test_auto_login(
+        runtime,
+        &state.config.project_dir,
+        std::env::var("QONTINUI_TEST_LOGIN_EMAIL").ok(),
+        std::env::var("QONTINUI_TEST_LOGIN_PASSWORD").ok(),
+    )
+}
+
+/// Forwards test-auto-login credentials to spawned runners, resolving them via
+/// [`resolve_test_auto_login_for_state`] (runtime API → runner `.env` →
+/// supervisor process env).
 ///
 /// SECURITY: dev-account only. The supervisor never targets a production
-/// binary, so forwarding to every spawned runner — primary included — is
-/// safe; the runner's `AuthProvider` only consumes these creds when no
-/// other auth state exists.
+/// binary, so forwarding to every spawned runner — primary included — is safe.
+///
+/// NOTE (2026-07): the runner side of this is **inert for login**. The runner's
+/// dev email/password auto-login was removed product-wide (`AuthProvider.tsx`
+/// now hard-codes `devAutoLoginPending: false`, the `get_test_auto_login` Tauri
+/// command is gone, and the backend's `/jwt/login` endpoint no longer exists), so
+/// a spawned runner will NOT sign itself in from these vars — it boots Tier 0/1
+/// Local. The vars are still forwarded because the runner reads
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` as a "this is an automated test runner"
+/// marker (e.g. `commands/setup_wizard.rs` skips the wizard on it) and
+/// `scripts/headless-launcher.js` consumes them. Read `auto_login_configured` as
+/// "the supervisor resolved and forwarded credentials", NOT as "the runner will
+/// be authenticated".
 pub struct TestAutoLoginEnv;
 
 impl EnvForwarder for TestAutoLoginEnv {
@@ -100,29 +205,9 @@ impl EnvForwarder for TestAutoLoginEnv {
         _runner: &'a ManagedRunner,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            // Priority 1: runtime-configured credentials.
-            if let Ok(guard) = state.test_auto_login.try_read() {
-                if let Some((ref email, ref password)) = *guard {
-                    cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-                    cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-                    return;
-                }
-            }
-            // Priority 2: runner's `.env` file.
-            if let Some((email, password)) = read_runner_env_creds(&state.config.project_dir) {
-                cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-                cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-                return;
-            }
-            // Priority 3: supervisor process env.
-            if let (Ok(email), Ok(password)) = (
-                std::env::var("QONTINUI_TEST_LOGIN_EMAIL"),
-                std::env::var("QONTINUI_TEST_LOGIN_PASSWORD"),
-            ) {
-                if !email.is_empty() && !password.is_empty() {
-                    cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", email);
-                    cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", password);
-                }
+            if let Some(resolved) = resolve_test_auto_login_for_state(state).await {
+                cmd.env("QONTINUI_TEST_AUTO_LOGIN_EMAIL", &resolved.email);
+                cmd.env("QONTINUI_TEST_AUTO_LOGIN_PASSWORD", &resolved.password);
             }
         })
     }
@@ -780,7 +865,103 @@ impl EnvForwarder for ExtraEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_plan_adapter_value, resolve_worktree_mode};
+    use super::{
+        resolve_plan_adapter_value, resolve_test_auto_login, resolve_worktree_mode,
+        TestAutoLoginSource,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// Build a `<root>/qontinui-runner/.env` with the given body and return the
+    /// `project_dir` (`.../src-tauri`) the resolver expects — `.env` lives at
+    /// `project_dir.parent()`.
+    fn project_dir_with_env(tmp: &Path, body: &str) -> PathBuf {
+        let runner = tmp.join("qontinui-runner");
+        let project_dir = runner.join("src-tauri");
+        std::fs::create_dir_all(&project_dir).expect("mkdir project_dir");
+        std::fs::write(runner.join(".env"), body).expect("write .env");
+        project_dir
+    }
+
+    #[test]
+    fn runtime_creds_win_over_dotenv_and_process_env() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let project_dir = project_dir_with_env(
+            tmp.path(),
+            "VITE_DEV_EMAIL=dotenv@x.io\nVITE_DEV_PASSWORD=dotenvpw\n",
+        );
+        let r = resolve_test_auto_login(
+            Some(("rt@x.io".into(), "rtpw".into())),
+            &project_dir,
+            Some("env@x.io".into()),
+            Some("envpw".into()),
+        )
+        .expect("must resolve");
+        assert_eq!(r.source, TestAutoLoginSource::RuntimeApi);
+        assert_eq!(r.email, "rt@x.io");
+    }
+
+    #[test]
+    fn dotenv_resolves_when_no_runtime_creds() {
+        // THE regression this item is about: with no `POST /test-login` creds
+        // but a runner `.env` present, the supervisor DOES forward credentials
+        // — so the report must be `Some`, not the old hard-coded `false`.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let project_dir = project_dir_with_env(
+            tmp.path(),
+            "# comment\nVITE_DEV_EMAIL=\"dotenv@x.io\"\nVITE_DEV_PASSWORD='dotenvpw'\n",
+        );
+        let r = resolve_test_auto_login(None, &project_dir, None, None).expect("must resolve");
+        assert_eq!(r.source, TestAutoLoginSource::RunnerDotEnv);
+        assert_eq!(r.email, "dotenv@x.io");
+        assert_eq!(r.password, "dotenvpw");
+    }
+
+    #[test]
+    fn process_env_is_last_resort() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // `.env` exists but carries no dev creds → fall through to process env.
+        let project_dir = project_dir_with_env(tmp.path(), "VITE_API_URL=http://localhost\n");
+        let r = resolve_test_auto_login(
+            None,
+            &project_dir,
+            Some("env@x.io".into()),
+            Some("envpw".into()),
+        )
+        .expect("must resolve");
+        assert_eq!(r.source, TestAutoLoginSource::SupervisorEnv);
+        assert_eq!(r.email, "env@x.io");
+    }
+
+    #[test]
+    fn nothing_configured_resolves_to_none() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let project_dir = project_dir_with_env(tmp.path(), "");
+        // Fully unset, and blank process-env values count as unset (a half-set
+        // pair must not resolve either).
+        assert!(resolve_test_auto_login(None, &project_dir, None, None).is_none());
+        assert!(resolve_test_auto_login(
+            None,
+            &project_dir,
+            Some(String::new()),
+            Some(String::new())
+        )
+        .is_none());
+        assert!(
+            resolve_test_auto_login(None, &project_dir, Some("env@x.io".into()), None).is_none()
+        );
+    }
+
+    #[test]
+    fn wire_strings_are_stable() {
+        // These strings are API surface (`auth_state.auto_login_source`,
+        // `GET /test-login`.source) — pin them.
+        assert_eq!(TestAutoLoginSource::RuntimeApi.as_str(), "runtime_api");
+        assert_eq!(TestAutoLoginSource::RunnerDotEnv.as_str(), "runner_dotenv");
+        assert_eq!(
+            TestAutoLoginSource::SupervisorEnv.as_str(),
+            "supervisor_env"
+        );
+    }
 
     #[test]
     fn default_on_when_nothing_set() {
