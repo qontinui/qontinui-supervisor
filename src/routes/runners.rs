@@ -1866,6 +1866,91 @@ fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
     })
 }
 
+/// Build-vintage check for a `rebuild: true` spawn: is the tree that was just
+/// compiled OLDER than the LKG binary the supervisor already has?
+///
+/// The trap this closes (2026-07-17): the live runner checkout can sit parked
+/// on a stale feature branch (observed 71 commits behind `origin/main`), so
+/// `spawn-test {rebuild: true}` silently compiles a binary that PREDATES the
+/// very fixes the spawn was commissioned to verify — while `use_lkg: true`
+/// would have produced a correct one. `source: "live_tree"` was the only
+/// signal, and it says nothing about vintage. An agent then built a whole
+/// root-cause theory on that stale binary. This makes the class self-announcing.
+///
+/// Reuses the existing ancestry machinery — [`crate::git_provenance::drift_against`]
+/// with the LKG's recorded sha as the base — rather than a bespoke compare, so
+/// there is exactly one implementation of "is A behind B" in the supervisor.
+///
+/// `built_sha` is the SHA of the tree that was actually compiled (a `git_ref`
+/// worktree's resolved sha, a `worktree_path` checkout's HEAD, or the live
+/// tree's HEAD). Best-effort throughout: an unknown built sha, an LKG with no
+/// recorded sha (legacy sidecar / failed git probe), or an unresolvable base
+/// all return `{"older": false, "reason": ...}` rather than a false alarm —
+/// mirroring the `lkg_stale_warning` field's always-present shape.
+async fn build_older_than_lkg_json(
+    state: &SharedState,
+    built_sha: Option<&str>,
+) -> serde_json::Value {
+    let Some(built_sha) = built_sha else {
+        return json!({ "older": false, "reason": "built_sha_unknown" });
+    };
+    let lkg = state.build_pool.last_known_good.read().await.clone();
+    let Some(lkg_sha) = lkg.and_then(|i| i.sha) else {
+        return json!({ "older": false, "reason": "lkg_sha_unknown" });
+    };
+
+    // `project_dir` is the runner's `src-tauri`; git resolves upward from any
+    // subdir, but use the repo root for parity with the other drift call sites
+    // (`build_monitor::warn_if_tree_behind_origin_main`, the detached rebuild).
+    let repo_root = state
+        .config
+        .project_dir
+        .parent()
+        .unwrap_or(&state.config.project_dir)
+        .to_path_buf();
+    let drift = crate::git_provenance::drift_against(&repo_root, built_sha, &lkg_sha).await;
+
+    // Base unresolvable (not a repo / LKG sha absent from this object db, e.g.
+    // a `worktree_path` build of an unrelated clone) ⇒ not computable.
+    if drift.origin_main_sha.is_empty() {
+        return json!({ "older": false, "reason": "not_computable" });
+    }
+    // The build contains everything the LKG contains ⇒ nothing to warn about.
+    // Gate on `behind_count` alone: a build whose branch merely diverges from
+    // the LKG while containing it (`is_ancestor == false`, `behind_count == 0`)
+    // is NOT older.
+    if drift.behind_count == 0 {
+        return json!({ "older": false });
+    }
+
+    let built_short: String = built_sha.chars().take(12).collect();
+    let lkg_short: String = lkg_sha.chars().take(12).collect();
+    let message = format!(
+        "build_older_than_lkg: the tree this spawn compiled ({}) is missing {} commit(s) that \
+         the LKG binary ({}) already contains (diverged={}). The spawned runner may PREDATE \
+         fixes you are testing for — `use_lkg: true` would run the newer binary. Confirm with \
+         the `git_sha` field before drawing conclusions from this runner.",
+        built_short,
+        drift.behind_count,
+        lkg_short,
+        drift.is_diverged(),
+    );
+    warn!("{}", message);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Warn, message.clone())
+        .await;
+
+    json!({
+        "older": true,
+        "built_sha": built_sha,
+        "lkg_sha": lkg_sha,
+        "behind_count": drift.behind_count,
+        "diverged": drift.is_diverged(),
+        "message": message,
+    })
+}
+
 /// POST /runners/spawn-test — spawn an ephemeral test runner on the next available port.
 ///
 /// Automatically picks a free port (9877-9899), creates a temporary runner,
@@ -3378,6 +3463,29 @@ async fn execute_spawn_build_inner(
         // Explicit "live_tree" provenance so callers can always branch on a
         // present field rather than needing missing-field handling.
         resp["source"] = json!("live_tree");
+    }
+
+    // Item 8 — build-vintage warning. `source` says WHICH tree was compiled but
+    // nothing about its VINTAGE: a live tree parked behind main compiles a
+    // binary older than the LKG we already have, silently. Only meaningful when
+    // a build actually happened (`rebuild: true`); a `use_lkg`/no-rebuild spawn
+    // has its own `lkg_stale_warning`. The built sha comes from the provenance
+    // the response already resolved above, falling back to the live tree's HEAD.
+    if body.rebuild {
+        let built_sha: Option<String> = match (&git_ref_info, &worktree_path_info) {
+            (Some((_, sha)), _) => Some(sha.clone()),
+            (_, Some(wt)) => wt.resolved_sha.clone(),
+            _ => {
+                let repo_root = state
+                    .config
+                    .project_dir
+                    .parent()
+                    .unwrap_or(&state.config.project_dir)
+                    .to_path_buf();
+                crate::build_monitor::rev_parse_head(&repo_root).await
+            }
+        };
+        resp["build_older_than_lkg"] = build_older_than_lkg_json(state, built_sha.as_deref()).await;
     }
 
     // Phase 3 — `frontend_only` echo + honest stale-reuse warning. Always echo
@@ -6277,6 +6385,134 @@ mod tests {
         }
         state.runners.write().await.insert(id.clone(), managed);
         id
+    }
+
+    /// Like [`make_state`] but rooted at `root`, so `project_dir`
+    /// (`<root>/src-tauri`) has a real repo at `<root>` for the git-provenance
+    /// probes to run against.
+    fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
+        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+        let config = SupervisorConfig {
+            project_dir: root.join("src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 19000,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: true,
+            no_webview: true,
+        };
+        std::sync::Arc::new(crate::state::SupervisorState::new(config))
+    }
+
+    /// Run `git <args>` in `cwd`, asserting success.
+    fn git_in(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed in {cwd:?}");
+    }
+
+    /// Commit `name` on the current branch, returning the new HEAD sha.
+    fn commit_file(dir: &std::path::Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).expect("write file");
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-q", "-m", name]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Seed `state.build_pool.last_known_good` with an LKG carrying `sha`.
+    async fn seed_lkg(state: &crate::state::SharedState, sha: Option<String>) {
+        *state.build_pool.last_known_good.write().await = Some(crate::state::LkgInfo {
+            built_at: chrono::Utc::now(),
+            source_slot: 0,
+            exe_size: 1234,
+            sha,
+            source: crate::process::manager::BuildSource::LiveTree,
+        });
+    }
+
+    /// Item 8 — the motivating trap: the checkout `spawn-test {rebuild:true}`
+    /// would compile sits BEHIND the LKG, so the response must warn with the
+    /// LKG sha and a behind-count instead of silently building stale code.
+    #[tokio::test]
+    async fn build_older_than_lkg_warns_with_behind_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        git_in(root, &["config", "user.email", "test@example.com"]);
+        git_in(root, &["config", "user.name", "test"]);
+
+        // The tree that would be built is two commits behind the LKG's sha.
+        let built = commit_file(root, "seed.txt");
+        commit_file(root, "a.txt");
+        let lkg_sha = commit_file(root, "b.txt");
+
+        let state = make_state_at(root);
+        seed_lkg(&state, Some(lkg_sha.clone())).await;
+
+        let out = super::build_older_than_lkg_json(&state, Some(&built)).await;
+        assert_eq!(out["older"], serde_json::json!(true), "got {out}");
+        assert_eq!(out["behind_count"], serde_json::json!(2));
+        assert_eq!(out["lkg_sha"], serde_json::json!(lkg_sha));
+        assert_eq!(out["built_sha"], serde_json::json!(built));
+        assert_eq!(out["diverged"], serde_json::json!(false));
+        assert!(
+            out["message"]
+                .as_str()
+                .unwrap()
+                .contains("build_older_than_lkg"),
+            "message must name the signal: {out}"
+        );
+    }
+
+    /// A build that already contains the LKG's commit is not older ⇒ no alarm.
+    #[tokio::test]
+    async fn build_not_older_than_lkg_is_silent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        git_in(root, &["config", "user.email", "test@example.com"]);
+        git_in(root, &["config", "user.name", "test"]);
+
+        let lkg_sha = commit_file(root, "seed.txt");
+        let built = commit_file(root, "newer.txt");
+
+        let state = make_state_at(root);
+        seed_lkg(&state, Some(lkg_sha)).await;
+
+        let out = super::build_older_than_lkg_json(&state, Some(&built)).await;
+        assert_eq!(out["older"], serde_json::json!(false), "got {out}");
+        assert!(out.get("behind_count").is_none());
+    }
+
+    /// Best-effort: an LKG with no recorded sha (legacy sidecar / failed git
+    /// probe) reports a reason, never a false staleness alarm.
+    #[tokio::test]
+    async fn build_older_than_lkg_without_lkg_sha_is_not_computable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = make_state_at(tmp.path());
+        seed_lkg(&state, None).await;
+
+        let out = super::build_older_than_lkg_json(&state, Some("deadbeef")).await;
+        assert_eq!(out["older"], serde_json::json!(false));
+        assert_eq!(out["reason"], serde_json::json!("lkg_sha_unknown"));
     }
 
     fn make_state() -> crate::state::SharedState {

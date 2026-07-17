@@ -18,6 +18,12 @@
 //!   - `is_ancestor == false` = diverged / on a feature branch (a peer parked
 //!     it) — the more dangerous case.
 //!   - `behind_count == 0 && is_ancestor` = up to date.
+//! * [`drift_against`] — the same compare against an ARBITRARY base ref/sha.
+//!   `origin_main_drift` is an alias for it with `base_ref = "origin/main"`.
+//!   `spawn-test {rebuild:true}` uses it with the LKG's recorded sha as the
+//!   base to answer "is the tree I'm about to build older than the LKG?" —
+//!   the 2026-07-17 trap, where a checkout parked 71 commits behind produced a
+//!   binary predating the very fixes the spawn was commissioned to verify.
 //!
 //! The git runner ([`git`]) mirrors the private `git()` helper in
 //! `spawn_worktree.rs:145`: a native tokio `Command::output()` that captures
@@ -121,32 +127,43 @@ pub async fn fetch_origin(repo_root: &Path) -> Result<(), SupervisorError> {
 
 /// Compute the drift of `built_sha` relative to `origin/main` in `repo_root`.
 ///
-/// Fetches origin first (best-effort, offline-tolerant), then runs three
-/// probes:
-/// - `git rev-parse origin/main` → [`OriginMainDrift::origin_main_sha`];
-/// - `git rev-list --count <built_sha>..origin/main` →
+/// Thin alias for [`drift_against`] with `base_ref = "origin/main"` — see that
+/// function for the probe list and the best-effort contract.
+pub async fn origin_main_drift(repo_root: &Path, built_sha: &str) -> OriginMainDrift {
+    drift_against(repo_root, built_sha, "origin/main").await
+}
+
+/// Compute the drift of `built_sha` relative to an arbitrary `base_ref` (a
+/// branch, tag, or raw SHA — anything `git rev-parse` accepts) in `repo_root`.
+///
+/// Generalized from [`origin_main_drift`] so the same ancestry machinery can
+/// answer "is this build older than the LKG?" (`base_ref` = the LKG's recorded
+/// sha) as well as "is this build older than main?". Fetches origin first
+/// (best-effort, offline-tolerant), then runs three probes:
+/// - `git rev-parse <base_ref>` → [`OriginMainDrift::origin_main_sha`] (the
+///   resolved BASE sha — the field keeps its wire name for `GET /builds`
+///   compatibility);
+/// - `git rev-list --count <built_sha>..<base_ref>` →
 ///   [`OriginMainDrift::behind_count`];
-/// - `git merge-base --is-ancestor <built_sha> origin/main` (exit 0 = ancestor)
+/// - `git merge-base --is-ancestor <built_sha> <base_ref>` (exit 0 = ancestor)
 ///   → [`OriginMainDrift::is_ancestor`].
 ///
-/// Best-effort throughout: if `origin/main` cannot be resolved (no remote / no
-/// branch / not a repo) the returned struct has an empty `origin_main_sha`,
-/// `behind_count == 0`, and `is_ancestor == true` (i.e. it reads as
-/// "up to date / not computable" — never a false staleness alarm). The
+/// Best-effort throughout: if `base_ref` cannot be resolved (no remote / no
+/// branch / unknown sha / not a repo) the returned struct has an empty
+/// `origin_main_sha`, `behind_count == 0`, and `is_ancestor == true` (i.e. it
+/// reads as "up to date / not computable" — never a false staleness alarm). The
 /// `fetched` flag records whether the pre-fetch succeeded so the caller can
 /// tell a fresh compare from a possibly-stale one.
-pub async fn origin_main_drift(repo_root: &Path, built_sha: &str) -> OriginMainDrift {
+pub async fn drift_against(repo_root: &Path, built_sha: &str, base_ref: &str) -> OriginMainDrift {
     let fetched = fetch_origin(repo_root).await.is_ok();
 
-    // Resolve origin/main. An empty / errored result means the ref is not
+    // Resolve the base ref. An empty / errored result means the ref is not
     // available — treat the whole compare as not-computable (up-to-date-ish)
     // rather than inventing a behind-count.
-    let origin_main_sha = match git(&["rev-parse", "origin/main"], repo_root, false).await {
+    let origin_main_sha = match git(&["rev-parse", base_ref], repo_root, false).await {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
-            debug!(
-                "origin_main_drift: `git rev-parse origin/main` returned empty in {repo_root:?}"
-            );
+            debug!("drift_against: `git rev-parse {base_ref}` returned empty in {repo_root:?}");
             return OriginMainDrift {
                 built_sha: built_sha.to_string(),
                 origin_main_sha: String::new(),
@@ -156,7 +173,7 @@ pub async fn origin_main_drift(repo_root: &Path, built_sha: &str) -> OriginMainD
             };
         }
         Err(e) => {
-            debug!("origin_main_drift: `git rev-parse origin/main` failed in {repo_root:?}: {e}");
+            debug!("drift_against: `git rev-parse {base_ref}` failed in {repo_root:?}: {e}");
             return OriginMainDrift {
                 built_sha: built_sha.to_string(),
                 origin_main_sha: String::new(),
@@ -167,10 +184,10 @@ pub async fn origin_main_drift(repo_root: &Path, built_sha: &str) -> OriginMainD
         }
     };
 
-    // How many commits origin/main is ahead of the built SHA. A non-numeric /
+    // How many commits the base ref is ahead of the built SHA. A non-numeric /
     // errored result (e.g. unknown built_sha) is treated as 0.
     let behind_count = match git(
-        &["rev-list", "--count", &format!("{built_sha}..origin/main")],
+        &["rev-list", "--count", &format!("{built_sha}..{base_ref}")],
         repo_root,
         false,
     )
@@ -178,17 +195,17 @@ pub async fn origin_main_drift(repo_root: &Path, built_sha: &str) -> OriginMainD
     {
         Ok(s) => s.trim().parse::<u32>().unwrap_or(0),
         Err(e) => {
-            debug!("origin_main_drift: `git rev-list --count` failed in {repo_root:?}: {e}");
+            debug!("drift_against: `git rev-list --count` failed in {repo_root:?}: {e}");
             0
         }
     };
 
-    // Is the built SHA on origin/main's history? `merge-base --is-ancestor`
+    // Is the built SHA on the base ref's history? `merge-base --is-ancestor`
     // exits 0 (ancestor) / 1 (not). `quiet_offline_ok = false` so a real exit-1
     // surfaces as Err; we map Err → not-ancestor (the dangerous case is the one
     // we must not under-report). A genuinely diverged feature branch exits 1.
     let is_ancestor = git(
-        &["merge-base", "--is-ancestor", built_sha, "origin/main"],
+        &["merge-base", "--is-ancestor", built_sha, base_ref],
         repo_root,
         false,
     )
@@ -337,6 +354,46 @@ mod tests {
         );
         assert!(drift.is_diverged());
         assert!(!drift.is_up_to_date());
+    }
+
+    /// Generalized base — the `spawn-test {rebuild:true}` build-vintage case:
+    /// the tree about to be built sits behind the LKG's recorded SHA (a raw
+    /// sha base, not a ref) ⇒ behind_count > 0, is_ancestor true.
+    #[tokio::test]
+    async fn drift_against_raw_sha_base_behind_lkg() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let built = init_repo_with_self_origin(dir);
+
+        // The LKG was built from a newer commit than the checkout's HEAD.
+        commit_file(dir, "a.txt", "a");
+        let lkg_sha = commit_file(dir, "b.txt", "b");
+
+        let drift = drift_against(dir, &built, &lkg_sha).await;
+        assert_eq!(
+            drift.behind_count, 2,
+            "the LKG contains two commits the built tree lacks"
+        );
+        assert!(drift.is_ancestor, "built SHA is an ancestor of the LKG SHA");
+        assert!(!drift.is_up_to_date());
+        assert_eq!(drift.origin_main_sha, lkg_sha, "base sha is resolved");
+    }
+
+    /// Generalized base, not-older case: the built tree already CONTAINS the
+    /// LKG's commit ⇒ behind_count 0 (no warning), even though the LKG sha is
+    /// not an ancestor-test subject of the built one.
+    #[tokio::test]
+    async fn drift_against_raw_sha_base_ahead_of_lkg() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let lkg_sha = init_repo_with_self_origin(dir);
+        let built = commit_file(dir, "newer.txt", "newer");
+
+        let drift = drift_against(dir, &built, &lkg_sha).await;
+        assert_eq!(
+            drift.behind_count, 0,
+            "the built tree contains the LKG commit ⇒ not older"
+        );
     }
 
     /// Best-effort: a non-repo directory yields a not-computable drift
