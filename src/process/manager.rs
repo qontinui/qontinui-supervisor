@@ -70,6 +70,26 @@ fn resolve_child_api_url(explicit_env: Option<String>, is_primary: bool) -> Opti
     }
 }
 
+/// The primary (user-started) runner's default secure-storage directory —
+/// `dirs::data_local_dir()/com.qontinui.runner`.
+///
+/// This mirrors `SecureStorage::new()`'s fallback in qontinui-runner
+/// (`src-tauri/src/secure_storage.rs`): the primary runs with no
+/// `QONTINUI_SECURE_STORAGE_DIR` override, so its encrypted `auth_tokens.enc`
+/// (holding the device machine key, `dmk_`) lives here. Non-primary spawns are
+/// pointed at this dir via `QONTINUI_PRIMARY_SECURE_STORAGE_DIR` (a *path
+/// pointer*, never the raw credential) so they can seed the primary's `dmk_`
+/// into their own isolated store and reach Tier 2 headlessly (plan
+/// `2026-07-13-runner-web-nav-and-workflows-auth-remediation`, item R4). A
+/// spawned runner running as the same OS user on the same machine derives the
+/// identical `SecureStorage` AES key (hostname + service name + salt + username,
+/// no path/instance component), so it can decrypt the primary's store directly.
+///
+/// Returns `None` only when the platform data-local dir can't be resolved.
+fn primary_secure_storage_dir() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"))
+}
+
 /// Binary metadata for diagnostics — lets callers detect stale binaries.
 #[derive(Clone, serde::Serialize)]
 pub struct BinaryMeta {
@@ -1754,6 +1774,19 @@ async fn start_exe_mode_for_runner(
             cmd.env("QONTINUI_CONFIG_DIR", dir);
             cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
         }
+
+        // Point the non-primary runner at the PRIMARY's secure-storage dir so it
+        // can seed the primary's device machine key (`dmk_`) into its own
+        // isolated store and reach Tier 2 headlessly (plan
+        // `2026-07-13-…-auth-remediation`, R4.1). This is a *computed path
+        // pointer*, NOT the raw credential — the spawned runner decrypts the
+        // primary's `auth_tokens.enc` itself with its own machine-derived
+        // `SecureStorage` key (same OS user + host → same key), keeping the
+        // high-privilege `dmk_` out of process listings, argv, and logs. Inert
+        // until the runner reads it; the runner degrades to Tier 0/1 if absent.
+        if let Some(primary_dir) = primary_secure_storage_dir() {
+            cmd.env("QONTINUI_PRIMARY_SECURE_STORAGE_DIR", &primary_dir);
+        }
     }
 
     // Apply the registered env forwarders. Order is load-bearing — see
@@ -3399,6 +3432,30 @@ mod tests {
         let explicit = || Some("https://api.qontinui.io".to_string());
         assert_eq!(resolve_child_api_url(explicit(), true), explicit());
         assert_eq!(resolve_child_api_url(explicit(), false), explicit());
+    }
+
+    // QONTINUI_PRIMARY_SECURE_STORAGE_DIR pointer (plan 2026-07-13, R4.1).
+    // The env var is set only in the non-primary spawn block of
+    // `start_exe_mode_for_runner` (guarded by `!is_primary()`), so a primary
+    // spawn never carries it. Here we assert the *value* the non-primary block
+    // forwards: the primary's default secure-storage dir, which must equal
+    // qontinui-runner's `SecureStorage::new()` fallback
+    // (`dirs::data_local_dir()/com.qontinui.runner`) so the spawned runner's
+    // machine-derived key can decrypt the primary's `auth_tokens.enc`.
+    #[test]
+    fn primary_secure_storage_dir_is_data_local_com_qontinui_runner() {
+        let expected = dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"));
+        assert_eq!(primary_secure_storage_dir(), expected);
+        // On any platform with a resolvable data-local dir, the pointer ends in
+        // the runner's service-name subdir — the exact dir SecureStorage::new()
+        // writes to when unoverridden.
+        if let Some(dir) = primary_secure_storage_dir() {
+            assert!(
+                dir.ends_with("com.qontinui.runner"),
+                "primary secure-storage pointer must target the runner's default \
+                 store dir, got {dir:?}"
+            );
+        }
     }
 
     /// A slot freshly built 5 minutes after the running copy is "stale".
