@@ -764,6 +764,74 @@ async fn run_build_inner(
             .await;
         info!("Slot {}: building frontend in {:?}", slot.id, npm_dir);
 
+        // LIVE-TREE ONLY: sync node_modules to the lockfile BEFORE building,
+        // exactly as CI does (`pnpm install --frozen-lockfile`). The live tree
+        // reuses whatever node_modules already exists on disk and never
+        // reinstalls, so a STALE dep (e.g. a `pnpm install` that aborted on a
+        // no-TTY node_modules purge, leaving `@qontinui/ui-bridge@0.21.1` where
+        // package.json pins `^0.22.0`) silently breaks the `tsc`/`vite` build
+        // with a phantom `error TS2339`. CI never hits this because it installs
+        // into a clean tree. A frozen install here makes the supervisor's
+        // live-tree build resolve dependencies the same way CI does. The
+        // worktree path (`build_dir_override.is_some()`) already installs via
+        // `prebuild_worktree_frontend`, so this runs only for the live tree.
+        // Kept inside the already-held `npm_lock` so install + build are one
+        // serialized unit. A `--frozen-lockfile` failure is a REAL error
+        // (lockfile/package.json drift, or a genuinely broken install) — match
+        // CI and fail the build loudly rather than proceeding to build stale;
+        // do NOT fall back to a non-frozen install (that reintroduces
+        // silent-stale).
+        if build_dir_override.is_none() {
+            state
+                .logs
+                .emit(
+                    LogSource::Build,
+                    LogLevel::Info,
+                    format!(
+                        "Slot {}: syncing frontend deps (pnpm install --frozen-lockfile)...",
+                        slot.id
+                    ),
+                )
+                .await;
+            let install_result = run_pnpm_command(&npm_dir, "install --frozen-lockfile").await;
+            match install_result {
+                Ok(output) if output.status.success() => {
+                    info!(
+                        "Slot {}: frontend deps synced (pnpm install --frozen-lockfile)",
+                        slot.id
+                    );
+                }
+                Ok(output) => {
+                    let merged = merge_process_output(&output);
+                    let tail = record_frontend_failure(state, slot, &merged).await;
+                    let msg = format!(
+                        "Slot {}: pnpm install --frozen-lockfile failed (exit {}) in {:?} — \
+                         likely lockfile/package.json drift or a broken install. Refusing to \
+                         build against a stale node_modules:\n{}",
+                        slot.id, output.status, npm_dir, tail
+                    );
+                    error!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Build, LogLevel::Error, &msg)
+                        .await;
+                    return Err(SupervisorError::BuildFailed(msg));
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "Slot {}: pnpm install --frozen-lockfile failed to spawn in {:?}: {}",
+                        slot.id, npm_dir, e
+                    );
+                    error!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Build, LogLevel::Error, &msg)
+                        .await;
+                    return Err(SupervisorError::BuildFailed(msg));
+                }
+            }
+        }
+
         let npm_result = run_pnpm_command(&npm_dir, "run build").await;
 
         match npm_result {
@@ -1883,6 +1951,12 @@ async fn run_pnpm_command(
         // Match the live-tree invocation: vite.config.ts gates the build
         // target on TAURI_PLATFORM=windows.
         .env("TAURI_PLATFORM", "windows")
+        // Force non-interactive pnpm. Without a TTY, `pnpm install` will abort
+        // with ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY when it wants to
+        // purge node_modules, leaving a STALE tree behind. CI=true makes pnpm
+        // assume a CI environment (same as GitHub Actions) and proceed
+        // non-interactively, so the install can never abort mid-purge.
+        .env("CI", "true")
         .job_guarded(true);
 
     #[cfg(not(windows))]
@@ -1891,6 +1965,10 @@ async fn run_pnpm_command(
         GuardedCommand::new("pnpm", Duration::from_secs(timeout_secs))
             .args(split_args)
             .current_dir(cwd)
+            // Force non-interactive pnpm (see the Windows branch above):
+            // CI=true prevents ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY so a
+            // node_modules purge can never abort and leave a stale tree.
+            .env("CI", "true")
             .job_guarded(true)
     };
 
