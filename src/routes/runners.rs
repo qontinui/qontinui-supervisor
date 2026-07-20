@@ -415,6 +415,7 @@ pub async fn list_runners(
                 "last_restart_at": watchdog.last_restart_at.map(|t| t.to_rfc3339()),
                 "disabled_reason": watchdog.disabled_reason.clone(),
                 "crash_count": watchdog.crash_history.len(),
+                "crash_restart_armed": crate::process::manager::crash_restart_globally_armed(&state.config),
             }
         }));
     }

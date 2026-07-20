@@ -1947,10 +1947,21 @@ pub const CRASH_LOOP_DISABLED_REASON: &str = "crash loop — operator required";
 
 /// Env kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all
 /// crash-only auto-restarts without a rebuild or code change.
-fn crash_restart_env_disabled() -> bool {
+pub fn crash_restart_env_disabled() -> bool {
     std::env::var("QONTINUI_SUPERVISOR_NO_CRASH_RESTART")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// The single source of truth for whether crash-only auto-restart is globally
+/// armed: the `--watchdog` CLI flag was set at launch AND the
+/// `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` kill-switch is not set. This is the
+/// bit that actually gates [`maybe_crash_restart`] and is **independent** of
+/// any per-runner [`crate::state::WatchdogState::enabled`] (which defaults
+/// `true` for the primary). Surfaced in `/health` + `/runners` so
+/// "watchdog enabled" can never imply protection that isn't there.
+pub fn crash_restart_globally_armed(config: &crate::config::SupervisorConfig) -> bool {
+    config.watchdog_enabled_at_start && !crash_restart_env_disabled()
 }
 
 /// Outcome of the crash-only watchdog decision for one observed exit.
@@ -2039,7 +2050,7 @@ async fn maybe_crash_restart(
 ) {
     let runner_id = managed.config.id.clone();
     let runner_name = managed.config.name.clone();
-    let globally_armed = state.config.watchdog_enabled_at_start && !crash_restart_env_disabled();
+    let globally_armed = crash_restart_globally_armed(&state.config);
     let now = chrono::Utc::now();
 
     // Decide + bookkeep under one watchdog write lock so two exits can't
@@ -2197,6 +2208,31 @@ async fn maybe_crash_restart(
                     error: msg,
                 });
             state.notify_health_change();
+        }
+        // A GENUINE crash (a supervisor-spawned Child that exited uncleanly
+        // without an operator stop) that goes unrestarted because crash-restart
+        // is not armed / has disarmed itself must leave a PERSISTED breadcrumb,
+        // not a debug line the buffer and log file both drop. This is the
+        // observability half of the 2026-07-20 incident: the primary crashed,
+        // the supervisor was up but launched without `--watchdog`, and the skip
+        // was swallowed at `debug!`.
+        skip @ (CrashRestartDecision::SkipNotArmed | CrashRestartDecision::SkipDisarmed)
+            if had_child_handle && !clean_exit && !stop_requested_at_exit =>
+        {
+            let reason = if matches!(skip, CrashRestartDecision::SkipNotArmed) {
+                "not armed (started without --watchdog)"
+            } else {
+                "disarmed (crash-loop guard tripped — operator required)"
+            };
+            let msg = format!(
+                "runner '{}' crashed (unclean exit) but crash-restart is {}; not restarting.",
+                runner_name, reason
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
         }
         skip => {
             debug!(
@@ -3769,6 +3805,40 @@ mod tests {
             decide_crash_restart(true, false, false, true, true, true, 0),
             CrashRestartDecision::SkipDisarmed
         );
+    }
+
+    /// The two WARN-worthy skip variants (`SkipNotArmed` / `SkipDisarmed`,
+    /// promoted to `warn!` + persisted emit in `maybe_crash_restart`) are ONLY
+    /// reachable for a genuine crash — a held Child handle, no operator stop,
+    /// and an unclean exit. The benign skips for the same crash inputs
+    /// (clean exit, operator stop, no child handle) classify away from the
+    /// WARN set, so the promotion never fires on a benign exit.
+    #[test]
+    fn crash_restart_warn_worthy_skips_are_genuine_crash_only() {
+        // Genuine crash, global arm off → WARN-worthy SkipNotArmed.
+        let not_armed = decide_crash_restart(true, false, false, false, true, false, 0);
+        assert_eq!(not_armed, CrashRestartDecision::SkipNotArmed);
+        assert!(matches!(
+            not_armed,
+            CrashRestartDecision::SkipNotArmed | CrashRestartDecision::SkipDisarmed
+        ));
+        // Genuine crash, armed+enabled but disarmed latch → WARN-worthy SkipDisarmed.
+        let disarmed = decide_crash_restart(true, false, false, true, true, true, 0);
+        assert_eq!(disarmed, CrashRestartDecision::SkipDisarmed);
+        // Benign skips for the SAME arm state must NOT be in the WARN-worthy set.
+        for benign in [
+            decide_crash_restart(true, false, true, false, true, false, 0), // clean exit
+            decide_crash_restart(true, true, false, false, true, false, 0), // operator stop
+            decide_crash_restart(false, false, false, false, true, false, 0), // no child handle
+        ] {
+            assert!(
+                !matches!(
+                    benign,
+                    CrashRestartDecision::SkipNotArmed | CrashRestartDecision::SkipDisarmed
+                ),
+                "benign skip {benign:?} must not be WARN-worthy"
+            );
+        }
     }
 
     // =========================================================================

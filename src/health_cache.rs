@@ -321,7 +321,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // Snapshot the crash-only watchdog state for SSE consumers.
                 let watchdog = {
                     let wd = managed.watchdog.read().await;
-                    crate::routes::health::WatchdogHealth::from_state(&wd)
+                    crate::routes::health::WatchdogHealth::from_state(
+                        &wd,
+                        crate::process::manager::crash_restart_globally_armed(&state.config),
+                    )
                 };
 
                 // Build runner snapshot for SSE consumers

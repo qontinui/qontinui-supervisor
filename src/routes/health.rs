@@ -121,18 +121,29 @@ pub struct WatchdogHealth {
     pub last_restart_at: Option<String>,
     pub disabled_reason: Option<String>,
     pub crash_count: usize,
+    /// The TRUE global arm for crash-only auto-restart
+    /// (`config.watchdog_enabled_at_start && !crash_restart_env_disabled()`),
+    /// NOT the per-runner `enabled`. When `false`, a crash of this runner will
+    /// NOT be auto-restarted even though `enabled` may read `true` — the two no
+    /// longer conflate. Computed by
+    /// `process::manager::crash_restart_globally_armed`.
+    pub crash_restart_armed: bool,
 }
 
 impl WatchdogHealth {
     /// Snapshot the live per-runner crash-only watchdog state (see
-    /// `process::manager::maybe_crash_restart` for who maintains it).
-    pub fn from_state(wd: &crate::state::WatchdogState) -> Self {
+    /// `process::manager::maybe_crash_restart` for who maintains it). `armed`
+    /// is the global crash-restart arm (see
+    /// [`crate::process::manager::crash_restart_globally_armed`]); it is passed
+    /// in because `WatchdogState` only carries the per-runner `enabled` bit.
+    pub fn from_state(wd: &crate::state::WatchdogState, armed: bool) -> Self {
         Self {
             enabled: wd.enabled,
             restart_attempts: wd.restart_attempts,
             last_restart_at: wd.last_restart_at.map(|t| t.to_rfc3339()),
             disabled_reason: wd.disabled_reason.clone(),
             crash_count: wd.crash_history.len(),
+            crash_restart_armed: armed,
         }
     }
 
@@ -146,6 +157,7 @@ impl WatchdogHealth {
             last_restart_at: None,
             disabled_reason: Some("watchdog state unavailable".to_string()),
             crash_count: 0,
+            crash_restart_armed: false,
         }
     }
 }
@@ -284,7 +296,10 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         if let Some(primary) = state.get_primary().await {
             let watchdog = {
                 let wd = primary.watchdog.read().await;
-                WatchdogHealth::from_state(&wd)
+                WatchdogHealth::from_state(
+                    &wd,
+                    crate::process::manager::crash_restart_globally_armed(&state.config),
+                )
             };
             let pr = primary.runner.read().await;
             (pr.running, pr.pid, pr.started_at, watchdog)
@@ -315,7 +330,10 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     for managed in &managed_runners {
         let watchdog_status = {
             let wd = managed.watchdog.read().await;
-            WatchdogHealth::from_state(&wd)
+            WatchdogHealth::from_state(
+                &wd,
+                crate::process::manager::crash_restart_globally_armed(&state.config),
+            )
         };
         let mr = managed.runner.read().await;
         let mc = managed.cached_health.read().await;
@@ -655,6 +673,7 @@ mod tests {
                 last_restart_at: None,
                 disabled_reason: None,
                 crash_count: 0,
+                crash_restart_armed: false,
             },
             build: BuildHealth {
                 in_progress: false,
@@ -691,6 +710,37 @@ mod tests {
         assert!(json.contains("\"softNavigate\""));
         assert!(json.contains("\"sdkFeaturesDocUrl\":\"https://"));
         assert!(json.contains("\"buildId\":\"2026-04-25T00:00:00+00:00\""));
+        // The global arm is surfaced additively alongside the per-runner `enabled`.
+        assert!(json.contains("\"crash_restart_armed\":false"), "{json}");
+    }
+
+    /// `crash_restart_armed` reflects the GLOBAL arm passed to `from_state`,
+    /// NOT the per-runner `WatchdogState.enabled`. This is the anti-lie
+    /// invariant: an `enabled: true` primary under a supervisor launched
+    /// without `--watchdog` (`armed = false`) must read `crash_restart_armed:
+    /// false`, so "watchdog enabled" can never imply protection that isn't
+    /// there.
+    #[test]
+    fn test_crash_restart_armed_follows_global_arm_not_per_runner_enabled() {
+        let wd_enabled = crate::state::WatchdogState::new(true);
+        // Per-runner enabled=true, but globally unarmed → armed must be false.
+        let unarmed = WatchdogHealth::from_state(&wd_enabled, false);
+        assert!(unarmed.enabled, "per-runner enabled is preserved");
+        assert!(
+            !unarmed.crash_restart_armed,
+            "crash_restart_armed must follow the global arm (false), not per-runner enabled (true)"
+        );
+        // Per-runner enabled=true and globally armed → armed true.
+        let armed = WatchdogHealth::from_state(&wd_enabled, true);
+        assert!(armed.crash_restart_armed);
+        // Per-runner disabled but globally armed → the arm still tracks the
+        // global bit; the two axes are independent.
+        let wd_disabled = crate::state::WatchdogState::new(false);
+        let armed_disabled = WatchdogHealth::from_state(&wd_disabled, true);
+        assert!(!armed_disabled.enabled);
+        assert!(armed_disabled.crash_restart_armed);
+        // The unavailable fallback is never armed.
+        assert!(!WatchdogHealth::unavailable().crash_restart_armed);
     }
 
     /// `LkgHealth` surfaces the #65 provenance fields: `sha` (when present)

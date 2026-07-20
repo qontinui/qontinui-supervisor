@@ -368,6 +368,34 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Observability: if a primary is registered/managed but crash-restart is
+    // NOT globally armed (supervisor launched without `--watchdog`, or the
+    // `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` kill-switch is set), the primary
+    // will NOT be auto-restarted on a crash. Observe-only supervision is a
+    // legitimate mode, so we neither auto-arm nor refuse to boot — we just make
+    // the posture LOUD instead of silent. Root cause of the 2026-07-20
+    // incident: a crashed primary sat dead ~7 min while `/health` reported
+    // `watchdog.enabled: true` and the global arm was off, with nothing
+    // persisted. This fires regardless of how the supervisor was launched so
+    // the `restart-supervisor.ps1` `-Watchdog` default can't be the only guard.
+    if !process::manager::crash_restart_globally_armed(&state.config) {
+        let has_primary = {
+            let runners = state.runners.read().await;
+            runners.values().any(|r| r.config.kind().is_primary())
+        };
+        if has_primary {
+            let msg = "crash-restart DISARMED (started without --watchdog): a primary is \
+                       managed but will NOT auto-restart on crash — relaunch with --watchdog \
+                       to arm."
+                .to_string();
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+    }
+
     // Background reaper: periodically purge stale/crashed test runners so they
     // don't exhaust the port range (9877-9899). Runs every 5 minutes.
     {
