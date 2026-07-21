@@ -238,6 +238,14 @@ export interface HealthResponse {
     last_restart_at?: string;
     disabled_reason?: string;
     crash_count: number;
+    /// The TRUE global arm for crash-only auto-restart (the `--watchdog` CLI
+    /// flag at launch AND the `QONTINUI_SUPERVISOR_NO_CRASH_RESTART` kill-switch
+    /// unset), NOT the per-runner `enabled`. When `false`, a crash of the
+    /// primary is NOT auto-restarted even though `enabled` may read `true` — the
+    /// two no longer conflate. Mirrors `WatchdogHealth::crash_restart_armed` on
+    /// the Rust side. Optional so a health payload from an older supervisor
+    /// (pre-#111) still type-checks.
+    crash_restart_armed?: boolean;
   };
   build: {
     in_progress: boolean;

@@ -1263,6 +1263,35 @@ function DashboardInner() {
             {h.runner.api_responding && h.runner.running ? ' (API ok)' : ''}
             {' | '}Build: {h.build.in_progress ? 'in progress' : 'idle'}
           </span>
+          {/* Crash-restart disarmed indicator (#111 follow-up). The supervisor
+              now surfaces the TRUE global arm (`watchdog.crash_restart_armed`),
+              which is independent of the per-runner `enabled`. When the primary
+              is supervisor-managed (running) but the arm is off — launched
+              without `--watchdog`, or the kill-switch is set — a crash will NOT
+              auto-restart it. That was the silent failure of the 2026-07-20
+              incident (primary dead ~7 min); this pill makes it a one-glance
+              diagnosis on the surface operators actually watch. `=== false`
+              (not falsy) so an older supervisor's omitted field never false-alarms. */}
+          {h.runner.running && h.watchdog.crash_restart_armed === false && (
+            <span
+              title="Crash-restart is DISARMED (supervisor launched without --watchdog, or QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1). The primary will NOT auto-restart if it crashes. Relaunch the supervisor with --watchdog to arm."
+              aria-label="Crash-restart disarmed: the primary will not auto-restart if it crashes. Relaunch the supervisor with --watchdog to arm."
+              data-testid="crash-restart-disarmed-badge"
+              style={{
+                fontSize: '0.65rem',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.03em',
+                color: 'var(--warning, #eab308)',
+                border: '1px solid var(--warning, #eab308)',
+                borderRadius: '4px',
+                padding: '0.1rem 0.4rem',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              ⚠ crash-restart disarmed
+            </span>
+          )}
           {lastRefresh && (
             <span className="text-muted" style={{ fontSize: '0.7rem', marginLeft: 'auto' }}>
               updated {lastRefresh.toLocaleTimeString()}

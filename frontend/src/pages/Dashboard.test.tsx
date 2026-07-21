@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
+import { api } from '../lib/api';
 
 // Mock the api module
 vi.mock('../lib/api', () => {
@@ -19,6 +20,7 @@ vi.mock('../lib/api', () => {
       enabled: true,
       restart_attempts: 0,
       crash_count: 0,
+      crash_restart_armed: true,
     },
     build: {
       in_progress: false,
@@ -119,5 +121,35 @@ describe('Dashboard', () => {
     renderDashboard();
     // The status bar should show "healthy"
     expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
+  });
+
+  it('does NOT show the crash-restart disarmed badge when the primary is armed', async () => {
+    // Default mock has watchdog.crash_restart_armed: true.
+    renderDashboard();
+    expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('crash-restart-disarmed-badge')).not.toBeInTheDocument();
+  });
+
+  it('shows the crash-restart disarmed badge when the running primary is unarmed (#111)', async () => {
+    // Override just this render: a supervisor-managed (running) primary whose
+    // global crash-restart arm is OFF must surface the disarmed pill, even
+    // though per-runner `enabled` reads true (the anti-lie the field fixes).
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'healthy',
+      runner: { running: true, pid: 1234, api_responding: true },
+      ports: { api_port: { port: 9876, in_use: true } },
+      watchdog: {
+        enabled: true,
+        restart_attempts: 0,
+        crash_count: 0,
+        crash_restart_armed: false,
+      },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+    expect(await screen.findByTestId('crash-restart-disarmed-badge')).toBeInTheDocument();
   });
 });
