@@ -832,12 +832,26 @@ impl EnvForwarder for PanicLogEnv {
 // ExtraEnv
 // =============================================================================
 
+/// Env vars whose silent override re-opens the unpaired-spawn bug.
+///
+/// `process::manager::apply_instance_dir_env` points the child at its
+/// per-instance dir with these two, and `routes::runners` writes the
+/// `paired_profile_id` snapshot into that same dir. A caller that passes BOTH
+/// `paired_profile_id` and an `extra_env` override for one of these gets the
+/// profile written to the instance dir while the child reads somewhere else —
+/// a spawn that reports `paired_profile_applied` and comes up unpaired. The
+/// override is still honored (that is `extra_env`'s contract), but it is never
+/// silent.
+const INSTANCE_DIR_ENV_KEYS: [&str; 2] = ["QONTINUI_CONFIG_DIR", "QONTINUI_SECURE_STORAGE_DIR"];
+
 /// Apply the caller-supplied `extra_env` map to the spawn command.
 ///
 /// MUST run last. Callers (e.g. `POST /runners/spawn-test` with
 /// `{"extra_env": {"QONTINUI_SCRIPTED_OUTPUT": "1"}}`) override anything
 /// the supervisor set, including `QONTINUI_SERVER_MODE`, `QONTINUI_API_URL`,
 /// etc. See `config.rs:148-153` for the documented contract.
+///
+/// Overriding one of [`INSTANCE_DIR_ENV_KEYS`] is warned about — see there.
 pub struct ExtraEnv;
 
 impl EnvForwarder for ExtraEnv {
@@ -848,15 +862,57 @@ impl EnvForwarder for ExtraEnv {
     fn apply<'a>(
         &'a self,
         cmd: &'a mut Command,
-        _state: &'a SharedState,
+        state: &'a SharedState,
         runner: &'a ManagedRunner,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             for (k, v) in &runner.config.extra_env {
+                if let Some(msg) = instance_dir_override_warning(cmd, &runner.config.name, k, v) {
+                    tracing::warn!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                        .await;
+                }
                 cmd.env(k, v);
             }
         })
     }
+}
+
+/// Build the warning for an `extra_env` entry that would redirect one of the
+/// [`INSTANCE_DIR_ENV_KEYS`] away from the per-instance dir the supervisor
+/// already set. Returns `None` when the key is unrelated, was never set by the
+/// supervisor (nothing is being overridden), or the value is identical.
+///
+/// Names BOTH values so the reader can see the split at a glance.
+fn instance_dir_override_warning(
+    cmd: &Command,
+    runner_name: &str,
+    key: &str,
+    new_value: &str,
+) -> Option<String> {
+    if !INSTANCE_DIR_ENV_KEYS.contains(&key) {
+        return None;
+    }
+    let key_os = std::ffi::OsStr::new(key);
+    let current = cmd
+        .as_std()
+        .get_envs()
+        .find(|(k, _)| *k == key_os)
+        .and_then(|(_, v)| v)?
+        .to_string_lossy()
+        .into_owned();
+    if current == new_value {
+        return None;
+    }
+    Some(format!(
+        "extra_env override: runner '{runner_name}' redirects {key} from the supervisor's \
+         per-instance dir '{current}' to '{new_value}'. A `paired_profile_id` snapshot is \
+         copied into '{current}', so the child will read a directory nothing was written to \
+         and come up UNPAIRED. Honoring the override as documented — drop it if you wanted \
+         the paired profile."
+    ))
 }
 
 // =============================================================================

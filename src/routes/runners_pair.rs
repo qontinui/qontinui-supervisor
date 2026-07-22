@@ -6,10 +6,28 @@
 //! to drive the headless pair flow without opening a system browser.
 //!
 //! This unblocks `/manual-test-coord`'s autonomous test-runner pairing —
-//! the CI machine mints a token via the web dashboard, posts it here, and
-//! the resulting device-JWT + paired-user state lands in
-//! `{data_local_dir}/com.qontinui.runner/` for the next spawn-test runner
-//! to pick up.
+//! the CI machine mints a token via the web dashboard and posts it here.
+//!
+//! ## Where the paired state lands (and who reads it)
+//!
+//! The CLI writes the device-JWT + paired-user state into the SHARED
+//! `{data_local_dir}/com.qontinui.runner/`. A supervisor-spawned runner does
+//! **not** pick that up: `start_exe_mode_for_runner` points every non-primary
+//! child at its own `<config_dir>/com.qontinui.runner/instances/<runner-id>/`
+//! via `QONTINUI_CONFIG_DIR` + `QONTINUI_SECURE_STORAGE_DIR`, and the runner
+//! prefers those over the `data_local_dir()` fallback. The supported route to
+//! a paired spawn-test runner is therefore to snapshot this state into
+//! `~/.qontinui/profiles/<id>/` and pass `paired_profile_id` to
+//! `POST /runners/spawn-test`, which copies it into that runner's instance dir.
+//!
+//! Closing the gap directly is a `qontinui-runner` change, not a supervisor
+//! one: `qontinui_profile`'s `paired_user_path()`
+//! (`src-tauri/src/bin/qontinui_profile.rs`) resolves `dirs::data_local_dir()`
+//! directly and ignores `QONTINUI_SECURE_STORAGE_DIR`, while the same binary's
+//! `SecureStorage::new` DOES honor it — so setting the env var on the child
+//! here would split the two credential halves across two directories. Follow-up
+//! work: make `paired_user_path()` honor the env var, then this route can
+//! target an instance dir.
 //!
 //! ## CLI invocation
 //!

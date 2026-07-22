@@ -9,6 +9,7 @@ use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::env_forwarders;
+use crate::process::instance_config_dir;
 use crate::process::port::wait_for_port_free;
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
@@ -1464,6 +1465,49 @@ struct SpawnResult {
 }
 
 /// Start exe mode for a specific runner with port/name env vars.
+/// Applies the per-instance config + secure-storage env vars to a spawn command.
+///
+/// Resolves [`instance_config_dir`] for `runner_id`, creates it, and sets BOTH
+/// `QONTINUI_CONFIG_DIR` and `QONTINUI_SECURE_STORAGE_DIR` to it. Returns the
+/// dir applied.
+///
+/// **This is the load-bearing site**: whatever this function writes onto the
+/// command is the directory the child loads its pairing and token cache from.
+/// It is a standalone function precisely so a test can drive it against a real
+/// [`Command`] and read the vars back — re-inlining a divergent path at the
+/// call site is then a test failure rather than a silently unpaired runner.
+///
+/// Both failure modes are hard errors, never a skip. Leaving the vars unset
+/// makes the child fall back to the shared
+/// `dirs::data_local_dir()/com.qontinui.runner`, which is the exact
+/// forbidden fallback documented on [`instance_config_dir`]: the spawn-test
+/// paired-profile writer would have copied the snapshot into the instance dir
+/// while the child read somewhere else.
+fn apply_instance_dir_env(
+    cmd: &mut Command,
+    runner_id: &str,
+) -> Result<std::path::PathBuf, SupervisorError> {
+    let dir = instance_config_dir(runner_id).ok_or_else(|| {
+        SupervisorError::Process(format!(
+            "Could not resolve the per-instance config dir \
+             <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
+             dirs::config_dir() returned None. Refusing to spawn — without \
+             QONTINUI_CONFIG_DIR/QONTINUI_SECURE_STORAGE_DIR the child falls back to the \
+             shared data_local_dir(), which is where paired-profile snapshots are NOT written."
+        ))
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        SupervisorError::Process(format!(
+            "Failed to create the per-instance config dir {dir:?} for runner '{runner_id}': {e}. \
+             Refusing to spawn — the child would be told to use a directory that does not exist, \
+             or fall back to the shared data_local_dir()."
+        ))
+    })?;
+    cmd.env("QONTINUI_CONFIG_DIR", &dir);
+    cmd.env("QONTINUI_SECURE_STORAGE_DIR", &dir);
+    Ok(dir)
+}
+
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
@@ -1759,21 +1803,19 @@ async fn start_exe_mode_for_runner(
             cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
         }
 
-        let instance_dir = dirs::config_dir().map(|d| {
-            d.join("com.qontinui.runner")
-                .join("instances")
-                .join(&managed.config.id)
-        });
-        if let Some(ref dir) = instance_dir {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                warn!(
-                    "Failed to create instance dir {:?} for runner '{}': {}",
-                    dir, managed.config.name, e
-                );
-            }
-            cmd.env("QONTINUI_CONFIG_DIR", dir);
-            cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
-        }
+        // Per-instance config + secure-storage dir. `instance_config_dir` is
+        // the single source of truth for this path — the spawn-test paired
+        // profile writer and the instance-dir reaper resolve it through the
+        // same helper so a snapshot can never be copied somewhere the child
+        // does not read (see `process::instance_config_dir`). Extracted into
+        // `apply_instance_dir_env` so the env application itself is unit-tested
+        // against a real `Command`; failures here abort the spawn rather than
+        // letting the child fall back to the shared data dir.
+        let instance_dir = apply_instance_dir_env(&mut cmd, &managed.config.id)?;
+        debug!(
+            "Runner '{}' using per-instance config dir: {:?}",
+            managed.config.name, instance_dir
+        );
 
         // Point the non-primary runner at the PRIMARY's secure-storage dir so it
         // can seed the primary's device machine key (`dmk_`) into its own
@@ -3492,6 +3534,58 @@ mod tests {
                  store dir, got {dir:?}"
             );
         }
+    }
+
+    // Per-instance config/secure-storage dir, asserted at the site that
+    // actually decides where the child reads.
+    //
+    // `start_exe_mode_for_runner` applies `apply_instance_dir_env` to every
+    // non-primary child, and `spawn-test` only ever mints non-primary
+    // (`RunnerKind::Temp`) runners — so the dir this function sets IS the
+    // directory a spawn-test runner loads its pairing and token cache from.
+    // `routes::runners` writes the `paired_profile_id` snapshot into
+    // `instance_config_dir`'s output for the same id.
+    //
+    // The assertion is made over a REAL `Command`'s env map rather than over a
+    // re-derivation of the helper's body: re-inlining a divergent path at the
+    // spawn's `cmd.env(...)` site — the failure this test exists to catch —
+    // fails here. (It covers the spawn side only; the route side is pinned by
+    // `routes::runners::tests::instance_config_dir_is_where_apply_paired_profile_for_spawn_writes`.)
+    #[test]
+    fn apply_instance_dir_env_sets_both_vars_to_instance_config_dir() {
+        let id = format!("test-apply-instance-dir-env-{}", std::process::id());
+        let Some(expected) = instance_config_dir(&id) else {
+            // No resolvable config dir on this platform — nothing to assert.
+            return;
+        };
+        let _cleanup = scopeguard::guard(expected.clone(), |dir| {
+            let _ = std::fs::remove_dir_all(dir);
+        });
+
+        let mut cmd = Command::new("cargo");
+        let applied = super::apply_instance_dir_env(&mut cmd, &id).expect("must resolve + create");
+        assert_eq!(applied, expected);
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let want = expected.to_string_lossy().into_owned();
+        for key in ["QONTINUI_CONFIG_DIR", "QONTINUI_SECURE_STORAGE_DIR"] {
+            assert_eq!(
+                envs.get(key).cloned().flatten().as_deref(),
+                Some(want.as_str()),
+                "{key} must be exported to the child as instance_config_dir({id}) = {expected:?}; \
+                 a spawn that inlines a different path leaves the runner unpaired"
+            );
+        }
+        assert!(expected.is_dir(), "the instance dir must have been created");
     }
 
     /// A slot freshly built 5 minutes after the running copy is "stale".

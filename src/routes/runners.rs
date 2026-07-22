@@ -193,12 +193,12 @@ pub struct WatchdogRunnerRequest {
 ///
 /// Looks up a profile snapshot dir under
 /// `<profiles_root>/<paired_profile_id>/` and copies its `paired_user.json`
-/// (required) + `auth_tokens.enc` (optional) into `<data_local_dir>/`.
+/// (required) + `auth_tokens.enc` (optional) into `<dest_dir>/`.
 ///
 /// Both root paths are injected (not pulled from `dirs::*`) so unit tests
 /// can drive the helper hermetically against tempdirs. The HTTP handler
 /// passes `dirs::home_dir().unwrap().join(".qontinui").join("profiles")`
-/// and `dirs::data_local_dir().unwrap().join("com.qontinui.runner")`
+/// and `crate::process::instance_config_dir(<runner id>).unwrap()`
 /// respectively.
 ///
 /// Returns `Ok(applied_files)` on success — the list of basenames copied,
@@ -208,7 +208,7 @@ pub struct WatchdogRunnerRequest {
 pub(crate) fn apply_paired_profile(
     profile_id: &str,
     profiles_root: &std::path::Path,
-    data_local_runner_dir: &std::path::Path,
+    dest_dir: &std::path::Path,
 ) -> Result<Vec<String>, (axum::http::StatusCode, serde_json::Value)> {
     // Defense-in-depth: refuse traversal characters. `~/.qontinui/profiles/`
     // is owned by the operator but a profile id like `../../etc/passwd`
@@ -243,7 +243,7 @@ pub(crate) fn apply_paired_profile(
         ));
     }
 
-    if let Err(e) = std::fs::create_dir_all(data_local_runner_dir) {
+    if let Err(e) = std::fs::create_dir_all(dest_dir) {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -251,13 +251,13 @@ pub(crate) fn apply_paired_profile(
                 "paired_profile_id": profile_id,
                 "message": format!(
                     "could not create {}: {e}",
-                    data_local_runner_dir.display()
+                    dest_dir.display()
                 ),
             }),
         ));
     }
 
-    let paired_dst = data_local_runner_dir.join("paired_user.json");
+    let paired_dst = dest_dir.join("paired_user.json");
     if let Err(e) = std::fs::copy(&paired_src, &paired_dst) {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -281,7 +281,7 @@ pub(crate) fn apply_paired_profile(
     // because the paired_user.json carries the user_id + tenant_id.
     let tokens_src = snapshot_dir.join("auth_tokens.enc");
     if tokens_src.exists() {
-        let tokens_dst = data_local_runner_dir.join("auth_tokens.enc");
+        let tokens_dst = dest_dir.join("auth_tokens.enc");
         if let Err(e) = std::fs::copy(&tokens_src, &tokens_dst) {
             return Err((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -303,11 +303,25 @@ pub(crate) fn apply_paired_profile(
 }
 
 /// HTTP-level wrapper around [`apply_paired_profile`] that resolves the
-/// production `profiles_root` + `data_local_runner_dir` from `dirs::*` and
-/// surfaces failures as `(StatusCode, Json)`. Returns the list of applied
-/// file basenames on success.
+/// production `profiles_root` from `dirs::home_dir()` and the destination from
+/// [`crate::process::instance_config_dir`], and surfaces failures as
+/// `(StatusCode, Json)`. Returns the list of applied file basenames on success.
+///
+/// The destination is the SPAWNED RUNNER'S per-instance dir, keyed by
+/// `runner_id` — not the shared `dirs::data_local_dir()/com.qontinui.runner`.
+/// Every runner this route can create is a `RunnerKind::Temp`, i.e. never
+/// primary, so `start_exe_mode_for_runner` unconditionally exports that
+/// per-instance dir to the child as `QONTINUI_CONFIG_DIR` +
+/// `QONTINUI_SECURE_STORAGE_DIR`, and the runner reads its pairing from there
+/// in preference to the `data_local_dir()` fallback. Writing to the shared dir
+/// therefore landed the snapshot where the child never looked: the spawn
+/// reported success and the runner came up UNPAIRED.
+///
+/// An unresolvable config dir FAILS the spawn. There is deliberately no
+/// fallback to the shared dir — a silent fallback is the original bug.
 fn apply_paired_profile_for_spawn(
     profile_id: &str,
+    runner_id: &str,
 ) -> Result<Vec<String>, (axum::http::StatusCode, serde_json::Value)> {
     let home = dirs::home_dir().ok_or_else(|| {
         (
@@ -318,18 +332,18 @@ fn apply_paired_profile_for_spawn(
             }),
         )
     })?;
-    let data_local = dirs::data_local_dir().ok_or_else(|| {
+    let dest_dir = crate::process::instance_config_dir(runner_id).ok_or_else(|| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
-                "error": "data_local_dir_unresolved",
-                "message": "could not resolve data_local_dir",
+                "error": "config_dir_unresolved",
+                "message": "could not resolve config_dir for the runner's instance dir",
+                "runner_id": runner_id,
             }),
         )
     })?;
     let profiles_root = home.join(".qontinui").join("profiles");
-    let data_local_runner_dir = data_local.join("com.qontinui.runner");
-    apply_paired_profile(profile_id, &profiles_root, &data_local_runner_dir)
+    apply_paired_profile(profile_id, &profiles_root, &dest_dir)
 }
 
 /// GET /runners — list all runners with status.
@@ -1536,8 +1550,13 @@ pub struct SpawnTestRequest {
     /// looks up a profile snapshot directory at
     /// `~/.qontinui/profiles/<paired_profile_id>/` and copies its
     /// `paired_user.json` (and `auth_tokens.enc`, when present) into the
-    /// shared runner data dir at `{data_local_dir}/com.qontinui.runner/`
-    /// BEFORE starting the spawned runner.
+    /// SPAWNED RUNNER'S per-instance dir at
+    /// `<config_dir>/com.qontinui.runner/instances/<runner-id>/`
+    /// BEFORE starting the spawned runner. That is exactly the directory the
+    /// spawn exports to the child as `QONTINUI_SECURE_STORAGE_DIR` (and
+    /// `QONTINUI_CONFIG_DIR`), and the runner prefers those env vars over its
+    /// `dirs::data_local_dir()/com.qontinui.runner` fallback — so this is the
+    /// only place the child will ever look for the pairing.
     ///
     /// This lets a paired CI machine inherit its operator's pairing without
     /// re-running the headless pair flow on every spawn (Phase 2b of
@@ -1551,12 +1570,12 @@ pub struct SpawnTestRequest {
     /// `paired_user.json` from `{data_local_dir}/com.qontinui.runner/` into
     /// `~/.qontinui/profiles/<id>/` after a successful browser pair).
     ///
-    /// **Shared data-dir caveat.** The runner reads `paired_user.json` from
-    /// a fixed `dirs::data_local_dir()` path with no env override. Copying
-    /// the snapshot in therefore overwrites whatever pairing the live data
-    /// dir currently holds — single-user dev boxes are the supported case.
-    /// For multi-tenant CI boxes a future iteration will need per-runner
-    /// data-dir isolation via the runner-side `--data-dir` flag.
+    /// **Per-runner isolation is delivered, not deferred.** Because the copy
+    /// lands in this spawn's own instance dir, it does NOT clobber the
+    /// operator's live pairing in the shared
+    /// `{data_local_dir}/com.qontinui.runner/` — and two concurrent
+    /// spawn-tests can carry two different profiles without fighting over one
+    /// directory. Multi-tenant CI boxes need no follow-up work here.
     #[serde(default)]
     pub paired_profile_id: Option<String>,
 
@@ -2905,14 +2924,16 @@ async fn execute_spawn_build_inner(
 
     // Phase 2b — `paired_profile_id`. If the caller asked the spawned runner
     // to inherit a previously-stashed pairing, copy the snapshot files into
-    // the shared runner data dir BEFORE starting the runner. On failure
-    // release the placeholder port and return the structured error body.
+    // THIS runner's per-instance config dir BEFORE starting the runner — that
+    // is the dir the spawn exports as `QONTINUI_SECURE_STORAGE_DIR`, and the
+    // only one the child reads its pairing from. On failure release the
+    // placeholder port and return the structured error body.
     //
     // Tracked under the spawn-test response as `paired_profile_applied`
     // (the list of basenames actually copied).
     let mut paired_profile_applied: Option<Vec<String>> = None;
     if let Some(profile_id) = body.paired_profile_id.as_deref() {
-        match apply_paired_profile_for_spawn(profile_id) {
+        match apply_paired_profile_for_spawn(profile_id, id) {
             Ok(applied) => {
                 state
                     .logs
@@ -2928,6 +2949,17 @@ async fn execute_spawn_build_inner(
                 paired_profile_applied = Some(applied);
             }
             Err((status, body_json)) => {
+                // `apply_paired_profile` may have already created the
+                // destination instance dir before a `fs::copy` failed. We are
+                // about to drop this runner from the registry, and the
+                // instance-dir reaper only visits REGISTERED runners — so the
+                // dir would leak forever. (It could not before: the old
+                // destination was the shared data dir, which always exists and
+                // is never reaped.) `id` is uuid-unique, so nothing else owns
+                // this path.
+                if let Some(dest) = crate::process::instance_config_dir(id) {
+                    let _ = std::fs::remove_dir_all(&dest);
+                }
                 let mut runners = state.runners.write().await;
                 runners.remove(id);
                 drop(runners);
@@ -6039,6 +6071,82 @@ mod tests {
         );
         assert!(tmp_data.path().join("paired_user.json").exists());
         assert!(tmp_data.path().join("auth_tokens.enc").exists());
+    }
+
+    /// The spawn-test route must write the profile snapshot into the SPAWNED
+    /// RUNNER'S per-instance dir — the same
+    /// `<config_dir>/com.qontinui.runner/instances/<runner id>` that
+    /// `process::manager` exports to the child as `QONTINUI_CONFIG_DIR` +
+    /// `QONTINUI_SECURE_STORAGE_DIR`.
+    ///
+    /// The bug this pins: the wrapper used to copy into the shared
+    /// `dirs::data_local_dir()/com.qontinui.runner` fallback, which a
+    /// supervisor-spawned runner never consults (its env vars win). The spawn
+    /// reported `paired_profile_applied` and the runner came up UNPAIRED.
+    ///
+    /// Driven through the real `apply_paired_profile_for_spawn` rather than
+    /// re-deriving the destination, so re-inlining a different path in the
+    /// route fails here even though the helper itself is unchanged. Uses the
+    /// production `~/.qontinui/profiles` root under a pid-unique profile id and
+    /// removes both dirs afterwards.
+    #[test]
+    fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
+        let unique = format!("supervisor-selftest-{}", std::process::id());
+        let runner_id = format!("test-{unique}");
+        let (Some(home), Some(dest)) = (
+            dirs::home_dir(),
+            crate::process::instance_config_dir(&runner_id),
+        ) else {
+            // No resolvable home / config dir on this platform.
+            return;
+        };
+        let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+        std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
+        let _cleanup = scopeguard::guard((snapshot.clone(), dest.clone()), |(snap, dst)| {
+            let _ = std::fs::remove_dir_all(snap);
+            let _ = std::fs::remove_dir_all(dst);
+        });
+        std::fs::write(
+            snapshot.join("paired_user.json"),
+            r#"{"user_id":"selftest"}"#,
+        )
+        .expect("write paired_user.json");
+        std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02")
+            .expect("write auth_tokens.enc");
+
+        let applied =
+            super::apply_paired_profile_for_spawn(&unique, &runner_id).expect("must succeed");
+
+        assert_eq!(
+            applied,
+            vec![
+                "paired_user.json".to_string(),
+                "auth_tokens.enc".to_string()
+            ]
+        );
+        // The destination is the per-instance dir, spelled out literally so a
+        // drift on the ROUTE side trips this assertion. The spawn side (the
+        // `cmd.env(...)` that tells the child to read this dir) is pinned
+        // separately by
+        // `process::manager::tests::apply_instance_dir_env_sets_both_vars_to_instance_config_dir`.
+        let expected = dirs::config_dir()
+            .expect("config_dir resolved above")
+            .join("com.qontinui.runner")
+            .join("instances")
+            .join(&runner_id);
+        assert_eq!(dest, expected);
+        assert!(
+            dest.join("paired_user.json").exists(),
+            "paired_user.json must land in the runner's instance dir {dest:?}"
+        );
+        assert!(
+            dest.join("auth_tokens.enc").exists(),
+            "auth_tokens.enc must land in the runner's instance dir {dest:?}"
+        );
+        // And NOT in the shared fallback the runner ignores.
+        if let Some(shared) = dirs::data_local_dir() {
+            assert_ne!(dest, shared.join("com.qontinui.runner"));
+        }
     }
 
     // -------------------------------------------------------------------
