@@ -12,6 +12,7 @@ import {
   RunnerKindWire,
   StaleBinarySummary,
   UiErrorSummary,
+  WatchdogHealthWire,
 } from '../lib/api';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { ToastContainer, addToast } from '../components/Toast';
@@ -250,6 +251,112 @@ interface RunnerInstance {
   // "stale binary" pill — clicking it opens a confirmation dialog that
   // restarts the runner (picking up the newer build).
   stale_binary?: StaleBinarySummary | null;
+  // Per-runner crash-only watchdog state (from `/runners[].watchdog`). Emitted
+  // by the supervisor but historically dropped by the fleet table; surfaced as
+  // a `RunnerWatchdogBadge` (#111/#113 per-runner completion). Optional so the
+  // panel keeps rendering against an older supervisor that omits it.
+  watchdog?: WatchdogHealthWire;
+}
+
+// ─── Per-runner watchdog badge (#111/#113 per-runner completion) ────────────
+// The status bar (Dashboard status bar) surfaces the PRIMARY's crash-restart
+// state. `/runners[].watchdog` carries the SAME shape for EVERY managed runner,
+// but the fleet table dropped it — so a NAMED/TEMP runner that an operator
+// explicitly armed (`POST /runners/{id}/watchdog {enabled:true}`) and that then
+// crash-loop self-disarmed showed nothing on its row. This badge closes that:
+//
+//  • Crash-loop disarmed (RED) — `disabled_reason` set while the global arm is
+//    on (`crash_restart_armed !== false`): the watchdog auto-restarted this
+//    runner, it kept crashing, and the guard gave up. Operator action required.
+//    Shown regardless of `running` — it is a persistent state that outlives the
+//    process, and a down runner that will NOT auto-recover is exactly what an
+//    operator must see. Deliberately NOT excluded on the primary: the status
+//    bar's red pill is gated on `runner.running`, so a crash-loop-disarmed
+//    primary that is DOWN (the exact state the guard produces when it gives up)
+//    shows nothing there — this ungated row badge is the only surface that
+//    catches it. Do NOT add `!isPrimary` here; it would reopen that gap.
+//  • Crash-restart disarmed (AMBER) — a NON-primary runner that is armed
+//    (`enabled === true`) while the global arm is off (`crash_restart_armed ===
+//    false`): its intent to auto-restart will not be honored. Gated on `running`
+//    (only a live runner is meaningfully unprotected) and on `!isPrimary` — the
+//    primary's global-arm state is already the status bar's job, so repeating it
+//    on the primary row would be redundant noise; a named runner has no other
+//    surface, so it is shown there. `=== false` (not falsy) so an older
+//    supervisor's omitted arm field never false-alarms.
+//
+// The two are mutually exclusive by construction (crash-loop disarm requires the
+// arm to be on) and priority-ordered red-over-amber for defence in depth.
+export function RunnerWatchdogBadge({
+  watchdog,
+  running,
+  isPrimary,
+}: {
+  watchdog?: WatchdogHealthWire | null;
+  running: boolean;
+  isPrimary: boolean;
+}) {
+  if (!watchdog) return null;
+
+  const crashLoopDisarmed =
+    !!watchdog.disabled_reason && watchdog.crash_restart_armed !== false;
+  if (crashLoopDisarmed) {
+    const crashes = watchdog.crash_count ?? 0;
+    const attempts = watchdog.restart_attempts ?? 0;
+    return (
+      <span
+        title={`Crash-restart AUTO-DISARMED: ${watchdog.disabled_reason}. This runner crash-looped (${crashes} crash${
+          crashes === 1 ? '' : 'es'
+        }, ${attempts} auto-restart attempt${
+          attempts === 1 ? '' : 's'
+        }) and will NOT auto-restart again until an operator resets it (POST /runners/{id}/watchdog {reset_attempts:true}).`}
+        aria-label={`Crash-loop disarmed: ${watchdog.disabled_reason}. This runner will not auto-restart until an operator resets the watchdog.`}
+        data-testid="runner-crash-loop-disarmed-badge"
+        style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em',
+          color: 'var(--danger, #ef4444)',
+          border: '1px solid var(--danger, #ef4444)',
+          borderRadius: '4px',
+          padding: '0.05rem 0.35rem',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        ⚠ crash-loop disarmed
+      </span>
+    );
+  }
+
+  const armedButGlobalOff =
+    !isPrimary &&
+    running &&
+    watchdog.enabled === true &&
+    watchdog.crash_restart_armed === false;
+  if (armedButGlobalOff) {
+    return (
+      <span
+        title="This runner is armed for crash-restart, but the supervisor was launched without --watchdog (or QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1). It will NOT auto-restart if it crashes. Relaunch the supervisor with --watchdog to arm."
+        aria-label="Crash-restart disarmed: this runner is armed but the supervisor's global crash-restart arm is off, so it will not auto-restart if it crashes."
+        data-testid="runner-crash-restart-disarmed-badge"
+        style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em',
+          color: 'var(--warning, #eab308)',
+          border: '1px solid var(--warning, #eab308)',
+          borderRadius: '4px',
+          padding: '0.05rem 0.35rem',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        ⚠ crash-restart disarmed
+      </span>
+    );
+  }
+
+  return null;
 }
 
 // ─── Startup-panic badge + modal (Phase 2b) ─────────────────────────────
@@ -665,6 +772,7 @@ function RunnerRow({
               disabled={actionsDisabled}
             />
           )}
+          <RunnerWatchdogBadge watchdog={r.watchdog} running={r.running} isPrimary={isPrimary} />
         </div>
       </td>
       <td>

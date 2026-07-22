@@ -221,6 +221,33 @@ export interface RunnerInstanceHealth {
   derived_status: RunnerDerivedStatus;
 }
 
+/// Watchdog health as surfaced by the supervisor. The top-level
+/// `HealthResponse.watchdog` carries the PRIMARY's state; the per-runner
+/// `/runners[].watchdog` carries each managed runner's own state. Both wire the
+/// same shape (`qontinui-supervisor::routes::health::WatchdogHealth` and the
+/// inline object in `routes::runners`), so one interface serves both.
+export interface WatchdogHealthWire {
+  /// Per-runner intent to crash-auto-restart. Defaults `true` for the primary,
+  /// `false` for named/temp runners (they must be armed explicitly).
+  enabled: boolean;
+  restart_attempts: number;
+  last_restart_at?: string;
+  /// Set when the crash-loop guard self-disarmed (e.g. "crash loop — operator
+  /// required") — restarts stay off until an operator resets it, even though
+  /// `enabled` remains `true`.
+  disabled_reason?: string;
+  crash_count: number;
+  /// The TRUE global arm for crash-only auto-restart (the `--watchdog` CLI
+  /// flag at launch AND the `QONTINUI_SUPERVISOR_NO_CRASH_RESTART` kill-switch
+  /// unset), NOT the per-runner `enabled`. When `false`, a crash is NOT
+  /// auto-restarted even though `enabled` may read `true` — the two no longer
+  /// conflate. It is a GLOBAL bit, identical across every runner in one
+  /// supervisor. Mirrors `crash_restart_globally_armed()` on the Rust side.
+  /// Optional so a health payload from an older supervisor (pre-#111) still
+  /// type-checks.
+  crash_restart_armed?: boolean;
+}
+
 export interface HealthResponse {
   status: string;
   runner: {
@@ -232,21 +259,7 @@ export interface HealthResponse {
   ports: {
     api_port: { port: number; in_use: boolean };
   };
-  watchdog: {
-    enabled: boolean;
-    restart_attempts: number;
-    last_restart_at?: string;
-    disabled_reason?: string;
-    crash_count: number;
-    /// The TRUE global arm for crash-only auto-restart (the `--watchdog` CLI
-    /// flag at launch AND the `QONTINUI_SUPERVISOR_NO_CRASH_RESTART` kill-switch
-    /// unset), NOT the per-runner `enabled`. When `false`, a crash of the
-    /// primary is NOT auto-restarted even though `enabled` may read `true` — the
-    /// two no longer conflate. Mirrors `WatchdogHealth::crash_restart_armed` on
-    /// the Rust side. Optional so a health payload from an older supervisor
-    /// (pre-#111) still type-checks.
-    crash_restart_armed?: boolean;
-  };
+  watchdog: WatchdogHealthWire;
   build: {
     in_progress: boolean;
     available_slots: number;
@@ -840,6 +853,10 @@ export const api = {
         recent_panic?: RecentPanicSummary | null;
         stale_binary?: StaleBinarySummary | null;
         derived_status?: RunnerDerivedStatus;
+        /// Per-runner watchdog state (crash-only auto-restart). Optional so a
+        /// payload from an older supervisor that predates per-runner watchdog
+        /// serialization still type-checks.
+        watchdog?: WatchdogHealthWire;
       }[]
     >('/runners'),
   protectRunner: (id: string, isProtected: boolean) =>
