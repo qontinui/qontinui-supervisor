@@ -1292,6 +1292,49 @@ function DashboardInner() {
               ⚠ crash-restart disarmed
             </span>
           )}
+          {/* Crash-loop self-disarm indicator (#111/#113 completion). The
+              sibling pill above catches "never armed" (global arm off). This
+              catches the OTHER silent-failure of the same crash-resilience
+              feature: the watchdog WAS armed, auto-restarted the primary, but
+              the primary kept crashing — so after 3 restarts in 30 min the
+              crash-loop guard disarmed itself (`disabled_reason` set, e.g.
+              "crash loop — operator required") and will NOT restart again until
+              an operator resets it. In that state the global arm is still ON
+              (`crash_restart_armed !== false`), so the disarmed pill above does
+              NOT fire and, before this, the dashboard showed nothing — an
+              actively-crashing primary that the operator had to notice by other
+              means. `disabled_reason` was emitted by /health + /runners and
+              typed in api.ts but never read. `!== false` excludes the degraded
+              "watchdog state unavailable" payload (arm=false → covered by the
+              pill above) while still surfacing on an older supervisor that omits
+              the arm field but sets a reason. More severe (red) than "never
+              armed": this means active crashing plus operator action required. */}
+          {h.runner.running &&
+            h.watchdog.disabled_reason &&
+            h.watchdog.crash_restart_armed !== false && (
+              <span
+                title={`Crash-restart AUTO-DISARMED: ${h.watchdog.disabled_reason}. The primary crash-looped (${h.watchdog.crash_count} crash${
+                  h.watchdog.crash_count === 1 ? '' : 'es'
+                }, ${h.watchdog.restart_attempts} auto-restart attempt${
+                  h.watchdog.restart_attempts === 1 ? '' : 's'
+                }) and will NOT auto-restart again until an operator resets it (POST /runners/{id}/watchdog {reset_attempts:true}) or relaunches the supervisor.`}
+                aria-label={`Crash-loop disarmed: ${h.watchdog.disabled_reason}. The primary will not auto-restart until an operator resets the watchdog.`}
+                data-testid="crash-loop-disarmed-badge"
+                style={{
+                  fontSize: '0.65rem',
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.03em',
+                  color: 'var(--danger, #ef4444)',
+                  border: '1px solid var(--danger, #ef4444)',
+                  borderRadius: '4px',
+                  padding: '0.1rem 0.4rem',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                ⚠ crash-loop disarmed
+              </span>
+            )}
           {lastRefresh && (
             <span className="text-muted" style={{ fontSize: '0.7rem', marginLeft: 'auto' }}>
               updated {lastRefresh.toLocaleTimeString()}
