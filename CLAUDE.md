@@ -151,9 +151,9 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/runners` | List all runners with status |
+| GET | `/runners` | List all runners with status. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
 | POST | `/runners` | Add a runner config to the registry |
-| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, frontend_only?, async?}`. Returns `{id, port, api_url, ui_bridge_url, build_id, source}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: `git_ref` / `worktree_path` / `frontend_only`" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
@@ -340,18 +340,34 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 - SSE `GET /logs/stream` for real-time log entries
 - Fetches runner, build, velocity, and evaluation data via REST
 
-## Build provenance: `git_ref` / `worktree_path` / `frontend_only`
+## Build provenance: spawn-test builds `origin/main` by DEFAULT
 
-`POST /runners/spawn-test` builds the **live runner tree** by default. To build something else, pass **exactly one** provenance selector — and these are the **only** accepted names:
+**`POST /runners/spawn-test {rebuild: true}` compiles a supervisor-owned detached worktree pinned to `origin/main` — NOT the shared working checkout.** The supervisor fetches and hard-resets that worktree on every spawn, so a rebuild is reproducible and can never inherit whatever branch a peer session parked `qontinui-runner/` on, nor their uncommitted WIP.
 
-| Param | Builds | Notes |
-|-------|--------|-------|
-| `git_ref` | A managed detached worktree at the ref (branch/tag/SHA) | Supervisor materializes `<ws>/.spawn-<ref>/` with a pinned `origin/main` schemas sibling. Requires `rebuild: true`. |
-| `worktree_path` | An **existing caller-owned** checkout at that absolute path | Built in place, **never mutated, never cleaned up** (the caller owns it). Requires `rebuild: true`. |
+**Why this is the default.** It used to build the shared checkout. On 2026-07-22 that checkout sat on `fix/runner-terminal-copy`, **72 commits behind `origin/main`** (it had been 45 behind at the previous incident — it drifts monotonically, it does not self-heal). A session that landed a fix on `origin/main` and spawned a test runner to verify it got a binary that did not contain the fix, with no warning. **A fix that is merely ABSENT reads as REGRESSED** — that misdiagnosis burned a full `/manual-test-loop` iteration.
 
-**Rejected aliases (400, not silently ignored).** `branch`, `worktree`, and `ref` are **not** spawn-test fields. Passing any of them now returns `400` naming the correct field (`git_ref` / `worktree_path`). Previously serde silently dropped them and the request fell back to a `source: "live_tree"` spawn — the exact failure that motivated this change. Always check the response `source` field (`"live_tree" | "worktree" | "worktree_path"`) to confirm what you actually got.
+To build something else, pass **exactly one** provenance selector:
 
-**Mutual exclusion.** Setting both `git_ref` and `worktree_path` → `400 provenance_conflict`. Either selector without `rebuild: true` → `400 <field> requires rebuild:true` (provenance is never inferred — without a recompile you'd get the live tree's exe).
+| Param | Builds | Provenance class | Notes |
+|-------|--------|------------------|-------|
+| *(none)* | Managed detached worktree at `origin/main` | `origin_main` (vouched) | **The default.** `source: "origin_main"`. Requires `rebuild: true` (without it no build happens and the exe comes from a slot / the LKG). |
+| `git_ref` | A managed detached worktree at the ref (branch/tag/SHA) | `origin_main` if the ref IS canonical `origin/main`, else `override` | Supervisor materializes `<ws>/.spawn-<ref>/` with a pinned `origin/main` schemas sibling. `source: "worktree"`. Requires `rebuild: true`. |
+| `worktree_path` | An **existing caller-owned** checkout at that absolute path | `override` | Built in place, **never mutated, never cleaned up** (the caller owns it). `source: "worktree_path"`. Requires `rebuild: true`. |
+| `from_working_tree: true` | The **shared live working checkout** | `live_tree` | **Explicit opt-in only.** Use when you deliberately want to test uncommitted edits in the shared checkout. `source: "live_tree"`. Requires `rebuild: true`. |
+
+**Classification is by what was COMPILED, not by how the request was spelled.** An explicit `git_ref: "origin/main"` is classified `origin_main` exactly like the default, because the binary genuinely is merged truth. A **local** `main` is deliberately NOT canonical — it can lag `origin/main` or carry unpushed commits, so vouching for it would reopen the hole. Only `origin/main` and `refs/remotes/origin/main` count (`git_provenance::is_canonical_main_ref`).
+
+**This also fixes LKG hygiene.** `origin_main` is a *vouched* source, so a default spawn-test rebuild is LKG-promotable. Previously LKG was advanced by `live_tree` builds — i.e. by whatever branch the shared checkout happened to be parked on, which is how `use_lkg: true` came to ship binaries built from feature branches.
+
+**Rejected aliases (400, not silently ignored).** `branch`, `worktree`, and `ref` are **not** spawn-test fields. Passing any of them returns `400` naming the correct field. Always check the response `source` field (`"origin_main" | "worktree" | "worktree_path" | "live_tree"`) to confirm what you actually got.
+
+**Mutual exclusion.** Setting more than one of `git_ref` / `worktree_path` / `from_working_tree` → `400 provenance_conflict` naming all of them. Any selector without `rebuild: true` → `400 <field> requires rebuild:true` (provenance is never inferred — without a recompile you'd get an existing exe while believing you got your tree).
+
+**Staleness is loud now, and commit-based.** On a `rebuild: true` spawn the response carries:
+
+- `build_sha` — the full 40-char SHA the binary was compiled from. This is the field that settles provenance definitively: `git merge-base --is-ancestor <fix-sha> <build_sha>`.
+- `build_source_default` — `true` when the supervisor picked `origin/main` for you.
+- `build_source_warning` — `null` when the compiled tree IS current merged truth; otherwise an object with `behind_count`, `diverged`, `origin_main_sha` and a message naming the remedy. With the default flipped this is unreachable in the normal case; it fires for `from_working_tree: true` and for an explicit stale `git_ref`.
 
 **`worktree_path` validation (each a precise 400):**
 - path must exist and be a directory;
@@ -440,7 +456,26 @@ The supervisor preserves the most recently successfully-built runner exe at `tar
    - **`max(mtime of changed files) > lkg.built_at`** → the LKG predates your changes. Pinning to it would silently run stale code. You must rebuild instead.
 4. If you have NO uncommitted changes, the LKG always covers you (any clean checkout's tracked files have mtimes from the original git checkout, which is older than every build).
 
-**Why timestamps and not git hashes.** With three concurrent agents touching files at different commits, hashes are noisy — what matters is "do the bytes I edited live in this binary." File mtime answers that directly. The risk case (agent edits file at T1, LKG at T0 < T1) is exactly the case where the comparison correctly says "do not use LKG."
+**Why timestamps for UNCOMMITTED edits.** For bytes you edited in a working tree and never committed, there is no sha to compare — mtime answers "do the bytes I edited live in this binary" directly. The risk case (agent edits file at T1, LKG at T0 < T1) is exactly the case where the comparison correctly says "do not use LKG."
+
+**But mtime CANNOT answer "does this binary contain commit X" — use `commit_provenance`.** `git checkout` rewrites mtimes wholesale, so a binary built from a branch parked 72 commits behind `origin/main` has perfectly fresh mtimes while missing all 72 commits. That is precisely how a landed fix came to read as a regression. `GET /lkg/coverage` therefore also returns a **commit-based** block:
+
+```bash
+# What commit is the LKG built from, and is it merged truth?
+curl -s 'localhost:9875/lkg/coverage' | jq '.data.commit_provenance'
+# → {"lkg_sha": "…", "lkg_source": "origin_main",
+#    "behind_origin_main": 0, "is_ancestor_of_origin_main": true,
+#    "contains_query": null, "contains": null}
+
+# Definitive: is MY fix in the LKG binary?
+curl -s 'localhost:9875/lkg/coverage?contains=<fix-sha>' | jq '.data.commit_provenance.contains'
+# → true  = the commit IS in the binary
+# → false = provably absent
+# → null  = NOT COMPUTABLE (no LKG sha, or a sha unknown to the local object db).
+#           null must NEVER be read as false.
+```
+
+`contains` is `git merge-base --is-ancestor <contains> <lkg_sha>` computed server-side. Prefer it over `file_newer_than_lkg_secs` whenever the question is about a commit rather than an uncommitted edit.
 
 **API.**
 
@@ -486,12 +521,16 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 If the build fails, the placeholder port reservation is cleaned up and the error is returned.
 
-**Hazard: spawn-test `rebuild: true` compiles whatever branch the runner working tree is checked out to — not `origin/main`.** This applies to **spawn-test / spawn-named** (a temp/named runner of the live tree), NOT the primary rebuild — see "Primary rebuild builds origin/main by default" below for the primary. For spawn-test, the supervisor doesn't fetch, doesn't compare against any expected ref, doesn't switch branches. In a multi-agent setup where another session `git switch`es `qontinui-runner` between agents, a `rebuild: true` call intending to test code on `main` will silently produce a binary from whichever feature branch is currently checked out. The build succeeds; the wrong code runs. Two diagnostic surfaces help:
+**FIXED (2026-07-22): spawn-test `rebuild: true` no longer compiles the shared working checkout.** It builds a supervisor-owned `origin/main` worktree — see "Build provenance: spawn-test builds `origin/main` by DEFAULT" above. The old hazard (the supervisor didn't fetch, didn't compare against any expected ref, and silently produced a binary from whichever feature branch a peer session had `git switch`ed the shared checkout to) is structurally gone: the build source is no longer the shared checkout at all, so no amount of branch-parking by a peer can reach it.
 
-1. **`git_sha` on the spawn-test response** is the authoritative answer to *"what did I actually run?"* — always compare it against what you expected before drawing conclusions from the resulting runner. The value is a 12-char abbreviated SHA of `HEAD` in the runner repo at build time.
-2. **`tracing::warn!` in supervisor.log** — when the working tree's `HEAD` differs from `origin/main`, the supervisor emits a `WARN` line with the actual SHA, branch name, and origin/main SHA before the cargo invocation. Best-effort: missing git, missing `origin/main` remote, or non-repo skip the warning silently. Filter `supervisor.log` for `working tree HEAD` to surface these.
+The old workaround — "build locally in a worktree off `origin/main` and `cp` the exe into `target-pool/slot-N/debug/`" — is **obsolete**; that is now exactly what the default does. **Do not `git switch` the shared checkout to work around a stale spawn**; it touches state another agent's session may be using, and there is nothing left to work around.
 
-If a `rebuild: true` returned a `git_sha` you didn't expect, the recovery path is to either (a) `git switch main && git pull && curl POST /runners/spawn-test {rebuild: true}` again (disruptive — touches state another agent's session may be using), or (b) build locally in a worktree off `origin/main` and `cp` the resulting exe into `target-pool/slot-N/debug/qontinui-runner.exe`, then spawn-test with `rebuild: false`. (b) is non-destructive and the recommended path during contested-worktree windows.
+Verification surfaces (still the right thing to check before drawing conclusions from a spawned runner):
+
+1. **`build_sha` on the spawn-test response** — the full 40-char SHA the binary was compiled from. Settle containment exactly with `git merge-base --is-ancestor <fix-sha> <build_sha>` rather than reasoning from timestamps.
+2. **`build_source` / `source`** — `origin_main` for the default. Anything else means you (or a stale caller) asked for a different tree.
+3. **`build_source_warning`** — non-null only when the compiled tree is behind or diverged from `origin/main`, with the behind-count and the remedy.
+4. **`GET /runners`** — every runner carries `build_sha` / `build_source` / `build_source_root` / `build_built_at` for the exe it is actually running. (`stale_binary`, next to it, is an **mtime** comparison and cannot see commit staleness — prefer `build_sha`.)
 
 ### Primary rebuild builds origin/main by default
 

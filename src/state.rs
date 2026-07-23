@@ -82,6 +82,21 @@ pub struct ManagedRunner {
     /// `purge-stale` reaper to a single requester so one session's purge can
     /// never evict another session's runner.
     pub requester_id: RwLock<Option<String>>,
+    /// Provenance of the exe this runner is ACTUALLY running — recorded at
+    /// start time from whichever artifact was resolved (the pinned LKG record,
+    /// or the picked build slot's provenance sidecar).
+    ///
+    /// This is the per-runner answer to "does this runner contain commit X?":
+    /// `git merge-base --is-ancestor <fix-sha> <build_provenance.sha>`. Before
+    /// this existed the only per-runner staleness signal was `stale_binary`,
+    /// which is an **mtime** comparison and therefore blind to a build from a
+    /// branch parked behind `origin/main` — a fresh mtime over stale commits is
+    /// exactly the case that made a landed fix read as a regression.
+    ///
+    /// `None` when the runner has never been started by this supervisor, or the
+    /// resolved artifact carried no provenance record (legacy `target/debug/`
+    /// exe, pre-upgrade slot). Absence is honest "unknown", never "current".
+    pub build_provenance: RwLock<Option<crate::process::manager::BuildProvenance>>,
 }
 
 /// Work-unit → preview correlation for a runner spawned as an attempt's
@@ -164,6 +179,7 @@ impl ManagedRunner {
             last_auth_result: RwLock::new(None),
             preview_binding: RwLock::new(None),
             requester_id: RwLock::new(None),
+            build_provenance: RwLock::new(None),
         }
     }
 
@@ -343,6 +359,30 @@ pub struct SupervisorState {
     /// regardless of age. Keyed by the canonical container path string so the
     /// pruner's directory enumeration and the build wiring agree on identity.
     pub active_spawn_worktrees: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// Per-spawn-container **mutual exclusion** for materialize-then-build.
+    ///
+    /// `prepare_worktree` REUSES a container by `git checkout --force` +
+    /// `git reset --hard`. Doing that while another spawn is mid-`cargo build`
+    /// in the same container yanks source files out from under the compiler —
+    /// producing failures that look exactly like code errors. Before
+    /// 2026-07-22 this could only happen when two callers passed the SAME
+    /// explicit `git_ref`; now that `origin/main` is the spawn-test default,
+    /// every default spawn targets one shared `.spawn-origin_main` container,
+    /// so it would be the common case rather than a rare collision.
+    ///
+    /// The guard is held across BOTH the materialization and the build, so a
+    /// container is never reset while a build reads it. Scope is per container
+    /// path: spawns of DIFFERENT refs never contend. Concurrent spawns of the
+    /// SAME ref serialize — an accepted trade, since they would otherwise
+    /// compile byte-identical source twice in parallel for no benefit.
+    ///
+    /// `std::sync::Mutex` guards only the map (never held across an await);
+    /// the per-container `tokio::sync::Mutex` is the async lock actually held
+    /// across the build. Entries are never evicted — one empty mutex per
+    /// distinct ref ever spawned is negligible, and evicting a lock another
+    /// task is queued on is the classic way to reintroduce the race.
+    pub spawn_container_locks:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// Cached build-artifact footprint snapshot (plan
     /// `2026-06-05-supervisor-build-artifact-footprint`). Walking the GB-scale
     /// `target-pool/slot-*` + `.spawn-*` trees is minutes-slow, so the snapshot
@@ -1066,6 +1106,7 @@ impl SupervisorState {
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
             active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
+            spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             footprint: RwLock::new(None),
         }
     }
@@ -1111,6 +1152,24 @@ impl SupervisorState {
 
     pub fn notify_health_change(&self) {
         let _ = self.health_tx.send(());
+    }
+
+    /// Get (creating on first use) the mutual-exclusion lock for a spawn
+    /// container. See [`SupervisorState::spawn_container_locks`] for why this
+    /// exists — in short, `prepare_worktree` hard-resets a reused container and
+    /// must never do so while a build is reading it.
+    ///
+    /// Returns an `Arc` so the caller can `lock_owned()` and hold the guard
+    /// across the whole materialize+build sequence. The map mutex is released
+    /// before the caller ever awaits, so this never blocks the runtime.
+    pub fn spawn_container_lock(&self, container: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .spawn_container_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(container.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Future that completes when a shutdown is signaled on `shutdown_tx`.
