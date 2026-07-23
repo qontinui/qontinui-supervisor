@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
@@ -80,43 +81,132 @@ pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     Ok(killed_any)
 }
 
-/// Clean up orphaned cargo/rustc processes that may be left from a previous build.
+/// Process-snapshot variant that also captures each process's command line and
+/// environment. Heavier than [`snapshot_processes`] (cmd + environ are large on
+/// Windows), so it is used ONLY by the slot-scoped cleanup, which needs those
+/// fields to tell its own pool-slot builds apart from unrelated cargo/rustc.
+fn snapshot_processes_with_cmdline() -> System {
+    let refresh = RefreshKind::new().with_processes(
+        ProcessRefreshKind::new()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    System::new_with_specifics(refresh)
+}
+
+/// Decide whether a cargo/rustc process is building into `slot_dir` — i.e. it
+/// belongs to THIS supervisor's build pool and is ours to reap.
 ///
-/// Enumerates processes via sysinfo (Win11 26200 removed wmic entirely, so
-/// the previous wmic-based implementation was a silent no-op on this OS).
-/// We attempt sysinfo's native `Process::kill()` first; if that returns
-/// false we fall back to taskkill via `kill_by_pid` to cover edge cases
-/// where sysinfo lacks the access right but taskkill (with /F) doesn't.
-pub async fn cleanup_orphaned_build_processes() {
+/// The supervisor spawns every pool build with
+/// `.env("CARGO_TARGET_DIR", &slot.target_dir)` (see
+/// `build_monitor::run_build_inner`), and the rustc children cargo spawns
+/// inherit that env AND receive an explicit `--out-dir <slot_dir>/debug/deps`
+/// in argv. So a process targets the slot iff its environment sets
+/// `CARGO_TARGET_DIR` to `slot_dir` OR any argv token contains the `slot_dir`
+/// path (case-insensitive, matching Windows path semantics).
+///
+/// SAFE DEGRADE: if BOTH `environ` and `cmd` are empty (sysinfo could not read
+/// them — common for another user's or an elevated process), returns `false`.
+/// Unknown is NOT a kill: the previous "kill every cargo/rustc" behavior was the
+/// unsafe degrade and it killed peer agents' worktree builds fleet-wide. A truly
+/// stuck orphan we cannot classify is left for `free_slot_exe`'s exe-lock path,
+/// which is already slot-scoped.
+fn process_targets_slot(environ: &[OsString], cmd: &[OsString], slot_dir: &Path) -> bool {
+    // Trim trailing separators so `slot-1` and `slot-1\` compare equal, and so
+    // the boundary check below is exact.
+    let needle = slot_dir
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .trim_end_matches(['/', '\\'])
+        .to_string();
+    if needle.is_empty() {
+        return false;
+    }
+
+    // CARGO_TARGET_DIR=<slot_dir> in the environment. cargo sets this for every
+    // pool build and rustc children inherit it, so this branch fires for both
+    // cargo.exe and rustc.exe and is an EXACT (not substring) compare.
+    for kv in environ {
+        let kv = kv.to_string_lossy();
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("CARGO_TARGET_DIR")
+                && v.to_ascii_lowercase().trim_end_matches(['/', '\\']) == needle
+            {
+                return true;
+            }
+        }
+    }
+
+    // Secondary net: a rustc argv token under the slot dir (e.g.
+    // `--out-dir <slot>/debug/deps`), for the rare case sysinfo could not read
+    // the environ. Boundary-aware so `slot-1` never matches `slot-10` — the
+    // slot path must be the whole token or be followed by a path separator.
+    let sep_back = format!("{needle}\\");
+    let sep_fwd = format!("{needle}/");
+    for arg in cmd {
+        let a = arg.to_string_lossy().to_ascii_lowercase();
+        if a == needle || a.contains(&sep_back) || a.contains(&sep_fwd) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Reap cargo/rustc processes left building into `slot_target_dir` by a
+/// PREVIOUS build of that same pool slot (e.g. after a supervisor crash), so the
+/// slot's target/exe is not locked when we build into it again.
+///
+/// SLOT-SCOPED, not machine-wide. It kills ONLY processes that
+/// [`process_targets_slot`] attributes to this exact slot dir. It deliberately
+/// leaves alone every other cargo/rustc — a peer agent's worktree build, another
+/// pool slot's in-flight build, an operator's manual build. The prior
+/// implementation (`cleanup_orphaned_build_processes`) killed every cargo.exe /
+/// rustc.exe on the machine except the supervisor's own PID, which silently
+/// killed peer agents' worktree builds mid-compile every time any build started,
+/// and made concurrent pool slots sabotage each other.
+///
+/// Enumerates via sysinfo (Win11 26200 removed wmic entirely). Tries sysinfo's
+/// native `Process::kill()` first; on failure falls back to taskkill via
+/// `kill_by_pid` for the access-right edge cases.
+pub async fn cleanup_orphaned_slot_processes(slot_target_dir: &Path) {
     let our_pid = std::process::id();
-    let system = snapshot_processes();
+    let system = snapshot_processes_with_cmdline();
 
     let mut killed_total: u32 = 0;
     for proc_name in &["cargo.exe", "rustc.exe"] {
         let mut killed_for_name: u32 = 0;
 
-        // Collect (pid, sysinfo_kill_succeeded) pairs first so we don't hold
-        // a borrow across the async fallback.
+        // Collect PIDs to kill first so we don't hold a borrow across the async
+        // taskkill fallback.
         let mut to_fallback: Vec<u32> = Vec::new();
         for process in system.processes().values() {
-            if process
+            if !process
                 .name()
                 .to_string_lossy()
                 .eq_ignore_ascii_case(proc_name)
             {
-                let pid = process.pid().as_u32();
-                if pid == 0 || pid == our_pid {
-                    continue;
-                }
-                debug!(
-                    "Cleaning up orphaned {} (PID {}) via sysinfo",
-                    proc_name, pid
-                );
-                if process.kill() {
-                    killed_for_name += 1;
-                } else {
-                    to_fallback.push(pid);
-                }
+                continue;
+            }
+            let pid = process.pid().as_u32();
+            if pid == 0 || pid == our_pid {
+                continue;
+            }
+            if !process_targets_slot(process.environ(), process.cmd(), slot_target_dir) {
+                // Not ours — a peer's build, another slot, or unclassifiable.
+                continue;
+            }
+            debug!(
+                "Reaping stale slot build {} (PID {}) targeting {}",
+                proc_name,
+                pid,
+                slot_target_dir.display()
+            );
+            if process.kill() {
+                killed_for_name += 1;
+            } else {
+                to_fallback.push(pid);
             }
         }
 
@@ -130,19 +220,14 @@ pub async fn cleanup_orphaned_build_processes() {
             }
         }
 
-        if killed_for_name > 0 {
-            debug!(
-                "Killed {} orphaned {} process(es)",
-                killed_for_name, proc_name
-            );
-            killed_total += killed_for_name;
-        }
+        killed_total += killed_for_name;
     }
 
     if killed_total > 0 {
         info!(
-            "cleanup_orphaned_build_processes: killed {} orphan cargo/rustc process(es)",
-            killed_total
+            "cleanup_orphaned_slot_processes: reaped {} stale cargo/rustc process(es) targeting {}",
+            killed_total,
+            slot_target_dir.display()
         );
     }
 }
@@ -498,6 +583,94 @@ pub async fn remove_runner_app_data_dirs(
 #[cfg(test)]
 mod tests {
     use crate::process::instance_config_dir;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    fn os(v: &str) -> OsString {
+        OsString::from(v)
+    }
+
+    /// A cargo process whose env sets `CARGO_TARGET_DIR` to the slot dir is ours.
+    #[test]
+    fn targets_slot_via_cargo_target_dir_env() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-0");
+        let environ = vec![
+            os("PATH=C:\\bin"),
+            os(r"CARGO_TARGET_DIR=D:\qontinui-root\qontinui-runner\target-pool\slot-0"),
+        ];
+        assert!(super::process_targets_slot(&environ, &[], slot));
+    }
+
+    /// Case-insensitive path match + a trailing separator must not defeat it.
+    #[test]
+    fn targets_slot_case_and_trailing_sep_insensitive() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-1");
+        let environ = vec![os(
+            r"cargo_target_dir=d:\QONTINUI-ROOT\qontinui-runner\target-pool\slot-1\",
+        )];
+        assert!(super::process_targets_slot(&environ, &[], slot));
+    }
+
+    /// A rustc argv `--out-dir <slot>/debug/deps` is ours even without env.
+    #[test]
+    fn targets_slot_via_rustc_out_dir_argv() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-2");
+        let cmd = vec![
+            os("rustc.exe"),
+            os("--out-dir"),
+            os(r"D:\qontinui-root\qontinui-runner\target-pool\slot-2\debug\deps"),
+        ];
+        assert!(super::process_targets_slot(&[], &cmd, slot));
+    }
+
+    /// A PEER agent's worktree build (different target dir) is NOT ours — this
+    /// is the whole point of the fix; the old code killed it.
+    #[test]
+    fn does_not_target_peer_worktree_build() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-0");
+        let environ = vec![os(
+            r"CARGO_TARGET_DIR=D:\qontinui-root\qontinui-runner-utf8\target",
+        )];
+        let cmd = vec![
+            os("rustc.exe"),
+            os("--out-dir"),
+            os(r"D:\qontinui-root\qontinui-runner-utf8\target\debug\deps"),
+        ];
+        assert!(!super::process_targets_slot(&environ, &cmd, slot));
+    }
+
+    /// Another pool slot's build is NOT reaped by this slot's cleanup (fixes the
+    /// concurrent-slot self-sabotage).
+    #[test]
+    fn does_not_target_sibling_pool_slot() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-0");
+        let environ = vec![os(
+            r"CARGO_TARGET_DIR=D:\qontinui-root\qontinui-runner\target-pool\slot-1",
+        )];
+        assert!(!super::process_targets_slot(&environ, &[], slot));
+    }
+
+    /// Boundary: a cleanup for `slot-1` must NOT match `slot-10`'s argv (the
+    /// `slot-1` string is a prefix of `slot-10`). Guards the pool-size ≥ 11 case.
+    #[test]
+    fn slot_1_does_not_match_slot_10_argv() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-1");
+        let cmd = vec![
+            os("rustc.exe"),
+            os("--out-dir"),
+            os(r"D:\qontinui-root\qontinui-runner\target-pool\slot-10\debug\deps"),
+        ];
+        assert!(!super::process_targets_slot(&[], &cmd, slot));
+    }
+
+    /// SAFE DEGRADE: unreadable env AND cmd ⇒ not ours ⇒ do not kill. This is
+    /// the inversion of the old "kill everything" default and the reason the fix
+    /// can never again take out a peer build it failed to classify.
+    #[test]
+    fn empty_environ_and_cmd_is_not_a_kill() {
+        let slot = Path::new(r"D:\qontinui-root\qontinui-runner\target-pool\slot-0");
+        assert!(!super::process_targets_slot(&[], &[], slot));
+    }
 
     /// The write side and the reap side must resolve the SAME directory.
     ///
