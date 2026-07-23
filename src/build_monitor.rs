@@ -12,7 +12,7 @@ use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
 use crate::process::manager::{BuildProvenance, BuildSource};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
-    cleanup_orphaned_build_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
+    cleanup_orphaned_slot_processes, find_pids_holding_exe, kill_by_pid, pid_exe_path,
 };
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
@@ -474,9 +474,12 @@ pub async fn run_cargo_build_with_dir_detailed(
     // (Non-primary runners now use copied exes, but stop any still using the original.)
     stop_exe_runners_for_build(state).await;
 
-    // Cleanup orphaned build processes first
+    // Reap stale cargo/rustc left building into THIS slot by a previous build
+    // (e.g. after a supervisor crash), so the slot's target/exe is not locked.
+    // Slot-scoped on purpose: a machine-wide kill would take out peer agents'
+    // worktree builds and sibling pool slots mid-compile.
     #[cfg(target_os = "windows")]
-    cleanup_orphaned_build_processes().await;
+    cleanup_orphaned_slot_processes(&slot.target_dir).await;
 
     // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit).
     // If the lock persists, identify the holder and kill orphans / stop registered temp runners.
