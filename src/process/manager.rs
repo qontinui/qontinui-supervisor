@@ -1521,6 +1521,12 @@ async fn start_exe_mode_for_runner(
     // any slot with an exe on disk; then the legacy single-target path for
     // cases where no parallel build has run yet (e.g. pre-pool-era builds
     // or manual `cargo build` invocations).
+    // Provenance of the artifact we end up resolving, recorded on the runner so
+    // `GET /runners` can answer "which COMMIT is this runner running?" exactly,
+    // rather than the mtime approximation `stale_binary` gives. Set in each
+    // resolution branch below; left `None` (honest unknown) when the artifact
+    // carries no provenance record.
+    let mut resolved_provenance: Option<BuildProvenance> = None;
     let source_exe = {
         let override_path = managed.source_exe_override.read().await.clone();
         match override_path {
@@ -1529,6 +1535,21 @@ async fn start_exe_mode_for_runner(
                     "Runner '{}' pinned to source exe override {:?}",
                     managed.config.name, p
                 );
+                // The only producer of `source_exe_override` today is a
+                // `use_lkg: true` spawn, so the LKG record IS this exe's
+                // provenance — but only claim that when the override actually
+                // points at the LKG exe. A future override producer aiming
+                // elsewhere must not silently inherit the LKG's sha.
+                if p == state.config.lkg_exe_path() {
+                    if let Some(info) = state.build_pool.last_known_good.read().await.as_ref() {
+                        resolved_provenance = Some(BuildProvenance {
+                            sha: info.sha.clone(),
+                            source: info.source,
+                            built_from: p.to_string_lossy().to_string(),
+                            built_at: info.built_at.to_rfc3339(),
+                        });
+                    }
+                }
                 p
             }
             Some(p) => {
@@ -1569,6 +1590,9 @@ async fn start_exe_mode_for_runner(
                             .iter()
                             .find(|s| s.id == picked_id)
                             .and_then(|s| read_slot_provenance(&s.target_dir));
+                        // Same single pick the gate evaluates, so the recorded
+                        // provenance always describes the exe actually deployed.
+                        resolved_provenance = prov.clone();
                         if let Some(StartProvenanceWarning(msg)) =
                             start_provenance_gate(is_temp, picked_id, prov.as_ref())?
                         {
@@ -1600,6 +1624,11 @@ async fn start_exe_mode_for_runner(
             }
         }
     };
+    // Publish before the (fallible) copy+spawn below: the provenance describes
+    // the artifact we RESOLVED, which is a fact regardless of whether the
+    // subsequent copy or process start succeeds — and a failed start is exactly
+    // when an operator most wants to know which binary was about to run.
+    *managed.build_provenance.write().await = resolved_provenance;
 
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.

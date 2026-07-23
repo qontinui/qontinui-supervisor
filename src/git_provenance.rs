@@ -39,6 +39,68 @@ use tracing::debug;
 
 use crate::error::SupervisorError;
 
+/// The canonical "latest merged truth" ref every supervisor-owned build
+/// defaults to.
+///
+/// Single source of truth so the spawn-test default, the primary rebuild path
+/// and the provenance classification can never name three different strings.
+pub const ORIGIN_MAIN_REF: &str = "origin/main";
+
+/// Is `git_ref` the canonical remote main branch?
+///
+/// Deliberately CONSERVATIVE: only the remote-tracking ref counts. A LOCAL
+/// `main` is just another working branch — it can sit behind `origin/main` or
+/// carry unpushed commits, so treating it as canonical would re-introduce the
+/// exact "built something that isn't merged truth" class of bug this module
+/// exists to detect.
+///
+/// Used to decide whether a prepared worktree is provenance-classified
+/// `BuildSource::OriginMain` (vouched, LKG-eligible) or `Override` (foreign).
+pub fn is_canonical_main_ref(git_ref: &str) -> bool {
+    matches!(git_ref.trim(), ORIGIN_MAIN_REF | "refs/remotes/origin/main")
+}
+
+/// Does `descendant` contain `ancestor`? — `git merge-base --is-ancestor`.
+///
+/// This is the COMMIT-based answer to "is my fix in this binary?", as opposed
+/// to the mtime-based guess `GET /lkg/coverage` originally offered. Returns
+/// `None` when the question is not computable (either sha unknown to this
+/// object database, not a repo, git missing) — an honest "unknown" that a
+/// caller must not read as `false`.
+///
+/// No fetch is performed: both shas are expected to already be in the local
+/// object db (the LKG sha was produced by a local build; the caller's sha
+/// comes from a local branch). Callers that need origin freshness call
+/// [`fetch_origin`] first.
+pub async fn contains_commit(repo_root: &Path, ancestor: &str, descendant: &str) -> Option<bool> {
+    // Both endpoints must resolve, else the `--is-ancestor` exit-1 would be
+    // indistinguishable from "unknown sha" and we'd report a false `false`.
+    for sha in [ancestor, descendant] {
+        match git(
+            &["rev-parse", "--verify", &format!("{sha}^{{commit}}")],
+            repo_root,
+            false,
+        )
+        .await
+        {
+            Ok(s) if !s.is_empty() => {}
+            _ => {
+                debug!("contains_commit: {sha} does not resolve in {repo_root:?} — not computable");
+                return None;
+            }
+        }
+    }
+    Some(
+        git(
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            repo_root,
+            false,
+        )
+        .await
+        .is_ok(),
+    )
+}
+
 /// Drift of a built tree's SHA relative to `origin/main`.
 ///
 /// Computed by [`origin_main_drift`]. Serialized verbatim into the
@@ -284,6 +346,71 @@ mod tests {
         git_in(dir, &["remote", "add", "origin", &dir_str]);
         git_in(dir, &["fetch", "-q", "origin"]);
         sha
+    }
+
+    /// Only the REMOTE-tracking main is canonical. A local `main` is just
+    /// another working branch — it can lag origin/main or hold unpushed
+    /// commits — so vouching for it would re-open the staleness hole this
+    /// module exists to close.
+    #[test]
+    fn is_canonical_main_ref_accepts_only_the_remote_tracking_ref() {
+        assert!(is_canonical_main_ref("origin/main"));
+        assert!(is_canonical_main_ref("refs/remotes/origin/main"));
+        // Surrounding whitespace is tolerated (query/JSON round-trips).
+        assert!(is_canonical_main_ref("  origin/main "));
+
+        for not_canonical in [
+            "main",
+            "master",
+            "origin/master",
+            "origin/main-2",
+            "upstream/main",
+            "refs/heads/main",
+            "",
+            "HEAD",
+        ] {
+            assert!(
+                !is_canonical_main_ref(not_canonical),
+                "{not_canonical:?} must NOT be treated as canonical main"
+            );
+        }
+    }
+
+    /// `contains_commit` is the COMMIT-based answer that mtimes cannot give:
+    /// an ancestor is contained, a later commit is not, and an unknown sha is
+    /// `None` (not computable) rather than a false `false`.
+    #[tokio::test]
+    async fn contains_commit_answers_ancestry_and_reports_unknown_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let base = init_repo_with_self_origin(dir);
+        let later = commit_file(dir, "later.txt", "later");
+
+        assert_eq!(
+            contains_commit(dir, &base, &later).await,
+            Some(true),
+            "an ancestor IS contained in the later build"
+        );
+        assert_eq!(
+            contains_commit(dir, &later, &base).await,
+            Some(false),
+            "a commit made after the build is provably ABSENT from it"
+        );
+        assert_eq!(
+            contains_commit(dir, &base, &base).await,
+            Some(true),
+            "a commit contains itself"
+        );
+
+        // An unknown sha is NOT computable. Reporting `false` here would be the
+        // dangerous lie — a caller would conclude their fix is missing.
+        let unknown = "0".repeat(40);
+        assert_eq!(contains_commit(dir, &unknown, &later).await, None);
+        assert_eq!(contains_commit(dir, &base, &unknown).await, None);
+
+        // Not a git repo at all ⇒ also not computable, never a panic.
+        let empty = TempDir::new().unwrap();
+        assert_eq!(contains_commit(empty.path(), &base, &later).await, None);
     }
 
     /// Up-to-date: built SHA == origin/main ⇒ behind_count 0, is_ancestor true.

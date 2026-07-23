@@ -261,20 +261,22 @@ pub enum BuildSourceKind {
     /// `build_dir_override == None`). Legacy default. SHA probed from the live
     /// tree root.
     LiveTree,
-    /// A supervisor-materialized `origin/main` worktree (the default primary
-    /// rebuild path). `build_dir_override` is the worktree's `src-tauri`; the
-    /// SHA is `prepare_worktree`'s `resolved_sha` (the exact origin/main commit
-    /// that was checked out), carried here so provenance records merged truth
-    /// rather than re-probing.
+    /// A supervisor-materialized `origin/main` worktree. Produced by BOTH
+    /// default build paths: the primary rebuild AND `spawn-test {rebuild:true}`
+    /// with no provenance selector. `build_dir_override` is the worktree's
+    /// `src-tauri`; the SHA is `prepare_worktree`'s `resolved_sha` (the exact
+    /// origin/main commit that was checked out), carried here so provenance
+    /// records merged truth rather than re-probing.
     OriginMain { resolved_sha: String },
-    /// A foreign override tree the supervisor does not vouch for (spawn-test
-    /// `git_ref` / `worktree_path`). `build_dir_override` is its `src-tauri`;
-    /// SHA probed from that tree root. Excluded from LKG + non-temp start.
+    /// A foreign override tree the supervisor does not vouch for — a spawn-test
+    /// `git_ref` naming a NON-canonical-main ref, or a caller-owned
+    /// `worktree_path`. `build_dir_override` is its `src-tauri`; SHA probed
+    /// from that tree root. Excluded from LKG + non-temp start.
     Override,
 }
 
 impl BuildSourceKind {
-    fn build_source(&self) -> BuildSource {
+    pub fn build_source(&self) -> BuildSource {
         match self {
             BuildSourceKind::LiveTree => BuildSource::LiveTree,
             BuildSourceKind::OriginMain { .. } => BuildSource::OriginMain,
