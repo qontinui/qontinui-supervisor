@@ -398,16 +398,21 @@ pub async fn update(State(_state): State<SharedState>) -> Response {
 }
 
 /// `GET /ci-runner/status` — Return the current CI runner state.
+///
+/// This is a hot path polled by the CI Runner settings panel every 10 s, so it
+/// must be fast: it reads the state cached by the 30 s probe loop
+/// (`ci_runner_probe`) and does no WSL work of its own. `installed` is cached
+/// alongside `status`/`labels`/`service_names` — previously this handler
+/// recomputed it per request via a `spawn_blocking` WSL cold-spawn (18–35 s),
+/// which aborted the frontend fetch and surfaced a spurious "Failed to reach
+/// supervisor" banner even though the supervisor was up.
 pub async fn status(State(state): State<SharedState>) -> Json<CiRunnerStatusResponse> {
     let ci_state = state.ci_runner_state.read().await;
-    let installed = tokio::task::spawn_blocking(ci_runner_lifecycle::is_runner_installed)
-        .await
-        .unwrap_or(false);
     Json(CiRunnerStatusResponse {
         runner_status: ci_state.status.as_str().to_string(),
         labels: ci_state.labels.clone(),
         service_names: ci_state.service_names.clone(),
-        installed,
+        installed: ci_state.installed,
     })
 }
 

@@ -52,6 +52,12 @@ pub struct CiRunnerState {
     pub status: CiRunnerStatus,
     pub labels: Vec<String>,
     pub service_names: Vec<String>,
+    /// Whether a runner is configured (`~/actions-runner/.runner` exists).
+    /// Cached here by the 30 s probe loop so the `/ci-runner/status` hot path
+    /// never pays a per-request WSL cold-spawn — a raw `wsl.exe` invocation
+    /// measures 18–35 s on Windows, which was aborting the frontend fetch and
+    /// surfacing a spurious "Failed to reach supervisor" banner.
+    pub installed: bool,
 }
 
 impl Default for CiRunnerState {
@@ -60,6 +66,7 @@ impl Default for CiRunnerState {
             status: CiRunnerStatus::Offline,
             labels: Vec::new(),
             service_names: Vec::new(),
+            installed: false,
         }
     }
 }
@@ -113,13 +120,29 @@ impl RestartTracker {
 /// Returns the aggregate state: service names discovered, labels parsed
 /// from the runner config, and overall status (idle/busy/offline).
 pub fn probe_ci_runners() -> CiRunnerState {
+    // Step 0: Cache whether a runner is configured. This is the value the
+    // `/ci-runner/status` hot path used to recompute per request via a
+    // spawn_blocking WSL call (18–35 s cold-spawn); probing it once here and
+    // caching it collapses that endpoint to a lock read. Probed independently
+    // of service discovery so `installed` is honest even when no service is
+    // active (a configured-but-stopped runner).
+    let installed = crate::ci_runner_lifecycle::is_runner_installed();
+
     // Step 1: List active actions.runner.* services.
     let service_names = match list_runner_services() {
         Ok(names) if !names.is_empty() => names,
-        Ok(_) => return CiRunnerState::default(),
+        Ok(_) => {
+            return CiRunnerState {
+                installed,
+                ..CiRunnerState::default()
+            }
+        }
         Err(e) => {
             tracing::debug!("ci_runner_probe: failed to list services: {}", e);
-            return CiRunnerState::default();
+            return CiRunnerState {
+                installed,
+                ..CiRunnerState::default()
+            };
         }
     };
 
@@ -144,6 +167,7 @@ pub fn probe_ci_runners() -> CiRunnerState {
         status,
         labels,
         service_names,
+        installed,
     }
 }
 
