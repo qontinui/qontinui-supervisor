@@ -52,11 +52,16 @@ pub struct CiRunnerState {
     pub status: CiRunnerStatus,
     pub labels: Vec<String>,
     pub service_names: Vec<String>,
-    /// Whether a runner is configured (`~/actions-runner/.runner` exists).
-    /// Cached here by the 30 s probe loop so the `/ci-runner/status` hot path
-    /// never pays a per-request WSL cold-spawn — a raw `wsl.exe` invocation
-    /// measures 18–35 s on Windows, which was aborting the frontend fetch and
-    /// surfacing a spurious "Failed to reach supervisor" banner.
+    /// Whether a CI runner is installed on this host. Derived by the probe
+    /// loop from service discovery (a discovered `actions.runner.*` service is
+    /// itself proof of an install), with a `~/actions-runner/.runner`
+    /// filesystem fallback for the classic tarball layout — see
+    /// `derive_installed`. Deriving from services (rather than the filesystem
+    /// check alone) is what makes this honest for systemd/service installs at
+    /// any path. Cached here by the 30 s probe loop so the `/ci-runner/status`
+    /// hot path never pays a per-request WSL cold-spawn — a raw `wsl.exe`
+    /// invocation measures 18–35 s on Windows, which was aborting the frontend
+    /// fetch and surfacing a spurious "Failed to reach supervisor" banner.
     pub installed: bool,
 }
 
@@ -120,27 +125,28 @@ impl RestartTracker {
 /// Returns the aggregate state: service names discovered, labels parsed
 /// from the runner config, and overall status (idle/busy/offline).
 pub fn probe_ci_runners() -> CiRunnerState {
-    // Step 0: Cache whether a runner is configured. This is the value the
-    // `/ci-runner/status` hot path used to recompute per request via a
-    // spawn_blocking WSL call (18–35 s cold-spawn); probing it once here and
-    // caching it collapses that endpoint to a lock read. Probed independently
-    // of service discovery so `installed` is honest even when no service is
-    // active (a configured-but-stopped runner).
-    let installed = crate::ci_runner_lifecycle::is_runner_installed();
-
-    // Step 1: List active actions.runner.* services.
+    // Step 1: List active actions.runner.* services. A discovered
+    // `actions.runner.*` service is itself proof of an install, so the
+    // `installed` flag is derived from service discovery (see
+    // `derive_installed`) rather than an independent filesystem check. That
+    // makes it honest for systemd/service installs at *any* path — not just
+    // the classic `~/actions-runner/.runner` tarball layout the old check
+    // hard-coded — and it can never disagree with the services the probe
+    // already found. When no service is discovered, `derive_installed` falls
+    // back to the filesystem check so a configured-but-unregistered
+    // classic-layout runner is still recognized.
     let service_names = match list_runner_services() {
         Ok(names) if !names.is_empty() => names,
         Ok(_) => {
             return CiRunnerState {
-                installed,
+                installed: derive_installed(&[], crate::ci_runner_lifecycle::is_runner_installed),
                 ..CiRunnerState::default()
             }
         }
         Err(e) => {
             tracing::debug!("ci_runner_probe: failed to list services: {}", e);
             return CiRunnerState {
-                installed,
+                installed: derive_installed(&[], crate::ci_runner_lifecycle::is_runner_installed),
                 ..CiRunnerState::default()
             };
         }
@@ -163,12 +169,39 @@ pub fn probe_ci_runners() -> CiRunnerState {
         CiRunnerStatus::Idle
     };
 
+    // `service_names` is non-empty here, so `installed` is `true` without any
+    // WSL filesystem round-trip (the `||` fallback short-circuits).
+    let installed = derive_installed(
+        &service_names,
+        crate::ci_runner_lifecycle::is_runner_installed,
+    );
+
     CiRunnerState {
         status,
         labels,
         service_names,
         installed,
     }
+}
+
+/// Derive whether a CI runner is installed on this host from the discovered
+/// service list, with a filesystem fallback.
+///
+/// A discovered `actions.runner.*` service is itself proof of an install and
+/// covers systemd/service installs at *any* path — so a non-empty
+/// `service_names` sets `installed` on its own, with no path/layout
+/// assumption. This is a single source of truth that cannot disagree with the
+/// services the probe already found (the exact defect the old independent WSL
+/// `~/actions-runner/.runner` check produced: `installed: false` while runner
+/// services were actively busy).
+///
+/// When no service is discovered, `fs_fallback` is consulted so a classic
+/// tarball-layout runner that was configured (`~/actions-runner/.runner`
+/// present) but never registered as a service is still recognized. `||`
+/// short-circuits, so the (WSL cold-spawn) fallback runs only when it is
+/// actually needed.
+fn derive_installed(service_names: &[String], fs_fallback: impl FnOnce() -> bool) -> bool {
+    !service_names.is_empty() || fs_fallback()
 }
 
 /// List `actions.runner.*` systemd services via WSL.
@@ -492,5 +525,30 @@ mod tests {
         let result = try_restart_ci_runner("actions.runner.test; rm -rf /");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("suspicious"));
+    }
+
+    #[test]
+    fn derive_installed_true_when_service_present_without_runner_file() {
+        // A discovered systemd/service runner with NO ~/actions-runner/.runner
+        // file must still report installed: true — this is the systemd
+        // false-negative the fix targets. The filesystem fallback must not even
+        // be consulted (short-circuit), so we panic if it runs.
+        let services = vec!["actions.runner.qontinui-qontinui-coord.spaceship-wsl".to_string()];
+        assert!(derive_installed(&services, || panic!(
+            "fs fallback must not run when a runner service is discovered"
+        )));
+    }
+
+    #[test]
+    fn derive_installed_false_when_no_runner_of_any_style() {
+        // No service discovered AND no classic-layout runner file ⇒ not installed.
+        assert!(!derive_installed(&[], || false));
+    }
+
+    #[test]
+    fn derive_installed_true_when_classic_layout_file_present_but_no_service() {
+        // Configured-but-unregistered classic tarball runner: no service, but
+        // ~/actions-runner/.runner exists ⇒ the fs fallback keeps installed: true.
+        assert!(derive_installed(&[], || true));
     }
 }
