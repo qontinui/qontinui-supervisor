@@ -1,22 +1,21 @@
-# qontinui-supervisor cargo config — Row 2 Phase 2 sccache defaults +
+# qontinui-supervisor cargo config — sccache defaults (local-disk backend) +
 # Row 2 Phase 3 path-remap.
 #
-# Mirrors qontinui-runner/src-tauri/.cargo/config.toml. Supervisor
-# build-pool slots produce runner binaries; with sccache in place each
-# slot's rustc compile units land in the canonical S3-backed cache
-# and become reusable across slots and across cloud-burst CI workers.
-#
-# RUSTC_WRAPPER is set per-shell (dev-start.ps1 / cargo-guard.sh / CI
-# workflow `env:` block), NOT pinned here — CI runners without sccache
-# installed would otherwise fail.
-#
+# Cut over from shared AWS S3 (qontinui-sccache, us-east-1) to the machine-
+# default local disk on 2026-07-23, after the S3 backend was proven to cause a
+# client-pileup build stall (~3-4s/op latency, ~0-2.5% hit rate, serialized
+# through one sccache server → a ~100-client pileup that stalled all cargo
+# builds under fleet concurrency). See
+# plans/2026-07-23-sccache-client-pileup-root-cause.md. Local disk is sub-ms and
+# pileup-proof; the S3 goal of cross-machine sharing was never realized (0%
+# cross-worktree hit). SCCACHE_DIR / SCCACHE_CACHE_SIZE are intentionally NOT
+# pinned here (a hardcoded path would break other machines + CI-Linux) — sccache
+# uses its machine default; per-machine overrides go in User-scope env.
+# RUSTC_WRAPPER stays opt-in/unpinned (export RUSTC_WRAPPER=sccache); CI sets no
+# sccache env, so this change is inert in CI.
 # See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3.
 
 [env]
-SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
-SCCACHE_REGION = { value = "us-east-1", force = false }
-SCCACHE_S3_USE_SSL = { value = "off", force = false }
-SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
 # Ξ_sccache: Docker/WSL hold sccache's default port 4226 on the build hosts;
 # clients that land there wedge ("version mismatch") + respawn. Pin off 4226 so
 # every cargo-spawned sccache client agrees on the port regardless of OS-env
