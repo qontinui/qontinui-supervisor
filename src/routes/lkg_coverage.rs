@@ -31,10 +31,26 @@
 //! fields are redundant by design — callers gate decisions on `covered`,
 //! and the signed delta is for human inspection.
 //!
+//! ## MTIME vs COMMITS (read this before trusting `covered`)
+//!
+//! Everything named `covered` / `*_mtime` / `*_secs` below is **mtime-based**.
+//! An mtime cannot tell you which *commits* a binary contains: `git checkout`
+//! rewrites mtimes wholesale, so a binary built from a branch parked 72 commits
+//! behind `origin/main` looks perfectly fresh while missing all 72. That is
+//! exactly how a landed fix came to read as a regression.
+//!
+//! The `commit_provenance` block answers the commit question exactly:
+//! `lkg_sha`, `lkg_source`, `behind_origin_main`, `is_ancestor_of_origin_main`.
+//! To settle "is MY fix in this binary?", pass `?contains=<sha>` and read
+//! `commit_provenance.contains` — it is `git merge-base --is-ancestor <sha>
+//! <lkg_sha>`, computed server-side. `null` means *not computable*, and must
+//! never be read as `false`.
+//!
 //! ## Query
 //!
 //! `path` is repeatable: `?path=foo.rs&path=bar.rs` checks both files in one
-//! request. Single-file callers (the common case) use it once. Paths may be
+//! request. `contains=<sha>` is single-valued (last wins) and adds the
+//! commit-containment answer described above. Single-file callers (the common case) use it once. Paths may be
 //! absolute, or relative to the supervisor's `--project-dir`
 //! (`qontinui-runner/src-tauri/`). Relative paths are resolved against
 //! `state.config.project_dir`.
@@ -174,6 +190,44 @@ pub struct CoverageResponse {
     /// True iff every requested file is `covered: true`. `false` when there
     /// are no files OR when LKG is absent OR when any file is not covered.
     pub all_covered: bool,
+    /// COMMIT-based provenance of the LKG binary. Every field above this one
+    /// is mtime-based and therefore can only ever *guess*; this block answers
+    /// the question that actually matters — "which commit is in this binary?"
+    /// — exactly. `None` when there is no LKG yet.
+    pub commit_provenance: Option<CommitProvenance>,
+}
+
+/// Commit-level provenance of the LKG binary, plus the answer to an optional
+/// `?contains=<sha>` question.
+///
+/// Why this exists: `covered` / `file_newer_than_lkg_secs` compare **mtimes**.
+/// An mtime says nothing about which commits a binary contains — a `git
+/// checkout` rewrites mtimes wholesale, and a build from a branch parked 72
+/// commits behind `origin/main` has a perfectly fresh mtime while missing every
+/// one of those commits. That is precisely how a landed fix came to read as a
+/// regression. These fields are derived from git history instead, so the answer
+/// is exact rather than inferred.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct CommitProvenance {
+    /// Full 40-char git SHA the LKG binary was built from. `None` when the
+    /// build-time git probe failed or the record predates sha recording.
+    pub lkg_sha: Option<String>,
+    /// How that tree was classified — `live_tree` / `origin_main` / `override`.
+    /// `None` when unrecorded.
+    pub lkg_source: Option<String>,
+    /// Commits `origin/main` is ahead of `lkg_sha`. `None` when not computable.
+    pub behind_origin_main: Option<u32>,
+    /// `false` ⇒ the LKG sha is NOT on `origin/main`'s history (built from a
+    /// feature branch — the dangerous case). `None` when not computable.
+    pub is_ancestor_of_origin_main: Option<bool>,
+    /// Echo of the `?contains=<sha>` query, when supplied.
+    pub contains_query: Option<String>,
+    /// `Some(true)` ⇔ `git merge-base --is-ancestor <contains_query> <lkg_sha>`
+    /// succeeds, i.e. **that commit IS in this binary**. `Some(false)` ⇔ it is
+    /// provably absent. `None` ⇔ not computable (no `contains` asked, no LKG
+    /// sha, or either sha is unknown to the local object database) — `None`
+    /// must NEVER be read as `false`.
+    pub contains: Option<bool>,
 }
 
 /// Number of seconds an LKG can age before `lkg_stale` flips to `true`.
@@ -186,7 +240,7 @@ pub const LKG_STALE_THRESHOLD_SECS: i64 = 86_400;
 /// One-line semantics summary embedded in every `/lkg/coverage` response.
 /// Kept as a single source of truth so the Rust doc-comments and the
 /// runtime payload can't drift.
-pub const COVERAGE_DESCRIPTION: &str = "covered=true means the file's content is in the LKG binary (file mtime <= lkg_built_at). file_newer_than_lkg_secs > 0 means the file was edited AFTER the LKG was built (covered=false, rebuild needed). Negative means file is older than LKG (covered=true).";
+pub const COVERAGE_DESCRIPTION: &str = "covered=true means the file's content is in the LKG binary (file mtime <= lkg_built_at). file_newer_than_lkg_secs > 0 means the file was edited AFTER the LKG was built (covered=false, rebuild needed). Negative means file is older than LKG (covered=true). NOTE: these are MTIME-based and cannot tell you which COMMITS a binary contains — a checkout rewrites mtimes wholesale. For that, read `commit_provenance` (lkg_sha, behind_origin_main, is_ancestor_of_origin_main) or ask directly with ?contains=<sha>, which answers `git merge-base --is-ancestor <sha> <lkg_sha>`.";
 
 /// Stable string values for `FileCoverage.reason`. Exposed as constants so
 /// tests and downstream callers can match on them without hard-coding
@@ -253,6 +307,32 @@ pub fn parse_path_params(raw: Option<&str>) -> Vec<String> {
         out.push(percent_decode(v));
     }
     out
+}
+
+/// Extract the LAST value of a single-valued query parameter, percent-decoded.
+///
+/// Shares [`percent_decode`] and the same lenient parsing posture as
+/// [`parse_path_params`] (malformed pairs are skipped, never fatal). Last-wins
+/// so a duplicated `?contains=` is deterministic rather than arbitrary. Blank
+/// values resolve to `None` — `?contains=` with nothing after it is "no
+/// question asked", not "ask about the empty sha".
+pub fn parse_single_param(raw: Option<&str>, key: &str) -> Option<String> {
+    let raw = raw?;
+    let mut found = None;
+    for pair in raw.split('&') {
+        // A pair with no `=` is skipped, not fatal — bailing here would make a
+        // trailing `&` silently drop a valid earlier match.
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == key {
+            let decoded = percent_decode(v);
+            if !decoded.trim().is_empty() {
+                found = Some(decoded.trim().to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Minimal percent-decoder: handles `+` → space and `%XX` → byte. Anything
@@ -500,6 +580,7 @@ pub fn build_coverage_response(
         lkg_stale,
         files,
         all_covered,
+        commit_provenance: None,
     }
 }
 
@@ -511,15 +592,47 @@ pub async fn lkg_coverage(
     RawQuery(raw): RawQuery,
 ) -> Json<serde_json::Value> {
     let requested = parse_path_params(raw.as_deref());
-    let lkg_at = state
-        .build_pool
-        .last_known_good
-        .read()
-        .await
-        .as_ref()
-        .map(|info| info.built_at);
+    let lkg = state.build_pool.last_known_good.read().await.clone();
+    let lkg_at = lkg.as_ref().map(|info| info.built_at);
     let project_dir = state.config.project_dir.clone();
-    let response = build_coverage_response(&requested, &project_dir, lkg_at, Utc::now());
+    let mut response = build_coverage_response(&requested, &project_dir, lkg_at, Utc::now());
+
+    // Commit-based provenance — the exact answer the mtime fields can only
+    // approximate. Best-effort throughout: any probe failure degrades to
+    // `None` ("not computable"), never to a false negative.
+    if let Some(info) = lkg.as_ref() {
+        let contains_query = parse_single_param(raw.as_deref(), "contains");
+        // `project_dir` is `<repo>/src-tauri`; git resolves from the repo root
+        // for parity with the other provenance call sites.
+        let repo_root = project_dir.parent().unwrap_or(&project_dir).to_path_buf();
+        let (behind, is_ancestor) = match info.sha.as_deref() {
+            Some(sha) => {
+                let drift = crate::git_provenance::origin_main_drift(&repo_root, sha).await;
+                if drift.origin_main_sha.is_empty() {
+                    (None, None)
+                } else {
+                    (Some(drift.behind_count), Some(drift.is_ancestor))
+                }
+            }
+            None => (None, None),
+        };
+        let contains = match (contains_query.as_deref(), info.sha.as_deref()) {
+            (Some(q), Some(lkg_sha)) => {
+                crate::git_provenance::contains_commit(&repo_root, q, lkg_sha).await
+            }
+            _ => None,
+        };
+        response.commit_provenance = Some(CommitProvenance {
+            lkg_sha: info.sha.clone(),
+            lkg_source: serde_json::to_value(info.source)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
+            behind_origin_main: behind,
+            is_ancestor_of_origin_main: is_ancestor,
+            contains_query,
+            contains,
+        });
+    }
 
     let data = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
     Json(json!({
@@ -632,6 +745,44 @@ mod tests {
     /// platform; on Windows and Unix `std` exposes this through
     /// `File::set_modified` (stable since 1.75). All tests run on
     /// Windows in this repo so this is straightforward.
+    /// `?contains=<sha>` parsing — the entry point to the COMMIT-based answer.
+    /// Must coexist with repeated `path` params, tolerate malformed pairs, and
+    /// treat a blank value as "no question asked" rather than a query for the
+    /// empty sha.
+    #[test]
+    fn parse_single_param_extracts_contains_alongside_paths() {
+        let p = |q: &str| parse_single_param(Some(q), "contains");
+
+        assert_eq!(p("contains=abc123"), Some("abc123".to_string()));
+        assert_eq!(
+            p("path=a.rs&contains=abc123&path=b.rs"),
+            Some("abc123".to_string()),
+            "must survive repeated `path` params on either side"
+        );
+        // Last wins, so a duplicated param is deterministic.
+        assert_eq!(p("contains=aaa&contains=bbb"), Some("bbb".to_string()));
+        // Percent/plus decoding shares the `path` decoder.
+        assert_eq!(p("contains=a%62c"), Some("abc".to_string()));
+
+        // Absent / blank / whitespace-only ⇒ no question asked.
+        assert_eq!(p("path=a.rs"), None);
+        assert_eq!(p("contains="), None);
+        assert_eq!(p("contains=%20%20"), None);
+        assert_eq!(parse_single_param(None, "contains"), None);
+
+        // A pair with no `=` must be SKIPPED, not abort the scan — otherwise a
+        // stray `&flag&` would silently drop a valid `contains` after it.
+        assert_eq!(
+            p("flag&contains=abc123"),
+            Some("abc123".to_string()),
+            "a valueless pair must not swallow later params"
+        );
+        assert_eq!(p("contains=abc123&trailing"), Some("abc123".to_string()));
+
+        // Key matching is exact — no prefix bleed.
+        assert_eq!(p("contains_sha=abc"), None);
+    }
+
     fn touch_file_mtime(path: &Path, when: SystemTime) {
         let f = fs::OpenOptions::new()
             .write(true)
@@ -1059,6 +1210,7 @@ mod tests {
                 reason: super::reason::FILE_NOT_FOUND,
             }],
             all_covered: false,
+            commit_provenance: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(
@@ -1109,6 +1261,7 @@ mod tests {
                 reason: super::reason::COVERED,
             }],
             all_covered: true,
+            commit_provenance: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(
@@ -1360,6 +1513,7 @@ mod tests {
             lkg_stale: true,
             files: vec![],
             all_covered: false,
+            commit_provenance: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(
