@@ -10,6 +10,11 @@
 //! 4. On-disk artifact readers (`read_machine_device_id`,
 //!    `read_paired_user`) round-trip correctly — exercised by the inline
 //!    `#[cfg(test)] mod tests` in `runners_pair.rs` itself.
+//! 5. `target_runner_id` validation: an unregistered id is a structured 404
+//!    (`runner_not_found`); the primary and External (user-started) runners
+//!    are each a 400 (neither reads a per-instance dir). Only Temp/Named
+//!    runners are valid targets. Instance-dir resolution + read-back path
+//!    selection are covered by the inline unit tests in `runners_pair.rs`.
 //!
 //! The "CLI succeeds + on-disk artifacts present" happy-path test would
 //! require either modifying the production handler to inject the
@@ -131,6 +136,81 @@ async fn rejects_malformed_tenant_uuid() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "validation_error");
     assert!(body["message"].as_str().unwrap().contains("tenant_id"));
+}
+
+#[tokio::test]
+async fn unknown_target_runner_id_is_a_structured_404() {
+    // The registry only holds the default primary; an unknown id must be a
+    // structured 404 BEFORE any CLI resolution/spawn happens (the fixture has
+    // no qontinui_profile binary, so reaching the resolver would 500 instead).
+    let (app, _state) = build_app();
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "target_runner_id": "test-9877",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "runner_not_found");
+    assert!(body["message"].as_str().unwrap().contains("test-9877"));
+}
+
+#[tokio::test]
+async fn primary_target_runner_id_is_rejected() {
+    // The primary reads the SHARED secure-storage dir, not an instance dir —
+    // targeting it would report success while the primary never sees the
+    // credentials. Must be a 400, not a silent misdirected write.
+    let (app, _state) = build_app();
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "target_runner_id": "primary",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "validation_error");
+    assert!(body["message"].as_str().unwrap().contains("primary"));
+}
+
+#[tokio::test]
+async fn external_target_runner_id_is_rejected() {
+    // External (user-started) runners are launched outside supervisor control
+    // and never receive the `QONTINUI_SECURE_STORAGE_DIR` export that
+    // Temp/Named children get — so they read the shared dir, not an instance
+    // dir. Targeting one would report success while the runner never sees the
+    // credentials (the same divergence class as the primary). Must be a 400.
+    let mut config = test_config();
+    config.runners.push(RunnerConfig {
+        id: "user-runner-1".to_string(),
+        name: "User Runner".to_string(),
+        port: 9890,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::External,
+        ..RunnerConfig::default_primary()
+    });
+    let state = Arc::new(SupervisorState::new(config));
+    let app = Router::new()
+        .route("/runners/pair-with-token", post(pair_with_token))
+        .with_state(state);
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "target_runner_id": "user-runner-1",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "validation_error");
+    let msg = body["message"].as_str().unwrap();
+    assert!(msg.contains("user-runner-1"), "message: {msg}");
+    assert!(msg.contains("External"), "message: {msg}");
 }
 
 #[tokio::test]
