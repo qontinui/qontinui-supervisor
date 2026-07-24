@@ -32,14 +32,18 @@ use std::path::PathBuf;
 ///    child process starts.
 /// 3. **Removal side** — [`windows::remove_instance_config_dir`] reaps it when
 ///    the runner is deleted.
+/// 4. **Pair side** — `routes::runners_pair::pair_with_token` (with
+///    `target_runner_id`) exports it to the `qontinui_profile` child as
+///    `QONTINUI_SECURE_STORAGE_DIR` and reads `paired_user.json` back from it,
+///    so an existing runner can be paired in place.
 ///
-/// None of the three may compute this path independently. They used to: the
+/// None of the four may compute this path independently. They used to: the
 /// profile-write side copied into the shared `data_local_dir()` fallback while
 /// the spawn side pointed the child at the per-instance dir. Every
 /// `POST /runners/spawn-test {"paired_profile_id": …}` therefore reported
 /// success and produced an UNPAIRED runner that logged `provisioning gate
 /// (advisory): runner has NO live coord device JWT` every 15s. Funnelling all
-/// three through one function is what makes that divergence impossible.
+/// call sites through one function is what makes that divergence impossible.
 ///
 /// Note on placement: this lives here rather than beside the remover in
 /// [`windows`] because that module is `#[cfg(target_os = "windows")]` while the
@@ -58,7 +62,7 @@ use std::path::PathBuf;
 /// [`windows::remove_instance_config_dir`] would `remove_dir_all` every
 /// runner's instance dir (its `is_primary` flag does not guard that). Ids are
 /// server-generated today, so this is unreachable — but this function is `pub`
-/// and is the documented single source of truth for three call sites, so the
+/// and is the documented single source of truth for four call sites, so the
 /// guard is worth its two comparisons.
 pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
     if runner_id.is_empty() || runner_id.contains(['/', '\\']) || runner_id.contains("..") {

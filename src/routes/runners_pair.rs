@@ -10,24 +10,27 @@
 //!
 //! ## Where the paired state lands (and who reads it)
 //!
-//! The CLI writes the device-JWT + paired-user state into the SHARED
-//! `{data_local_dir}/com.qontinui.runner/`. A supervisor-spawned runner does
-//! **not** pick that up: `start_exe_mode_for_runner` points every non-primary
-//! child at its own `<config_dir>/com.qontinui.runner/instances/<runner-id>/`
-//! via `QONTINUI_CONFIG_DIR` + `QONTINUI_SECURE_STORAGE_DIR`, and the runner
-//! prefers those over the `data_local_dir()` fallback. The supported route to
-//! a paired spawn-test runner is therefore to snapshot this state into
-//! `~/.qontinui/profiles/<id>/` and pass `paired_profile_id` to
-//! `POST /runners/spawn-test`, which copies it into that runner's instance dir.
+//! The CLI writes through the runner lib's `persist_pairing`, which resolves
+//! its output dir from `QONTINUI_SECURE_STORAGE_DIR` first and falls back to
+//! the SHARED `{data_local_dir}/com.qontinui.runner/`. (The CLI's *read* path
+//! historically ignored the env var; that is fixed on the qontinui-runner
+//! branch `fix/profile-secure-storage-dir-readers` — writes were never split.)
+//! That gives this route three provisioning shapes:
 //!
-//! Closing the gap directly is a `qontinui-runner` change, not a supervisor
-//! one: `qontinui_profile`'s `paired_user_path()`
-//! (`src-tauri/src/bin/qontinui_profile.rs`) resolves `dirs::data_local_dir()`
-//! directly and ignores `QONTINUI_SECURE_STORAGE_DIR`, while the same binary's
-//! `SecureStorage::new` DOES honor it — so setting the env var on the child
-//! here would split the two credential halves across two directories. Follow-up
-//! work: make `paired_user_path()` honor the env var, then this route can
-//! target an instance dir.
+//! - **Default (no `target_runner_id`)** — the child runs with no override and
+//!   writes the shared dir, unchanged behavior. That dir is what the primary
+//!   (user-started) runner reads; supervisor-spawned runners do NOT read it.
+//! - **`target_runner_id`** — the supervisor points the child at that runner's
+//!   per-instance dir (`process::instance_config_dir`, the same single source
+//!   of truth `start_exe_mode_for_runner` exports to non-primary children as
+//!   `QONTINUI_SECURE_STORAGE_DIR`), directly pairing an EXISTING/registered
+//!   runner in place. The runner's heartbeat re-reads the token store from
+//!   disk on each tick, so a running runner picks the credentials up without
+//!   a restart.
+//! - **`paired_profile_id` on `POST /runners/spawn-test`** — the established
+//!   route for provisioning FUTURE spawns: pair into the shared dir here,
+//!   snapshot it into `~/.qontinui/profiles/<id>/`, and spawn-test copies the
+//!   snapshot into the new runner's instance dir before it starts.
 //!
 //! ## CLI invocation
 //!
@@ -49,9 +52,14 @@
 //! It does NOT print the full JSON pair-cli response, so we recover the
 //! shape by reading back the on-disk artifacts:
 //!
-//! - `device_id` from `~/.qontinui/machine.json`
+//! - `device_id` from `~/.qontinui/machine.json` (home-scoped — the SAME file
+//!   regardless of `target_runner_id`)
 //! - `user_id` from `paired_user.json` (cross-checked against the stdout line)
 //! - `tenant_id` from `paired_user.json`
+//!
+//! `paired_user.json` is read back from the SAME dir the child wrote to: the
+//! target runner's instance dir when `target_runner_id` was given, the shared
+//! `{data_local_dir}/com.qontinui.runner/` otherwise.
 //!
 //! `expires_at` is NOT surfaced — the JWT exp claim lives in the
 //! AES-encrypted `auth_tokens.enc` which we cannot decrypt from this layer.
@@ -96,6 +104,18 @@ pub struct PairWithTokenRequest {
     /// the binary via [`resolve_qontinui_profile_path`].
     #[serde(default)]
     pub qontinui_profile_path_override: Option<PathBuf>,
+
+    /// Optional runner to pair IN PLACE. When set, the paired state is
+    /// written to (and read back from) that runner's per-instance
+    /// secure-storage dir — `<config_dir>/com.qontinui.runner/instances/<id>`,
+    /// resolved through [`crate::process::instance_config_dir`], the same
+    /// single source of truth `start_exe_mode_for_runner` exports to
+    /// non-primary children — instead of the shared `data_local_dir()` dir.
+    /// The id must exist in the registry (404 `runner_not_found` otherwise)
+    /// and must not be the primary (the primary reads the shared dir; omit
+    /// this field to pair it).
+    #[serde(default)]
+    pub target_runner_id: Option<String>,
 }
 
 /// Default timeout for the spawned CLI. Pair-CLI is a single HTTPS round-trip
@@ -161,10 +181,38 @@ pub(crate) fn machine_json_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
 }
 
-/// Path to the paired-user JSON the CLI writes on successful pair. Lives
-/// under the Tauri app's local data dir alongside the encrypted JWT cache.
-pub(crate) fn paired_user_json_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+/// Path to the paired-user JSON the CLI writes on successful pair.
+///
+/// With a `target_dir` (the target runner's instance secure-storage dir, i.e.
+/// what the child saw as `QONTINUI_SECURE_STORAGE_DIR`) the file lives
+/// DIRECTLY under it — mirroring the runner lib's `paired_user_path()`, which
+/// joins `paired_user.json` onto the env-var dir without any subdirectory.
+/// Without one, the shared-dir fallback is unchanged: the Tauri app's local
+/// data dir, alongside the encrypted JWT cache.
+pub(crate) fn paired_user_json_path(target_dir: Option<&Path>) -> Option<PathBuf> {
+    match target_dir {
+        Some(dir) => Some(dir.join("paired_user.json")),
+        None => {
+            dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+        }
+    }
+}
+
+/// Resolve the per-instance secure-storage dir for `target_runner_id`.
+///
+/// Delegates to [`crate::process::instance_config_dir`] — the documented
+/// single source of truth for that path (the spawn side, the profile-write
+/// side, and the removal side all funnel through it) — so this route can
+/// never diverge from the dir `start_exe_mode_for_runner` points the runner
+/// itself at.
+pub(crate) fn pair_target_instance_dir(runner_id: &str) -> Result<PathBuf, String> {
+    crate::process::instance_config_dir(runner_id).ok_or_else(|| {
+        format!(
+            "could not resolve the per-instance config dir \
+             <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
+             dirs::config_dir() returned None or the runner id is degenerate"
+        )
+    })
 }
 
 /// `POST /runners/pair-with-token` handler.
@@ -173,7 +221,9 @@ pub(crate) fn paired_user_json_path() -> Option<PathBuf> {
 /// success. `expires_at` is always `null` — see the module docstring.
 ///
 /// Error responses:
-/// - 400 `validation_error` for missing / malformed body fields.
+/// - 400 `validation_error` for missing / malformed body fields (including a
+///   primary `target_runner_id` — the primary reads the shared dir).
+/// - 404 `runner_not_found` when `target_runner_id` names no registered runner.
 /// - 500 `qontinui_profile_not_found` when the runner binary isn't built.
 /// - 500 `pair_cli_failed` with the captured stderr + exit code.
 /// - 504 `pair_cli_timeout` when the CLI hangs beyond [`PAIR_CLI_TIMEOUT`].
@@ -204,6 +254,65 @@ pub async fn pair_with_token(
         )
             .into_response();
     }
+
+    // Resolve the optional target runner's instance dir. Unknown ids are a
+    // structured 404; only Temp/Named runners are valid targets. The primary
+    // and External (user-started) runners are rejected because they do NOT
+    // read a per-instance secure-storage dir: the primary reads the SHARED
+    // `data_local_dir()`, and External runners are launched outside supervisor
+    // control so they never receive the `QONTINUI_SECURE_STORAGE_DIR` export
+    // that `start_exe_mode_for_runner` gives Temp/Named children. Pairing
+    // either into an `instances/<id>` dir would report success while the
+    // runner never sees the credentials — the exact divergence bug documented
+    // on `process::instance_config_dir`.
+    let target_dir: Option<PathBuf> = match body.target_runner_id.as_deref() {
+        None => None,
+        Some(runner_id) => {
+            let Some(managed) = state.get_runner(runner_id).await else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "runner_not_found",
+                        "message": format!(
+                            "target_runner_id '{runner_id}' is not in the runner registry — \
+                             cannot resolve its instance secure-storage dir"
+                        ),
+                    })),
+                )
+                    .into_response();
+            };
+            // Only supervisor-spawned runners (Temp/Named) are pointed at a
+            // per-instance secure-storage dir; everything else reads the
+            // shared dir it was launched with.
+            let kind = managed.config.kind();
+            if !(kind.is_temp() || kind.is_named()) {
+                let which = if kind.is_primary() {
+                    "the primary reads the shared secure-storage dir"
+                } else {
+                    "External (user-started) runners are launched outside supervisor \
+                     control and never read a per-instance dir"
+                };
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "validation_error",
+                        "message": format!(
+                            "target_runner_id '{runner_id}' is not a supervisor-spawned \
+                             (test-*/named-*) runner — {which}. Only Temp/Named runners can \
+                             be paired in place; omit target_runner_id to pair the shared dir"
+                        ),
+                    })),
+                )
+                    .into_response();
+            }
+            match pair_target_instance_dir(runner_id) {
+                Ok(dir) => Some(dir),
+                Err(message) => {
+                    return server_error("instance_dir_unresolved", &message);
+                }
+            }
+        }
+    };
 
     // Resolve the CLI path. The override branch is for tests; production
     // callers always go through `resolve_qontinui_profile_path`.
@@ -242,8 +351,9 @@ pub async fn pair_with_token(
             LogSource::Supervisor,
             LogLevel::Info,
             format!(
-                "pair-with-token: invoking {:?} with tenant_id={} web_base_url={:?}",
-                cli_path, body.tenant_id, body.web_base_url
+                "pair-with-token: invoking {:?} with tenant_id={} web_base_url={:?} \
+                 target_runner_id={:?} secure_storage_dir={:?}",
+                cli_path, body.tenant_id, body.web_base_url, body.target_runner_id, target_dir
             ),
         )
         .await;
@@ -265,6 +375,23 @@ pub async fn pair_with_token(
         .env_remove("CLAUDECODE");
     if let Some(web_base) = &body.web_base_url {
         cmd.env("QONTINUI_WEB_BASE", web_base);
+    }
+    // Point the child at the target runner's instance dir. The runner lib's
+    // `persist_pairing` (and `SecureStorage::new`) resolve their output dir
+    // from this env var, so both credential halves — `auth_tokens.enc` and
+    // `paired_user.json` — land in the dir the target runner actually reads.
+    // Create it first: the target runner may never have started.
+    if let Some(dir) = &target_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return server_error(
+                "instance_dir_create_failed",
+                &format!(
+                    "failed to create instance secure-storage dir {}: {e}",
+                    dir.display()
+                ),
+            );
+        }
+        cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
     }
 
     let output_fut = async {
@@ -350,7 +477,9 @@ pub async fn pair_with_token(
             );
         }
     };
-    let paired_json = match paired_user_json_path() {
+    // Read back from the SAME dir the child wrote to: the target runner's
+    // instance dir when one was resolved, the shared dir otherwise.
+    let paired_json = match paired_user_json_path(target_dir.as_deref()) {
         Some(p) => p,
         None => {
             return server_error(
@@ -489,6 +618,64 @@ mod tests {
             tenant_id.as_deref(),
             Some("44444444-4444-4444-8444-444444444444")
         );
+    }
+
+    /// A known (well-formed) runner id resolves to the SAME per-instance dir
+    /// `start_exe_mode_for_runner` exports to the runner itself —
+    /// `<config_dir>/com.qontinui.runner/instances/<id>` — because both sides
+    /// funnel through `process::instance_config_dir`. If this shape drifts,
+    /// pair-with-token writes credentials into a dir the target never reads.
+    #[test]
+    fn pair_target_instance_dir_matches_spawn_side_shape() {
+        if dirs::config_dir().is_none() {
+            return;
+        }
+        let dir = pair_target_instance_dir("test-9877").expect("normal id must resolve");
+        assert_eq!(
+            Some(dir.as_path()),
+            crate::process::instance_config_dir("test-9877").as_deref(),
+            "pair side and spawn side must agree byte-for-byte on the instance dir"
+        );
+        assert!(
+            dir.ends_with(std::path::Path::new(
+                "com.qontinui.runner/instances/test-9877"
+            )),
+            "unexpected instance-dir shape: {dir:?}"
+        );
+    }
+
+    /// Degenerate ids (empty / traversal) must error, never resolve to the
+    /// shared `instances/` parent.
+    #[test]
+    fn pair_target_instance_dir_rejects_degenerate_ids() {
+        for bad in ["", "a/b", "a\\b", ".."] {
+            assert!(
+                pair_target_instance_dir(bad).is_err(),
+                "pair_target_instance_dir({bad:?}) must be an error"
+            );
+        }
+    }
+
+    /// With a target dir, `paired_user.json` is read DIRECTLY under it —
+    /// mirroring the runner lib's `paired_user_path()`, which joins the file
+    /// name onto `QONTINUI_SECURE_STORAGE_DIR` with no subdirectory.
+    #[test]
+    fn paired_user_json_path_prefers_target_dir() {
+        let dir = tempdir().unwrap();
+        let path = paired_user_json_path(Some(dir.path())).expect("target dir always resolves");
+        assert_eq!(path, dir.path().join("paired_user.json"));
+    }
+
+    /// Without a target dir, the shared-dir fallback is unchanged:
+    /// `{data_local_dir}/com.qontinui.runner/paired_user.json`.
+    #[test]
+    fn paired_user_json_path_falls_back_to_shared_dir() {
+        let Some(expected) =
+            dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+        else {
+            return;
+        };
+        assert_eq!(paired_user_json_path(None), Some(expected));
     }
 
     #[test]
