@@ -16,3 +16,7 @@ agent-worktrees/
 # .mcp.json at launch. It is a live credential and must never be committed.
 # (Was previously only in .git/info/exclude — local-only, lost on fresh clone/CI.)
 .mcp.json
+
+# MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
+# Build-environment noise on Windows dev boxes, never source.
+*.stackdump
