@@ -37,7 +37,7 @@ rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 regex = "1"
 socket2 = "0.6"
 glob = "0.3"
