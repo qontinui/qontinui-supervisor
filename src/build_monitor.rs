@@ -2447,7 +2447,14 @@ pub async fn slot_exe_holders(exe_path: &std::path::Path) -> Vec<u32> {
 ///   directly. By construction it's a zombie the supervisor lost track of —
 ///   typically a child the supervisor itself spawned that drifted out of the
 ///   registry. There is no scenario where leaving a slot binary running
-///   detached from the registry is intentional.
+///   detached from the registry is intentional. **Before killing, the holder's
+///   live image path is checked against every registered runner's
+///   `runner_exe_copy_path`** (`orphan_scan::classify_exe_owner`) — a PID the
+///   registry lost but whose image is the operator's primary/named runner is
+///   NOT an orphan, and takes the refuse-and-error path below instead. The
+///   registry's `pid` field alone is not proof of ownership: a runner the
+///   startup scan failed to adopt has `pid: None` while still being the
+///   operator's.
 /// - **Registered temp runner** holding the slot exe: stop it via the
 ///   supervisor's normal stop path. Temp runners *should* be running from a
 ///   copy in `target/debug/`; finding one running directly from the slot
@@ -2498,23 +2505,58 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
     }
 
     let runners = state.get_all_runners().await;
+    // Image-path identity table — the same deterministic ownership signal the
+    // startup orphan scan uses. The registry's `pid` field is not the only
+    // evidence of ownership: an inherited runner the scan could not adopt
+    // (its port probe failed, or it had not bound its port yet) has
+    // `pid: None` in the registry while still being the operator's process.
+    // Killing it here would just move the 2026-07-27 reap from supervisor
+    // startup to the next build.
+    let registered_exes = crate::process::orphan_scan::registered_exe_table(state).await;
     for holder_pid in holders {
         // Find the registered runner (if any) that owns this PID.
         let mut owner_match: Option<(String, bool, bool)> = None; // (id, is_temp, registry_running)
         for managed in &runners {
             let runner = managed.runner.read().await;
             if runner.pid == Some(holder_pid) && runner.running {
-                let is_temp = crate::process::manager::is_temp_runner(&managed.config.id);
+                let is_temp = managed.config.kind().is_temp();
                 owner_match = Some((managed.config.id.clone(), is_temp, true));
                 break;
             }
         }
 
+        // Second ownership signal, independent of the registry's `pid`: does
+        // this PID's live image path belong to a registered non-temp runner?
+        if owner_match.is_none() {
+            if let Some(live_exe) = resolve_pid_exe_path(holder_pid).await {
+                if let crate::process::orphan_scan::ExeOwner::Registered {
+                    runner_id,
+                    is_temp: false,
+                } = crate::process::orphan_scan::classify_exe_owner(&live_exe, &registered_exes)
+                {
+                    let msg = format!(
+                        "Slot {} exe held by PID {}, which the registry does not claim but whose \
+                         image {:?} IS user-owned runner '{}'. Refusing to kill a user-managed \
+                         runner. Stop it via the supervisor API, or investigate why the startup \
+                         orphan scan did not adopt it.",
+                        slot.id, holder_pid, live_exe, runner_id
+                    );
+                    error!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Build, LogLevel::Error, &msg)
+                        .await;
+                    return Err(SupervisorError::Other(msg));
+                }
+            }
+        }
+
         match owner_match {
             None => {
-                // Orphan — no registered runner claims this PID, or the entry
-                // that claims it has running=false / pid=None. Either way the
-                // supervisor cannot reach it via its API; kill directly.
+                // Orphan — no registered runner claims this PID by pid or by
+                // image path, or the entry that claims it has running=false /
+                // pid=None. Either way the supervisor cannot reach it via its
+                // API; kill directly.
                 warn!(
                     "Slot {} exe held by orphan PID {} (no registered runner claims it). Killing.",
                     slot.id, holder_pid

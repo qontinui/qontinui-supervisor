@@ -40,7 +40,8 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     EndpointEntry {
         method: "POST",
         path: "/supervisor/restart",
-        summary: "Self-restart supervisor (runners are left running)",
+        summary: "Self-restart supervisor (user-owned runners — primary, named, \
+                  external — are left running; temp runners are reaped)",
     },
     EndpointEntry {
         method: "POST",

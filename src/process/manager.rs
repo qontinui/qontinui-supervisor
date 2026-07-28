@@ -1183,13 +1183,18 @@ pub async fn start_managed_runner(
         runner_name, pid, port
     );
 
-    // Assign the spawned process to the supervisor's kill-on-exit JobObject.
-    // When the supervisor process dies (graceful exit, panic, force-kill, or
-    // BSOD), the kernel closes the last handle to the job and terminates
-    // every assigned process per `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-    // WebView2 children of the runner are transitively in the job too —
-    // Windows assigns child processes of a job-tracked process to the same
-    // job by default.
+    // Route the spawned process to the supervisor's kill-on-exit JobObject —
+    // but ONLY if it is a supervisor-owned ephemeral. When the supervisor
+    // process dies (graceful exit, panic, force-kill, or BSOD), the kernel
+    // closes the last handle to the job and terminates every assigned process
+    // per `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. WebView2 children of the
+    // runner are transitively in the job too — Windows assigns child
+    // processes of a job-tracked process to the same job by default.
+    //
+    // A process cannot be removed from a Windows job once assigned, so the
+    // temp-vs-user-owned split has to happen HERE. This is the single
+    // assignment site; there are at least three supervisor exit paths, which
+    // is why the fix lives here rather than at any of them.
     //
     // We assign AFTER `cmd.spawn()` because the runner is not started with
     // `CREATE_SUSPENDED`, so it's already executing. That's fine for
@@ -1199,37 +1204,54 @@ pub async fn start_managed_runner(
     //
     // Assignment failure is loud but non-fatal — the runner is functional;
     // it just won't be auto-killed if the supervisor dies abruptly.
-    if let (Some(job), Some(pid_val)) = (state.runner_job.as_ref(), pid) {
-        match job.assign(pid_val) {
-            Ok(()) => {
-                let msg = format!(
-                    "Assigned runner '{}' (PID {}) to kill-on-exit JobObject",
-                    runner_name, pid_val
-                );
-                info!("{}", msg);
-                state
-                    .logs
-                    .emit(LogSource::Supervisor, LogLevel::Info, msg)
-                    .await;
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to assign runner '{}' (PID {}) to kill-on-exit JobObject: {}. \
-                     Supervisor exit will not terminate this runner.",
-                    runner_name, pid_val, e
-                );
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Warn,
-                        format!(
-                            "Runner '{}' (PID {}) NOT assigned to kill-on-exit JobObject: {}. \
-                             If the supervisor crashes, this runner may linger as an orphan.",
-                            runner_name, pid_val, e
-                        ),
-                    )
-                    .await;
+    if let Some(pid_val) = pid {
+        if !crate::process::job::should_assign_to_ephemeral_job(&managed.config.kind()) {
+            // Log the skip too. A durable runner that is silently never
+            // assigned would make the next incident's forensics as hard as
+            // the 2026-07-27 one, where the reap produced NO log line at all.
+            let msg = format!(
+                "Runner '{}' (PID {}) NOT assigned to the kill-on-exit JobObject — \
+                 user-owned runners survive supervisor exit.",
+                runner_name, pid_val
+            );
+            info!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+        } else if let Some(job) = state.ephemeral_job.as_ref() {
+            match job.assign(pid_val) {
+                Ok(()) => {
+                    let msg = format!(
+                        "Assigned temp runner '{}' (PID {}) to kill-on-exit JobObject",
+                        runner_name, pid_val
+                    );
+                    info!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                        .await;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to assign temp runner '{}' (PID {}) to kill-on-exit JobObject: {}. \
+                         Supervisor exit will not terminate this runner.",
+                        runner_name, pid_val, e
+                    );
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!(
+                                "Temp runner '{}' (PID {}) NOT assigned to kill-on-exit \
+                                 JobObject: {}. If the supervisor crashes, this runner may \
+                                 linger as an orphan.",
+                                runner_name, pid_val, e
+                            ),
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -2766,9 +2788,23 @@ pub async fn stop_runner_by_id(
     // that the current supervisor adopted partially. Kill it up-front so the
     // graceful path below has a free port to verify, instead of returning
     // success while the OS process keeps running.
+    //
+    // A probe that could not RUN is UNKNOWN, not "port idle": skip the
+    // recovery kill entirely rather than acting on an answer we don't have.
     #[cfg(target_os = "windows")]
     if pid_to_kill.is_none() {
-        if let Some(orphan_pid) = crate::process::windows::find_pid_on_port(port).await {
+        let orphan_probe = match crate::process::windows::find_pid_on_port(port).await {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(
+                    "Orphan-PID recovery for runner '{}' on port {}: listener probe failed \
+                     ({}) — treating the port as UNKNOWN and skipping the recovery kill",
+                    runner_name, port, e
+                );
+                None
+            }
+        };
+        if let Some(orphan_pid) = orphan_probe {
             let msg = format!(
                 "Recovered orphan PID {} on port {} for runner '{}'; killing",
                 orphan_pid, port, runner_name
@@ -2888,10 +2924,18 @@ pub async fn stop_runner_by_id(
                         }
                         // Also catch a survivor whose PID we never tracked
                         // (orphan adopted on a port we knew but no PID for).
-                        if let Some(live_pid) =
-                            crate::process::windows::find_pid_on_port(port).await
-                        {
-                            let _ = crate::process::windows::kill_by_pid_tree(live_pid).await;
+                        // A probe that could not RUN is UNKNOWN — never a
+                        // kill; the next escalation step re-confirms anyway.
+                        match crate::process::windows::find_pid_on_port(port).await {
+                            Ok(Some(live_pid)) => {
+                                let _ = crate::process::windows::kill_by_pid_tree(live_pid).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(
+                                "Stop-reap escalation for runner '{}': listener probe on port \
+                                 {} failed ({}) — skipping the untracked-survivor kill",
+                                runner_name, port, e
+                            ),
                         }
                     }
                 }

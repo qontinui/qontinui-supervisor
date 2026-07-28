@@ -288,14 +288,28 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // listening on the port, so netstat tells us which PID
                     // to track. Netstat is ~100ms on Windows, so guard on
                     // `pid.is_none()` to keep this out of the steady state.
+                    //
+                    // A probe that could not RUN (`Err`) is UNKNOWN, not
+                    // "port idle" — leave `pid` as None and try again next
+                    // tick rather than recording a wrong answer.
                     #[cfg(target_os = "windows")]
                     if needs_pid_recovery {
-                        if let Some(pid) =
-                            crate::process::windows::find_pid_on_port(runner_port).await
-                        {
-                            let mut runner_state = managed.runner.write().await;
-                            if runner_state.pid.is_none() {
-                                runner_state.pid = Some(pid);
+                        match crate::process::windows::find_pid_on_port(runner_port).await {
+                            Ok(Some(pid)) => {
+                                let mut runner_state = managed.runner.write().await;
+                                if runner_state.pid.is_none() {
+                                    runner_state.pid = Some(pid);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    "PID recovery for runner '{}' on port {}: listener probe \
+                                     failed ({}) — leaving pid unknown for this tick",
+                                    runner_id,
+                                    runner_port,
+                                    e
+                                );
                             }
                         }
                     }

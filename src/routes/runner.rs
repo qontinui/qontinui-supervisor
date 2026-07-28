@@ -918,8 +918,20 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // Only stop temp runners — user runners survive supervisor restarts
-    let _ = manager::stop_all_temp_runners(&state).await;
+    // NOTE: we deliberately do NOT call `stop_all_temp_runners` here — same
+    // reasoning as the shutdown path in `main.rs` ("the dominant source of
+    // `POST /supervisor/shutdown` latency: it iterated every temp runner with
+    // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
+    // wall-clock"). The `std::process::exit(0)` below closes this process's
+    // handles, including the kill-on-exit JobObject's, so the kernel reaps
+    // every assigned temp runner anyway.
+    //
+    // User-owned runners (primary, named, external) genuinely survive this
+    // restart: `process::job::should_assign_to_ephemeral_job` never assigns
+    // them to that job. Before 2026-07-28 they did NOT survive — this
+    // endpoint is spawn-and-exit, so it reaped them exactly like the
+    // `restart-supervisor.ps1` path did, while the comment here claimed the
+    // opposite.
 
     // Spawn replacement process
     let mut cmd = std::process::Command::new(&exe);

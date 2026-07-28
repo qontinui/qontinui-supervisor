@@ -46,6 +46,27 @@ pub struct HealthResponse {
     /// refresh.
     #[serde(rename = "buildId")]
     pub build_id: String,
+    /// **Capability flag: does this supervisor scope the kill-on-exit
+    /// JobObject to temp runners only?**
+    ///
+    /// Always serialized, always `true` on this build — its *presence* is the
+    /// signal, not its value. A supervisor built before 2026-07-28 assigned
+    /// EVERY runner it spawned to the `KILL_ON_JOB_CLOSE` job, so stopping it
+    /// reaped the operator's primary (2026-07-27 incident); that binary has no
+    /// code for this field and omits it entirely.
+    ///
+    /// `scripts/restart-supervisor.ps1` reads it from `GET /health` before
+    /// stopping the RUNNING supervisor. A process cannot be removed from a
+    /// Windows job after assignment, so what matters is which binary made the
+    /// assignment — not which binary is on disk. Field present ⇒ the running
+    /// supervisor's job holds temp runners only ⇒ the pre-flight
+    /// "non-temp runner is running" guard is unnecessary and skips itself.
+    /// Field absent ⇒ pre-fix supervisor ⇒ the guard stands. Without this the
+    /// guard would refuse every restart forever (the primary is always
+    /// running on this fleet), training operators into a permanent
+    /// `-ForceKillRunners`, which disarms the guard on exactly the binary
+    /// where it matters.
+    pub ephemeral_job_temp_only: bool,
     /// Live count of in-flight SSE connections across every long-lived
     /// streaming endpoint (`/health/stream`, `/logs/stream`,
     /// `/expo/logs/stream`, `/runners/{id}/logs/stream`,
@@ -394,6 +415,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         build_id: state.build_id.clone(),
         sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
+        // Hardcoded `true`: this binary contains
+        // `process::job::should_assign_to_ephemeral_job`, so its job holds
+        // temp runners only. Presence is the capability signal — see the
+        // field's doc comment.
+        ephemeral_job_temp_only: true,
     }
 }
 
@@ -524,6 +550,9 @@ fn try_build_sse_health(
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         build_id,
         sse_active_connections: state.active_sse_connections.load(Ordering::Relaxed),
+        // Same capability flag as the `GET /health` path — the SSE stream
+        // shares this struct, so it carries it too.
+        ephemeral_job_temp_only: true,
     })
 }
 
@@ -699,6 +728,7 @@ mod tests {
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
             build_id: "2026-04-25T00:00:00+00:00".to_string(),
             sse_active_connections: 0,
+            ephemeral_job_temp_only: true,
         };
 
         let json = serde_json::to_string(&response).expect("should serialize");
@@ -712,6 +742,75 @@ mod tests {
         assert!(json.contains("\"buildId\":\"2026-04-25T00:00:00+00:00\""));
         // The global arm is surfaced additively alongside the per-runner `enabled`.
         assert!(json.contains("\"crash_restart_armed\":false"), "{json}");
+        // The JobObject-scoping capability flag: `restart-supervisor.ps1`
+        // matches on this EXACT key to decide whether its pre-flight
+        // non-temp-runner guard applies to the RUNNING supervisor. It must
+        // always be present and always `true` on this build — a pre-fix
+        // supervisor omits it because its binary has no such code.
+        assert!(
+            json.contains("\"ephemeral_job_temp_only\":true"),
+            "restart-supervisor.ps1 consumes this exact key from GET /health: {json}"
+        );
+    }
+
+    /// The capability flag is unconditional — no `skip_serializing_if`, no
+    /// rename. Serializing a `HealthResponse` must never produce a body
+    /// without it, or the PowerShell guard silently falls back to treating a
+    /// fixed supervisor as pre-fix and refuses every restart.
+    #[test]
+    fn test_ephemeral_job_temp_only_is_always_serialized() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        assert_eq!(
+            value.get("ephemeral_job_temp_only"),
+            Some(&serde_json::Value::Bool(true)),
+            "the flag must be present and true: {value}"
+        );
+    }
+
+    /// Minimal `HealthResponse` for serialization-shape assertions.
+    fn build_minimal_health_response() -> HealthResponse {
+        HealthResponse {
+            status: "stopped".to_string(),
+            runner: RunnerHealth {
+                running: false,
+                pid: None,
+                started_at: None,
+                api_responding: false,
+            },
+            ports: PortsHealth {
+                api_port: PortStatus {
+                    port: RUNNER_API_PORT,
+                    in_use: false,
+                },
+            },
+            watchdog: WatchdogHealth::unavailable(),
+            build: BuildHealth {
+                in_progress: false,
+                available_slots: 3,
+                error_detected: false,
+                last_error: None,
+                last_build_at: None,
+                frontend_stale_any: false,
+                lkg: None,
+            },
+            expo: ExpoHealth {
+                running: false,
+                pid: None,
+                port: 8081,
+                configured: false,
+            },
+            supervisor: SupervisorInfo {
+                version: "0.1.0".to_string(),
+                project_dir: "/tmp/test".to_string(),
+            },
+            runners: Vec::new(),
+            sdk_features: SDK_FEATURES.to_vec(),
+            sdk_features_doc_url: SDK_FEATURE_DOC_URL,
+            build_id: "test".to_string(),
+            sse_active_connections: 0,
+            ephemeral_job_temp_only: true,
+        }
     }
 
     /// `crash_restart_armed` reflects the GLOBAL arm passed to `from_state`,

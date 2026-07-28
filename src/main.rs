@@ -580,12 +580,14 @@ async fn main() -> anyhow::Result<()> {
     // blocking IO inside spawn_blocking, etc.) keeps the runtime alive past
     // its useful lifetime, this guarantees the process actually goes away.
     //
-    // The supervisor's children are protected by the kill-on-job-close
-    // JobObject (`state.runner_job`); they die when *this* process dies,
-    // regardless of whether we stopped them gracefully first. So a hard
-    // exit here cannot leak orphan runners — it just skips the polite
+    // The supervisor's ephemeral children are covered by the kill-on-job-close
+    // JobObject (`state.ephemeral_job`); temp runners die when *this* process
+    // dies, regardless of whether we stopped them gracefully first. So a hard
+    // exit here cannot leak orphan temp runners — it just skips the polite
     // "ask everything to stop" step that's already redundant under the
-    // JobObject contract.
+    // JobObject contract. User-owned runners (primary, named, external) are
+    // deliberately NOT in the job and are expected to keep running across
+    // this exit; the next supervisor's orphan scan adopts them back.
     const HARD_EXIT_DEADLINE_SECS: u64 = 3;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(HARD_EXIT_DEADLINE_SECS)).await;
@@ -610,14 +612,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // NOTE: We deliberately do NOT call `stop_all_temp_runners` here. The
-    // Win32 `RunnerJob` (held in `state.runner_job`) has `KILL_ON_JOB_CLOSE`
-    // set, so every supervisor-spawned runner is terminated by the kernel
-    // the instant the last handle to the Job closes — which happens when
-    // `state` drops at the end of `main`. The previous `stop_all_temp_runners`
-    // call here was the dominant source of `POST /supervisor/shutdown`
-    // latency: it iterated every temp runner with a 5s graceful-stop poll
-    // plus a 5s port-free wait, easily 30+ seconds wall-clock with several
-    // runners attached. The JobObject makes it redundant.
+    // Win32 `RunnerJob` (held in `state.ephemeral_job`) has
+    // `KILL_ON_JOB_CLOSE` set, so every supervisor-spawned *temp* runner is
+    // terminated by the kernel the instant the last handle to the Job closes
+    // — which happens when `state` drops at the end of `main`. (Temps are the
+    // only runners assigned to the job; see
+    // `process::job::should_assign_to_ephemeral_job`.) The previous
+    // `stop_all_temp_runners` call here was the dominant source of
+    // `POST /supervisor/shutdown` latency: it iterated every temp runner with
+    // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
+    // wall-clock with several runners attached. The JobObject makes it
+    // redundant.
 
     Ok(())
 }
@@ -802,10 +807,20 @@ mod tests {
         assert_eq!(primary_to_boot_start(false, None), None);
     }
 
+    /// Post-2026-07-28 steady state: the primary is NOT in the kill-on-exit
+    /// JobObject, so it survives supervisor exit and the startup orphan scan
+    /// adopts it back as `running`. Boot-start must be a no-op for it — a
+    /// second start would fight the live process for port 9876. The decision
+    /// keys off `running`, never off the id, which is why an
+    /// arbitrarily-named primary behaves identically.
     #[test]
     fn auto_start_with_running_primary_is_noop() {
         // Orphan adoption already brought it back => leave it alone.
         assert_eq!(primary_to_boot_start(true, Some(("primary", true))), None);
+        assert_eq!(
+            primary_to_boot_start(true, Some(("some-other-primary-id", true))),
+            None
+        );
     }
 
     #[test]

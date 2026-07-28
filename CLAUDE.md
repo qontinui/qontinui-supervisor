@@ -6,7 +6,14 @@ Rust-based build server and fleet dashboard for qontinui-runner. Provides parall
 
 The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health but never starts, stops, or restarts them unprompted.
 
-With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it never auto-starts named/temp/external runners.
+With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it never auto-starts named/temp/external runners. If the startup orphan scan already adopted a surviving primary, boot-start is a no-op (`main::primary_to_boot_start`).
+
+**Supervisor *exit* used to be the one path that took every runner with it — it explicitly no longer does.** Every spawned runner was assigned to a single Win32 JobObject carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so when the supervisor process ended for any reason (graceful `/supervisor/shutdown`, `POST /supervisor/restart`, `Stop-Process`, panic, BSOD) the kernel silently terminated every assigned process. On 2026-07-27 a routine `restart-supervisor.ps1 -Build` therefore destroyed the operator's primary runner, ~80 `claude.exe` processes and 287 PTYs — with **no log line**, because nothing "stopped" it. Since 2026-07-28 the job holds **temp runners only** (`process::job::should_assign_to_ephemeral_job`, an `is_temp()` allowlist applied at the single assignment site in `start_managed_runner`):
+
+- **Temp runners** are supervisor-owned and still die with the supervisor — deliberately, since orphaned temps hold open slot binaries and break subsequent cargo builds.
+- **Primary, named, and external runners** are user-owned, are assigned to no job at all, and survive every supervisor exit path. A non-assignment is logged (`Runner 'Primary' (PID N) NOT assigned to the kill-on-exit JobObject`) so the next incident has forensics.
+- The **startup orphan scan** (`process::orphan_scan`) then adopts the survivor back into the registry. It no longer kills an adoptable orphan for having a stale binary — staleness is reported as a `Warn` naming the gap and the remedy (`POST /runner/restart {"rebuild": true}`), and the operator decides.
+- **Known gap:** an adopted runner has no `tokio::process::Child` handle (we did not spawn it), so the crash-only watchdog's **exit observation** does not cover an inherited primary until this supervisor starts it itself. HTTP health polling is unaffected. A `Child` is deliberately not synthesized.
 
 **Crash-only ambient watchdog** (plan `2026-07-03-primary-runner-crash-resilience`, Phase 1). Under `--watchdog`, a supervisor-spawned runner whose process **crashes** (exits non-zero / dies unexpectedly) is auto-restarted through the same `start_runner_by_id` funnel (provenance start gate applies). Hard rules:
 
@@ -101,7 +108,29 @@ for the port to free, copies `target\debug\qontinui-supervisor.exe` to
 It launches the copy in a **visible** window on purpose: Windows Defender's
 `PowhidSubExec.B` heuristic kills hidden (`-WindowStyle Hidden` +
 `-ExecutionPolicy Bypass`) launches of the unsigned exe (2026-06-05 incident).
-Params: `-Build`, `-Port` (9875), `-ProjectDir`, `-LogFile`, `-Watchdog`.
+Params: `-Build`, `-Port` (9875), `-ProjectDir`, `-LogFile`, `-Watchdog`,
+`-ForceKillRunners`.
+
+**Runner lifetime across a supervisor restart.** The primary, named, and
+external runners **keep running** — they are user-owned and are never assigned
+to the kill-on-exit JobObject (see "CRITICAL: Runner Lifecycle Scope"). **Temp
+runners (`test-*`) are reaped**, deliberately: they are supervisor-owned and
+would otherwise linger holding slot binaries. The new supervisor's startup
+orphan scan adopts the survivors back into its registry, so `GET /runners`
+shows correct `pid` / `running` within a few seconds of the restart.
+
+The script additionally refuses to proceed with **exit 4** when a non-temp
+runner is running, unless `-ForceKillRunners` is passed. Keep
+`-ForceKillRunners` out of any documented "normal" invocation.
+
+**Why that guard still matters after the code fix:** a job assignment is made
+by the supervisor that *spawned* the runner, and a process cannot be removed
+from a Windows job afterwards. `restart-supervisor.ps1` stops the **currently
+running** supervisor — so if that instance is a binary built before
+2026-07-28, its job still holds the primary and stopping it still reaps.
+The code fix takes effect only for runners spawned by a supervisor that
+carries it; the guard covers the deploy window (and any peer running a stale
+supervisor exe).
 
 ## Persistent Logs
 
@@ -145,7 +174,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | GET | `/` | React SPA dashboard |
 | GET | `/health` | Comprehensive status (runners, build, expo) |
 | GET | `/health/stream` | SSE stream of real-time health data |
-| POST | `/supervisor/restart` | Self-restart supervisor (runners are left running) |
+| POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, then `std::process::exit(0)` closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner. |
 
 ### Runner Management
 

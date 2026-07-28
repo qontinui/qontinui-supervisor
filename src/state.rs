@@ -279,18 +279,26 @@ pub struct SupervisorState {
     /// supervisor rebuild + restart can prompt the user to refresh.
     pub build_id: String,
     /// Windows JobObject used to enforce kill-on-supervisor-exit semantics
-    /// for spawned runners. Created once at startup; every runner spawned
-    /// via `start_managed_runner` is assigned to it via
-    /// `RunnerJob::assign`. When this `Arc` drops (at supervisor exit) the
-    /// kernel closes the last handle to the job and terminates every
-    /// assigned process — so a force-killed or panicked supervisor cannot
-    /// leave orphan runners holding slot binaries.
+    /// for **supervisor-owned ephemeral (temp) runners only**. Created once
+    /// at startup; `start_managed_runner` assigns a spawned runner to it via
+    /// `RunnerJob::assign` **iff**
+    /// [`crate::process::job::should_assign_to_ephemeral_job`] says the kind
+    /// is `Temp`. When this `Arc` drops (at supervisor exit) the kernel
+    /// closes the last handle to the job and terminates every assigned
+    /// process — so a force-killed or panicked supervisor cannot leave
+    /// orphan temp runners holding slot binaries.
+    ///
+    /// The operator's primary, named, and external runners are deliberately
+    /// assigned to **no job at all**: they are user-owned, they hold user
+    /// sessions, and they must survive every supervisor exit path
+    /// (`/supervisor/shutdown`, `/supervisor/restart`, `Stop-Process`,
+    /// panic, BSOD). Assigning them was the 2026-07-27 incident.
     ///
     /// `None` when the OS refused to create the job (extremely rare on
     /// Windows; non-Windows builds always get a no-op stub via
     /// `process::job`'s cross-platform shim). Spawning continues either
     /// way — without the safety net, but functional.
-    pub runner_job: Option<Arc<RunnerJob>>,
+    pub ephemeral_job: Option<Arc<RunnerJob>>,
     /// Log messages captured during synchronous `SupervisorState::new`
     /// construction that need to be routed through `state.logs.emit` once
     /// async context is available. The `logs` field is initialized inside the
@@ -1028,10 +1036,12 @@ impl SupervisorState {
         let build_pool = BuildPool::new(&config);
 
         // Create the kill-on-exit JobObject. On Windows this enforces that
-        // every supervisor-spawned runner dies when the supervisor exits
-        // (graceful, panic, force-kill). On non-Windows it's a no-op stub.
-        // Failure to create is logged loudly but never aborts startup —
-        // the supervisor still functions, just without the safety net.
+        // every supervisor-spawned *temp* runner dies when the supervisor
+        // exits (graceful, panic, force-kill); user-owned runners (primary,
+        // named, external) are never assigned to it and survive. On
+        // non-Windows it's a no-op stub. Failure to create is logged loudly
+        // but never aborts startup — the supervisor still functions, just
+        // without the safety net.
         //
         // The `state.logs` collector isn't constructed yet at this point
         // (it's initialized inside the `Self { ... }` block below), so we
@@ -1040,10 +1050,10 @@ impl SupervisorState {
         // which `flush_pending_startup_logs` drains right after the state
         // is wrapped in an `Arc` (see `main.rs`).
         let mut startup_logs: Vec<(LogLevel, String)> = Vec::new();
-        let runner_job = match RunnerJob::create() {
+        let ephemeral_job = match RunnerJob::create() {
             Ok(j) => {
-                let msg = "Created kill-on-exit JobObject for spawned runners \
-                           (KILL_ON_JOB_CLOSE)"
+                let msg = "Created kill-on-exit JobObject for spawned temp runners \
+                           (KILL_ON_JOB_CLOSE; user-owned runners are never assigned)"
                     .to_string();
                 tracing::info!("{}", msg);
                 startup_logs.push((LogLevel::Info, msg));
@@ -1052,14 +1062,14 @@ impl SupervisorState {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Failed to create runner JobObject — supervisor exit will NOT \
-                     terminate spawned runners; orphans may linger and lock build slots"
+                    "Failed to create ephemeral-runner JobObject — supervisor exit will NOT \
+                     terminate spawned temp runners; orphans may linger and lock build slots"
                 );
                 startup_logs.push((
                     LogLevel::Warn,
                     format!(
-                        "Failed to create runner JobObject: {} — supervisor exit will NOT \
-                         terminate spawned runners",
+                        "Failed to create ephemeral-runner JobObject: {} — supervisor exit will \
+                         NOT terminate spawned temp runners",
                         e
                     ),
                 ));
@@ -1097,7 +1107,7 @@ impl SupervisorState {
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
             boot_id: load_or_create_boot_id(),
             build_id: compute_build_id(),
-            runner_job,
+            ephemeral_job,
             pending_startup_logs: std::sync::Mutex::new(startup_logs),
             active_sse_connections: Arc::new(AtomicUsize::new(0)),
             debug_endpoints_enabled,

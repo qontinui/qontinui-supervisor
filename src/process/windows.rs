@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,12 +33,25 @@ fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_ascii_lowercase() == b.to_string_lossy().to_ascii_lowercase()
 }
 
-/// Return every distinct PID found LISTENING on `port`. Empty vec when the
-/// port is idle or netstat fails for any reason — callers treat an empty
-/// result as "nothing to do here". Shared by `find_pid_on_port` (first
-/// result) and `kill_by_port` (kill all results).
-async fn find_pids_on_port(port: u16) -> Vec<u32> {
-    let Ok(output) = Command::new("cmd")
+/// Return every distinct PID found LISTENING on `port`. Shared by
+/// [`find_pid_on_port`] (first result) and [`kill_by_port`] (kill all
+/// results).
+///
+/// **`Ok(vec![])` and `Err(_)` are NOT the same answer.** `Ok(vec![])` means
+/// the probe RAN and the port is genuinely idle; `Err(_)` means the probe
+/// could not run at all (the `cmd.exe` spawn failed — process-table pressure,
+/// a missing/blocked `cmd.exe`, a hit handle quota) and the port's state is
+/// **UNKNOWN**.
+///
+/// This distinction is load-bearing for every caller that kills something.
+/// The function used to swallow the spawn error and return an empty vec, so
+/// one failed spawn under load made *every* registered port look unclaimed —
+/// and the startup orphan scan reads "no registered port claims this PID" as
+/// "true orphan, kill it". That is a fleet-wide reap of the operator's own
+/// runners from a single transient `cmd.exe` failure (silent-empty treated as
+/// NO). Callers must treat `Err` as "do not kill" and log a WARN.
+async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+    let output = Command::new("cmd")
         .args([
             "/C",
             &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
@@ -47,9 +61,7 @@ async fn find_pids_on_port(port: u16) -> Vec<u32> {
         .stderr(Stdio::piped())
         .output()
         .await
-    else {
-        return Vec::new();
-    };
+        .with_context(|| format!("netstat listener probe for port {port} could not be run"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut pids = Vec::new();
@@ -64,15 +76,16 @@ async fn find_pids_on_port(port: u16) -> Vec<u32> {
             }
         }
     }
-    pids
+    Ok(pids)
 }
 
 /// Kill every process listening on a specific port. Returns true if at
-/// least one kill succeeded. Never errors on netstat failure — it just
-/// finds nothing to kill and returns Ok(false).
+/// least one kill succeeded, `Ok(false)` when the port is provably idle, and
+/// `Err` when the listener probe could not run (UNKNOWN — nothing was killed
+/// and the caller must not conclude the port is free).
 pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     let mut killed_any = false;
-    for pid in find_pids_on_port(port).await {
+    for pid in find_pids_on_port(port).await? {
         info!("Killing PID {} on port {}", pid, port);
         if kill_by_pid(pid).await.unwrap_or(false) {
             killed_any = true;
@@ -232,13 +245,18 @@ pub async fn cleanup_orphaned_slot_processes(slot_target_dir: &Path) {
     }
 }
 
-/// Return the PID of the first process found LISTENING on `port`, or `None`
-/// if the port is idle. Used by the health cache to recover a runner's PID
-/// after a supervisor restart re-discovers it (the supervisor lost the PID
-/// when it shut down; the process is still the same one bound to the
-/// port).
-pub async fn find_pid_on_port(port: u16) -> Option<u32> {
-    find_pids_on_port(port).await.into_iter().next()
+/// Return the PID of the first process found LISTENING on `port`. Used by the
+/// health cache to recover a runner's PID after a supervisor restart
+/// re-discovers it (the supervisor lost the PID when it shut down; the process
+/// is still the same one bound to the port).
+///
+/// Three-state on purpose, mirroring [`find_pids_on_port`]:
+/// - `Ok(Some(pid))` — that PID holds the port;
+/// - `Ok(None)` — the probe ran and the port is idle;
+/// - `Err(_)` — the probe could not run; the port's state is UNKNOWN and no
+///   caller may treat it as idle (never a kill).
+pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
+    Ok(find_pids_on_port(port).await?.into_iter().next())
 }
 
 /// Return every PID whose `exe()` matches `exe_path` (case-insensitive
