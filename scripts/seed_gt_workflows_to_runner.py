@@ -18,7 +18,15 @@ RUNNER = "http://localhost:9876"
 # (<workspace-root>/qontinui-supervisor/scripts/) — never a literal user
 # profile, which named one machine's Windows account and seeded every RAG
 # example workflow with working directories that do not exist anywhere else.
-WS = os.environ.get("QONTINUI_ROOT") or str(Path(__file__).resolve().parents[2])
+#
+# Both branches go through Path() so a value like "D:/qontinui-root" or one with
+# a trailing separator cannot bake mixed/doubled separators into the seeded
+# working_directory fields — these get POSTed and PERSISTED as RAG examples.
+#
+# abspath, not resolve: resolve() collapses a `subst`-mapped drive to its real
+# target, so on a machine where D: is a subst of C:\Users\<u>\Documents it would
+# reintroduce a user-profile path — the exact shape this change removes.
+WS = str(Path(os.environ.get("QONTINUI_ROOT") or Path(os.path.abspath(__file__)).parents[2]))
 
 
 def api_post(url, data):

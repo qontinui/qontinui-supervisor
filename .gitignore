@@ -20,3 +20,9 @@ agent-worktrees/
 # MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
 # Build-environment noise on Windows dev boxes, never source.
 *.stackdump
+
+# Python bytecode from scripts/*.py. Interpreter-version-specific and it churns
+# on every run, so it conflicts across machines; two .pyc files reached the
+# index before this entry existed.
+__pycache__/
+*.py[cod]
