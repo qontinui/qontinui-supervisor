@@ -5,7 +5,9 @@ pre-commit hook configurations in each repo.
 Usage: python3 scripts/seed_check_ground_truth.py
 """
 import json
+import os
 import urllib.request
+from pathlib import Path
 
 BASE = "http://localhost:9875"
 
@@ -69,8 +71,11 @@ def upsert_prompt(prompt_data):
 
 PROMPTS = []
 
-# Base path for all repos
-WS = r"C:\Users\jspin\Documents\qontinui-root"
+# Base path for all repos. Derived from $QONTINUI_ROOT, else from this script's
+# own location (<workspace-root>/qontinui-supervisor/scripts/) — never a literal
+# user profile, which named one machine's Windows account and seeded every
+# ground-truth workflow with working directories that do not exist anywhere else.
+WS = os.environ.get("QONTINUI_ROOT") or str(Path(__file__).resolve().parents[2])
 
 
 def add(prompt_id, prompt_text, ground_truth_checks):

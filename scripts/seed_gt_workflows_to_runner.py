@@ -8,11 +8,17 @@ as a reference example with full JSON, helping it produce correct tool choices.
 Usage: python scripts/seed_gt_workflows_to_runner.py
 """
 import json
+import os
 import urllib.request
+from pathlib import Path
 
 RUNNER = "http://localhost:9876"
 
-WS = r"C:\Users\jspin\Documents\qontinui-root"
+# Derived from $QONTINUI_ROOT, else from this script's own location
+# (<workspace-root>/qontinui-supervisor/scripts/) — never a literal user
+# profile, which named one machine's Windows account and seeded every RAG
+# example workflow with working directories that do not exist anywhere else.
+WS = os.environ.get("QONTINUI_ROOT") or str(Path(__file__).resolve().parents[2])
 
 
 def api_post(url, data):
