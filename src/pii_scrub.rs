@@ -26,7 +26,9 @@ pub const REDACT_KEY_SUBSTRINGS: &[&str] = &[
 
 pub const REDACTED_VALUE: &str = "<redacted>";
 
-#[allow(dead_code)] // exercised by tests + by sanitize_kv consumers
+/// Called in production by `process::slot_territory::cmd_snippet`, which uses
+/// the substring semantics to catch cargo's dotted
+/// `registries.<name>.token=…` config keys.
 pub fn key_is_sensitive(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     REDACT_KEY_SUBSTRINGS.iter().any(|p| lower.contains(p))
@@ -35,7 +37,17 @@ pub fn key_is_sensitive(key: &str) -> bool {
 #[allow(dead_code)] // exercised by tests + by sanitize_value consumers
 pub fn value_looks_sensitive(value: &str) -> bool {
     let trimmed = value.trim_start();
-    if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+    // `get(..7)` NOT `[..7]`: byte-indexing a `str` panics when the index is not
+    // a char boundary, so a multi-byte value ("ééé…", a non-ASCII build path)
+    // panicked here instead of returning false. `get` yields `None` for both the
+    // too-short and the mid-codepoint case, which is exactly "not a bearer
+    // prefix". Reached from `slot_territory::cmd_snippet`, i.e. from inside a
+    // build cleanup — the worst possible place to panic.
+    if trimmed.len() > 7
+        && trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+    {
         return true;
     }
     let segs: Vec<&str> = value.split('.').collect();
@@ -91,6 +103,21 @@ mod tests {
         let (k, v) = sanitize_kv("repo", "qontinui-runner");
         assert_eq!(k, "repo");
         assert_eq!(v, "qontinui-runner");
+    }
+
+    /// A multi-byte value must not panic the bearer-prefix check.
+    ///
+    /// `trimmed[..7]` byte-slices, so any value whose 7th byte falls inside a
+    /// codepoint panicked. Live regression: `cmd_snippet` routes every argv
+    /// token through `sanitize_value`, and cargo command lines routinely carry
+    /// non-ASCII paths.
+    #[test]
+    fn multibyte_value_does_not_panic_the_bearer_check() {
+        assert!(!value_looks_sensitive(&"é".repeat(50)));
+        assert!(!value_looks_sensitive("日本語のパス"));
+        assert_eq!(sanitize_value("ééééé"), "ééééé");
+        // ASCII bearer detection still works.
+        assert!(value_looks_sensitive("Bearer abcdef"));
     }
 
     #[test]

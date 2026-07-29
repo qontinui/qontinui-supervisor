@@ -6,6 +6,8 @@ use tracing::{error, info, warn};
 
 use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
+#[cfg(target_os = "windows")]
+use crate::diagnostics::ExeLockKillReason;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
@@ -16,6 +18,27 @@ use crate::process::windows::{
 };
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
+
+/// Max per-process build-kill diagnostics events (`BuildProcessKilled` /
+/// `BuildKillFailed`) emitted by a SINGLE slot-cleanup pass.
+///
+/// A crashed pool build leaves 1 cargo plus up to `-j N` rustc children, and `N`
+/// is 24-32 on the operator's box: an uncapped pass emitted ~25-33 events, and
+/// three slots recovering together evicted every build/restart record from the
+/// ring. The true counts (and a capped pid sample) always ride on the single
+/// `BuildCleanupSummary` event, so the cap costs only per-pid detail past the
+/// tenth process. Paired with the ring's own capacity in `diagnostics.rs`.
+///
+/// Deliberately DIFFERENT from `slot_territory::PID_LIST_CAP` (5), which is read
+/// right next to it: this one bounds a **per-process event stream** — one
+/// addressable, individually-queryable event per process, where the per-pid
+/// detail IS the payload — while that one bounds a **summary sample** rendered
+/// inline next to a true count in one log line / one event. Two caps that unify
+/// two surfaces rendering the same list (as `PID_LIST_CAP` does) is a
+/// consistency requirement; unifying two caps over different KINDS of surface
+/// would only trade a flooded ring for lost kill detail.
+#[cfg(target_os = "windows")]
+const MAX_KILL_EVENTS_PER_PASS: usize = 10;
 
 /// Pure threshold check for the pre-permit disk guard (plan
 /// `2026-06-05-supervisor-build-artifact-footprint`, Phase 2).
@@ -479,7 +502,57 @@ pub async fn run_cargo_build_with_dir_detailed(
     // Slot-scoped on purpose: a machine-wide kill would take out peer agents'
     // worktree builds and sibling pool slots mid-compile.
     #[cfg(target_os = "windows")]
-    cleanup_orphaned_slot_processes(&slot.target_dir).await;
+    {
+        let cleanup_report = cleanup_orphaned_slot_processes(&slot.target_dir, slot.id).await;
+        if !cleanup_report.is_empty() {
+            let territory = slot.target_dir.display().to_string();
+            // One write-lock acquisition for the whole burst — a per-event lock
+            // would interleave this pass with a concurrent slot's events.
+            let mut diag = state.diagnostics.write().await;
+            // CAP the per-process events. A crashed pool build leaves 1 cargo
+            // plus up to `-j N` rustc children (N is 24-32 on the operator's
+            // box), so an uncapped pass emitted ~25-33 events and three slots
+            // recovering together wiped the whole ring — including the
+            // verification harness's own evidence. The TRUE counts always
+            // travel on `BuildCleanupSummary` below, so nothing is lost but the
+            // per-pid detail past the cap.
+            for k in cleanup_report.killed.iter().take(MAX_KILL_EVENTS_PER_PASS) {
+                diag.emit(DiagnosticEventKind::BuildProcessKilled {
+                    pid: k.pid,
+                    process_name: k.process_name.clone(),
+                    cmd_snippet: k.cmd_snippet.clone(),
+                    slot_id: slot.id,
+                    territory: territory.clone(),
+                    matched_by: k.matched_by,
+                    method: k.method,
+                });
+            }
+            // Failed kills are higher signal than successful ones — this is the
+            // state in which the build is about to fail on a locked artifact —
+            // but they share the ring, and the same `-j N` fan-out applies, so
+            // they share the cap.
+            for f in cleanup_report.failed.iter().take(MAX_KILL_EVENTS_PER_PASS) {
+                diag.emit(DiagnosticEventKind::BuildKillFailed {
+                    pid: f.pid,
+                    process_name: f.process_name.clone(),
+                    slot_id: slot.id,
+                    territory: territory.clone(),
+                    matched_by: f.matched_by,
+                    detail: f.detail.clone(),
+                });
+            }
+            diag.emit(DiagnosticEventKind::BuildCleanupSummary {
+                slot_id: slot.id,
+                territory,
+                killed: cleanup_report.killed.len(),
+                spared: cleanup_report.spared.len(),
+                unclassifiable: cleanup_report.unclassifiable_count(),
+                failed: cleanup_report.failed.len(),
+                killed_pids: cleanup_report.killed_pids(),
+                spared_pids: cleanup_report.spared_pids(),
+            });
+        }
+    }
 
     // Wait for the runner exe to be unlocked (Windows holds file locks briefly after process exit).
     // If the lock persists, identify the holder and kill orphans / stop registered temp runners.
@@ -2435,6 +2508,65 @@ pub async fn slot_exe_holders(exe_path: &std::path::Path) -> Vec<u32> {
     }
 }
 
+/// The `kill_by_pid(..) == Ok(false)` detail: taskkill RAN and did not
+/// terminate the holder.
+///
+/// Worded the same way `slot_territory::triage_kill` words the sweep path's
+/// equivalent outcome, so an operator grepping either kill path's telemetry for
+/// "refused" finds both.
+#[cfg(target_os = "windows")]
+const TASKKILL_REFUSED_DETAIL: &str =
+    "the taskkill fallback ran and refused the kill (typically an elevated or \
+     other-user process: \"Access is denied\")";
+
+/// Report an exe-lock kill that did not happen, on all three surfaces an
+/// operator might look at: the `warn!` stream, the supervisor log buffer, and
+/// the queryable `build_kill` diagnostics category.
+///
+/// Exists because the alternative — `Ok(false) => {}` — is the diagnosis-blind
+/// shape this telemetry work eliminated on the sweep path: the holder keeps the
+/// lock, the build then fails on the locked artifact, and nothing anywhere names
+/// the process that caused it. `kill_by_pid` logs the refusal only at `debug!`,
+/// which is off by default.
+#[cfg(target_os = "windows")]
+async fn emit_exe_lock_kill_failed(
+    state: &SharedState,
+    pid: u32,
+    slot_id: usize,
+    exe_path: &std::path::Path,
+    runner_id: Option<String>,
+    reason: ExeLockKillReason,
+    detail: String,
+) {
+    let owner = match &runner_id {
+        Some(id) => format!("registered temp runner '{id}'"),
+        None => "orphan".to_string(),
+    };
+    let msg = format!(
+        "Slot {} exe {} is still held by {} PID {} — the kill did NOT succeed: {}. \
+         The build will likely fail on the locked artifact.",
+        slot_id,
+        exe_path.display(),
+        owner,
+        pid,
+        detail
+    );
+    warn!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::ExeLockKillFailed {
+            pid,
+            slot_id,
+            exe_path: exe_path.display().to_string(),
+            runner_id,
+            reason,
+            detail,
+        });
+}
+
 /// Wait for the runner exe in a specific slot's target dir to be writable
 /// (unlocked) before building. On Windows, the OS can hold file locks briefly
 /// after a process is killed.
@@ -2572,8 +2704,48 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
                         ),
                     )
                     .await;
-                if let Err(e) = kill_by_pid(holder_pid).await {
-                    warn!("kill_by_pid({}) failed: {}", holder_pid, e);
+                // Only a confirmed kill is reported as one — `Ok(false)` means
+                // taskkill ran and did not terminate it, and `Err` means it
+                // could not be run at all. BOTH leave the lock held and the
+                // build about to fail on the locked artifact, so both get a
+                // `warn!` plus a queryable failure event — the same symmetry
+                // the sweep path has via `BuildKillFailed`.
+                match kill_by_pid(holder_pid).await {
+                    Ok(true) => {
+                        state.diagnostics.write().await.emit(
+                            DiagnosticEventKind::ExeLockHolderKilled {
+                                pid: holder_pid,
+                                slot_id: slot.id,
+                                exe_path: exe_path.display().to_string(),
+                                runner_id: None,
+                                reason: ExeLockKillReason::Orphan,
+                            },
+                        );
+                    }
+                    Ok(false) => {
+                        emit_exe_lock_kill_failed(
+                            state,
+                            holder_pid,
+                            slot.id,
+                            &exe_path,
+                            None,
+                            ExeLockKillReason::Orphan,
+                            TASKKILL_REFUSED_DETAIL.to_string(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        emit_exe_lock_kill_failed(
+                            state,
+                            holder_pid,
+                            slot.id,
+                            &exe_path,
+                            None,
+                            ExeLockKillReason::Orphan,
+                            format!("the taskkill fallback could not be run: {e}"),
+                        )
+                        .await;
+                    }
                 }
             }
             Some((runner_id, is_temp, _running)) if is_temp => {
@@ -2591,7 +2763,45 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
                         "stop_runner_by_id('{}') failed: {} — escalating to direct kill",
                         runner_id, e
                     );
-                    let _ = kill_by_pid(holder_pid).await;
+                    // The escalation used to discard its result outright; the
+                    // telemetry must not claim a kill that did not happen.
+                    match kill_by_pid(holder_pid).await {
+                        Ok(true) => {
+                            state.diagnostics.write().await.emit(
+                                DiagnosticEventKind::ExeLockHolderKilled {
+                                    pid: holder_pid,
+                                    slot_id: slot.id,
+                                    exe_path: exe_path.display().to_string(),
+                                    runner_id: Some(runner_id.clone()),
+                                    reason: ExeLockKillReason::GracefulStopFailed,
+                                },
+                            );
+                        }
+                        Ok(false) => {
+                            emit_exe_lock_kill_failed(
+                                state,
+                                holder_pid,
+                                slot.id,
+                                &exe_path,
+                                Some(runner_id.clone()),
+                                ExeLockKillReason::GracefulStopFailed,
+                                TASKKILL_REFUSED_DETAIL.to_string(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            emit_exe_lock_kill_failed(
+                                state,
+                                holder_pid,
+                                slot.id,
+                                &exe_path,
+                                Some(runner_id.clone()),
+                                ExeLockKillReason::GracefulStopFailed,
+                                format!("the taskkill fallback could not be run: {e}"),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Some((runner_id, _is_temp, _running)) => {

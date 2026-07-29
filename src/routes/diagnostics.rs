@@ -20,7 +20,11 @@ pub async fn get_diagnostics(
     State(state): State<SharedState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> impl IntoResponse {
-    let limit = query.limit.min(200);
+    // Clamp to the ring's real capacity rather than a second hard-coded number:
+    // a `limit` above it can never return more events anyway, and when the ring
+    // grew from 200 to 500 an independent literal here would have silently
+    // capped every caller at the OLD size.
+    let limit = query.limit.min(crate::diagnostics::DIAGNOSTICS_BUFFER_SIZE);
     let filter: Option<Vec<String>> = query
         .filter
         .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());

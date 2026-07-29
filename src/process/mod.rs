@@ -8,6 +8,9 @@ pub mod orphan_scan;
 pub mod panic_log;
 pub mod port;
 pub mod restate_port;
+/// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
+/// slot-kill predicate must be covered by the gate that blocks merges.
+pub mod slot_territory;
 pub mod stopped_cache;
 #[cfg(target_os = "windows")]
 pub mod windows;

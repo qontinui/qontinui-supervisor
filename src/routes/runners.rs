@@ -2553,28 +2553,85 @@ async fn execute_spawn_build(
     managed: Arc<ManagedRunner>,
     no_wait: bool,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
-    // Issue 3 fix part 1: `execute_spawn_build_inner` writes the FULL cargo
-    // stderr of a failed build pool invocation here (a generous tail, split
-    // into lines) so it can be threaded onto the build submission's
-    // `stderr_tail` and recovered via `GET /build/{id}/status`. Empty when the
-    // build succeeded or there was no cargo failure.
-    let mut build_stderr_tail: Vec<String> = Vec::new();
-    match execute_spawn_build_inner(
-        &state,
-        body,
-        &id,
-        port,
-        &managed,
-        no_wait,
-        &mut build_stderr_tail,
-    )
-    .await
-    {
-        Ok((status, body)) => (status, body, build_stderr_tail),
-        Err(e) => {
-            let (status, body) = e.to_status_body();
-            (status, body, build_stderr_tail)
+    let mut side = SpawnBuildSideChannel::default();
+    // Merged on BOTH arms, not just `Err`. Several of the inner fn's FAILURE
+    // responses (`runner_died_during_startup`, `runner_started_but_unresponsive`,
+    // `frontend_stale` / `frontend_dist_missing`, the paired-profile failure) are
+    // returned as `Ok((status, body))` with a non-2xx status, and every one of
+    // them sits AFTER the build block — so a slot was claimed and its cleanup
+    // pass demonstrably ran. Merging only on `Err` left exactly those bodies
+    // without attribution and falsified `attach_build_slot_id`'s "always
+    // present" contract. The insert is idempotent against the key the success
+    // body already carries (same value, from the same `side.slot_id`).
+    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait, &mut side).await {
+        Ok((status, mut body)) => {
+            attach_build_slot_id(&mut body, side.slot_id);
+            (status, body, side.stderr_tail)
         }
+        Err(e) => {
+            let (status, mut body) = e.to_status_body();
+            attach_build_slot_id(&mut body, side.slot_id);
+            (status, body, side.stderr_tail)
+        }
+    }
+}
+
+/// Values `execute_spawn_build_inner` produces on its way to a result that the
+/// caller needs **even when it returns `Err`**.
+///
+/// `SupervisorError::to_status_body()` renders a canonical `{"error": …}` body
+/// that carries neither of these, so anything reachable only through the `Ok`
+/// body is silently lost on every failure path. Bundled into one struct rather
+/// than passed as two `&mut` out-params so the inner fn stays under clippy's
+/// argument limit — and so a third such value has an obvious home.
+#[derive(Default)]
+struct SpawnBuildSideChannel {
+    /// The FULL cargo stderr of a failed pool build (a generous tail, split into
+    /// lines), threaded onto the build submission's `stderr_tail` so
+    /// `GET /build/{id}/status` returns the real compiler error instead of an
+    /// empty / 2KB-truncated tail. Empty when the build succeeded or there was
+    /// no cargo failure.
+    stderr_tail: Vec<String>,
+    /// The AUTHORITATIVE build-pool slot this spawn's build actually CLAIMED,
+    /// taken off the `BuildAttempt` on the success AND the failure path.
+    /// Surfaced as the response's top-level `build_slot_id`.
+    ///
+    /// Distinct from `build_result.slot_id`, which is `last_successful_slot`
+    /// read AFTER the build: that is a shared global, so under concurrency it
+    /// can name a peer's slot, and on a stale-fallback run it deliberately names
+    /// the slot whose exe is being reused. Both fields are kept — they answer
+    /// different questions. A verification harness wants THIS one: inferring the
+    /// claimed slot from a `build_cleanup_summary` diagnostics event is
+    /// unreliable, since a quiet pass emits no event at all and the ring can
+    /// evict one that did.
+    ///
+    /// Assigned with `.or(side.slot_id)`, never a bare assign — a poisoned-slot
+    /// retry can be refused before claiming a slot (`BuildAttempt::default()`),
+    /// and downgrading a known slot to `None` there would blank the attribution
+    /// in the very case the retry path just cleaned that slot.
+    ///
+    /// On the failure path it used to die with the stack frame: the `Err` arm
+    /// assigned it and then `return Err(e)`d, so the response carried no slot
+    /// attribution exactly when it matters most — a build that claimed slot N,
+    /// ran the slot-cleanup pass over slot N (reaping whatever was planted
+    /// there), and then failed to compile. A harness has no other reliable
+    /// signal for that: a quiet cleanup pass emits no event at all, and the
+    /// diagnostics ring can evict one that did.
+    slot_id: Option<usize>,
+}
+
+/// Merge `build_slot_id` into an already-rendered error body.
+///
+/// Always inserts the key — `null` included — so the field is present on the
+/// success body and the error body alike and a caller can read it
+/// unconditionally. A non-object body (there is none today, but
+/// `to_status_body` owns that shape, not this function) is left alone rather
+/// than silently reshaped.
+///
+/// Split out as a pure fn so the contract is unit-testable without a build pool.
+fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usize>) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("build_slot_id".to_string(), json!(build_slot_id));
     }
 }
 
@@ -2588,7 +2645,7 @@ async fn execute_spawn_build_inner(
     port: u16,
     managed: &Arc<ManagedRunner>,
     no_wait: bool,
-    build_stderr_tail: &mut Vec<String>,
+    side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
@@ -2598,6 +2655,10 @@ async fn execute_spawn_build_inner(
     let mut build_succeeded: Option<bool> = None;
     let mut build_error: Option<String> = None;
     let mut build_reused_stale = false;
+    // The claimed build-pool slot is NOT a local here — it lives on
+    // `side.slot_id` so it survives this function's `return Err(e)` paths. See
+    // `SpawnBuildSideChannel::slot_id` for the full rationale.
+
     // Which tree this spawn compiles. Re-derived here (pure + cheap) from the
     // same inputs the handler validated, so the sync and `async: true` paths
     // agree by construction rather than by threading an extra argument.
@@ -2955,6 +3016,15 @@ async fn execute_spawn_build_inner(
         // surfacing the 500. A genuine compiler error returns immediately (no
         // wasteful retry). Both outcomes are logged via `tracing`.
         if let Err((_, ref attempt)) = build_result {
+            // Record the FIRST attempt's slot before any retry can overwrite
+            // `build_result`. A retry that is refused before claiming a slot
+            // returns `BuildAttempt::default()` (`slot_id: None`) — queue
+            // timeout, disk guard, closed semaphore — and the assignment below
+            // would then report `null` even though this attempt claimed a slot
+            // AND had its cleanup pass run over it (the retry path literally
+            // cleans that slot). That is the one case the field exists to
+            // resolve, so it must never be downgraded to `null`.
+            side.slot_id = attempt.slot_id.or(side.slot_id);
             let stderr_for_class = attempt.full_stderr.clone().unwrap_or_default();
             let class = crate::build_monitor::classify_build_stderr(&stderr_for_class);
             if class == crate::build_monitor::StderrClass::Environmental {
@@ -3030,18 +3100,24 @@ async fn execute_spawn_build_inner(
         }
 
         match build_result {
-            Ok(_attempt) => {
+            Ok(attempt) => {
                 build_attempted = true;
                 build_succeeded = Some(true);
+                // `.or()`, never a bare assign: a poisoned-slot retry may have
+                // been refused before claiming a slot, and losing the first
+                // attempt's slot id is exactly the attribution gap this field
+                // exists to close. See the pre-retry record above.
+                side.slot_id = attempt.slot_id.or(side.slot_id);
             }
             Err((mut e, attempt)) => {
+                side.slot_id = attempt.slot_id.or(side.slot_id);
                 // Issue 3 fix part 1: surface the FULL cargo stderr (a generous
                 // tail, split into lines) onto the build submission's
                 // `stderr_tail` so `GET /build/{id}/status` returns the real
                 // compiler error instead of an empty/2KB-truncated tail.
                 if let Some(full) = &attempt.full_stderr {
                     let tail = crate::build_monitor::stderr_submission_tail(full);
-                    *build_stderr_tail = tail.lines().map(|l| l.to_string()).collect();
+                    side.stderr_tail = tail.lines().map(|l| l.to_string()).collect();
                 }
                 // Item 1(b) — drift diagnostic. With pinned-schemas isolation
                 // a build failure should reference only files inside the spawn
@@ -3662,6 +3738,15 @@ async fn execute_spawn_build_inner(
         // agents testing runner internals should hit these instead.
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
+        // The build-pool slot the build ACTUALLY ran on, straight off the
+        // `BuildAttempt`. `null` ONLY when no build was attempted or the build
+        // was refused before claiming a slot — notably NOT null merely because
+        // the build failed: a failed build that had claimed a slot reports that
+        // slot here, and on the error body too (`attach_build_slot_id`), since
+        // that is precisely the case where a cleanup pass demonstrably ran over
+        // the slot and needs attributing. NOT interchangeable with
+        // `build_result.slot_id` — see the `side.slot_id` commentary above.
+        "build_slot_id": side.slot_id,
         "build_result": build_result,
         "auth_state": auth_state_json,
         "message": if body.wait && healthy {
@@ -6137,9 +6222,42 @@ mod tests {
     //! to catch. These tests pin the new contract: missing dist surfaces
     //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
     //! state as `None`.
-    use super::{check_dist_freshness, FrontendStaleReason};
+    use super::{attach_build_slot_id, check_dist_freshness, FrontendStaleReason};
     use std::fs;
     use tempfile::TempDir;
+
+    /// A FAILED spawn-test build that had already claimed a slot must still
+    /// report `build_slot_id` on the error body.
+    ///
+    /// The regression: the `Err` arm reads the slot off the `BuildAttempt`, but
+    /// then `return Err(e)`s, and `SupervisorError::to_status_body()` renders a
+    /// canonical `{"error": …}` that knows nothing about slots. So attribution
+    /// vanished exactly when it matters most — the build claimed slot N, ran the
+    /// cleanup pass over slot N (reaping whatever the harness had planted
+    /// there), and then cargo failed. Without the merge, a harness reading the
+    /// response cannot say which slot's probe its own build was responsible for.
+    #[test]
+    fn error_body_carries_the_claimed_build_slot_id() {
+        let mut body = serde_json::json!({ "error": "cargo build failed" });
+        attach_build_slot_id(&mut body, Some(1));
+        assert_eq!(body["build_slot_id"], serde_json::json!(1));
+        // The canonical error text is preserved, not replaced.
+        assert_eq!(body["error"], serde_json::json!("cargo build failed"));
+    }
+
+    /// The key is ALWAYS present, `null` included, so a caller can read
+    /// `build_slot_id` unconditionally on success and failure alike instead of
+    /// having to distinguish "absent" from "no slot claimed".
+    #[test]
+    fn error_body_carries_a_null_build_slot_id_when_no_slot_was_claimed() {
+        let mut body = serde_json::json!({ "error": "build_pool_full" });
+        attach_build_slot_id(&mut body, None);
+        assert!(
+            body.as_object().unwrap().contains_key("build_slot_id"),
+            "{body}"
+        );
+        assert_eq!(body["build_slot_id"], serde_json::Value::Null);
+    }
 
     fn write_file(path: &std::path::Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {

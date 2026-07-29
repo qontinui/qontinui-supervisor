@@ -132,6 +132,130 @@ The code fix takes effect only for runners spawned by a supervisor that
 carries it; the guard covers the deploy window (and any peer running a stale
 supervisor exe).
 
+## Verifying scoped slot cleanup
+
+`scripts/verify-scoped-cleanup.ps1` is the end-to-end proof that the build
+pool's slot cleanup is territory-scoped. It plants a long-lived `cargo check`
+probe in the foreign target dir and one in **every** pool slot, submits a real
+`POST /runners/spawn-test {rebuild:true, async:true}`, then **polls**
+`GET /build/{id}/status` and `GET /diagnostics?filter=build_kill` every 10s,
+accumulating events into a run-local de-duplicated set, and asserts: the foreign
+build survives and is recorded as `spared`; the probe in the slot the build
+claimed is reaped with `matched_by: "env"`; the probes in the **other** slots are
+untouched.
+
+The `build_kill` filter category carries five event kinds:
+`build_process_killed` and `build_kill_failed` (per-process, from the slot
+sweep), `build_cleanup_summary` (one per consequential pass), and
+`exe_lock_holder_killed` / `exe_lock_kill_failed` (from `free_slot_exe`'s
+exe-lock path). The two `*_failed` kinds are the ones worth alerting on: a kill
+that was *refused* (taskkill ran and the process survived) used to leave only a
+`debug!` line, so a build would fail on a locked artifact with no queryable
+trace — the exact blind spot this surface exists to remove. The harness ignores
+kinds it does not assert on, so the set is additive.
+
+The `spared` assertion compares **counts** against the number of probes planted
+out of territory, and uses `build_cleanup_summary.spared_pids` only to
+*strengthen* the evidence when it happens to name the foreign probe's pid.
+Asserting containment would flake: `spared_pids` is a sample capped at
+`PID_LIST_CAP = 5`, so on a box with ~9 concurrent sessions our probe can
+legitimately fall outside it while being perfectly spared. The gap is
+deliberate — see `Get-SparedPidAttribution`.
+
+It polls rather than issuing one blocking call because
+`DIAGNOSTICS_BUFFER_SIZE` (500) is shared across **all** event kinds and
+filtering happens at read time: the cleanup pass emits at the *start* of a build
+that then runs for 10–30 minutes, so a single read at the end can find its
+events already evicted by unrelated `BuildStarted`/`Restart*` traffic — and the
+eviction is invisible, because the route computes `total` after filter+limit, so
+a filtered read just returns a small array. An absence-check would then report
+PASS from an empty ring.
+
+**Attribution gates every PASS, not just the FAILs.** A `build_cleanup_summary`
+naming one of our slot territories is *not* evidence that **our** build ran a
+pass — on this box a peer's `spawn-test` emits one routinely. So the four rows
+whose evidence is an **absence** (V1-1 our probe is still alive, V1-2 no kill
+event names it, V2-3 the siblings are still alive, V2-4 nobody was killed
+cross-slot) gate their PASS arm on `Test-AttributableCleanupPass`: `build_slot_id`
+came back **and** a summary for that claimed slot is in the bag. Missing either →
+INCONCLUSIVE, with the detail naming *which* ("no pass ran at all" vs "a pass ran
+but it was a peer's"). Otherwise a pass that never examined our probes would
+report PASS — the same vacuity `sawAnyCleanupPass` was introduced to fix. **FAIL
+arms are deliberately not gated:** a wrongful kill is a defect whoever's pass
+emitted it, and V2-4 must still catch a machine-wide kill when the claimed slot
+is unidentifiable. V1-3 is the one ungated row on purpose — its evidence is a
+*positive* event from the code under test (a pass reporting it spared N
+out-of-territory processes), so a peer's pass is still real evidence; its detail
+names whose pass accounted for it.
+
+It plants one probe per slot because slot selection is dynamic. The
+**authoritative** claimed slot is the spawn-test response's `build_slot_id`
+(from `BuildAttempt.slot_id`); the adjacent `build_result.slot_id` is *not* a
+substitute — it is `last_successful_slot` read after the build and can name a
+slot a peer finished into. When `build_slot_id` is absent the harness falls back
+to inferring from the `build_cleanup_summary` events, and only from one that
+actually killed something: a lone `killed: 0` summary is a peer's pass, not
+ours. A claim it cannot attribute to its own build is reported INCONCLUSIVE,
+never FAIL.
+
+```powershell
+# from the repo root
+.\scripts\verify-scoped-cleanup.ps1 -DryRun   # connectivity + slot discovery only
+.\scripts\verify-scoped-cleanup.ps1           # the real run
+.\scripts\verify-scoped-cleanup.ps1 -Cleanup  # sweep leftovers after a hard kill
+```
+
+**A failed submission does not hold the pool for 40 minutes.** If the
+`POST /runners/spawn-test` never yields a submission id (503 `build_pool_full`,
+a 400, a supervisor restart mid-call, or a 2xx carrying neither `submission_id`
+nor `build_id`) there is nothing to poll to a terminal state — `build_state`
+stays `unsubmitted` and the terminal-state `break` is unreachable — so the loop
+would otherwise run out the whole `-BuildTimeoutSec` while its probes hold the
+cargo build lock on every pool slot **and** `-ForeignTargetDir`, stalling every
+peer's `spawn-test`. `Get-PollDeadline` bounds that case to two poll intervals:
+the harness names the submission failure, records a `SUBMIT` INCONCLUSIVE
+assertion, tears down, and exits 3. The submitted case is unchanged.
+
+**Runtime 10–30 minutes** — that is the compile itself; every HTTP call is now
+short. `-BuildTimeoutSec` (default 2400) bounds the poll loop, and
+`-ProbeLifetimeSecs` auto-derives to `-BuildTimeoutSec + 600` so a probe can
+never expire before the telemetry is read. `-SkipV1` (foreign-survives half) and
+`-SkipV2` (reap + sibling-isolation half) re-run one half alone after a failure.
+Exit 0 = all assertions passed, 2 = a real scoping defect, 3 = inconclusive (no
+cleanup pass ran, a pass ran but was a peer's and so is not attributable to our
+build, the spawn-test submission failed, or a probe exited early — re-run),
+1 = the run could not be performed.
+
+Probes are launched as the **real toolchain `cargo.exe`** resolved via `rustup
+which cargo`, never `~\.cargo\bin\cargo.exe` — that is a 0-byte symlink to
+`rustup.exe`, and the proxy does not `exec`, so launching it yields a process
+named `rustup.exe` that neither the harness's liveness check nor the reaper
+(which enumerates only `cargo.exe`/`rustc.exe`) will ever name. The script
+asserts the spawned process image is `cargo.exe` and aborts loudly if not.
+
+**Blast radius.** While it runs, every pool slot **and** `-ForeignTargetDir`
+(default: the supervisor's own shared `target\`) is lock-held by a probe, so a
+peer's `spawn-test` or `cargo build` blocks behind it; `POST /diagnostics/clear`
+is global state. Ctrl-C is far safer than it was — the longest uninterruptible
+window is now one 10s poll sleep rather than a 40-minute blocking call, so
+`finally` runs and teardown happens. Every plant is still recorded in
+`%TEMP%\qontinui-verify-scoped-cleanup\last-run.json` as it happens; run
+`-Cleanup` to sweep a leak after a hard kill (probes also self-expire after
+`-ProbeLifetimeSecs`). `-Cleanup` will **not** kill a recorded pid whose
+`StartTimeIso` is missing — an unverifiable identity could be a peer's build
+that inherited the pid. That posture applies to **in-session teardown** too, so
+a probe whose `Process.StartTime` was unreadable at plant time is left running
+until it self-expires; teardown now reports how many pids it had to leave
+behind (and what is running on them) instead of leaking them silently.
+
+Pure decision helpers are unit-tested in
+`scripts/verify-scoped-cleanup.Tests.ps1` (`Invoke-Pester`). The harness is
+Windows-only and can never run on the `ubuntu-latest` gate, so everything it
+string-matches is pinned by CI-enforced Rust tests: `"env"` / `"sysinfo"` and
+the `KilledProcess` fields in `src/process/slot_territory.rs`, and the
+`{timestamp, kind, data}` envelope plus `slot_id` / `territory` / the
+`build_kill` filter category in `src/diagnostics.rs`.
+
 ## Persistent Logs
 
 The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, ~30 min of activity at default) in its in-memory circular buffer, which is not enough to diagnose a crash-loop after the fact. Pass `--log-dir` (or `--log-file`) to tee every entry into an append-only file on disk.
