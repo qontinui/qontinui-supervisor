@@ -6,6 +6,23 @@
 //!   2. POST /apps/<app_id>/spec/proposals/<id>/execute  for every queued row
 //!   3. POST /apps/<app_id>/spec/proposals/sweep-pending
 //!
+//! **State derivation is NOT part of this cron.** It lives in the runner, as a
+//! single global loop (`state_discovery::derive::run_derive_loop`). Two reasons
+//! it must stay there:
+//!   - the supervisor is a dev-only tool the operator alone runs, so a derive
+//!     driven from here reaches no ordinary user;
+//!   - derivation is **global**, not per-app. `/state-discovery/derive` takes
+//!     no `app_id`, so looping the app registry issued N byte-identical global
+//!     derivations per tick (18 artifacts / 4,254 observations over a 237-row
+//!     table, observed 2026-07-27) at one 60 s Python clustering round-trip
+//!     each.
+//!
+//! Do not re-add a derive step here, and do not "fix" the runner's loop into a
+//! per-page or per-spec derive: a state is a set of elements sharing a
+//! render-set signature, so clustering needs the cross-view render pool. The
+//! page label is a selection key, not a partition key — see
+//! `qontinui-runner`'s `spec_authoring::load_and_project_skeleton`.
+//!
 //! Per-app failures `warn` and the loop continues — a flaky app must not
 //! starve its siblings.
 //!
@@ -20,26 +37,6 @@
 //!
 //! Env gate: `QONTINUI_FLYWHEEL_ENABLED=1` is honored by the caller spawning
 //! [`flywheel_loop`]; this module assumes the gate has already been checked.
-//!
-//! # Derive scoping — KNOWN GAP
-//!
-//! Step 0 of each app's tick posts to the runner's `/state-discovery/derive`.
-//! That endpoint scopes derivation by **`spec_id`** (one spec per pathname,
-//! via `pathname_to_spec_id`) — it accepts **no `app_id`**. With no `spec_id`
-//! the runner clusters *every* observation globally and persists a row with
-//! `spec_id = NULL`.
-//!
-//! Two consequences, both live today:
-//!   - the per-app loop issues N byte-identical global derivations per tick,
-//!     each costing a Python clustering round trip (60 s bridge budget);
-//!   - the only consumer, `spec_authoring::load_latest_artifact`, selects
-//!     `WHERE spec_id = $1` with a concrete id, so a `NULL`-`spec_id` row can
-//!     never match — the rows this writes are unreadable.
-//!
-//! Making derive do useful work needs a scoping decision (iterate each app's
-//! spec catalog and pass `spec_id`, or add an app-scoped derive route to the
-//! runner). Until then the phase is inert-but-honest: it reports what it
-//! actually did rather than implying per-app derivation.
 //!
 //! Anti-pattern guards (§6.7):
 //! - Time-driven only — never event-driven (no git-hook / fs-watcher).
@@ -72,15 +69,6 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// the registry is a single PG SELECT.
 const APPS_LIST_TIMEOUT_SECS: u64 = 30;
 
-/// Per-tick HTTP request timeout for the `/state-discovery/derive` call.
-/// Sized for state clustering to complete; 120s is sufficient for Python's
-/// observation accumulation and artifact generation.
-const DERIVE_REQUEST_TIMEOUT_SECS: u64 = 120;
-
-/// Default observation lookback for `/state-discovery/derive`, in days.
-/// Override per-deployment with `QONTINUI_FLYWHEEL_DERIVE_WINDOW_DAYS`.
-const DEFAULT_DERIVE_WINDOW_DAYS: u32 = 90;
-
 /// Sentinel error string returned by [`http_post_json`] when the runner
 /// responds with 404 — interpreted as "spec-authoring feature is off or the
 /// app id is unknown; warn-once and continue".
@@ -94,14 +82,6 @@ const FEATURE_OFF_SENTINEL: &str = "feature-off";
 pub struct TickReport {
     /// Number of apps the registry returned.
     pub apps_seen: usize,
-    /// Number of apps for which `/state-discovery/derive` succeeded.
-    pub derived: usize,
-    /// Number of apps for which `/state-discovery/derive` failed.
-    pub derive_errors: usize,
-    /// Number of apps whose derive was skipped because the runner returned
-    /// 404 (state discovery off / route not deployed). Tracked apart from
-    /// `derive_errors` so "not deployed" never reads as "broken".
-    pub derive_skipped: usize,
     /// Number of apps for which `/scan` succeeded.
     pub apps_scanned: usize,
     /// Total queued proposal ids across all apps.
@@ -154,12 +134,9 @@ pub async fn flywheel_loop(state: SharedState) {
             Ok(report) => {
                 feature_off_warned = false;
                 tracing::info!(
-                    "flywheel: tick complete — apps_seen={}, derived={}, derive_errors={}, \
-                     derive_skipped={}, apps_scanned={}, queued={}, executed={}, swept={}",
+                    "flywheel: tick complete — apps_seen={}, apps_scanned={}, \
+                     queued={}, executed={}, swept={}",
                     report.apps_seen,
-                    report.derived,
-                    report.derive_errors,
-                    report.derive_skipped,
                     report.apps_scanned,
                     report.queued,
                     report.executed,
@@ -205,9 +182,6 @@ pub(crate) async fn run_one_tick_against(
 ) -> Result<TickReport, String> {
     let client = &state.http_client;
     let mut report = TickReport::default();
-    // Latch so a runner without the state-discovery routes yields one WARN
-    // per tick rather than one per app.
-    let mut derive_feature_off_warned = false;
 
     // 0. List apps. A 404 here is the feature-off signal — propagate the
     //    sentinel so the caller can warn-once and skip the rest of this tick.
@@ -220,50 +194,11 @@ pub(crate) async fn run_one_tick_against(
     report.apps_seen = apps.len();
     tracing::info!("flywheel: registry returned {} app(s) to scan", apps.len());
 
-    // 0..3. Per-app derive → scan → execute → sweep. Per-app failures are
-    // logged at warn! and the loop continues — one flaky app must not starve
-    // the siblings.
-    //
-    // Derive is counted here rather than inside `run_one_tick_for_app` because
-    // it is non-fatal and independent of the scan: an app whose derive
-    // succeeded but whose /scan then 5xx'd still counts as derived, and the
-    // Err arm below discards the per-app counts.
-    // Read once per tick, not once per app — matches how `flywheel_loop`
-    // reads its own tunables at startup.
-    let derive_window_days = std::env::var("QONTINUI_FLYWHEEL_DERIVE_WINDOW_DAYS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|d| *d > 0)
-        .unwrap_or(DEFAULT_DERIVE_WINDOW_DAYS);
-
+    // 1..3. Per-app scan → execute → sweep. Per-app failures are logged at
+    // warn! and the loop continues — one flaky app must not starve the
+    // siblings. There is deliberately no derive step here; see the
+    // module-level note.
     for app in apps {
-        match run_derive_for_app(client, base, &app.app_id, derive_window_days).await {
-            Ok(()) => report.derived += 1,
-            // A 404 means the runner predates the state-discovery routes —
-            // "not deployed", not "broken". Counting it as an error would peg
-            // derive_errors == apps_seen on every tick forever and train
-            // operators to ignore the field, so it gets its own counter and
-            // a warn-once latch (mirroring the /apps feature-off handling).
-            Err(e) if e == FEATURE_OFF_SENTINEL => {
-                report.derive_skipped += 1;
-                if !derive_feature_off_warned {
-                    derive_feature_off_warned = true;
-                    tracing::warn!(
-                        "flywheel: /state-discovery/derive returned 404 — state discovery \
-                         is off or this runner predates the route; skipping derive this tick"
-                    );
-                }
-            }
-            Err(e) => {
-                report.derive_errors += 1;
-                tracing::warn!(
-                    app_id = %app.app_id,
-                    error = %e,
-                    "flywheel: derive call failed (continuing to scan)"
-                );
-            }
-        }
-
         match run_one_tick_for_app(state, base, &app).await {
             Ok(per_app) => {
                 report.apps_scanned += 1;
@@ -300,59 +235,7 @@ struct PerAppCounts {
     swept: usize,
 }
 
-/// Step 0 of an app's tick: trigger clustering of accumulated observations
-/// into state artifacts via `/state-discovery/derive`.
-///
-/// Failure is non-fatal to the tick — the caller counts it into
-/// `TickReport::derive_errors`, logs, and proceeds to `/scan` anyway.
-async fn run_derive_for_app(
-    client: &reqwest::Client,
-    base: &str,
-    app_id: &str,
-    derive_window_days: u32,
-) -> Result<(), String> {
-    // NOTE: the runner's handler is `Query<DeriveQuery>` — it reads
-    // `spec_id` + `window_days` from the QUERY STRING and ignores any JSON
-    // body. Sending these as a body silently drops them (the handler sees
-    // all-`None` and 200s), so they must go through `.query()`.
-    let derive_url = format!("{}/state-discovery/derive", base);
-    let body = http_post_json_with_timeout(
-        client,
-        &derive_url,
-        &[("window_days", derive_window_days.to_string())],
-        &serde_json::Value::Null,
-        Duration::from_secs(DERIVE_REQUEST_TIMEOUT_SECS),
-    )
-    .await?;
-
-    // The runner wraps payloads in the `ApiResponse` envelope
-    // (`{"success":true,"data":{…}}`) and the field is snake_case. Read the
-    // envelope, and distinguish "absent" from "zero" — a missing key means
-    // the response shape drifted, not that nothing was derived.
-    let observation_count = body
-        .get("data")
-        .and_then(|d| d.get("observation_count"))
-        .and_then(|v| v.as_i64());
-    match observation_count {
-        Some(n) => tracing::info!(
-            app_id = %app_id,
-            observation_count = n,
-            derive_window_days,
-            "flywheel: state discovery derived"
-        ),
-        None => tracing::warn!(
-            app_id = %app_id,
-            derive_window_days,
-            "flywheel: state discovery derived, but observation_count was absent \
-             from the response envelope — response shape may have drifted"
-        ),
-    }
-    Ok(())
-}
-
 /// Run the scan → execute → sweep sequence for a single registered app.
-/// Step 0 (`/state-discovery/derive`) runs in the caller — see
-/// [`run_derive_for_app`].
 ///
 /// On any 4xx/5xx for `/scan`, returns an error and the caller skips
 /// `/execute` + `/sweep` for this app. Per-proposal `/execute` failures are
@@ -508,33 +391,9 @@ async fn http_post_json(
     url: &str,
     body: &Value,
 ) -> Result<Value, String> {
-    http_post_json_with_timeout(
-        client,
-        url,
-        &[],
-        body,
-        Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS),
-    )
-    .await
-}
-
-/// POST to `url` with explicit query parameters and timeout. Returns the
-/// parsed JSON response body on 2xx.
-///
-/// Same error mapping as [`http_post_json`], which delegates here. `query`
-/// entries are appended to the URL — required by handlers that extract
-/// `Query<T>` rather than `Json<T>`.
-async fn http_post_json_with_timeout(
-    client: &reqwest::Client,
-    url: &str,
-    query: &[(&str, String)],
-    body: &Value,
-    timeout: Duration,
-) -> Result<Value, String> {
     let resp = client
         .post(url)
-        .timeout(timeout)
-        .query(query)
+        .timeout(Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .json(body)
         .send()
         .await
@@ -595,14 +454,14 @@ mod tests {
     #[derive(Default)]
     struct MockState {
         apps_calls: AtomicUsize,
+        /// Kept solely so the tests can assert the cron NEVER calls
+        /// `/state-discovery/derive`. Derivation is the runner's job (one
+        /// global loop); a supervisor-driven derive is the defect this
+        /// counter guards against regressing.
         derive_calls: AtomicUsize,
         scan_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         sweep_calls: AtomicUsize,
-        /// `window_days` as it actually arrived on the QUERY STRING of each
-        /// /derive call. `None` means the param did not arrive — which is
-        /// what a JSON-body-instead-of-query regression looks like.
-        derive_window_days_seen: parking_lot_compat::Mutex<Vec<Option<i32>>>,
         /// Recorded order of /execute path params, so we can assert
         /// proposals were processed sequentially in scan order.
         execute_order: parking_lot_compat::Mutex<Vec<String>>,
@@ -611,17 +470,8 @@ mod tests {
         scan_order: parking_lot_compat::Mutex<Vec<String>>,
         /// /apps response payload (set by each test).
         apps_response: parking_lot_compat::Mutex<Vec<App>>,
-        /// /state-discovery/derive response payload (set by each test).
-        derive_response: parking_lot_compat::Mutex<serde_json::Value>,
         /// /scan response payload per-app (set by each test).
         scan_response: parking_lot_compat::Mutex<serde_json::Value>,
-        /// 0-based /derive call indices that should return 500, to exercise
-        /// the non-fatal derive failure path. Keyed by call index rather
-        /// than app id because the real endpoint takes NO app parameter —
-        /// the requests are indistinguishable server-side.
-        derive_fails_on_calls: parking_lot_compat::Mutex<HashSet<usize>>,
-        /// When true, /derive returns 404 (state discovery not deployed).
-        derive_returns_404: parking_lot_compat::Mutex<bool>,
         /// Apps that should return 500 on /scan to exercise the
         /// per-app-failure-doesn't-abort path.
         scan_fails_for: parking_lot_compat::Mutex<HashSet<String>>,
@@ -656,36 +506,13 @@ mod tests {
         (axum::http::StatusCode::OK, Json(resp)).into_response()
     }
 
-    /// Mirrors the runner's real extractor — `Query<DeriveQuery>`, NOT
-    /// `Json<_>` (see `qontinui-runner/src-tauri/src/state_discovery/derive.rs`).
-    /// Taking the params off the query string is what makes a
-    /// body-instead-of-query regression visible to these tests: a JSON body
-    /// would deserialize to all-`None` here and silently 200.
-    #[derive(Debug, serde::Deserialize)]
-    struct MockDeriveQuery {
-        #[allow(dead_code)]
-        spec_id: Option<String>,
-        window_days: Option<i32>,
-    }
-
-    async fn derive_handler(
-        State(s): State<Arc<MockState>>,
-        axum::extract::Query(q): axum::extract::Query<MockDeriveQuery>,
-    ) -> axum::response::Response {
-        let call_index = s.derive_calls.fetch_add(1, Ordering::SeqCst);
-        s.derive_window_days_seen.lock().push(q.window_days);
-        if *s.derive_returns_404.lock() {
-            return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
-        }
-        if s.derive_fails_on_calls.lock().contains(&call_index) {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "synthetic derive failure",
-            )
-                .into_response();
-        }
-        let body = s.derive_response.lock().clone();
-        (axum::http::StatusCode::OK, Json(body)).into_response()
+    /// Trap route. The cron must never hit `/state-discovery/derive` — that
+    /// endpoint derives the whole observation corpus globally and belongs to
+    /// the runner's own loop. Any call here is counted so a test can fail on
+    /// it.
+    async fn derive_trap_handler(State(s): State<Arc<MockState>>) -> axum::response::Response {
+        s.derive_calls.fetch_add(1, Ordering::SeqCst);
+        (axum::http::StatusCode::OK, Json(serde_json::json!({}))).into_response()
     }
 
     async fn scan_handler(
@@ -730,7 +557,7 @@ mod tests {
     async fn spawn_mock_runner(state: Arc<MockState>) -> String {
         let app = Router::new()
             .route("/apps", get(apps_handler))
-            .route("/state-discovery/derive", post(derive_handler))
+            .route("/state-discovery/derive", post(derive_trap_handler))
             .route("/apps/{app_id}/spec/proposals/scan", post(scan_handler))
             .route(
                 "/apps/{app_id}/spec/proposals/{id}/execute",
@@ -789,7 +616,6 @@ mod tests {
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
         assert_eq!(report.apps_seen, 0);
-        assert_eq!(report.derived, 0);
         assert_eq!(report.apps_scanned, 0);
         assert_eq!(report.queued, 0);
         assert_eq!(report.executed, 0);
@@ -803,8 +629,6 @@ mod tests {
     async fn tick_with_one_app_and_zero_queued_only_sweeps() {
         let mock = Arc::new(MockState::default());
         *mock.apps_response.lock() = vec![mk_app("qontinui-runner")];
-        *mock.derive_response.lock() =
-            serde_json::json!({ "success": true, "data": { "observation_count": 5 } });
         *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
         let base = spawn_mock_runner(mock.clone()).await;
         let state = test_state();
@@ -812,13 +636,12 @@ mod tests {
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
         assert_eq!(report.apps_seen, 1);
-        assert_eq!(report.derived, 1);
         assert_eq!(report.apps_scanned, 1);
         assert_eq!(report.queued, 0);
         assert_eq!(report.executed, 0);
         assert_eq!(report.swept, 1);
         assert_eq!(mock.apps_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mock.scan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(mock.execute_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mock.sweep_calls.load(Ordering::SeqCst), 1);
@@ -828,8 +651,6 @@ mod tests {
     async fn tick_with_two_queued_calls_execute_twice() {
         let mock = Arc::new(MockState::default());
         *mock.apps_response.lock() = vec![mk_app("qontinui-runner")];
-        *mock.derive_response.lock() =
-            serde_json::json!({ "success": true, "data": { "observation_count": 10 } });
         *mock.scan_response.lock() = serde_json::json!({
             "queuedProposals": [
                 {"proposal_id": "prop-a"},
@@ -841,22 +662,13 @@ mod tests {
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
-        assert_eq!(report.derived, 1);
         assert_eq!(report.queued, 2);
         assert_eq!(report.executed, 2);
         assert_eq!(report.swept, 1);
-        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mock.scan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(mock.execute_calls.load(Ordering::SeqCst), 2);
         assert_eq!(mock.sweep_calls.load(Ordering::SeqCst), 1);
-
-        // `window_days` must arrive on the QUERY STRING. `Some(90)` here is
-        // the assertion that distinguishes a correct call from the
-        // JSON-body form, which the runner's `Query` extractor ignores.
-        assert_eq!(
-            mock.derive_window_days_seen.lock().clone(),
-            vec![Some(DEFAULT_DERIVE_WINDOW_DAYS as i32)]
-        );
 
         // Sequential order — proposals are dispatched in scan order, never
         // parallel (§6.7 anti-pattern guard).
@@ -909,7 +721,6 @@ mod tests {
 
     /// Stream E.9 test #5: cron iterates the registry and a 5xx on one
     /// app's `/scan` does NOT abort the tick — siblings still run.
-    /// Phase 2: Derive is called for all apps, even if scan fails later.
     #[tokio::test]
     async fn cron_iterates_app_list_and_continues_on_per_app_failure() {
         let mock = Arc::new(MockState::default());
@@ -918,8 +729,6 @@ mod tests {
             mk_app("flaky-app"),
             mk_app("qontinui-web"),
         ];
-        *mock.derive_response.lock() =
-            serde_json::json!({ "success": true, "data": { "observation_count": 3 } });
         *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
         mock.scan_fails_for.lock().insert("flaky-app".to_string());
         let base = spawn_mock_runner(mock.clone()).await;
@@ -927,28 +736,16 @@ mod tests {
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
-        // All three apps were visited (derive + scan attempted), but only the two
+        // All three apps were visited (scan attempted), but only the two
         // healthy ones completed the full sequence (sweep).
         assert_eq!(report.apps_seen, 3);
-        assert_eq!(report.derived, 3, "all apps should derive successfully");
         assert_eq!(report.apps_scanned, 2, "flaky-app should fail at scan");
         assert_eq!(report.swept, 2, "only healthy apps sweep");
-        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 3);
         assert_eq!(mock.scan_calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             mock.sweep_calls.load(Ordering::SeqCst),
             2,
             "flaky-app never sweeps"
-        );
-
-        // KNOWN GAP: derive order cannot be asserted per-app, because the
-        // three requests are byte-identical — `/state-discovery/derive`
-        // accepts no app parameter. All we can assert is the call count.
-        // See the module-level "Derive scoping" note.
-        assert_eq!(
-            mock.derive_window_days_seen.lock().len(),
-            3,
-            "one derive per app, all indistinguishable server-side"
         );
 
         // Apps were iterated in registry order for scan.
@@ -963,66 +760,20 @@ mod tests {
         );
     }
 
-    /// A 404 on `/state-discovery/derive` means the runner predates the
-    /// route (or state discovery is off). That is "not deployed", not
-    /// "broken": it must land in `derive_skipped`, leave `derive_errors`
-    /// clean, and never block the scan.
+    /// Regression guard for the defect this step removed: the cron must NEVER
+    /// call `/state-discovery/derive`. Derivation is global (the endpoint
+    /// takes no `app_id`), so a per-app loop produced N byte-identical
+    /// artifacts per tick — and the supervisor is dev-only, so a derive driven
+    /// from here reaches no ordinary user. The runner owns the one global
+    /// loop now.
     #[tokio::test]
-    async fn derive_404_counts_as_skipped_not_error() {
+    async fn tick_never_calls_state_discovery_derive() {
         let mock = Arc::new(MockState::default());
-        *mock.apps_response.lock() = vec![mk_app("qontinui-runner"), mk_app("qontinui-web")];
-        *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
-        *mock.derive_returns_404.lock() = true;
-        let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
-
-        let report = run_one_tick_against(&state, &base).await.unwrap();
-
-        assert_eq!(report.derived, 0);
-        assert_eq!(
-            report.derive_errors, 0,
-            "feature-off must never read as broken"
-        );
-        assert_eq!(report.derive_skipped, 2);
-        // The tick proceeds normally despite state discovery being absent.
-        assert_eq!(report.apps_scanned, 2);
-        assert_eq!(report.swept, 2);
-    }
-
-    /// A 5xx on `/state-discovery/derive` is non-fatal: the app still scans,
-    /// executes and sweeps, and the failure lands in `derive_errors` rather
-    /// than aborting the app's tick.
-    #[tokio::test]
-    async fn derive_failure_is_non_fatal_and_app_still_scans() {
-        let mock = Arc::new(MockState::default());
-        *mock.apps_response.lock() = vec![mk_app("qontinui-runner"), mk_app("derive-flaky")];
-        *mock.derive_response.lock() =
-            serde_json::json!({ "success": true, "data": { "observation_count": 7 } });
-        *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
-        // Fail the SECOND derive call (index 1) — i.e. the one issued while
-        // processing the second app.
-        mock.derive_fails_on_calls.lock().insert(1);
-        let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
-
-        let report = run_one_tick_against(&state, &base).await.unwrap();
-
-        assert_eq!(report.apps_seen, 2);
-        assert_eq!(report.derived, 1, "only the healthy app derives");
-        assert_eq!(report.derive_errors, 1, "the 5xx lands in derive_errors");
-        // The derive failure must NOT stop the app from scanning/sweeping.
-        assert_eq!(report.apps_scanned, 2, "derive failure never blocks scan");
-        assert_eq!(report.swept, 2, "derive failure never blocks sweep");
-        assert_eq!(mock.derive_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(mock.scan_calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn tick_multiple_apps_aggregates_counts() {
-        let mock = Arc::new(MockState::default());
-        *mock.apps_response.lock() = vec![mk_app("qontinui-runner"), mk_app("qontinui-web")];
-        *mock.derive_response.lock() =
-            serde_json::json!({ "success": true, "data": { "observation_count": 1 } });
+        *mock.apps_response.lock() = vec![
+            mk_app("qontinui-runner"),
+            mk_app("qontinui-web"),
+            mk_app("qontinui-mobile"),
+        ];
         *mock.scan_response.lock() = serde_json::json!({
             "queuedProposals": [{"proposal_id": "p1"}]
         });
@@ -1031,9 +782,29 @@ mod tests {
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
-        // Each app gets derive + one queued proposal → 2 derived + 2 queued + 2 executed + 2 swept.
+        assert_eq!(report.apps_seen, 3);
+        assert_eq!(report.apps_scanned, 3, "the tick still does its real work");
+        assert_eq!(
+            mock.derive_calls.load(Ordering::SeqCst),
+            0,
+            "the supervisor must not derive — that belongs to the runner's global loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_multiple_apps_aggregates_counts() {
+        let mock = Arc::new(MockState::default());
+        *mock.apps_response.lock() = vec![mk_app("qontinui-runner"), mk_app("qontinui-web")];
+        *mock.scan_response.lock() = serde_json::json!({
+            "queuedProposals": [{"proposal_id": "p1"}]
+        });
+        let base = spawn_mock_runner(mock.clone()).await;
+        let state = test_state();
+
+        let report = run_one_tick_against(&state, &base).await.unwrap();
+
+        // Each app gets one queued proposal → 2 queued + 2 executed + 2 swept.
         assert_eq!(report.apps_seen, 2);
-        assert_eq!(report.derived, 2);
         assert_eq!(report.apps_scanned, 2);
         assert_eq!(report.queued, 2);
         assert_eq!(report.executed, 2);
