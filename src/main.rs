@@ -1,4 +1,7 @@
 mod bazel_remote;
+/// Pure rendering of a failed build's stderr into a diagnosable error. Split
+/// out of `build_monitor` so the Linux-only merge gate can test it.
+mod build_diagnostics;
 mod build_monitor;
 mod build_submissions;
 mod cache_key;

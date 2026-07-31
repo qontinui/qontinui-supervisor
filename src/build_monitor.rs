@@ -1147,32 +1147,43 @@ async fn run_build_inner(
             );
             (output.status, output.stderr)
         }
+        // The three arms below all end the build WITHOUT an exit status. They
+        // used to early-return before any of the persistence below ran, so a
+        // timeout-killed build wrote NO `last-build.stderr`, NO
+        // `last_build_stderr_capture` and NO `last_build_log` — the sidecar
+        // was left dated from whatever build last exited normally, and the
+        // only surviving trace was whatever fit in the supervisor's 500-entry
+        // ring buffer. Two failed builds on 2026-07-31 were diagnosed with
+        // `slot-0/last-build.stderr` still dated from the previous day.
+        //
+        // `partial` is the stderr the process HAD produced before we killed
+        // it, which is exactly where a timeout's cause lives (an OOM'd rustc
+        // thrashing, a wedged linker). It is now persisted and rendered
+        // through the same path a normal failure uses.
         Ok(GuardedOutcome::TimedOut { after, partial }) => {
             warn!(
                 "GCMD: cargo TimedOut after {}s, killing — slot={}",
                 after.as_secs(),
                 slot.id
             );
-            // Make sure the consumer terminates even though we early-return.
-            let _ = consumer.await;
-            let _ = partial; // partial stderr already streamed live to logs
-            return Err(SupervisorError::Timeout(format!(
-                "Build timed out after {}s",
-                after.as_secs()
-            )));
+            let partial_stderr = recover_partial_stderr(consumer, &partial.stderr).await;
+            let base = format!("Build timed out after {}s", after.as_secs());
+            let detail = persist_and_render_incomplete_build(slot, &base, &partial_stderr).await;
+            return Err(SupervisorError::Timeout(detail));
         }
-        Ok(GuardedOutcome::Cancelled { .. }) => {
+        Ok(GuardedOutcome::Cancelled { partial }) => {
             warn!("GCMD: cargo Cancelled — slot={}", slot.id);
-            let _ = consumer.await;
-            return Err(SupervisorError::Process("Build cancelled".to_string()));
+            let partial_stderr = recover_partial_stderr(consumer, &partial.stderr).await;
+            let detail =
+                persist_and_render_incomplete_build(slot, "Build cancelled", &partial_stderr).await;
+            return Err(SupervisorError::Process(detail));
         }
         Err(e) => {
             warn!("GCMD: cargo run() returned err={} slot={}", e, slot.id);
-            let _ = consumer.await;
-            return Err(SupervisorError::Process(format!(
-                "Failed to run cargo build: {}",
-                e
-            )));
+            let partial_stderr = recover_partial_stderr(consumer, &[]).await;
+            let base = format!("Failed to run cargo build: {}", e);
+            let detail = persist_and_render_incomplete_build(slot, &base, &partial_stderr).await;
+            return Err(SupervisorError::Process(detail));
         }
     };
 
@@ -1283,39 +1294,19 @@ async fn run_build_inner(
         // Reuse `joined_stderr` from above; identical to `all_stderr_lines.join("\n")`.
         let full_stderr = joined_stderr;
 
-        // Persist the full captured stderr next to the slot so it survives
-        // a supervisor restart for postmortem inspection. Best-effort: a
-        // failed write is logged but does not change the build outcome.
-        let stderr_path = slot.target_dir.join("last-build.stderr");
-        if let Err(e) = tokio::fs::write(&stderr_path, full_stderr.as_bytes()).await {
-            warn!(
-                "Failed to persist last-build.stderr for slot {} at {:?}: {}",
-                slot.id, stderr_path, e
-            );
-        }
+        persist_slot_failure_stderr(slot, &full_stderr).await;
 
-        // Stash the tail (capped) on the slot so the outer caller can fold
-        // it into SlotHistory::last_error_detail.
-        let detail_tail = tail_bytes_keep_utf8(&full_stderr, LAST_BUILD_STDERR_DETAIL_BYTES);
-        *slot.last_build_stderr_capture.write().await = Some(detail_tail.clone());
-
-        // Append a short tail to the user-visible error so even the legacy
-        // `last_error` string carries actionable info (the SlotHistory
-        // detail field has the longer cap).
-        let short_tail = tail_bytes_keep_utf8(&full_stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
         let base = if error_lines.is_empty() {
             format!("Build failed with exit code: {}", status)
         } else {
             format!("Build failed:\n{}", error_lines.join("\n"))
         };
-        let error_summary = if short_tail.is_empty() {
-            base
-        } else {
-            format!(
-                "{}\n\n--- cargo stderr (last 2KB) ---\n{}",
-                base, short_tail
-            )
-        };
+        // Signatures scanned across the WHOLE log, then a head+tail excerpt —
+        // NOT a bare 2 KB tail. See `build_diagnostics`: for the runner's bin
+        // crate the final rustc command line alone exceeds 2 KB, so the old
+        // tail window held only linker flags and the real cause (an allocator
+        // abort on line 18) never reached the operator.
+        let error_summary = crate::build_diagnostics::render_build_failure(&base, &full_stderr);
         error!("{}", error_summary);
         state
             .logs
@@ -1323,6 +1314,95 @@ async fn run_build_inner(
             .await;
         Err(SupervisorError::BuildFailed(error_summary))
     }
+}
+
+/// Persist a failed build's stderr where a postmortem can find it:
+///
+///  * `<slot.target_dir>/last-build.stderr` — the FULL text, surviving a
+///    supervisor restart, and the thing `BuildAttempt::full_stderr` reads back
+///    into the submission's `stderr_tail`;
+///  * `slot.last_build_stderr_capture` — the capped in-memory blob the outer
+///    caller folds into `SlotHistory::last_error_detail`.
+///
+/// Best-effort on the disk half: a failed write is logged and does not change
+/// the build outcome. Split out of the exit-status arm so the timeout /
+/// cancel / spawn-failure arms can call it too — they previously wrote
+/// NEITHER, which is how two failed builds came to be diagnosed against a
+/// `last-build.stderr` dated from the previous day.
+async fn persist_slot_failure_stderr(slot: &Arc<BuildSlot>, full_stderr: &str) {
+    let stderr_path = slot.target_dir.join("last-build.stderr");
+    if let Err(e) = tokio::fs::write(&stderr_path, full_stderr.as_bytes()).await {
+        warn!(
+            "Failed to persist last-build.stderr for slot {} at {:?}: {}",
+            slot.id, stderr_path, e
+        );
+    }
+    // A RENDERED detail, not a raw tail. `SlotHistory::last_error_detail` is
+    // capped downstream by dropping the OLDEST bytes, so a raw tail here has
+    // exactly the defect this whole change is about — 4 KB of the runner's
+    // build log is still nothing but linker flags.
+    let detail =
+        crate::build_diagnostics::render_capped_detail(full_stderr, LAST_BUILD_STDERR_DETAIL_BYTES);
+    *slot.last_build_stderr_capture.write().await = Some(detail);
+}
+
+/// Recover whatever cargo managed to say before a timeout/cancel/spawn
+/// failure ended the build.
+///
+/// Two sources are available and they are NOT equivalent:
+///
+///  * `captured_bytes` — `GuardedOutcome`'s `PartialOutput`, which
+///    `GuardedCommand` produces by reading the redirect FILE back. Complete.
+///  * the live line consumer — fed by a bounded (4096) broadcast channel that
+///    explicitly DROPS frames on `Lagged`. Lossy.
+///
+/// So we take whichever is longer, rather than preferring the stream. The
+/// lossy source is exactly the one that fails on a long, high-volume,
+/// memory-starved build — i.e. precisely the timeout this function serves, and
+/// precisely where an `memory allocation … failed` line can land inside a
+/// dropped window. This value is used for PERSISTENCE and DIAGNOSIS, not
+/// display, so completeness beats live fidelity.
+///
+/// The consumer is still awaited (under a short bound) so the task terminates
+/// and its sender is released; a wedged consumer must not add its own hang on
+/// top of the timeout we are already reporting.
+async fn recover_partial_stderr(
+    consumer: tokio::task::JoinHandle<(Vec<String>, Vec<String>)>,
+    captured_bytes: &[u8],
+) -> String {
+    let from_file = String::from_utf8_lossy(captured_bytes).to_string();
+    let from_stream = match tokio::time::timeout(Duration::from_secs(5), consumer).await {
+        Ok(Ok((_errors, all_lines))) => all_lines.join("\n"),
+        _ => String::new(),
+    };
+    if from_file.len() >= from_stream.len() {
+        from_file
+    } else {
+        from_stream
+    }
+}
+
+/// Persist + render a build that ended without an exit status.
+///
+/// Runs the SAME persistence a normally-failed build gets (`last-build.stderr`,
+/// `last_build_stderr_capture`, `last_build_log`) and returns the rendered,
+/// cause-naming error string for the `SupervisorError`.
+async fn persist_and_render_incomplete_build(
+    slot: &Arc<BuildSlot>,
+    base: &str,
+    partial_stderr: &str,
+) -> String {
+    if !partial_stderr.is_empty() {
+        persist_slot_failure_stderr(slot, partial_stderr).await;
+        let log = crate::state::tail_bytes_keep_utf8(
+            partial_stderr,
+            crate::state::LAST_BUILD_LOG_MAX_BYTES,
+        );
+        *slot.last_build_log.write().await = Some((chrono::Utc::now(), log));
+    }
+    let detail = crate::build_diagnostics::render_incomplete_build(base, partial_stderr);
+    error!("{}", detail);
+    detail
 }
 
 /// Filename of the install-interception shadow-stub sidecar binary built
@@ -1916,8 +1996,10 @@ fn merge_process_output(output: &std::process::Output) -> String {
 }
 
 /// Record a frontend (pnpm) failure blob on the slot so it reaches every
-/// downstream error surface, and return the short tail to embed in the returned
-/// `SupervisorError::BuildFailed` message.
+/// downstream error surface, and return the RENDERED failure document
+/// (signatures + head/tail excerpt, per `crate::build_diagnostics`) to embed
+/// in the returned `SupervisorError::BuildFailed` message. It used to return a
+/// bare 2 KB tail.
 ///
 /// The frontend prebuild fails BEFORE cargo ever runs, so none of the cargo
 /// failure plumbing fires. Without this, `run_cargo_build_with_dir_detailed`
@@ -1943,22 +2025,25 @@ async fn record_frontend_failure(
         );
     }
 
-    let detail_tail = tail_bytes_keep_utf8(merged_output, LAST_BUILD_STDERR_DETAIL_BYTES);
-    *slot.last_build_stderr_capture.write().await = Some(detail_tail);
+    // Same treatment as a cargo failure, for the same reason: `tsc`/`vite`
+    // print `error TS####` EARLY and pnpm buries it under harness noise, so a
+    // pure tail can crop the only line that matters.
+    let detail = crate::build_diagnostics::render_capped_detail(
+        merged_output,
+        LAST_BUILD_STDERR_DETAIL_BYTES,
+    );
+    *slot.last_build_stderr_capture.write().await = Some(detail);
 
-    let short_tail = tail_bytes_keep_utf8(merged_output, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+    let rendered = crate::build_diagnostics::render_output_failure(
+        &format!("Slot {}: frontend (pnpm) step FAILED", slot.id),
+        merged_output,
+        "frontend (pnpm) stdout+stderr",
+    );
     state
         .logs
-        .emit(
-            LogSource::Build,
-            LogLevel::Error,
-            format!(
-                "Slot {}: frontend (pnpm) step FAILED — captured stdout+stderr:\n{}",
-                slot.id, short_tail
-            ),
-        )
+        .emit(LogSource::Build, LogLevel::Error, rendered.clone())
         .await;
-    short_tail
+    rendered
 }
 
 /// True iff `<wt_root>` is missing EITHER the `pnpm install` marker OR

@@ -2,6 +2,10 @@
 // main.rs has its own mod declarations; this re-exports all modules.
 
 pub mod bazel_remote;
+/// Pure rendering of a failed build's stderr into a diagnosable error. Split
+/// out of `build_monitor` so the Linux-only merge gate can test it — a build
+/// error that does not name its own cause is a defect the gate must catch.
+pub mod build_diagnostics;
 pub mod build_monitor;
 pub mod build_submissions;
 pub mod cache_key;
