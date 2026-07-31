@@ -849,9 +849,16 @@ pub async fn purge_stale_test_runners_core(
         let name = managed.config.name.clone();
         let port = managed.config.port;
 
-        // Best-effort kill anything still on the port
+        // Best-effort kill anything still on the port. `Err` is UNKNOWN (the
+        // listener probe could not answer), not "port idle" — log it rather
+        // than swallowing it, per the contract on `find_pids_on_port`.
         #[cfg(target_os = "windows")]
-        let _ = crate::process::windows::kill_by_port(port).await;
+        if let Err(e) = crate::process::windows::kill_by_port(port).await {
+            tracing::warn!(
+                "purge-stale: listener probe on port {} could not answer ({}) — nothing was \n                 killed by port",
+                port, e
+            );
+        }
 
         // Preserve logs for post-mortem. purge-stale only targets test runners
         // whose process is already dead, so mark them `Crashed`.

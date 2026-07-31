@@ -4,6 +4,11 @@ pub mod guarded_command;
 pub mod health_probe;
 pub mod job;
 pub mod manager;
+/// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
+/// "which PID is LISTENING on this port" predicate must be covered by the gate
+/// that blocks merges; it silently returned the wrong answer on every
+/// non-English Windows for as long as it lived inside the `windows` module.
+pub mod netstat_parse;
 pub mod orphan_scan;
 pub mod panic_log;
 pub mod port;
@@ -11,6 +16,10 @@ pub mod restate_port;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
 /// slot-kill predicate must be covered by the gate that blocks merges.
 pub mod slot_territory;
+/// Cross-platform on purpose — see the module docs. Decides what a failed stop
+/// TELLS the operator, which is Windows-path logic the Linux-only merge gate
+/// must still be able to test.
+pub mod stop_ledger;
 pub mod stopped_cache;
 #[cfg(target_os = "windows")]
 pub mod windows;
