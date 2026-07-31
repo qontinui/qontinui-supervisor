@@ -137,6 +137,54 @@ pub fn min_free_disk_gb() -> u64 {
         .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
 }
 
+/// Default minimum free COMMIT (GB) below which the pre-permit memory guard
+/// DEFERS a build. Mirrors `cargo-guard.sh`'s `MIN_FREE_GB=5` and `ci_node`'s
+/// `MIN_FREE_RAM_GB`, so the supervisor lane now applies the same floor the
+/// agent lane and the CI lane already did — it was the one build path without
+/// one.
+///
+/// Why this exists: the runner's bin crate needs several GiB in a SINGLE rustc.
+/// Starting it into a starved box does not fail cleanly — rustc aborts with
+/// `memory allocation of N bytes failed` / `STATUS_STACK_BUFFER_OVERRUN`
+/// (`0xc0000409`, Rust's `__fastfail` abort path, NOT a real buffer overrun),
+/// **and that abort corrupts the slot's incremental cache**, so the next build
+/// restarts from scratch and needs even MORE memory than the one that just
+/// died. The failure is self-perpetuating, which is why a too-eager start is
+/// worse than waiting. Observed 8x on the MSI box between 2026-07-23 and
+/// 2026-07-30; the 07-30 instance is what took the runner build offline.
+pub const DEFAULT_MIN_FREE_RAM_GB: u64 = 5;
+
+/// Env var overriding the pre-permit memory guard threshold, in GB.
+pub const MIN_FREE_RAM_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB";
+
+/// Minimum free commit (in GB) required before a build may acquire a build-pool
+/// permit. Resolved from [`MIN_FREE_RAM_GB_ENV`], falling back to
+/// [`DEFAULT_MIN_FREE_RAM_GB`]. Parse-with-default exactly like
+/// [`min_free_disk_gb`]. A `0` disables the guard entirely.
+pub fn min_free_ram_gb() -> u64 {
+    std::env::var(MIN_FREE_RAM_GB_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_RAM_GB)
+}
+
+/// Default cap (seconds) on how long the memory guard defers before building
+/// anyway. Mirrors `cargo-guard.sh`'s `MEM_WAIT_MAX=900`.
+pub const DEFAULT_MEM_WAIT_MAX_SECS: u64 = 900;
+
+/// Env var overriding the memory guard's maximum defer window, in seconds.
+pub const MEM_WAIT_MAX_SECS_ENV: &str = "QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS";
+
+/// Maximum seconds the memory guard will defer a build waiting for headroom
+/// before proceeding anyway. Bounded so a mis-measuring box can never deadlock
+/// the build lane.
+pub fn mem_wait_max_secs() -> u64 {
+    std::env::var(MEM_WAIT_MAX_SECS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MEM_WAIT_MAX_SECS)
+}
+
 /// Configuration for a single managed runner instance.
 ///
 /// The canonical discriminator is the `kind` field (a [`RunnerKind`]).
@@ -244,7 +292,17 @@ pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
 /// the endpoint returns as soon as the event is queued — if it hangs, the
 /// runner is already unhealthy and we want to fall through to kill quickly.
 pub const RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS: u64 = 500;
-const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 1800; // 30 minutes — cold Tauri builds on Windows can run 11+ min
+// 90 minutes. Was 1800 (30 min) on the estimate that "cold Tauri builds on
+// Windows can run 11+ min" — measured cold `spawn-test {rebuild:true}` builds
+// on the MSI box are 2382s and 2974s (2026-07-31), i.e. 40-50 min, and CI's
+// Windows leg medians 77 min. 1800 killed BOTH of those builds.
+//
+// Why this mattered more than "a build occasionally gets cut short": it closed
+// a loop. A rustc OOM abort poisons the slot's incremental cache, so the NEXT
+// build is cold; a cold build then exceeds 1800s and is killed; a killed build
+// leaves the cache poisoned, so the one after that is cold too. The lane never
+// recovers on its own, and raising memory alone would NOT have broken it.
+const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 5400;
 
 /// Resolved cargo build timeout in seconds, read from
 /// `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` env var at first access.

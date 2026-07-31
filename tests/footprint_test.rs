@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use qontinui_supervisor::build_monitor::{check_disk_guard, disk_guard_allows};
+use qontinui_supervisor::build_monitor::{
+    available_commit_bytes, check_disk_guard, disk_guard_allows, ram_guard_allows,
+};
 use qontinui_supervisor::config::{RunnerConfig, SupervisorConfig};
 use qontinui_supervisor::error::SupervisorError;
 use qontinui_supervisor::state::SupervisorState;
@@ -56,6 +58,39 @@ fn disk_guard_pure_threshold() {
     // At/above threshold → allowed.
     assert!(disk_guard_allows(Some(30 * gb), 30));
     assert!(disk_guard_allows(Some(100 * gb), 30));
+}
+
+#[test]
+fn ram_guard_pure_threshold() {
+    let gb = 1024u64 * 1024 * 1024;
+    // 0 disables the guard regardless of free commit.
+    assert!(ram_guard_allows(Some(0), 0));
+    // None (probe failed) fails open — a telemetry gap must never brick the
+    // build lane, same contract as the disk guard.
+    assert!(ram_guard_allows(None, 5));
+    // Below the floor → defer. 3 GB free is roughly where the 2026-07-30
+    // rustc abort (0xc0000409) happened on the MSI box.
+    assert!(!ram_guard_allows(Some(3 * gb), 5));
+    // At/above the floor → build.
+    assert!(ram_guard_allows(Some(5 * gb), 5));
+    assert!(ram_guard_allows(Some(32 * gb), 5));
+}
+
+#[test]
+fn ram_probe_reports_a_plausible_value() {
+    // The probe must return Some on a supported platform (it is the input the
+    // guard fails OPEN on, so a silently-None probe would disable the guard on
+    // exactly the box it exists to protect — the `free_mem_gb` MSYS trap that
+    // cargo-guard.sh documents).
+    let free = available_commit_bytes();
+    assert!(free.is_some(), "memory probe returned None");
+    // Sanity: a machine that can build this workspace has more than 64 MB of
+    // commit available; anything less means we read the wrong field.
+    assert!(
+        free.unwrap() > 64 * 1024 * 1024,
+        "implausible free commit: {:?}",
+        free
+    );
 }
 
 #[tokio::test]

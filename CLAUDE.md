@@ -327,6 +327,12 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 
 The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, override via env `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is serialized behind a dedicated mutex since Tauri embeds a single `dist/`.
 
+**Pre-permit memory guard (2026-07-31).** Before acquiring a permit, a build waits while free **commit** is below `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (default 5). This mirrors `cargo-guard.sh`'s `MIN_FREE_GB` and `ci_node`'s `MIN_FREE_RAM_GB` — the supervisor was the only build lane without a memory floor, which is why it was the lane that OOM'd. It **defers, never rejects** (unlike the disk guard, which refuses with 507): memory pressure is transient, so failing the build would turn a recoverable condition into an error. After `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) it builds anyway, and it fails open on an unreadable probe — a mis-measuring box degrades to the old behavior rather than wedging the lane. The wait happens **before** permit acquisition, so it never holds a slot.
+
+It measures free COMMIT, not free physical RAM, deliberately: the binding constraint for a big rustc is the commit limit, and builds here have died at ~90% commit while free-physical looked healthy. On Windows it reads `GlobalMemoryStatusEx().ullAvailPageFile` — the same counter `cargo-guard.sh` reads via `Win32_OperatingSystem.FreeVirtualMemory`.
+
+**It is a safety net, not a cure.** It stops a build entering an already-starved box and prevents the poisoned-cache cascade, but it cannot guarantee headroom 40 minutes later when the single `qontinui_runner` bin-crate rustc peaks (~5-6 GB). If that rustc's allocator fails, rustc aborts with `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN` — Rust's `__fastfail`, NOT a real buffer overrun) and the slot's incremental cache is corrupted. The durable fix on a 32 GB box is raising the Windows pagefile so the commit ceiling clears the peak.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), `last_successful_slot`, and a top-level `active_builds` array. **Invariant:** `pool_size == available_permits + active_builds.len()`. `active_builds` and `available_permits` are derived from the same per-slot iteration as `slots[]` so the three views can never disagree mid-release. A separate `semaphore_permits` field exposes the raw `Semaphore::available_permits()` value for debugging transient release-ordering divergence inside `run_cargo_build_with_dir` — at steady state it equals `available_permits`. |
@@ -667,7 +673,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 4. **Optional wait** — if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
 
 **Timeouts:**
-- **Build timeout:** 30 minutes default (override via `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS`, clamped [60, 7200]). If cargo exceeds this, the build process is killed.
+- **Build timeout:** 90 minutes default (override via `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS`, clamped [60, 7200]). If cargo exceeds this, the build process is killed. Raised from 30 min on 2026-07-31: measured cold `spawn-test {rebuild:true}` builds are 40–50 min (2382s / 2974s observed), so 30 min killed them mid-compile. That mattered because it closed a loop — a rustc OOM abort poisons the slot's incremental cache, the next build is therefore cold, a cold build then blew the 30-min timeout, and being killed left the cache poisoned again. The lane could not recover on its own.
 - **Queue timeout:** configurable via `queue_timeout_secs`. **It bounds the WHOLE build (cargo permit wait + frontend `pnpm run build` + cargo compile), not just slot acquisition.** A spawn can therefore time out while `GET /builds` shows free cargo permits, because the frontend build is serialized behind `npm_lock` and a concurrent `pnpm run build` (this supervisor's other slots, or an EXTERNAL build on a multi-agent machine) can hold that lock with all cargo slots idle. The timeout message now NAMES the blocked phase — "waited Ns, blocked on the frontend (pnpm) lock with M cargo permits free" vs "waited Ns for a cargo build slot" — so the error itself tells you whether it was slot exhaustion or frontend serialization. `GET /builds` surfaces the same contention via `npm_lock_held` (bool, best-effort sample) and `npm_lock_waiters` (count of spawns blocked on the frontend lock); free `available_permits` with `npm_lock_held: true` does NOT guarantee a prompt start. A spawn waiting >60s on the frontend lock while cargo permits are free emits a `tracing::warn!` in supervisor.log.
 - **Wait timeout:** configurable via `wait_timeout_secs` (default 120s). Only applies when `wait: true`. Returns successfully even if the runner doesn't become healthy — `status` field will say `"timeout"`.
 - **No-wait mode:** pass `X-Queue-Mode: no-wait` header for immediate 503 with queue info instead of blocking.
@@ -700,7 +706,8 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Supervisor port | 9875 |
 | Runner API port | 9876 |
 | Expo port | 8081 |
-| Build timeout | 30min (1800s) default, override `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` |
+| Build timeout | 90min (5400s) default, override `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` (clamped [60, 7200]) |
+| Pre-permit memory floor | 5 GB free **commit**, override `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (0 disables); defers up to `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) then builds anyway |
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |
 | Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |

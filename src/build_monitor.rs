@@ -66,6 +66,130 @@ pub fn disk_guard_allows(disk_free_bytes: Option<u64>, min_free_gb: u64) -> bool
     }
 }
 
+/// Pure threshold check for the pre-permit memory guard. Same shape and
+/// fail-open contract as [`disk_guard_allows`].
+///
+/// - `min_free_gb == 0` ⇒ guard disabled, always allow.
+/// - `available_bytes == None` ⇒ the probe could not be read; FAIL OPEN. A
+///   telemetry gap must never brick the build lane (identical reasoning to the
+///   disk guard, and to `cargo-guard.sh`'s `free_mem_gb` returning empty).
+pub fn ram_guard_allows(available_bytes: Option<u64>, min_free_gb: u64) -> bool {
+    if min_free_gb == 0 {
+        return true;
+    }
+    match available_bytes {
+        None => true,
+        Some(free) => {
+            let required = min_free_gb.saturating_mul(1024 * 1024 * 1024);
+            free >= required
+        }
+    }
+}
+
+/// Available **commit** in bytes, or `None` when it cannot be determined.
+///
+/// On Windows this deliberately reports free COMMIT (`ullAvailPageFile`), NOT
+/// free physical RAM. The binding constraint for a big rustc here is the commit
+/// limit: builds have died at ~90% commit while free-physical still looked
+/// healthy. `cargo-guard.sh` documents the same choice and reads the same
+/// underlying number via `Win32_OperatingSystem.FreeVirtualMemory` — keeping
+/// both lanes on one metric is the point, so the floor means the same thing
+/// wherever it is applied.
+///
+/// Non-Windows uses sysinfo's `available_memory()` (MemAvailable on Linux).
+/// The supervisor only ships on Windows, but the fallback keeps this compiling
+/// and unit-testable on a Linux CI gate.
+pub fn available_commit_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: `status` is a correctly-sized, zeroed MEMORYSTATUSEX with
+        // `dwLength` set as the API requires; the call only writes into it.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok == 0 {
+            return None;
+        }
+        Some(status.ullAvailPageFile)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        Some(sys.available_memory())
+    }
+}
+
+/// Pre-permit memory guard. Called BEFORE acquiring a build-pool permit/slot at
+/// every build-spawning site, so the wait never holds a slot hostage.
+///
+/// **Defers, never rejects.** The caller asked for a build and will get one;
+/// we only decline to ADD load to a box that is already thrashing. This differs
+/// deliberately from [`check_disk_guard`], which refuses outright: a full disk
+/// needs operator action to clear, whereas memory pressure is transient and
+/// typically resolves within minutes. Returning an error here would turn a
+/// recoverable condition into a failed build.
+///
+/// Fails open on an unreadable probe and after `mem_wait_max_secs()`, so a
+/// mis-measuring box can never deadlock the build lane — it degrades to exactly
+/// today's behavior (build anyway, accept the OOM risk) rather than wedging.
+pub async fn check_ram_guard(state: &SharedState) {
+    let min_free_gb = crate::config::min_free_ram_gb();
+    if min_free_gb == 0 {
+        return;
+    }
+    let wait_max = crate::config::mem_wait_max_secs();
+    let interval = std::time::Duration::from_secs(15);
+    let mut waited: u64 = 0;
+    let mut warned = false;
+
+    loop {
+        let free = available_commit_bytes();
+        if ram_guard_allows(free, min_free_gb) {
+            if warned {
+                let gb = free.unwrap_or(0) / (1024 * 1024 * 1024);
+                let msg = format!(
+                    "Pre-permit memory guard: headroom recovered ({} GB free commit) — building",
+                    gb
+                );
+                info!("{}", msg);
+                state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+            }
+            return;
+        }
+
+        let free_gb = free.unwrap_or(0) / (1024 * 1024 * 1024);
+
+        if waited >= wait_max {
+            let msg = format!(
+                "Pre-permit memory guard: still only {} GB free commit after {}s \
+                 (floor {} GB, QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB) — building anyway; \
+                 expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
+                 incremental cache).",
+                free_gb, waited, min_free_gb,
+            );
+            warn!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+            return;
+        }
+
+        if !warned {
+            let msg = format!(
+                "Pre-permit memory guard: low memory — {} GB free commit < {} GB floor; \
+                 deferring build up to {}s for headroom (no build slot is held while waiting).",
+                free_gb, min_free_gb, wait_max,
+            );
+            warn!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+            warned = true;
+        }
+
+        tokio::time::sleep(interval).await;
+        waited = waited.saturating_add(interval.as_secs());
+    }
+}
+
 /// The phase a `spawn-test` build future is in, tracked via a shared
 /// `Arc<AtomicU8>` so the route-level `tokio::time::timeout` wrapper can read
 /// the LIVE phase at the instant it fires and compose a phase-accurate timeout
@@ -417,6 +541,11 @@ pub async fn run_cargo_build_with_dir_detailed(
     if let Err(e) = check_disk_guard(state).await {
         return Err((e, BuildAttempt::default()));
     }
+
+    // Pre-permit memory guard: defer (never reject) while the box lacks the
+    // commit headroom a single rustc on the runner's bin crate needs. Runs
+    // before permit acquisition so waiting never holds a slot.
+    check_ram_guard(state).await;
 
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -3105,6 +3234,11 @@ async fn prewarm_single_slot(
     // Guarding ONLY the real-build path would let prewarm fill a near-full
     // disk (a vet-flagged defect) — both permit-acquisition sites are covered.
     check_disk_guard(state).await?;
+
+    // Same memory floor as the real-build path: the prewarm `cargo check` also
+    // spawns rustc against this workspace, so gating only the real build would
+    // let prewarm be the thing that OOMs and poisons the slot.
+    check_ram_guard(state).await;
 
     // Acquire a permit so concurrent spawn-test calls see this slot as busy.
     state
