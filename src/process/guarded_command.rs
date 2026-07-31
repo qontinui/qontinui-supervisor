@@ -82,15 +82,11 @@ pub enum GuardedOutcome {
         partial: PartialOutput,
     },
     /// The cancellation token fired; the process tree was killed. `partial` is
-    /// whatever was captured before the kill.
-    ///
-    /// `partial` is part of the complete primitive surface (tests + future
-    /// cancel-aware callers); the current build call sites early-return on
-    /// cancel without reading it, hence the allow.
-    Cancelled {
-        #[allow(dead_code)]
-        partial: PartialOutput,
-    },
+    /// whatever was captured before the kill, and the build call sites now
+    /// persist + render it the same way they do a timeout's — a cancelled
+    /// build that leaves no trace is indistinguishable from one that never
+    /// started.
+    Cancelled { partial: PartialOutput },
 }
 
 /// Captured stdout/stderr bytes from a killed (timed-out / cancelled) command.
@@ -102,10 +98,12 @@ pub struct PartialOutput {
     /// need it.
     #[allow(dead_code)]
     pub stdout: Vec<u8>,
-    /// Captured stderr before the kill. Part of the complete primitive surface;
-    /// the current build call sites stream stderr live and early-return on
-    /// timeout/cancel without reading the partial blob, hence the allow.
-    #[allow(dead_code)]
+    /// Captured stderr before the kill. This is where a killed build's cause
+    /// lives (an OOM'd rustc, a wedged linker), so `run_build_inner`'s
+    /// timeout/cancel arms read it as the fallback when the live line consumer
+    /// yielded nothing — see `build_monitor::recover_partial_stderr`. Dropping
+    /// it on the floor is what left a timed-out build with no persisted stderr
+    /// at all (2026-07-31).
     pub stderr: Vec<u8>,
 }
 

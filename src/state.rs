@@ -559,13 +559,20 @@ impl SlotHistory {
             // Full last-build log stays at the slot level for forensics.
             self.last_error_log = None;
         } else {
-            // Compute the short inline tail from the same source as the 4 KiB
-            // detail so they tell a consistent story. `last_error_log` is the
-            // 1 KiB summary surfaced in `GET /builds`; `last_error_detail` is
-            // the longer tail. Both are derived from the captured stderr.
+            // `last_error_log` is the 1 KiB summary surfaced inline in
+            // `GET /builds`; `last_error_detail` is the longer 4 KiB view.
+            // Both derive from the same captured blob so they tell a
+            // consistent story.
+            //
+            // It is a HEAD, not a tail. `error_detail` is no longer raw cargo
+            // stderr — it is a rendered document whose whole point is that the
+            // cause is hoisted to the FRONT (see `build_diagnostics`). Taking
+            // its last 1 KiB would hand `GET /builds` the tail of an excerpt
+            // that is mostly linker flags, faithfully reproducing the
+            // 2026-07-31 defect on the most-consulted surface of all.
             self.last_error_log = error_detail
                 .as_deref()
-                .map(|s| tail_bytes_keep_utf8(s, LAST_ERROR_LOG_MAX_BYTES));
+                .map(|s| head_bytes_keep_utf8(s, LAST_ERROR_LOG_MAX_BYTES));
             self.last_error = error;
             self.last_error_detail = error_detail.map(truncate_error_detail_keep_tail);
         }
@@ -588,6 +595,24 @@ impl SlotHistory {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(sorted[sorted.len() / 2])
     }
+}
+
+/// Return the FIRST `max_bytes` bytes of `s`, snapped back to a UTF-8
+/// character boundary, with a marker when a cut was made.
+///
+/// The counterpart to [`tail_bytes_keep_utf8`], for the surfaces whose input
+/// is a *rendered* diagnostic rather than raw cargo output. Those put the
+/// cause at the front by construction, so keeping the tail throws away
+/// exactly the part that was hoisted there to be seen.
+pub fn head_bytes_keep_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n[...truncated]", &s[..cut])
 }
 
 /// Return the last `max_bytes` bytes of `s`, snapped forward to a UTF-8
@@ -1709,16 +1734,31 @@ mod tests {
     }
 
     #[test]
-    fn test_slot_history_last_error_log_truncates_to_1k() {
+    /// `last_error_log` keeps the HEAD of the detail, not the tail.
+    ///
+    /// This assertion was inverted on 2026-07-31 along with the behaviour.
+    /// `error_detail` is no longer raw cargo stderr — it is a rendered
+    /// diagnostic (`build_diagnostics::render_capped_detail`) that hoists the
+    /// cause to the FRONT precisely so a size cap cannot drop it. Keeping the
+    /// tail of that document hands `GET /builds` an excerpt of linker flags,
+    /// which is the exact defect the rendering was introduced to fix.
+    fn test_slot_history_last_error_log_keeps_the_head_within_1k() {
         let mut h = SlotHistory::new();
         let big = "Z".repeat(LAST_ERROR_LOG_MAX_BYTES * 4);
-        let detail = format!("{}TAIL_LOG_END", big);
+        let detail = format!("HEAD_LOG_START{}TAIL_LOG_END", big);
         h.record(1.0, false, Some("err".into()), Some(detail));
         let stored = h.last_error_log.as_ref().expect("log recorded");
-        assert!(stored.ends_with("TAIL_LOG_END"));
-        // Tail-only helper does not prepend a marker; the cap is the cap.
         assert!(
-            stored.len() <= LAST_ERROR_LOG_MAX_BYTES,
+            stored.starts_with("HEAD_LOG_START"),
+            "the head — where the rendered cause lives — must survive: {stored:.60}"
+        );
+        assert!(
+            !stored.contains("TAIL_LOG_END"),
+            "a 4x-oversized detail must actually be cut"
+        );
+        // The head helper appends a short truncation marker; allow for it.
+        assert!(
+            stored.len() <= LAST_ERROR_LOG_MAX_BYTES + 32,
             "log too large: {}",
             stored.len()
         );
@@ -1737,6 +1777,24 @@ mod tests {
         let out = tail_bytes_keep_utf8(&s, 50);
         assert!(out.len() <= 50 + 1); // up to 1 byte of slack to land on boundary
         assert!(s.ends_with(&out));
+    }
+
+    #[test]
+    fn test_head_bytes_keep_utf8_short_passthrough() {
+        assert_eq!(head_bytes_keep_utf8("short", 1024), "short");
+    }
+
+    /// The head counterpart must be UTF-8 safe at the cut and must mark that
+    /// it cut — an unmarked crop invites the reader to treat a truncated
+    /// document as complete.
+    #[test]
+    fn test_head_bytes_keep_utf8_long_keeps_head_on_boundary() {
+        let s: String = "ééééééééééééé".repeat(200); // 'é' is 2 bytes in UTF-8
+        let out = head_bytes_keep_utf8(&s, 51); // odd cap lands mid-character
+        let body = out.strip_suffix("\n[...truncated]").expect("cut is marked");
+        assert!(body.len() <= 51);
+        assert!(s.starts_with(body), "must be a prefix of the input");
+        assert!(body.chars().all(|c| c == 'é'), "must stay valid UTF-8");
     }
 
     #[test]
