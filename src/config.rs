@@ -306,7 +306,7 @@ const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 5400;
 
 /// Resolved cargo build timeout in seconds, read from
 /// `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` env var at first access.
-/// Clamped to [60, 7200], defaults to 1800 (30 minutes).
+/// Clamped to [60, 7200], defaults to 5400 (90 minutes).
 pub fn build_timeout_secs() -> u64 {
     use std::sync::OnceLock;
     static SECS: OnceLock<u64> = OnceLock::new();
@@ -769,8 +769,42 @@ mod tests {
     // --- Process constant tests ---
 
     #[test]
-    fn test_build_timeout_default_is_30_minutes() {
-        assert_eq!(DEFAULT_BUILD_TIMEOUT_SECS, 1800);
+    fn test_build_timeout_default_is_90_minutes() {
+        // Raised from 1800 on 2026-07-31: measured cold `spawn-test
+        // {rebuild:true}` builds are 2382s and 2974s, so 30 min killed them
+        // mid-compile — and a killed build leaves the slot's incremental cache
+        // poisoned, so the next one is cold too. See DEFAULT_BUILD_TIMEOUT_SECS.
+        assert_eq!(DEFAULT_BUILD_TIMEOUT_SECS, 5400);
+    }
+
+    #[test]
+    fn test_build_timeout_default_is_within_clamp() {
+        // The default must survive its own clamp, or `build_timeout_secs()`
+        // would silently return something other than the declared default.
+        assert!((60..=7200).contains(&DEFAULT_BUILD_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn test_memory_guard_defaults() {
+        // The floor mirrors cargo-guard.sh's MIN_FREE_GB=5 and ci_node's
+        // MIN_FREE_RAM_GB. If this value drifts, the three build lanes stop
+        // agreeing on what "enough memory to start a build" means.
+        assert_eq!(DEFAULT_MIN_FREE_RAM_GB, 5);
+        assert_eq!(DEFAULT_MEM_WAIT_MAX_SECS, 900);
+    }
+
+    #[test]
+    fn test_memory_guard_resolvers_fall_back_to_defaults() {
+        // Only assert the no-override path when the env is genuinely unset —
+        // asserting unconditionally would fail for an operator who has set a
+        // per-machine override, and reading an absent var as "default" is the
+        // silent-empty-is-unknown trap.
+        if std::env::var(MIN_FREE_RAM_GB_ENV).is_err() {
+            assert_eq!(min_free_ram_gb(), DEFAULT_MIN_FREE_RAM_GB);
+        }
+        if std::env::var(MEM_WAIT_MAX_SECS_ENV).is_err() {
+            assert_eq!(mem_wait_max_secs(), DEFAULT_MEM_WAIT_MAX_SECS);
+        }
     }
 
     #[test]
