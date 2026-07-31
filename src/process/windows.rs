@@ -41,10 +41,11 @@ fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
 /// results).
 ///
 /// **`Ok(vec![])` and `Err(_)` are NOT the same answer.** `Ok(vec![])` means
-/// the probe RAN and the port is genuinely idle; `Err(_)` means the probe
-/// could not run at all (the `cmd.exe` spawn failed — process-table pressure,
-/// a missing/blocked `cmd.exe`, a hit handle quota) and the port's state is
-/// **UNKNOWN**.
+/// the probe RAN, its output was recognizably netstat, and the port is
+/// genuinely idle; `Err(_)` means the port's state is **UNKNOWN** — either the
+/// process could not be spawned (process-table pressure, a missing/blocked
+/// `netstat.exe`, a hit handle quota) or its output did not parse as netstat
+/// table output at all.
 ///
 /// This distinction is load-bearing for every caller that kills something.
 /// The function used to swallow the spawn error and return an empty vec, so
@@ -53,12 +54,21 @@ fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
 /// "true orphan, kill it". That is a fleet-wide reap of the operator's own
 /// runners from a single transient `cmd.exe` failure (silent-empty treated as
 /// NO). Callers must treat `Err` as "do not kill" and log a WARN.
+///
+/// **The row filtering itself lives in [`crate::process::netstat_parse`]** and
+/// is locale-independent. It used to be a `| findstr LISTENING` stage in a
+/// `cmd /C` pipeline, which matched nothing on any non-English Windows (German
+/// prints `ABHÖREN`) and so returned `Ok(vec![])` — the exact silent-empty
+/// answer the `Ok`/`Err` split above exists to forbid, reintroduced below the
+/// level the types could see. That module's docs carry the full incident.
+/// `netstat` is now invoked directly rather than through `cmd /C`: there is no
+/// shell pipeline left to build, and one fewer process to fail to spawn.
 async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
-    let output = Command::new("cmd")
-        .args([
-            "/C",
-            &format!("netstat -ano | findstr :{} | findstr LISTENING", port),
-        ])
+    // Plain `-ano`, deliberately without `-p TCP`: the parser already filters
+    // non-TCP rows structurally, so the flag buys nothing and only adds a
+    // flag-rejection failure mode that would degrade the probe to UNKNOWN.
+    let output = Command::new("netstat")
+        .args(["-ano"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,20 +76,36 @@ async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
         .await
         .with_context(|| format!("netstat listener probe for port {port} could not be run"))?;
 
+    // netstat writes the connection table in the console's OEM codepage, so a
+    // localized state column may not be valid UTF-8. We never read that column
+    // (see the module docs) and every field we DO read is ASCII, so a lossy
+    // decode is exact for our purposes.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut pids = Vec::new();
-    for line in stdout.lines() {
-        // netstat -ano row: TCP    0.0.0.0:9876    0.0.0.0:0    LISTENING    12345
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(pid_str) = parts.last() {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                if pid > 0 && !pids.contains(&pid) {
-                    pids.push(pid);
-                }
-            }
+    match crate::process::netstat_parse::scan_listeners(&stdout, port) {
+        // A non-zero exit with no hit on our port means the table we parsed
+        // may be partial — treat that as UNKNOWN rather than reporting a
+        // confident "idle" derived from a truncated capture. A non-zero exit
+        // that still named a PID on our port is evidence enough; the PID is
+        // there either way.
+        crate::process::netstat_parse::ListenerScan::Parsed(pids)
+            if pids.is_empty() && !output.status.success() =>
+        {
+            anyhow::bail!(
+                "netstat listener probe for port {port} exited {} and found no listener; \
+                 the table may be partial, so the port's state is UNKNOWN, not idle",
+                output.status
+            )
+        }
+        crate::process::netstat_parse::ListenerScan::Parsed(pids) => Ok(pids),
+        crate::process::netstat_parse::ListenerScan::Unrecognized { sample } => {
+            anyhow::bail!(
+                "netstat listener probe for port {port} produced output with no TCP rows \
+                 (exit {}); the port's state is UNKNOWN, not idle. First bytes: {:?}",
+                output.status,
+                sample
+            )
         }
     }
-    Ok(pids)
 }
 
 /// Kill every process listening on a specific port. Returns true if at

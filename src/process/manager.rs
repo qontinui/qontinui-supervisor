@@ -11,6 +11,11 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::env_forwarders;
 use crate::process::instance_config_dir;
 use crate::process::port::wait_for_port_free;
+use crate::process::stop_ledger::{resolve_stop_target, StopLedger, StopStrategy, StopTarget};
+#[cfg(target_os = "windows")]
+use crate::process::stop_ledger::{
+    verify_target_image, PidSource, TargetVerification as StopVerification,
+};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
     kill_by_pid, kill_by_port, remove_instance_config_dir, remove_runner_app_data_dirs,
@@ -1041,8 +1046,15 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             let name = managed.config.name.clone();
             let port = managed.config.port;
 
+            // `Err` is UNKNOWN, not "port idle" — say so rather than
+            // swallowing it (contract on `find_pids_on_port`).
             #[cfg(target_os = "windows")]
-            let _ = kill_by_port(port).await;
+            if let Err(e) = kill_by_port(port).await {
+                warn!(
+                    "Stale-test-runner reap: listener probe on port {} could not answer \n                     ({}) — nothing was killed by port",
+                    port, e
+                );
+            }
 
             // Preserve the runner's logs in the stopped-runners cache before
             // dropping its ManagedRunner so post-mortem debugging still works
@@ -2742,6 +2754,70 @@ async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str
     }
 }
 
+/// Identify the process a stop should target, WITHOUT killing anything.
+///
+/// Drives [`resolve_stop_target`] from the three live sources. The third —
+/// image-path identity via sysinfo — is the one that makes a stop survivable
+/// when the netstat listener probe cannot answer: every runner runs from its
+/// own deterministic `runner_exe_copy_path`, so the process can be named with
+/// no subprocess, no locale dependence, and no listening socket required. It
+/// is the same signal `orphan_scan::classify_exe_owner` already trusts to
+/// decide a surviving primary is the operator's and must not be killed.
+async fn resolve_stop_target_for(
+    state: &SharedState,
+    managed: &ManagedRunner,
+    port: u16,
+    registry_pid: Option<u32>,
+) -> StopTarget {
+    // Short-circuit: the registry already knows, so neither probe is worth
+    // paying for.
+    if let Some(pid) = registry_pid {
+        return resolve_stop_target(Some(pid), Ok(None), &[]);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let listener = crate::process::windows::find_pid_on_port(port)
+            .await
+            .map_err(|e| e.to_string());
+        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
+        let by_exe = crate::process::windows::find_pids_holding_exe(&exe_copy).await;
+        resolve_stop_target(None, listener, &by_exe)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (state, managed, port);
+        // NOT `Ok(None)`: neither probe was compiled in, so claiming they ran
+        // and found nothing would be exactly the false assertion this module
+        // exists to eliminate.
+        resolve_stop_target(
+            None,
+            Err("this build has no Windows process probes compiled in".to_string()),
+            &[],
+        )
+    }
+}
+
+/// Windows adapter for [`verify_target_image`]: read the target's live image
+/// path and compare it with the runner's own exe copy.
+#[cfg(target_os = "windows")]
+async fn verify_kill_target(
+    state: &SharedState,
+    managed: &ManagedRunner,
+    stop_target: &StopTarget,
+    pid: u32,
+) -> StopVerification {
+    let source = match stop_target {
+        StopTarget::Found { source, .. } => source.clone(),
+        // Unreachable in practice (there is no pid without a Found), but a
+        // conservative default beats an unwrap.
+        StopTarget::NotFound { .. } => PidSource::ListenerProbe,
+    };
+    let expected = state.config.runner_exe_copy_path(&managed.config);
+    let observed = crate::process::windows::pid_exe_path(pid).await;
+    verify_target_image(&source, observed.as_deref(), &expected)
+}
+
 /// Stop a specific runner by ID. Kills by PID (not by process name).
 pub async fn stop_runner_by_id(
     state: &SharedState,
@@ -2774,58 +2850,93 @@ pub async fn stop_runner_by_id(
     // was spawned when the runner started — it calls `runner.process.take()`
     // immediately so it can await `child.wait()` without holding the lock. So
     // by the time we get here, `managed.runner.process` is always None, and
-    // we have to work via (a) the graceful HTTP close endpoint, (b) the stored
-    // PID, and (c) the `running` flag that the monitor task flips to false
-    // when the process exits.
-    let pid_to_kill = {
+    // we have to work via (a) the graceful HTTP close endpoint, (b) an
+    // identified PID, and (c) the `running` flag that the monitor task flips
+    // to false when the process exits.
+    //
+    // For an ADOPTED runner there is no monitor task and no Child at all, and
+    // the stored PID can be None indefinitely — so (b) is resolved below from
+    // three independent sources rather than read straight out of the registry.
+    let registry_pid = {
         let runner = managed.runner.read().await;
         runner.pid
     };
 
-    // Orphan-PID recovery: if the registry lost track of the PID (None) but
-    // the runner's configured port is in use by some process, that process is
-    // the de-facto runner — likely a zombie from a prior supervisor instance
-    // that the current supervisor adopted partially. Kill it up-front so the
-    // graceful path below has a free port to verify, instead of returning
-    // success while the OS process keeps running.
+    // Ledger of what this stop ACTUALLY does, so a failure can say which rungs
+    // ran and which had nothing to aim at. See `stop_ledger` for why a fixed
+    // "after PID kill, tree-kill, kill-by-port" sentence was worse than no
+    // message at all.
+    let mut ledger = StopLedger::new();
+
+    // --- Target identification (no kills here) ---------------------------
     //
-    // A probe that could not RUN is UNKNOWN, not "port idle": skip the
-    // recovery kill entirely rather than acting on an answer we don't have.
-    #[cfg(target_os = "windows")]
-    if pid_to_kill.is_none() {
-        let orphan_probe = match crate::process::windows::find_pid_on_port(port).await {
-            Ok(found) => found,
-            Err(e) => {
-                warn!(
-                    "Orphan-PID recovery for runner '{}' on port {}: listener probe failed \
-                     ({}) — treating the port as UNKNOWN and skipping the recovery kill",
-                    runner_name, port, e
+    // An ADOPTED runner (the startup orphan scan inherits a primary this
+    // supervisor did not spawn) can sit at `pid: None` indefinitely: the health
+    // cache's PID-recovery tick is the only writer, and it is gated on the
+    // netstat listener probe. When that probe cannot answer, EVERY PID-based
+    // rung below silently becomes a no-op and the stop fails while the runner
+    // is plainly alive (observed 2026-07-31, PID 8872 on port 9876).
+    //
+    // So resolve the target from three independent sources before touching
+    // anything, and fall back to DETERMINISTIC IDENTITY — the runner runs from
+    // its own `runner_exe_copy_path`, so sysinfo can name it with no
+    // subprocess, no locale, and no listening socket required. This is the
+    // same identity signal `orphan_scan::classify_exe_owner` already trusts.
+    //
+    // Deliberately identification-only: the previous revision killed the
+    // recovered PID here, on the spot, which skipped `request_drain` and
+    // `request_graceful_stop` entirely — a hard kill of the operator's primary
+    // with no chance to flush in-flight AI turns or stash dirty worktrees.
+    // Identify now, kill through the normal ladder below.
+    let stop_target = resolve_stop_target_for(state, &managed, port, registry_pid).await;
+
+    // `mut` because the pre-kill identity re-check below can retract the
+    // target. That re-check is Windows-only, so on other targets nothing ever
+    // reassigns it — hence the allow, which would otherwise fail the
+    // Linux-only `clippy -D warnings` gate.
+    #[allow(unused_mut)]
+    let mut pid_to_kill = match &stop_target {
+        StopTarget::Found { pid, source } => {
+            if registry_pid.is_none() {
+                let msg = format!(
+                    "Runner '{}': registry tracked no PID; identified PID {} via {} — \
+                     stopping that process",
+                    runner_name, pid, source
                 );
-                None
-            }
-        };
-        if let Some(orphan_pid) = orphan_probe {
-            let msg = format!(
-                "Recovered orphan PID {} on port {} for runner '{}'; killing",
-                orphan_pid, port, runner_name
-            );
-            info!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Info, msg)
-                .await;
-            let _ = kill_by_pid(orphan_pid).await;
-            // Be explicit about the resulting registry state. The PID was
-            // already None, but flip running=false so callers that race a
-            // health probe see the post-kill view immediately rather than the
-            // stale "running=true, pid=None" tuple.
-            {
+                info!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                    .await;
+                // Publish it so the dashboard, the exit monitor and any racing
+                // health probe all see the same process we are about to stop.
                 let mut runner = managed.runner.write().await;
-                runner.pid = None;
-                runner.running = false;
+                if runner.pid.is_none() {
+                    runner.pid = Some(*pid);
+                }
             }
+            Some(*pid)
         }
-    }
+        StopTarget::NotFound { why } => {
+            warn!(
+                "Runner '{}' stop: could not identify a target process — {}. \
+                 The port-level rung is the only one left.",
+                runner_name, why
+            );
+            None
+        }
+    };
+    // The reason every later PID-based rung records when it has nothing to
+    // aim at. Starts as the identification failure and is REPLACED by the
+    // retraction reason if the pre-kill identity check refuses the target —
+    // otherwise the tree-kill rung would render "DID NOT RUN ()" with an
+    // empty parenthesis, which is the content-free message this whole change
+    // exists to remove.
+    #[allow(unused_mut)]
+    let mut no_target_why = match &stop_target {
+        StopTarget::Found { .. } => String::new(),
+        StopTarget::NotFound { why } => why.clone(),
+    };
 
     // 0. Pre-stop drain (Phase 2): give the runner a bounded chance to flush
     //    in-flight AI turns, stash dirty worktrees to refs/wip/*, and persist
@@ -2876,14 +2987,60 @@ pub async fn stop_runner_by_id(
             .await;
     }
 
+    ledger.ran(
+        StopStrategy::GracefulClose,
+        format!("port {}", port),
+        exited_gracefully,
+    );
+
     // 3. Kill by PID. This is a no-op if the process already exited gracefully
     //    (taskkill reports "PID not found" at debug level) and the primary
     //    mechanism otherwise.
-    if let Some(pid) = pid_to_kill {
-        #[cfg(target_os = "windows")]
-        let _ = kill_by_pid(pid).await;
-        #[cfg(not(target_os = "windows"))]
-        let _ = pid;
+    //
+    // Re-verified immediately before firing: identification happened up to
+    // ~34s ago (drain + close-request + graceful poll), and a probe-derived
+    // PID was only ever a candidate. See `stop_ledger::verify_target_image`.
+    match pid_to_kill {
+        Some(pid) => {
+            #[cfg(target_os = "windows")]
+            {
+                match verify_kill_target(state, &managed, &stop_target, pid).await {
+                    StopVerification::Proceed { note } => {
+                        if let Some(note) = note {
+                            warn!("Runner '{}' stop: PID {} — {}", runner_name, pid, note);
+                        }
+                        let killed = kill_by_pid(pid).await.unwrap_or(false);
+                        ledger.ran(StopStrategy::PidKill, format!("PID {}", pid), killed);
+                    }
+                    StopVerification::Refuse { why } => {
+                        warn!(
+                            "Runner '{}' stop: REFUSING to kill PID {} — {}",
+                            runner_name, pid, why
+                        );
+                        state
+                            .logs
+                            .emit(
+                                LogSource::Supervisor,
+                                LogLevel::Warn,
+                                format!(
+                                    "Runner '{}' stop: refused to kill PID {} — {}",
+                                    runner_name, pid, why
+                                ),
+                            )
+                            .await;
+                        ledger.no_target(StopStrategy::PidKill, why.clone());
+                        no_target_why = why;
+                        pid_to_kill = None;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = pid;
+                ledger.no_target(StopStrategy::PidKill, "not a Windows host");
+            }
+        }
+        None => ledger.no_target(StopStrategy::PidKill, no_target_why.clone()),
     }
 
     // 4. Confirm the process is actually gone before reporting success.
@@ -2919,18 +3076,35 @@ pub async fn stop_runner_by_id(
                     );
                     #[cfg(target_os = "windows")]
                     {
-                        if let Some(pid) = pid_to_kill {
-                            let _ = crate::process::windows::kill_by_pid_tree(pid).await;
+                        match pid_to_kill {
+                            Some(pid) => {
+                                let killed = crate::process::windows::kill_by_pid_tree(pid)
+                                    .await
+                                    .unwrap_or(false);
+                                ledger.ran(
+                                    StopStrategy::TreeKill,
+                                    format!("PID {} (+ child tree)", pid),
+                                    killed,
+                                );
+                            }
+                            None => ledger.no_target(StopStrategy::TreeKill, no_target_why.clone()),
                         }
                         // Also catch a survivor whose PID we never tracked
                         // (orphan adopted on a port we knew but no PID for).
                         // A probe that could not RUN is UNKNOWN — never a
                         // kill; the next escalation step re-confirms anyway.
                         match crate::process::windows::find_pid_on_port(port).await {
-                            Ok(Some(live_pid)) => {
-                                let _ = crate::process::windows::kill_by_pid_tree(live_pid).await;
+                            Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
+                                let killed = crate::process::windows::kill_by_pid_tree(live_pid)
+                                    .await
+                                    .unwrap_or(false);
+                                ledger.ran(
+                                    StopStrategy::TreeKill,
+                                    format!("untracked listener PID {}", live_pid),
+                                    killed,
+                                );
                             }
-                            Ok(None) => {}
+                            Ok(_) => {}
                             Err(e) => warn!(
                                 "Stop-reap escalation for runner '{}': listener probe on port \
                                  {} failed ({}) — skipping the untracked-survivor kill",
@@ -2946,7 +3120,19 @@ pub async fn stop_runner_by_id(
                         port, runner_name, attempt
                     );
                     #[cfg(target_os = "windows")]
-                    let _ = kill_by_port(port).await;
+                    match kill_by_port(port).await {
+                        Ok(killed) => {
+                            ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
+                        }
+                        // The listener probe could not answer, so kill-by-port
+                        // had nothing to aim at. Recording this as a NON-RUN is
+                        // the whole point: it is exactly the case the old fixed
+                        // failure sentence misreported as an attempted kill.
+                        Err(e) => ledger.no_target(
+                            StopStrategy::KillByPort,
+                            format!("listener probe could not answer: {}", e),
+                        ),
+                    }
                 }
                 StopReapOutcome::RetryAfterBackoff => {
                     warn!(
@@ -2958,12 +3144,13 @@ pub async fn stop_runner_by_id(
                     tokio::time::sleep(Duration::from_secs(STOP_REAP_BACKOFF_SECS)).await;
                 }
                 StopReapOutcome::StillHeld => {
-                    let msg = format!(
-                        "Runner '{}' stop could not be confirmed: port {} is still in \
-                         use after PID kill, tree-kill, kill-by-port, and a {}s backoff \
-                         re-check — refusing to report success",
-                        runner_name, port, STOP_REAP_BACKOFF_SECS
-                    );
+                    // Derived from the LEDGER, never asserted. The old fixed
+                    // sentence claimed "after PID kill, tree-kill,
+                    // kill-by-port" unconditionally — on 2026-07-31 none of
+                    // the three had a target and the message sent diagnosis
+                    // hunting for an unkillable process for hours. See
+                    // `process::stop_ledger`.
+                    let msg = ledger.failure_message(&runner_name, port, STOP_REAP_BACKOFF_SECS);
                     warn!("{}", msg);
                     state
                         .logs

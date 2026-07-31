@@ -145,8 +145,17 @@ pub async fn stop_expo(state: &SharedState) -> Result<(), SupervisorError> {
 
     // Fallback: kill by port
     let expo_port = state.config.expo_port;
+    // An `Err` here is UNKNOWN (the listener probe could not answer), not
+    // "nothing there" — worth a WARN even on a best-effort path, per the
+    // contract on `find_pids_on_port`.
     #[cfg(target_os = "windows")]
-    let _ = kill_by_port(expo_port).await;
+    if let Err(e) = kill_by_port(expo_port).await {
+        tracing::warn!(
+            "Expo stop: listener probe on port {} could not answer ({}) — nothing was \n             killed by port and the port's state is UNKNOWN",
+            expo_port,
+            e
+        );
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = expo_port;
 
