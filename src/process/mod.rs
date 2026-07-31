@@ -8,6 +8,13 @@ pub mod manager;
 /// "which PID is LISTENING on this port" predicate must be covered by the gate
 /// that blocks merges; it silently returned the wrong answer on every
 /// non-English Windows for as long as it lived inside the `windows` module.
+///
+/// The `allow` is the price of that placement: every non-test CONSUMER is
+/// `#[cfg(target_os = "windows")]`, so from the binary's private module tree
+/// these items are unreachable on Linux and `-D warnings` rejects them as dead
+/// code. Scoped to non-Windows deliberately — on Windows, where the code does
+/// run, genuine dead code is still reported.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod netstat_parse;
 pub mod orphan_scan;
 pub mod panic_log;
@@ -19,6 +26,13 @@ pub mod slot_territory;
 /// Cross-platform on purpose — see the module docs. Decides what a failed stop
 /// TELLS the operator, which is Windows-path logic the Linux-only merge gate
 /// must still be able to test.
+///
+/// Same `allow` rationale as [`netstat_parse`]: the tree-kill / kill-by-port
+/// rungs and the pre-kill identity check are only ever constructed inside
+/// `#[cfg(target_os = "windows")]` blocks, so they read as dead code on the
+/// Linux gate. Scoped to non-Windows so real dead code is still caught where
+/// the code executes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod stop_ledger;
 pub mod stopped_cache;
 #[cfg(target_os = "windows")]
