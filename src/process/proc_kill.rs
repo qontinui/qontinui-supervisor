@@ -30,8 +30,13 @@ pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
     imp::kill_by_pid_tree(pid).await
 }
 
-/// Kill every process LISTENING on `port`. Returns true if at least one kill
-/// landed. Never errors when the port-lookup tool is unavailable.
+/// Kill every process LISTENING on `port`. `Ok(true)` when at least one kill
+/// landed, `Ok(false)` when the probe ran and there was nothing to kill.
+///
+/// `Err` means the port-lookup probe could not RUN, so the port's state is
+/// UNKNOWN — it is NOT "nothing was listening". Callers that record what they
+/// actually did (`stop_ledger`) must log it as a rung that never ran rather
+/// than as an attempted kill.
 pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     imp::kill_by_port(port).await
 }

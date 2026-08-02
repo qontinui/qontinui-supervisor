@@ -2813,7 +2813,10 @@ async fn emit_exe_lock_kill_failed(
 ///   prevent it from recurring.)
 #[cfg(target_os = "windows")]
 async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
-    let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot
+        .target_dir
+        .join("debug")
+        .join(crate::config::RUNNER_BIN_NAME);
     if !exe_path.exists() {
         return Ok(());
     }
@@ -3262,7 +3265,10 @@ async fn check_slot_fingerprint(slot: &Arc<BuildSlot>) {
     let fingerprint = slot.target_dir.join("debug").join(".fingerprint");
     let exists = tokio::fs::metadata(&fingerprint).await.is_ok();
     if !exists {
-        let exe = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
+        let exe = slot
+            .target_dir
+            .join("debug")
+            .join(crate::config::RUNNER_BIN_NAME);
         if tokio::fs::metadata(&exe).await.is_ok() {
             warn!(
                 "Slot {}: target/debug/.fingerprint missing but exe is present at {:?}; \
@@ -3290,7 +3296,10 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
     info!("Pre-warming {} build slot(s)...", slots.len());
 
     for slot in slots {
-        let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
+        let exe_path = slot
+            .target_dir
+            .join("debug")
+            .join(crate::config::RUNNER_BIN_NAME);
         if exe_path.exists() {
             info!("Slot {} already has a binary, skipping prewarm", slot.id);
             continue;
@@ -3339,7 +3348,10 @@ async fn prewarm_single_slot(
         .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
     // Re-check after acquiring: another caller may have populated this slot.
-    let exe_path = slot.target_dir.join("debug").join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot
+        .target_dir
+        .join("debug")
+        .join(crate::config::RUNNER_BIN_NAME);
     if exe_path.exists() {
         info!(
             "Slot {} populated while waiting for permit, skipping prewarm",

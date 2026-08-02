@@ -59,7 +59,10 @@ fn test_config_runner_exe_path() {
     };
 
     let exe_path = config.runner_exe_path();
-    assert!(exe_path.ends_with("qontinui-runner.exe"));
+    // Platform-aware: `qontinui-runner.exe` on Windows, bare `qontinui-runner`
+    // on macOS/Linux. Asserting the literal `.exe` here would fail the
+    // Linux-only merge gate for exactly the reason `RUNNER_BIN_NAME` exists.
+    assert!(exe_path.ends_with(RUNNER_BIN_NAME));
     assert!(exe_path.to_string_lossy().contains("target"));
     assert!(exe_path.to_string_lossy().contains("debug"));
 }
