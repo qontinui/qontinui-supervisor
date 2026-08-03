@@ -76,6 +76,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::state::SharedState;
 
 /// JSON body for `POST /runners/pair-with-token`.
@@ -370,9 +371,9 @@ pub async fn pair_with_token(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
-        // Don't let an existing CLAUDECODE env var leak into the child;
+        // Don't let inherited Claude Code markers leak into the child;
         // mirrors what manager.rs does on runner spawn.
-        .env_remove("CLAUDECODE");
+        .strip_inherited_claude_markers();
     if let Some(web_base) = &body.web_base_url {
         cmd.env("QONTINUI_WEB_BASE", web_base);
     }

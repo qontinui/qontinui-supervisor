@@ -3,6 +3,7 @@ use tracing::{info, warn};
 
 use super::{ScoreResponse, TestPrompt};
 use crate::config::resolve_model_id;
+use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::state::SharedState;
 
 /// System prompt for the scoring judge — keeps Claude focused on JSON output.
@@ -159,7 +160,7 @@ pub async fn score_workflow(
                 "--tools",
                 "",
             ])
-            .env_remove("CLAUDECODE")
+            .strip_inherited_claude_markers()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -195,6 +196,10 @@ pub async fn score_workflow(
                 "-File",
                 &script_path.display().to_string(),
             ])
+            // Not a `claude` launch, but still an AI agent we hand our env to,
+            // and `gemini --yolo` may launch one. The rule is per-spawn, not
+            // per-vendor: never pass an inherited Claude marker to a child.
+            .strip_inherited_claude_markers()
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
             #[cfg(windows)]

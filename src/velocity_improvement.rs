@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::resolve_model_id;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::state::SharedState;
 use crate::velocity_tests::db::VelocityTestDb;
 use crate::velocity_tests::VelocityTestResult;
@@ -728,7 +729,7 @@ async fn spawn_fix_agent(
         "--model",
         &model_id,
     ])
-    .env_remove("CLAUDECODE")
+    .strip_inherited_claude_markers()
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
     #[cfg(windows)]

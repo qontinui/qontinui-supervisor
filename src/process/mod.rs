@@ -1,3 +1,7 @@
+/// Cross-platform on purpose — the strip rule applies to every spawn on every
+/// platform, and the grep-level regression guard inside it must run on the
+/// Linux-only CI gate that blocks merges.
+pub mod claude_env;
 pub mod early_log;
 pub mod env_forwarders;
 pub mod guarded_command;

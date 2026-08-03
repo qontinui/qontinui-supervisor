@@ -4,6 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::error::SupervisorError;
 use crate::log_capture::{self, LogLevel, LogSource};
+use crate::process::claude_env::StripInheritedClaudeMarkers;
 #[cfg(target_os = "windows")]
 use crate::process::windows::kill_by_port;
 use crate::state::SharedState;
@@ -55,7 +56,7 @@ pub async fn start_expo(state: &SharedState) -> Result<(), SupervisorError> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .env_remove("CLAUDECODE")
+            .strip_inherited_claude_markers()
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn Expo: {}", e)))?
     };
@@ -67,7 +68,7 @@ pub async fn start_expo(state: &SharedState) -> Result<(), SupervisorError> {
             .current_dir(&expo_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_remove("CLAUDECODE")
+            .strip_inherited_claude_markers()
             .spawn()
             .map_err(|e| SupervisorError::Process(format!("Failed to spawn Expo: {}", e)))?
     };

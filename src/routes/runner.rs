@@ -11,6 +11,7 @@ use crate::dev_action::{
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
 use crate::process::manager;
 use crate::state::SharedState;
@@ -933,9 +934,17 @@ pub async fn supervisor_restart(
     // `restart-supervisor.ps1` path did, while the comment here claimed the
     // opposite.
 
-    // Spawn replacement process
+    // Spawn replacement process.
+    //
+    // The strip matters MORE here than at any other spawn site: this is the
+    // only path that spawns another supervisor. Without it an inherited
+    // `CLAUDE_CODE_CHILD_SESSION` survives every self-restart, so the remedy
+    // the startup warning prints ("launch from a shell that does not carry the
+    // marker") is defeated by the restart endpoint — the marker would outlive
+    // the session that set it for as long as the supervisor keeps restarting
+    // itself.
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&remaining_args);
+    cmd.args(&remaining_args).strip_inherited_claude_markers();
 
     #[cfg(windows)]
     {

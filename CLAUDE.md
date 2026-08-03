@@ -756,6 +756,47 @@ SELECT pid, query, wait_event_type, wait_event,
 
 Either wait ~2 min for PG to clean up, or `SELECT pg_terminate_backend(<pid>)` the offending sessions. **Avoid force-killing runners** when the supervisor can stop them via API — graceful stop closes PG connections cleanly.
 
+## Claude CLI spawning — strip inherited markers at EVERY spawn site
+
+**Every `Command` the supervisor spawns must call
+`process::claude_env::StripInheritedClaudeMarkers::strip_inherited_claude_markers()`.**
+Never open-code `.env_remove("CLAUDECODE")` or
+`.env_remove("CLAUDE_CODE_CHILD_SESSION")` — a unit test
+(`every_spawn_site_goes_through_the_shared_strip`) fails the build if you do.
+
+Claude Code sets `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` to describe a
+process's place in a session tree. Both are inherited by the whole process tree
+and **nothing clears them**. The supervisor is normally launched from a Claude
+Code session, so it carries both and would hand them to every child — the
+`claude` processes it launches directly (`evaluation/judge.rs`,
+`velocity_improvement.rs`), the runners that go on to launch more, and the
+replacement supervisor spawned by `POST /supervisor/restart`. A genuine
+top-level session then claims to be the child of a session that exited long ago.
+
+`INHERITED_CLAUDE_MARKERS` (`src/process/claude_env.rs`) is the single source of
+truth for the list; adding a marker there covers every site at once.
+
+**Why the rule is code and not just prose.** It used to be prose plus a
+copy-pasted `env_remove` line. That is exactly how `CLAUDE_CODE_CHILD_SESSION`
+came to be missing from all six spawn sites for months while `CLAUDECODE` was
+stripped at every one of them: nothing could notice the omission, and the leak
+was then misdiagnosed for a week as a transcript-persistence failure (it is
+not — see plan `2026-07-28-runner-transcript-persistence-env-leak` §0/§7a; the
+marker does **not** suppress transcript persistence). The grep-level test is the
+durable fix; the `strip_inherited_claude_markers()` calls are just today's
+instance of it.
+
+**The escape hatch is deliberate and must be preserved.** The strip goes on the
+base `Command`, *not* into `process::env_forwarders` — that registry is for
+things to *set* and is applied afterwards, with `ExtraEnv` last. So
+`POST /runners/spawn-test {extra_env: {"CLAUDE_CODE_CHILD_SESSION": "1"}}` can
+still re-inject a marker to test the marked-child case on purpose.
+
+The supervisor's own inherited marker is reported once at startup
+(`claude_env::warn_if_child_session_marker_inherited`), naming where the marker
+entered the fleet. Clearing that requires launching the supervisor from a shell
+that does not carry it — a self-restart no longer propagates it.
+
 ## Code Standards
 
 - Idiomatic Rust, `Result` types for errors
