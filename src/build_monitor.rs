@@ -1074,8 +1074,8 @@ async fn run_build_inner(
                     *slot.frontend_stale.write().await = false;
                 } else {
                     let msg = format!(
-                        "Slot {}: frontend_stale: pnpm exit 0 but dist/index.html missing or empty (likely concurrent external `pnpm run build` wiped dist/, or empty-output regression)",
-                        slot.id
+                        "Slot {}: frontend_stale: pnpm exit 0 but dist/ is incomplete — one of {:?} is missing or empty (likely concurrent external `pnpm run build` wiped dist/, an empty-output regression, or cargo racing a dist vite has not finished writing)",
+                        slot.id, REQUIRED_DIST_ARTIFACTS
                     );
                     error!("{}", msg);
                     state
@@ -1085,9 +1085,7 @@ async fn run_build_inner(
                     *slot.frontend_stale.write().await = true;
                     {
                         let mut history = slot.history.write().await;
-                        history.last_error = Some(
-                            "frontend_stale: pnpm exit 0 but dist/index.html missing or empty (likely concurrent external `pnpm run build` wiped dist/, or empty-output regression)".to_string()
-                        );
+                        history.last_error = Some(msg.clone());
                     }
                     // Continue with cargo build — the binary will still
                     // build (rust-embed of an empty dir succeeds), but
@@ -2185,26 +2183,36 @@ fn needs_frontend_prebuild(wt_root: &std::path::Path) -> bool {
 }
 
 /// Verify the frontend output exists after a successful `npm run build`.
-/// Returns `SupervisorError::BuildFailed` mentioning `dist/index.html` on
-/// failure so callers see exactly which artifact is missing.
+/// Returns `SupervisorError::BuildFailed` naming the offending artifact on
+/// failure so callers see exactly which one is missing.
+///
+/// Checks every entry in [`REQUIRED_DIST_ARTIFACTS`] — `index.html` (what
+/// `tauri::generate_context!` embeds) AND `build-id.txt` (what the runner's
+/// `build.rs` reads back to stamp `RUNNER_BUILD_ID`). Handing off to cargo
+/// with the latter missing bakes an `unstamped-<sha>` provenance into the
+/// binary and, historically, froze a mismatched meta-tag/env pair into one
+/// exe forever.
 fn verify_frontend_built(wt_root: &std::path::Path) -> Result<(), SupervisorError> {
-    let dist_index = wt_root.join("dist").join("index.html");
-    let metadata = match std::fs::metadata(&dist_index) {
-        Ok(m) => m,
-        Err(_) => {
+    for rel in REQUIRED_DIST_ARTIFACTS {
+        let path = wt_root.join("dist").join(rel);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(SupervisorError::BuildFailed(format!(
+                    "frontend prebuild produced no {:?} — cargo must not embed \
+                     an incomplete dist; every required artifact must exist \
+                     before `tauri::generate_context!` runs",
+                    path
+                )));
+            }
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
             return Err(SupervisorError::BuildFailed(format!(
-                "frontend prebuild produced no {:?} — `tauri::generate_context!` \
-                 would panic on the missing artifact when cargo runs",
-                dist_index
+                "frontend prebuild left an empty/invalid {:?} — every required \
+                 dist artifact must be a non-empty file before cargo runs",
+                path
             )));
         }
-    };
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(SupervisorError::BuildFailed(format!(
-            "frontend prebuild left an empty/invalid {:?} — \
-             `tauri::generate_context!` requires a non-empty dist/index.html",
-            dist_index
-        )));
     }
     Ok(())
 }
@@ -2300,23 +2308,55 @@ async fn run_pnpm_command(
     }
 }
 
-/// True iff `<npm_dir>/dist/index.html` exists, is a regular file, and is
-/// non-empty.
+/// True iff every artifact in [`REQUIRED_DIST_ARTIFACTS`] exists under
+/// `<npm_dir>/dist/`, is a regular file, and is non-empty. `npm_dir` is
+/// always the RUNNER's frontend directory (`Config::runner_npm_dir`) — the
+/// supervisor's own frontend never passes through this gate.
 ///
 /// Used by the frontend-build success arm in `run_build_inner` as a
-/// defense-in-depth check after `npm run build` exits 0: an empty or
-/// missing `dist/index.html` means the cargo `rust-embed` step is about to
-/// embed a broken frontend even though the npm child reported success.
+/// defense-in-depth check after `npm run build` exits 0: an incomplete
+/// `dist/` means the cargo `rust-embed` step is about to embed a broken
+/// frontend even though the npm child reported success.
 /// The most common causes are a concurrent external `npm run build` that
-/// wiped `dist/` between npm-exit and cargo-embed, and historical
+/// wiped `dist/` between npm-exit and cargo-embed, historical
 /// empty-output vite regressions
-/// (`proj_issue_runner_npm_build_safari13_target.md`).
+/// (`proj_issue_runner_npm_build_safari13_target.md`), and cargo starting
+/// against a dist vite has not finished writing (which is how a mismatched
+/// build-id pair got frozen into one binary — see
+/// [`REQUIRED_DIST_ARTIFACTS`]).
 ///
 /// Pulled into a separate helper so the slot-mutating success-arm logic
 /// can be exercised by unit tests without invoking npm.
 fn dist_index_ok(npm_dir: &std::path::Path) -> bool {
-    let dist_index = npm_dir.join("dist").join("index.html");
-    match std::fs::metadata(&dist_index) {
+    REQUIRED_DIST_ARTIFACTS
+        .iter()
+        .all(|rel| dist_artifact_ok(npm_dir, rel))
+}
+
+/// The dist artifacts that MUST exist and be non-empty before cargo is
+/// allowed to embed the frontend. One list, consumed by BOTH pre-cargo
+/// gates ([`dist_index_ok`] on the live-tree path and
+/// [`verify_frontend_built`] on the spawn-worktree path) so the two can
+/// never drift into disagreeing about what a complete dist is.
+///
+/// - `index.html` — what `tauri::generate_context!` embeds; absent or empty
+///   means a panic at cargo time or a blank page at runtime.
+/// - `build-id.txt` — written by `vite.config.ts`, read back by the runner's
+///   `build.rs` to stamp `RUNNER_BUILD_ID`. When it is missing, `build.rs`
+///   falls back to an `unstamped-<sha>` sentinel and the binary ships with
+///   build provenance that names no real dist. That is exactly how a
+///   mismatched meta-tag/env pair got frozen into one binary on 2026-07-26
+///   (plan `2026-07-28-runner-build-id-banner-permanent-false-positive`, D1):
+///   cargo started against a `dist/` that vite had not finished writing.
+///   Gating on it closes that window from the supervisor side regardless of
+///   which concurrent spawn raced.
+const REQUIRED_DIST_ARTIFACTS: &[&str] = &["index.html", "build-id.txt"];
+
+/// True iff `<npm_dir>/dist/<rel>` exists, is a regular file, and is
+/// non-empty. Shared leaf predicate behind both pre-cargo gates.
+fn dist_artifact_ok(npm_dir: &std::path::Path, rel: &str) -> bool {
+    let path = npm_dir.join("dist").join(rel);
+    match std::fs::metadata(&path) {
         Ok(m) => m.is_file() && m.len() > 0,
         Err(_) => false,
     }
@@ -4206,7 +4246,9 @@ mod tests {
 
     #[test]
     fn verify_frontend_built_ok_when_index_present_and_nonempty() {
-        // Happy path — a real npm build wrote a non-empty index.html.
+        // Happy path — a real npm build wrote every required dist artifact.
+        // NOTE: build-id.txt is required as of the build-id-banner plan; a
+        // dist carrying index.html alone is NOT a complete build.
         let tmp = TempDir::new().expect("tempdir");
         let dist = tmp.path().join("dist");
         fs::create_dir_all(&dist).expect("mkdir dist");
@@ -4215,7 +4257,61 @@ mod tests {
             b"<!doctype html><html><body>ok</body></html>",
         )
         .expect("write index");
-        verify_frontend_built(tmp.path()).expect("non-empty dist/index.html must verify clean");
+        fs::write(dist.join("build-id.txt"), b"abc123-1785101162102").expect("write build-id");
+        verify_frontend_built(tmp.path()).expect("a complete dist must verify clean");
+    }
+
+    #[test]
+    fn verify_frontend_built_err_when_build_id_missing() {
+        // The regression this plan exists for: vite had not yet written
+        // dist/build-id.txt when cargo was handed the tree, so build.rs took
+        // its invent-a-timestamp fallback and froze a meta-tag/env mismatch
+        // into the binary permanently (2026-07-26, plan
+        // 2026-07-28-runner-build-id-banner-permanent-false-positive D1).
+        // A dist with index.html but no build-id.txt must NOT reach cargo.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(
+            dist.join("index.html"),
+            b"<!doctype html><html><body>ok</body></html>",
+        )
+        .expect("write index");
+        let err = verify_frontend_built(tmp.path())
+            .expect_err("dist without build-id.txt must error before cargo runs");
+        let s = err.to_string();
+        assert!(
+            s.contains("build-id.txt") && !s.contains("index.html"),
+            "error must name the MISSING artifact (dist/build-id.txt) and not \
+             the present one (index.html); got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn verify_frontend_built_err_when_build_id_empty() {
+        // Same window, zero-byte flavour: the file exists but vite has not
+        // finished writing it. An empty build-id.txt makes build.rs read an
+        // empty string and fall through to the sentinel just as if the file
+        // were absent, so it must be rejected on the same terms.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(
+            dist.join("index.html"),
+            b"<!doctype html><html><body>ok</body></html>",
+        )
+        .expect("write index");
+        fs::write(dist.join("build-id.txt"), b"").expect("write empty build-id");
+        let err = verify_frontend_built(tmp.path())
+            .expect_err("empty dist/build-id.txt must error before cargo runs");
+        let s = err.to_string();
+        assert!(
+            s.contains("build-id.txt") && !s.contains("index.html"),
+            "error must name the EMPTY artifact (dist/build-id.txt) and not \
+             the valid one (index.html); got: {}",
+            s
+        );
     }
 
     #[test]
@@ -4258,7 +4354,28 @@ mod tests {
 
     #[test]
     fn dist_index_ok_returns_true_when_index_html_present_and_nonempty() {
-        // Happy path — a real build wrote a non-empty index.html.
+        // Happy path — a real build wrote every required dist artifact.
+        // build-id.txt joined the contract with the build-id-banner plan.
+        let tmp = TempDir::new().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).expect("mkdir dist");
+        fs::write(
+            dist.join("index.html"),
+            b"<!doctype html><html><body>ok</body></html>",
+        )
+        .expect("write index");
+        fs::write(dist.join("build-id.txt"), b"abc123-1785101162102").expect("write build-id");
+        assert!(
+            dist_index_ok(tmp.path()),
+            "a complete non-empty dist is the signal of a healthy build"
+        );
+    }
+
+    #[test]
+    fn dist_index_ok_returns_false_when_build_id_missing_or_empty() {
+        // The live-tree half of the same gate. Widening only
+        // verify_frontend_built would have left this path able to flip
+        // frontend_stale=false against a dist vite had not finished writing.
         let tmp = TempDir::new().expect("tempdir");
         let dist = tmp.path().join("dist");
         fs::create_dir_all(&dist).expect("mkdir dist");
@@ -4268,8 +4385,14 @@ mod tests {
         )
         .expect("write index");
         assert!(
-            dist_index_ok(tmp.path()),
-            "non-empty dist/index.html is the only signal of a healthy build"
+            !dist_index_ok(tmp.path()),
+            "dist without build-id.txt must be reported as not-ok"
+        );
+
+        fs::write(dist.join("build-id.txt"), b"").expect("write empty build-id");
+        assert!(
+            !dist_index_ok(tmp.path()),
+            "dist with an empty build-id.txt must be reported as not-ok"
         );
     }
 
