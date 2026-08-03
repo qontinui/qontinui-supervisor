@@ -249,6 +249,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
 
+    // Report an inherited Claude Code child-session marker. The supervisor is
+    // where the marker enters the fleet, so surfacing it here names the origin;
+    // the spawn-side strip in `start_exe_mode_for_runner` stops it propagating.
+    if process::manager::warn_if_child_session_marker_inherited() {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Warn,
+                format!(
+                    "Supervisor inherited {} from its launching session — it is stripped from \
+                     every runner spawn, but this process is mislabelled as a nested session.",
+                    process::manager::CLAUDE_CHILD_SESSION_ENV
+                ),
+            )
+            .await;
+    }
+
     // Spawn health cache refresher (caches expensive port checks every 2s)
     let _health_cache_handle = health_cache::spawn_health_cache_refresher(state.clone());
 

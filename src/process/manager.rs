@@ -133,6 +133,49 @@ pub fn binary_meta(path: &std::path::Path) -> Option<BinaryMeta> {
 /// stamped t+2s from the same cargo invocation. 30s keeps the badge meaningful.
 pub const STALE_BINARY_THRESHOLD_SECS: i64 = 30;
 
+/// Claude Code's "you are a nested/child session" marker.
+///
+/// Siblings `CLAUDECODE`: both are process-topology markers that a Claude Code
+/// session sets for its children, and both are inherited by the whole process
+/// tree with nothing clearing them. The supervisor is typically launched FROM a
+/// Claude Code session, so it inherits this and would otherwise pass it to every
+/// runner it spawns — and thence to every `claude` those runners launch, making
+/// genuine top-level sessions claim to be children indefinitely.
+///
+/// Stripped at the runner spawn (`start_exe_mode_for_runner`) and reported at
+/// supervisor startup by [`warn_if_child_session_marker_inherited`].
+pub const CLAUDE_CHILD_SESSION_ENV: &str = "CLAUDE_CODE_CHILD_SESSION";
+
+/// Log loudly when the supervisor process itself carries
+/// [`CLAUDE_CHILD_SESSION_ENV`].
+///
+/// The supervisor is the ORIGIN of the leak for the whole fleet — it inherits
+/// the marker from the session that launched it and hands it to every runner.
+/// The spawn-side strip stops it propagating, but the supervisor's own copy is
+/// the evidence of where it came in, and nothing surfaced it before: the leak
+/// ran unnoticed for months and was then misdiagnosed, both observability
+/// failures. Returns whether the marker was present so it can be unit-tested
+/// without asserting on log output.
+pub fn warn_if_child_session_marker_inherited() -> bool {
+    // `var_os`, not `var`: PRESENCE is what matters. `var` also returns `Err`
+    // for a non-UTF-8 value, which would report a set marker as absent — and
+    // an empty value is still set (`env_remove` is what clears one).
+    match std::env::var_os(CLAUDE_CHILD_SESSION_ENV) {
+        Some(value) => {
+            warn!(
+                env_var = CLAUDE_CHILD_SESSION_ENV,
+                value = %value.to_string_lossy(),
+                "supervisor inherited Claude Code's child-session marker from its launching \
+                 session; it is stripped from every runner spawn, but this process is \
+                 mislabelled as a nested session. Launch the supervisor from a shell that \
+                 does not carry the marker to clear it."
+            );
+            true
+        }
+        None => false,
+    }
+}
+
 /// Per-runner "newer build available" summary surfaced on `/runners` and
 /// `/runners/{id}/logs`. `None` is the normal case (running binary is newer
 /// than or equal to the newest slot, within the 30s jitter threshold).
@@ -1926,6 +1969,16 @@ async fn start_exe_mode_for_runner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("CLAUDECODE")
+        // Strip the inherited child-session marker for the same reason as
+        // CLAUDECODE above: the supervisor inherits it from whatever Claude
+        // Code session launched it, and passes it down to every runner and
+        // every `claude` those runners spawn — so top-level sessions claim to
+        // be somebody's child forever. It is a lie about process topology that
+        // the CLI is entitled to act on however it likes. `ExtraEnv` runs last
+        // (see `env_forwarders::default_env_forwarders`), so a caller can still
+        // re-inject it via `POST /runners/spawn-test {extra_env:{...}}` to
+        // deliberately test the marked-child case.
+        .env_remove(CLAUDE_CHILD_SESSION_ENV)
         .env("QONTINUI_PORT", managed.config.port.to_string());
 
     // QONTINUI_API_URL policy (plan 2026-07-08). Decision factored into the pure
@@ -3857,6 +3910,52 @@ pub async fn rebuild_and_restart_by_id(
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // Claude Code child-session marker strip (plan
+    // 2026-07-28-runner-transcript-persistence-env-leak).
+
+    #[test]
+    fn child_session_env_name_is_the_cli_marker() {
+        // The strip and the startup warning are only correct if this is the
+        // exact variable Claude Code sets. A typo here is silent: the spawn
+        // would keep leaking the real marker while removing nothing.
+        assert_eq!(CLAUDE_CHILD_SESSION_ENV, "CLAUDE_CODE_CHILD_SESSION");
+    }
+
+    #[test]
+    fn child_session_marker_detection_follows_env_presence() {
+        // No env lock exists in this crate (see `stopped_cache` tests, which
+        // sidestep it with unique var names). That trick can't work here — the
+        // point is the REAL marker name — but this is the only test in the
+        // crate that touches it, so nothing races it. `var_os` preserves a
+        // non-UTF-8 pre-existing value across the restore.
+        let restore = std::env::var_os(CLAUDE_CHILD_SESSION_ENV);
+
+        std::env::remove_var(CLAUDE_CHILD_SESSION_ENV);
+        assert!(
+            !warn_if_child_session_marker_inherited(),
+            "absent marker must not report as inherited"
+        );
+
+        std::env::set_var(CLAUDE_CHILD_SESSION_ENV, "1");
+        assert!(
+            warn_if_child_session_marker_inherited(),
+            "present marker must report as inherited"
+        );
+
+        // An empty value is still an inherited marker — `env_remove` is what
+        // clears it, not setting it to "".
+        std::env::set_var(CLAUDE_CHILD_SESSION_ENV, "");
+        assert!(
+            warn_if_child_session_marker_inherited(),
+            "empty-but-set marker is still inherited"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var(CLAUDE_CHILD_SESSION_ENV, v),
+            None => std::env::remove_var(CLAUDE_CHILD_SESSION_ENV),
+        }
+    }
 
     // QONTINUI_API_URL child-env policy (plan 2026-07-08).
 
