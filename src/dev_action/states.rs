@@ -117,6 +117,37 @@ pub fn lkg_stale_from_times(
     }
 }
 
+/// `PRIMARY_DOWN` from the three facts the supervisor actually has about the
+/// primary: whether its HTTP `/health` answered, whether anything is listening
+/// on its port, and whether the runner registry believes it is running.
+///
+/// It reports `True` only when ALL THREE agree the primary is gone. This is
+/// the 2026-08-03 fix: the predicate used to read one cached bit —
+/// `cached_health.runner_responding`, a single short-timeout HTTP probe — and
+/// stamped `PRIMARY_DOWN` into a spawn outcome while the primary was running
+/// and answering. On a box carrying 6-7 concurrent cargo builds that probe
+/// flakes, and the health refresher then *syncs the registry `running` flag to
+/// it*, so a flake is not self-correcting within one tick.
+///
+/// The disagreement case is `Unknown`, never `False`: something is listening
+/// (or a process is registered) but `/health` did not answer, which is a real
+/// condition — a wedged or still-booting runner — that this predicate is not
+/// equipped to name. Reporting it as "not down" would hide it; reporting it as
+/// "down" is the false alarm we are removing.
+pub fn primary_down_from_facts(
+    api_responding: bool,
+    port_listening: bool,
+    registry_running: bool,
+) -> Eval {
+    if api_responding {
+        return Eval::False;
+    }
+    if port_listening || registry_running {
+        return Eval::Unknown;
+    }
+    Eval::True
+}
+
 /// Best-effort newest mtime across `index.html` plus the immediate entries of
 /// the frontend `src/` dir. A shallow scan keeps this off the action hot path
 /// (the deep walk is the Phase-3 ledger's concern); good enough to catch the
@@ -192,12 +223,31 @@ pub async fn evaluate_all(state: &SharedState, slot_id: SlotResolution) -> Vec<D
         .map(|l| l.built_at);
     let lkg_stale = lkg_stale_from_times(lkg_built_at, newest_src);
 
-    // PRIMARY_DOWN — read the cached primary health (the background refresher
-    // keeps this current; a cheap in-memory read, no probe on the hot path).
+    // PRIMARY_DOWN — start from the cached health (an in-memory read, kept
+    // current by the background refresher), and confirm a negative against the
+    // LIVE runner registry + one direct probe before claiming the primary is
+    // down. The cached bit alone is a single short-timeout HTTP probe that
+    // flakes under build load; see `primary_down_from_facts`.
     let primary_down = match state.get_primary().await {
         Some(primary) => {
-            let cached = primary.cached_health.read().await;
-            eval_bool(!cached.runner_responding)
+            let (port_open, cached_responding) = {
+                let cached = primary.cached_health.read().await;
+                (cached.runner_port_open, cached.runner_responding)
+            };
+            if cached_responding {
+                Eval::False
+            } else {
+                // Negative path only (the primary is rare-case down), so this
+                // stays off the green hot path: re-probe once, because the
+                // cached bit may be a load-induced flake or simply stale.
+                let live_responding =
+                    crate::process::port::is_runner_responding(primary.config.port).await;
+                let registry_running = {
+                    let r = primary.runner.read().await;
+                    r.running || r.pid.is_some()
+                };
+                primary_down_from_facts(live_responding, port_open, registry_running)
+            }
         }
         // No primary registered ⇒ can't judge whether it's down.
         None => Eval::Unknown,
@@ -288,6 +338,24 @@ mod tests {
         assert_eq!(dist_stale_from_mtimes(None, Some(newer)), Eval::Unknown);
         // No source signal ⇒ Unknown.
         assert_eq!(dist_stale_from_mtimes(Some(older), None), Eval::Unknown);
+    }
+
+    #[test]
+    fn primary_down_needs_all_three_facts_to_agree() {
+        // Responding ⇒ definitively not down, whatever else says.
+        assert_eq!(
+            primary_down_from_facts(true, false, false),
+            Eval::False,
+            "a responding primary can never be PRIMARY_DOWN"
+        );
+        // HEADLINE regression: probe says no, but the port is listening /
+        // the registry has it running ⇒ the two signals disagree, so the
+        // predicate must NOT stamp PRIMARY_DOWN.
+        assert_eq!(primary_down_from_facts(false, true, false), Eval::Unknown);
+        assert_eq!(primary_down_from_facts(false, false, true), Eval::Unknown);
+        assert_eq!(primary_down_from_facts(false, true, true), Eval::Unknown);
+        // All three agree it's gone ⇒ the one True case.
+        assert_eq!(primary_down_from_facts(false, false, false), Eval::True);
     }
 
     #[test]
