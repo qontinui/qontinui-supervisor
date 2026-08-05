@@ -253,6 +253,67 @@ mod tests {
         out
     }
 
+    /// Every file in this crate that spawns a child the strip applies to.
+    ///
+    /// Paths are relative to `src/`. This inventory exists because
+    /// [`every_spawn_site_goes_through_the_shared_strip`] has a blind spot it
+    /// cannot close on its own: it greps for an OPEN-CODED `env_remove`, so a
+    /// spawn site that strips **nothing at all** matches no needle and is not
+    /// an "offender" anywhere.
+    ///
+    /// That blind spot is not hypothetical — it is the exact shape of the
+    /// original defect. `POST /supervisor/restart` (`routes/runner.rs`, which
+    /// spawns the REPLACEMENT SUPERVISOR) and the gemini branch of
+    /// `evaluation/judge.rs` stripped neither marker, so neither could ever
+    /// have matched a grep for `CLAUDECODE`, and both stayed uncovered through
+    /// the first fix. A guard that only catches the hand-rolled form would not
+    /// have caught them.
+    ///
+    /// So this list pins the sites by NAME: removing the strip from one of
+    /// these files now fails the build. It cannot catch a spawn added in a
+    /// brand-new file — nothing grep-shaped can — which is why adding a file
+    /// here is part of adding a spawn site. Keep it in sync.
+    const KNOWN_SPAWN_SITE_FILES: &[&str] = &[
+        "process/manager.rs",      // runner spawn
+        "routes/runner.rs",        // POST /supervisor/restart — spawns the replacement supervisor
+        "routes/runners_pair.rs",  // qontinui_profile device-pair CLI
+        "evaluation/judge.rs",     // `claude` scoring judge + the powershell/gemini branch
+        "expo.rs",                 // npx expo (windows + unix arms)
+        "velocity_improvement.rs", // `claude` fix agent
+    ];
+
+    /// Each known spawn-site file must still call the shared strip.
+    ///
+    /// Complements the open-coded-`env_remove` ban: that test catches a site
+    /// that strips the WRONG way, this one catches a site that stops stripping
+    /// at all. See [`KNOWN_SPAWN_SITE_FILES`] for why the second half matters.
+    #[test]
+    fn every_known_spawn_site_file_still_calls_the_strip() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut missing = Vec::new();
+
+        for rel in KNOWN_SPAWN_SITE_FILES {
+            let path = src.join(rel);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    if !text.contains(".strip_inherited_claude_markers()") {
+                        missing.push(format!("{rel} — no call to the shared strip"));
+                    }
+                }
+                // A renamed/deleted spawn-site file must fail loudly, not skip:
+                // a silent skip would let the inventory rot into a no-op.
+                Err(e) => missing.push(format!("{rel} — unreadable ({e})")),
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these known spawn-site files no longer strip inherited Claude markers (or moved \
+             without the inventory being updated):\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
     /// No spawn site may open-code the strip — they must all call the helper.
     ///
     /// This is the durable half of the fix. The `CLAUDE_CODE_CHILD_SESSION`
