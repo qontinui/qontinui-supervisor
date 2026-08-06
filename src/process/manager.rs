@@ -2486,6 +2486,33 @@ async fn maybe_crash_restart(
                 .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                 .await;
         }
+        // An UNREQUESTED clean exit: the supervisor spawned this runner, nobody
+        // asked it to stop, and it exited 0 anyway. Crash-only means we
+        // correctly do not restart it — code 0 is also what an operator closing
+        // the runner window produces, and resurrecting a deliberately closed
+        // app would be worse than the silence. But the two are indistinguishable
+        // from out here, so the one thing this MUST NOT do is stay quiet.
+        //
+        // The 2026-08-06 incident is the case in point: the runner's webview
+        // recovery destroyed and rebuilt its window, a late `ExitRequested`
+        // slipped past the veto, and the process exited 0 at 03:00. It read as
+        // an ordinary shutdown, so nothing surfaced and it stayed down ~6 hours.
+        // Same lesson as the 2026-07-20 breadcrumb above: an exit nobody asked
+        // for is a reportable event even when not restarting it is correct.
+        CrashRestartDecision::SkipCleanExit if had_child_handle && !stop_requested_at_exit => {
+            let msg = format!(
+                "runner '{}' exited cleanly (code 0) but NO stop was requested. Not restarting \
+                 (crash-only watchdog: code 0 is indistinguishable from an operator closing the \
+                 window). If nobody closed it, this is an unrequested self-exit — check the \
+                 runner log around the exit for the cause.",
+                runner_name
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
         skip => {
             debug!(
                 "crash-only watchdog: no restart for runner '{}' exit ({:?})",
@@ -4281,12 +4308,19 @@ mod tests {
         );
     }
 
-    /// The two WARN-worthy skip variants (`SkipNotArmed` / `SkipDisarmed`,
-    /// promoted to `warn!` + persisted emit in `maybe_crash_restart`) are ONLY
-    /// reachable for a genuine crash — a held Child handle, no operator stop,
-    /// and an unclean exit. The benign skips for the same crash inputs
-    /// (clean exit, operator stop, no child handle) classify away from the
-    /// WARN set, so the promotion never fires on a benign exit.
+    /// The two CRASH WARN-worthy skip variants (`SkipNotArmed` /
+    /// `SkipDisarmed`, promoted to `warn!` + persisted emit in
+    /// `maybe_crash_restart`) are ONLY reachable for a genuine crash — a held
+    /// Child handle, no operator stop, and an unclean exit. The benign skips
+    /// for the same crash inputs (clean exit, operator stop, no child handle)
+    /// classify away from the WARN set, so the CRASH promotion never fires on
+    /// a benign exit.
+    ///
+    /// Note `SkipCleanExit` carries its OWN, separate warn arm for the
+    /// unrequested-clean-exit case (supervisor-spawned, code 0, no stop
+    /// requested — the 2026-08-06 self-exit). That arm is deliberately not part
+    /// of this crash set: it reports rather than restarts, and it is gated on
+    /// `!stop_requested_at_exit` in `maybe_crash_restart`, not here.
     #[test]
     fn crash_restart_warn_worthy_skips_are_genuine_crash_only() {
         // Genuine crash, global arm off → WARN-worthy SkipNotArmed.
