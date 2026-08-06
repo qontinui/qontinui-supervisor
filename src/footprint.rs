@@ -58,22 +58,30 @@ pub struct ExeCopiesFootprint {
 /// healthy. Publishing both, named for what they are, is what makes a lane's
 /// drift onto a different quantity visible instead of silent.
 ///
-/// **Swap, and what it means per lane.** On a saturated *Linux/WSL* box
-/// `mem_available` is pinned by the kernel reserve and reads as an all-clear
-/// (measured on this fleet at −13.5 ± 11.2 M/day, indistinguishable from zero)
-/// while `swap_used` moves (+138.6 ± 41.7 M/day) — which is why a consumer must
-/// lead on swap there rather than on mem-available.
+/// **Swap is NOT published on platforms that derive it from commit** — see
+/// [`SWAP_IS_DERIVED_FROM_COMMIT`]. On Windows, sysinfo computes
+/// `swap_total = CommitLimit − PhysicalTotal` and
+/// `swap_used = CommitTotal − PhysicalTotal` (both saturating), so
+/// `swap_total − swap_used` is *identically* `commit_available_bytes` in the
+/// same row: publishing it would be the commit reading under a second name, and
+/// a consumer that naively ranks `swap_used / swap_total` reads ~0.77 on an
+/// **idle** Windows box and calls it saturated. A docstring cannot stop that —
+/// it is not on the read path — so the fields are left `None` instead.
 ///
-/// That guidance does NOT transfer verbatim to the Windows **host** lane this
-/// module publishes. sysinfo derives Windows swap from the commit counters
-/// (`swap_total = CommitLimit − PhysicalTotal`,
-/// `swap_used = CommitTotal − PhysicalTotal`, both saturating), so on this lane
-/// `swap_total − swap_used` is *identical* to `commit_available_bytes` in the
-/// same row, and `swap_used` pins to 0 whenever commit charge sits below
-/// physical RAM. A ranker that leads on swap here is double-weighting a
-/// quantity it already reads. The fields are still published — they are the §A1
-/// columns and they are the right signal on the WSL/Linux lane — but the
-/// commit pair is the honest saturation signal for `lane='host'`.
+/// This is keyed on the **platform**, not on the lane: a `host` lane on a Linux
+/// machine has a real, independent swap device and publishes it. There, the
+/// measured finding governs — `mem_available` is pinned by the kernel reserve
+/// under saturation and reads as an all-clear (−13.5 ± 11.2 M/day,
+/// indistinguishable from zero) while `swap_used` moves (+138.6 ± 41.7 M/day),
+/// so a consumer must lead on swap. That finding continues to govern the
+/// `wsl` / `container` rows other publishers write.
+///
+/// On the platforms where swap is withheld, `commit_available_bytes` /
+/// `commit_total_bytes` **is** the honest saturation signal and stays the lead
+/// metric. The sibling runner publisher
+/// (`qontinui-runner` PR #996) applies the same rule, so a `swap_*` value's
+/// presence is a property of the machine, never of which publisher wrote the
+/// row.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct MemorySnapshot {
     pub mem_total_bytes: Option<u64>,
@@ -135,23 +143,58 @@ pub struct FootprintSnapshot {
 /// can never measure different things. Physical memory and swap come from
 /// sysinfo's single refreshed `System`.
 ///
+/// Whether this platform's reported "swap" is derived from the commit counters
+/// rather than measured from an independent swap device.
+///
+/// `true` on Windows: sysinfo computes swap as
+/// `CommitLimit/CommitTotal − PhysicalTotal`, so a published `swap_used` is the
+/// commit charge wearing a different name. Publishing it would make
+/// `swap_used / swap_total` read ~0.77 on an idle box — a ranker leading on
+/// that ratio would treat a healthy machine as saturated, and would
+/// double-weight a quantity it already reads as `commit_available_bytes`.
+///
+/// Keyed on the platform, deliberately **not** on the lane: a Linux host has a
+/// real swap device, and a future Linux supervisor must publish it rather than
+/// inherit a Windows-shaped omission. The sibling runner publisher applies the
+/// same platform rule, so `swap_*` presence describes the machine and not the
+/// publisher.
+pub const SWAP_IS_DERIVED_FROM_COMMIT: bool = cfg!(windows);
+
+/// Sample host memory, commit and — where it is a real, independent
+/// measurement — swap.
+///
+/// Commit comes from [`crate::build_monitor::available_commit_bytes`] /
+/// [`crate::build_monitor::total_commit_bytes`] — the guard's own probe, called
+/// rather than reimplemented, so the published number and the enforced floor
+/// can never measure different things. Physical memory and swap come from
+/// sysinfo's single refreshed `System`.
+///
+/// **Swap is withheld where [`SWAP_IS_DERIVED_FROM_COMMIT`] holds**, because
+/// there it is not a second signal — it is the commit reading restated. See
+/// [`MemorySnapshot`].
+///
 /// A zero `mem_total_bytes` is reported as `None`: a box with no memory is not
-/// a state that exists, so zero there means the probe failed. **Every other
+/// a state that exists, so zero there means the probe failed. **Every measured
 /// field keeps a genuine `Some(0)`** — a zero `mem_available` or
 /// `commit_available` is the extreme-pressure reading this telemetry exists to
 /// catch, and mapping it to UNKNOWN would erase the signal at exactly the
 /// moment it matters (the mirror image of the false-safe this plan is fixing).
-/// Likewise `Some(0)` swap means "no swap configured", which is real.
+/// Where swap IS published, `Some(0)` means "no swap configured", which is real.
 pub fn memory_snapshot() -> MemorySnapshot {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
+    let (swap_total_bytes, swap_used_bytes) = if SWAP_IS_DERIVED_FROM_COMMIT {
+        (None, None)
+    } else {
+        (Some(sys.total_swap()), Some(sys.used_swap()))
+    };
     MemorySnapshot {
         mem_total_bytes: Some(sys.total_memory()).filter(|b| *b > 0),
         mem_available_bytes: Some(sys.available_memory()),
         commit_total_bytes: crate::build_monitor::total_commit_bytes(),
         commit_available_bytes: crate::build_monitor::available_commit_bytes(),
-        swap_total_bytes: Some(sys.total_swap()),
-        swap_used_bytes: Some(sys.used_swap()),
+        swap_total_bytes,
+        swap_used_bytes,
     }
 }
 
@@ -497,18 +540,49 @@ mod tests {
         if let (Some(avail), Some(total)) = (snap.mem_available_bytes, snap.mem_total_bytes) {
             assert!(avail <= total);
         }
-        // Swap keeps a genuine Some(0) — "no swap configured" is a real state,
-        // and swap is the metric that keeps moving under saturation.
-        assert!(
-            snap.swap_total_bytes.is_some(),
-            "swap_total must be sampled"
-        );
-        assert!(snap.swap_used_bytes.is_some(), "swap_used must be sampled");
-        if let (Some(used), Some(total)) = (snap.swap_used_bytes, snap.swap_total_bytes) {
-            assert!(
-                used <= total,
-                "swap used ({used}) cannot exceed total ({total})"
+    }
+
+    #[test]
+    fn swap_is_withheld_where_the_platform_derives_it_from_commit() {
+        let snap = memory_snapshot();
+        if SWAP_IS_DERIVED_FROM_COMMIT {
+            // On Windows sysinfo computes swap from the commit counters, so a
+            // published `swap_used / swap_total` would be the commit reading
+            // under a second name — ~0.77 on an IDLE box, which a ranker reads
+            // as saturated. Withhold it rather than document around it: a
+            // docstring is not on the read path.
+            assert_eq!(
+                snap.swap_total_bytes, None,
+                "swap_total must not be published where it is derived from commit"
             );
+            assert_eq!(
+                snap.swap_used_bytes, None,
+                "swap_used must not be published where it is derived from commit"
+            );
+            // The replacement signal must still be there — withholding swap is
+            // only honest because commit carries the same information natively.
+            assert!(
+                snap.commit_available_bytes.is_some() && snap.commit_total_bytes.is_some(),
+                "commit pair is the saturation signal on this platform and must be published"
+            );
+        } else {
+            // A Linux host has a real, independent swap device: publish it.
+            // This arm is what stops a future Linux supervisor inheriting a
+            // Windows-shaped omission — the rule is per-platform, not per-lane.
+            assert!(
+                snap.swap_total_bytes.is_some(),
+                "a platform with a real swap device must publish swap_total"
+            );
+            assert!(
+                snap.swap_used_bytes.is_some(),
+                "a platform with a real swap device must publish swap_used"
+            );
+            if let (Some(used), Some(total)) = (snap.swap_used_bytes, snap.swap_total_bytes) {
+                assert!(
+                    used <= total,
+                    "swap used ({used}) cannot exceed total ({total})"
+                );
+            }
         }
     }
 

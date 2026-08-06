@@ -348,14 +348,23 @@ adds, alongside the existing artifact sizes:
   `total_commit_bytes`), i.e. the same `ullAvailPageFile` number
   `cargo-guard.sh` reads. Published under its own name so a lane that drifts
   onto physical-available becomes *visible* rather than silently disagreeing.
-- `swap_total_bytes` / `swap_used_bytes` — the saturation signal **on the
-  Linux/WSL lane**, where mem-available is pinned by the kernel reserve and
-  reads as an all-clear (measured on this fleet at −13.5 ± 11.2 M/day) while
-  swap moves (+138.6 ± 41.7 M/day). On the Windows **host** lane this publisher
-  emits, sysinfo derives swap from the commit counters, so
-  `swap_total − swap_used` is identical to `commit_available_bytes` in the same
-  row — there, the commit pair is the honest signal and leading on swap would
-  double-weight it.
+- `swap_total_bytes` / `swap_used_bytes` — **not published on Windows.**
+  sysinfo derives Windows swap from the commit counters
+  (`CommitLimit/CommitTotal − PhysicalTotal`), so `swap_total − swap_used` is
+  identically `commit_available_bytes` in the same row: publishing it would be
+  the commit reading under a second name, and a consumer that ranks
+  `swap_used / swap_total` reads ~0.77 on an **idle** box and calls it
+  saturated. The fields are left null (`footprint::SWAP_IS_DERIVED_FROM_COMMIT`),
+  and the commit pair above is the lead saturation metric here.
+
+  **The rule is per-platform, not per-lane.** A `host` lane on a Linux machine
+  has a real, independent swap device and publishes it — a future Linux
+  supervisor must not inherit this omission. The measured
+  swap-leads-`mem_available` finding (mem-available pinned by the kernel reserve
+  at −13.5 ± 11.2 M/day while swap moves +138.6 ± 41.7 M/day) still governs the
+  `wsl` / `container` rows other publishers write. The sibling runner publisher
+  applies the same platform rule, so a `swap_*` value's presence is a property
+  of the machine, never of which publisher wrote the row.
 - `disk_total_bytes` / `disk_mount` next to the existing `disk_free_bytes`, so a
   free-byte figure is readable against its own capacity and attributable to a
   volume.

@@ -434,6 +434,45 @@ mod tests {
     }
 
     #[test]
+    fn windows_payload_carries_no_swap_reading() {
+        // End-to-end version of the footprint rule, asserted on the WIRE shape
+        // because that is what a consumer sees. The sibling runner publisher
+        // applies the same platform rule, so `swap_*` presence must describe
+        // the machine — never which publisher wrote the row. A Windows row
+        // carrying swap would let a ranker read ~0.77 saturation off an idle
+        // box, and §C3 forbids absence of signal being read as anything else.
+        let mut snap = snapshot_fixture();
+        snap.memory = crate::footprint::memory_snapshot();
+        let v = serde_json::to_value(payload_from_snapshot(&snap, 1)).unwrap();
+        if crate::footprint::SWAP_IS_DERIVED_FROM_COMMIT {
+            assert!(
+                v["swap_total_bytes"].is_null(),
+                "no swap_total may reach coord from this platform"
+            );
+            assert!(
+                v["swap_used_bytes"].is_null(),
+                "no swap_used may reach coord from this platform"
+            );
+            // Withholding swap is only honest if the replacement lead metric
+            // is present in the same row.
+            assert!(
+                !v["commit_available_bytes"].is_null(),
+                "the commit pair must carry the saturation signal instead"
+            );
+        } else {
+            assert!(
+                !v["swap_total_bytes"].is_null() && !v["swap_used_bytes"].is_null(),
+                "a real swap device must be published (a Linux supervisor must not \
+                 inherit the Windows omission)"
+            );
+        }
+        // The §A1 columns still exist either way — withheld means null, not a
+        // renamed or dropped key.
+        assert!(v.get("swap_total_bytes").is_some());
+        assert!(v.get("swap_used_bytes").is_some());
+    }
+
+    #[test]
     fn load_1m_is_null_on_windows_and_real_elsewhere() {
         let got = load_1m();
         if cfg!(windows) {
