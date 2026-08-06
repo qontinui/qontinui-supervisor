@@ -87,7 +87,7 @@ pub fn detect_resources() -> Resources {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct MachineFile {
+pub struct MachineFile {
     /// Canonical post-unified-devices field. The live `machine.json` carries
     /// `device_id`; older hosts used `machine_id`. Accept either (prefer
     /// `device_id`) — making both optional is REQUIRED so deserialization
@@ -104,7 +104,7 @@ struct MachineFile {
 impl MachineFile {
     /// The device id, preferring the canonical `device_id` over legacy
     /// `machine_id`.
-    fn device_id(&self) -> Option<&str> {
+    pub fn device_id(&self) -> Option<&str> {
         self.device_id.as_deref().or(self.machine_id.as_deref())
     }
 }
@@ -131,7 +131,7 @@ fn profiles_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
 }
 
-fn load_machine_file() -> Option<MachineFile> {
+pub fn load_machine_file() -> Option<MachineFile> {
     let bytes = std::fs::read(machine_file_path()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -141,7 +141,7 @@ fn load_machine_file() -> Option<MachineFile> {
 /// convert that to `http://host:9870` so reqwest can POST to
 /// `/coord/devices/:id/budget`. Returns `None` if profiles.json is
 /// missing or the active profile has no coord_url.
-fn coord_http_base() -> Option<String> {
+pub fn coord_http_base() -> Option<String> {
     let bytes = std::fs::read(profiles_path()?).ok()?;
     let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
     let active = pf.active.as_deref().unwrap_or("dev");

@@ -874,6 +874,30 @@ impl BuildPool {
         out
     }
 
+    /// Build-pool occupancy for the resource sample published to coord.
+    ///
+    /// Derived from [`BuildPool::snapshot`] — the same per-slot `busy` scan
+    /// `GET /builds` renders its `slots[]` / `active_builds` from — and the
+    /// same `queue_depth` counter it reports as `queued`. There is deliberately
+    /// no second accounting of the pool: "busy" means exactly what the
+    /// dashboard already means by it, so a sample and the endpoint can never
+    /// disagree about whether this machine has room.
+    ///
+    /// Note the count comes from `slot.busy`, NOT from
+    /// `permits.available_permits()`. The semaphore permit is released after
+    /// `busy` is cleared, so the two views diverge transiently mid-release;
+    /// `GET /builds` derives its `available_permits` from the slot scan for
+    /// exactly this reason and exposes the raw semaphore separately.
+    pub async fn occupancy(&self) -> crate::footprint::BuildPoolOccupancy {
+        let slots = self.snapshot().await;
+        let busy = slots.iter().filter(|(_, _, info)| info.is_some()).count();
+        crate::footprint::BuildPoolOccupancy {
+            build_slots_total: Some(slots.len() as u32),
+            build_slots_busy: Some(busy as u32),
+            build_queue_depth: Some(self.queue_depth.load(Ordering::Relaxed) as u32),
+        }
+    }
+
     /// Returns true when at least one slot has its `frontend_stale` flag set —
     /// i.e. its most recent `npm run build` failed but a cargo build proceeded
     /// anyway using a pre-existing `dist/`. Surfaced in `GET /builds` and
@@ -1179,10 +1203,16 @@ impl SupervisorState {
         self: &std::sync::Arc<Self>,
     ) -> crate::footprint::FootprintSnapshot {
         let this = self.clone();
-        let snapshot =
+        let mut snapshot =
             tokio::task::spawn_blocking(move || crate::footprint::compute_snapshot(&this.config))
                 .await
                 .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
+        // Occupancy is read AFTER the walk, deliberately. The walk is
+        // minutes-slow on real trees, and `computed_at` is stamped at its end —
+        // a slot count taken before it would ship under a timestamp minutes
+        // newer than itself, advertising slots that filled while it ran. It is
+        // a cheap async read, so taking it here costs nothing.
+        snapshot.build_pool = self.build_pool.occupancy().await;
         *self.footprint.write().await = Some(snapshot.clone());
         snapshot
     }
@@ -1969,5 +1999,51 @@ mod tests {
         std::fs::write(&path, format!("{seeded}\n")).expect("seed valid contents");
         let id = load_or_create_boot_id_at(&path);
         assert_eq!(id, seeded, "trailing whitespace must be trimmed");
+    }
+
+    // --- Build-pool occupancy (resource sample §A2) ---
+
+    #[tokio::test]
+    async fn occupancy_counts_the_same_busy_slots_get_builds_renders() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut config = make_test_config();
+        config.project_dir = tmp.path().join("qontinui-runner").join("src-tauri");
+        config.build_pool = crate::config::BuildPoolConfig { pool_size: 3 };
+        let pool = BuildPool::new(&config);
+
+        let idle = pool.occupancy().await;
+        assert_eq!(idle.build_slots_total, Some(3));
+        assert_eq!(idle.build_slots_busy, Some(0));
+        assert_eq!(idle.build_queue_depth, Some(0));
+
+        // Claim a slot the way a build does, and queue two callers.
+        let _slot = pool
+            .claim_idle_slot(BuildInfo {
+                started_at: Utc::now(),
+                requester_id: Some("test".to_string()),
+                rebuild_kind: "exe".to_string(),
+            })
+            .await;
+        pool.queue_depth.fetch_add(2, Ordering::Relaxed);
+
+        let busy = pool.occupancy().await;
+        assert_eq!(busy.build_slots_total, Some(3));
+        assert_eq!(busy.build_slots_busy, Some(1));
+        assert_eq!(busy.build_queue_depth, Some(2));
+
+        // The whole point: this is not a second accounting. The published
+        // busy count must equal the count `GET /builds` derives from the same
+        // per-slot `busy` scan (its `active_builds` / `available_permits`), so
+        // a sample can never claim room the dashboard says is taken.
+        let busy_in_snapshot = pool
+            .snapshot()
+            .await
+            .iter()
+            .filter(|(_, _, info)| info.is_some())
+            .count() as u32;
+        assert_eq!(busy.build_slots_busy, Some(busy_in_snapshot));
+        // ...and it must NOT be read off the semaphore, which releases after
+        // `busy` is cleared and so disagrees transiently mid-release.
+        assert_eq!(pool.permits.available_permits(), 3);
     }
 }

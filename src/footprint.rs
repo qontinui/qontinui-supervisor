@@ -46,17 +46,156 @@ pub struct ExeCopiesFootprint {
     pub bytes: u64,
 }
 
+/// Host memory, commit and swap, all in bytes. `None` on any field whose probe
+/// could not be read — absence is UNKNOWN, never zero.
+///
+/// **`commit_available_bytes` is the field the pre-permit memory guard enforces
+/// its floor against** ([`crate::build_monitor::available_commit_bytes`]), and
+/// the field `cargo-guard.sh` reads through
+/// `Win32_OperatingSystem.FreeVirtualMemory`. It is deliberately NOT
+/// `mem_available_bytes`: the binding constraint for a big rustc here is the
+/// commit limit, and builds have died at ~90% commit while free-physical looked
+/// healthy. Publishing both, named for what they are, is what makes a lane's
+/// drift onto a different quantity visible instead of silent.
+///
+/// **Swap is NOT published on platforms that derive it from commit** — see
+/// [`SWAP_IS_DERIVED_FROM_COMMIT`]. On Windows, sysinfo computes
+/// `swap_total = CommitLimit − PhysicalTotal` and
+/// `swap_used = CommitTotal − PhysicalTotal` (both saturating), so
+/// `swap_total − swap_used` is *identically* `commit_available_bytes` in the
+/// same row: publishing it would be the commit reading under a second name, and
+/// a consumer that naively ranks `swap_used / swap_total` reads ~0.77 on an
+/// **idle** Windows box and calls it saturated. A docstring cannot stop that —
+/// it is not on the read path — so the fields are left `None` instead.
+///
+/// This is keyed on the **platform**, not on the lane: a `host` lane on a Linux
+/// machine has a real, independent swap device and publishes it. There, the
+/// measured finding governs — `mem_available` is pinned by the kernel reserve
+/// under saturation and reads as an all-clear (−13.5 ± 11.2 M/day,
+/// indistinguishable from zero) while `swap_used` moves (+138.6 ± 41.7 M/day),
+/// so a consumer must lead on swap. That finding continues to govern the
+/// `wsl` / `container` rows other publishers write.
+///
+/// On the platforms where swap is withheld, `commit_available_bytes` /
+/// `commit_total_bytes` **is** the honest saturation signal and stays the lead
+/// metric. The sibling runner publisher
+/// (`qontinui-runner` PR #996) applies the same rule, so a `swap_*` value's
+/// presence is a property of the machine, never of which publisher wrote the
+/// row.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MemorySnapshot {
+    pub mem_total_bytes: Option<u64>,
+    pub mem_available_bytes: Option<u64>,
+    pub commit_total_bytes: Option<u64>,
+    pub commit_available_bytes: Option<u64>,
+    pub swap_total_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
+}
+
+/// Build-pool occupancy at snapshot time: how many cargo slots exist, how many
+/// are executing a build, and how many callers are queued on the permit
+/// semaphore.
+///
+/// Populated by [`crate::state::BuildPool::occupancy`], which derives every
+/// field from the same per-slot `busy` scan and the same `queue_depth` counter
+/// `GET /builds` renders — there is exactly one accounting of the pool.
+/// All-`None` means the occupancy was not supplied (e.g. a bare
+/// [`compute_snapshot`] call in a test), which is UNKNOWN, not "idle".
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BuildPoolOccupancy {
+    pub build_slots_total: Option<u32>,
+    pub build_slots_busy: Option<u32>,
+    pub build_queue_depth: Option<u32>,
+}
+
 /// A full footprint snapshot. `computed_at` makes staleness explicit to every
 /// reader. `disk_free_bytes` is the free space on the volume containing the
-/// build-pool root (`None` when sysinfo could not resolve a containing disk).
+/// build-pool root (`None` when sysinfo could not resolve a containing disk);
+/// `disk_total_bytes` / `disk_mount` describe that same volume, so a free-byte
+/// figure can be read against its own capacity and attributed to a mount.
+///
+/// The `memory` and `build_pool` groups are **flattened** into the serialized
+/// form, so `GET /builds`'s `footprint` object carries `mem_total_bytes`,
+/// `commit_available_bytes`, `swap_used_bytes`, `build_slots_busy`, … as
+/// top-level keys — the §A1 column names of `coord.device_resource_samples`,
+/// so the published sample and the local surface cannot drift apart.
 #[derive(Debug, Clone, Serialize)]
 pub struct FootprintSnapshot {
     pub computed_at: String,
     pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub disk_mount: Option<String>,
+    #[serde(flatten)]
+    pub memory: MemorySnapshot,
+    #[serde(flatten)]
+    pub build_pool: BuildPoolOccupancy,
     pub slots: Vec<SlotFootprint>,
     pub lkg_bytes: u64,
     pub spawn_containers: SpawnContainersFootprint,
     pub exe_copies: ExeCopiesFootprint,
+}
+
+/// Sample host memory, commit and swap.
+///
+/// Commit comes from [`crate::build_monitor::available_commit_bytes`] /
+/// [`crate::build_monitor::total_commit_bytes`] — the guard's own probe, called
+/// rather than reimplemented, so the published number and the enforced floor
+/// can never measure different things. Physical memory and swap come from
+/// sysinfo's single refreshed `System`.
+///
+/// Whether this platform's reported "swap" is derived from the commit counters
+/// rather than measured from an independent swap device.
+///
+/// `true` on Windows: sysinfo computes swap as
+/// `CommitLimit/CommitTotal − PhysicalTotal`, so a published `swap_used` is the
+/// commit charge wearing a different name. Publishing it would make
+/// `swap_used / swap_total` read ~0.77 on an idle box — a ranker leading on
+/// that ratio would treat a healthy machine as saturated, and would
+/// double-weight a quantity it already reads as `commit_available_bytes`.
+///
+/// Keyed on the platform, deliberately **not** on the lane: a Linux host has a
+/// real swap device, and a future Linux supervisor must publish it rather than
+/// inherit a Windows-shaped omission. The sibling runner publisher applies the
+/// same platform rule, so `swap_*` presence describes the machine and not the
+/// publisher.
+pub const SWAP_IS_DERIVED_FROM_COMMIT: bool = cfg!(windows);
+
+/// Sample host memory, commit and — where it is a real, independent
+/// measurement — swap.
+///
+/// Commit comes from [`crate::build_monitor::available_commit_bytes`] /
+/// [`crate::build_monitor::total_commit_bytes`] — the guard's own probe, called
+/// rather than reimplemented, so the published number and the enforced floor
+/// can never measure different things. Physical memory and swap come from
+/// sysinfo's single refreshed `System`.
+///
+/// **Swap is withheld where [`SWAP_IS_DERIVED_FROM_COMMIT`] holds**, because
+/// there it is not a second signal — it is the commit reading restated. See
+/// [`MemorySnapshot`].
+///
+/// A zero `mem_total_bytes` is reported as `None`: a box with no memory is not
+/// a state that exists, so zero there means the probe failed. **Every measured
+/// field keeps a genuine `Some(0)`** — a zero `mem_available` or
+/// `commit_available` is the extreme-pressure reading this telemetry exists to
+/// catch, and mapping it to UNKNOWN would erase the signal at exactly the
+/// moment it matters (the mirror image of the false-safe this plan is fixing).
+/// Where swap IS published, `Some(0)` means "no swap configured", which is real.
+pub fn memory_snapshot() -> MemorySnapshot {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let (swap_total_bytes, swap_used_bytes) = if SWAP_IS_DERIVED_FROM_COMMIT {
+        (None, None)
+    } else {
+        (Some(sys.total_swap()), Some(sys.used_swap()))
+    };
+    MemorySnapshot {
+        mem_total_bytes: Some(sys.total_memory()).filter(|b| *b > 0),
+        mem_available_bytes: Some(sys.available_memory()),
+        commit_total_bytes: crate::build_monitor::total_commit_bytes(),
+        commit_available_bytes: crate::build_monitor::available_commit_bytes(),
+        swap_total_bytes,
+        swap_used_bytes,
+    }
 }
 
 /// Recursively sum the byte size of every regular file under `dir`.
@@ -110,11 +249,22 @@ fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
-/// Free bytes on the volume containing `path`, via sysinfo's `Disks`
+/// Free + total space and mount point for the volume containing `path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiskUsage {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    /// Mount point of the resolved volume (`D:\` on Windows, `/` or a mount
+    /// path elsewhere). Attributing a free-byte figure to a mount is what stops
+    /// a multi-volume host's numbers being read as one pool.
+    pub mount: String,
+}
+
+/// Free/total/mount for the volume containing `path`, via sysinfo's `Disks`
 /// enumerator. Picks the disk whose mount point is the longest prefix of
 /// `path` (most-specific mount wins). `None` when no disk contains the path or
 /// the path can't be canonicalized.
-pub fn disk_free_bytes_for(path: &Path) -> Option<u64> {
+pub fn disk_usage_for(path: &Path) -> Option<DiskUsage> {
     use sysinfo::Disks;
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     // On Windows `canonicalize` returns a verbatim path (`\\?\D:\...`) whose
@@ -124,17 +274,31 @@ pub fn disk_free_bytes_for(path: &Path) -> Option<u64> {
     // / non-Windows paths.
     let target = strip_verbatim_prefix(&canon);
     let disks = Disks::new_with_refreshed_list();
-    let mut best: Option<(usize, u64)> = None;
+    let mut best: Option<(usize, DiskUsage)> = None;
     for d in disks.list() {
         let mp = d.mount_point();
         if target.starts_with(mp) {
             let len = mp.as_os_str().len();
-            if best.map(|(blen, _)| len > blen).unwrap_or(true) {
-                best = Some((len, d.available_space()));
+            if best.as_ref().map(|(blen, _)| len > *blen).unwrap_or(true) {
+                best = Some((
+                    len,
+                    DiskUsage {
+                        free_bytes: d.available_space(),
+                        total_bytes: d.total_space(),
+                        mount: mp.to_string_lossy().into_owned(),
+                    },
+                ));
             }
         }
     }
-    best.map(|(_, free)| free)
+    best.map(|(_, usage)| usage)
+}
+
+/// Free bytes on the volume containing `path`. Thin projection of
+/// [`disk_usage_for`] — the pre-permit disk guard reads this, so the guard and
+/// the published sample resolve the same volume by the same rule.
+pub fn disk_free_bytes_for(path: &Path) -> Option<u64> {
+    disk_usage_for(path).map(|u| u.free_bytes)
 }
 
 /// Enumerate `<npm_dir>/target/debug/qontinui-runner-*.exe` per-runner exe
@@ -219,6 +383,14 @@ fn spawn_containers_footprint(workspace_root: &Path) -> SpawnContainersFootprint
 /// (yielding 0 for that component) so a permission glitch on one slot never
 /// poisons the whole snapshot. Slow (walks GB-scale trees) — callers run it
 /// off a timer or inside `spawn_blocking`, never inline on a hot path.
+///
+/// Leaves `build_pool` UNKNOWN (all-`None`).
+/// [`crate::state::SupervisorState::refresh_footprint`] fills it in **after**
+/// this returns: occupancy lives behind async locks (this function is sync +
+/// `spawn_blocking`-hosted), and reading it *before* a minutes-long walk would
+/// stamp `computed_at` on a slot count from minutes earlier — advertising slots
+/// that filled while the walk ran, which is exactly the confidently-wrong
+/// number this telemetry exists to remove.
 pub fn compute_snapshot(config: &SupervisorConfig) -> FootprintSnapshot {
     let npm_dir = config.runner_npm_dir();
     let pool_root = npm_dir.join("target-pool");
@@ -250,11 +422,15 @@ pub fn compute_snapshot(config: &SupervisorConfig) -> FootprintSnapshot {
     } else {
         npm_dir
     };
-    let disk_free_bytes = disk_free_bytes_for(&disk_probe);
+    let disk = disk_usage_for(&disk_probe);
 
     FootprintSnapshot {
         computed_at: chrono::Utc::now().to_rfc3339(),
-        disk_free_bytes,
+        disk_free_bytes: disk.as_ref().map(|d| d.free_bytes),
+        disk_total_bytes: disk.as_ref().map(|d| d.total_bytes),
+        disk_mount: disk.map(|d| d.mount),
+        memory: memory_snapshot(),
+        build_pool: BuildPoolOccupancy::default(),
         slots,
         lkg_bytes,
         spawn_containers,
@@ -314,6 +490,167 @@ mod tests {
             disk_free_bytes_for(tmp.path()).is_some(),
             "disk_free_bytes_for must resolve a real tempdir to a disk"
         );
+    }
+
+    #[test]
+    fn disk_usage_reports_total_and_mount_for_the_same_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usage = disk_usage_for(tmp.path()).expect("a real tempdir resolves to a disk");
+        assert!(
+            usage.total_bytes >= usage.free_bytes,
+            "free ({}) cannot exceed total ({})",
+            usage.free_bytes,
+            usage.total_bytes
+        );
+        assert!(
+            !usage.mount.is_empty(),
+            "resolved volume must name its mount"
+        );
+        // The guard's projection must resolve the SAME volume by the same rule
+        // — one accounting, not two. Compared on the mount, not on free bytes:
+        // free space moves between two reads of a live disk, so a byte-equality
+        // assertion here would flake without pinning anything extra.
+        let again = disk_usage_for(tmp.path()).expect("second probe resolves too");
+        assert_eq!(again.mount, usage.mount);
+        assert_eq!(again.total_bytes, usage.total_bytes);
+        assert!(disk_free_bytes_for(tmp.path()).is_some());
+    }
+
+    #[test]
+    fn memory_snapshot_reports_the_guards_own_commit_probe() {
+        let snap = memory_snapshot();
+        // The published commit field IS the pre-permit guard's probe — not a
+        // second memory quantity sampled alongside it. If this ever diverges,
+        // the dashboard would show a headroom number the guard does not enforce.
+        assert_eq!(
+            snap.commit_available_bytes.is_some(),
+            crate::build_monitor::available_commit_bytes().is_some(),
+            "commit_available_bytes must come from build_monitor::available_commit_bytes"
+        );
+        if let (Some(avail), Some(total)) = (snap.commit_available_bytes, snap.commit_total_bytes) {
+            assert!(
+                avail <= total,
+                "available commit ({avail}) cannot exceed the commit ceiling ({total})"
+            );
+        }
+        // Physical memory must be readable on any host this runs on, and a
+        // zero total is reported as unknown rather than as "no memory".
+        assert!(snap.mem_total_bytes.is_some(), "mem_total_bytes must probe");
+        assert_ne!(snap.mem_total_bytes, Some(0));
+        if let (Some(avail), Some(total)) = (snap.mem_available_bytes, snap.mem_total_bytes) {
+            assert!(avail <= total);
+        }
+    }
+
+    #[test]
+    fn swap_is_withheld_where_the_platform_derives_it_from_commit() {
+        let snap = memory_snapshot();
+        if SWAP_IS_DERIVED_FROM_COMMIT {
+            // On Windows sysinfo computes swap from the commit counters, so a
+            // published `swap_used / swap_total` would be the commit reading
+            // under a second name — ~0.77 on an IDLE box, which a ranker reads
+            // as saturated. Withhold it rather than document around it: a
+            // docstring is not on the read path.
+            assert_eq!(
+                snap.swap_total_bytes, None,
+                "swap_total must not be published where it is derived from commit"
+            );
+            assert_eq!(
+                snap.swap_used_bytes, None,
+                "swap_used must not be published where it is derived from commit"
+            );
+            // The replacement signal must still be there — withholding swap is
+            // only honest because commit carries the same information natively.
+            assert!(
+                snap.commit_available_bytes.is_some() && snap.commit_total_bytes.is_some(),
+                "commit pair is the saturation signal on this platform and must be published"
+            );
+        } else {
+            // A Linux host has a real, independent swap device: publish it.
+            // This arm is what stops a future Linux supervisor inheriting a
+            // Windows-shaped omission — the rule is per-platform, not per-lane.
+            assert!(
+                snap.swap_total_bytes.is_some(),
+                "a platform with a real swap device must publish swap_total"
+            );
+            assert!(
+                snap.swap_used_bytes.is_some(),
+                "a platform with a real swap device must publish swap_used"
+            );
+            if let (Some(used), Some(total)) = (snap.swap_used_bytes, snap.swap_total_bytes) {
+                assert!(
+                    used <= total,
+                    "swap used ({used}) cannot exceed total ({total})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_serializes_the_a1_column_names_flat() {
+        // The published sample and `GET /builds`'s footprint object must carry
+        // the §A1 column names of `coord.device_resource_samples`. A rename on
+        // either side has to fail here rather than silently produce a column
+        // coord drops on the floor.
+        let snap = FootprintSnapshot {
+            computed_at: "2026-08-06T00:00:00Z".to_string(),
+            disk_free_bytes: Some(1),
+            disk_total_bytes: Some(2),
+            disk_mount: Some("D:\\".to_string()),
+            memory: MemorySnapshot {
+                mem_total_bytes: Some(3),
+                mem_available_bytes: Some(4),
+                commit_total_bytes: Some(5),
+                commit_available_bytes: Some(6),
+                swap_total_bytes: Some(7),
+                swap_used_bytes: Some(8),
+            },
+            build_pool: BuildPoolOccupancy {
+                build_slots_total: Some(3),
+                build_slots_busy: Some(1),
+                build_queue_depth: Some(2),
+            },
+            slots: vec![],
+            lkg_bytes: 0,
+            spawn_containers: SpawnContainersFootprint::default(),
+            exe_copies: ExeCopiesFootprint::default(),
+        };
+        let v = serde_json::to_value(&snap).unwrap();
+        for key in [
+            "disk_free_bytes",
+            "disk_total_bytes",
+            "disk_mount",
+            "mem_total_bytes",
+            "mem_available_bytes",
+            "commit_total_bytes",
+            "commit_available_bytes",
+            "swap_total_bytes",
+            "swap_used_bytes",
+            "build_slots_total",
+            "build_slots_busy",
+            "build_queue_depth",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "footprint snapshot must expose `{key}` as a top-level key"
+            );
+        }
+        assert_eq!(v["commit_available_bytes"], 6);
+        assert_eq!(v["swap_used_bytes"], 8);
+        assert_eq!(v["build_slots_busy"], 1);
+    }
+
+    #[test]
+    fn unsupplied_build_pool_occupancy_is_unknown_not_idle() {
+        // All-None must NOT read as "0 slots busy" — absence of signal is not
+        // an idle pool, and a consumer ranking on it would prefer a machine it
+        // knows nothing about.
+        let occ = BuildPoolOccupancy::default();
+        assert_eq!(occ.build_slots_total, None);
+        assert_eq!(occ.build_slots_busy, None);
+        assert_eq!(occ.build_queue_depth, None);
+        let v = serde_json::to_value(occ).unwrap();
+        assert!(v["build_slots_busy"].is_null());
     }
 
     #[test]
