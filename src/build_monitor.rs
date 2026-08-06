@@ -121,6 +121,40 @@ pub fn available_commit_bytes() -> Option<u64> {
     }
 }
 
+/// Total **commit** in bytes (the ceiling [`available_commit_bytes`] is measured
+/// against), or `None` when it cannot be determined.
+///
+/// Deliberately the SAME counter as [`available_commit_bytes`] —
+/// `GlobalMemoryStatusEx().ullTotalPageFile` is the ceiling of the
+/// `ullAvailPageFile` number the guard and `cargo-guard.sh` both read. This is
+/// not a second memory quantity: it exists so a published sample can report the
+/// guard's headroom *against its own ceiling* rather than as a bare byte count,
+/// which is meaningless across hosts with different pagefile sizes.
+///
+/// Non-Windows mirrors [`available_commit_bytes`]'s fallback and reports
+/// sysinfo's `total_memory()`.
+pub fn total_commit_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: identical contract to `available_commit_bytes` — a
+        // correctly-sized, zeroed MEMORYSTATUSEX with `dwLength` set.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok == 0 {
+            return None;
+        }
+        Some(status.ullTotalPageFile)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        Some(sys.total_memory())
+    }
+}
+
 /// Pre-permit memory guard. Called BEFORE acquiring a build-pool permit/slot at
 /// every build-spawning site, so the wait never holds a slot hostage.
 ///

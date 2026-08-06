@@ -336,6 +336,53 @@ It measures free COMMIT, not free physical RAM, deliberately: the binding constr
 
 **It is a safety net, not a cure.** It stops a build entering an already-starved box and prevents the poisoned-cache cascade, but it cannot guarantee headroom 40 minutes later when the single `qontinui_runner` bin-crate rustc peaks (~5-6 GB). If that rustc's allocator fails, rustc aborts with `0xc0000409` (`STATUS_STACK_BUFFER_OVERRUN` — Rust's `__fastfail`, NOT a real buffer overrun) and the slot's incremental cache is corrupted. The durable fix on a 32 GB box is raising the Windows pagefile so the commit ceiling clears the peak.
 
+### Resource telemetry (fleet resource sample)
+
+The cached footprint snapshot is also the supervisor's **capacity sample** (plan
+`2026-08-02-fleet-resource-telemetry-and-ci-allocation` §A2). `compute_snapshot`
+adds, alongside the existing artifact sizes:
+
+- `mem_total_bytes` / `mem_available_bytes` — physical, from sysinfo.
+- `commit_total_bytes` / `commit_available_bytes` — **the pre-permit memory
+  guard's own probe** (`build_monitor::available_commit_bytes`, and its ceiling
+  `total_commit_bytes`), i.e. the same `ullAvailPageFile` number
+  `cargo-guard.sh` reads. Published under its own name so a lane that drifts
+  onto physical-available becomes *visible* rather than silently disagreeing.
+- `swap_total_bytes` / `swap_used_bytes` — **lead on these, not on
+  `mem_available_bytes`.** Under saturation mem-available is pinned by the
+  kernel reserve and reads as an all-clear (measured on this fleet at
+  −13.5 ± 11.2 M/day) while swap moves (+138.6 ± 41.7 M/day).
+- `disk_total_bytes` / `disk_mount` next to the existing `disk_free_bytes`, so a
+  free-byte figure is readable against its own capacity and attributable to a
+  volume.
+- `build_slots_total` / `build_slots_busy` / `build_queue_depth`, from
+  `BuildPool::occupancy()` — derived from the same per-slot `busy` scan and
+  `queue_depth` counter `GET /builds` already renders. There is exactly one
+  accounting of the pool; "busy" means what the dashboard means by it.
+
+Every field is `null` when its probe failed. **Null is UNKNOWN, never zero** — a
+zero would render as "no headroom" or "idle pool", the false-safe class this
+telemetry exists to remove.
+
+The same footprint timer (default 15 min,
+`QONTINUI_SUPERVISOR_FOOTPRINT_REFRESH_SECS`) POSTs the snapshot to coord's
+`POST /coord/devices/:device_id/resource-sample` as a `lane="host"`,
+`source="supervisor"` row (`src/resource_sample.rs`). It is deliberately **not**
+a second timer: the sample is a projection of this snapshot, so a separate
+cadence could only publish numbers that disagree with `GET /builds`.
+`lane_instance` is NULL (the supervisor is the sole publisher for the host
+lane); `ci_jobs_running` is NULL (each host runs two Actions runner services in
+one WSL VM, so the supervisor cannot count jobs — deriving one from
+idle/busy would be a fabricated number in a column an allocator reads). The WSL
+lane is a different pool and is not the supervisor's to report.
+
+Publishing is **best-effort and silent on failure**: machine identity and coord
+URL resolve exactly as `fleet::publish_budget`'s do (`~/.qontinui/machine.json`,
+`~/.qontinui/profiles.json`), a device bearer is attached when
+`$COORD_DEVICE_JWT` or `~/.qontinui/coord-device-jwt` exists, and every failure
+path returns after one WARN (subsequent ones DEBUG). A coord outage must never
+touch the build lane.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), `last_successful_slot`, and a top-level `active_builds` array. **Invariant:** `pool_size == available_permits + active_builds.len()`. `active_builds` and `available_permits` are derived from the same per-slot iteration as `slots[]` so the three views can never disagree mid-release. A separate `semaphore_permits` field exposes the raw `Semaphore::available_permits()` value for debugging transient release-ordering divergence inside `run_cargo_build_with_dir` — at steady state it equals `available_permits`. |
