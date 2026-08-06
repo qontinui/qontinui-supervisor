@@ -20,6 +20,11 @@ pub mod evaluation;
 pub mod expo;
 pub mod external_volume;
 pub mod footprint;
+// Row 2 Phase 1 (fleet topology): CPU/RAM/disk detection + the
+// `max_concurrent_builds` budget POST. Exposed here (not only in `main.rs`) so
+// `resource_sample` can reuse its machine-identity / coord-URL resolution and
+// so both are reachable from tests.
+pub mod fleet;
 pub mod fs_atomic;
 pub mod git_provenance;
 pub mod health_cache;
@@ -32,6 +37,11 @@ pub mod process;
 /// script's logic is covered by the merge-blocking CI gate).
 pub mod provenance_stamp;
 pub mod reapi;
+/// §A2 of plan `2026-08-02-fleet-resource-telemetry-and-ci-allocation`: turns
+/// the footprint snapshot into a `lane='host'`, `source='supervisor'` resource
+/// sample and publishes it to coord. Best-effort — a coord outage never touches
+/// the build lane.
+pub mod resource_sample;
 /// The restart-readiness gate: the supervisor consults the runner's own
 /// `GET /restart-readiness` verdict before stopping or restarting it, and the
 /// long-advertised (and until now inert) `force` field is the override. Plan

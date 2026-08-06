@@ -40,6 +40,10 @@ mod process;
 /// stamping rules and the reading rules are one source.
 mod provenance_stamp;
 mod reapi;
+// §A2 of plan `2026-08-02-fleet-resource-telemetry-and-ci-allocation`:
+// publishes the footprint snapshot's memory/commit/swap/disk/build-pool fields
+// to coord as a `lane='host'` resource sample, on the footprint timer.
+mod resource_sample;
 mod restart_readiness;
 mod routes;
 /// S3-backend degrade guard for the supervisor's own in-process cargo spawns
@@ -588,6 +592,15 @@ async fn main() -> anyhow::Result<()> {
     // `GET /builds` and the pre-permit disk guard. An immediate first refresh
     // populates the cache at boot; thereafter on a timer (default 15 min,
     // override `QONTINUI_SUPERVISOR_FOOTPRINT_REFRESH_SECS`).
+    //
+    // The same tick publishes the snapshot to coord as a `lane='host'`,
+    // `source='supervisor'` resource sample (plan
+    // `2026-08-02-fleet-resource-telemetry-and-ci-allocation` §A2). Deliberately
+    // NOT a second timer: the sample is a projection of this snapshot, so a
+    // separate cadence could only publish numbers that disagree with
+    // `GET /builds`. The publish is best-effort and awaited inside the same
+    // task — it cannot fail the refresh, and a coord outage never reaches the
+    // build lane.
     {
         let state_for_footprint = state.clone();
         tokio::spawn(async move {
@@ -599,7 +612,8 @@ async fn main() -> anyhow::Result<()> {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             loop {
                 ticker.tick().await;
-                let _ = state_for_footprint.refresh_footprint().await;
+                let snapshot = state_for_footprint.refresh_footprint().await;
+                resource_sample::publish(&snapshot).await;
             }
         });
     }
