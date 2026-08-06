@@ -26,6 +26,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Reading `build.target-dir` out of the `.cargo/config.toml` hierarchy when
+# resolving which target dir cargo actually wrote the runner exe into
+# (`config::read_cargo_config_target_dir`). A real parser rather than a
+# hand-rolled scan: the value can be spelled as a `[build]` section or as a
+# top-level dotted key, and mis-parsing it silently resolves the exe to the
+# wrong directory — the exact failure class this resolution exists to close.
+toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"

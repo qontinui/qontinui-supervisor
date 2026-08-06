@@ -578,7 +578,7 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 
 **Why `--features custom-protocol` is mandatory:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. No Vite dev server is running, so the webview would show `ERR_CONNECTION_REFUSED`.
 
-**Why you must build into a slot dir:** the supervisor's `resolve_source_exe` picks the source exe from `last_successful_slot` first, then scans other slots, and only falls back to `target/debug/qontinui-runner.exe` last. On every runner start it copies the source over `target/debug/qontinui-runner-{id}.exe` — so building into the default `target/` means the supervisor may overwrite it with a stale slot exe.
+**Why you must build into a slot dir:** the supervisor's `resolve_source_exe` picks the source exe from `last_successful_slot` first, then scans other slots, and only falls back to the non-pool cargo target dir last. On every runner start it copies the source over `target/debug/qontinui-runner-{id}.exe` — so building into a non-pool `target/` means the supervisor may overwrite it with a stale slot exe. It is also the only build that produces **no provenance sidecar**, so if resolution ever does reach it, the start is refused as unverified (see "Exe resolution order" below) unless you opt in explicitly.
 
 **Supervisor source of truth:** the exact args are assembled in `src/build_monitor.rs::run_build_inner`. If this doc drifts from that code, that file wins.
 
@@ -597,7 +597,46 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 
 1. `target-pool/slot-{last_successful_slot}/debug/qontinui-runner.exe`
 2. Any `target-pool/slot-{k}/debug/qontinui-runner.exe` that exists on disk
-3. `target/debug/qontinui-runner.exe` — legacy fallback
+3. The **non-pool cargo target dir**, resolved through cargo's OWN target-dir
+   precedence — `CARGO_TARGET_DIR` → `build.target-dir` from the applicable
+   `.cargo/config.toml` → the workspace default `<runner>/target` — taking the
+   first candidate that actually holds a runner exe.
+
+**Preference 3 used to be a hardcoded `<runner>/target/debug/`, and that was a
+verification-integrity defect.** Every build on this fleet exports
+`CARGO_TARGET_DIR=<runner>/src-tauri/target` (cargo-guard.sh, the dev docs, and
+every agent told to reuse the warm shared target dir), so cargo wrote to the
+override while the supervisor read the un-overridden default — where a
+**54-day-old** artifact was still sitting. Measured 2026-08-06:
+
+```
+qontinui-runner/target/debug/qontinui-runner.exe            2026-06-12 17:29  259,355,136 B
+qontinui-runner/src-tauri/target/debug/qontinui-runner.exe  2026-08-06 02:54  340,434,432 B
+```
+
+A `spawn-test {rebuild:false}` meant to verify a branch launched the June
+binary; it came up healthy and served the UI Bridge, so nothing looked wrong —
+the test simply measured the wrong code. Repointing the constant at
+`src-tauri/target` would have inverted the bug onto every environment that sets
+no override, hence the precedence ladder.
+
+**Preference 3 now REFUSES rather than spawning silently.** A non-pool artifact
+carries no provenance sidecar, so its build identity is unknown — and unknown
+reads as *refuse*, not as *fine* (`unverified_exe_gate`). The start fails with
+`409 {"error": "unverified_runner_exe"}` naming the resolved path, its mtime,
+its build identity and which target-dir precedence level produced it. Slot
+artifacts are unaffected — they keep `start_provenance_gate`'s posture (refuse
+only on positive evidence of a foreign tree). Two explicit opt-ins keep the
+"run whatever exists" case available, and **both state the staleness in the
+response** instead of going quiet:
+
+- `spawn-test` / `spawn-named` body `{"allow_stale_fallback": true}`;
+- supervisor env `QONTINUI_SUPERVISOR_ALLOW_UNVERIFIED_EXE=1`.
+
+**Every spawn response (and `GET /runners`) now carries `source_exe`** —
+`{path, origin, slot_id, target_dir_source, mtime, build_sha, build_source,
+unverified_warning}`. Nothing reported the path before, which is the whole
+reason the stale spawn survived a full manual-test iteration.
 
 Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process. The `qontinui-shim.exe` sidecar rides along on every start: the supervisor builds it into the same slot right after the runner build (fail-open), preserves it in the LKG dir, and copies it from next to the source exe to next to the exe copy (`deploy_shim_sidecar` in `src/process/manager.rs`). The runner materializes terminal identity shims from the stub next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed shim build/copy logs a WARN ("identity shims will be stale") but never fails the build or start.
 

@@ -1,7 +1,7 @@
 use clap::Parser;
 use qontinui_types::wire::runner_kind::RunnerKind;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Runner binary filename for the current platform: `qontinui-runner.exe` on
 /// Windows, `qontinui-runner` on Unix. Build/spawn/LKG/footprint paths must use
@@ -13,6 +13,174 @@ use std::path::PathBuf;
 pub const RUNNER_BIN_NAME: &str = "qontinui-runner.exe";
 #[cfg(not(windows))]
 pub const RUNNER_BIN_NAME: &str = "qontinui-runner";
+
+/// Cargo's own target-dir override env var. Read (never written) by the
+/// supervisor so exe resolution lands on the directory cargo actually wrote to.
+pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
+
+/// Which level of cargo's target-dir precedence produced a resolved path.
+///
+/// Cargo picks its target directory in this order (highest first), and so must
+/// anything that wants to *find* what cargo built:
+///
+/// 1. `CARGO_TARGET_DIR` in the environment,
+/// 2. `build.target-dir` from the `.cargo/config.toml` hierarchy that applies
+///    at cargo's working directory,
+/// 3. the workspace root's `target/`.
+///
+/// **Why this exists.** `runner_exe_path()` used to hardcode level 3. Every
+/// build on this fleet exports
+/// `CARGO_TARGET_DIR=<runner>/src-tauri/target` (cargo-guard.sh, the dev docs,
+/// and every agent instructed to reuse the warm shared target dir), so cargo
+/// wrote level 1 while the supervisor read level 3 — and level 3 still held a
+/// months-old artifact from before the convention. Measured 2026-08-06 on the
+/// fleet box:
+///
+/// ```text
+/// qontinui-runner/target/debug/qontinui-runner.exe            2026-06-12 17:29  259,355,136 B
+/// qontinui-runner/src-tauri/target/debug/qontinui-runner.exe  2026-08-06 02:54  340,434,432 B
+/// ```
+///
+/// A `spawn-test {rebuild:false}` therefore launched a 54-day-old binary that
+/// came up healthy and served the UI Bridge — a false green in the verification
+/// path. Repointing the constant at `src-tauri/target` would have inverted the
+/// bug onto every environment that sets no override, which is why resolution
+/// follows cargo's precedence instead of picking a different fixed level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetDirSource {
+    /// Level 1 — `CARGO_TARGET_DIR` was set in the environment.
+    CargoTargetDirEnv,
+    /// Level 2 — `build.target-dir` from an applicable `.cargo/config.toml`.
+    CargoConfigBuildTargetDir,
+    /// Level 3 — cargo's default: the workspace root's `target/`.
+    WorkspaceDefault,
+}
+
+impl TargetDirSource {
+    /// Stable machine-readable label, mirrored in API responses and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetDirSource::CargoTargetDirEnv => "cargo_target_dir_env",
+            TargetDirSource::CargoConfigBuildTargetDir => "cargo_config_build_target_dir",
+            TargetDirSource::WorkspaceDefault => "workspace_default",
+        }
+    }
+}
+
+/// Resolve `p` against `base` when it is relative. Cargo resolves a relative
+/// `CARGO_TARGET_DIR` against its own working directory and a relative
+/// `build.target-dir` against the directory *containing* the `.cargo` dir the
+/// value was read from — hence the caller-supplied base.
+fn absolutize(p: &Path, base: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// Build the ordered target-dir candidate list for a cargo invocation, in
+/// cargo's own precedence order. Pure — every input is injected, so the
+/// precedence rule is unit-testable without touching the environment or the
+/// filesystem.
+///
+/// - `cargo_cwd` — the directory cargo is invoked from (the runner's
+///   `src-tauri`). Base for a relative `CARGO_TARGET_DIR`.
+/// - `workspace_root` — the cargo workspace root (the runner npm dir), whose
+///   `target/` is cargo's default.
+/// - `env_target_dir` — the raw `CARGO_TARGET_DIR` value, if set. Empty /
+///   whitespace-only is treated as unset (that is how cargo reads it too).
+/// - `config_target_dir` — `(value, base)` from the applicable
+///   `.cargo/config.toml`, if any.
+///
+/// The workspace default is ALWAYS the last candidate, so the list is never
+/// empty and an environment with no override keeps today's behavior exactly.
+pub fn target_dir_candidates(
+    cargo_cwd: &Path,
+    workspace_root: &Path,
+    env_target_dir: Option<&str>,
+    config_target_dir: Option<(&Path, &Path)>,
+) -> Vec<(TargetDirSource, PathBuf)> {
+    let mut out: Vec<(TargetDirSource, PathBuf)> = Vec::with_capacity(3);
+    if let Some(v) = env_target_dir.map(str::trim).filter(|v| !v.is_empty()) {
+        out.push((
+            TargetDirSource::CargoTargetDirEnv,
+            absolutize(Path::new(v), cargo_cwd),
+        ));
+    }
+    if let Some((value, base)) = config_target_dir {
+        out.push((
+            TargetDirSource::CargoConfigBuildTargetDir,
+            absolutize(value, base),
+        ));
+    }
+    out.push((
+        TargetDirSource::WorkspaceDefault,
+        workspace_root.join("target"),
+    ));
+    out
+}
+
+/// Parse `build.target-dir` out of a `.cargo/config.toml` body. Returns `None`
+/// when the file does not set it (or is not parseable — an unreadable config is
+/// "no opinion", never an error, because cargo itself would still build).
+pub fn parse_build_target_dir(toml_text: &str) -> Option<PathBuf> {
+    let value: toml::Value = toml::from_str(toml_text).ok()?;
+    let s = value.get("build")?.get("target-dir")?.as_str()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+/// Walk the `.cargo/config.toml` hierarchy at and above `start_dir` looking for
+/// `build.target-dir`, exactly as cargo does — the deepest file wins, and both
+/// the modern `config.toml` and the legacy extensionless `config` name are
+/// honoured (cargo still reads the latter).
+///
+/// Returns `(value, base_dir)` where `base_dir` is the directory that CONTAINS
+/// the `.cargo` dir — the anchor cargo resolves a relative value against.
+pub fn read_cargo_config_target_dir(start_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    for dir in start_dir.ancestors() {
+        for name in ["config.toml", "config"] {
+            let path = dir.join(".cargo").join(name);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(value) = parse_build_target_dir(&text) {
+                return Some((value, dir.to_path_buf()));
+            }
+        }
+    }
+    None
+}
+
+/// Pick the winning exe candidate: the first one that exists, in precedence
+/// order. When none exist, the highest-precedence candidate is returned so
+/// error messages name the path cargo would have written to rather than a
+/// lower-precedence path nobody uses.
+///
+/// Existence is injected so the choice is unit-testable with no filesystem.
+///
+/// **Why first-EXISTING rather than first-declared:** the supervisor's own
+/// process may carry a `CARGO_TARGET_DIR` meant for something else entirely
+/// (an agent's shell exports it for the supervisor's own builds). Requiring the
+/// runner exe to actually be there makes a mis-aimed override degrade to the
+/// next candidate instead of resolving to a path that will never hold a runner.
+pub fn pick_exe_candidate<F: Fn(&Path) -> bool>(
+    candidates: &[(TargetDirSource, PathBuf)],
+    exists: F,
+) -> (TargetDirSource, PathBuf) {
+    if let Some((src, path)) = candidates.iter().find(|(_, p)| exists(p)) {
+        return (*src, path.clone());
+    }
+    candidates
+        .first()
+        .cloned()
+        .expect("target_dir_candidates always yields the workspace default")
+}
 
 /// Qontinui Supervisor — manages the qontinui-runner process lifecycle.
 #[derive(Parser, Debug, Clone)]
@@ -653,19 +821,69 @@ impl SupervisorConfig {
         self.lkg_dir().join("lkg.json")
     }
 
-    /// Path to the runner executable (for exe mode).
+    /// The directory cargo is invoked from for runner builds (`src-tauri`),
+    /// absolute. Base for a relative `CARGO_TARGET_DIR` and the starting point
+    /// for the `.cargo/config.toml` hierarchy walk.
+    pub fn runner_cargo_cwd(&self) -> PathBuf {
+        let dir = self.project_dir.clone();
+        let canonical = dir.canonicalize().unwrap_or(dir);
+        strip_verbatim_prefix(canonical)
+    }
+
+    /// The ordered target-dir candidates for a runner build, in cargo's own
+    /// precedence order (`CARGO_TARGET_DIR` → `build.target-dir` → workspace
+    /// default). See [`TargetDirSource`] for why this is a ladder and not a
+    /// constant.
     ///
-    /// Cargo builds into the workspace root's target directory (parent of
-    /// src-tauri), not the package directory's target. `build_monitor::run_cargo_build`
-    /// runs `cargo build --bin qontinui-runner` (no `--release` flag), so the
-    /// fresh artifact lives under `target/debug/`, not `target/release/`.
-    /// Pointing this at release caused `spawn-test {rebuild:true}` to rebuild
-    /// debug and then silently launch a stale release binary.
+    /// Reads the environment and the `.cargo/config.toml` hierarchy on every
+    /// call — deliberately, so an operator who exports a different
+    /// `CARGO_TARGET_DIR` and rebuilds does not need to restart the supervisor
+    /// for resolution to follow. Both reads are cheap and off any hot path
+    /// (resolution runs once per runner start).
+    pub fn runner_target_dir_candidates(&self) -> Vec<(TargetDirSource, PathBuf)> {
+        let cargo_cwd = self.runner_cargo_cwd();
+        let env_value = std::env::var(CARGO_TARGET_DIR_ENV).ok();
+        let config_value = read_cargo_config_target_dir(&cargo_cwd);
+        target_dir_candidates(
+            &cargo_cwd,
+            &self.runner_npm_dir(),
+            env_value.as_deref(),
+            config_value
+                .as_ref()
+                .map(|(v, base)| (v.as_path(), base.as_path())),
+        )
+    }
+
+    /// The same ladder as [`Self::runner_target_dir_candidates`], expressed as
+    /// runner-exe paths (`<target-dir>/debug/<RUNNER_BIN_NAME>`).
+    ///
+    /// `build_monitor::run_cargo_build` runs `cargo build --bin qontinui-runner`
+    /// with no `--release`, so the fresh artifact is always under `debug/`.
+    /// Pointing this at release once caused `spawn-test {rebuild:true}` to
+    /// rebuild debug and then silently launch a stale release binary.
+    pub fn runner_exe_candidates(&self) -> Vec<(TargetDirSource, PathBuf)> {
+        self.runner_target_dir_candidates()
+            .into_iter()
+            .map(|(src, dir)| (src, dir.join("debug").join(RUNNER_BIN_NAME)))
+            .collect()
+    }
+
+    /// Resolve the non-pool runner exe, reporting WHICH precedence level won.
+    ///
+    /// Callers that surface the path to an operator (logs, spawn responses,
+    /// refusal messages) should use this rather than [`Self::runner_exe_path`]:
+    /// the whole reason the stale-binary incident went unnoticed is that
+    /// nothing ever reported where the binary came from.
+    pub fn runner_exe_path_resolved(&self) -> (TargetDirSource, PathBuf) {
+        let candidates = self.runner_exe_candidates();
+        pick_exe_candidate(&candidates, |p| p.exists())
+    }
+
+    /// Path to the runner executable (for exe mode), resolved through cargo's
+    /// target-dir precedence. Convenience wrapper over
+    /// [`Self::runner_exe_path_resolved`] for call sites that only need the path.
     pub fn runner_exe_path(&self) -> PathBuf {
-        self.runner_npm_dir()
-            .join("target")
-            .join("debug")
-            .join(RUNNER_BIN_NAME)
+        self.runner_exe_path_resolved().1
     }
 
     /// Path to a copied runner executable for non-primary runners.
@@ -959,6 +1177,183 @@ mod tests {
         let config = SupervisorConfig::from_args(args);
         let exe_path = config.runner_exe_path();
         assert!(exe_path.ends_with(format!("target/debug/{}", RUNNER_BIN_NAME)));
+    }
+
+    // --- Cargo target-dir precedence (the stale-exe defect) ---
+    //
+    // Every case drives the pure core with injected inputs: no env mutation
+    // (which races other tests in the same process) and no filesystem.
+
+    fn cwd() -> PathBuf {
+        PathBuf::from("/ws/qontinui-runner/src-tauri")
+    }
+    fn ws_root() -> PathBuf {
+        PathBuf::from("/ws/qontinui-runner")
+    }
+
+    #[test]
+    fn cargo_target_dir_env_wins_over_the_workspace_default() {
+        // The measured defect: the fleet exports CARGO_TARGET_DIR at
+        // `<runner>/src-tauri/target` and cargo writes there, while the old
+        // resolution read `<runner>/target` and found a 54-day-old exe.
+        let env = "/ws/qontinui-runner/src-tauri/target";
+        let candidates = target_dir_candidates(&cwd(), &ws_root(), Some(env), None);
+        assert_eq!(candidates[0].0, TargetDirSource::CargoTargetDirEnv);
+        assert_eq!(candidates[0].1, PathBuf::from(env));
+        // The default is still present as the last-resort candidate.
+        assert_eq!(
+            candidates.last().unwrap(),
+            &(
+                TargetDirSource::WorkspaceDefault,
+                PathBuf::from("/ws/qontinui-runner/target")
+            )
+        );
+    }
+
+    #[test]
+    fn unset_cargo_target_dir_resolves_to_the_workspace_default() {
+        // The inverse of the bug: an environment with no override must keep
+        // resolving exactly where it does today. This is what repointing the
+        // constant at `src-tauri/target` would have broken.
+        let candidates = target_dir_candidates(&cwd(), &ws_root(), None, None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0],
+            (
+                TargetDirSource::WorkspaceDefault,
+                PathBuf::from("/ws/qontinui-runner/target")
+            )
+        );
+    }
+
+    #[test]
+    fn empty_cargo_target_dir_is_treated_as_unset() {
+        let candidates = target_dir_candidates(&cwd(), &ws_root(), Some("   "), None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, TargetDirSource::WorkspaceDefault);
+    }
+
+    #[test]
+    fn relative_cargo_target_dir_resolves_against_the_cargo_cwd() {
+        // Cargo resolves a relative CARGO_TARGET_DIR against its own working
+        // directory, which for the runner is `src-tauri` — NOT the workspace
+        // root. Getting this backwards is how a "../target" override lands one
+        // directory off.
+        let candidates = target_dir_candidates(&cwd(), &ws_root(), Some("target"), None);
+        assert_eq!(
+            candidates[0].1,
+            PathBuf::from("/ws/qontinui-runner/src-tauri/target")
+        );
+    }
+
+    #[test]
+    fn build_target_dir_from_cargo_config_is_honoured_below_the_env() {
+        let value = PathBuf::from("cargo-out");
+        let base = PathBuf::from("/ws/qontinui-runner/src-tauri");
+        let candidates = target_dir_candidates(
+            &cwd(),
+            &ws_root(),
+            None,
+            Some((value.as_path(), base.as_path())),
+        );
+        assert_eq!(candidates[0].0, TargetDirSource::CargoConfigBuildTargetDir);
+        // Config-relative paths anchor at the dir CONTAINING `.cargo`.
+        assert_eq!(
+            candidates[0].1,
+            PathBuf::from("/ws/qontinui-runner/src-tauri/cargo-out")
+        );
+        assert_eq!(candidates[1].0, TargetDirSource::WorkspaceDefault);
+
+        // With BOTH set, the env still wins — cargo's own order.
+        let both = target_dir_candidates(
+            &cwd(),
+            &ws_root(),
+            Some("/env/target"),
+            Some((value.as_path(), base.as_path())),
+        );
+        assert_eq!(
+            both.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![
+                TargetDirSource::CargoTargetDirEnv,
+                TargetDirSource::CargoConfigBuildTargetDir,
+                TargetDirSource::WorkspaceDefault,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_build_target_dir_reads_both_spellings_and_ignores_the_rest() {
+        assert_eq!(
+            parse_build_target_dir("[build]\ntarget-dir = \"out\"\n"),
+            Some(PathBuf::from("out"))
+        );
+        assert_eq!(
+            parse_build_target_dir("build.target-dir = \"out\"\n"),
+            Some(PathBuf::from("out"))
+        );
+        // The runner's real config sets [env] + rustflags but no target-dir —
+        // it must read as "no opinion", not as an empty override.
+        assert_eq!(
+            parse_build_target_dir("[env]\nFOO = \"bar\"\n[build]\nrustflags = []\n"),
+            None
+        );
+        assert_eq!(parse_build_target_dir("not = valid = toml"), None);
+        assert_eq!(parse_build_target_dir("[build]\ntarget-dir = \"\"\n"), None);
+    }
+
+    #[test]
+    fn pick_exe_candidate_takes_the_first_that_exists() {
+        let candidates = target_dir_candidates(
+            &cwd(),
+            &ws_root(),
+            Some("/ws/qontinui-runner/src-tauri/target"),
+            None,
+        )
+        .into_iter()
+        .map(|(s, d)| (s, d.join("debug").join(RUNNER_BIN_NAME)))
+        .collect::<Vec<_>>();
+
+        // Both present → the env override wins (the fresh artifact).
+        let (src, _) = pick_exe_candidate(&candidates, |_| true);
+        assert_eq!(src, TargetDirSource::CargoTargetDirEnv);
+
+        // Override aimed somewhere that holds no runner (e.g. a shell that
+        // exported CARGO_TARGET_DIR for a DIFFERENT crate) → degrade to the
+        // default rather than resolve to a path that will never hold a runner.
+        let default_exe = candidates.last().unwrap().1.clone();
+        let (src, path) = pick_exe_candidate(&candidates, |p| p == default_exe);
+        assert_eq!(src, TargetDirSource::WorkspaceDefault);
+        assert_eq!(path, default_exe);
+
+        // Nothing exists → report the highest-precedence candidate, i.e. where
+        // cargo would have written, so the error names a useful path.
+        let (src, _) = pick_exe_candidate(&candidates, |_| false);
+        assert_eq!(src, TargetDirSource::CargoTargetDirEnv);
+    }
+
+    #[test]
+    fn read_cargo_config_target_dir_walks_up_and_anchors_relative_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src_tauri = root.join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(src_tauri.join(".cargo")).unwrap();
+        // No target-dir here — the deepest config must not shadow an ancestor
+        // that DOES set one just by existing.
+        std::fs::write(
+            src_tauri.join(".cargo").join("config.toml"),
+            "[env]\nFOO = \"bar\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo").join("config.toml"),
+            "[build]\ntarget-dir = \"shared-target\"\n",
+        )
+        .unwrap();
+
+        let (value, base) = read_cargo_config_target_dir(&src_tauri).expect("ancestor config");
+        assert_eq!(value, PathBuf::from("shared-target"));
+        assert_eq!(base, root);
     }
 
     #[test]

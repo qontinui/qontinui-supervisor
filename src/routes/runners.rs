@@ -426,11 +426,19 @@ pub async fn list_runners(
             None => (None, None, None, None),
         };
 
+        let source_exe = source_exe_json(managed).await;
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
             "requester_id": requester_id,
+            // WHERE the binary came from and how resolution got there. Distinct
+            // from `build_sha` (what commit it claims): this answers "which
+            // directory won", the question nobody could answer when a
+            // `spawn-test {rebuild:false}` launched a 54-day-old exe out of the
+            // un-overridden default target dir.
+            "source_exe": source_exe,
             "kind": managed.config.kind(),
             "protected": is_protected,
             "running": effectively_running,
@@ -464,6 +472,45 @@ pub async fn list_runners(
     drop(cached_snapshots);
 
     Ok(Json(json!(result)))
+}
+
+/// JSON view of the artifact a runner was actually started from: the resolved
+/// path, which resolution rung produced it, its mtime, its build identity, and
+/// any opt-in staleness warning.
+///
+/// `null` until this supervisor has started the runner — an honest "unknown",
+/// never an implied "current".
+///
+/// **Why every spawn response carries this.** The 2026-08-06 stale-spawn went
+/// unnoticed because nothing reported the path: the runner came up healthy and
+/// served the UI Bridge, so a `{rebuild:false}` test measured a binary from June
+/// while reading as a clean pass. `target_dir_source` names which of cargo's
+/// target-dir precedence levels won, so the env-override-vs-default split that
+/// caused it is visible in the response itself.
+pub async fn source_exe_json(managed: &crate::state::ManagedRunner) -> serde_json::Value {
+    let Some(r) = managed.resolved_exe.read().await.clone() else {
+        return serde_json::Value::Null;
+    };
+    let target_dir_source = match r.origin {
+        crate::process::manager::ExeOrigin::CargoTargetDir(src) => json!(src.label()),
+        _ => serde_json::Value::Null,
+    };
+    json!({
+        "path": r.path.display().to_string(),
+        "origin": r.origin.label(),
+        "slot_id": r.slot_id(),
+        "target_dir_source": target_dir_source,
+        "mtime": r.mtime_rfc3339(),
+        "build_sha": r.provenance.as_ref().and_then(|p| p.sha.clone()),
+        "build_source": r
+            .provenance
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p.source).ok()),
+        // Non-null ONLY when the caller opted into an artifact whose identity
+        // could not be established. Its presence means: do not read a test
+        // result from this runner as evidence about a branch.
+        "unverified_warning": r.unverified_warning,
+    })
 }
 
 /// GET /runners/by-unit/{unit_id} — resolve the preview handle(s) bound to an
@@ -3258,6 +3305,13 @@ async fn execute_spawn_build_inner(
         }
     }
 
+    // `allow_stale_fallback` is the caller explicitly saying "run whatever
+    // exists". Carry it to the start path so `unverified_exe_gate` allows a
+    // non-pool artifact of unknown build identity instead of refusing it — the
+    // spawn response then STATES the staleness (`source_exe.unverified_warning`)
+    // rather than the supervisor going quiet about it.
+    *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
+
     // If the caller asked to pin this runner to the LKG binary, resolve the
     // path now (before starting) and stash it on the ManagedRunner. The
     // override takes precedence over the slot-resolution chain inside
@@ -3755,6 +3809,12 @@ async fn execute_spawn_build_inner(
         // `build_result.slot_id` — see the `side.slot_id` commentary above.
         "build_slot_id": side.slot_id,
         "build_result": build_result,
+        // Which artifact actually got launched, and which resolution rung
+        // produced it (`origin` / `target_dir_source`). Always present on a
+        // successful spawn — a caller can no longer be left guessing which
+        // directory the binary came from, which is the gap that let a
+        // 54-day-old exe pass for a branch under test.
+        "source_exe": source_exe_json(managed).await,
         "auth_state": auth_state_json,
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
@@ -4586,6 +4646,11 @@ pub async fn spawn_named(
         build_reused_stale = true;
     }
 
+    // Same opt-in as spawn-test: `allow_stale_fallback` is the caller asking
+    // for "whatever exists", so `unverified_exe_gate` allows an unidentifiable
+    // non-pool artifact instead of refusing it — and the response says so.
+    *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
+
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
@@ -4755,6 +4820,9 @@ pub async fn spawn_named(
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "build_result": build_result,
+        // Which artifact was launched and which resolution rung produced it —
+        // same shape as spawn-test (`source_exe_json`).
+        "source_exe": source_exe_json(&managed).await,
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {

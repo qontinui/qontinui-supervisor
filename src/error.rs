@@ -48,6 +48,22 @@ pub enum SupervisorError {
         footprint: Box<Option<serde_json::Value>>,
     },
 
+    /// The runner exe that resolution landed on carries no usable build
+    /// identity (or a foreign one), so the supervisor cannot show it is the
+    /// code the caller asked for — and it refused to start it rather than
+    /// produce a false green. Raised only for the non-pool artifact resolved
+    /// through cargo's target-dir precedence; see
+    /// [`crate::process::manager::unverified_exe_gate`] for the scope and the
+    /// two opt-outs. Mapped to `409 CONFLICT`: the request is fine, the
+    /// on-disk state is not.
+    ///
+    /// Boxed so the whole `SupervisorError` stays small — every
+    /// `Result<_, SupervisorError>` in the crate pays for the largest variant
+    /// (`clippy::result_large_err`), same reason `InsufficientDisk` boxes its
+    /// footprint snapshot.
+    #[error("{}", .0.detail)]
+    UnverifiedExe(Box<UnverifiedExeInfo>),
+
     #[error("Process error: {0}")]
     Process(String),
 
@@ -74,6 +90,25 @@ pub enum SupervisorError {
 
     #[error("{0}")]
     Other(String),
+}
+
+/// Payload of [`SupervisorError::UnverifiedExe`] — everything an operator needs
+/// to see WHICH artifact was refused and why, without scraping the prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedExeInfo {
+    /// Absolute path of the artifact that would have been launched.
+    pub path: String,
+    /// RFC3339 mtime of that artifact; `None` when unreadable.
+    pub mtime: Option<String>,
+    /// Recorded build SHA, `None` when there is no provenance record.
+    pub build_sha: Option<String>,
+    /// Recorded build source (`live_tree`/`origin_main`/`override`), `None`
+    /// when there is no provenance record.
+    pub build_source: Option<String>,
+    /// Which cargo target-dir precedence level produced the path.
+    pub target_dir_source: String,
+    /// Full human-readable reason, including the recovery and the opt-ins.
+    pub detail: String,
 }
 
 impl SupervisorError {
@@ -127,6 +162,37 @@ impl SupervisorError {
             return (StatusCode::INSUFFICIENT_STORAGE, body);
         }
 
+        if let SupervisorError::UnverifiedExe(info) = self {
+            let UnverifiedExeInfo {
+                path,
+                mtime,
+                build_sha,
+                build_source,
+                target_dir_source,
+                detail,
+            } = info.as_ref();
+            // Typed body: the caller can branch on `error` and read the exact
+            // artifact that was refused without scraping prose.
+            let body = serde_json::json!({
+                "error": "unverified_runner_exe",
+                "message": detail,
+                "resolved_exe": path,
+                "resolved_exe_mtime": mtime,
+                "build_sha": build_sha,
+                "build_source": build_source,
+                "target_dir_source": target_dir_source,
+                "opt_ins": [
+                    "spawn-test/spawn-named body: {\"allow_stale_fallback\": true}",
+                    "supervisor env: QONTINUI_SUPERVISOR_ALLOW_UNVERIFIED_EXE=1",
+                ],
+                "recovery": [
+                    "POST /runners/spawn-test {\"rebuild\": true}",
+                    "POST /runner/fix-and-rebuild",
+                ],
+            });
+            return (StatusCode::CONFLICT, body);
+        }
+
         let status = match self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
@@ -134,6 +200,7 @@ impl SupervisorError {
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
+            SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
