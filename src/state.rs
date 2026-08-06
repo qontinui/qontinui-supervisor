@@ -97,6 +97,27 @@ pub struct ManagedRunner {
     /// resolved artifact carried no provenance record (legacy `target/debug/`
     /// exe, pre-upgrade slot). Absence is honest "unknown", never "current".
     pub build_provenance: RwLock<Option<crate::process::manager::BuildProvenance>>,
+    /// Which artifact this runner was actually started from, and how it was
+    /// resolved: the path, the origin (build-pool slot / non-pool cargo target
+    /// dir + WHICH target-dir precedence level won / an explicit pin), the
+    /// mtime, and any opt-in staleness warning.
+    ///
+    /// Surfaced on the spawn responses so a caller can see where the binary
+    /// came from. Nothing reported the path before, which is how a
+    /// `spawn-test {rebuild:false}` came to launch a 54-day-old exe from
+    /// `<runner>/target/debug/` (cargo had been writing to the
+    /// `CARGO_TARGET_DIR` override at `src-tauri/target/` for weeks) while
+    /// looking perfectly healthy.
+    ///
+    /// `None` until this supervisor starts the runner.
+    pub resolved_exe: RwLock<Option<crate::process::manager::ResolvedRunnerExe>>,
+    /// Per-spawn opt-in: allow starting from a resolved exe whose build
+    /// identity cannot be established (see
+    /// [`crate::process::manager::unverified_exe_gate`]). Set from the
+    /// `allow_stale_fallback` field of `spawn-test` / `spawn-named` — the
+    /// caller explicitly asking for "whatever exists". The staleness is still
+    /// logged and still reported on the response; only the refusal is waived.
+    pub allow_unverified_exe: RwLock<bool>,
 }
 
 /// Work-unit → preview correlation for a runner spawned as an attempt's
@@ -180,6 +201,8 @@ impl ManagedRunner {
             preview_binding: RwLock::new(None),
             requester_id: RwLock::new(None),
             build_provenance: RwLock::new(None),
+            resolved_exe: RwLock::new(None),
+            allow_unverified_exe: RwLock::new(false),
         }
     }
 

@@ -4,7 +4,9 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS};
+use crate::config::{
+    TargetDirSource, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
+};
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -491,18 +493,12 @@ pub fn format_drift_warning(d: &SlotShaDrift) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartProvenanceWarning(pub String);
 
-/// Warning text for a NON-temp runner start that resolved to the legacy
-/// `target/debug/` exe (no build-pool slot, therefore no provenance sidecar at
-/// all). The legacy artifact is the most-unknown binary in the system — it is
-/// the very path `detect_target_debug_staleness` exists to distrust — so the
-/// unknown-provenance posture (warn-and-proceed, never refuse on absence)
-/// applies to it the same as to a sidecar-less slot. Pure so it is
-/// unit-testable.
-pub fn legacy_exe_provenance_warning(exe: &std::path::Path) -> StartProvenanceWarning {
-    StartProvenanceWarning(format!(
-        "Starting non-temp runner from the legacy exe {exe:?} with UNKNOWN provenance          (no build-pool slot, no provenance sidecar). Proceeding: refusal keys on          positive evidence of a foreign exe only. Prefer a pool build          (POST /runner/fix-and-rebuild) so the deploy carries a provenance record."
-    ))
-}
+// NOTE: `legacy_exe_provenance_warning` used to live here — the warn-and-proceed
+// text for a non-temp start off the non-pool `target/debug/` exe. It is deleted,
+// not deprecated: that path no longer warns and proceeds, it refuses
+// ([`unverified_exe_gate`]). Warning about a binary of unknown provenance and
+// launching it anyway is exactly how a 54-day-old artifact served a healthy UI
+// Bridge through a whole verification iteration.
 
 /// Pure decision gate for a runner start, over `(temp-ness, slot provenance)`.
 ///
@@ -751,10 +747,11 @@ pub fn compute_target_debug_staleness(
 /// in [`newest_slot_binary_mtime`]). If all slot reads fail, treat that as
 /// "no baseline" and return `None`.
 ///
-/// **Observability only.** Resolution order is unchanged; the legacy path is
-/// never used as a fallback resolution source by [`resolve_source_exe`] (it
-/// only falls back to the legacy path when NO slot has an exe, which is the
-/// pre-pool case the legacy fallback originally covered).
+/// **Observability only** — it never alters which artifact wins. The non-pool
+/// exe IS a resolution source ([`resolve_source_exe`] preference 3), but only
+/// when NO slot has an exe at all; whenever this warning can fire (i.e. at
+/// least one slot exe exists) a slot always wins. When it does get reached,
+/// [`unverified_exe_gate`] refuses it rather than launching it silently.
 pub fn detect_target_debug_staleness(
     legacy_exe_path: &std::path::Path,
     slot_exe_paths: &[(usize, &std::path::Path)],
@@ -782,10 +779,12 @@ pub fn format_target_debug_warning(s: &TargetDebugStaleness) -> String {
     let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
     let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
     format!(
-        "target_debug_staleness: legacy {} (mtime {}) is older than every \
-         slot exe (oldest slot mtime {}). It will not be used by spawn-test \
-         {{rebuild:false}}. Either rebuild via supervisor (build into a slot) \
-         or delete the stale exe. See feedback_runner_manual_build.",
+        "target_debug_staleness: non-pool exe {} (mtime {}) is older than every \
+         slot exe (oldest slot mtime {}). While a slot exe exists it is not used; \
+         if every slot is emptied, spawn-test {{rebuild:false}} falls through to \
+         it (preference 3) and it is then refused unless allow_stale_fallback is \
+         set. Either rebuild via supervisor (build into a slot) or delete the \
+         stale exe. See feedback_runner_manual_build.",
         s.legacy_path.display(),
         legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -817,13 +816,225 @@ fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<Targe
     detect_target_debug_staleness(&legacy, &slot_refs)
 }
 
+// =============================================================================
+// Source-exe resolution + identity
+// =============================================================================
+
+/// Where the resolved source exe came from. Reported in logs and on the spawn
+/// response so a caller can always see which path won — the reason the
+/// 54-day-old-binary spawn went unnoticed is that nothing reported the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExeOrigin {
+    /// A build-pool slot (`target-pool/slot-N/debug/`) — preference 1/2.
+    Slot(usize),
+    /// The non-pool cargo target dir — preference 3 — resolved through cargo's
+    /// own target-dir precedence. The variant carries WHICH precedence level
+    /// won (`CARGO_TARGET_DIR`, `build.target-dir`, workspace default).
+    CargoTargetDir(TargetDirSource),
+    /// A per-runner `source_exe_override` (today: the LKG pin).
+    PinnedOverride,
+}
+
+impl ExeOrigin {
+    /// Stable machine-readable label for logs and API responses.
+    pub fn label(self) -> String {
+        match self {
+            ExeOrigin::Slot(id) => format!("slot-{id}"),
+            ExeOrigin::CargoTargetDir(src) => format!("cargo_target_dir:{}", src.label()),
+            ExeOrigin::PinnedOverride => "pinned_override".to_string(),
+        }
+    }
+
+    /// The build-pool slot id, when the exe came from one.
+    pub fn slot_id(self) -> Option<usize> {
+        match self {
+            ExeOrigin::Slot(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// A resolved runner exe plus everything needed to judge and report it: where
+/// it came from, when it was written, and what build identity it carries.
+///
+/// `provenance == None` is an honest UNKNOWN — never "fine". The identity gate
+/// ([`unverified_exe_gate`]) treats it as a refusal condition on the non-pool
+/// path, because an artifact with no identity cannot be shown to match what the
+/// caller asked for.
+#[derive(Debug, Clone)]
+pub struct ResolvedRunnerExe {
+    pub path: std::path::PathBuf,
+    pub origin: ExeOrigin,
+    /// mtime of the resolved exe, `None` when unreadable.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Build identity recorded next to the artifact, when there is one.
+    pub provenance: Option<BuildProvenance>,
+    /// Set when the identity gate ALLOWED an unverified artifact through an
+    /// explicit opt-in. Callers MUST surface it — an opted-in stale spawn
+    /// states its staleness, it does not go quiet.
+    pub unverified_warning: Option<String>,
+}
+
+impl ResolvedRunnerExe {
+    pub fn slot_id(&self) -> Option<usize> {
+        self.origin.slot_id()
+    }
+
+    /// mtime as RFC3339, for messages and API responses.
+    pub fn mtime_rfc3339(&self) -> Option<String> {
+        self.mtime.map(|m| {
+            let dt: chrono::DateTime<chrono::Utc> = m.into();
+            dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+    }
+
+    /// Human-readable build identity: `sha (source)`, or an explicit "absent"
+    /// so a reader can never mistake unknown for current.
+    pub fn identity_label(&self) -> String {
+        match &self.provenance {
+            Some(p) => format!(
+                "sha {} (source {}, built_from {}, built_at {})",
+                p.sha.as_deref().unwrap_or("(unknown)"),
+                source_label(p.source),
+                p.built_from,
+                p.built_at,
+            ),
+            None => "ABSENT (no provenance sidecar next to the artifact)".to_string(),
+        }
+    }
+}
+
+/// Read the provenance sidecar sitting NEXT TO an exe (as opposed to
+/// [`read_slot_provenance`], which takes a slot's target dir and joins
+/// `debug/`). Used for the non-pool artifact, which has no slot.
+pub fn read_provenance_beside_exe(exe_path: &std::path::Path) -> Option<BuildProvenance> {
+    let sidecar = exe_path.parent()?.join(SLOT_PROVENANCE_SIDECAR_FILENAME);
+    let content = std::fs::read_to_string(&sidecar).ok()?;
+    serde_json::from_str::<BuildProvenance>(&content).ok()
+}
+
+/// Env kill-switch: treat every start as if the caller had opted into an
+/// unverified exe. Exists so a box whose build pool is empty and whose only
+/// artifact is a sidecar-less manual build can still start a runner without a
+/// supervisor rebuild — the same shape as
+/// `QONTINUI_SUPERVISOR_NO_CRASH_RESTART`. The staleness is still logged and
+/// still reported on the response; only the refusal is waived.
+pub const ALLOW_UNVERIFIED_EXE_ENV: &str = "QONTINUI_SUPERVISOR_ALLOW_UNVERIFIED_EXE";
+
+/// Is the fleet-level unverified-exe opt-in set?
+pub fn allow_unverified_exe_env() -> bool {
+    std::env::var(ALLOW_UNVERIFIED_EXE_ENV)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Verdict of [`unverified_exe_gate`] on the allow side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExeIdentityVerdict {
+    /// Positive evidence the artifact is a vouched supervisor build (or it came
+    /// from a build-pool slot, which has its own [`start_provenance_gate`]).
+    Verified,
+    /// Identity is unknown or foreign, and an explicit opt-in allowed it. The
+    /// string states the staleness and MUST be surfaced to the caller.
+    AllowedByOptIn(String),
+}
+
+/// Refuse to start a runner from an artifact that cannot be shown to be what
+/// was asked for.
+///
+/// **Scope: the non-pool (`ExeOrigin::CargoTargetDir`) artifact only.** Slot
+/// artifacts keep their existing posture ([`start_provenance_gate`]: refuse only
+/// on POSITIVE evidence of a foreign tree, warn-and-proceed on absence), because
+/// a slot exe at least came from a supervisor build and a refusal there would
+/// brick the normal path.
+///
+/// **Why absence refuses HERE and warns THERE.** The non-pool artifact is
+/// reached only when NO slot has an exe at all — an already-degenerate state —
+/// and it is the artifact nobody maintains: on the fleet box it was a 54-day-old
+/// binary that started healthy, served the UI Bridge, and made a
+/// `spawn-test {rebuild:false}` measure code from June while the caller believed
+/// it was testing a branch. Warning about that and launching it anyway is
+/// exactly the false green this gate exists to remove, so unknown reads as
+/// *refuse*, not as *fine*. The escape hatches are explicit:
+/// `allow_stale_fallback: true` per request, or the
+/// `QONTINUI_SUPERVISOR_ALLOW_UNVERIFIED_EXE=1` env kill-switch — both of which
+/// still report the staleness rather than hiding it.
+///
+/// Pure (no I/O, no state) so the decision is unit-testable.
+pub fn unverified_exe_gate(
+    allow_unverified: bool,
+    resolved: &ResolvedRunnerExe,
+) -> Result<ExeIdentityVerdict, SupervisorError> {
+    let target_dir_source = match resolved.origin {
+        // Slots and explicit pins are governed elsewhere.
+        ExeOrigin::Slot(_) | ExeOrigin::PinnedOverride => return Ok(ExeIdentityVerdict::Verified),
+        ExeOrigin::CargoTargetDir(src) => src,
+    };
+
+    // Positive evidence of a vouched supervisor build — allow.
+    if let Some(p) = &resolved.provenance {
+        if p.source.is_vouched() {
+            return Ok(ExeIdentityVerdict::Verified);
+        }
+    }
+
+    let mtime = resolved.mtime_rfc3339();
+    let detail = format!(
+        "Refusing to start a runner from {path}: the supervisor cannot show this binary is the \
+         code you asked for. Resolved outside the build pool via cargo's target-dir precedence \
+         ({target_dir_source}); mtime {mtime}; build identity {identity}. No build-pool slot has \
+         an exe, so resolution fell through to this artifact — the one nobody maintains (on \
+         2026-08-06 it was a 54-day-old binary that started healthy and served the UI Bridge \
+         while a spawn-test believed it was measuring a branch). Recovery: \
+         POST /runners/spawn-test {{\"rebuild\": true}} (or POST /runner/fix-and-rebuild) so the \
+         binary carries a provenance record. To deliberately run whatever exists, re-send with \
+         {{\"allow_stale_fallback\": true}} — the response will state the staleness — or set \
+         {env}=1 on the supervisor.",
+        path = resolved.path.display(),
+        target_dir_source = target_dir_source.label(),
+        mtime = mtime.as_deref().unwrap_or("(unreadable)"),
+        identity = resolved.identity_label(),
+        env = ALLOW_UNVERIFIED_EXE_ENV,
+    );
+
+    if allow_unverified {
+        return Ok(ExeIdentityVerdict::AllowedByOptIn(format!(
+            "Starting from UNVERIFIED runner exe {path} by explicit opt-in. Resolved via \
+             {target_dir_source}; mtime {mtime}; build identity {identity}. This binary's \
+             contents are not attributable to any commit — do NOT read a test result from it \
+             as evidence about a branch.",
+            path = resolved.path.display(),
+            target_dir_source = target_dir_source.label(),
+            mtime = mtime.as_deref().unwrap_or("(unreadable)"),
+            identity = resolved.identity_label(),
+        )));
+    }
+
+    Err(SupervisorError::UnverifiedExe(Box::new(
+        crate::error::UnverifiedExeInfo {
+            path: resolved.path.display().to_string(),
+            mtime,
+            build_sha: resolved.provenance.as_ref().and_then(|p| p.sha.clone()),
+            build_source: resolved
+                .provenance
+                .as_ref()
+                .map(|p| source_label(p.source).to_string()),
+            target_dir_source: target_dir_source.label().to_string(),
+            detail,
+        },
+    )))
+}
+
 /// Locate the most recent successfully-built runner exe across the build pool.
 ///
 /// Preference order:
 /// 1. The exe in the slot recorded as `last_successful_slot` (fresh build).
 /// 2. Any slot whose exe exists on disk (e.g. after a supervisor restart).
-/// 3. The legacy `runner_exe_path()` (default `target/debug/`) for builds
-///    that predate the build pool.
+/// 3. The non-pool cargo target dir — resolved through cargo's OWN target-dir
+///    precedence ([`crate::config::TargetDirSource`]), not a hardcoded
+///    `<workspace>/target/debug` — for builds that predate the build pool or
+///    were run by hand.
 ///
 /// After picking a slot (preference 1 or 2), this function emits a `WARN`
 /// log line when the picked slot's `.git_sha` sidecar differs from any other
@@ -832,11 +1043,11 @@ fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<Targe
 pub async fn resolve_source_exe(
     state: &SharedState,
 ) -> Result<std::path::PathBuf, SupervisorError> {
-    resolve_source_exe_with_slot(state).await.map(|(_, p)| p)
+    resolve_source_exe_detailed(state).await.map(|r| r.path)
 }
 
 /// [`resolve_source_exe`] variant that ALSO returns which build-pool slot the
-/// exe came from (`None` for the legacy `target/debug/` fallback).
+/// exe came from (`None` for the non-pool preference-3 fallback).
 ///
 /// Exists so the start-path provenance gate can be evaluated on the SAME pick
 /// the resolution deploys: the previous shape (gate runs its own
@@ -849,6 +1060,17 @@ pub async fn resolve_source_exe(
 pub async fn resolve_source_exe_with_slot(
     state: &SharedState,
 ) -> Result<(Option<usize>, std::path::PathBuf), SupervisorError> {
+    resolve_source_exe_detailed(state)
+        .await
+        .map(|r| (r.slot_id(), r.path))
+}
+
+/// Full resolution: the winning path, WHICH source produced it, its mtime and
+/// its build identity. The two thinner wrappers above delegate here so there is
+/// exactly one resolution implementation.
+pub async fn resolve_source_exe_detailed(
+    state: &SharedState,
+) -> Result<ResolvedRunnerExe, SupervisorError> {
     if let Some(picked_id) = pick_slot_for_resolution(state).await {
         let picked_path = state.config.runner_exe_path_for_slot(picked_id);
 
@@ -891,20 +1113,53 @@ pub async fn resolve_source_exe_with_slot(
                 .await;
         }
 
-        return Ok((Some(picked_id), picked_path));
+        let provenance = state
+            .build_pool
+            .slots
+            .iter()
+            .find(|s| s.id == picked_id)
+            .and_then(|s| read_slot_provenance(&s.target_dir));
+        return Ok(ResolvedRunnerExe {
+            mtime: file_mtime(&picked_path),
+            path: picked_path,
+            origin: ExeOrigin::Slot(picked_id),
+            provenance,
+            unverified_warning: None,
+        });
     }
 
-    // Preference 3: legacy path for pre-pool builds. No slot id — callers that
-    // gate on provenance treat this as the most-unknown artifact there is.
-    let legacy = state.config.runner_exe_path();
-    if legacy.exists() {
-        return Ok((None, legacy));
+    // Preference 3: the non-pool cargo target dir, resolved through cargo's own
+    // precedence ladder. No slot id — callers that gate on provenance treat
+    // this as the most-unknown artifact there is.
+    let candidates = state.config.runner_exe_candidates();
+    if let Some((src, path)) = candidates.iter().find(|(_, p)| p.exists()) {
+        return Ok(ResolvedRunnerExe {
+            mtime: file_mtime(path),
+            provenance: read_provenance_beside_exe(path),
+            path: path.clone(),
+            origin: ExeOrigin::CargoTargetDir(*src),
+            unverified_warning: None,
+        });
     }
 
+    // Name every candidate that was tried, with the precedence level that
+    // produced it: "not found at <one path>" was actively misleading once the
+    // ladder had more than one rung.
+    let tried = candidates
+        .iter()
+        .map(|(src, p)| format!("{} ({})", p.display(), src.label()))
+        .collect::<Vec<_>>()
+        .join("; ");
     Err(SupervisorError::Process(format!(
-        "Runner exe not found in any build slot or at legacy path {:?}. Run a build first.",
-        legacy
+        "Runner exe not found in any build slot, nor at any cargo target-dir candidate: {tried}. \
+         Run a build first."
     )))
+}
+
+/// mtime of a path, `None` when it can't be stat'd. Best-effort by design —
+/// an unreadable mtime is reported as unknown, never as fresh.
+fn file_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 // =============================================================================
@@ -1701,6 +1956,14 @@ async fn start_exe_mode_for_runner(
     // resolution branch below; left `None` (honest unknown) when the artifact
     // carries no provenance record.
     let mut resolved_provenance: Option<BuildProvenance> = None;
+    // Full record of what resolution picked and why — published on the runner
+    // so every caller (spawn response, `GET /runners`) can see WHICH path won.
+    // Nothing reported the path before, which is precisely why a months-stale
+    // binary served a healthy UI Bridge for a whole test iteration unnoticed.
+    // Assigned exactly once, in whichever resolution arm wins (the remaining
+    // arm returns early), so it is deliberately left uninitialized here rather
+    // than seeded with a `None` nothing ever reads.
+    let resolved_record: Option<ResolvedRunnerExe>;
     let source_exe = {
         let override_path = managed.source_exe_override.read().await.clone();
         match override_path {
@@ -1724,6 +1987,13 @@ async fn start_exe_mode_for_runner(
                         });
                     }
                 }
+                resolved_record = Some(ResolvedRunnerExe {
+                    mtime: file_mtime(&p),
+                    path: p.clone(),
+                    origin: ExeOrigin::PinnedOverride,
+                    provenance: resolved_provenance.clone(),
+                    unverified_warning: None,
+                });
                 p
             }
             Some(p) => {
@@ -1755,20 +2025,14 @@ async fn start_exe_mode_for_runner(
                 // exactly what moves `last_successful_slot` — could deploy a
                 // slot the gate never saw.)
                 let is_temp = is_temp_runner(&managed.config.id);
-                let (picked_slot, resolved_path) = resolve_source_exe_with_slot(state).await?;
-                match picked_slot {
-                    Some(picked_id) => {
-                        let prov = state
-                            .build_pool
-                            .slots
-                            .iter()
-                            .find(|s| s.id == picked_id)
-                            .and_then(|s| read_slot_provenance(&s.target_dir));
+                let mut resolved = resolve_source_exe_detailed(state).await?;
+                match resolved.origin {
+                    ExeOrigin::Slot(picked_id) => {
                         // Same single pick the gate evaluates, so the recorded
                         // provenance always describes the exe actually deployed.
-                        resolved_provenance = prov.clone();
+                        resolved_provenance = resolved.provenance.clone();
                         if let Some(StartProvenanceWarning(msg)) =
-                            start_provenance_gate(is_temp, picked_id, prov.as_ref())?
+                            start_provenance_gate(is_temp, picked_id, resolved.provenance.as_ref())?
                         {
                             warn!("{}", msg);
                             state
@@ -1777,32 +2041,62 @@ async fn start_exe_mode_for_runner(
                                 .await;
                         }
                     }
-                    // Legacy `target/debug/` fallback — no slot, no sidecar:
-                    // the most-unknown artifact in the system. Same
-                    // unknown-provenance posture as a sidecar-less slot:
-                    // warn-and-proceed for non-temp runners, never refuse on
-                    // absence.
-                    None => {
-                        if !is_temp {
-                            let StartProvenanceWarning(msg) =
-                                legacy_exe_provenance_warning(&resolved_path);
-                            warn!("{}", msg);
-                            state
-                                .logs
-                                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-                                .await;
+                    // Non-pool artifact (preference 3) — no slot, and in
+                    // practice no provenance sidecar either: the most-unknown
+                    // binary in the system. Unknown here reads as REFUSE, not
+                    // as "fine": this is the artifact that spawned a 54-day-old
+                    // runner which came up healthy and made a whole
+                    // `spawn-test {rebuild:false}` iteration measure the wrong
+                    // code. Two explicit opt-ins keep the "whatever exists"
+                    // case available, and both state the staleness.
+                    ExeOrigin::CargoTargetDir(_) => {
+                        let allow = *managed.allow_unverified_exe.read().await
+                            || allow_unverified_exe_env();
+                        match unverified_exe_gate(allow, &resolved)? {
+                            ExeIdentityVerdict::Verified => {
+                                resolved_provenance = resolved.provenance.clone();
+                            }
+                            ExeIdentityVerdict::AllowedByOptIn(msg) => {
+                                warn!("{}", msg);
+                                state
+                                    .logs
+                                    .emit(LogSource::Supervisor, LogLevel::Warn, msg.clone())
+                                    .await;
+                                resolved.unverified_warning = Some(msg);
+                                resolved_provenance = resolved.provenance.clone();
+                            }
                         }
                     }
+                    // `resolve_source_exe_detailed` never yields a pinned
+                    // override — that arm is handled above, from the per-runner
+                    // `source_exe_override`.
+                    ExeOrigin::PinnedOverride => {}
                 }
-                resolved_path
+                let path = resolved.path.clone();
+                resolved_record = Some(resolved);
+                path
             }
         }
     };
+    // Say which path won, every time. The stale-spawn incident survived a full
+    // manual-test iteration because no log line and no response field named the
+    // binary's directory.
+    if let Some(record) = &resolved_record {
+        info!(
+            "Runner '{}' source exe resolved: {} (origin {}, mtime {}, identity {})",
+            managed.config.name,
+            record.path.display(),
+            record.origin.label(),
+            record.mtime_rfc3339().as_deref().unwrap_or("(unreadable)"),
+            record.identity_label(),
+        );
+    }
     // Publish before the (fallible) copy+spawn below: the provenance describes
     // the artifact we RESOLVED, which is a fact regardless of whether the
     // subsequent copy or process start succeeds — and a failed start is exactly
     // when an operator most wants to know which binary was about to run.
     *managed.build_provenance.write().await = resolved_provenance;
+    *managed.resolved_exe.write().await = resolved_record;
 
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.
@@ -4987,23 +5281,149 @@ mod tests {
         assert_eq!(temp.expect("temp start must be allowed"), None);
     }
 
-    /// The legacy-exe warning is the unknown-provenance posture applied to the
-    /// pool-less fallback path: names the exe, says UNKNOWN, names the
-    /// recovery. Pinning the load-bearing fragments keeps the start-path log
-    /// greppable.
+    // =========================================================================
+    // unverified_exe_gate — "refuse stale" on the non-pool artifact
+    // =========================================================================
+
+    fn resolved(
+        origin: ExeOrigin,
+        provenance: Option<BuildProvenance>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> ResolvedRunnerExe {
+        ResolvedRunnerExe {
+            path: std::path::PathBuf::from("/ws/qontinui-runner/target/debug/q.exe"),
+            origin,
+            mtime,
+            provenance,
+            unverified_warning: None,
+        }
+    }
+
+    fn prov(source: BuildSource) -> BuildProvenance {
+        BuildProvenance {
+            sha: Some("a".repeat(40)),
+            source,
+            built_from: "/ws/qontinui-runner".to_string(),
+            built_at: "2026-08-06T02:54:00Z".to_string(),
+        }
+    }
+
+    /// The defect itself: a non-pool artifact with NO build identity must be
+    /// refused, not launched — and the refusal must name the path, the mtime
+    /// and the (absent) identity so the operator can see what was rejected.
     #[test]
-    fn legacy_exe_warning_names_exe_and_recovery() {
-        let StartProvenanceWarning(msg) =
-            legacy_exe_provenance_warning(std::path::Path::new("/ws/target/debug/q.exe"));
-        assert!(msg.contains("q.exe"), "must name the exe: {msg}");
-        assert!(
-            msg.contains("UNKNOWN provenance"),
-            "must say unknown: {msg}"
+    fn unverified_exe_gate_refuses_an_identity_less_non_pool_exe() {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000);
+        let r = resolved(
+            ExeOrigin::CargoTargetDir(TargetDirSource::WorkspaceDefault),
+            None,
+            Some(mtime),
         );
-        assert!(
-            msg.contains("/runner/fix-and-rebuild"),
-            "must name the recovery: {msg}"
+        let err = unverified_exe_gate(false, &r).expect_err("unknown identity must refuse");
+        match &err {
+            SupervisorError::UnverifiedExe(info) => {
+                let crate::error::UnverifiedExeInfo {
+                    path,
+                    mtime,
+                    build_sha,
+                    build_source,
+                    target_dir_source,
+                    detail,
+                } = info.as_ref();
+                assert!(path.contains("q.exe"), "names the path: {path}");
+                assert!(mtime.is_some(), "carries the mtime");
+                assert_eq!(*build_sha, None);
+                assert_eq!(*build_source, None);
+                assert_eq!(target_dir_source, "workspace_default");
+                assert!(detail.contains("ABSENT"), "identity reads absent: {detail}");
+                assert!(
+                    detail.contains("allow_stale_fallback"),
+                    "names the opt-in: {detail}"
+                );
+            }
+            other => panic!("expected UnverifiedExe, got {other:?}"),
+        }
+        // 409, not 500: the request is fine, the on-disk state is not.
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body["error"], "unverified_runner_exe");
+    }
+
+    /// Absence is refused; so is POSITIVE evidence of a foreign tree. Only a
+    /// vouched build passes silently.
+    #[test]
+    fn unverified_exe_gate_refuses_an_override_built_non_pool_exe() {
+        let r = resolved(
+            ExeOrigin::CargoTargetDir(TargetDirSource::CargoTargetDirEnv),
+            Some(prov(BuildSource::Override)),
+            None,
         );
+        let err = unverified_exe_gate(false, &r).expect_err("override identity must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("override"), "names the foreign source: {msg}");
+    }
+
+    #[test]
+    fn unverified_exe_gate_allows_a_vouched_non_pool_exe() {
+        for source in [BuildSource::LiveTree, BuildSource::OriginMain] {
+            let r = resolved(
+                ExeOrigin::CargoTargetDir(TargetDirSource::CargoTargetDirEnv),
+                Some(prov(source)),
+                None,
+            );
+            assert_eq!(
+                unverified_exe_gate(false, &r).expect("vouched identity must pass"),
+                ExeIdentityVerdict::Verified,
+                "{source:?} is a vouched supervisor build"
+            );
+        }
+    }
+
+    /// The opt-in does not go quiet — it STATES the staleness, so a caller that
+    /// deliberately asked for "whatever exists" still cannot mistake the result
+    /// for evidence about a branch.
+    #[test]
+    fn unverified_exe_gate_opt_in_allows_but_states_the_staleness() {
+        let r = resolved(
+            ExeOrigin::CargoTargetDir(TargetDirSource::WorkspaceDefault),
+            None,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000)),
+        );
+        match unverified_exe_gate(true, &r).expect("opt-in must allow") {
+            ExeIdentityVerdict::AllowedByOptIn(msg) => {
+                assert!(msg.contains("UNVERIFIED"), "states it is unverified: {msg}");
+                assert!(msg.contains("q.exe"), "names the path: {msg}");
+                assert!(
+                    msg.contains("workspace_default"),
+                    "names which path won: {msg}"
+                );
+            }
+            other => panic!("expected AllowedByOptIn, got {other:?}"),
+        }
+    }
+
+    /// Slot artifacts keep their existing posture — this gate must not
+    /// second-guess `start_provenance_gate` and brick the normal path.
+    #[test]
+    fn unverified_exe_gate_never_touches_slot_or_pinned_artifacts() {
+        for origin in [ExeOrigin::Slot(1), ExeOrigin::PinnedOverride] {
+            let r = resolved(origin, None, None);
+            assert_eq!(
+                unverified_exe_gate(false, &r).expect("must not refuse"),
+                ExeIdentityVerdict::Verified,
+                "{origin:?} is governed elsewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn exe_origin_labels_name_which_path_won() {
+        assert_eq!(ExeOrigin::Slot(2).label(), "slot-2");
+        assert_eq!(
+            ExeOrigin::CargoTargetDir(TargetDirSource::CargoTargetDirEnv).label(),
+            "cargo_target_dir:cargo_target_dir_env"
+        );
+        assert_eq!(ExeOrigin::PinnedOverride.label(), "pinned_override");
     }
 
     // =========================================================================
