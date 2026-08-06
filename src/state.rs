@@ -1202,16 +1202,17 @@ impl SupervisorState {
     pub async fn refresh_footprint(
         self: &std::sync::Arc<Self>,
     ) -> crate::footprint::FootprintSnapshot {
-        // Sample pool occupancy BEFORE the (slow) walk so the two halves of the
-        // snapshot describe roughly the same instant; the walk itself cannot
-        // read it, being sync + `spawn_blocking`-hosted.
-        let occupancy = self.build_pool.occupancy().await;
         let this = self.clone();
-        let snapshot = tokio::task::spawn_blocking(move || {
-            crate::footprint::compute_snapshot(&this.config, occupancy)
-        })
-        .await
-        .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config, occupancy));
+        let mut snapshot =
+            tokio::task::spawn_blocking(move || crate::footprint::compute_snapshot(&this.config))
+                .await
+                .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
+        // Occupancy is read AFTER the walk, deliberately. The walk is
+        // minutes-slow on real trees, and `computed_at` is stamped at its end —
+        // a slot count taken before it would ship under a timestamp minutes
+        // newer than itself, advertising slots that filled while it ran. It is
+        // a cheap async read, so taking it here costs nothing.
+        snapshot.build_pool = self.build_pool.occupancy().await;
         *self.footprint.write().await = Some(snapshot.clone());
         snapshot
     }

@@ -65,6 +65,12 @@ static WARNED_ONCE: AtomicBool = AtomicBool::new(false);
 /// serializes — a rename cannot make the two surfaces disagree.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceSamplePayload {
+    /// When the underlying snapshot was taken (its `computed_at`), NOT when
+    /// coord received it. The snapshot is refreshed on a slow timer, so a
+    /// consumer that aged the row by ingest time would treat a 15-minute-old
+    /// reading as current — and §C3 requires a stale sample to render as stale
+    /// rather than as its last value.
+    pub sampled_at: String,
     /// `'host'` from the supervisor. Mandatory and load-bearing: host and WSL
     /// measure different (coupled) pools and must never be summed.
     pub lane: &'static str,
@@ -117,6 +123,7 @@ pub fn payload_from_snapshot(
     cpu_cores: u32,
 ) -> ResourceSamplePayload {
     ResourceSamplePayload {
+        sampled_at: snapshot.computed_at.clone(),
         lane: LANE,
         lane_instance: None,
         cpu_cores: Some(cpu_cores),
@@ -170,39 +177,106 @@ fn note_failure(reason: &str) {
     }
 }
 
+/// Everything the POST needs that comes from the filesystem, resolved in one
+/// blocking hop.
+struct PublishTarget {
+    device_id: String,
+    url: String,
+    /// `Some` only when a credential exists AND the transport is safe to carry
+    /// it on — see [`bearer_for`].
+    bearer: Option<String>,
+    cpu_cores: u32,
+}
+
+/// A bearer to send to `base`, or `None`.
+///
+/// This is the supervisor's FIRST outbound credential (the sibling budget POST
+/// sends none), and [`crate::fleet::coord_http_base`] maps `ws://` to plain
+/// `http://` — so a profile pointing at a non-loopback `ws://` host would put a
+/// device JWT on the wire in cleartext. Attach it only over `https://` or to a
+/// loopback host; everything else publishes unauthenticated and lets coord
+/// decide, which degrades exactly like any other non-2xx.
+fn bearer_for(base: &str) -> Option<String> {
+    let host_is_loopback = base
+        .split("://")
+        .nth(1)
+        .map(|rest| rest.split('/').next().unwrap_or(rest))
+        .map(|hostport| hostport.split(':').next().unwrap_or(hostport))
+        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
+        .unwrap_or(false);
+    if base.starts_with("https://") || host_is_loopback {
+        device_bearer()
+    } else {
+        None
+    }
+}
+
+/// Resolve machine identity, coord URL, credential and CPU count.
+///
+/// Every step here touches the filesystem (`machine.json`, `profiles.json`, the
+/// device-JWT file), so it runs inside `spawn_blocking` — a stalled volume must
+/// not park a tokio worker, and the surrounding code already knows this (the
+/// footprint walk is `spawn_blocking`-hosted for the same reason).
+///
+/// `Err` carries a ready-to-log reason.
+fn resolve_target() -> Result<PublishTarget, String> {
+    let machine = crate::fleet::load_machine_file().ok_or_else(|| {
+        "~/.qontinui/machine.json missing — run `qontinui_profile machine init` on this host"
+            .to_string()
+    })?;
+    let raw = machine
+        .device_id()
+        .ok_or_else(|| "machine.json has neither device_id nor machine_id".to_string())?;
+    // Validate as a UUID exactly as `fleet::publish_budget` does. Pasting an
+    // unvalidated string into the URL path would silently produce a different
+    // (or invalid) request and take this host off fleet telemetry with no
+    // diagnosable cause.
+    let device_id = uuid::Uuid::parse_str(raw.trim())
+        .map_err(|e| format!("machine.json device_id is not a UUID ({e})"))?
+        .to_string();
+    let base = crate::fleet::coord_http_base().ok_or_else(|| {
+        "~/.qontinui/profiles.json missing or its active profile has no coord_url".to_string()
+    })?;
+    let bearer = bearer_for(&base);
+    // Same probe `fleet::detect_resources` uses for `cpu_cores`, without its
+    // disk enumeration + memory refresh — this module must not re-sample what
+    // the footprint snapshot already carries.
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .max(1);
+    Ok(PublishTarget {
+        url: format!("{base}/coord/devices/{device_id}/resource-sample"),
+        device_id,
+        bearer,
+        cpu_cores,
+    })
+}
+
 /// Best-effort publish of one `lane='host'`, `source='supervisor'` sample.
 ///
 /// Never returns an error and never panics: the caller is the footprint timer,
 /// and telemetry must not be able to disturb builds.
 pub async fn publish(snapshot: &FootprintSnapshot) {
-    let machine = match crate::fleet::load_machine_file() {
-        Some(m) => m,
-        None => {
-            note_failure(
-                "~/.qontinui/machine.json missing — run `qontinui_profile machine init` on this host",
-            );
+    let target = match tokio::task::spawn_blocking(resolve_target).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(reason)) => {
+            note_failure(&reason);
+            return;
+        }
+        Err(e) => {
+            note_failure(&format!("identity resolution task failed: {e}"));
             return;
         }
     };
-    let device_id = match machine.device_id() {
-        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        _ => {
-            note_failure("machine.json has neither device_id nor machine_id");
-            return;
-        }
-    };
-    let base = match crate::fleet::coord_http_base() {
-        Some(b) => b,
-        None => {
-            note_failure(
-                "~/.qontinui/profiles.json missing or its active profile has no coord_url",
-            );
-            return;
-        }
-    };
+    let PublishTarget {
+        device_id,
+        url,
+        bearer,
+        cpu_cores,
+    } = target;
 
-    let payload = payload_from_snapshot(snapshot, crate::fleet::detect_resources().cpu_cores);
-    let url = format!("{base}/coord/devices/{device_id}/resource-sample");
+    let payload = payload_from_snapshot(snapshot, cpu_cores);
 
     let client = match reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
         Ok(c) => c,
@@ -212,11 +286,18 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
         }
     };
     let mut req = client.post(&url).json(&payload);
-    if let Some(token) = device_bearer() {
+    if let Some(token) = bearer {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
+            // Re-arm the warn-once latch: "once" must mean once per failure
+            // EPISODE, not once per process. Otherwise the expected 404 at boot
+            // (before the coord ingest route lands) consumes the only WARN this
+            // module will ever emit, and a later real failure — an expired JWT,
+            // a coord outage — takes this machine off the fleet dashboard in
+            // total silence.
+            WARNED_ONCE.store(false, Ordering::Relaxed);
             debug!(
                 "resource_sample: published lane={LANE} device_id={device_id} \
                  (commit_free={:?} swap_used={:?} slots_busy={:?})",
@@ -227,9 +308,13 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
         }
         Ok(resp) => {
             let status = resp.status();
+            // Coord's own error text is the thing you most want on a real
+            // failure; bound it so a stray HTML page can't fill the log.
+            let mut body = resp.text().await.unwrap_or_default();
+            body.truncate(500);
             note_failure(&format!(
-                "coord returned {status} for POST /coord/devices/{device_id}/resource-sample \
-                 (a 404 is expected until the coord ingest route lands)"
+                "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: \
+                 {body} (a 404 is expected until the coord ingest route lands)"
             ));
         }
         Err(e) => note_failure(&format!("POST {url}: {e}")),
@@ -292,6 +377,7 @@ mod tests {
     fn payload_serializes_every_a1_column_name() {
         let v = serde_json::to_value(payload_from_snapshot(&snapshot_fixture(), 8)).unwrap();
         for key in [
+            "sampled_at",
             "lane",
             "lane_instance",
             "cpu_cores",
