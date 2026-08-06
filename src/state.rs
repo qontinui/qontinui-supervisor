@@ -400,6 +400,49 @@ pub struct SupervisorState {
     /// `None` until the first refresh completes. Each snapshot carries its own
     /// `computed_at` so readers can judge staleness.
     pub footprint: RwLock<Option<crate::footprint::FootprintSnapshot>>,
+    /// Cached expensive derivations for `GET /builds` — see [`BuildsMeta`].
+    /// `None` until the first refresh completes.
+    pub builds_meta: RwLock<Option<BuildsMeta>>,
+    /// Dedup latch so at most one background `GET /builds` meta refresh is in
+    /// flight; a burst of pollers must not fan out into a burst of `git fetch`.
+    pub builds_meta_refreshing: AtomicBool,
+}
+
+/// How long a [`BuildsMeta`] snapshot is served before a background refresh is
+/// triggered. Generous on purpose: every field in it changes only when a build
+/// finishes or someone pushes to `origin/main`, while `GET /builds` is polled
+/// every few seconds by agents watching a build.
+pub const BUILDS_META_TTL_SECS: i64 = 120;
+
+/// The parts of `GET /builds` that are expensive to compute, cached off the
+/// hot path.
+///
+/// `origin_main_drift` runs `git fetch origin` plus three more git
+/// subprocesses; on a box carrying several concurrent cargo builds that took
+/// more than 25s against a 30s git timeout — so `GET /builds` (the endpoint an
+/// agent polls to watch a build progress) became unusable exactly while a
+/// build was running, which is the only time anyone polls it (2026-08-03).
+/// Slot freshness additionally stats every slot's sidecar + exe.
+///
+/// The response now serves this snapshot and NEVER waits on git: a stale or
+/// absent snapshot is served as-is (with `meta_computed_at` / `meta_stale` so
+/// the reader can see it), and the refresh happens in a detached task.
+#[derive(Clone)]
+pub struct BuildsMeta {
+    /// When this snapshot was computed.
+    pub computed_at: DateTime<Utc>,
+    /// Cross-slot provenance/drift snapshot.
+    pub freshness: Arc<crate::process::manager::SlotFreshness>,
+    /// Pre-rendered `origin_main_drift` JSON (`None` = up-to-date / not
+    /// computable), exactly as the endpoint surfaces it.
+    pub origin_main_drift: Option<serde_json::Value>,
+}
+
+impl BuildsMeta {
+    /// Is this snapshot older than the TTL?
+    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+        (now - self.computed_at).num_seconds() >= BUILDS_META_TTL_SECS
+    }
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -1143,7 +1186,80 @@ impl SupervisorState {
             active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
             spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             footprint: RwLock::new(None),
+            builds_meta: RwLock::new(None),
+            builds_meta_refreshing: AtomicBool::new(false),
         }
+    }
+
+    /// Non-blocking read of the cached `GET /builds` meta snapshot.
+    ///
+    /// `try_read` only: the endpoint must never park behind a writer. A missed
+    /// read reports `None`, which the endpoint renders as "not computed yet"
+    /// rather than blocking.
+    pub fn builds_meta_cached(&self) -> Option<BuildsMeta> {
+        self.builds_meta.try_read().ok().and_then(|g| g.clone())
+    }
+
+    /// Kick off a detached refresh of the `GET /builds` meta snapshot unless
+    /// one is already in flight. Returns immediately — the caller never waits
+    /// on git.
+    pub fn spawn_builds_meta_refresh(self: &std::sync::Arc<Self>) {
+        if self
+            .builds_meta_refreshing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return; // already refreshing
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.refresh_builds_meta().await;
+            this.builds_meta_refreshing.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Recompute the `GET /builds` meta snapshot (slot freshness + LKG
+    /// origin/main drift) and publish it. Slow — runs git subprocesses — so it
+    /// belongs on a background task, never inside a request.
+    pub async fn refresh_builds_meta(self: &std::sync::Arc<Self>) -> BuildsMeta {
+        let freshness = Arc::new(crate::process::manager::compute_slot_freshness(self).await);
+
+        let lkg_sha: Option<String> = self
+            .build_pool
+            .last_known_good
+            .read()
+            .await
+            .as_ref()
+            .and_then(|info| info.sha.clone());
+        let origin_main_drift = match (&lkg_sha, self.config.project_dir.parent()) {
+            (Some(sha), Some(repo_root)) => {
+                let drift = crate::git_provenance::origin_main_drift(repo_root, sha).await;
+                // Null when up-to-date or not computable; surface only real
+                // drift, matching the null-when-fine convention of the
+                // `*_warning` siblings.
+                if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
+                    None
+                } else {
+                    Some(serde_json::json!({
+                        "built_sha": drift.built_sha,
+                        "origin_main_sha": drift.origin_main_sha,
+                        "behind_count": drift.behind_count,
+                        "is_ancestor": drift.is_ancestor,
+                        "diverged": drift.is_diverged(),
+                        "fetched": drift.fetched,
+                    }))
+                }
+            }
+            _ => None,
+        };
+
+        let meta = BuildsMeta {
+            computed_at: Utc::now(),
+            freshness,
+            origin_main_drift,
+        };
+        *self.builds_meta.write().await = Some(meta.clone());
+        meta
     }
 
     /// Recompute the build-artifact footprint snapshot and store it on
