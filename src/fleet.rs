@@ -142,7 +142,7 @@ pub struct MachineFile {
     device_id: Option<String>,
     #[serde(default)]
     machine_id: Option<String>,
-    pub hostname: String,
+    hostname: String,
 }
 
 impl MachineFile {

@@ -58,12 +58,22 @@ pub struct ExeCopiesFootprint {
 /// healthy. Publishing both, named for what they are, is what makes a lane's
 /// drift onto a different quantity visible instead of silent.
 ///
-/// **Swap is not an afterthought.** Under saturation `mem_available_bytes` is
-/// pinned by the kernel reserve and reads as an all-clear (measured on this
-/// fleet at −13.5 ± 11.2 M/day, indistinguishable from zero) while `swap_used`
-/// moves (+138.6 ± 41.7 M/day). Any consumer ranking or alerting on this
-/// snapshot must lead on `swap_used_bytes / swap_total_bytes`, not on
-/// `mem_available_bytes`.
+/// **Swap, and what it means per lane.** On a saturated *Linux/WSL* box
+/// `mem_available` is pinned by the kernel reserve and reads as an all-clear
+/// (measured on this fleet at −13.5 ± 11.2 M/day, indistinguishable from zero)
+/// while `swap_used` moves (+138.6 ± 41.7 M/day) — which is why a consumer must
+/// lead on swap there rather than on mem-available.
+///
+/// That guidance does NOT transfer verbatim to the Windows **host** lane this
+/// module publishes. sysinfo derives Windows swap from the commit counters
+/// (`swap_total = CommitLimit − PhysicalTotal`,
+/// `swap_used = CommitTotal − PhysicalTotal`, both saturating), so on this lane
+/// `swap_total − swap_used` is *identical* to `commit_available_bytes` in the
+/// same row, and `swap_used` pins to 0 whenever commit charge sits below
+/// physical RAM. A ranker that leads on swap here is double-weighting a
+/// quantity it already reads. The fields are still published — they are the §A1
+/// columns and they are the right signal on the WSL/Linux lane — but the
+/// commit pair is the honest saturation signal for `lane='host'`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct MemorySnapshot {
     pub mem_total_bytes: Option<u64>,
@@ -125,17 +135,19 @@ pub struct FootprintSnapshot {
 /// can never measure different things. Physical memory and swap come from
 /// sysinfo's single refreshed `System`.
 ///
-/// A zero `mem_total_bytes` / `mem_available_bytes` is reported as `None`: a
-/// box with no memory is not a state that exists, so zero there means the probe
-/// failed. Swap keeps a genuine `Some(0)` — "no swap configured" is real, and
-/// collapsing it to unknown would hide the one metric that moves under
-/// saturation.
+/// A zero `mem_total_bytes` is reported as `None`: a box with no memory is not
+/// a state that exists, so zero there means the probe failed. **Every other
+/// field keeps a genuine `Some(0)`** — a zero `mem_available` or
+/// `commit_available` is the extreme-pressure reading this telemetry exists to
+/// catch, and mapping it to UNKNOWN would erase the signal at exactly the
+/// moment it matters (the mirror image of the false-safe this plan is fixing).
+/// Likewise `Some(0)` swap means "no swap configured", which is real.
 pub fn memory_snapshot() -> MemorySnapshot {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     MemorySnapshot {
         mem_total_bytes: Some(sys.total_memory()).filter(|b| *b > 0),
-        mem_available_bytes: Some(sys.available_memory()).filter(|b| *b > 0),
+        mem_available_bytes: Some(sys.available_memory()),
         commit_total_bytes: crate::build_monitor::total_commit_bytes(),
         commit_available_bytes: crate::build_monitor::available_commit_bytes(),
         swap_total_bytes: Some(sys.total_swap()),
@@ -329,15 +341,14 @@ fn spawn_containers_footprint(workspace_root: &Path) -> SpawnContainersFootprint
 /// poisons the whole snapshot. Slow (walks GB-scale trees) — callers run it
 /// off a timer or inside `spawn_blocking`, never inline on a hot path.
 ///
-/// `build_pool` is passed in rather than read here: occupancy lives behind the
-/// async locks on [`crate::state::BuildPool`] and this function is sync +
-/// `spawn_blocking`-hosted. [`crate::state::SupervisorState::refresh_footprint`]
-/// samples it immediately before the walk. [`BuildPoolOccupancy::default`]
-/// (all-`None`) is the honest value when a caller has no pool to report.
-pub fn compute_snapshot(
-    config: &SupervisorConfig,
-    build_pool: BuildPoolOccupancy,
-) -> FootprintSnapshot {
+/// Leaves `build_pool` UNKNOWN (all-`None`).
+/// [`crate::state::SupervisorState::refresh_footprint`] fills it in **after**
+/// this returns: occupancy lives behind async locks (this function is sync +
+/// `spawn_blocking`-hosted), and reading it *before* a minutes-long walk would
+/// stamp `computed_at` on a slot count from minutes earlier — advertising slots
+/// that filled while the walk ran, which is exactly the confidently-wrong
+/// number this telemetry exists to remove.
+pub fn compute_snapshot(config: &SupervisorConfig) -> FootprintSnapshot {
     let npm_dir = config.runner_npm_dir();
     let pool_root = npm_dir.join("target-pool");
 
@@ -376,7 +387,7 @@ pub fn compute_snapshot(
         disk_total_bytes: disk.as_ref().map(|d| d.total_bytes),
         disk_mount: disk.map(|d| d.mount),
         memory: memory_snapshot(),
-        build_pool,
+        build_pool: BuildPoolOccupancy::default(),
         slots,
         lkg_bytes,
         spawn_containers,

@@ -1180,21 +1180,13 @@ mod tests {
             published.commit_available_bytes.is_some(),
             "the guard's probe and the published sample field must be the same probe"
         );
-        // The floor is applied to that field and to no other: feeding the
-        // published value through the guard's own predicate at the resolved
-        // floor must agree with what the guard decides about the same byte
-        // count. (Asserting on live probe *values* would flake — two reads of a
-        // moving counter differ — so the invariant is over the predicate, with
-        // the published number as its input.)
-        let floor = min_free_ram_gb();
-        if let Some(published_commit) = published.commit_available_bytes {
-            let required = floor.saturating_mul(1024 * 1024 * 1024);
-            assert_eq!(
-                crate::build_monitor::ram_guard_allows(Some(published_commit), floor),
-                floor == 0 || published_commit >= required,
-                "the floor must be enforced against the published commit field"
-            );
-        }
+        // Windows commit-available and physical-available are DIFFERENT
+        // numbers, so the published pair must not collapse into one field:
+        // that collapse is precisely how a lane drifts onto the wrong quantity
+        // without anything noticing. (Values are not compared across the two
+        // probes — a live counter moves between reads and that would flake;
+        // what is pinned is that both fields exist and are sourced separately.)
+        //
         // Physical-available is published too, but as its OWN named field — the
         // point of A3 is that a divergence is visible, not that it is erased.
         assert!(

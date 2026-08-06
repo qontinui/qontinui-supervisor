@@ -709,10 +709,14 @@ adds, alongside the existing artifact sizes:
   `total_commit_bytes`), i.e. the same `ullAvailPageFile` number
   `cargo-guard.sh` reads. Published under its own name so a lane that drifts
   onto physical-available becomes *visible* rather than silently disagreeing.
-- `swap_total_bytes` / `swap_used_bytes` — **lead on these, not on
-  `mem_available_bytes`.** Under saturation mem-available is pinned by the
-  kernel reserve and reads as an all-clear (measured on this fleet at
-  −13.5 ± 11.2 M/day) while swap moves (+138.6 ± 41.7 M/day).
+- `swap_total_bytes` / `swap_used_bytes` — the saturation signal **on the
+  Linux/WSL lane**, where mem-available is pinned by the kernel reserve and
+  reads as an all-clear (measured on this fleet at −13.5 ± 11.2 M/day) while
+  swap moves (+138.6 ± 41.7 M/day). On the Windows **host** lane this publisher
+  emits, sysinfo derives swap from the commit counters, so
+  `swap_total − swap_used` is identical to `commit_available_bytes` in the same
+  row — there, the commit pair is the honest signal and leading on swap would
+  double-weight it.
 - `disk_total_bytes` / `disk_mount` next to the existing `disk_free_bytes`, so a
   free-byte figure is readable against its own capacity and attributable to a
   volume.
