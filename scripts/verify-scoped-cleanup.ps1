@@ -1295,9 +1295,18 @@ function Stop-SpawnedRunners {
         if ($script:PreExistingTempRunners -contains $id) { continue }
         Write-Step "teardown: stopping temp runner $id"
         try {
-            Invoke-RestMethod -Method Post -Uri "$base/runners/$id/stop" -TimeoutSec 60 | Out-Null
+            # -ContentType + a body are REQUIRED: the stop route rejects a
+            # bodyless POST with 415 Unsupported Media Type, so without these
+            # the teardown fails and LEAKS the temp runner it just spawned.
+            # Found on the harness's first live run (2026-08-09), which
+            # otherwise passed all 9 assertions -- the leak is silent from the
+            # assertions' point of view because teardown runs after them and
+            # only warns.
+            Invoke-RestMethod -Method Post -Uri "$base/runners/$id/stop" `
+                -ContentType 'application/json' -Body '{}' -TimeoutSec 60 | Out-Null
         } catch {
             Write-Warn "could not stop temp runner $id : $($_.Exception.Message)"
+            Write-Warn "  ^ this LEAKS a temp runner - stop it by hand: POST $base/runners/$id/stop -H 'Content-Type: application/json' -d '{}'"
         }
     }
 }
