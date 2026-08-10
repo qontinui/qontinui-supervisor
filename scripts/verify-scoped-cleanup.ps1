@@ -251,8 +251,12 @@
     contended dir.
 
 .PARAMETER PoolSize
-    Override the discovered pool size. Normally read from `GET /builds` ->
-    `pool_size`, then the QONTINUI_SUPERVISOR_BUILD_POOL_SIZE env var, then 3.
+    Declare the build pool size. Normally read from `GET /builds` ->
+    `pool_size`, else the QONTINUI_SUPERVISOR_BUILD_POOL_SIZE env var. There is
+    NO default: if neither answers, the script ABORTS rather than assuming one.
+    Pool size decides how many slot territories get a probe, and a guess that
+    is too low makes assertion V2-3 (no cross-slot kills) pass while leaving a
+    real slot unchecked. This parameter is the declared-intent escape hatch.
 
 .PARAMETER SkipV1
     Skip the foreign-build-survives half. Use to re-run V2 alone after a
@@ -1467,14 +1471,33 @@ if (-not $PSBoundParameters.ContainsKey('RunnerRepo')) {
 $RunnerRepo       = ConvertTo-RootedPath -Path $RunnerRepo -Label 'runner repo'
 $ForeignTargetDir = ConvertTo-RootedPath -Path $ForeignTargetDir -Label '-ForeignTargetDir'
 
+# Pool size MUST come from an authoritative source. `$poolSource` carries the
+# provenance so the run log says on its face where the number came from, and so
+# the no-source case can fail instead of guessing.
+$poolSource = if ($PoolSize -gt 0) { "-PoolSize $PoolSize (explicit)" } else { $null }
+
 if ($PoolSize -le 0) {
-    try {
-        $builds = Invoke-RestMethod -Method Get -Uri "$base/builds" -TimeoutSec 10
-        if ($builds.PSObject.Properties.Name -contains 'pool_size') {
-            $PoolSize = [int]$builds.pool_size
+    # RETRY before concluding unknown. `GET /builds` is intermittent on this
+    # fleet -- observed both timing out and answering within the same minute --
+    # and the silent-empty rule says to rerun with errors visible rather than
+    # trust the first miss. Three bounded attempts distinguishes a flake from a
+    # genuinely unavailable route; only the latter should stop the run.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $builds = Invoke-RestMethod -Method Get -Uri "$base/builds" -TimeoutSec 20
+            if ($builds.PSObject.Properties.Name -contains 'pool_size') {
+                $PoolSize = [int]$builds.pool_size
+                $poolSource = "GET /builds -> pool_size (attempt $attempt)"
+                break
+            }
+            # A 200 that omits the field is a CONTRACT miss, not a flake -- do
+            # not spend two more attempts on a route that answered clearly.
+            Write-Warn "GET $base/builds returned no 'pool_size' property"
+            break
+        } catch {
+            Write-Warn "GET $base/builds attempt $attempt/3 failed: $($_.Exception.Message)"
+            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
         }
-    } catch {
-        Write-Warn "GET $base/builds failed: $($_.Exception.Message)"
     }
 }
 if ($PoolSize -le 0) {
@@ -1488,10 +1511,39 @@ if ($PoolSize -le 0) {
             exit 1
         }
         $PoolSize = $parsedPool
+        $poolSource = 'QONTINUI_SUPERVISOR_BUILD_POOL_SIZE (env)'
     }
 }
-if ($PoolSize -le 0) { $PoolSize = 3 }
-Write-Step "pool size = $PoolSize"
+if ($PoolSize -le 0 -or -not $poolSource) {
+    # NO SILENT DEFAULT. This used to fall back to `$PoolSize = 3` on a WARN,
+    # which is a guess wearing the costume of a discovered value -- fleet policy
+    # `verification-and-evidence` / `unknown-must-not-render-as-a-default`: "a
+    # read that cannot support its answer must render UNKNOWN, not a
+    # confident-looking value", and the consumer "takes the CONSERVATIVE arm".
+    #
+    # Guessing LOW is not merely unhelpful here, it manufactures a FALSE PASS on
+    # a safety assertion. Pool size decides how many slot territories get a
+    # probe. Guess 3 against a real pool of 4 and V2-3 ("orphans in the OTHER
+    # pool slots are still ALIVE") checks two siblings instead of three -- so a
+    # wrongful kill in the unprobed slot goes unseen and the run reports PASS.
+    # The assertion whose whole job is to detect a cross-slot kill is exactly
+    # the one the guess blinds.
+    #
+    # Aborting is safe because the operator already has a documented override:
+    # -PoolSize is a first-class parameter, so this is a fix-or-declare prompt,
+    # not a dead end.
+    Write-Fail @"
+could not establish the build pool size from any authoritative source.
+  tried: GET $base/builds -> pool_size   x3 (see the warnings above for why it did not answer)
+         QONTINUI_SUPERVISOR_BUILD_POOL_SIZE  (unset or zero)
+  This script will NOT assume a pool size. It decides how many slot
+  territories get a probe, and guessing too low makes assertion V2-3
+  (no cross-slot kills) pass while leaving a real slot unchecked.
+  Fix the supervisor's /builds route, or declare it: -PoolSize <n>
+"@
+    exit 1
+}
+Write-Step "pool size = $PoolSize (source: $poolSource)"
 
 $slotDirs = Get-SlotTargetDirs -RunnerRepoRoot $RunnerRepo -Size $PoolSize
 
