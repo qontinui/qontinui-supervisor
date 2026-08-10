@@ -65,7 +65,9 @@ $functionsToExtract = @(
     'Test-ProbeIdentity',
     'Test-ProbeAlive',
     'Start-Probe',
-    'Get-TempRunnerIds'
+    'Get-TempRunnerIds',
+    'Resolve-RunnerRepo',
+    'Resolve-PoolSize'
 )
 foreach ($name in $functionsToExtract) {
     $funcAst = $ast.FindAll(
@@ -928,5 +930,235 @@ Describe 'teardown leak visibility (source - Stop-AllProbes is never run)' {
     It 'warns about them rather than dropping them silently' {
         ($src -like '*$unverified.Count -gt 0*') | Should Be $true
         ($src -like '*teardown LEFT*') | Should Be $true
+    }
+}
+
+Describe 'Resolve-PoolSize - the pool size is never guessed' {
+
+    # WHY THIS BLOCK EXISTS
+    #
+    #     The pool size used to end in a hardcoded `$PoolSize = 3` after a WARN.
+    #     Guessing LOW manufactures a FALSE PASS on the one assertion whose job
+    #     is to catch a cross-slot kill: pool size decides how many territories
+    #     get a probe, so a guess of 3 against a real pool of 4 leaves slot 3
+    #     unprobed and V2-3 ("orphans in the OTHER pool slots are still ALIVE")
+    #     passes having never looked at it.
+    #
+    #     The fallback is gone, but "gone" is a claim like any other. These
+    #     tests drive every arm so it stays gone - the arms were verified once
+    #     by hand against a live supervisor, which proves nothing about the
+    #     next edit.
+    #
+    # -RetryDelaySec 0 everywhere: the retry SLEEP is not under test and a real
+    # one would put seconds of dead time in the suite.
+
+    It 'takes an explicit -PoolSize without touching the route at all' {
+        $script:probeCalls = 0
+        $r = Resolve-PoolSize -Override 4 -RetryDelaySec 0 -ReadBuilds {
+            $script:probeCalls++
+            [PSCustomObject]@{ pool_size = 9 }
+        }
+        $r.Size | Should Be 4
+        $r.Error | Should BeNullOrEmpty
+        $r.Source | Should Match 'explicit'
+        # The route must not even be consulted - an explicit declaration is
+        # authoritative and /builds is a contended call.
+        $script:probeCalls | Should Be 0
+    }
+
+    It 'reads pool_size from the route and names it as the source' {
+        $r = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds { [PSCustomObject]@{ pool_size = 5 } }
+        $r.Size | Should Be 5
+        $r.Error | Should BeNullOrEmpty
+        $r.Source | Should Match 'pool_size \(attempt 1\)'
+    }
+
+    It 'retries a flaking route and succeeds on a later attempt' {
+        # The observed failure was a TIMEOUT on a route that answered fine
+        # moments later, which is exactly what the retry is for.
+        $script:attempts = 0
+        $r = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds {
+            $script:attempts++
+            if ($script:attempts -lt 3) { throw 'The operation has timed out' }
+            [PSCustomObject]@{ pool_size = 4 }
+        }
+        $r.Size | Should Be 4
+        $r.Source | Should Match 'attempt 3'
+        $script:attempts | Should Be 3
+    }
+
+    It 'surfaces each failed attempt through OnWarn rather than swallowing it' {
+        $script:warnings = @()
+        $null = Resolve-PoolSize -RetryDelaySec 0 -Attempts 3 `
+                                 -ReadBuilds { throw 'The operation has timed out' } `
+                                 -OnWarn { param($m) $script:warnings += $m }
+        $script:warnings.Count | Should Be 3
+        ($script:warnings[0] -like '*attempt 1/3 failed*') | Should Be $true
+    }
+
+    It 'treats a 200 with no pool_size as a contract miss and does NOT burn more attempts' {
+        $script:attempts = 0
+        $r = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds {
+            $script:attempts++
+            [PSCustomObject]@{ builds = @() }
+        }
+        $script:attempts | Should Be 1
+        $r.Error | Should Not BeNullOrEmpty
+    }
+
+    It 'treats a non-numeric pool_size as a contract miss, not a flake' {
+        $script:attempts = 0
+        $r = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds {
+            $script:attempts++
+            [PSCustomObject]@{ pool_size = 'lots' }
+        }
+        $script:attempts | Should Be 1
+        $r.Size | Should Be 0
+        $r.Error | Should Not BeNullOrEmpty
+    }
+
+    It 'falls back to the env var when the route cannot answer' {
+        $r = Resolve-PoolSize -RetryDelaySec 0 -EnvValue '6' -ReadBuilds { throw 'no route' }
+        $r.Size | Should Be 6
+        $r.Error | Should BeNullOrEmpty
+        $r.Source | Should Match 'env'
+    }
+
+    It 'names a non-integer env var instead of throwing a raw cast' {
+        $r = Resolve-PoolSize -RetryDelaySec 0 -EnvValue 'three' -ReadBuilds { throw 'no route' }
+        $r.Size | Should Be 0
+        ($r.Error -like '*QONTINUI_SUPERVISOR_BUILD_POOL_SIZE*') | Should Be $true
+        ($r.Error -like '*not an integer*') | Should Be $true
+    }
+
+    It 'lets the env var answer when the route reports a nonsense pool_size of 0' {
+        $r = Resolve-PoolSize -RetryDelaySec 0 -EnvValue '2' -ReadBuilds { [PSCustomObject]@{ pool_size = 0 } }
+        $r.Size | Should Be 2
+        $r.Source | Should Match 'env'
+    }
+
+    It 'refuses a non-positive size from either source' {
+        foreach ($bad in @(0, -1)) {
+            $viaRoute = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds ({ [PSCustomObject]@{ pool_size = $bad } }.GetNewClosure())
+            $viaRoute.Error | Should Not BeNullOrEmpty
+            $viaEnv = Resolve-PoolSize -RetryDelaySec 0 -EnvValue "$bad" -ReadBuilds { throw 'no route' }
+            $viaEnv.Error | Should Not BeNullOrEmpty
+        }
+    }
+
+    It 'ABORTS instead of defaulting when no source can answer - the whole point' {
+        $r = Resolve-PoolSize -RetryDelaySec 0 -ReadBuilds { throw 'The operation has timed out' }
+        $r.Source | Should BeNullOrEmpty
+        $r.Error | Should Not BeNullOrEmpty
+        # 3 was the old silent default. A future edit that reinstates ANY
+        # default fails on Size, and this pins the exact value that caused the
+        # incident.
+        $r.Size | Should Be 0
+        $r.Size | Should Not Be 3
+        # The failure has to be actionable, not just loud.
+        ($r.Error -like '*-PoolSize*') | Should Be $true
+    }
+
+    It 'still aborts when there is no route to read at all' {
+        $r = Resolve-PoolSize
+        $r.Size | Should Be 0
+        $r.Error | Should Not BeNullOrEmpty
+    }
+}
+
+Describe 'Resolve-RunnerRepo - the repo root is never guessed either' {
+
+    # Same class as the pool size, and it was left behind when that one was
+    # fixed: a missing `supervisor.project_dir` used to WARN and fall back to a
+    # hardcoded D:\qontinui-root\qontinui-runner. This box holds several runner
+    # checkouts and worktrees, so the wrong-but-existing one plants V2's probes
+    # into a pool the build under test never touches - the orphan is not reaped
+    # and V2-1 reports a scoping defect that does not exist, which is the
+    # failure mode this whole file was written to prevent.
+
+    function New-Health {
+        param($ProjectDir)
+        if ($null -eq $ProjectDir) { return [PSCustomObject]@{ status = 'ok' } }
+        [PSCustomObject]@{
+            status     = 'ok'
+            supervisor = [PSCustomObject]@{ version = '0.1.0'; project_dir = $ProjectDir }
+        }
+    }
+
+    It 'derives the repo root one level above project_dir' {
+        $r = Resolve-RunnerRepo -HealthBody (New-Health 'D:\ws\qontinui-runner\src-tauri')
+        $r.Path | Should Be 'D:\ws\qontinui-runner'
+        $r.Error | Should BeNullOrEmpty
+        $r.Source | Should Match 'project_dir'
+    }
+
+    It 'prefers an explicit -RunnerRepo and does not consult /health' {
+        $r = Resolve-RunnerRepo -Override 'D:\other\runner' -OverrideProvided $true `
+                                -HealthBody (New-Health 'D:\ws\qontinui-runner\src-tauri')
+        $r.Path | Should Be 'D:\other\runner'
+        $r.Source | Should Match 'explicit'
+    }
+
+    It 'ABORTS when /health carries no supervisor block' {
+        $r = Resolve-RunnerRepo -HealthBody (New-Health $null)
+        $r.Path | Should BeNullOrEmpty
+        $r.Error | Should Not BeNullOrEmpty
+        ($r.Error -like '*-RunnerRepo*') | Should Be $true
+    }
+
+    It 'ABORTS when the supervisor block carries no project_dir' {
+        $r = Resolve-RunnerRepo -HealthBody ([PSCustomObject]@{ supervisor = [PSCustomObject]@{ version = '0.1.0' } })
+        $r.Error | Should Not BeNullOrEmpty
+    }
+
+    It 'ABORTS on a project_dir with no parent rather than deriving an empty root' {
+        # An empty root would make every slot territory a bare relative
+        # `target-pool\slot-k`, which resolves against OUR cwd.
+        $r = Resolve-RunnerRepo -HealthBody (New-Health 'src-tauri')
+        $r.Path | Should BeNullOrEmpty
+        $r.Error | Should Not BeNullOrEmpty
+    }
+
+    It 'never returns the old hardcoded checkout on any failure arm' {
+        foreach ($body in @((New-Health $null), $null, ([PSCustomObject]@{ supervisor = $null }))) {
+            $r = Resolve-RunnerRepo -HealthBody $body
+            $r.Error | Should Not BeNullOrEmpty
+            ("$($r.Path)" -like '*qontinui-runner*') | Should Be $false
+        }
+    }
+}
+
+Describe 'preflight discovery is wired to the resolvers (source)' {
+
+    # The resolvers being correct is worthless if the script still carries a
+    # fallback of its own - same posture as the absence-check wiring block.
+    $scriptText = Get-Content -Raw $ScriptUnderTest
+
+    It 'routes both discoveries through the extracted resolvers' {
+        ($scriptText -like '*$repoRes = Resolve-RunnerRepo*') | Should Be $true
+        ($scriptText -like '*$poolRes = Resolve-PoolSize*') | Should Be $true
+    }
+
+    It 'aborts the preflight on either resolver Error' {
+        # Both guards, and both report the resolver's own named cause rather
+        # than a generic "discovery failed".
+        ([regex]::Matches($scriptText, 'if \(\$(repo|pool)Res\.Error\)')).Count | Should Be 2
+        ([regex]::Matches($scriptText, 'Write-Fail \$(repo|pool)Res\.Error')).Count | Should Be 2
+    }
+
+    It 'carries no hardcoded pool-size default anywhere' {
+        ($scriptText -match '\$PoolSize\s*=\s*3\b') | Should Be $false
+    }
+
+    It 'carries no hardcoded runner-repo default in the param block' {
+        # The parameter default is the last place the old guess could hide: an
+        # unbound -RunnerRepo is resolved from /health, so a value here would be
+        # a guess that never announces itself.
+        ($scriptText -match '\[string\]\$RunnerRepo\s*=\s*''D:') | Should Be $false
+    }
+
+    It 'prints the provenance of both numbers so a run log can be audited' {
+        ($scriptText -like '*runner repo = $RunnerRepo (source:*') | Should Be $true
+        ($scriptText -like '*pool size = $PoolSize (source:*') | Should Be $true
     }
 }

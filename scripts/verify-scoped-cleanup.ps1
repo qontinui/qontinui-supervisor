@@ -237,10 +237,12 @@
     territories as `<RunnerRepo>\target-pool\slot-<k>`. When omitted this is
     resolved from the live supervisor's `GET /health` ->
     `supervisor.project_dir`, which is authoritative; pass it only to override
-    a supervisor that reports something unexpected. Falls back to
-    D:\qontinui-root\qontinui-runner when /health carries no project_dir.
-    Whatever the source, it is normalized to a rooted absolute path and the
-    script refuses a path that cannot be rooted.
+    a supervisor that reports something unexpected. There is NO default: if
+    /health carries no project_dir the script ABORTS rather than assuming a
+    checkout, because this box holds several and probing the wrong pool makes
+    V2-1 report a scoping defect that does not exist. Whatever the source, it
+    is normalized to a rooted absolute path and the script refuses a path that
+    cannot be rooted.
 
 .PARAMETER ForeignTargetDir
     An EXISTING, warm target dir that is provably outside every slot
@@ -354,7 +356,9 @@
 [CmdletBinding()]
 param(
     [int]$Port = 9875,
-    [string]$RunnerRepo = 'D:\qontinui-root\qontinui-runner',
+    # No default on purpose -- see .PARAMETER RunnerRepo. An unbound value is
+    # resolved from GET /health, and an unresolvable one aborts the preflight.
+    [string]$RunnerRepo = '',
     [string]$ForeignTargetDir = 'D:\qontinui-root\qontinui-supervisor\target',
     [int]$PoolSize = 0,
     [switch]$SkipV1,
@@ -439,6 +443,192 @@ function Get-SlotTargetDirs {
     }
     # Leading comma: force array semantics for 0/1 elements.
     return ,$dirs
+}
+
+# Decide the runner repo root, and record WHERE the answer came from.
+#
+# Same rule as Resolve-PoolSize below -- preflight discovery must never render
+# an unknown as a confident-looking default. This used to WARN and fall back to
+# a hardcoded `D:\qontinui-root\qontinui-runner` when /health carried no
+# `supervisor.project_dir`. That guess decides where EVERY slot territory is,
+# and this box holds several runner checkouts and worktrees: a wrong-but-
+# existing repo plants V2's probes into a pool the build under test never
+# touches, so the in-territory orphan is not reaped, V2-1 FAILs, and the run
+# reports a scoping defect that does not exist -- the exact failure the unit
+# tests exist to prevent.
+#
+# `SupervisorInfo.project_dir` (src/routes/health.rs) is a non-Option String, so
+# every supervisor built from this tree answers. Reaching the abort means the
+# responder is not one, which is precisely when a guess is wrong.
+#
+# Returns { Path, Source, Error }. A non-null Error is the caller's cue to fail
+# the preflight; nothing here exits, so the function is safe to unit-test.
+function Resolve-RunnerRepo {
+    param(
+        [string]$Override = '',
+        [bool]$OverrideProvided = $false,
+        $HealthBody = $null
+    )
+    if ($OverrideProvided) {
+        return [PSCustomObject]@{
+            Path   = $Override
+            Source = '-RunnerRepo (explicit)'
+            Error  = $null
+        }
+    }
+
+    $projectDir = $null
+    if ($HealthBody -and ($HealthBody.PSObject.Properties.Name -contains 'supervisor')) {
+        $sup = $HealthBody.supervisor
+        if ($sup -and ($sup.PSObject.Properties.Name -contains 'project_dir')) {
+            $projectDir = $sup.project_dir
+        }
+    }
+
+    if ($projectDir) {
+        # project_dir points at <runner-repo>\src-tauri; the slot pool lives one
+        # level up (SupervisorConfig::runner_npm_dir).
+        $parent = Split-Path -Parent $projectDir
+        if (-not $parent) {
+            return [PSCustomObject]@{
+                Path   = $null
+                Source = $null
+                Error  = "GET /health reported supervisor.project_dir = '$projectDir', which has no parent directory. The slot pool lives one level above project_dir, so this cannot be resolved. Declare the repo instead: -RunnerRepo <path>"
+            }
+        }
+        return [PSCustomObject]@{
+            Path   = $parent
+            Source = "GET /health -> supervisor.project_dir ('$projectDir')"
+            Error  = $null
+        }
+    }
+
+    return [PSCustomObject]@{
+        Path   = $null
+        Source = $null
+        Error  = @"
+GET /health carried no supervisor.project_dir, so the runner repo is UNKNOWN.
+  This script will NOT assume one. The repo root decides where every slot
+  territory is; pointing at the wrong checkout plants V2's probes into a pool
+  the build under test never touches, which makes V2-1 report a scoping defect
+  that does not exist.
+  Every supervisor built from this tree always reports project_dir, so a
+  responder that omits it is not one. Declare it: -RunnerRepo <path>
+"@
+    }
+}
+
+# Decide the build pool size, and record WHERE the number came from.
+#
+# NO SILENT DEFAULT. This resolution used to end in a hardcoded pool size of
+# three on a WARN -- a guess wearing the costume of a discovered value. Fleet
+# policy `verification-and-evidence` / `unknown-must-not-render-as-a-default`:
+# a read that cannot support its answer must render UNKNOWN, not a
+# confident-looking value, and the consumer takes the conservative arm.
+#
+# Guessing LOW does not merely inconvenience, it manufactures a FALSE PASS on a
+# safety assertion. Pool size decides how many slot territories get a probe.
+# Guess 3 against a real pool of 4 and V2-3 ("orphans in the OTHER pool slots
+# are still ALIVE") checks two siblings instead of three, so a wrongful kill in
+# the unprobed slot goes unseen and the run reports PASS. The assertion whose
+# whole job is to detect a cross-slot kill is exactly the one the guess blinds.
+#
+# `-ReadBuilds` is injected rather than called inline so this decision is unit-
+# testable without a supervisor: extracting the function is what lets the tests
+# drive every arm (flake-then-answer, contract miss, no source at all) instead
+# of the arms being verified once by hand and never again.
+#
+# Returns { Size, Source, Error }, with the same contract as Resolve-RunnerRepo.
+function Resolve-PoolSize {
+    param(
+        [int]$Override = 0,
+        [scriptblock]$ReadBuilds = $null,
+        [string]$EnvValue = '',
+        [string]$BuildsUri = '/builds',
+        [int]$Attempts = 3,
+        [int]$RetryDelaySec = 2,
+        [scriptblock]$OnWarn = $null
+    )
+    if ($Override -gt 0) {
+        return [PSCustomObject]@{
+            Size   = $Override
+            Source = "-PoolSize $Override (explicit)"
+            Error  = $null
+        }
+    }
+
+    $size   = 0
+    $source = $null
+
+    if ($ReadBuilds) {
+        # RETRY before concluding unknown. `GET /builds` is intermittent on this
+        # fleet -- observed both timing out and answering within the same minute
+        # -- and the silent-empty rule says to rerun with errors visible rather
+        # than trust the first miss. Bounded attempts separate a flake from a
+        # genuinely unavailable route; only the latter should stop the run.
+        for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+            try {
+                $builds = & $ReadBuilds
+                if ($builds -and ($builds.PSObject.Properties.Name -contains 'pool_size')) {
+                    $parsed = 0
+                    if ([int]::TryParse("$($builds.pool_size)", [ref]$parsed)) {
+                        $size   = $parsed
+                        $source = "GET $BuildsUri -> pool_size (attempt $attempt)"
+                        break
+                    }
+                    # A body that answered with a non-numeric pool_size is a
+                    # CONTRACT miss like the missing-field case below, not a
+                    # flake. Retrying cannot turn it into a number.
+                    if ($OnWarn) { & $OnWarn "GET $BuildsUri returned pool_size = '$($builds.pool_size)', which is not an integer" }
+                    break
+                }
+                # A 200 that omits the field is a CONTRACT miss, not a flake --
+                # do not spend more attempts on a route that answered clearly.
+                if ($OnWarn) { & $OnWarn "GET $BuildsUri returned no 'pool_size' property" }
+                break
+            } catch {
+                if ($OnWarn) { & $OnWarn "GET $BuildsUri attempt $attempt/$Attempts failed: $($_.Exception.Message)" }
+                if ($attempt -lt $Attempts -and $RetryDelaySec -gt 0) { Start-Sleep -Seconds $RetryDelaySec }
+            }
+        }
+    }
+
+    if ($size -le 0 -and $EnvValue) {
+        # A bare [int] cast on a non-numeric value throws a raw cast stack trace
+        # under $ErrorActionPreference = 'Stop'. Every other bad input in this
+        # file gets a named preflight failure; so does this one.
+        $parsedPool = 0
+        if (-not [int]::TryParse($EnvValue, [ref]$parsedPool)) {
+            return [PSCustomObject]@{
+                Size   = 0
+                Source = $null
+                Error  = "QONTINUI_SUPERVISOR_BUILD_POOL_SIZE is '$EnvValue', which is not an integer. Unset it or pass -PoolSize."
+            }
+        }
+        $size   = $parsedPool
+        $source = 'QONTINUI_SUPERVISOR_BUILD_POOL_SIZE (env)'
+    }
+
+    if ($size -le 0 -or -not $source) {
+        # Aborting is safe because the operator already has a documented
+        # override: -PoolSize is a first-class parameter, so this is a
+        # fix-or-declare prompt, not a dead end.
+        return [PSCustomObject]@{
+            Size   = 0
+            Source = $null
+            Error  = @"
+could not establish the build pool size from any authoritative source.
+  tried: GET $BuildsUri -> pool_size   x$Attempts (see the warnings above for why it did not answer)
+         QONTINUI_SUPERVISOR_BUILD_POOL_SIZE  (unset, zero, or non-positive)
+  This script will NOT assume a pool size. It decides how many slot
+  territories get a probe, and guessing too low makes assertion V2-3
+  (no cross-slot kills) pass while leaving a real slot unchecked.
+  Fix the supervisor's /builds route, or declare it: -PoolSize <n>
+"@
+        }
+    }
+
+    return [PSCustomObject]@{ Size = $size; Source = $source; Error = $null }
 }
 
 # Resolve the REAL toolchain cargo.exe.
@@ -1448,102 +1638,35 @@ try {
 }
 
 # The supervisor is authoritative about its own project_dir; -RunnerRepo is an
-# override, so only consult /health when the caller did NOT pass it.
-if (-not $PSBoundParameters.ContainsKey('RunnerRepo')) {
-    $projectDir = $null
-    if ($health.PSObject.Properties.Name -contains 'supervisor') {
-        if ($health.supervisor.PSObject.Properties.Name -contains 'project_dir') {
-            $projectDir = $health.supervisor.project_dir
-        }
-    }
-    if ($projectDir) {
-        # project_dir points at <runner-repo>\src-tauri; the slot pool lives one
-        # level up (SupervisorConfig::runner_npm_dir).
-        $RunnerRepo = Split-Path -Parent $projectDir
-        Write-Step "runner repo resolved from /health project_dir: $RunnerRepo"
-    } else {
-        Write-Warn "/health carried no supervisor.project_dir; falling back to default $RunnerRepo"
-    }
-} else {
-    Write-Step "runner repo overridden by -RunnerRepo: $RunnerRepo"
+# override, so only consult /health when the caller did NOT pass it. Both
+# resolutions below are decided by extracted, unit-tested functions and neither
+# has a fallback value: an unestablished repo or pool size aborts the preflight.
+$repoRes = Resolve-RunnerRepo -Override $RunnerRepo `
+                              -OverrideProvided ($PSBoundParameters.ContainsKey('RunnerRepo')) `
+                              -HealthBody $health
+if ($repoRes.Error) {
+    Write-Fail $repoRes.Error
+    exit 1
 }
+$RunnerRepo = $repoRes.Path
+Write-Step "runner repo = $RunnerRepo (source: $($repoRes.Source))"
 
 $RunnerRepo       = ConvertTo-RootedPath -Path $RunnerRepo -Label 'runner repo'
 $ForeignTargetDir = ConvertTo-RootedPath -Path $ForeignTargetDir -Label '-ForeignTargetDir'
 
-# Pool size MUST come from an authoritative source. `$poolSource` carries the
-# provenance so the run log says on its face where the number came from, and so
-# the no-source case can fail instead of guessing.
-$poolSource = if ($PoolSize -gt 0) { "-PoolSize $PoolSize (explicit)" } else { $null }
-
-if ($PoolSize -le 0) {
-    # RETRY before concluding unknown. `GET /builds` is intermittent on this
-    # fleet -- observed both timing out and answering within the same minute --
-    # and the silent-empty rule says to rerun with errors visible rather than
-    # trust the first miss. Three bounded attempts distinguishes a flake from a
-    # genuinely unavailable route; only the latter should stop the run.
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            $builds = Invoke-RestMethod -Method Get -Uri "$base/builds" -TimeoutSec 20
-            if ($builds.PSObject.Properties.Name -contains 'pool_size') {
-                $PoolSize = [int]$builds.pool_size
-                $poolSource = "GET /builds -> pool_size (attempt $attempt)"
-                break
-            }
-            # A 200 that omits the field is a CONTRACT miss, not a flake -- do
-            # not spend two more attempts on a route that answered clearly.
-            Write-Warn "GET $base/builds returned no 'pool_size' property"
-            break
-        } catch {
-            Write-Warn "GET $base/builds attempt $attempt/3 failed: $($_.Exception.Message)"
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-    }
-}
-if ($PoolSize -le 0) {
-    if ($env:QONTINUI_SUPERVISOR_BUILD_POOL_SIZE) {
-        # A bare [int] cast on a non-numeric value throws a raw cast stack
-        # trace under $ErrorActionPreference = 'Stop'. Every other bad input in
-        # this file gets a named preflight failure; so does this one.
-        $parsedPool = 0
-        if (-not [int]::TryParse("$env:QONTINUI_SUPERVISOR_BUILD_POOL_SIZE", [ref]$parsedPool)) {
-            Write-Fail "QONTINUI_SUPERVISOR_BUILD_POOL_SIZE is '$env:QONTINUI_SUPERVISOR_BUILD_POOL_SIZE', which is not an integer. Unset it or pass -PoolSize."
-            exit 1
-        }
-        $PoolSize = $parsedPool
-        $poolSource = 'QONTINUI_SUPERVISOR_BUILD_POOL_SIZE (env)'
-    }
-}
-if ($PoolSize -le 0 -or -not $poolSource) {
-    # NO SILENT DEFAULT. This used to fall back to `$PoolSize = 3` on a WARN,
-    # which is a guess wearing the costume of a discovered value -- fleet policy
-    # `verification-and-evidence` / `unknown-must-not-render-as-a-default`: "a
-    # read that cannot support its answer must render UNKNOWN, not a
-    # confident-looking value", and the consumer "takes the CONSERVATIVE arm".
-    #
-    # Guessing LOW is not merely unhelpful here, it manufactures a FALSE PASS on
-    # a safety assertion. Pool size decides how many slot territories get a
-    # probe. Guess 3 against a real pool of 4 and V2-3 ("orphans in the OTHER
-    # pool slots are still ALIVE") checks two siblings instead of three -- so a
-    # wrongful kill in the unprobed slot goes unseen and the run reports PASS.
-    # The assertion whose whole job is to detect a cross-slot kill is exactly
-    # the one the guess blinds.
-    #
-    # Aborting is safe because the operator already has a documented override:
-    # -PoolSize is a first-class parameter, so this is a fix-or-declare prompt,
-    # not a dead end.
-    Write-Fail @"
-could not establish the build pool size from any authoritative source.
-  tried: GET $base/builds -> pool_size   x3 (see the warnings above for why it did not answer)
-         QONTINUI_SUPERVISOR_BUILD_POOL_SIZE  (unset or zero)
-  This script will NOT assume a pool size. It decides how many slot
-  territories get a probe, and guessing too low makes assertion V2-3
-  (no cross-slot kills) pass while leaving a real slot unchecked.
-  Fix the supervisor's /builds route, or declare it: -PoolSize <n>
-"@
+# Pool size MUST come from an authoritative source; the provenance is printed so
+# the run log says on its face where the number came from.
+$poolRes = Resolve-PoolSize -Override $PoolSize `
+                            -ReadBuilds { Invoke-RestMethod -Method Get -Uri "$base/builds" -TimeoutSec 20 } `
+                            -EnvValue "$env:QONTINUI_SUPERVISOR_BUILD_POOL_SIZE" `
+                            -BuildsUri "$base/builds" `
+                            -OnWarn { param($m) Write-Warn $m }
+if ($poolRes.Error) {
+    Write-Fail $poolRes.Error
     exit 1
 }
-Write-Step "pool size = $PoolSize (source: $poolSource)"
+$PoolSize = $poolRes.Size
+Write-Step "pool size = $PoolSize (source: $($poolRes.Source))"
 
 $slotDirs = Get-SlotTargetDirs -RunnerRepoRoot $RunnerRepo -Size $PoolSize
 

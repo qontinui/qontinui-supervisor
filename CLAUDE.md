@@ -251,6 +251,16 @@ a probe whose `Process.StartTime` was unreadable at plant time is left running
 until it self-expires; teardown now reports how many pids it had to leave
 behind (and what is running on them) instead of leaking them silently.
 
+**Preflight discovery has no defaults.** The runner repo comes from `GET
+/health` → `supervisor.project_dir` and the pool size from `GET /builds` →
+`pool_size` (retried, because that route flakes); if neither answers, the run
+**aborts** rather than assuming one, and every run prints the provenance of both
+(`source: ...`). A guessed pool size that is too low silently narrows V2-3 to
+fewer slots than the pool really has, so the run reports PASS having never
+looked at the slot where a cross-slot kill would show. Declare them with
+`-RunnerRepo` / `-PoolSize` (or `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) when the
+supervisor cannot.
+
 Pure decision helpers are unit-tested in
 `scripts/verify-scoped-cleanup.Tests.ps1` (`Invoke-Pester`). The harness is
 Windows-only and can never run on the `ubuntu-latest` gate, so everything it
