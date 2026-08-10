@@ -1455,9 +1455,21 @@ pub struct SpawnTestRequest {
     /// Recorded with the active build info for `GET /builds` visibility.
     #[serde(default)]
     pub requester_id: Option<String>,
-    /// Maximum seconds to wait in the build queue before giving up with 504.
-    /// Only meaningful when `rebuild: true` and all slots are busy.
-    /// `None` means wait indefinitely (the default).
+    /// Maximum seconds to spend WAITING IN THE QUEUE before giving up with 504.
+    /// Only meaningful when `rebuild: true`. `None` means wait indefinitely
+    /// (the default).
+    ///
+    /// It bounds only the queue phases — waiting on a cargo build permit and,
+    /// after that, on the serialized frontend (pnpm) lock. **The clock stops
+    /// the moment the build starts doing work**: a build that has its slot and
+    /// is compiling can no longer be 504'd out from under itself, however
+    /// small a value you pass. Until 2026-08-03 this bounded the whole
+    /// build+spawn future despite its name and docs, so a caller asking "don't
+    /// make me queue for more than 60s" also got their compiling build
+    /// abandoned at 60s — losing everything it had compiled.
+    ///
+    /// Use `wait_timeout_secs` to bound the post-spawn health wait; there is
+    /// deliberately no knob that kills a healthy in-flight compile.
     #[serde(default)]
     pub queue_timeout_secs: Option<u64>,
     /// Optional post-spawn health probe window in milliseconds.
@@ -2024,6 +2036,40 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
         }
     }
     Ok(())
+}
+
+/// How often the queue-timeout watcher re-reads the build's phase marker.
+/// Small relative to any sane `queue_timeout_secs`, so the reported wait is
+/// accurate to well under a second.
+const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolve only if `timeout` elapses while the build is STILL in a queue phase
+/// (see [`crate::build_monitor::BuildPhase::is_queue_wait`]); returns the phase
+/// that was blocking so the caller can compose a phase-accurate message.
+///
+/// Once the build leaves its queue phases — the cargo permit and, after it, the
+/// frontend lock are both held and real work has started — this future never
+/// resolves, so `queue_timeout_secs` can no longer 504 a build that is
+/// compiling. Phases advance monotonically within one attempt, so "left the
+/// queue" is a latch, not a sample that can flap back.
+async fn wait_out_queue_timeout(
+    timeout: std::time::Duration,
+    marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> crate::build_monitor::BuildPhase {
+    let start = std::time::Instant::now();
+    loop {
+        let phase = crate::build_monitor::BuildPhase::from_u8(
+            marker.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if !phase.is_queue_wait() {
+            // Work has started — stop counting, forever.
+            std::future::pending::<()>().await;
+        }
+        if start.elapsed() >= timeout {
+            return phase;
+        }
+        tokio::time::sleep(QUEUE_PHASE_POLL).await;
+    }
 }
 
 /// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
@@ -3036,13 +3082,21 @@ async fn execute_spawn_build_inner(
                 );
                 match queue_timeout_secs {
                     Some(secs) => {
+                        // `queue_timeout_secs` bounds the QUEUE, not the build.
+                        // It used to wrap the whole future, so a caller passing
+                        // a small bound to say "don't make me wait for a busy
+                        // pool" got a 504 that ALSO abandoned an already-
+                        // compiling slot — throwing away a live build (and
+                        // everything it had compiled) for a wait that had
+                        // already ended. The watcher below stops counting the
+                        // moment the build leaves its queue phases, so the
+                        // field now means what it is documented to mean.
                         let timeout = std::time::Duration::from_secs(secs);
-                        match tokio::time::timeout(timeout, fut).await {
-                            Ok(r) => r,
-                            Err(_) => {
-                                let phase = crate::build_monitor::BuildPhase::from_u8(
-                                    phase_marker.load(std::sync::atomic::Ordering::Relaxed),
-                                );
+                        let watcher = wait_out_queue_timeout(timeout, phase_marker.clone());
+                        tokio::pin!(fut);
+                        tokio::select! {
+                            r = &mut fut => r,
+                            phase = watcher => {
                                 let available_permits =
                                     state.build_pool.permits.available_permits();
                                 Err((
@@ -3069,7 +3123,7 @@ async fn execute_spawn_build_inner(
         // exact slot's `CARGO_TARGET_DIR` and retry the build ONCE before
         // surfacing the 500. A genuine compiler error returns immediately (no
         // wasteful retry). Both outcomes are logged via `tracing`.
-        if let Err((_, ref attempt)) = build_result {
+        if let Err((ref build_err, ref attempt)) = build_result {
             // Record the FIRST attempt's slot before any retry can overwrite
             // `build_result`. A retry that is refused before claiming a slot
             // returns `BuildAttempt::default()` (`slot_id: None`) — queue
@@ -3081,7 +3135,7 @@ async fn execute_spawn_build_inner(
             side.slot_id = attempt.slot_id.or(side.slot_id);
             let stderr_for_class = attempt.full_stderr.clone().unwrap_or_default();
             let class = crate::build_monitor::classify_build_stderr(&stderr_for_class);
-            if class == crate::build_monitor::StderrClass::Environmental {
+            if crate::build_monitor::should_self_heal_slot(build_err, class) {
                 if let Some(slot_id) = attempt.slot_id {
                     if let Some(slot) = state.build_pool.slots.get(slot_id).cloned() {
                         tracing::warn!(
@@ -3146,6 +3200,16 @@ async fn execute_spawn_build_inner(
                         build_result = retry;
                     }
                 }
+            } else if matches!(build_err, SupervisorError::Timeout(_)) {
+                // A timeout is NEVER evidence of a poisoned incremental cache
+                // — and wiping the slot guarantees the retry starts cold. See
+                // `build_monitor::should_self_heal_slot`.
+                tracing::warn!(
+                    slot_id = ?attempt.slot_id,
+                    "spawn-test build timed out; keeping the slot's incremental cache intact \
+                     (no clean, no retry) so a retry starts WARM: {}",
+                    build_err
+                );
             } else {
                 tracing::info!(
                     "spawn-test build failed with a compiler diagnostic; returning immediately (no poisoned-slot retry)"
@@ -4934,13 +4998,27 @@ pub async fn list_builds(
     let mut active_builds: Vec<serde_json::Value> =
         Vec::with_capacity(state.build_pool.slots.len());
 
-    // Cross-slot SHA snapshot — what resolve_source_exe would pick now,
-    // each slot's sidecar SHA (None when absent), and the drift warning.
-    let freshness = crate::process::manager::compute_slot_freshness(&state).await;
+    // Cross-slot SHA snapshot + LKG origin/main drift, served from the cached
+    // meta snapshot. NEVER computed inline: the drift probe shells out to
+    // `git fetch` (+3 more git calls) with a 30s timeout, which is what made
+    // `GET /builds` hang >25s while a build was running — the one moment
+    // anyone polls it. A stale or absent snapshot is served as-is and a
+    // refresh is kicked off in the background.
+    let meta = state.builds_meta_cached();
+    let meta_stale = meta.as_ref().map(|m| m.is_stale(now)).unwrap_or(true);
+    if meta_stale {
+        state.spawn_builds_meta_refresh();
+    }
+    let freshness = meta.as_ref().map(|m| m.freshness.clone());
+    let origin_main_drift = meta.as_ref().and_then(|m| m.origin_main_drift.clone());
+    let meta_computed_at = meta.as_ref().map(|m| m.computed_at.to_rfc3339());
     let provenance_by_slot: std::collections::HashMap<
         usize,
         crate::process::manager::SlotProvenanceKey,
-    > = freshness.slot_provenance.iter().cloned().collect();
+    > = freshness
+        .as_ref()
+        .map(|f| f.slot_provenance.iter().cloned().collect())
+        .unwrap_or_default();
 
     let mut any_slot_has_stale_frontend = false;
     for slot in &state.build_pool.slots {
@@ -5086,40 +5164,10 @@ pub async fn list_builds(
                 "source": info.source,
             })
         });
-    // Phase A: origin/main drift for the LKG sha — turns the silent stale-build
-    // (the 2026-06-07 incident) into a surfaced signal. Computed only when the
-    // LKG records a sha; `null` when up-to-date, unknown, or not computable
-    // (no remote / not a repo). The git repo root is `project_dir.parent()`
-    // (project_dir is `qontinui-runner/src-tauri`). Best-effort: a probe
-    // failure reads as not-computable and yields `null`.
-    let lkg_sha: Option<String> = state
-        .build_pool
-        .last_known_good
-        .read()
-        .await
-        .as_ref()
-        .and_then(|info| info.sha.clone());
-    let origin_main_drift = match (&lkg_sha, state.config.project_dir.parent()) {
-        (Some(sha), Some(repo_root)) => {
-            let drift = crate::git_provenance::origin_main_drift(repo_root, sha).await;
-            // Null when up-to-date or not computable; surface only real drift,
-            // matching the null-when-fine convention of the `*_warning` siblings.
-            if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
-                None
-            } else {
-                Some(json!({
-                    "built_sha": drift.built_sha,
-                    "origin_main_sha": drift.origin_main_sha,
-                    "behind_count": drift.behind_count,
-                    "is_ancestor": drift.is_ancestor,
-                    "diverged": drift.is_diverged(),
-                    "fetched": drift.fetched,
-                }))
-            }
-        }
-        _ => None,
-    };
-    let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
+    // `origin_main_drift` (Phase A: turns the silent stale-build of 2026-06-07
+    // into a surfaced signal) comes from the cached meta snapshot computed
+    // above — see there for why it is not computed inline.
+    let slot_freshness_warning = freshness.as_ref().and_then(|f| f.drift.as_ref()).map(|d| {
         let source_label = |s: &crate::process::manager::BuildSource| match s {
             crate::process::manager::BuildSource::LiveTree => "live_tree",
             crate::process::manager::BuildSource::OriginMain => "origin_main",
@@ -5140,16 +5188,19 @@ pub async fn list_builds(
     // Adjacent staleness surface: a stale exe at `target/debug/` (operator
     // built from workspace root instead of into a slot). Null when no legacy
     // exe, no slot exes, or legacy is not strictly older than every slot.
-    let legacy_target_debug_warning = freshness.target_debug_staleness.as_ref().map(|s| {
-        let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
-        let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
-        json!({
-            "legacy_path": s.legacy_path.to_string_lossy(),
-            "legacy_mtime": legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "oldest_slot_mtime": oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "message": crate::process::manager::format_target_debug_warning(s),
-        })
-    });
+    let legacy_target_debug_warning = freshness
+        .as_ref()
+        .and_then(|f| f.target_debug_staleness.as_ref())
+        .map(|s| {
+            let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
+            let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
+            json!({
+                "legacy_path": s.legacy_path.to_string_lossy(),
+                "legacy_mtime": legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "oldest_slot_mtime": oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "message": crate::process::manager::format_target_debug_warning(s),
+            })
+        });
 
     Json(json!({
         "pool_size": state.build_pool.slots.len(),
@@ -5171,7 +5222,7 @@ pub async fn list_builds(
         // The slot resolve_source_exe would pick right now. Differs from
         // last_successful_slot when that slot's exe is gone (supervisor restart,
         // wipe, etc.) and the scan falls through to a different slot.
-        "resolved_slot_id": freshness.picked_slot_id,
+        "resolved_slot_id": freshness.as_ref().and_then(|f| f.picked_slot_id),
         "avg_build_duration_secs": avg_build_duration_secs,
         "any_slot_has_stale_frontend": any_slot_has_stale_frontend,
         "slots": slots_json,
@@ -5193,6 +5244,15 @@ pub async fn list_builds(
         // first refresh; carries its own `computed_at` for staleness. Force a
         // fresh walk with `?refresh_footprint=1`.
         "footprint": footprint_json,
+        // Staleness of the git/fs-derived block above (`resolved_slot_id`,
+        // `origin_main_drift`, `slot_freshness_warning`,
+        // `legacy_target_debug_warning`, and each slot's `git_sha`/`source`).
+        // `meta_computed_at` is null until the first background refresh lands;
+        // `meta_stale` true means a refresh was just kicked off and this
+        // response carries the previous snapshot. The endpoint deliberately
+        // NEVER blocks on that refresh — it shells out to git.
+        "meta_computed_at": meta_computed_at,
+        "meta_stale": meta_stale,
     }))
 }
 
@@ -6300,9 +6360,66 @@ mod tests {
     //! to catch. These tests pin the new contract: missing dist surfaces
     //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
     //! state as `None`.
-    use super::{attach_build_slot_id, check_dist_freshness, FrontendStaleReason};
+    use super::{
+        attach_build_slot_id, check_dist_freshness, wait_out_queue_timeout, FrontendStaleReason,
+    };
+    use crate::build_monitor::BuildPhase;
     use std::fs;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    /// HEADLINE regression (2026-08-03): `queue_timeout_secs` must stop
+    /// counting once the build holds its slot and is compiling. Before this,
+    /// the bound wrapped the whole build future, so a caller who passed a
+    /// small bound to avoid queueing got a 504 that ALSO abandoned a live
+    /// compile.
+    #[tokio::test]
+    async fn queue_timeout_never_fires_once_the_build_is_compiling() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+        // The build acquires its permit and starts compiling almost at once.
+        BuildPhase::Compiling.store(&marker);
+
+        let fired = tokio::time::timeout(
+            Duration::from_millis(900),
+            wait_out_queue_timeout(Duration::from_millis(100), marker),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "the queue watcher fired against a COMPILING build — that 504s a live compile"
+        );
+    }
+
+    /// The other half: while the request really is queued, the bound still
+    /// fires, and it names the phase that was blocking.
+    #[tokio::test]
+    async fn queue_timeout_still_fires_while_actually_queued() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+        let phase = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_out_queue_timeout(Duration::from_millis(150), marker),
+        )
+        .await
+        .expect("a genuinely queued request must still time out");
+        assert_eq!(phase, BuildPhase::AwaitingSlot);
+    }
+
+    /// A build blocked on the serialized frontend (pnpm) lock is still queued
+    /// — no work of its own is happening — so the bound applies there too, and
+    /// the reported phase distinguishes it from cargo-slot exhaustion.
+    #[tokio::test]
+    async fn queue_timeout_covers_the_frontend_lock_wait() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingNpmLock.as_u8()));
+        let phase = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_out_queue_timeout(Duration::from_millis(150), marker),
+        )
+        .await
+        .expect("a frontend-lock wait is still a queue wait");
+        assert_eq!(phase, BuildPhase::AwaitingNpmLock);
+    }
 
     /// A FAILED spawn-test build that had already claimed a slot must still
     /// report `build_slot_id` on the error body.
