@@ -29,11 +29,83 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Kill-switch:** env `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all crash auto-restarts without a rebuild.
 - **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream.
 
-- **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners.
+- **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners. They are also the **only** kind subject to a max-age bound — see "Temp runner isolation and max age" below.
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor observes health only.
 
 **First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0). Note: on a crash-watchdog-armed runner, the first-healthy kill reads as a crash (non-zero exit, no stop intent) — the crash-only watchdog will retry the start up to its loop-guard budget, then disarm.
+
+## Temp runner isolation and max age
+
+**`QONTINUI_INSTANCE_NAME` is the runner's unique id, never its port.** The
+runner roots its entire `instance-<sanitized_name>` app-data tree on that string
+(`qontinui-runner` `src-tauri/src/instance.rs:scope_path`) — dev logs, macros,
+prompts, contexts, the Restate journal, **and `terminal-sessions.json`**. It used
+to be `format!("test-{port}")`, and temp ports are recycled inside a 23-slot
+range, so two sequential temps resolved to the same instance dir and the second
+booted on the first's live terminal-session registry (283 inherited PTYs observed
+2026-08-08; plan `2026-08-10-temp-runner-session-restore-isolation`). Plan
+`2026-07-20-runner-port-keyed-state-inheritance` had moved that store off a
+`-<port>` *filename* onto an instance key that was itself port-derived — the
+inheritance was renamed, not removed.
+
+`process::temp_runner_instance_name` now mints it from the
+already-unique per-spawn runner id (`test-<hex-millis>-<hex-seq>`), which also
+keys `instance_config_dir`, the WebView2 profile and `QONTINUI_RUNNER_ID`, so
+name and id cannot drift apart again. **No second uuid is minted.** Teardown
+follows automatically: all **four** removal sites (`remove_runner`,
+`purge_stale_test_runners_core`, `manager::stop_runner_by_id`, and
+`manager::reap_stale_test_runners` — the sweep, which can now kill a *live*
+runner for age) hand `managed.config.name` to
+`windows::remove_runner_app_data_dirs`, whose sanitizer
+(`process::sanitize_instance_name`) mirrors the runner's and maps the id to
+itself. `config::runner_exe_copy_path` stays **deliberately port-keyed** — a
+per-spawn exe path re-triggers a Windows Firewall prompt on every cold spawn.
+
+**Legacy `instance-test-<port>` trees are now permanently orphaned.** Up to 23
+of them (one per port slot, with their stale `terminal-sessions.json`) exist on
+machines that ran the old scheme. Nothing keys onto those names again, so
+nothing reuses them — the point of the fix — and nothing removes them either.
+Bounded and harmless, but it makes permanent the orphaned-file janitor that
+`2026-07-20-runner-port-keyed-state-inheritance` §7 deferred.
+
+**Temp runners have a max age; nothing else does.** Before this, a *healthy*
+temp runner had no terminator at all short of supervisor exit — an unowned
+(`requester_id: None`) temp was found alive with 31 live PTYs two days after it
+was spawned. `process::manager::reap_stale_test_runners` now also reaps a
+`RunnerKind::Temp` past `config::temp_runner_max_age()` (default **24h**,
+`QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS`, `0` disables), logging the
+runner's identity, its measured age, the bound and the knob at WARN **before**
+killing.
+
+- The predicate `manager::exceeds_temp_runner_max_age` is an explicit
+  `kind.is_temp()` **allowlist**, exactly like
+  `process::job::should_assign_to_ephemeral_job` — never `!is_primary()`.
+  `RunnerKind` is `#[non_exhaustive]`; a variant added later must default to
+  *not reaped*. Getting that inverted was the 2026-07-27 incident.
+- **The bound lives in `manager::reap_stale_test_runners` only.** The other
+  sweeper (`main::reap_stale_test_runners` →
+  `routes::runners::purge_stale_test_runners_core`) stays strictly
+  liveness-based (`port_alive => continue`): it has no `created_at` input, no
+  kill ladder for a live process, and it also backs the operator-facing
+  `POST /runners/purge-stale`, whose contract is "remove runners whose processes
+  are no longer alive".
+- **Age is measured from `RunnerState::started_at`, not from the spawn
+  request.** `ManagedRunner::created_at` starts when `spawn_test` reserves the
+  placeholder, which on a cold `spawn-test {rebuild:true}` is 40-50 min before
+  the child ever runs. `manager::resolve_temp_runner_age` prefers `started_at`,
+  falls back to time-since-first-seen when it is absent or in the future (clock
+  skew), and the kill log names which clock it used. The configurable floor
+  (3600s) sits above the measured cold-build ceiling as a second, independent
+  guard against the same mistake.
+- **`protected: true` does NOT exempt a temp runner from the age bound.** Every
+  temp runner is created `protected: true` (it is not an operator opt-in), so
+  honouring the flag here would make the bound inert for 100% of its intended
+  targets — a veto keyed on a value nothing ever varies. The flag continues to
+  mean what it always meant (no stop/restart by smart rebuild, watchdog, AI
+  session, or loop). If a per-runner age exemption is ever wanted, it needs its
+  own opt-in field, not this one. The kill log states this inline so an operator
+  who clicked "protect" is not left guessing.
 
 ## Per-instance settings (runner registry isolation)
 
@@ -767,6 +839,7 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Stopped-runners cache TTL | 3600s / 60min (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS`, clamped [60, 86400]) |
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
 | Temp runner port range | 9877-9899 |
+| Temp runner max age | 24h (86400s) default, override `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` (clamped [3600, 604800]; **0 disables**). `RunnerKind::Temp` only; measured from `started_at`; `protected` does not exempt. |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
 | Crash-restart backoff ladder | 5s → 30s → 120s; max 3 auto-restarts per rolling 30min, then disarm (kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`) |
 

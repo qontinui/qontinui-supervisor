@@ -834,6 +834,14 @@ pub async fn purge_stale(
 ///   runner. Runners with no owner (`requester_id == None`) are also skipped
 ///   under a scoped purge — an unowned runner is never "this requester's" to
 ///   reap. (friction-1: requester-scoped reaping.)
+///
+/// **This function is liveness-based and stays that way** — `port_alive =>
+/// continue` is its whole truth. The temp-runner max-age bound lives in the
+/// OTHER sweep (`process::manager::reap_stale_test_runners`), which holds the
+/// `created_at` input and the kill ladder for a live process. Adding an age
+/// rule here would also change `POST /runners/purge-stale`, whose contract is
+/// "remove runners whose processes are no longer alive" — an operator tidying
+/// dead records must not lose a healthy runner to it.
 pub async fn purge_stale_test_runners_core(
     state: &SharedState,
     respect_active_builds: bool,
@@ -2390,7 +2398,12 @@ pub async fn spawn_test(
                 )
             })?;
         let id = format!("test-{}", uuid_simple());
-        let name = format!("test-{}", port);
+        // The instance name is the (already unique) runner id, NOT the port —
+        // see `process::temp_runner_instance_name`. Ports 9877-9899 are recycled, so a
+        // port-derived name made two sequential temps share one
+        // `instance-test-<port>` app-data tree (and one live
+        // `terminal-sessions.json`).
+        let name = crate::process::temp_runner_instance_name(&id);
 
         let server_mode = body.server_mode.unwrap_or(false);
         let existing_configs: Vec<RunnerConfig> =
@@ -3368,7 +3381,13 @@ async fn execute_spawn_build_inner(
         build_reused_stale = true;
     }
 
-    let name = format!("test-{}", port);
+    // Log label only — this value never reaches `RunnerConfig` (the
+    // authoritative one was minted alongside the id in `spawn_test`). Read from
+    // the ManagedRunner rather than re-derived: `managed.config.name` IS the
+    // string the child was given, so it cannot drift by construction, whereas a
+    // second call to `process::temp_runner_instance_name(id)` only agrees for as long as
+    // every spawn path builds its config the same way.
+    let name = managed.config.name.clone();
 
     // Phase 2b — `paired_profile_id`. If the caller asked the spawned runner
     // to inherit a previously-stashed pairing, copy the snapshot files into
@@ -6303,6 +6322,183 @@ mod tests {
     use super::{attach_build_slot_id, check_dist_freshness, FrontendStaleReason};
     use std::fs;
     use tempfile::TempDir;
+
+    /// Walk every `.rs` file under `src/`, returning `(path, line_no, line)` for
+    /// each PRODUCTION line matching `pred`.
+    ///
+    /// "Production" = everything before the file's first `#[cfg(test)] mod`,
+    /// and never a `//` / `///` line. Test modules legitimately build fixture
+    /// ids from ports, and the doc comments deliberately quote the old form to
+    /// explain why it is gone — neither reaches a spawn.
+    ///
+    /// **The cut is anchored on the test MODULE, not the bare attribute.**
+    /// `#[cfg(test)]` also decorates test-only *helper items* at column 0, and
+    /// cutting at the first one discards every real function after it. Measured
+    /// on this tree, `"\n#[cfg(test)]\n"` cut `process/manager.rs` at line 455
+    /// (its `#[cfg(test)] pub fn read_slot_sha`) instead of 4448 and
+    /// `build_monitor.rs` at 2179 instead of 3732 — hiding 21,654 of 65,665
+    /// `src/` lines, including `reap_stale_test_runners`, `start_managed_runner`
+    /// and `apply_non_primary_instance_env`, i.e. the exact function this branch
+    /// extracted to hold `QONTINUI_INSTANCE_NAME`. A false NEGATIVE, and
+    /// invisible: the guard still passed.
+    ///
+    /// It must be `mod ` and not `mod tests`: `supervisor_bridge.rs` alone has
+    /// five named test modules (`mod heartbeat_body_tests`, …).
+    ///
+    /// **Line endings are normalized to LF before the split.**
+    /// `fs::read_to_string` does no newline translation, so on a CRLF checkout
+    /// (this repo's default working-copy state — `git` normalizes to LF only on
+    /// commit) a marker written as `"\n#[cfg(test)]\n"` never matches, the
+    /// split silently falls through to "whole file", and every test module in
+    /// the tree gets scanned as if it were production. That is a false POSITIVE
+    /// here, but the same mistake in a guard whose default is "skip" would be a
+    /// silent false negative — so normalize rather than rely on the checkout.
+    fn scan_production_lines(
+        pred: impl Fn(&str) -> bool,
+    ) -> Vec<(std::path::PathBuf, usize, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(
+            files.len() > 20,
+            "the source walk found only {} files under {src:?} — it is not scanning the tree, \
+             so this guard would pass vacuously",
+            files.len()
+        );
+
+        // Anti-vacuity canary. `process/manager.rs` is the largest production
+        // file and the one most likely to grow a spawn path; it is also the file
+        // the bare-attribute split truncated to 455 lines. If the split ever
+        // regresses, its scanned span collapses and this fires — the coverage
+        // loss cannot go silent again. The floor is well under the real span
+        // (~4.4k) so ordinary edits do not trip it.
+        const CANARY: &str = "manager.rs";
+        const CANARY_MIN_PRODUCTION_LINES: usize = 3000;
+        let mut canary_lines = 0usize;
+
+        let mut hits = Vec::new();
+        for path in files {
+            // A file we cannot read must fail loudly, not skip: a silent skip
+            // lets the guard rot into a no-op.
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("spawn-site guard could not read {path:?}: {e}"))
+                .replace("\r\n", "\n");
+            let prod = text
+                .split_once("\n#[cfg(test)]\nmod ")
+                .map(|(before, _)| before)
+                .unwrap_or(&text);
+            if path.ends_with(CANARY) {
+                canary_lines = prod.lines().count();
+            }
+            for (i, line) in prod.lines().enumerate() {
+                let l = line.trim();
+                if l.starts_with("//") {
+                    continue;
+                }
+                if pred(l) {
+                    hits.push((path.clone(), i + 1, l.to_string()));
+                }
+            }
+        }
+
+        assert!(
+            canary_lines >= CANARY_MIN_PRODUCTION_LINES,
+            "the production span of {CANARY} scanned as only {canary_lines} lines (floor \
+             {CANARY_MIN_PRODUCTION_LINES}). The `#[cfg(test)] mod` cut has regressed — most \
+             likely back to the bare `#[cfg(test)]` attribute, which stops at the first \
+             test-only helper item and hides thousands of production lines from every \
+             predicate this scanner runs."
+        );
+
+        hits
+    }
+
+    /// No spawn site anywhere in `src/` may mint a temp runner's instance name
+    /// or id from its PORT.
+    ///
+    /// The env-block assertion in
+    /// `process::manager::tests::non_primary_env_block_keys_instance_name_per_spawn_not_per_port`
+    /// builds its fixture THROUGH [`crate::process::temp_runner_instance_name`], so it
+    /// pins the helper — not the call site's use of it. This test is the only
+    /// thing tying `spawn_test` to the helper, so it is deliberately
+    /// spelling-agnostic and repo-wide:
+    ///
+    /// - **Normalized match, not one literal.** Any production line containing
+    ///   both `"test-{` and `port` is rejected. That covers the original
+    ///   `format!("test-{}", port)`, the inline-capture `format!("test-{port}")`
+    ///   — which is the form a future author is most likely to reach for, since
+    ///   it is the form this file's own rustdoc and tests use — and the
+    ///   `managed.config.port` / `body.port` spellings.
+    /// - **Whole `src/` tree**, not just this file, so a spawn path added in a
+    ///   new module is covered too (the same gap
+    ///   `process::claude_env`'s `KNOWN_SPAWN_SITE_FILES` documents about
+    ///   itself).
+    /// - **Plus a positive assertion** that `spawn_test`'s body still calls
+    ///   `temp_runner_instance_name(&id)`. A negative grep alone would pass if
+    ///   someone deleted the mint entirely, or routed it through a third,
+    ///   port-derived helper whose name happens not to match.
+    #[test]
+    fn no_spawn_site_mints_a_port_derived_instance_name() {
+        // Assembled at runtime so this line does not contain the needle and
+        // self-flag. (It sits inside `mod tests` and is excluded by the
+        // `#[cfg(test)]` split anyway — but only while that split works, and a
+        // guard that depends on its own exclusion to pass is one checkout
+        // setting away from crying wolf. Belt and braces.)
+        let needle = format!("{}{}", "\"test-", '{');
+        let offenders =
+            scan_production_lines(|l| l.contains(needle.as_str()) && l.contains("port"));
+
+        assert!(
+            offenders.is_empty(),
+            "a temp runner's name/id must never be derived from its port — ports 9877-9899 \
+             are recycled, so the second spawn on a port inherits the first's \
+             instance-<name> app-data tree (terminal-sessions.json included). Route it \
+             through `temp_runner_instance_name(&id)` instead. Offending lines: {offenders:#?}"
+        );
+
+        // Positive half: `spawn_test` must still route through the helper.
+        let this_file = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners.rs"),
+        )
+        .expect("this source file must be readable")
+        .replace("\r\n", "\n");
+        let spawn_test_body = this_file
+            .split_once("pub async fn spawn_test(")
+            .map(|(_, after)| after)
+            .expect("spawn_test must exist — did it get renamed?");
+        // Bound the search to spawn_test itself, not the whole rest of the file:
+        // cut at whichever top-level `fn` comes first, so a match in a LATER
+        // function can never satisfy this assertion.
+        let spawn_test_body = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
+            .iter()
+            .filter_map(|marker| spawn_test_body.find(marker))
+            .min()
+            .map(|end| &spawn_test_body[..end])
+            .unwrap_or(spawn_test_body);
+        assert!(
+            spawn_test_body.contains("temp_runner_instance_name(&id)"),
+            "spawn_test no longer mints its instance name via \
+             `temp_runner_instance_name(&id)`. That helper is what keeps \
+             QONTINUI_INSTANCE_NAME in lockstep with the per-spawn runner id; a call site \
+             that stops using it re-opens the port-recycling inheritance even if the \
+             negative grep above still passes."
+        );
+    }
 
     /// A FAILED spawn-test build that had already claimed a slot must still
     /// report `build_slot_id` on the error body.

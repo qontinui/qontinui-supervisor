@@ -656,6 +656,72 @@ pub(crate) fn parse_clamped_i64(env_var: &str, default: i64, min: i64, max: i64)
         .unwrap_or(default)
 }
 
+/// Default upper bound on a **temp** runner's lifetime, in seconds: 24 hours.
+///
+/// Deliberately generous. The bound exists to catch the abandoned-orphan case
+/// the 2026-08-08 incident evidenced (an unowned `requester_id: None` temp
+/// still alive with 31 live PTYs **two days** after it was spawned), not to
+/// police normal use — a temp runner outliving a working session is the
+/// anomaly, and reaping one an operator is actively driving is the worse
+/// failure. Override via `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS`.
+const DEFAULT_TEMP_RUNNER_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Resolved max-age bound for temp runners, read from
+/// `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` at first access.
+///
+/// - unset / unparseable → the 24h default;
+/// - `0` → **disabled**, `None`; no temp runner is ever reaped for age. The
+///   explicit off-switch matters because this is the one sweep rule that kills
+///   a *healthy* process, so an operator running a long-lived temp needs a way
+///   to turn it off without a rebuild (same posture as
+///   `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB=0` and
+///   `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`);
+/// - anything else → clamped to `[3600, 604_800]` (1 hour – 7 days). The floor
+///   is set ABOVE the observed cold-build ceiling: a cold
+///   `spawn-test {rebuild:true}` runs 40–50 min (2382s and 2974s measured — the
+///   same evidence that raised [`DEFAULT_BUILD_TIMEOUT_SECS`] to 5400s), so
+///   3600s is the smallest floor at which a legal setting cannot reap a runner
+///   that has only just finished building. The age itself is measured from
+///   `RunnerState::started_at` (see
+///   [`crate::process::manager::resolve_temp_runner_age`]), so build time is
+///   not charged to the runner's lifetime either — floor and clock are two
+///   independent guards against the same mistake.
+///
+/// Applies to `RunnerKind::Temp` only — see
+/// `process::manager::reap_stale_test_runners`.
+///
+/// Memoized via `OnceLock`, so later env changes are ignored after the first
+/// read. Tests drive [`parse_temp_runner_max_age`] directly to avoid the cache.
+pub fn temp_runner_max_age() -> Option<std::time::Duration> {
+    use std::sync::OnceLock;
+    static AGE: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *AGE.get_or_init(|| {
+        parse_temp_runner_max_age(
+            std::env::var("QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS").ok(),
+        )
+    })
+}
+
+/// Pure decision core behind [`temp_runner_max_age`]; see it for the contract.
+/// Takes the raw env value so the parse/clamp/disable logic is unit-testable
+/// without the `OnceLock` (which memoizes its first read process-wide) and
+/// without mutating the environment (which races every other test).
+pub(crate) fn parse_temp_runner_max_age(raw: Option<String>) -> Option<std::time::Duration> {
+    // Above the measured cold-build ceiling (2974s) — see the doc on
+    // `temp_runner_max_age`. A lower floor would advertise a legal setting that
+    // reaps a runner right after a cold `spawn-test {rebuild:true}` finishes.
+    const MIN_SECS: u64 = 3600;
+    const MAX_SECS: u64 = 7 * 24 * 60 * 60;
+    let secs = match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(0)) => return None,
+        Some(Ok(n)) => n.clamp(MIN_SECS, MAX_SECS),
+        // Missing OR unparseable → the default. An unreadable knob must not
+        // silently disable the bound.
+        _ => DEFAULT_TEMP_RUNNER_MAX_AGE_SECS,
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
+
 /// Resolved maximum entries for the post-mortem `stopped_runners` cache
 /// (see `process::stopped_cache`), read from
 /// `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP` env var at first access.
@@ -978,6 +1044,74 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Temp-runner max-age bound ---
+
+    /// Missing or unreadable knob → the default bound, never "disabled".
+    /// An unparseable value silently turning the safety bound off is the
+    /// failure mode worth pinning (`silent-empty-is-unknown`).
+    #[test]
+    fn temp_runner_max_age_defaults_to_24h_and_never_silently_disables() {
+        let want = std::time::Duration::from_secs(DEFAULT_TEMP_RUNNER_MAX_AGE_SECS);
+        assert_eq!(parse_temp_runner_max_age(None), Some(want));
+        for junk in ["", "  ", "abc", "-1", "12.5", "1e6"] {
+            assert_eq!(
+                parse_temp_runner_max_age(Some(junk.to_string())),
+                Some(want),
+                "unparseable {junk:?} must fall back to the default bound, not disable it"
+            );
+        }
+        assert_eq!(DEFAULT_TEMP_RUNNER_MAX_AGE_SECS, 86_400);
+    }
+
+    /// `0` is the explicit off-switch — the one way to get `None`.
+    #[test]
+    fn temp_runner_max_age_zero_disables_the_bound() {
+        assert_eq!(parse_temp_runner_max_age(Some("0".to_string())), None);
+        assert_eq!(parse_temp_runner_max_age(Some(" 0 ".to_string())), None);
+    }
+
+    /// Clamped to [1 hour, 7 days]. The floor sits ABOVE the measured cold
+    /// `spawn-test {rebuild:true}` ceiling (2382s and 2974s observed — the same
+    /// evidence behind `DEFAULT_BUILD_TIMEOUT_SECS = 5400`), so no legal
+    /// setting can reap a runner that has only just finished building.
+    #[test]
+    fn temp_runner_max_age_clamps_to_a_safe_range() {
+        assert_eq!(
+            parse_temp_runner_max_age(Some("1".to_string())),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_temp_runner_max_age(Some("3599".to_string())),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_temp_runner_max_age(Some("7200".to_string())),
+            Some(std::time::Duration::from_secs(7200))
+        );
+        assert_eq!(
+            parse_temp_runner_max_age(Some(u64::MAX.to_string())),
+            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+        );
+    }
+
+    /// The floor must clear the slowest cold build the repo has measured,
+    /// otherwise a legal setting reaps a runner the moment it finishes
+    /// building. Tied to `DEFAULT_BUILD_TIMEOUT_SECS` so raising the build
+    /// timeout without revisiting this floor fails here.
+    #[test]
+    fn temp_runner_max_age_floor_clears_the_observed_cold_build() {
+        const OBSERVED_COLD_BUILD_SECS: u64 = 2974;
+        let floor = parse_temp_runner_max_age(Some("1".to_string()))
+            .expect("a non-zero setting must yield a bound");
+        assert!(
+            floor.as_secs() > OBSERVED_COLD_BUILD_SECS,
+            "the max-age floor ({}s) must exceed the slowest observed cold \
+             `spawn-test {{rebuild:true}}` ({OBSERVED_COLD_BUILD_SECS}s), or an operator can \
+             legally configure a bound that reaps a runner right after it builds",
+            floor.as_secs()
+        );
+    }
 
     // --- Port constant tests ---
 

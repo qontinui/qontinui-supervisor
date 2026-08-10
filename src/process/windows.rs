@@ -563,7 +563,17 @@ pub async fn remove_instance_config_dir(runner_id: &str, is_primary: bool) -> an
 /// unbounded.
 ///
 /// `runner_name` must be the `managed.config.name` value that the supervisor
-/// passed to the runner as `QONTINUI_INSTANCE_NAME` — not the runner's id.
+/// passed to the runner as `QONTINUI_INSTANCE_NAME`. For a **temp** runner that
+/// value now IS the runner id (`process::temp_runner_instance_name`) —
+/// it used to be `test-<port>`, which made two spawns on a recycled port share
+/// one `instance-<name>` tree. Keep resolving it from `config.name` rather than
+/// substituting `config.id` at a call site: named runners still carry an
+/// operator-supplied name, and the two keys must not be assumed equal.
+///
+/// The name → directory mapping goes through
+/// `process::sanitize_instance_name`, which mirrors the runner's own
+/// `instance.rs:sanitize()`; the round-trip is pinned by
+/// `process::tests::temp_runner_instance_name_survives_the_app_data_sanitizer`.
 ///
 /// Refuses to touch anything for primary runners as a safety check.
 pub async fn remove_runner_app_data_dirs(
@@ -574,18 +584,10 @@ pub async fn remove_runner_app_data_dirs(
         anyhow::bail!("refusing to remove the primary runner's app data dirs");
     }
 
-    // Mirror runner's sanitize() in src-tauri/src/instance.rs.
-    let safe_name: String = runner_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let subdir = format!("instance-{}", safe_name);
+    let subdir = format!(
+        "instance-{}",
+        crate::process::sanitize_instance_name(runner_name)
+    );
 
     let local_app_data = std::env::var("LOCALAPPDATA")
         .ok()

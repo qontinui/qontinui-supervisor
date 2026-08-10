@@ -740,6 +740,16 @@ const STALE_TEST_RUNNER_SWEEP_SECS: u64 = 5 * 60;
 /// Periodically run `purge_stale_test_runners_core` to drain placeholders
 /// left behind by failed or interrupted `spawn-test` calls. Best-effort —
 /// errors are swallowed; the next tick retries.
+///
+/// **Liveness only — do NOT add a max-age bound here.** This is one of two
+/// stale-temp sweeps; the other is `process::manager::reap_stale_test_runners`,
+/// and that one owns the temp-runner max-age bound
+/// (`config::temp_runner_max_age`). Two reasons the split is deliberate: the
+/// core has no `created_at` input and no kill ladder for a *live* process, and
+/// it also backs the operator-facing `POST /runners/purge-stale`, whose
+/// contract is "remove runners whose processes are no longer alive". A second
+/// age rule here would let the two loops disagree about when a healthy runner
+/// dies. See the doc comment on `manager::reap_stale_test_runners`.
 async fn reap_stale_test_runners(state: state::SharedState) {
     let mut interval =
         tokio::time::interval(std::time::Duration::from_secs(STALE_TEST_RUNNER_SWEEP_SECS));

@@ -105,9 +105,133 @@ pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
     })
 }
 
+/// The value a temp runner is given as its `QONTINUI_INSTANCE_NAME` — i.e.
+/// **the runner's own unique id**, never anything derived from its port.
+///
+/// The runner keys its entire `instance-<sanitized_name>` app-data tree off
+/// this string (`qontinui-runner` `src-tauri/src/instance.rs:scope_path`),
+/// including `terminal-sessions.json`. It used to be `format!("test-{port}")`,
+/// and temp ports are recycled inside a 23-slot range (9877-9899) — so two
+/// sequential temp runners on the same port resolved to the SAME instance dir
+/// and the second inherited the first's live terminal-session registry. Plan
+/// `2026-07-20-runner-port-keyed-state-inheritance` moved that store off a
+/// `-<port>` *filename* onto an instance key that was itself port-derived: the
+/// inheritance was renamed, not removed.
+///
+/// The id (`test-<hex-millis>-<hex-seq>`, minted by `routes::runners::uuid_simple`) is already
+/// unique per spawn and already keys every other per-instance resource — the
+/// config/secure-storage dir ([`instance_config_dir`]), the
+/// WebView2 profile, and `QONTINUI_RUNNER_ID` itself. Reusing it here is what
+/// keeps the name and the id from drifting apart again; no second uuid is
+/// minted.
+///
+/// **Teardown follows automatically** because every removal site reads
+/// `managed.config.name`. There are **four**, not three:
+///
+/// 1. `routes::runners::remove_runner` (the `DELETE` handler)
+/// 2. `routes::runners::purge_stale_test_runners_core`
+/// 3. `process::manager::stop_runner_by_id` (auto-remove arm)
+/// 4. `process::manager::reap_stale_test_runners` (the periodic sweep — and the
+///    one that can now kill a *live* runner for age)
+///
+/// All four hand that value to `process::windows::remove_runner_app_data_dirs`,
+/// whose sanitizer ([`sanitize_instance_name`]) mirrors the
+/// runner's. The id's alphabet is `[0-9a-f-]`, so it survives both sanitizers
+/// unchanged (identity mapping) and the dir removed is exactly the dir created
+/// — pinned by
+/// `process::tests::temp_runner_instance_name_survives_the_app_data_sanitizer`.
+///
+/// **Legacy trees are permanently orphaned by this change.** Up to 23
+/// `instance-test-9877` … `instance-test-9899` trees (and their stale
+/// `terminal-sessions.json`) exist on machines that ran the old scheme. Nothing
+/// will ever key onto those names again, so nothing reuses them — which is the
+/// point — and nothing removes them either. Bounded (≤23 dirs, one per port
+/// slot) and harmless, but it makes permanent the orphaned-file janitor that
+/// `2026-07-20-runner-port-keyed-state-inheritance` §7 deferred. That janitor is
+/// now the only thing that will ever clean them up.
+///
+/// Note this deliberately does NOT change
+/// [`crate::config::SupervisorConfig::runner_exe_copy_path`], which stays
+/// port-keyed on purpose (a per-spawn exe path re-triggers a Windows Firewall
+/// prompt on every cold spawn).
+pub(crate) fn temp_runner_instance_name(id: &str) -> String {
+    id.to_string()
+}
+
+/// Map a runner's `QONTINUI_INSTANCE_NAME` to the directory-safe form the
+/// runner itself uses: keep `[A-Za-z0-9-_]`, replace everything else with `_`.
+///
+/// **Byte-for-byte mirror of `qontinui-runner`
+/// `src-tauri/src/instance.rs:sanitize()`**, which is what `instance::scope_path`
+/// applies when it creates the `instance-<sanitized>` app-data tree. The
+/// supervisor's `windows::remove_runner_app_data_dirs` is the only consumer:
+/// it must reconstruct exactly the directory the runner created, or teardown
+/// deletes nothing while the real tree leaks — silently, and once per spawn.
+///
+/// **Cross-platform on purpose**, like [`netstat_parse`] and [`slot_territory`]:
+/// this is a cross-repo contract, and the test pinning it must run on the
+/// Linux-only CI gate that blocks merges rather than only on a Windows box.
+/// The `allow` is the price of that placement (the sole non-test consumer is
+/// `#[cfg(target_os = "windows")]`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn sanitize_instance_name(runner_name: &str) -> String {
+    runner_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::instance_config_dir;
+    use super::{instance_config_dir, sanitize_instance_name};
+
+    /// The sanitizer still agrees with the runner's `sanitize()` on the exact
+    /// cases the runner pins (`instance.rs::sanitize_keeps_safe_chars`).
+    #[test]
+    fn sanitize_instance_name_mirrors_the_runner_side_sanitizer() {
+        assert_eq!(sanitize_instance_name("test-runner_1"), "test-runner_1");
+        assert_eq!(sanitize_instance_name("abc/def"), "abc_def");
+        assert_eq!(sanitize_instance_name("weird name!"), "weird_name_");
+    }
+
+    /// The instance name a temp spawn mints must survive the app-data
+    /// sanitizer **unchanged**, so the tree teardown removes is exactly the
+    /// tree the runner created.
+    ///
+    /// [`temp_runner_instance_name`] returns the runner id
+    /// (`test-<hex-millis>-<hex-seq>`), whose alphabet is `[0-9a-f-]` — every
+    /// character is already in the keep-set of BOTH [`sanitize_instance_name`]
+    /// and the runner's `instance.rs:sanitize()`, so the mapping is the
+    /// identity and the two repos cannot disagree about the resulting
+    /// `instance-<name>` dir.
+    ///
+    /// This is the "worse than the bug" risk from plan
+    /// `2026-08-10-temp-runner-session-restore-isolation`: re-keying
+    /// `QONTINUI_INSTANCE_NAME` while teardown still resolves the old key turns
+    /// one reused directory into unbounded per-spawn clutter.
+    #[test]
+    fn temp_runner_instance_name_survives_the_app_data_sanitizer() {
+        for id in [
+            "test-19fe1161aa3-0".to_string(),
+            "test-1a02b3c4d5e-ff".to_string(),
+            format!("test-{:x}-{:x}", u64::MAX, u32::MAX),
+        ] {
+            let name = super::temp_runner_instance_name(&id);
+            assert_eq!(
+                sanitize_instance_name(&name),
+                name,
+                "the minted instance name {name:?} must be its own sanitized form — \
+                 otherwise the runner creates instance-<sanitized> while teardown \
+                 targets a different string"
+            );
+        }
+    }
 
     /// A degenerate id must resolve to `None`, never to a path.
     ///

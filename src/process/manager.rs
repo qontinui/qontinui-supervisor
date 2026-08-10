@@ -56,6 +56,80 @@ pub fn is_temp_runner(runner_id: &str) -> bool {
     runner_kind(runner_id).is_temp()
 }
 
+/// Has this runner outlived the max-age bound, and is it a kind the bound is
+/// allowed to apply to?
+///
+/// The one sweep rule in the supervisor that kills a **healthy** process, so
+/// its scope is written as an explicit `kind.is_temp()` **allowlist**, never as
+/// `!kind.is_primary()` — exactly the shape (and for exactly the reason) of
+/// [`crate::process::job::should_assign_to_ephemeral_job`]: `RunnerKind` is
+/// `#[non_exhaustive]`, so a variant added upstream later must default to *not
+/// reaped*, and getting that inverted was the 2026-07-27 incident. Primary,
+/// named, and external runners are user-owned and are **never** age-bounded,
+/// whatever `max_age` says.
+///
+/// `max_age: None` disables the bound entirely (see
+/// [`crate::config::temp_runner_max_age`]).
+///
+/// How long has this temp runner been *running*, and by which clock?
+///
+/// **`ManagedRunner::created_at` is the wrong clock on its own.** It starts when
+/// `spawn_test` reserves the placeholder — BEFORE the build. A cold
+/// `spawn-test {rebuild:true}` is 40-50 min of `npm run build` + `cargo build`
+/// (measured; `DEFAULT_BUILD_TIMEOUT_SECS` is 5400s for exactly that reason),
+/// so charging build time to the runner's lifetime would reap a runner moments
+/// after it finally bound its port, and the log would claim "alive 2700s" for a
+/// process alive 90 seconds.
+///
+/// So prefer `RunnerState::started_at`, which `start_exe_mode_for_runner` sets
+/// when the child actually starts (and `orphan_scan` sets on adoption). Fall
+/// back to time-since-first-seen only when it is absent — a runner with
+/// `running=true` and no `started_at` is an unexpected state, and the fallback
+/// is conservative in the safe direction only insofar as it can never *under*
+/// report.
+///
+/// A `started_at` in the FUTURE (clock skew, NTP step) yields a negative delta;
+/// `to_std()` fails on it and we fall back rather than panic or wrap.
+///
+/// Returns the age plus a short human label naming which clock produced it, so
+/// the kill log says which one it used instead of leaving the operator to guess.
+/// Pure — every input injected — so it is unit-testable without a registry or a
+/// real clock.
+pub fn resolve_temp_runner_age(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    since_first_seen: Duration,
+) -> (Duration, &'static str) {
+    match started_at.map(|s| now.signed_duration_since(s)) {
+        Some(delta) => match delta.to_std() {
+            Ok(d) => (d, "since process start"),
+            // Negative delta — `started_at` is in the future. Clock skew, not a
+            // real lifetime; do not trust it.
+            Err(_) => (
+                since_first_seen,
+                "since first seen (started_at is in the future)",
+            ),
+        },
+        None => (since_first_seen, "since first seen (no started_at)"),
+    }
+}
+
+/// Pure — every input injected — so the policy is unit-testable without a
+/// registry, a clock, or the env.
+pub fn exceeds_temp_runner_max_age(
+    kind: &qontinui_types::wire::runner_kind::RunnerKind,
+    age: Duration,
+    max_age: Option<Duration>,
+) -> bool {
+    if !kind.is_temp() {
+        return false;
+    }
+    match max_age {
+        Some(max) => age >= max,
+        None => false,
+    }
+}
+
 /// Decide the `QONTINUI_API_URL` value to set on a spawned runner child.
 ///
 /// Policy (plan 2026-07-08-runner-relay-honor-persisted-backend-url):
@@ -1249,7 +1323,29 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
 ///
 /// A test runner is considered stale if:
 ///   - Its `running` flag is false, OR
-///   - Its `running` flag is true but nothing is listening on its port (crash).
+///   - Its `running` flag is true but nothing is listening on its port (crash),
+///     OR
+///   - It is a `RunnerKind::Temp` that has outlived
+///     [`crate::config::temp_runner_max_age`] — the only rule here that reaps a
+///     **healthy** runner.
+///
+/// **This is the sweeper that owns the max-age bound, and it owns it alone.**
+/// There are two independent stale-temp sweeps, both spawned from `main.rs`:
+/// this one, and `main::reap_stale_test_runners` →
+/// `routes::runners::purge_stale_test_runners_core`. The bound lives here for
+/// two reasons.
+/// (1) **It is the only one that can act on it** — this loop is the sole holder
+/// of `ManagedRunner::created_at` (the core has no time input at all), and it
+/// is the one with the full kill ladder (tree-kill by pid → kill by port →
+/// confirm the port freed) that terminating a live process needs; the core's
+/// Windows-only best-effort `kill_by_port` runs only after it has already
+/// decided the process is dead. (2) **The core must stay liveness-only**,
+/// because it also backs the operator-facing `POST /runners/purge-stale`, whose
+/// contract is "remove runners whose processes are no longer alive" — reaping a
+/// healthy runner from under an operator who asked to tidy up dead records
+/// would be a surprise. So the two loops do not disagree: the core's
+/// `port_alive => continue` remains the whole truth for the core, and the
+/// max-age exception exists in exactly one place.
 ///
 /// **Active-build grace:** a placeholder with `running=false` is the normal
 /// pre-spawn state while `spawn-test --rebuild` runs `npm run build` +
@@ -1264,6 +1360,23 @@ pub async fn reap_stale_test_runners(state: SharedState) {
     const INTERVAL: Duration = Duration::from_secs(5 * 60);
     // Wait a bit on startup to let normal init complete
     tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Resolved once — the accessor memoizes anyway, and reading it here means
+    // the setting is reported at startup rather than only when it first bites.
+    let max_age_bound = crate::config::temp_runner_max_age();
+    match max_age_bound {
+        Some(max) => info!(
+            "Stale-temp-runner sweep armed with a {}s max-age bound (RunnerKind::Temp only; \
+             primary/named/external are exempt). Override with \
+             QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS, 0 to disable.",
+            max.as_secs()
+        ),
+        None => info!(
+            "Stale-temp-runner sweep running with the max-age bound DISABLED \
+             (QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS=0) — a healthy temp runner will \
+             never be reaped for age."
+        ),
+    }
 
     loop {
         tokio::time::sleep(INTERVAL).await;
@@ -1288,6 +1401,28 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if managed.created_at.elapsed() < Duration::from_secs(120) {
                 continue;
             }
+            // Max-age bound. Measured from when the runner actually STARTED,
+            // not from when `spawn-test` reserved its placeholder — see
+            // `resolve_temp_runner_age`. A cold `spawn-test {rebuild:true}`
+            // spends 40-50 min building before the child ever runs, and
+            // charging that to the runner's lifetime would reap it moments
+            // after it finally came up.
+            let (age, age_basis) = {
+                let started_at = managed.runner.read().await.started_at;
+                resolve_temp_runner_age(
+                    started_at,
+                    chrono::Utc::now(),
+                    managed.created_at.elapsed(),
+                )
+            };
+            // Second gate is DEFENSIVE, not a different predicate: the loop
+            // already filtered on `is_temp_runner(&config.id)` (the id prefix)
+            // above, and this re-asks the same question of the typed
+            // `RunnerKind`. Two independent spellings must both say "temp"
+            // before anything healthy is killed.
+            let over_max_age =
+                exceeds_temp_runner_max_age(&managed.config.kind(), age, max_age_bound);
+
             let is_running = {
                 let runner = managed.runner.read().await;
                 runner.running
@@ -1301,12 +1436,77 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if !is_running && any_build_active {
                 continue;
             }
+            // True only on the max-age arm — i.e. the one path that reaches the
+            // kill ladder with a runner we just observed LISTENING. It makes the
+            // ladder's terminal "port still busy → drop the record anyway" rule
+            // conditional; see there.
+            let mut age_kill = false;
+
             if is_running {
-                if crate::process::port::is_port_listening(managed.config.port) {
-                    continue; // genuinely alive
+                let port_alive = crate::process::port::is_port_listening(managed.config.port);
+                if port_alive && !over_max_age {
+                    continue; // genuinely alive, and inside its lifetime bound
                 }
-                // Port free but state says running — crashed
-                {
+                if port_alive {
+                    // A HEALTHY temp runner is about to be killed for age. This
+                    // is the only place the sweep does that, so say so loudly
+                    // and completely BEFORE acting — with the runner's identity,
+                    // its measured age (and which clock measured it), the bound
+                    // it broke, and the knob that changes or disables the bound.
+                    // An operator who finds a temp runner gone must be able to
+                    // learn why from the log alone.
+                    age_kill = true;
+                    let owner = managed.requester_id.read().await.clone();
+                    let msg = format!(
+                        "Reaping temp runner '{}' (id {}, port {}, requester {:?}) — it has \
+                         been alive {}s ({}), past the {}s max-age bound. Raise or disable the \
+                         bound with QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS \
+                         (0 = never reap for age). Only RunnerKind::Temp is ever age-bounded; \
+                         primary/named/external runners are exempt, and `protected: true` does \
+                         NOT exempt a temp runner (every temp is created protected, so honouring \
+                         it here would make the bound inert).",
+                        managed.config.name,
+                        managed.config.id,
+                        managed.config.port,
+                        owner,
+                        age.as_secs(),
+                        age_basis,
+                        max_age_bound.map(|d| d.as_secs()).unwrap_or(0),
+                    );
+                    warn!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                        .await;
+
+                    // Latch the stop INTENT before the kill ladder, exactly as
+                    // `stop_runner_by_id` does. This is a supervisor-spawned
+                    // child with a live `Child` handle, so `start_managed_runner`
+                    // has a `monitor_runner_process_exit` watching it; without
+                    // the flag the age-kill exit reaches `decide_crash_restart`
+                    // as `had_child_handle = true, stop_requested = false,
+                    // clean_exit = false` — a textbook crash — and a runner
+                    // armed via `POST /runners/{id}/watchdog {"enabled": true}`
+                    // gets auto-restarted for a death the supervisor itself
+                    // caused.
+                    //
+                    // The dangerous case is not the noisy one: on the
+                    // `age_kill => continue` path below we deliberately KEEP the
+                    // record, so a process that dies just after the 5s
+                    // `wait_for_port_free` window would be restarted into that
+                    // surviving record — and `start_managed_runner` sets
+                    // `started_at = Some(now)`, resetting the measured age to
+                    // zero. The over-age temp would become unreapable in
+                    // perpetuity: kill → resurrect → age resets → the next sweep
+                    // measures a young runner.
+                    //
+                    // No unwind is needed on the `continue` path: the flag's
+                    // lifecycle is "latched on stop request, cleared on the next
+                    // start", so a retry simply re-latches and a legitimate
+                    // operator restart clears it.
+                    managed.runner.write().await.stop_requested = true;
+                } else {
+                    // Port free but state says running — crashed
                     let mut runner = managed.runner.write().await;
                     runner.running = false;
                     runner.pid = None;
@@ -1343,12 +1543,39 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                     port, e
                 );
             }
-            // Confirm the process actually released the port. If it didn't, log
-            // loudly but still drop the record — leaving it would re-trip the
-            // same reap next cycle; the reconcile sweep will re-kill any
-            // survivor by port. Bounded so a wedged process never stalls the
-            // reaper loop.
+            // Confirm the process actually released the port.
             if !crate::process::port::wait_for_port_free(port, 5).await {
+                if age_kill {
+                    // The max-age arm is the ONLY path that reaches here with a
+                    // runner we just watched LISTENING. Forgetting it now would
+                    // delete its WebView2 profile, `instance-<name>` tree and
+                    // instance config dir out from under a live process, and
+                    // leave that process serving the port untracked. The port
+                    // allocator in `routes::runners::spawn_test` is
+                    // registry-only (it derives `used_ports` from
+                    // `runners.values()` and never probes the socket), so the
+                    // next spawn would reuse this port and `wait_for_healthy`
+                    // would poll the ZOMBIE's `/health` — handing the caller a
+                    // "healthy" runner id served by an untracked,
+                    // config-dir-less process.
+                    //
+                    // We know it was alive, so retrying on the next sweep is
+                    // both safe and correct: the runner is still registered,
+                    // still owns its dirs, and is still over the bound.
+                    warn!(
+                        "reaper: temp runner '{}' (id {}, pid {:?}) survived the max-age kill — \
+                         port {} is still in use after 5s. KEEPING the registry record and its \
+                         on-disk dirs; retrying on the next sweep. Dropping it here would orphan \
+                         a LIVE process onto a port the allocator would then hand to a new spawn.",
+                        name, id, pid, port
+                    );
+                    continue;
+                }
+                // Dead-runner arms (running=false, or running=true with a dead
+                // port): the process was already concluded dead, so log loudly
+                // but still drop the record — leaving it would re-trip the same
+                // reap next cycle; the reconcile sweep will re-kill any survivor
+                // by port. Bounded so a wedged process never stalls the loop.
                 warn!(
                     "reaper: port {} still in use after killing stale test runner '{}' \
                      (pid {:?}); dropping record anyway — reconcile sweep will re-kill by port",
@@ -1937,6 +2164,92 @@ fn apply_instance_dir_env(
     Ok(dir)
 }
 
+/// Apply the whole **non-primary** per-instance env block to a spawn command.
+///
+/// Everything a secondary (temp / named) runner needs in order to keep its
+/// state off the primary's, in one place:
+///
+/// | Var | Keyed on | Why |
+/// |---|---|---|
+/// | `QONTINUI_INSTANCE_NAME` | `config.name` | Roots the runner's `instance-<sanitized>` app-data tree (`instance::scope_path`) — the terminal-session registry, dev logs, macros, prompts, contexts. |
+/// | `QONTINUI_PRIMARY_PORT` | caller-resolved | The runner requires BOTH this and the instance name to classify itself as a secondary; unset makes it silently behave as a primary. |
+/// | `WEBVIEW2_USER_DATA_FOLDER` | `config.id` | Isolated localStorage / IndexedDB / cookies (Windows only). |
+/// | `QONTINUI_CONFIG_DIR` + `QONTINUI_SECURE_STORAGE_DIR` | `config.id` | Per-instance config + pairing store, via [`apply_instance_dir_env`]. |
+/// | `QONTINUI_PRIMARY_SECURE_STORAGE_DIR` | fixed | Path *pointer* (not a credential) so a secondary can seed the primary's device machine key. |
+///
+/// **`QONTINUI_INSTANCE_NAME` must be unique per SPAWN, not per port.** Temp
+/// ports are recycled inside 9877-9899, so a port-derived name made two
+/// sequential temps resolve to the same instance dir and the second inherited
+/// the first's live `terminal-sessions.json`. `routes::runners::spawn_test`
+/// mints it via `process::temp_runner_instance_name(&id)`; the assertion lives in
+/// `tests::non_primary_env_block_keys_instance_name_per_spawn_not_per_port`.
+///
+/// Extracted as a standalone function for the same reason
+/// [`apply_instance_dir_env`] is: so a test can drive it against a REAL
+/// [`Command`] and read the vars back, rather than re-deriving the body.
+/// The primary-port lookup stays in the caller because it is async.
+fn apply_non_primary_instance_env(
+    cmd: &mut Command,
+    config: &crate::config::RunnerConfig,
+    primary_port: u16,
+) -> Result<std::path::PathBuf, SupervisorError> {
+    cmd.env("QONTINUI_INSTANCE_NAME", &config.name);
+    cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
+
+    // Per-runner WebView2 data dir — non-primary runners get isolated
+    // localStorage, IndexedDB, cookies, and caches. Primary keeps the
+    // default path so its existing state (auth, terminal layouts, etc.)
+    // is preserved. This prevents state bleed-over when spawning temp
+    // test runners and eliminates the "216 restored terminals" problem
+    // where one runner's persisted UI state floods every other runner.
+    // On non-Windows the variable is ignored by other webview backends,
+    // so this is harmless but keeps behavior consistent.
+    #[cfg(target_os = "windows")]
+    if let Some(webview_dir) = webview2_user_data_folder(&config.id, false) {
+        // Ensure the folder exists so WebView2 doesn't race to create
+        // it against the parent dir's permissions.
+        if let Err(e) = std::fs::create_dir_all(&webview_dir) {
+            warn!(
+                "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
+                webview_dir, config.name, e
+            );
+        }
+        info!(
+            "Runner '{}' using isolated WebView2 data dir: {:?}",
+            config.name, webview_dir
+        );
+        cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
+    }
+
+    // Per-instance config + secure-storage dir. `instance_config_dir` is
+    // the single source of truth for this path — the spawn-test paired
+    // profile writer and the instance-dir reaper resolve it through the
+    // same helper so a snapshot can never be copied somewhere the child
+    // does not read (see `process::instance_config_dir`). Failures here
+    // abort the spawn rather than letting the child fall back to the
+    // shared data dir.
+    let instance_dir = apply_instance_dir_env(cmd, &config.id)?;
+    debug!(
+        "Runner '{}' using per-instance config dir: {:?}",
+        config.name, instance_dir
+    );
+
+    // Point the non-primary runner at the PRIMARY's secure-storage dir so it
+    // can seed the primary's device machine key (`dmk_`) into its own
+    // isolated store and reach Tier 2 headlessly (plan
+    // `2026-07-13-…-auth-remediation`, R4.1). This is a *computed path
+    // pointer*, NOT the raw credential — the spawned runner decrypts the
+    // primary's `auth_tokens.enc` itself with its own machine-derived
+    // `SecureStorage` key (same OS user + host → same key), keeping the
+    // high-privilege `dmk_` out of process listings, argv, and logs. Inert
+    // until the runner reads it; the runner degrades to Tier 0/1 if absent.
+    if let Some(primary_dir) = primary_secure_storage_dir() {
+        cmd.env("QONTINUI_PRIMARY_SECURE_STORAGE_DIR", &primary_dir);
+    }
+
+    Ok(instance_dir)
+}
+
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
@@ -2263,7 +2576,6 @@ async fn start_exe_mode_for_runner(
     // the scheduler and `QONTINUI_PRIMARY_PORT` so they can proxy process
     // commands to the primary.
     if !managed.config.kind().is_primary() {
-        cmd.env("QONTINUI_INSTANCE_NAME", &managed.config.name);
         // Find the primary runner's port for process log proxying.
         //
         // The user-started primary isn't in the supervisor's runners
@@ -2280,59 +2592,11 @@ async fn start_exe_mode_for_runner(
             .await
             .map(|p| p.config.port)
             .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
-        cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
 
-        // Per-runner WebView2 data dir — non-primary runners get isolated
-        // localStorage, IndexedDB, cookies, and caches. Primary keeps the
-        // default path so its existing state (auth, terminal layouts, etc.)
-        // is preserved. This prevents state bleed-over when spawning temp
-        // test runners and eliminates the "216 restored terminals" problem
-        // where one runner's persisted UI state floods every other runner.
-        // On non-Windows the variable is ignored by other webview backends,
-        // so this is harmless but keeps behavior consistent.
-        #[cfg(target_os = "windows")]
-        if let Some(webview_dir) = webview2_user_data_folder(&managed.config.id, false) {
-            // Ensure the folder exists so WebView2 doesn't race to create
-            // it against the parent dir's permissions.
-            if let Err(e) = std::fs::create_dir_all(&webview_dir) {
-                warn!(
-                    "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
-                    webview_dir, managed.config.name, e
-                );
-            }
-            info!(
-                "Runner '{}' using isolated WebView2 data dir: {:?}",
-                managed.config.name, webview_dir
-            );
-            cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
-        }
-
-        // Per-instance config + secure-storage dir. `instance_config_dir` is
-        // the single source of truth for this path — the spawn-test paired
-        // profile writer and the instance-dir reaper resolve it through the
-        // same helper so a snapshot can never be copied somewhere the child
-        // does not read (see `process::instance_config_dir`). Extracted into
-        // `apply_instance_dir_env` so the env application itself is unit-tested
-        // against a real `Command`; failures here abort the spawn rather than
-        // letting the child fall back to the shared data dir.
-        let instance_dir = apply_instance_dir_env(&mut cmd, &managed.config.id)?;
-        debug!(
-            "Runner '{}' using per-instance config dir: {:?}",
-            managed.config.name, instance_dir
-        );
-
-        // Point the non-primary runner at the PRIMARY's secure-storage dir so it
-        // can seed the primary's device machine key (`dmk_`) into its own
-        // isolated store and reach Tier 2 headlessly (plan
-        // `2026-07-13-…-auth-remediation`, R4.1). This is a *computed path
-        // pointer*, NOT the raw credential — the spawned runner decrypts the
-        // primary's `auth_tokens.enc` itself with its own machine-derived
-        // `SecureStorage` key (same OS user + host → same key), keeping the
-        // high-privilege `dmk_` out of process listings, argv, and logs. Inert
-        // until the runner reads it; the runner degrades to Tier 0/1 if absent.
-        if let Some(primary_dir) = primary_secure_storage_dir() {
-            cmd.env("QONTINUI_PRIMARY_SECURE_STORAGE_DIR", &primary_dir);
-        }
+        // The rest of the block is `apply_non_primary_instance_env` so it can
+        // be asserted as a WHOLE against a real `Command` in tests — see that
+        // function for the per-var rationale.
+        apply_non_primary_instance_env(&mut cmd, &managed.config, primary_port)?;
     }
 
     // Apply the registered env forwarders. Order is load-bearing — see
@@ -4187,6 +4451,132 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
+    // Temp-runner max-age bound (plan
+    // 2026-08-10-temp-runner-session-restore-isolation, Phase 5).
+
+    fn all_kinds() -> Vec<qontinui_types::wire::runner_kind::RunnerKind> {
+        use qontinui_types::wire::runner_kind::RunnerKind;
+        vec![
+            RunnerKind::Primary,
+            RunnerKind::Named {
+                name: "named-9880".to_string(),
+            },
+            RunnerKind::Temp {
+                id: "test-abc123".to_string(),
+            },
+            RunnerKind::External,
+        ]
+    }
+
+    /// The bound is an `is_temp()` ALLOWLIST. A user-owned runner is never
+    /// age-reaped, no matter how old it is or how tight the bound — the
+    /// `!is_primary()` denylist spelling of this rule is what took the
+    /// operator's primary down on 2026-07-27.
+    #[test]
+    fn max_age_bound_applies_to_temp_runners_only() {
+        let ancient = Duration::from_secs(365 * 24 * 60 * 60);
+        let tight = Some(Duration::from_secs(1));
+        for kind in all_kinds() {
+            let reaped = exceeds_temp_runner_max_age(&kind, ancient, tight);
+            assert_eq!(
+                reaped,
+                kind.is_temp(),
+                "{kind:?}: only RunnerKind::Temp may be reaped for age — primary, named \
+                 and external runners are user-owned"
+            );
+        }
+    }
+
+    /// A temp runner inside the bound survives; one past it does not.
+    #[test]
+    fn max_age_bound_fires_only_past_the_bound() {
+        let kind = qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-abc123".to_string(),
+        };
+        let max = Duration::from_secs(3600);
+        assert!(!exceeds_temp_runner_max_age(
+            &kind,
+            Duration::from_secs(0),
+            Some(max)
+        ));
+        assert!(!exceeds_temp_runner_max_age(
+            &kind,
+            Duration::from_secs(3599),
+            Some(max)
+        ));
+        assert!(exceeds_temp_runner_max_age(
+            &kind,
+            Duration::from_secs(3600),
+            Some(max)
+        ));
+        assert!(exceeds_temp_runner_max_age(
+            &kind,
+            Duration::from_secs(100_000),
+            Some(max)
+        ));
+    }
+
+    /// The age clock is `started_at`, NOT time-since-placeholder. This is the
+    /// cold-build case: `spawn_test` reserved the placeholder 50 minutes ago,
+    /// the child bound its port 90 seconds ago. The runner is 90s old, not
+    /// 3000s — reading it the other way reaps a brand-new runner on the very
+    /// next sweep, every retry.
+    #[test]
+    fn age_is_measured_from_process_start_not_from_the_spawn_request() {
+        let now = chrono::Utc::now();
+        let started = now - chrono::Duration::seconds(90);
+        let (age, basis) = resolve_temp_runner_age(Some(started), now, Duration::from_secs(3000));
+        assert_eq!(age.as_secs(), 90);
+        assert!(basis.contains("process start"), "basis was {basis:?}");
+
+        // And that age is INSIDE a 1h bound, where the placeholder clock would
+        // have blown straight past it.
+        let kind = qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-abc123".to_string(),
+        };
+        let bound = Some(Duration::from_secs(3600));
+        assert!(!exceeds_temp_runner_max_age(&kind, age, bound));
+        assert!(exceeds_temp_runner_max_age(
+            &kind,
+            Duration::from_secs(3000 * 2),
+            bound
+        ));
+    }
+
+    /// No `started_at` → fall back to time-since-first-seen rather than
+    /// reporting zero age (which would make the bound unreachable).
+    #[test]
+    fn age_falls_back_to_first_seen_without_started_at() {
+        let now = chrono::Utc::now();
+        let (age, basis) = resolve_temp_runner_age(None, now, Duration::from_secs(4242));
+        assert_eq!(age.as_secs(), 4242);
+        assert!(basis.contains("first seen"), "basis was {basis:?}");
+    }
+
+    /// A `started_at` in the FUTURE (clock skew / NTP step) must not panic or
+    /// wrap into a huge age that reaps a live runner — fall back and say so.
+    #[test]
+    fn age_falls_back_when_started_at_is_in_the_future() {
+        let now = chrono::Utc::now();
+        let started = now + chrono::Duration::seconds(600);
+        let (age, basis) = resolve_temp_runner_age(Some(started), now, Duration::from_secs(11));
+        assert_eq!(age.as_secs(), 11);
+        assert!(basis.contains("future"), "basis was {basis:?}");
+    }
+
+    /// `None` is the off-switch: nothing is ever reaped for age, including a
+    /// temp runner that has been alive for a year.
+    #[test]
+    fn max_age_bound_disabled_never_reaps() {
+        let ancient = Duration::from_secs(365 * 24 * 60 * 60);
+        for kind in all_kinds() {
+            assert!(
+                !exceeds_temp_runner_max_age(&kind, ancient, None),
+                "{kind:?}: a disabled bound must never reap anything"
+            );
+        }
+    }
+
     // QONTINUI_API_URL child-env policy (plan 2026-07-08).
 
     #[test]
@@ -4287,6 +4677,163 @@ mod tests {
             );
         }
         assert!(expected.is_dir(), "the instance dir must have been created");
+    }
+
+    /// Read a `Command`'s env overrides back as a plain map.
+    fn command_envs(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// A `RunnerConfig` shaped exactly like the one `spawn_test` builds — the
+    /// instance name comes from the same helper the spawn site uses, so this
+    /// test tracks the real minting policy instead of a copy of it.
+    fn temp_config(id: &str, port: u16) -> crate::config::RunnerConfig {
+        crate::config::RunnerConfig {
+            id: id.to_string(),
+            name: crate::process::temp_runner_instance_name(id),
+            port,
+            kind: qontinui_types::wire::runner_kind::RunnerKind::Temp { id: id.to_string() },
+            protected: true,
+            server_mode: false,
+            restate_ingress_port: None,
+            restate_admin_port: None,
+            restate_service_port: None,
+            external_restate_admin_url: None,
+            external_restate_ingress_url: None,
+            extra_env: Default::default(),
+        }
+    }
+
+    /// The non-primary env block, asserted **as a whole** against a real
+    /// `Command` — `QONTINUI_INSTANCE_NAME`, `QONTINUI_PRIMARY_PORT` and
+    /// `WEBVIEW2_USER_DATA_FOLDER` together, because it is the combination
+    /// that isolates a secondary's state from the primary's and from other
+    /// secondaries'. Sibling of
+    /// `apply_instance_dir_env_sets_both_vars_to_instance_config_dir`, which
+    /// covers the two config-dir vars.
+    ///
+    /// **The load-bearing assertion is that `QONTINUI_INSTANCE_NAME` is unique
+    /// per SPAWN, not per port.** Both configs here take the SAME port —
+    /// temp ports are recycled inside the 23-slot range 9877-9899, so a
+    /// second spawn routinely lands on a port a previous temp just released.
+    /// While the name was `format!("test-{port}")`, those two spawns shared
+    /// one `instance-test-<port>` app-data tree, and the second runner booted
+    /// on the first's live `terminal-sessions.json` — 283 inherited PTYs
+    /// observed 2026-08-08 (plan
+    /// `2026-08-10-temp-runner-session-restore-isolation`). Nothing failed
+    /// when that scheme changed, because no test asserted it; this is that
+    /// test.
+    #[test]
+    fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
+        // Two sequential spawns that RECYCLE the same port.
+        const PORT: u16 = 9877;
+        const PRIMARY_PORT: u16 = 9876;
+        let pid = std::process::id();
+        let first = temp_config(&format!("test-envblock-a-{pid}"), PORT);
+        let second = temp_config(&format!("test-envblock-b-{pid}"), PORT);
+
+        if instance_config_dir(&first.id).is_none() {
+            // No resolvable config dir on this platform — nothing to assert.
+            return;
+        }
+        // Both dirs land under the operator's REAL app-data roots (the block
+        // creates them), so they must not survive a failing assertion below.
+        // Same guard shape as `apply_instance_dir_env_sets_both_vars_to_…`.
+        let _cleanup = scopeguard::guard(
+            vec![first.id.clone(), second.id.clone()],
+            |ids: Vec<String>| {
+                for id in ids {
+                    if let Some(dir) = instance_config_dir(&id) {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    #[cfg(target_os = "windows")]
+                    if let Some(dir) = webview2_user_data_folder(&id, false) {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+            },
+        );
+
+        let mut cmd_a = Command::new("cargo");
+        let mut cmd_b = Command::new("cargo");
+        super::apply_non_primary_instance_env(&mut cmd_a, &first, PRIMARY_PORT)
+            .expect("must resolve + create");
+        super::apply_non_primary_instance_env(&mut cmd_b, &second, PRIMARY_PORT)
+            .expect("must resolve + create");
+        let envs_a = command_envs(&cmd_a);
+        let envs_b = command_envs(&cmd_b);
+
+        let name_a = envs_a
+            .get("QONTINUI_INSTANCE_NAME")
+            .cloned()
+            .flatten()
+            .expect("a secondary must always be given QONTINUI_INSTANCE_NAME");
+        let name_b = envs_b
+            .get("QONTINUI_INSTANCE_NAME")
+            .cloned()
+            .flatten()
+            .expect("a secondary must always be given QONTINUI_INSTANCE_NAME");
+
+        assert_ne!(
+            name_a, name_b,
+            "two temp runners spawned on the SAME recycled port {PORT} must get \
+             DIFFERENT QONTINUI_INSTANCE_NAME values — the runner roots its whole \
+             instance-<name> app-data tree (terminal-sessions.json included) on this \
+             string, so a port-derived name makes the second spawn inherit the \
+             first's live terminal registry"
+        );
+        for (name, config) in [(&name_a, &first), (&name_b, &second)] {
+            assert_eq!(
+                name, &config.id,
+                "the instance name must BE the per-spawn runner id (no second uuid, \
+                 nothing port-derived) so it stays in lockstep with the id-keyed \
+                 instance_config_dir / WebView2 / QONTINUI_RUNNER_ID resources"
+            );
+            assert!(
+                !name.contains(&PORT.to_string()),
+                "instance name {name:?} must carry no trace of the recycled port"
+            );
+        }
+
+        for (envs, config) in [(&envs_a, &first), (&envs_b, &second)] {
+            assert_eq!(
+                envs.get("QONTINUI_PRIMARY_PORT").cloned().flatten(),
+                Some(PRIMARY_PORT.to_string()),
+                "a secondary needs BOTH the instance name and the primary port to \
+                 classify itself as secondary; unset makes it behave as a primary"
+            );
+
+            #[cfg(target_os = "windows")]
+            {
+                let want = webview2_user_data_folder(&config.id, false)
+                    .expect("LOCALAPPDATA resolves on Windows")
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(
+                    envs.get("WEBVIEW2_USER_DATA_FOLDER").cloned().flatten(),
+                    Some(want),
+                    "the WebView2 profile must be keyed on the per-spawn runner id \
+                     so two temps never share localStorage/IndexedDB/cookies"
+                );
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = config;
+        }
+
+        #[cfg(target_os = "windows")]
+        assert_ne!(
+            envs_a.get("WEBVIEW2_USER_DATA_FOLDER"),
+            envs_b.get("WEBVIEW2_USER_DATA_FOLDER"),
+            "same-port spawns must not share a WebView2 profile"
+        );
     }
 
     /// A slot freshly built 5 minutes after the running copy is "stale".
