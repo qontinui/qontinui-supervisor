@@ -333,13 +333,21 @@ looked at the slot where a cross-slot kill would show. Declare them with
 `-RunnerRepo` / `-PoolSize` (or `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) when the
 supervisor cannot.
 
+That route flakes because it *used* to run `git fetch` inline — see
+"`/builds` must not run git" below, which removes the cause the retry works
+around.
+
 Pure decision helpers are unit-tested in
 `scripts/verify-scoped-cleanup.Tests.ps1` (`Invoke-Pester`). The harness is
 Windows-only and can never run on the `ubuntu-latest` gate, so everything it
 string-matches is pinned by CI-enforced Rust tests: `"env"` / `"sysinfo"` and
-the `KilledProcess` fields in `src/process/slot_territory.rs`, and the
+the `KilledProcess` fields in `src/process/slot_territory.rs`; the
 `{timestamp, kind, data}` envelope plus `slot_id` / `territory` / the
-`build_kill` filter category in `src/diagnostics.rs`.
+`build_kill` filter category in `src/diagnostics.rs`; and `pool_size` on the
+`GET /builds` body in `src/routes/runners.rs`
+(`list_builds_emits_the_pool_size_the_harness_refuses_to_run_without`) — that
+one became a **hard** dependency when the fallback was deleted, since a rename
+now aborts every run at preflight while the Rust suite stays green.
 
 ## Persistent Logs
 
@@ -420,10 +428,45 @@ It measures free COMMIT, not free physical RAM, deliberately: the binding constr
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), `last_successful_slot`, and a top-level `active_builds` array. **Invariant:** `pool_size == available_permits + active_builds.len()`. `active_builds` and `available_permits` are derived from the same per-slot iteration as `slots[]` so the three views can never disagree mid-release. A separate `semaphore_permits` field exposes the raw `Semaphore::available_permits()` value for debugging transient release-ordering divergence inside `run_cargo_build_with_dir` — at steady state it equals `available_permits`. |
+| GET | `/builds` | Snapshot of the parallel build pool: pool size, available permits, queue depth, per-slot state (`idle` or `building` with `started_at`/`elapsed_secs`/`requester_id`/`rebuild_kind`), `last_successful_slot`, and a top-level `active_builds` array. **Invariant:** `pool_size == available_permits + active_builds.len()`. `active_builds` and `available_permits` are derived from the same per-slot iteration as `slots[]` so the three views can never disagree mid-release. A separate `semaphore_permits` field exposes the raw `Semaphore::available_permits()` value for debugging transient release-ordering divergence inside `run_cargo_build_with_dir` — at steady state it equals `available_permits`. **This handler performs no network I/O** — see "`/builds` must not run git" below. |
 | GET | `/builds/{slot_id}/log/stream` | SSE stream of cargo stderr lines for this slot's currently-running build. Events: `status` (one-shot prelude with `{state: "idle"\|"building", ...}`), `cargo` (one per stderr line, data is the raw line), `lagged` (broadcast drop count when the subscriber falls behind), `completed` (one frame on each building→idle transition, then the stream stays open for the next build). Returns 404 with `{error: "slot_not_found", ...}` if `slot_id` is out of range. Best for "tail cold cargo builds spawned via `POST /runners/spawn-test {rebuild: true}` so the user has progress visibility without polling `/builds/{slot_id}/log`." |
 | DELETE | `/builds/caches` | Clear build caches across all pool slots |
 | POST | `/build/reset` | Reset build state |
+
+#### `/builds` must not run git
+
+`GET /builds` used to compute `origin_main_drift` **inline**, and computing it
+runs `git fetch origin` — a network call, with no deadline of its own. Measured
+2026-08-10 on this fleet: `/builds` took **4.07s–27.12s** across 12 samples
+while `/health` answered in 0.0–0.1s and the disk queue sat at 0. The cost was
+neither disk nor memory; it was a per-request fetch. Any consumer with a
+timeout under ~30s therefore saw the route as intermittent — which is exactly
+how `verify-scoped-cleanup.ps1` came to fall back to a **guessed** pool size
+(PR #139).
+
+The drift is now computed by a background ticker (`refresh_origin_drift`,
+default every 120s, override `QONTINUI_SUPERVISOR_ORIGIN_DRIFT_REFRESH_SECS`)
+and the handler serves whatever is cached — the same stale-while-revalidate
+shape as `footprint`. `fetch_origin` is additionally bounded by
+`QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS` (default 20s); an abandoned fetch
+lands as `fetched: false`, which already means "compared against a possibly
+stale local `origin/main`".
+
+Because the reading is now cached, `origin_main_drift: null` alone cannot say
+whether it means *up to date* or *never computed* — the confident-looking
+default fleet policy `verification-and-evidence`
+`unknown-must-not-render-as-a-default` forbids. A sibling
+**`origin_main_drift_probe`** makes the two distinguishable:
+
+| `state` | Meaning |
+|---|---|
+| `pending` | No reading has ever been computed (`computed_at`/`age_secs` null). |
+| `fresh` | The cached reading answers for the CURRENT LKG sha. |
+| `superseded_lkg_moved` | The LKG advanced since the reading; it answers a superseded question, and `origin_main_drift` is withheld. |
+| `not_computable` | `origin/main` could not be resolved (no remote / not a repo). |
+
+It also carries `computed_at`, `age_secs`, and `computed_for_sha` so a reader
+can judge the reading's age instead of assuming it is current.
 
 ### Logs
 
@@ -842,6 +885,8 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Temp runner max age | 24h (86400s) default, override `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` (clamped [3600, 604800]; **0 disables**). `RunnerKind::Temp` only; measured from `started_at`; `protected` does not exempt. |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
 | Crash-restart backoff ladder | 5s → 30s → 120s; max 3 auto-restarts per rolling 30min, then disarm (kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`) |
+| origin/main drift refresh | 120s (override: `QONTINUI_SUPERVISOR_ORIGIN_DRIFT_REFRESH_SECS`, min 1) — background ticker; `GET /builds` never computes it inline |
+| `git fetch` deadline | 20s (override: `QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`, min 1) — an abandoned fetch reads as `fetched: false`, not an error |
 
 ## Diagnosing failed builds
 

@@ -5118,25 +5118,63 @@ pub async fn list_builds(
         .await
         .as_ref()
         .and_then(|info| info.sha.clone());
-    let origin_main_drift = match (&lkg_sha, state.config.project_dir.parent()) {
-        (Some(sha), Some(repo_root)) => {
-            let drift = crate::git_provenance::origin_main_drift(repo_root, sha).await;
-            // Null when up-to-date or not computable; surface only real drift,
-            // matching the null-when-fine convention of the `*_warning` siblings.
-            if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
+    // Served from the timer-refreshed cache — this handler does NOT run git.
+    // Computing drift runs `git fetch origin`, and doing that per request made
+    // this route take 4.07s–27.12s (measured 2026-08-10, 12 samples) while
+    // `/health` answered in 0.0–0.1s with an idle disk. See
+    // `SupervisorState::origin_drift`.
+    let drift_cache = state.origin_drift.read().await.clone();
+    let (origin_main_drift, origin_main_drift_probe) = match &drift_cache {
+        Some(snap) => {
+            let age_secs = (chrono::Utc::now() - snap.computed_at).num_seconds().max(0);
+            // The LKG can move between refreshes. A reading computed for a
+            // different sha describes a build that is no longer current, so say
+            // so rather than letting it read as current.
+            let sha_current = lkg_sha.as_deref() == Some(snap.built_sha.as_str());
+            let d = &snap.drift;
+            let value = if !sha_current || d.origin_main_sha.is_empty() || d.is_up_to_date() {
                 None
             } else {
                 Some(json!({
-                    "built_sha": drift.built_sha,
-                    "origin_main_sha": drift.origin_main_sha,
-                    "behind_count": drift.behind_count,
-                    "is_ancestor": drift.is_ancestor,
-                    "diverged": drift.is_diverged(),
-                    "fetched": drift.fetched,
+                    "built_sha": d.built_sha,
+                    "origin_main_sha": d.origin_main_sha,
+                    "behind_count": d.behind_count,
+                    "is_ancestor": d.is_ancestor,
+                    "diverged": d.is_diverged(),
+                    "fetched": d.fetched,
                 }))
-            }
+            };
+            let state_label = if !sha_current {
+                // Not "stale" in the age sense — it answers a superseded question.
+                "superseded_lkg_moved"
+            } else if d.origin_main_sha.is_empty() {
+                "not_computable"
+            } else {
+                "fresh"
+            };
+            (
+                value,
+                json!({
+                    "state": state_label,
+                    "computed_at": snap.computed_at.to_rfc3339(),
+                    "age_secs": age_secs,
+                    "computed_for_sha": snap.built_sha,
+                }),
+            )
         }
-        _ => None,
+        // NEVER COMPUTED is not the same as NO DRIFT, and both used to
+        // serialize as a bare `null` — the confident-looking default that
+        // `verification-and-evidence` / `unknown-must-not-render-as-a-default`
+        // forbids. The probe field is what makes the two distinguishable.
+        None => (
+            None,
+            json!({
+                "state": "pending",
+                "computed_at": serde_json::Value::Null,
+                "age_secs": serde_json::Value::Null,
+                "computed_for_sha": serde_json::Value::Null,
+            }),
+        ),
     };
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
         let source_label = |s: &crate::process::manager::BuildSource| match s {
@@ -5205,6 +5243,10 @@ pub async fn list_builds(
         // `diverged` flag (is_ancestor == false). The loud counterpart to the
         // silent stale-build incident (2026-06-07).
         "origin_main_drift": origin_main_drift,
+        // Provenance for the field above. `origin_main_drift: null` alone
+        // cannot distinguish "up to date" from "never computed" — this says
+        // which, plus how old the reading is.
+        "origin_main_drift_probe": origin_main_drift_probe,
         "slot_freshness_warning": slot_freshness_warning,
         "legacy_target_debug_warning": legacy_target_debug_warning,
         // Build-artifact footprint snapshot (plan
@@ -7700,6 +7742,162 @@ mod tests {
         assert!(
             r_b["requester_id"].is_null(),
             "an unowned runner reports requester_id: null"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wire shape `GET /builds` owes the Phase 3 verification harness.
+    //
+    // `scripts/verify-scoped-cleanup.ps1` is Windows-only and CI is
+    // `ubuntu-latest`, so the harness can never run on the merge gate — the
+    // same reason the sibling pins exist in `crate::diagnostics` and
+    // `crate::process::slot_territory`. This is the pin for the field it reads
+    // off THIS route.
+    // ---------------------------------------------------------------------
+
+    /// `pool_size` must stay on the `GET /builds` body, as a positive number.
+    ///
+    /// The harness's `Resolve-PoolSize` reads `$builds.pool_size` and feeds it
+    /// to `Get-SlotTargetDirs`, which decides how many slot territories get a
+    /// probe — so this one field bounds what assertion V2-3 ("orphans in the
+    /// OTHER pool slots are still ALIVE") can even see.
+    ///
+    /// This field used to be a SOFT dependency: a rename degraded to a
+    /// hardcoded `$PoolSize = 3`, and the run continued while quietly checking
+    /// the wrong number of slots. PR #139 deleted that default precisely
+    /// because the silent-undersize case manufactures a false PASS — which
+    /// makes the dependency HARD: rename or drop `pool_size` now and every
+    /// harness run aborts at preflight with "could not establish the build pool
+    /// size", on a fleet where the Rust suite stays entirely green. Escalating
+    /// the consumer's failure mode is what makes this pin necessary, not
+    /// optional.
+    #[tokio::test]
+    async fn list_builds_emits_the_pool_size_the_harness_refuses_to_run_without() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        let state = make_state(); // BuildPoolConfig { pool_size: 1 }
+
+        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read /builds body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
+
+        let pool_size = body
+            .get("pool_size")
+            .expect("`pool_size` is a hard dependency of verify-scoped-cleanup.ps1");
+        assert!(
+            pool_size.is_u64(),
+            "the harness casts this with [int]; a string or null is a contract miss: {body}"
+        );
+        assert_eq!(
+            pool_size.as_u64(),
+            Some(state.build_pool.slots.len() as u64),
+            "pool_size must report the REAL slot count — the harness plants one \
+             probe per slot and an undersized value silently narrows V2-3"
+        );
+        assert!(
+            pool_size.as_u64().unwrap_or(0) > 0,
+            "the harness treats a non-positive pool_size as an unusable answer \
+             and aborts; a live pool is never zero-sized"
+        );
+    }
+
+    /// A never-computed drift reading must not serialize as "no drift".
+    ///
+    /// `origin_main_drift` is `null` both when the LKG is up to date and when
+    /// nothing has been computed yet — indistinguishable to a reader, which is
+    /// the confident-looking default `verification-and-evidence` /
+    /// `unknown-must-not-render-as-a-default` forbids. `origin_main_drift_probe`
+    /// is what separates them, so it has to be present on a fresh state.
+    #[tokio::test]
+    async fn list_builds_reports_an_uncomputed_drift_as_pending_not_as_no_drift() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        let state = make_state();
+        assert!(
+            state.origin_drift.read().await.is_none(),
+            "a fresh state has no drift reading yet"
+        );
+
+        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read /builds body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
+
+        assert!(
+            body["origin_main_drift"].is_null(),
+            "nothing computed yet, so there is no drift to report"
+        );
+        let probe = body
+            .get("origin_main_drift_probe")
+            .expect("the probe field is what makes `null` readable");
+        assert_eq!(
+            probe["state"], "pending",
+            "never-computed must be distinguishable from up-to-date: {body}"
+        );
+        assert!(
+            probe["computed_at"].is_null() && probe["age_secs"].is_null(),
+            "a pending reading has no timestamp to report: {probe}"
+        );
+    }
+
+    /// A cached reading computed for a SUPERSEDED LKG sha must say so.
+    ///
+    /// The drift cache is refreshed on a timer, so the LKG can move between
+    /// refreshes. Serving the old reading as current would answer a question
+    /// nobody asked — about a build that is no longer the LKG.
+    #[tokio::test]
+    async fn list_builds_marks_a_drift_reading_superseded_when_the_lkg_moved() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        let state = make_state();
+
+        *state.build_pool.last_known_good.write().await = Some(crate::state::LkgInfo {
+            built_at: chrono::Utc::now(),
+            source_slot: 0,
+            exe_size: 1,
+            sha: Some("bbbbbbbb".to_string()),
+            source: crate::process::manager::BuildSource::OriginMain,
+        });
+        // Reading was computed for a DIFFERENT sha than the LKG now records.
+        *state.origin_drift.write().await = Some(crate::state::OriginDriftSnapshot {
+            built_sha: "aaaaaaaa".to_string(),
+            drift: crate::git_provenance::OriginMainDrift {
+                built_sha: "aaaaaaaa".to_string(),
+                origin_main_sha: "cccccccc".to_string(),
+                behind_count: 7,
+                is_ancestor: true,
+                fetched: true,
+            },
+            computed_at: chrono::Utc::now(),
+        });
+
+        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read /builds body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
+
+        let probe = &body["origin_main_drift_probe"];
+        assert_eq!(
+            probe["state"], "superseded_lkg_moved",
+            "a reading for a stale sha must not read as current: {body}"
+        );
+        assert_eq!(
+            probe["computed_for_sha"], "aaaaaaaa",
+            "say WHICH sha the reading answers for, so the gap is checkable"
+        );
+        assert!(
+            body["origin_main_drift"].is_null(),
+            "a superseded reading must not be published as the drift itself"
         );
     }
 

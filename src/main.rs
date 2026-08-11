@@ -587,6 +587,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // origin/main drift for the LKG sha, on its own timer.
+    //
+    // This USED to be computed inline by `GET /builds`, and computing it runs
+    // `git fetch origin` — a network call. Measured 2026-08-10: `/builds` took
+    // 4.07s–27.12s across 12 samples while `/health` answered in 0.0–0.1s and
+    // the disk queue sat at 0, so the cost was the per-request fetch, not disk
+    // or memory. A read endpoint must not do network I/O.
+    //
+    // Deliberately a SEPARATE ticker from the footprint refresh above, at a
+    // much shorter interval: drift is cheap (one fetch + three local probes)
+    // and wants to be current, while the footprint walk is GB-scale and wants
+    // to be rare. Sharing one ticker would force the wrong cadence on one of
+    // them. Override with QONTINUI_SUPERVISOR_ORIGIN_DRIFT_REFRESH_SECS.
+    {
+        let state_for_drift = state.clone();
+        tokio::spawn(async move {
+            let interval_secs = std::env::var("QONTINUI_SUPERVISOR_ORIGIN_DRIFT_REFRESH_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(120);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+                let _ = state_for_drift.refresh_origin_drift().await;
+            }
+        });
+    }
+
     // Serve with graceful shutdown (no global timeout — eval benchmarks can run for hours)
     let serve_future =
         axum::serve(listener, router).with_graceful_shutdown(shutdown_signal(state.clone()));

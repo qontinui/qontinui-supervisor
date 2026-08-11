@@ -212,6 +212,25 @@ impl ManagedRunner {
     }
 }
 
+/// A timestamped origin/main drift reading, cached on
+/// [`SupervisorState::origin_drift`].
+///
+/// `computed_at` is carried so `GET /builds` can report the reading's AGE
+/// rather than presenting a cached value as current. Per fleet policy
+/// `verification-and-evidence` / `unknown-must-not-render-as-a-default`, a
+/// never-computed cache must be distinguishable from "no drift" -- both used to
+/// serialize as `null`, which is exactly the confident-looking default that
+/// clause forbids.
+#[derive(Debug, Clone)]
+pub struct OriginDriftSnapshot {
+    /// The LKG sha this reading was computed for. Compared against the CURRENT
+    /// LKG sha at read time: if the LKG moved since, the reading describes a
+    /// build that is no longer current and must be reported as stale.
+    pub built_sha: String,
+    pub drift: crate::git_provenance::OriginMainDrift,
+    pub computed_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct SupervisorState {
     pub config: SupervisorConfig,
     /// Multi-runner map: runner_id -> ManagedRunner
@@ -423,6 +442,21 @@ pub struct SupervisorState {
     /// `None` until the first refresh completes. Each snapshot carries its own
     /// `computed_at` so readers can judge staleness.
     pub footprint: RwLock<Option<crate::footprint::FootprintSnapshot>>,
+
+    /// Cached origin/main drift for the LKG sha, refreshed on a timer.
+    ///
+    /// `GET /builds` used to compute this INLINE, and computing it runs
+    /// `git fetch origin` -- a NETWORK call, with no deadline. Measured on this
+    /// fleet 2026-08-10: `/builds` took 4.07s to 27.12s across 12 samples while
+    /// `/health` answered in 0.0-0.1s and the disk queue sat at 0. The cost was
+    /// neither disk nor memory; it was a per-request fetch. Any consumer with a
+    /// timeout under ~30s saw intermittent failures, and the scoped-cleanup
+    /// harness silently degraded to a guessed pool size because of it.
+    ///
+    /// A read endpoint must not perform network I/O. This is the same
+    /// stale-while-revalidate shape as `footprint` above: the timer refreshes
+    /// it, readers serve whatever is cached and NEVER block on git.
+    pub origin_drift: RwLock<Option<OriginDriftSnapshot>>,
 }
 
 /// RAII guard that increments [`SupervisorState::active_sse_connections`]
@@ -1166,6 +1200,7 @@ impl SupervisorState {
             active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
             spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             footprint: RwLock::new(None),
+            origin_drift: RwLock::new(None),
         }
     }
 
@@ -1185,6 +1220,35 @@ impl SupervisorState {
                 .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
         *self.footprint.write().await = Some(snapshot.clone());
         snapshot
+    }
+
+    /// Recompute the origin/main drift snapshot and store it on
+    /// `self.origin_drift`. Runs `git fetch` (bounded by
+    /// `QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`), so it belongs on the
+    /// timer, never on a request path -- see the field's doc comment.
+    ///
+    /// Returns `None` when there is nothing to compute (no LKG sha recorded, or
+    /// `project_dir` has no parent), leaving any previous snapshot in place: a
+    /// transiently missing LKG should not erase a good reading.
+    pub async fn refresh_origin_drift(&self) -> Option<OriginDriftSnapshot> {
+        let lkg_sha: Option<String> = self
+            .build_pool
+            .last_known_good
+            .read()
+            .await
+            .as_ref()
+            .and_then(|info| info.sha.clone());
+        let repo_root = self.config.project_dir.parent()?.to_path_buf();
+        let sha = lkg_sha?;
+
+        let drift = crate::git_provenance::origin_main_drift(&repo_root, &sha).await;
+        let snapshot = OriginDriftSnapshot {
+            built_sha: sha,
+            drift,
+            computed_at: chrono::Utc::now(),
+        };
+        *self.origin_drift.write().await = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     /// Drain `pending_startup_logs` into `state.logs`.

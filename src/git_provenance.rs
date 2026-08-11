@@ -175,16 +175,65 @@ async fn git(args: &[&str], cwd: &Path, quiet_offline_ok: bool) -> Result<String
     }
 }
 
-/// Best-effort `git fetch origin --quiet` in `repo_root`.
+/// How long a network `git fetch` may run before it is abandoned. Override with
+/// `QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`.
+///
+/// [`git`] shells out with no deadline of its own, so an unreachable or hanging
+/// remote pins the calling task indefinitely. Abandoning a slow fetch degrades
+/// to "used the refs we already had" — the same state as being offline, which
+/// this code path already handles.
+///
+/// A non-numeric or zero override is ignored rather than honored: zero would
+/// abandon every fetch before it could start, which is a footgun disguised as a
+/// tuning knob.
+fn fetch_timeout() -> std::time::Duration {
+    parse_fetch_timeout(std::env::var("QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS").ok())
+}
+
+const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 20;
+
+/// The parsing half of [`fetch_timeout`], split out so it is testable without
+/// mutating process-global env inside a parallel test binary.
+fn parse_fetch_timeout(raw: Option<String>) -> std::time::Duration {
+    let secs = raw
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_FETCH_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Best-effort `git fetch origin --quiet` in `repo_root`, bounded by
+/// [`fetch_timeout`].
 ///
 /// Offline-tolerant: a network / remote failure resolves to `Ok(())` (like the
 /// `quiet_offline_ok` path of [`git`]) because a stale origin ref must never
-/// block a build. Returns `Ok(())` on success OR a tolerated failure; only a
-/// spawn failure (git missing) bubbles up as `Err`.
+/// block a build. Only a spawn failure (git missing) — or exceeding the
+/// timeout — bubbles up as `Err`.
+///
+/// The sole caller ([`origin_main_drift`]) reads this as
+/// `fetched = fetch_origin(..).is_ok()`, so an abandoned fetch lands as
+/// `fetched: false`, which already means "the compare used a possibly-stale
+/// local `origin/main`". The timeout therefore degrades the ANSWER's confidence
+/// rather than failing the caller.
 pub async fn fetch_origin(repo_root: &Path) -> Result<(), SupervisorError> {
-    git(&["fetch", "origin", "--quiet"], repo_root, true)
-        .await
-        .map(|_| ())
+    // Read the deadline ONCE: the error message must name the budget that was
+    // actually applied, and re-reading env could report a different number than
+    // the one the timeout enforced.
+    let budget = fetch_timeout();
+    match tokio::time::timeout(
+        budget,
+        git(&["fetch", "origin", "--quiet"], repo_root, true),
+    )
+    .await
+    {
+        Ok(res) => res.map(|_| ()),
+        Err(_) => Err(SupervisorError::Process(format!(
+            "`git fetch origin` exceeded {}s and was abandoned; \
+             continuing with the refs already present",
+            budget.as_secs()
+        ))),
+    }
 }
 
 /// Compute the drift of `built_sha` relative to `origin/main` in `repo_root`.
@@ -531,5 +580,49 @@ mod tests {
         let drift = origin_main_drift(tmp.path(), "deadbeef").await;
         assert!(drift.origin_main_sha.is_empty());
         assert!(drift.is_up_to_date(), "not-computable reads as up-to-date");
+    }
+
+    /// The fetch deadline exists because `git()` has none of its own: a hanging
+    /// remote otherwise pins the calling task forever, which is how a read
+    /// endpoint came to take 27s. Every rejected override falls back to the
+    /// default rather than to something unbounded or instantaneous.
+    #[test]
+    fn fetch_timeout_parsing_rejects_nonsense_and_zero() {
+        use super::{parse_fetch_timeout, DEFAULT_FETCH_TIMEOUT_SECS};
+        let default = std::time::Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+
+        assert_eq!(parse_fetch_timeout(None), default, "unset ⇒ default");
+        assert_eq!(
+            parse_fetch_timeout(Some("45".into())),
+            std::time::Duration::from_secs(45),
+            "a sane override is honored"
+        );
+        assert_eq!(
+            parse_fetch_timeout(Some("  45  ".into())),
+            std::time::Duration::from_secs(45),
+            "surrounding whitespace is tolerated"
+        );
+        // Zero would abandon every fetch before it could start — a knob that
+        // silently disables fetching is worse than no knob.
+        assert_eq!(
+            parse_fetch_timeout(Some("0".into())),
+            default,
+            "zero ⇒ default"
+        );
+        assert_eq!(
+            parse_fetch_timeout(Some("forever".into())),
+            default,
+            "non-numeric ⇒ default"
+        );
+        assert_eq!(
+            parse_fetch_timeout(Some("".into())),
+            default,
+            "empty ⇒ default"
+        );
+        assert_eq!(
+            parse_fetch_timeout(Some("-5".into())),
+            default,
+            "negative does not parse as u64 ⇒ default"
+        );
     }
 }
