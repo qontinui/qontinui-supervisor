@@ -1150,11 +1150,49 @@ mod tests {
 
     #[test]
     fn test_memory_guard_defaults() {
-        // The floor mirrors cargo-guard.sh's MIN_FREE_GB=5 and ci_node's
-        // MIN_FREE_RAM_GB. If this value drifts, the three build lanes stop
-        // agreeing on what "enough memory to start a build" means.
+        // These are literals, and a literal is all this test can honestly
+        // assert: it cannot see `cargo-guard.sh` or the runner's `ci_node`, so
+        // it must not claim to pin them. (The comment here used to say it
+        // mirrored both — and `ci_node`'s floor is 4, not 5, which nothing
+        // detected because nothing could. Converging that lane is the runner's
+        // half of §A3 of plan
+        // `2026-08-02-fleet-resource-telemetry-and-ci-allocation`.)
+        //
+        // What IS pinned in-repo is the QUANTITY, by
+        // `memory_guard_floor_and_published_sample_read_one_field` below.
         assert_eq!(DEFAULT_MIN_FREE_RAM_GB, 5);
         assert_eq!(DEFAULT_MEM_WAIT_MAX_SECS, 900);
+    }
+
+    #[test]
+    fn memory_guard_floor_and_published_sample_read_one_field() {
+        // The observable invariant this repo CAN assert: the floor
+        // `check_ram_guard` enforces and the `commit_available_bytes` field
+        // published in every resource sample are the same probe, not two
+        // measurements that happen to agree today. A lane that drifted onto
+        // physical-available memory (which on Windows is a different number
+        // entirely) would fail here instead of silently rendering a headroom
+        // figure no guard enforces.
+        let guard_probe = crate::build_monitor::available_commit_bytes();
+        let published = crate::footprint::memory_snapshot();
+        assert_eq!(
+            guard_probe.is_some(),
+            published.commit_available_bytes.is_some(),
+            "the guard's probe and the published sample field must be the same probe"
+        );
+        // Windows commit-available and physical-available are DIFFERENT
+        // numbers, so the published pair must not collapse into one field:
+        // that collapse is precisely how a lane drifts onto the wrong quantity
+        // without anything noticing. (Values are not compared across the two
+        // probes — a live counter moves between reads and that would flake;
+        // what is pinned is that both fields exist and are sourced separately.)
+        //
+        // Physical-available is published too, but as its OWN named field — the
+        // point of A3 is that a divergence is visible, not that it is erased.
+        assert!(
+            published.mem_available_bytes.is_some(),
+            "mem_available_bytes must be published alongside, under its own name"
+        );
     }
 
     #[test]

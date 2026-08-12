@@ -19,6 +19,11 @@ pub mod error;
 pub mod evaluation;
 pub mod expo;
 pub mod footprint;
+// Row 2 Phase 1 (fleet topology): CPU/RAM/disk detection + the
+// `max_concurrent_builds` budget POST. Exposed here (not only in `main.rs`) so
+// `resource_sample` can reuse its machine-identity / coord-URL resolution and
+// so both are reachable from tests.
+pub mod fleet;
 pub mod fs_atomic;
 pub mod git_provenance;
 pub mod health_cache;
@@ -27,6 +32,11 @@ pub mod otel;
 pub mod pii_scrub;
 pub mod process;
 pub mod reapi;
+/// §A2 of plan `2026-08-02-fleet-resource-telemetry-and-ci-allocation`: turns
+/// the footprint snapshot into a `lane='host'`, `source='supervisor'` resource
+/// sample and publishes it to coord. Best-effort — a coord outage never touches
+/// the build lane.
+pub mod resource_sample;
 pub mod routes;
 pub mod sdk_features;
 pub mod server;
