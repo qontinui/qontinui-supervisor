@@ -486,11 +486,70 @@ impl Drop for SseConnectionGuard {
 
 pub struct RunnerState {
     pub process: Option<Child>,
+    /// Whether the runner's HTTP API answered on the most recent probe.
+    ///
+    /// **This is a two-state answer to a three-state question**, which is why
+    /// [`Self::last_seen_responding_at`] exists beside it. `false` conflates
+    /// "stopped" with "alive but not answering" — and the second is the
+    /// wedge case, where the process is running fine and holding its port.
+    /// Never render this alone as "gone"; use [`Self::liveness`].
     pub running: bool,
     pub started_at: Option<DateTime<Utc>>,
     pub restart_requested: bool,
     pub stop_requested: bool,
     pub pid: Option<u32>,
+    /// When the API was last observed responding.
+    ///
+    /// `None` means "never seen responding since the supervisor started
+    /// tracking it", which is NOT the same as "not responding now". Set on
+    /// every successful probe; never cleared. Together with `running` it
+    /// separates a runner that stopped from one that went quiet and how long
+    /// ago (plan `2026-08-07-runner-wedge-and-supervisor-hung-blindness`,
+    /// Phase 3b).
+    pub last_seen_responding_at: Option<DateTime<Utc>>,
+}
+
+/// What the supervisor actually knows about a runner's liveness.
+///
+/// Replaces reading the `running` boolean as if it were the whole truth. The
+/// dashboard lost 7 hours to that conflation on 2026-08-08: it reported
+/// `running: false, pid: null` for a 411 MB process that was holding its port
+/// in the same JSON document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerLiveness {
+    /// API answered on the most recent probe.
+    Responding,
+    /// API is silent but the port is still held — the process is alive and
+    /// not answering. This is the wedge state, and the one that used to be
+    /// mislabelled "stopped".
+    UnresponsiveSince(DateTime<Utc>),
+    /// API is silent and the port is not held. Positive evidence of absence.
+    Stopped,
+    /// API is silent, the port is not held, and we have never seen it
+    /// respond — so we cannot distinguish "never started" from "stopped".
+    Unknown,
+}
+
+impl RunnerState {
+    /// Classify liveness from the API probe, the port observation, and the
+    /// last-responding stamp.
+    ///
+    /// `port_open` MUST come from an actual listener probe. Passing a stale
+    /// or assumed value re-creates the conflation this exists to remove.
+    pub fn liveness(&self, port_open: bool) -> RunnerLiveness {
+        if self.running {
+            return RunnerLiveness::Responding;
+        }
+        match (port_open, self.last_seen_responding_at) {
+            (true, Some(at)) => RunnerLiveness::UnresponsiveSince(at),
+            // Port held but never seen responding: still alive-and-quiet, and
+            // the honest stamp is when we started watching, not "stopped".
+            (true, None) => RunnerLiveness::Unknown,
+            (false, Some(_)) => RunnerLiveness::Stopped,
+            (false, None) => RunnerLiveness::Unknown,
+        }
+    }
 }
 
 pub struct WatchdogState {
@@ -1376,6 +1435,7 @@ impl RunnerState {
             restart_requested: false,
             stop_requested: false,
             pid: None,
+            last_seen_responding_at: None,
         }
     }
 }
@@ -2033,5 +2093,48 @@ mod tests {
         std::fs::write(&path, format!("{seeded}\n")).expect("seed valid contents");
         let id = load_or_create_boot_id_at(&path);
         assert_eq!(id, seeded, "trailing whitespace must be trimmed");
+    }
+
+    // ---- Phase 3b: liveness must not conflate "quiet" with "gone" ----
+
+    #[test]
+    fn responding_runner_is_responding() {
+        let mut st = RunnerState::new();
+        st.running = true;
+        assert_eq!(st.liveness(true), RunnerLiveness::Responding);
+        // Even with the port probe somehow false, a positive API answer wins:
+        // it is direct evidence the process is serving.
+        assert_eq!(st.liveness(false), RunnerLiveness::Responding);
+    }
+
+    #[test]
+    fn silent_api_with_a_held_port_is_unresponsive_not_stopped() {
+        // This is the 2026-08-08 incident shape: PID alive, port held, API
+        // silent. The old boolean reported this as "not running, pid null".
+        let seen = Utc::now();
+        let mut st = RunnerState::new();
+        st.running = false;
+        st.last_seen_responding_at = Some(seen);
+        st.pid = Some(148320);
+
+        assert_eq!(st.liveness(true), RunnerLiveness::UnresponsiveSince(seen));
+        assert_ne!(st.liveness(true), RunnerLiveness::Stopped);
+    }
+
+    #[test]
+    fn silent_api_with_a_closed_port_is_stopped() {
+        let mut st = RunnerState::new();
+        st.running = false;
+        st.last_seen_responding_at = Some(Utc::now());
+        assert_eq!(st.liveness(false), RunnerLiveness::Stopped);
+    }
+
+    #[test]
+    fn never_seen_responding_is_unknown_not_stopped() {
+        // No stamp means we cannot distinguish "never started" from
+        // "stopped before we looked" — say UNKNOWN rather than guessing.
+        let st = RunnerState::new();
+        assert_eq!(st.liveness(false), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(true), RunnerLiveness::Unknown);
     }
 }

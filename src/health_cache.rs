@@ -120,6 +120,17 @@ pub struct CachedRunnerHealth {
     /// consumers can surface live values without touching the per-runner
     /// `WatchdogState` lock.
     pub watchdog: crate::routes::health::WatchdogHealth,
+    /// Three-state liveness, so consumers stop reading `running: false` as
+    /// "gone" (Phase 3b).
+    ///
+    /// `running` + `pid` alone cannot distinguish a stopped runner from a
+    /// wedged one, and on 2026-08-08 the dashboard asserted `running: false,
+    /// pid: null` about a live process it could see holding the port in the
+    /// same document. **Render this field, not `running`.**
+    pub liveness: crate::state::RunnerLiveness,
+    /// When the API was last seen responding — `None` if never seen.
+    /// Gives "unresponsive since T" an actual T to show.
+    pub last_seen_responding_at: Option<DateTime<Utc>>,
 }
 
 /// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
@@ -232,10 +243,27 @@ fn derive_runner_status(
     }
 }
 
+/// Consecutive 2s ticks of "port held, API silent" before the supervisor
+/// escalates.
+///
+/// 15 ticks ≈ 30 s. Long enough that a GC pause, a slow `/health`, or a
+/// restart window does not page; short enough that a real wedge surfaces in
+/// well under a minute instead of the 7 hours the 2026-08-08 incident took.
+const UNRESPONSIVE_ESCALATION_TICKS: u32 = 15;
+
+/// Re-escalate every this many further ticks while the condition persists
+/// (≈5 min), so a long wedge stays visible without spamming every 2 s.
+const UNRESPONSIVE_REESCALATION_TICKS: u32 = 150;
+
 pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(2));
         let mut tick_count: u64 = 0;
+        // 3e — consecutive "alive but not answering" ticks, per runner id.
+        // Local to this loop on purpose: it is escalation bookkeeping, not
+        // state any consumer should read.
+        let mut unresponsive_ticks: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         loop {
             // Wait for either the periodic tick or an immediate refresh notification
             tokio::select! {
@@ -277,11 +305,48 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         let mut runner_state = managed.runner.write().await;
                         if runner_state.running != runner_responding {
                             runner_state.running = runner_responding;
-                            if !runner_responding {
-                                runner_state.pid = None;
-                            }
                         }
-                        runner_responding && runner_state.pid.is_none()
+
+                        // 3a — SILENCE IS `UNKNOWN`, NOT `GONE`.
+                        //
+                        // This used to clear `pid` whenever the API stopped
+                        // answering. That is how the dashboard came to assert
+                        // `running: false, pid: null` about a process it could
+                        // see holding the port in the same JSON document
+                        // (reproduced 2026-08-08 against live PID 148320,
+                        // which was alive throughout and read
+                        // `running: true, pid: 148320` again after recovery).
+                        //
+                        // An unresponsive API says nothing about whether the
+                        // PROCESS exists — a wedged runner is unresponsive and
+                        // very much alive. So keep the last known pid and let
+                        // the liveness rules below decide what to say about
+                        // it. This extends the discipline already applied a
+                        // few lines down to a probe that could not RUN: that
+                        // one is UNKNOWN, and so is this one.
+                        //
+                        // `pid` is now cleared only on positive evidence of
+                        // absence: the port is closed AND the API is silent.
+                        if !runner_responding && !runner_port_open {
+                            runner_state.pid = None;
+                        }
+
+                        // 3b — record WHEN it was last seen responding, so the
+                        // three states the `running` boolean conflates can be
+                        // told apart downstream: responding / alive but
+                        // unresponsive since T / stopped.
+                        if runner_responding {
+                            runner_state.last_seen_responding_at = Some(Utc::now());
+                        }
+
+                        // 3c — allow PID recovery while the port is listening
+                        // even if the API is silent. The old guard was
+                        // `runner_responding && pid.is_none()`, which blocked
+                        // recovery for exactly the wedged case that needs it
+                        // most: the port is demonstrably held, so `netstat`
+                        // CAN tell us by whom. `pid.is_none()` is retained so
+                        // the ~100ms netstat stays out of the steady state.
+                        (runner_responding || runner_port_open) && runner_state.pid.is_none()
                     };
                     // Recover the PID for a re-discovered runner after a
                     // supervisor restart: the process is still the one
@@ -315,6 +380,86 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     }
                     #[cfg(not(target_os = "windows"))]
                     let _ = needs_pid_recovery;
+
+                    // 3e — ESCALATE a persistently unresponsive runner.
+                    //
+                    // "Alive but not answering" is the state that cost this
+                    // box 7 hours on 2026-08-08 while the dashboard quietly
+                    // said the runner was gone. It is not a normal state and
+                    // it must not be silent.
+                    //
+                    // NEVER auto-restart from here. The supervisor's contract
+                    // is that user-managed runners are observed, never
+                    // started/stopped/restarted unprompted — and a restart
+                    // would destroy in-flight sessions, which is an explicit
+                    // non-goal for this failure class. Escalate only.
+                    if !runner_responding && runner_port_open {
+                        let ticks = unresponsive_ticks
+                            .entry(runner_id.clone())
+                            .and_modify(|t| *t = t.saturating_add(1))
+                            .or_insert(1);
+
+                        let should_escalate = *ticks == UNRESPONSIVE_ESCALATION_TICKS
+                            || (*ticks > UNRESPONSIVE_ESCALATION_TICKS
+                                && (*ticks - UNRESPONSIVE_ESCALATION_TICKS)
+                                    .is_multiple_of(UNRESPONSIVE_REESCALATION_TICKS));
+
+                        if should_escalate {
+                            let (pid, since) = {
+                                let runner_state = managed.runner.read().await;
+                                (runner_state.pid, runner_state.last_seen_responding_at)
+                            };
+                            tracing::error!(
+                                runner_id = %runner_id,
+                                port = runner_port,
+                                pid = ?pid,
+                                last_seen_responding_at = ?since,
+                                unresponsive_for_secs = (*ticks * 2),
+                                "RUNNER WEDGED: port is held but the HTTP API has not answered \
+                                 for {}s. The process is ALIVE and not responding — this is not \
+                                 a stopped runner. Not restarting (user-managed runners are \
+                                 observed only, and a restart destroys in-flight sessions); \
+                                 capture a thread dump before any manual restart.",
+                                *ticks * 2
+                            );
+                            state
+                                .logs
+                                .emit(
+                                    LogSource::Supervisor,
+                                    LogLevel::Error,
+                                    format!(
+                                        "Runner '{}' WEDGED — port {} held, API silent for {}s \
+                                         (pid {:?}, last responded {:?}). Alive, not stopped.",
+                                        runner_id,
+                                        runner_port,
+                                        *ticks * 2,
+                                        pid,
+                                        since
+                                    ),
+                                )
+                                .await;
+                        }
+                    } else if runner_responding {
+                        // Recovered (or never wedged) — reset, and say so if
+                        // we had previously escalated, so the log carries the
+                        // end of the window as well as the start.
+                        if let Some(prev) = unresponsive_ticks.remove(runner_id) {
+                            if prev >= UNRESPONSIVE_ESCALATION_TICKS {
+                                tracing::warn!(
+                                    runner_id = %runner_id,
+                                    port = runner_port,
+                                    wedged_for_secs = (prev * 2),
+                                    "Runner recovered from a wedge after {}s without any \
+                                     supervisor intervention",
+                                    prev * 2
+                                );
+                            }
+                        }
+                    } else {
+                        // Port not held either — that is a stopped runner,
+                        // not a wedge. Different condition, different signal.
+                        unresponsive_ticks.remove(runner_id);
+                    }
                 }
 
                 // If the runner's TCP port is responsive, GET its /health to
@@ -360,6 +505,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     recent_crash,
                     derived_status,
                     watchdog,
+                    // Phase 3b — classified from the SAME tick's live listener
+                    // probe, never from a remembered or assumed port state.
+                    liveness: runner_state.liveness(runner_port_open),
+                    last_seen_responding_at: runner_state.last_seen_responding_at,
                 });
                 drop(runner_state);
 
