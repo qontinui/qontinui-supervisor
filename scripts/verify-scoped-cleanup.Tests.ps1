@@ -67,7 +67,9 @@ $functionsToExtract = @(
     'Start-Probe',
     'Get-TempRunnerIds',
     'Resolve-RunnerRepo',
-    'Resolve-PoolSize'
+    'Resolve-PoolSize',
+    'Get-RunnersToStop',
+    'Resolve-TeardownExitCode'
 )
 foreach ($name in $functionsToExtract) {
     $funcAst = $ast.FindAll(
@@ -632,6 +634,83 @@ Describe 'Get-TempRunnerIds' {
     }
 }
 
+Describe 'Get-RunnersToStop' {
+
+    It 'stops a runner that appeared during the run but not one that predates it' {
+        $ids = Get-RunnersToStop -Baseline @('test-peer') -After @('test-peer', 'test-ours') -OwnIds @()
+        $ids.Count | Should Be 1
+        $ids[0] | Should Be 'test-ours'
+    }
+
+    It 'stops the id the spawn response named even with NO baseline - the leak #138 could not reach' {
+        # $null baseline = the pre-spawn GET failed. The diff is unusable, but an
+        # id the supervisor handed us is unambiguously ours.
+        $ids = Get-RunnersToStop -Baseline $null -After @('test-peer', 'test-ours') -OwnIds @('test-ours')
+        $ids.Count | Should Be 1
+        $ids[0] | Should Be 'test-ours'
+    }
+
+    It 'still refuses to diff without a baseline, so a peer''s runner is never stopped' {
+        $ids = Get-RunnersToStop -Baseline $null -After @('test-peer') -OwnIds @()
+        $ids.Count | Should Be 0
+    }
+
+    It 'treats an EMPTY baseline as a real snapshot - the zero-peer case must not skip teardown' {
+        $ids = Get-RunnersToStop -Baseline @() -After @('test-ours') -OwnIds @()
+        $ids.Count | Should Be 1
+        $ids[0] | Should Be 'test-ours'
+    }
+
+    It 'unions the two sources without duplicating the id they agree on' {
+        $ids = Get-RunnersToStop -Baseline @() -After @('test-ours') -OwnIds @('test-ours')
+        $ids.Count | Should Be 1
+    }
+
+    It 'keeps a named id the runners list has not caught up with yet' {
+        # The async spawn reserves the id before the runner process exists, so
+        # `After` can legitimately not contain it yet.
+        $ids = Get-RunnersToStop -Baseline @() -After @() -OwnIds @('test-ours')
+        $ids.Count | Should Be 1
+        $ids[0] | Should Be 'test-ours'
+    }
+
+    It 'ignores a null or empty own-id rather than emitting a bogus target' {
+        $ids = Get-RunnersToStop -Baseline @() -After @() -OwnIds @($null, '')
+        $ids.Count | Should Be 0
+    }
+
+    It 'returns an array, not $null, when there is nothing to stop' {
+        # The `return ,$out` idiom matters: a bare `return @()` collapses to
+        # $null, and the caller's `@($targets).Count` would then be 1.
+        $ids = Get-RunnersToStop -Baseline @() -After @() -OwnIds @()
+        ($ids -is [array]) | Should Be $true
+        $ids.Count | Should Be 0
+    }
+}
+
+Describe 'Resolve-TeardownExitCode' {
+
+    It 'raises a clean run to 3 when teardown leaked - the 2026-08-09 silent exit 0' {
+        Resolve-TeardownExitCode -CurrentExitCode 0 -LeakedCount 1 | Should Be 3
+    }
+
+    It 'leaves a clean run at 0 when nothing leaked' {
+        Resolve-TeardownExitCode -CurrentExitCode 0 -LeakedCount 0 | Should Be 0
+    }
+
+    It 'never demotes a FAILED assertion - a scoping defect outranks a leak' {
+        Resolve-TeardownExitCode -CurrentExitCode 2 -LeakedCount 3 | Should Be 2
+    }
+
+    It 'never demotes an aborted run' {
+        Resolve-TeardownExitCode -CurrentExitCode 1 -LeakedCount 1 | Should Be 1
+    }
+
+    It 'leaves an already-inconclusive run at 3' {
+        Resolve-TeardownExitCode -CurrentExitCode 3 -LeakedCount 1 | Should Be 3
+    }
+}
+
 Describe 'Test-KillEventForSlot' {
 
     It 'accepts a kill attributed to the claimed slot via the strong env match' {
@@ -1160,5 +1239,57 @@ Describe 'preflight discovery is wired to the resolvers (source)' {
     It 'prints the provenance of both numbers so a run log can be audited' {
         ($scriptText -like '*runner repo = $RunnerRepo (source:*') | Should Be $true
         ($scriptText -like '*pool size = $PoolSize (source:*') | Should Be $true
+    }
+}
+
+Describe 'runner-leak accounting is WIRED to the exit code (source - never run)' {
+
+    # Resolve-TeardownExitCode being correct in isolation is worth nothing if
+    # `finally` does not call it: the 2026-08-09 leak was a wiring silence, not a
+    # arithmetic bug. These assert the plumbing the unit tests above cannot see.
+    $stopRunnersAst = $ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stop-SpawnedRunners' },
+        $true) | Select-Object -First 1
+    $stopSrc = $stopRunnersAst.Extent.Text
+    $wholeSrc = $ast.Extent.Text
+
+    It 'records leaks on a script-scoped ledger rather than only warning' {
+        ($stopSrc -like '*$script:LeakedRunners +=*') | Should Be $true
+    }
+
+    It 'proves the stop by RE-READING /runners instead of trusting the 200' {
+        # Two GETs: the pre-stop list and the confirming post-stop list.
+        $gets = ([regex]::Matches($stopSrc, [regex]::Escape('Invoke-RestMethod -Method Get -Uri "$base/runners"'))).Count
+        ($gets -ge 2) | Should Be $true
+        ($stopSrc -like '*still present in GET /runners*') | Should Be $true
+    }
+
+    It 'settles before convicting, so a removal race is not reported as a leak' {
+        # A leak report escalates the exit code and sends the operator cleaning
+        # up; a one-off registry race must not manufacture one. The settle bounds
+        # how long the supervisor gets, never WHETHER we re-read.
+        ($stopSrc -like '*settle before convicting*') | Should Be $true
+        ($stopSrc -like '*Start-Sleep -Seconds 5*') | Should Be $true
+        ($stopSrc -like '*after a 5s settle*') | Should Be $true
+    }
+
+    It 'treats a failed confirming read as UNKNOWN, not as stopped' {
+        ($stopSrc -like '*UNKNOWN*') | Should Be $true
+    }
+
+    It 'stops the id the spawn response named, not only the snapshot diff' {
+        ($stopSrc -like '*$script:OurSpawnedRunnerIds*') | Should Be $true
+        ($wholeSrc -like '*$script:OurSpawnedRunnerIds += $spawnResp.id*') | Should Be $true
+    }
+
+    It 'escalates the exit code from the finally block' {
+        ($wholeSrc -like '*$script:ExitCode = Resolve-TeardownExitCode*') | Should Be $true
+    }
+
+    It 'exits AFTER the finally block, so the escalation can still take effect' {
+        # `exit $script:ExitCode` must be the last statement in the file, outside
+        # try/catch/finally. Inside the try it would run before teardown.
+        $lines = @($wholeSrc -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        $lines[-1] | Should Be 'exit $script:ExitCode'
     }
 }

@@ -12,6 +12,7 @@ pub mod health;
 pub mod lineage;
 pub mod lkg_coverage;
 pub mod logs;
+pub mod optional_json;
 pub mod runner;
 pub mod runner_monitor;
 pub mod runners;

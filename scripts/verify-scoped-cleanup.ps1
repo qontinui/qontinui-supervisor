@@ -347,6 +347,12 @@
           and so is not attributable to our build (the absence-checks cannot
           PASS off someone else's pass); the spawn-test submission failed; or a
           probe exited before the pass. Re-run.
+          ALSO 3: every assertion passed but TEARDOWN LEAKED - a temp runner
+          this run spawned is still listed in `GET /runners`, or could not be
+          confirmed stopped. The assertion verdict is unaffected; the operator
+          still has to clean up, so the run must not exit 0. The
+          "TEARDOWN LEAKED" block names each runner and the exact stop command.
+          A leak never DEMOTES 1 or 2 (see Resolve-TeardownExitCode).
 
     This script does NOT use taskkill /T anywhere. Tree kills on this machine
     have historically reaped sibling node/powershell processes - see the root
@@ -1108,6 +1114,64 @@ function Get-TempRunnerIds {
     return ,$ids
 }
 
+# Which temp runners is this run allowed to stop?
+#
+# TWO INDEPENDENT SOURCES, deliberately unioned:
+#
+#   $OwnIds  - the `id` the spawn-test 202 handed back. Unambiguously OURS: the
+#              supervisor assigns it at port reservation, BEFORE the build, so
+#              it comes back even on the async path where the runner process
+#              does not exist yet. This source needs no baseline.
+#   diff     - ($After - $Baseline), the historical source. Needed because a
+#              spawn whose response never arrived (a timeout on a request the
+#              supervisor DID act on) still leaves a runner we own but cannot
+#              name.
+#
+# $Baseline is $null for "we never got a snapshot" and an EMPTY ARRAY for
+# "we snapshotted, there were none" - they cannot share a sentinel (see the
+# declaration). With a $null baseline the diff is UNSAFE (every peer's runner
+# would look new), so it is dropped - but $OwnIds still applies, which is the
+# point of tracking it. Before, a failed baseline GET disabled teardown
+# entirely and leaked the runner this script had just spawned by name.
+function Get-RunnersToStop {
+    param($Baseline, $After, $OwnIds)
+    $out = @()
+    foreach ($id in @($OwnIds)) {
+        if ($null -eq $id) { continue }
+        if ("$id" -eq '') { continue }
+        if ($out -notcontains $id) { $out += $id }
+    }
+    if ($null -ne $Baseline) {
+        foreach ($id in @($After)) {
+            if ($null -eq $id) { continue }
+            if (@($Baseline) -contains $id) { continue }
+            if ($out -notcontains $id) { $out += $id }
+        }
+    }
+    return ,$out
+}
+
+# Fold a teardown that left something behind into the process exit code.
+#
+# WHY A LEAK MUST MOVE THE EXIT CODE AT ALL. Teardown runs in `finally`, i.e.
+# AFTER the assertion table has been printed and after $script:ExitCode has been
+# decided. So on 2026-08-09 the harness leaked a temp runner and still reported
+# "all assertions PASSED" and exited 0 - the leak was structurally invisible to
+# every consumer of this script's result. #138 removed that run's CAUSE (a 415
+# on the stop call); this removes the SILENCE, which is the part that let one
+# bad call shape survive a green run.
+#
+# Escalation only, never demotion: a FAILED assertion (2) or an aborted run (1)
+# is strictly more important than a leaked runner and must stay visible. 0 -> 3
+# because 3 already means "the operator must look at this and re-run", which is
+# exactly the disposition a leaked runner needs.
+function Resolve-TeardownExitCode {
+    param([int]$CurrentExitCode, [int]$LeakedCount)
+    if ($LeakedCount -le 0) { return $CurrentExitCode }
+    if ($CurrentExitCode -eq 0) { return 3 }
+    return $CurrentExitCode
+}
+
 # ---------------------------------------------------------------------------
 # Assertion ledger
 # ---------------------------------------------------------------------------
@@ -1140,6 +1204,17 @@ $script:CargoExe     = Resolve-CargoExe
 # teardown. They cannot share a sentinel: `-not @()` is $true in PowerShell, so
 # a falsiness check would silently skip cleanup in the common zero-peer case.
 $script:PreExistingTempRunners = $null
+# The runner id(s) the spawn-test response named as ours. Independent of the
+# baseline above, and the only source that survives a failed baseline GET.
+$script:OurSpawnedRunnerIds = @()
+# Populated by Stop-SpawnedRunners: one entry per temp runner this run may have
+# left behind, each carrying WHY. Non-empty escalates the exit code (see
+# Resolve-TeardownExitCode) and prints the teardown block after the report.
+$script:LeakedRunners = @()
+# Set to the build's terminal state so teardown can tell "our runner never
+# appeared because the build was still compiling" (it may appear AFTER we exit)
+# from "it never appeared and never will".
+$script:BuildReachedTerminal = $false
 # Run-scoped package name. The build-script exe path is derived from the
 # PACKAGE name, not the crate source path, so a constant name would make one
 # run's teardown sweep kill a concurrent run's build scripts.
@@ -1465,42 +1540,133 @@ function Stop-AllProbes {
     }
 }
 
-# Stop every `test-*` runner that appeared during this run. Snapshot-diffed
-# rather than "stop the id the POST returned", because the build may still be
-# in flight at the poll deadline - and diffing is what keeps us from stopping a
-# PEER's temp runner.
+# Stop every `test-*` runner this run is responsible for, then PROVE by read
+# that they are gone. Anything still standing is recorded on
+# $script:LeakedRunners, which moves the exit code (Resolve-TeardownExitCode).
+#
+# Targets come from Get-RunnersToStop: the id the spawn response named plus the
+# snapshot diff, so a failed baseline GET no longer disables teardown for a
+# runner we can name outright.
+#
+# WHY IT RE-READS INSTEAD OF TRUSTING THE 200. A stop that answers 200 has not
+# necessarily finished: `stop_runner_by_id` can report a StillHeld process, and
+# the whole reason this function is under review is that its previous failure
+# mode was believing itself. "It returned without throwing" is not evidence the
+# runner is gone; its absence from `GET /runners` is.
 function Stop-SpawnedRunners {
-    # $null (not @()) is the "we never got a baseline" sentinel - see the
-    # declaration. Without a baseline we cannot tell our temp runner from a
-    # peer's, so we stop nothing.
-    if ($null -eq $script:PreExistingTempRunners) {
-        Write-Warn 'no pre-spawn runner baseline; skipping temp-runner teardown rather than risk stopping a peer''s runner'
-        return
-    }
     $after = @()
+    $listFailed = $null
     try {
         $payload = Invoke-RestMethod -Method Get -Uri "$base/runners" -TimeoutSec 15
         $after = Get-TempRunnerIds -RunnersPayload $payload
     } catch {
-        Write-Warn "could not list runners for teardown: $($_.Exception.Message)"
+        $listFailed = $_.Exception.Message
+        Write-Warn "could not list runners for teardown: $listFailed"
+    }
+
+    if ($null -eq $script:PreExistingTempRunners) {
+        Write-Warn 'no pre-spawn runner baseline; the snapshot diff is unusable (every peer''s runner would look new). Only runners the spawn response named as ours will be stopped.'
+    }
+    $baselineForDiff = $script:PreExistingTempRunners
+    if ($null -ne $listFailed) {
+        # No `after` list to diff against. Fall through with $null so
+        # Get-RunnersToStop uses $OwnIds alone rather than diffing against @().
+        $baselineForDiff = $null
+    }
+
+    $targets = Get-RunnersToStop -Baseline $baselineForDiff -After $after -OwnIds $script:OurSpawnedRunnerIds
+    if (@($targets).Count -eq 0) {
+        if ($null -ne $listFailed -and @($script:OurSpawnedRunnerIds).Count -eq 0) {
+            # We can neither name nor discover a runner, and we cannot prove
+            # there is none. UNKNOWN, not clean - the same rule the assertions
+            # follow for an empty diagnostics read.
+            $script:LeakedRunners += [PSCustomObject]@{
+                Id     = '(unknown)'
+                Reason = "could not list runners ($listFailed) and no spawn response named an id, so whether this run left a temp runner behind is UNKNOWN"
+            }
+        } else {
+            Write-Step 'teardown: no temp runner of ours to stop'
+        }
         return
     }
-    foreach ($id in $after) {
-        if ($script:PreExistingTempRunners -contains $id) { continue }
+
+    foreach ($id in $targets) {
         Write-Step "teardown: stopping temp runner $id"
         try {
-            # -ContentType + a body are REQUIRED: the stop route rejects a
-            # bodyless POST with 415 Unsupported Media Type, so without these
-            # the teardown fails and LEAKS the temp runner it just spawned.
-            # Found on the harness's first live run (2026-08-09), which
-            # otherwise passed all 9 assertions -- the leak is silent from the
-            # assertions' point of view because teardown runs after them and
-            # only warns.
+            # -ContentType + -Body are belt-and-braces, and the belt is the
+            # interesting part. The stop route's body is OPTIONAL, but
+            # `Invoke-RestMethod -Method Post` with no -Body still sends
+            # `Content-Type: application/x-www-form-urlencoded` (the .NET
+            # HttpWebRequest default), and axum's Option<Json<T>> answered 415
+            # to any non-JSON content type even with zero bytes to parse. That
+            # is what leaked a runner on 2026-08-09. The supervisor now accepts
+            # an empty body whatever the content type (routes/optional_json.rs),
+            # so this is no longer load-bearing against a current supervisor -
+            # it is kept because this harness is routinely pointed at an OLDER
+            # running supervisor, and spelling the call correctly costs nothing.
             Invoke-RestMethod -Method Post -Uri "$base/runners/$id/stop" `
                 -ContentType 'application/json' -Body '{}' -TimeoutSec 60 | Out-Null
         } catch {
             Write-Warn "could not stop temp runner $id : $($_.Exception.Message)"
-            Write-Warn "  ^ this LEAKS a temp runner - stop it by hand: POST $base/runners/$id/stop -H 'Content-Type: application/json' -d '{}'"
+        }
+    }
+
+    # ---- Prove it, or say we could not ------------------------------------
+    # Read TWICE with a settle in between, and only the second read can convict.
+    # Registry removal is not guaranteed to be observable the instant the stop
+    # response lands, and a leak report is loud (it escalates the exit code and
+    # tells the operator to go clean up) — so a one-off race must not manufacture
+    # one. The check is still "prove it by read": the settle only decides how
+    # long we let the supervisor take, never whether we look.
+    $stillListed = @()
+    $readFailure = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $readFailure = $null
+        try {
+            $payload = Invoke-RestMethod -Method Get -Uri "$base/runners" -TimeoutSec 15
+            $stillListed = Get-TempRunnerIds -RunnersPayload $payload
+        } catch {
+            $readFailure = $_.Exception.Message
+        }
+        if ($null -ne $readFailure) { break }
+        # Nothing of ours left: settled, no second read needed.
+        $survivors = @($targets | Where-Object { @($stillListed) -contains $_ })
+        if ($survivors.Count -eq 0) { break }
+        if ($attempt -lt 2) {
+            Write-Step "teardown: $($survivors.Count) runner(s) still listed; waiting 5s for the registry to settle before convicting"
+            Start-Sleep -Seconds 5
+        }
+    }
+    if ($null -ne $readFailure) {
+        foreach ($id in $targets) {
+            $script:LeakedRunners += [PSCustomObject]@{
+                Id     = $id
+                Reason = "stop was issued, but the confirming GET /runners failed ($readFailure), so whether it stopped is UNKNOWN"
+            }
+        }
+        return
+    }
+
+    foreach ($id in $targets) {
+        if (@($stillListed) -contains $id) {
+            $script:LeakedRunners += [PSCustomObject]@{
+                Id     = $id
+                Reason = 'still present in GET /runners after the stop call AND after a 5s settle'
+            }
+        }
+    }
+
+    # A runner we NAMED but never saw listed, on a build that never reached a
+    # terminal state, is the third leak class: the supervisor may still spawn it
+    # after we exit, so "not listed" here does not mean "will never exist".
+    if (-not $script:BuildReachedTerminal) {
+        foreach ($id in @($script:OurSpawnedRunnerIds)) {
+            if (@($stillListed) -contains $id) { continue }
+            if (@($after) -contains $id) { continue }
+            $script:LeakedRunners += [PSCustomObject]@{
+                Id     = $id
+                Reason = 'never appeared in GET /runners AND our build never reached a terminal state - the supervisor may still spawn it after this script exits'
+            }
         }
     }
 }
@@ -1789,6 +1955,16 @@ try {
             # Defensive: a supervisor that ignored `async` answers synchronously.
             $submissionId = $spawnResp.build_id
         }
+        # Record the runner id BEFORE anything else can fail. Both the async 202
+        # and the sync 200 carry `id`; on the async path the supervisor assigns
+        # it at port reservation, so it is known long before the runner process
+        # exists. This is what lets teardown name our runner without a baseline.
+        if ($spawnResp -and ($spawnResp.PSObject.Properties.Name -contains 'id') -and ("$($spawnResp.id)" -ne '')) {
+            $script:OurSpawnedRunnerIds += $spawnResp.id
+            Write-Step "spawn-test reserved runner id $($spawnResp.id) (recorded for teardown)"
+        } else {
+            Write-Warn 'spawn-test response carried no `id`; teardown falls back to the snapshot diff alone'
+        }
         Write-Step "spawn-test accepted in $([int]((Get-Date) - $spawnStart).TotalSeconds)s (submission=$submissionId)"
     } catch {
         # A failed SUBMISSION still leaves whatever cleanup passes already ran
@@ -1880,6 +2056,9 @@ try {
     }
 
     $buildTerminal = ($buildState -eq 'succeeded' -or $buildState -eq 'failed')
+    # Teardown reads this from `finally` to classify a runner we named but never
+    # saw: a non-terminal build can still spawn it after we exit.
+    $script:BuildReachedTerminal = $buildTerminal
     if (-not $submissionId) {
         Write-Warn "submission failed: $submitError; polled briefly ($pollCount poll(s), $([int]((Get-Date) - $spawnStart).TotalSeconds)s) then stopped rather than holding every slot's build lock to the ${BuildTimeoutSec}s deadline. Teardown runs now; re-run when the pool has a free slot."
     }
@@ -2268,10 +2447,45 @@ try {
     # had to leave running, and each of those holds a build lock until it
     # self-expires after -ProbeLifetimeSecs.
     try { Stop-AllProbes } catch { Write-Warn "probe teardown failed: $($_.Exception.Message)" }
-    try { Stop-SpawnedRunners } catch { Write-Warn "temp-runner teardown failed: $($_.Exception.Message)" }
+    try { Stop-SpawnedRunners } catch {
+        Write-Warn "temp-runner teardown failed: $($_.Exception.Message)"
+        # A throw here means the function did not reach its own leak accounting,
+        # so the state it left behind is UNKNOWN. Record it as a leak rather
+        # than letting a crashed teardown read as a clean one.
+        $script:LeakedRunners += [PSCustomObject]@{
+            Id     = '(unknown)'
+            Reason = "temp-runner teardown threw before it could account for itself: $($_.Exception.Message)"
+        }
+    }
     try {
         if (Test-Path $script:ManifestPath) { Remove-Item -Force $script:ManifestPath -ErrorAction Stop }
     } catch { }
+
+    # ---- Teardown outcome: the one thing the report above CANNOT show -------
+    # The assertion table and $script:ExitCode were decided before this block
+    # ran, so a leak here would otherwise be invisible to every consumer of this
+    # script (2026-08-09: leaked a runner, printed "all assertions PASSED",
+    # exited 0). Escalate, and say exactly what to paste.
+    if (@($script:LeakedRunners).Count -gt 0) {
+        $before = $script:ExitCode
+        $script:ExitCode = Resolve-TeardownExitCode -CurrentExitCode $script:ExitCode -LeakedCount @($script:LeakedRunners).Count
+        Write-Host ''
+        Write-Host '================ TEARDOWN LEAKED - operator action required ================' -ForegroundColor Red
+        Write-Fail "$(@($script:LeakedRunners).Count) temp runner(s) may still be running. The assertion table above was printed BEFORE teardown and does not reflect this."
+        foreach ($leak in $script:LeakedRunners) {
+            Write-Fail "  $($leak.Id): $($leak.Reason)"
+            if ($leak.Id -ne '(unknown)') {
+                Write-Host "    stop it by hand: curl -X POST $base/runners/$($leak.Id)/stop -H 'Content-Type: application/json' -d '{}'"
+            }
+        }
+        Write-Host "    then confirm: curl -s $base/runners | ConvertFrom-Json | %{ `$_.runners } | ? { `$_.id -like 'test-*' }"
+        if ($script:ExitCode -ne $before) {
+            Write-Fail "exit code raised $before -> $($script:ExitCode) because this run left state behind."
+        } else {
+            Write-Fail "exit code stays $($script:ExitCode) - a failed/aborted run outranks a leak, but the leak is real and still needs cleaning up."
+        }
+        Write-Host '===========================================================================' -ForegroundColor Red
+    }
     Write-Step 'teardown complete.'
 }
 

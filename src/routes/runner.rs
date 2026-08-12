@@ -14,6 +14,7 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
 use crate::process::manager;
+use crate::routes::optional_json::OptionalJson;
 use crate::state::SharedState;
 
 /// Query string for endpoints that opt-OUT of the post-spawn health wait.
@@ -210,6 +211,9 @@ pub struct WatchdogRequest {
     pub reset_attempts: bool,
 }
 
+/// Body for `POST /runner/stop`. Every field defaults, so the body as a whole
+/// is optional — see [`OptionalJson`] for why that needs a custom extractor
+/// rather than `Option<Json<_>>`.
 #[derive(Deserialize, Default)]
 pub struct StopRequest {
     #[serde(default)]
@@ -218,9 +222,9 @@ pub struct StopRequest {
 
 pub async fn stop_runner(
     State(state): State<SharedState>,
-    body: Option<Json<StopRequest>>,
+    body: OptionalJson<StopRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let force = body.map(|b| b.force).unwrap_or(false);
+    let force = body.into_inner_or_default().force;
     manager::stop_runner(&state, force).await?;
 
     Ok(Json(serde_json::json!({

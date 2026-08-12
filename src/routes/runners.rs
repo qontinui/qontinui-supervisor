@@ -23,6 +23,7 @@ use crate::dev_action::{
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
+use crate::routes::optional_json::OptionalJson;
 use crate::settings;
 use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
 use qontinui_types::wire::runner_kind::RunnerKind;
@@ -66,8 +67,12 @@ pub struct StopRunnerRequest {
     pub force: bool,
 }
 
-/// Body for `POST /runners/purge-stale`. All fields optional so a body-less
-/// POST still deserializes (the historical contract).
+/// Body for `POST /runners/purge-stale`. All fields optional, and the body as a
+/// whole is too — which takes [`OptionalJson`], not `Option<Json<_>>`. Field
+/// defaults alone do NOT make a body-less POST deserialize: axum decides on the
+/// `Content-Type` header before it ever looks for bytes, so this used to answer
+/// 415 to an empty POST that declared a form content type. See the
+/// [`OptionalJson`] module docs for the full matrix.
 #[derive(Deserialize, Default)]
 pub struct PurgeStaleRequest {
     /// When set, only purge stale runners owned by this requester. When absent,
@@ -779,9 +784,9 @@ pub async fn remove_runner(
 /// purges every stale test runner, preserving the historical behavior.
 pub async fn purge_stale(
     State(state): State<SharedState>,
-    body: Option<Json<PurgeStaleRequest>>,
+    body: OptionalJson<PurgeStaleRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let only_requester = body.and_then(|Json(b)| b.requester_id);
+    let only_requester = body.into_inner_or_default().requester_id;
     // Explicit user request — purge regardless of build-pool state.
     let purged_triples =
         purge_stale_test_runners_core(&state, false, only_requester.as_deref()).await;
@@ -1034,12 +1039,15 @@ pub async fn start_runner(
 }
 
 /// POST /runners/{id}/stop — stop a specific runner.
+///
+/// The body is optional; see [`OptionalJson`] for why that is not spelled
+/// `Option<Json<_>>`. This route is the reason that module exists.
 pub async fn stop_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-    body: Option<Json<StopRunnerRequest>>,
+    body: OptionalJson<StopRunnerRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let _force = body.map(|b| b.force).unwrap_or(false);
+    let _force = body.into_inner_or_default().force;
 
     // Capture the early-log path BEFORE stopping — for test-* runners the
     // stop also removes them from the registry, after which we can no longer

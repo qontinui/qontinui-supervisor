@@ -301,6 +301,27 @@ cleanup pass ran, a pass ran but was a peer's and so is not attributable to our
 build, the spawn-test submission failed, or a probe exited early — re-run),
 1 = the run could not be performed.
 
+**A leaked temp runner also exits 3, and says so.** Teardown runs in `finally`,
+i.e. after the assertion table is printed and after the exit code is decided, so
+a teardown failure used to be structurally invisible: on 2026-08-09 the harness
+left a temp runner running and still printed "all assertions PASSED" and exited
+0 (the cause was a 415 on the stop call, fixed client-side in #138 and
+server-side in `OptionalJson` — see "Optional request bodies"). Teardown now
+**proves the stop by re-reading `GET /runners`** rather than trusting the 200,
+records each survivor on a ledger, prints a `TEARDOWN LEAKED` block naming the
+exact stop command per runner, and escalates 0 → 3. Escalation only: a FAILED
+assertion (2) or an aborted run (1) outranks a leak and is never demoted. Three
+leak classes are distinguished — still listed after the stop; the confirming read
+failed so the outcome is **UNKNOWN**; or the runner never appeared while the
+build never reached a terminal state, so the supervisor may still spawn it after
+the script exits.
+
+Teardown also stops **the runner id the spawn response named** (`id` on the
+async 202, assigned at port reservation before the build), not just the
+snapshot diff. A failed pre-spawn baseline `GET /runners` therefore no longer
+disables runner teardown entirely — it only disables the diff, which stays
+unsafe without a baseline because every peer's runner would look new.
+
 Probes are launched as the **real toolchain `cargo.exe`** resolved via `rustup
 which cargo`, never `~\.cargo\bin\cargo.exe` — that is a 0-byte symlink to
 `rustup.exe`, and the proxy does not `exec`, so launching it yields a process
@@ -401,10 +422,10 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | POST | `/runners` | Add a runner config to the registry |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
-| POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive |
+| POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive. Optional body `{requester_id?}` scopes the purge; a bodyless POST purges every stale test runner. |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
 | POST | `/runners/{id}/start` | Start a runner |
-| POST | `/runners/{id}/stop` | Stop a runner |
+| POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). |
 | POST | `/runners/{id}/restart` | Restart a runner |
 | POST | `/runners/{id}/protect` | Toggle protection on a runner |
 | POST | `/runners/{id}/watchdog` | Control watchdog for a specific runner |
@@ -415,6 +436,44 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 **Queue behavior for spawn-test and spawn-named:**
 - **Default (blocking):** If all build slots are busy, the HTTP request holds open until a slot frees. Optional `queue_timeout_secs` bounds the wait and returns 504 on timeout.
 - **`X-Queue-Mode: no-wait` header:** Returns immediately with **503 Service Unavailable** and body `{error: "build_pool_full", queue_position, active_builds: [...]}`.
+
+### Optional request bodies — `OptionalJson`, not `Option<Json<T>>`
+
+Three routes take a body every field of which defaults, so the body as a whole
+is optional: `POST /runner/stop`, `POST /runners/{id}/stop`,
+`POST /runners/purge-stale`. They use the **`OptionalJson<T>` extractor**
+(`src/routes/optional_json.rs`). **An empty body is `None` whatever the
+`Content-Type` says**; a non-empty body is handed to axum's `Json` verbatim, so
+it keeps axum's content-type check and rejection bodies.
+
+**Do not "simplify" these back to `Option<Json<T>>`.** Field-level
+`#[serde(default)]` does not make a bodyless POST work: axum 0.8 branches on the
+`Content-Type` header and never looks at whether there are bytes to parse.
+
+| `Content-Type` | body | `Option<Json<T>>` (old) | `OptionalJson<T>` (now) |
+|---|---|---|---|
+| absent | empty | `None` | `None` |
+| `application/json` | `{}` | `Some` | `Some` |
+| `application/json` | *empty* | **400** EOF while parsing | `None` |
+| `application/x-www-form-urlencoded` | *empty* | **415** | `None` |
+| `application/x-www-form-urlencoded` | `{...}` | 415 | 415 (unchanged) |
+| absent | `{"force":true}` | `None` — **silently dropped** | **415**, named |
+
+The two empty-body rejections are what an ordinary client sends for a bodyless
+POST: `.NET`'s `HttpWebRequest` — and so PowerShell 5.1's `Invoke-RestMethod
+-Method Post` with no `-Body` — defaults to `application/x-www-form-urlencoded`,
+and so does `curl -d ''`. That is not hypothetical: it is how
+`scripts/verify-scoped-cleanup.ps1` came to leak the temp runner it spawned while
+reporting all 9 assertions passed (2026-08-09, PR #138 fixed that one caller).
+
+The last row is a deliberate behavior change: a body sent with no `Content-Type`
+is now refused instead of vanishing. Silently dropping `force: true` on a stop
+turns an operator's deliberate force-stop of a protected runner into a confusing
+"runner is protected" refusal — the same reason `spawn-test` answers 400 on a
+misspelled provenance selector rather than ignoring it.
+
+Browser `fetch(url, {method: 'POST'})` sends no `Content-Type` and no body, so
+the dashboard's own stop/start buttons were never affected either way.
 
 ### Parallel Build Pool
 
@@ -595,7 +654,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 |--------|------|-------------|
 | GET/POST/DELETE | `/test-login` | Get/set/clear test login credentials for runner spawning |
 | GET | `/ws` | WebSocket endpoint |
-| POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint) |
+| POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint). Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies"). |
 | POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?}`. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"rebuilding", build_id, poll:"/builds"}` immediately and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll}` immediately; the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
