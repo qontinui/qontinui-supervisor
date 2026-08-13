@@ -356,9 +356,19 @@ struct ScanSummary {
 /// entries so an operator can audit what happened.
 #[cfg(not(target_os = "windows"))]
 pub async fn scan_orphans_at_startup(_state: &SharedState) {
-    // Orphan scanning is Windows-specific (handles `qontinui-runner.exe`
-    // file locks via Win32 process enumeration). On other platforms the
-    // supervisor is not supported, so this is a no-op.
+    // Orphan scanning is Windows-specific (it resolves `qontinui-runner.exe`
+    // file locks via Win32 process enumeration), so it is a no-op elsewhere.
+    //
+    // That is a statement about THIS TOOL, not about the product. The
+    // supervisor is single-operator dev tooling that never ships to users and
+    // is run on Windows only, so its non-Windows paths are unexercised rather
+    // than unsupported. qontinui itself — runner, web, mobile — is
+    // cross-platform, which is why the reaper, stop and reconcile paths around
+    // this one already dispatch through `proc_kill`'s `unix_kill` arm.
+    //
+    // Reopening this off Windows means promoting `find_runner_processes` into
+    // `proc_kill` (it is the one piece of the scan still living only in
+    // `process::windows`) and un-gating the Windows-only body below.
 }
 
 #[cfg(target_os = "windows")]
