@@ -1253,7 +1253,12 @@ async fn run_build_inner(
         })
     };
 
-    let guarded = GuardedCommand::new("cargo", Duration::from_secs(timeout_secs))
+    // `sccache_guard::guarded_cargo`, not a bare `GuardedCommand::new("cargo", …)`:
+    // it degrades RUSTC_WRAPPER for this spawn when the live sccache server is
+    // S3-bound (Phase 1.3 — see the module docs for why the shell-side guards
+    // never covered this path).
+    let guarded = crate::sccache_guard::guarded_cargo(Duration::from_secs(timeout_secs), cargo_cwd)
+        .await
         .args(CARGO_BUILD_ARGS)
         .current_dir(cargo_cwd)
         // Redirect cargo output to this slot's isolated target dir so
@@ -1600,11 +1605,16 @@ async fn build_shim_sidecar(
         slot.id, slot.target_dir
     );
 
-    let guarded = GuardedCommand::new("cargo", Duration::from_secs(SHIM_BUILD_TIMEOUT_SECS))
-        .args(SHIM_BUILD_ARGS)
-        .current_dir(cargo_cwd)
-        .env("CARGO_TARGET_DIR", &slot.target_dir)
-        .job_guarded(true);
+    // Same S3-backend degrade as the main pool build — see `sccache_guard`.
+    let guarded = crate::sccache_guard::guarded_cargo(
+        Duration::from_secs(SHIM_BUILD_TIMEOUT_SECS),
+        cargo_cwd,
+    )
+    .await
+    .args(SHIM_BUILD_ARGS)
+    .current_dir(cargo_cwd)
+    .env("CARGO_TARGET_DIR", &slot.target_dir)
+    .job_guarded(true);
 
     let failure = match guarded.run().await {
         Ok(GuardedOutcome::Exited(output)) if output.status.success() => {
@@ -3470,14 +3480,19 @@ async fn prewarm_single_slot(
         "GCMD: prewarm cargo check start slot={} timeout={}s",
         slot.id, PREWARM_TIMEOUT_SECS
     );
-    let outcome = GuardedCommand::new("cargo", Duration::from_secs(PREWARM_TIMEOUT_SECS))
-        .args(args)
-        .current_dir(&state.config.project_dir)
-        .env("CARGO_TARGET_DIR", &slot.target_dir)
-        .job_guarded(true)
-        .stream_lines(line_tx)
-        .run()
-        .await;
+    // Same S3-backend degrade as the pool build — see `sccache_guard`.
+    let outcome = crate::sccache_guard::guarded_cargo(
+        Duration::from_secs(PREWARM_TIMEOUT_SECS),
+        &state.config.project_dir,
+    )
+    .await
+    .args(args)
+    .current_dir(&state.config.project_dir)
+    .env("CARGO_TARGET_DIR", &slot.target_dir)
+    .job_guarded(true)
+    .stream_lines(line_tx)
+    .run()
+    .await;
 
     // Map the GuardedOutcome back onto the legacy match shape: `Ok(Ok(status))`
     // for a clean exit, the timeout arm for TimedOut/Cancelled, and a process

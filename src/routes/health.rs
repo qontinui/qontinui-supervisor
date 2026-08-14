@@ -235,8 +235,52 @@ pub struct LkgHealth {
 
 #[derive(Serialize)]
 pub struct SupervisorInfo {
+    /// The crate version. Hardcoded in `Cargo.toml` and unchanged for the life
+    /// of the repo, so it identifies the PRODUCT, never the build — use
+    /// [`Self::built_from_sha`] to tell two supervisor binaries apart.
     pub version: String,
     pub project_dir: String,
+    /// **The commit THIS supervisor binary was compiled from**: a bare
+    /// lowercase-hex git sha — the full 40 characters for any build that read
+    /// it from git, and an unambiguous prefix only if a build-env override
+    /// supplied one — or `null` when the build could not establish a commit at
+    /// all (built outside a git checkout / no git on PATH).
+    ///
+    /// Shape is a consumed contract — it is fed straight to
+    /// `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is
+    /// the running supervisor newer than fix X?", which before this field had
+    /// no read-only answer at all (2026-08-04: the fallback measured an exe
+    /// mtime, and the wrong exe at that). So: **a bare sha, never a timestamp
+    /// and never a composite.** The neighbouring `buildId` on this same
+    /// response is the RUNNER's and is an ISO timestamp; the runner's own
+    /// `/health` spells the same name as `<sha>-<epoch-ms>`. Two shapes for one
+    /// name already exist — this field must not become a third. Full shape
+    /// rationale: [`crate::self_provenance`].
+    ///
+    /// `null` is UNKNOWN, not "clean" and not "old".
+    pub built_from_sha: Option<String>,
+    /// Whether the working tree carried modified TRACKED files when this binary
+    /// was built; `null` when unknown.
+    ///
+    /// Carried as a SEPARATE field rather than a `-dirty` suffix so
+    /// [`Self::built_from_sha`] stays directly git-resolvable. `true` makes the
+    /// sha a lower bound: "contains fix X" still holds, "does not contain fix
+    /// X" is not conclusive.
+    pub built_from_dirty: Option<bool>,
+}
+
+impl SupervisorInfo {
+    /// The live values for this running binary: crate version + the compile-time
+    /// build provenance. One constructor so the `GET /health` and SSE arms can
+    /// never report different provenance for the same process.
+    pub fn current(project_dir: String) -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            project_dir,
+            built_from_sha: crate::self_provenance::built_from_sha().map(str::to_string),
+            built_from_dirty: crate::self_provenance::built_from_dirty(),
+        }
+    }
 }
 
 /// Determine the overall health status string based on runner, API, and build state.
@@ -406,10 +450,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             port: expo.port,
             configured: state.config.expo_dir.is_some(),
         },
-        supervisor: SupervisorInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            project_dir: state.config.project_dir.display().to_string(),
-        },
+        supervisor: SupervisorInfo::current(state.config.project_dir.display().to_string()),
         runners: runners_health,
         sdk_features: SDK_FEATURES.to_vec(),
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
@@ -540,10 +581,7 @@ fn try_build_sse_health(
             port: expo.port,
             configured: state.config.expo_dir.is_some(),
         },
-        supervisor: SupervisorInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            project_dir: state.config.project_dir.display().to_string(),
-        },
+        supervisor: SupervisorInfo::current(state.config.project_dir.display().to_string()),
         // Read cached runner snapshots (built by background health refresher)
         runners: build_sse_runners(state),
         sdk_features: SDK_FEATURES.to_vec(),
@@ -719,10 +757,7 @@ mod tests {
                 port: 8081,
                 configured: false,
             },
-            supervisor: SupervisorInfo {
-                version: "0.1.0".to_string(),
-                project_dir: "/tmp/test".to_string(),
-            },
+            supervisor: SupervisorInfo::current("/tmp/test".to_string()),
             runners: Vec::new(),
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
@@ -768,6 +803,46 @@ mod tests {
         );
     }
 
+    /// The supervisor's own build commit must be present on every `/health`
+    /// body, under `supervisor`, as a **bare git sha or `null`** — never a
+    /// timestamp, never a `<sha>-<suffix>` composite, never `""`.
+    ///
+    /// A companion script feeds this value straight to
+    /// `git merge-base --is-ancestor <fix-sha> <value>`, so any other shape
+    /// silently answers "is the running supervisor newer than fix X?" wrong.
+    /// The neighbouring `buildId` on this same response is the RUNNER's and IS
+    /// a timestamp — this test is what keeps the two from converging.
+    #[test]
+    fn test_supervisor_built_from_sha_is_a_bare_sha_or_null() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        let supervisor = value
+            .get("supervisor")
+            .expect("the supervisor object must be present");
+        let sha = supervisor
+            .get("built_from_sha")
+            .expect("built_from_sha must always be present, even when unknown");
+        match sha {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(s) => {
+                assert!(
+                    (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()),
+                    "built_from_sha must be a bare git object id, got {s:?}"
+                );
+            }
+            other => panic!("built_from_sha must be a string or null, got {other}"),
+        }
+        // The dirty marker is a SEPARATE tri-state field, so the sha above
+        // never has to be de-suffixed before it reaches git.
+        let dirty = supervisor
+            .get("built_from_dirty")
+            .expect("built_from_dirty must always be present, even when unknown");
+        assert!(
+            dirty.is_null() || dirty.is_boolean(),
+            "built_from_dirty must be a bool or null, got {dirty}"
+        );
+    }
+
     /// Minimal `HealthResponse` for serialization-shape assertions.
     fn build_minimal_health_response() -> HealthResponse {
         HealthResponse {
@@ -800,10 +875,7 @@ mod tests {
                 port: 8081,
                 configured: false,
             },
-            supervisor: SupervisorInfo {
-                version: "0.1.0".to_string(),
-                project_dir: "/tmp/test".to_string(),
-            },
+            supervisor: SupervisorInfo::current("/tmp/test".to_string()),
             runners: Vec::new(),
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,

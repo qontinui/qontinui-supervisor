@@ -37,7 +37,14 @@ mod pii_scrub;
 mod process;
 mod reapi;
 mod routes;
+/// S3-backend degrade guard for the supervisor's own in-process cargo spawns
+/// (`plans/2026-08-04-landed-infra-fixes-not-in-effect-on-this-machine.md`
+/// Phase 1.3).
+mod sccache_guard;
 mod sdk_features;
+/// The supervisor's own build commit, stamped by `build.rs` and surfaced on
+/// `/health` (same plan, Phase 2.3).
+mod self_provenance;
 mod server;
 mod settings;
 mod spawn_worktree;
@@ -125,9 +132,14 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    // The commit is the only part of this line that distinguishes two builds:
+    // the crate version is hardcoded and has never changed. Same value as
+    // `/health` `supervisor.built_from_sha`, except that the log form glues on
+    // the `-dirty` marker for human reading.
     info!(
-        "Starting qontinui-supervisor v{}",
-        env!("CARGO_PKG_VERSION")
+        "Starting qontinui-supervisor v{} (built from {})",
+        env!("CARGO_PKG_VERSION"),
+        self_provenance::describe()
     );
     info!("Project dir: {:?}", args.project_dir);
     info!("Watchdog: {}", args.watchdog);

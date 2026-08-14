@@ -28,7 +28,14 @@ pub mod pii_scrub;
 pub mod process;
 pub mod reapi;
 pub mod routes;
+/// S3-backend degrade guard for the supervisor's own in-process cargo spawns
+/// (`plans/2026-08-04-landed-infra-fixes-not-in-effect-on-this-machine.md`
+/// Phase 1.3).
+pub mod sccache_guard;
 pub mod sdk_features;
+/// The supervisor's own build commit, stamped by `build.rs` and surfaced on
+/// `/health` (same plan, Phase 2.3).
+pub mod self_provenance;
 pub mod server;
 pub mod settings;
 pub mod spawn_worktree;
