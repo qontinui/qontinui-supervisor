@@ -55,12 +55,13 @@ fn main() {
     println!("cargo:rerun-if-changed=dist");
 }
 
-/// The value stamped when this build could not establish a commit at all.
-///
-/// A distinct sentinel, never an empty string: `""` deserialises downstream as
-/// a present-but-blank field and reads as "clean/unset", which is exactly the
-/// plausible-looking wrong answer this provenance exists to prevent.
-const UNKNOWN: &str = "unknown";
+// The pure classification rules (`UNKNOWN_STAMP`, `looks_like_sha`,
+// `dirty_marker`), shared verbatim with the crate as
+// `crate::provenance_stamp`. A build script cannot import from the crate it
+// builds, so the file is `include!`d here and compiled again over there — which
+// is what puts these rules under the merge-blocking CI gate. See that file's
+// module docs for the dirty-marker defect that made the sharing necessary.
+include!("src/provenance_stamp.rs");
 
 /// Stamp the supervisor's OWN build commit into the binary
 /// (`plans/2026-08-04-landed-infra-fixes-not-in-effect-on-this-machine.md`
@@ -95,18 +96,28 @@ fn emit_self_build_provenance() {
     let sha = override_sha
         .map(|s| s.trim().to_string())
         .or_else(|| git(&["rev-parse", "HEAD"]).filter(|s| looks_like_sha(s)))
-        .unwrap_or_else(|| UNKNOWN.to_string());
+        .unwrap_or_else(|| UNKNOWN_STAMP.to_string());
 
     // `--untracked-files=no`: an untracked scratch file is not part of what was
     // compiled, so counting it would report every worktree as permanently
     // dirty and the marker would carry no information.
-    let dirty = if sha == UNKNOWN {
+    //
+    // Classified through `dirty_marker` on the raw (status, stdout) pair, NOT
+    // through the `git()` helper below: a clean tree exits 0 with zero bytes,
+    // and `git()` reports empty stdout as "no answer". Routing this call
+    // through it made `"false"` unreachable — see `src/provenance_stamp.rs`.
+    let dirty = if sha == UNKNOWN_STAMP {
         // No commit ⇒ no honest statement about drift FROM that commit.
-        UNKNOWN.to_string()
+        UNKNOWN_STAMP.to_string()
     } else {
-        match git(&["status", "--porcelain", "--untracked-files=no"]) {
-            Some(out) => (!out.trim().is_empty()).to_string(),
-            None => UNKNOWN.to_string(),
+        match std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .output()
+        {
+            Ok(out) => dirty_marker(out.status.success(), &String::from_utf8_lossy(&out.stdout))
+                .to_string(),
+            // Could not even run git ⇒ unknown, same as a non-zero exit.
+            Err(_) => UNKNOWN_STAMP.to_string(),
         }
     };
 
@@ -149,10 +160,16 @@ fn git_ref_paths() -> Vec<String> {
     paths
 }
 
-/// Run `git` in the package root, returning trimmed stdout on success only.
+/// Run `git` in the package root for a command whose answer IS its stdout
+/// (`rev-parse`, `symbolic-ref`), returning that stdout trimmed.
 ///
 /// Every failure mode (git not installed, not a repository, a broken index)
 /// collapses to `None` — build provenance must never be able to fail a build.
+///
+/// **Only for commands where empty output means failure.** `git status
+/// --porcelain` is the counter-example — empty stdout there is the *answer*
+/// (clean tree), which is why the dirty classification above calls `output()`
+/// directly and keys on the exit status instead.
 fn git(args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -164,15 +181,4 @@ fn git(args: &[&str]) -> Option<String> {
     } else {
         Some(s)
     }
-}
-
-/// Is `s` a plausible git object id (7-40 lowercase-hex characters)?
-///
-/// Guards the env-override path and the `rev-parse` result so a stray value can
-/// never be stamped as a commit. Duplicated (small, and deliberately) in
-/// `crate::self_provenance`, which re-validates at READ time — build.rs cannot
-/// import from the crate it builds.
-fn looks_like_sha(s: &str) -> bool {
-    let s = s.trim();
-    (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
 }

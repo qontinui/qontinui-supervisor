@@ -45,8 +45,12 @@
 //! the checkout says now, which diverges from what the running binary is made
 //! of the moment anyone pulls or switches branch under a long-lived supervisor.
 
-/// The sentinel `build.rs` stamps when it could not establish a commit.
-const UNKNOWN: &str = "unknown";
+/// The sentinel `build.rs` stamps when it could not establish a value.
+///
+/// Re-exported from [`crate::provenance_stamp`], which `build.rs` `include!`s —
+/// one definition, so the writer and the reader cannot disagree about what
+/// "unknown" is spelled as.
+use crate::provenance_stamp::{looks_like_sha, UNKNOWN_STAMP as UNKNOWN};
 
 /// Raw compile-time stamps. `build.rs` emits both unconditionally (before its
 /// own early-return paths), so these `env!`s cannot fail to resolve.
@@ -97,7 +101,7 @@ fn parse_sha(raw: &str) -> Option<&str> {
     if s.is_empty() || s.eq_ignore_ascii_case(UNKNOWN) {
         return None;
     }
-    if (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if looks_like_sha(s) {
         Some(s)
     } else {
         None
@@ -185,6 +189,47 @@ mod tests {
             }
             None => assert_eq!(d, "unknown"),
         }
+    }
+
+    /// **Read-side regression test for the unreachable-`false` defect.**
+    ///
+    /// If the stamped sha is the commit this checkout is on right now, the
+    /// build read it from a live git checkout — so git worked at build time,
+    /// so the dirty probe must have produced a DEFINITE answer. "Sha known,
+    /// dirtiness unknown" is precisely the signature of the shipped bug, in
+    /// which a clean tree's zero-byte `git status` output was misread as "no
+    /// answer" and every clean build stamped `unknown`. On a clean CI checkout
+    /// the old code failed this assertion; the sibling
+    /// `provenance_stamp::dirty_marker_reports_clean_on_successful_empty_output`
+    /// pins the same rule without a subprocess.
+    ///
+    /// Skips (rather than fails) when git is unavailable or the stamp predates
+    /// the current HEAD — a build-env override on a source tarball legitimately
+    /// yields a sha with no measurable tree, and a cached build-script run
+    /// legitimately yields an older sha.
+    #[test]
+    fn a_sha_read_from_this_live_checkout_implies_a_definite_dirty_answer() {
+        let Some(stamped) = built_from_sha() else {
+            return; // no commit established at build time — nothing to pin
+        };
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output();
+        let Ok(head) = head else { return }; // no git on PATH
+        if !head.status.success() {
+            return; // not a repository
+        }
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if head != stamped {
+            return; // stamp is from a different (older) build
+        }
+        assert!(
+            built_from_dirty().is_some(),
+            "the build read {stamped} from this checkout, so git ran — a dirty \
+             marker of `unknown` means the clean case was misclassified as \
+             'no answer' (see provenance_stamp::dirty_marker)"
+        );
     }
 
     /// The compile-time stamps themselves must be well-formed on whatever

@@ -26,6 +26,10 @@ pub mod log_capture;
 pub mod otel;
 pub mod pii_scrub;
 pub mod process;
+/// Pure build-provenance classification, `include!`d by `build.rs` so the
+/// stamping rules and the reading rules are one source (and so a build
+/// script's logic is covered by the merge-blocking CI gate).
+pub mod provenance_stamp;
 pub mod reapi;
 pub mod routes;
 /// S3-backend degrade guard for the supervisor's own in-process cargo spawns

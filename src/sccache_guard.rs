@@ -19,26 +19,57 @@
 //! * `qontinui-claude-config/.claude/hooks/sccache-backend-guard.sh` is a
 //!   PreToolUse hook and only intercepts an **agent's** Bash calls.
 //!
-//! The supervisor spawns cargo IN-PROCESS (`build_monitor`'s pool build, the
-//! shim sidecar build, and the slot prewarm), so the single most-built path on
-//! this machine had no S3 guard at all. [`guarded_cargo`] is the one seam all
-//! three go through.
+//! The supervisor spawns cargo IN-PROCESS, so the single most-built path on
+//! this machine had no S3 guard at all.
+//!
+//! ## What is covered, and what is deliberately not
+//!
+//! **Four compiling cargo spawns, all guarded:**
+//!
+//! | Call site | Seam |
+//! |---|---|
+//! | `build_monitor::run_build_inner` (the pool build) | [`guarded_cargo`] |
+//! | `build_monitor::build_shim_sidecar` | [`guarded_cargo`] |
+//! | `build_monitor::prewarm_single_slot` | [`guarded_cargo`] |
+//! | `build_submissions::run_submission` (`/build/submit`, `submit_detached`, `submit_spawn`) | [`degrade_cargo_env_if_s3`] |
+//!
+//! The fourth is a bare `tokio::process::Command`, not a `GuardedCommand` —
+//! which is exactly why the first cut of this module missed it (that pass
+//! searched for `GuardedCommand::new("cargo", …)`). It is on the `/build/submit`
+//! and **spawn-test** paths and inherits the supervisor's sccache env by
+//! design, so leaving it out meant an S3-latched daemon stalled it silently
+//! while the pool build beside it degraded and logged.
+//!
+//! **Two cargo spawns are excluded on purpose, not by oversight:**
+//!
+//! * `process::manager`'s two spawns are inside `#[cfg(test)]` — they never
+//!   run in a shipped supervisor and compile nothing.
+//! * `routes::runners`' `cargo clean --target-dir` compiles nothing, so
+//!   `RUSTC_WRAPPER` is irrelevant to it; it neither consults sccache nor
+//!   benefits from a degrade.
 //!
 //! ## The predicate: mirror the shipped one, in spirit and in letter
 //!
 //! * **Probe the server's ACTUAL latched backend** — the `s3,` marker in
-//!   `sccache --show-stats` — not whether `SCCACHE_BUCKET` happens to be set.
-//!   The bucket variable is only a proxy for the real thing: it MISSES a server
-//!   latched to S3 whose spawning env has since been cleaned, and it
+//!   `sccache --show-stats` **stdout** — not whether `SCCACHE_BUCKET` happens to
+//!   be set. The bucket variable is only a proxy for the real thing: it MISSES a
+//!   server latched to S3 whose spawning env has since been cleaned, and it
 //!   FALSE-FIRES on a set-but-unused variable. `--show-stats` answers instantly
 //!   even while every compile slot is blocked, so it cannot hang the gate.
+//!   Stdout only, byte-for-byte the stream `cargo-guard.sh` greps: a bucket name
+//!   in an sccache *diagnostic* on stderr must not read as a latched backend.
 //! * **Probe only when a listener already holds the pinned sccache port; never
 //!   spawn the daemon to probe it.** This is load-bearing, not defensive style:
 //!   a bare `sccache --show-stats` with no server running STARTS one, and
 //!   starting it from a polluted env is the exact mechanism that re-pins the
 //!   machine to S3. The probe would then have caused the regression it exists
-//!   to detect. (The probe child additionally has the S3 env vars REMOVED, so
-//!   even a version-mismatch respawn inside sccache itself cannot latch S3.)
+//!   to detect. The check-then-probe ordering makes that *unlikely, not
+//!   impossible*: sccache self-terminates on its idle timeout (600s by
+//!   default), so a daemon that idles out in the window between the two would
+//!   still be started by the client. The residual risk is bounded by removing
+//!   the S3 selectors from the probe child's env — any server it did manage to
+//!   start could not be S3-bound — which also covers sccache's own
+//!   version-mismatch respawn.
 //! * **Warn and degrade — never fail the build.** A slow build beats a build
 //!   that will not run. This matches the shipped `RUSTC_WRAPPER=""` /
 //!   `CARGO_GUARD_SCCACHE_CONN_CAP` precedent; no new mechanism.
@@ -75,9 +106,10 @@ const SCCACHE_DEFAULT_SERVER_PORT: u16 = 4226;
 const STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The substring that marks an S3-backed cache in `sccache --show-stats`
-/// output (`Cache location  S3, bucket: …`). Byte-for-byte the same assertion
-/// `cargo-guard.sh` makes with `grep -qi 's3,'` — the trailing comma is what
-/// keeps it off unrelated prose.
+/// STDOUT (`Cache location  S3, bucket: …`). Byte-for-byte the same assertion
+/// `cargo-guard.sh` makes with `grep -qi 's3,'`, over byte-for-byte the same
+/// stream (the shell greps command-substitution output, i.e. stdout) — the
+/// trailing comma is what keeps it off unrelated prose.
 const S3_BACKEND_MARKER: &str = "s3,";
 
 /// What to do with `RUSTC_WRAPPER` for one cargo spawn.
@@ -260,23 +292,38 @@ async fn probe_show_stats(port: u16) -> Option<String> {
         );
         return None;
     }
-    // sccache prints the stats table on stdout; keep stderr too so a build of
-    // sccache that reports the cache location there is still covered.
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push('\n');
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    Some(text)
+    // STDOUT ONLY — the stats table lives there, and that is also the exact
+    // stream `cargo-guard.sh` greps (it pipes command-substitution output).
+    // Folding stderr in would widen the marker's reach to sccache DIAGNOSTICS:
+    // a config-parse warning or a credential error naming an S3 bucket would
+    // then read as "the server is S3-bound" and silently uncache every
+    // supervisor build until the daemon restarted.
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run the full decision against the live machine.
-async fn decide_for_live_server(cargo_cwd: &Path) -> WrapperDecision {
+///
+/// `pub` because not every cargo spawn is a [`GuardedCommand`]: the build
+/// submission runner (`build_submissions::run_submission`) drives a bare
+/// `tokio::process::Command` so it can stream stdout+stderr through its own
+/// ring buffers. It applies the same degrade via
+/// [`degrade_cargo_env_if_s3`].
+pub async fn decide_for_live_server(cargo_cwd: &Path) -> WrapperDecision {
     let wrapper = std::env::var("RUSTC_WRAPPER").ok();
     if !wrapper_is_sccache(wrapper.as_deref()) {
         return WrapperDecision::Keep;
     }
     let port = resolve_server_port(cargo_cwd);
     // ORDER IS THE GUARD: no listener ⇒ no probe, because the probe would
-    // start the daemon.
+    // start the daemon. Not an absolute guarantee — sccache can idle out
+    // (600s default) in the window between this check and the probe — which is
+    // why `probe_show_stats` also strips the S3 selectors from the child env.
+    //
+    // `is_port_listening` binds the port to test it, so this runs a brief
+    // bind/close on the sccache port before every guarded cargo spawn — far
+    // more often than any previous caller. The socket is bound without
+    // SO_REUSEADDR and never listened on, so it leaves no TIME_WAIT state, and
+    // a real listener simply makes the bind fail (which IS the answer).
     let listener_present = is_port_listening(port);
     let stats = if listener_present {
         probe_show_stats(port).await
@@ -286,13 +333,33 @@ async fn decide_for_live_server(cargo_cwd: &Path) -> WrapperDecision {
     decide_wrapper(wrapper.as_deref(), listener_present, stats.as_deref())
 }
 
+/// The one WARN every degrade path emits. Shared so the two seams cannot
+/// describe the same condition two different ways in the log.
+fn warn_degraded() {
+    warn!(
+        "sccache server is bound to the S3 backend — the 2026-07-23 local-disk cutover \
+         has regressed. Building direct (uncached) for this cargo spawn to avoid the \
+         S3-latency pileup. Fix: unset SCCACHE_BUCKET/SCCACHE_REGION in the \
+         session/launcher env and restart the daemon from a clean env \
+         (plans/2026-08-04-sccache-daemon-wedge-and-s3-regression.md)."
+    );
+}
+
+/// The env override that expresses the degrade: empty value, matching
+/// `cargo-guard.sh`'s `export RUSTC_WRAPPER=""` — cargo treats an empty wrapper
+/// as no wrapper.
+const DEGRADE_ENV: (&str, &str) = ("RUSTC_WRAPPER", "");
+
 /// Build the [`GuardedCommand`] for a supervisor-spawned `cargo` invocation,
 /// degrading `RUSTC_WRAPPER` when the live sccache server is S3-bound.
 ///
-/// **Every in-process `cargo` spawn must go through this** rather than
+/// **Every `GuardedCommand`-based cargo spawn goes through this** rather than
 /// `GuardedCommand::new("cargo", …)` — one shared helper is what keeps the pool
 /// build, the shim sidecar build and the prewarm from drifting into three
-/// different postures (they did not have any posture at all before Phase 1.3).
+/// different postures (they had no posture at all before Phase 1.3). The fourth
+/// compiling spawn, `build_submissions::run_submission`, is a bare
+/// `tokio::process::Command` and uses [`degrade_cargo_env_if_s3`] instead; see
+/// the module docs for the full inventory.
 ///
 /// `cargo_cwd` is the directory cargo will run in; it is used only to resolve
 /// which `.cargo/config.toml` pins the sccache port. The caller still sets its
@@ -302,17 +369,31 @@ pub async fn guarded_cargo(timeout: Duration, cargo_cwd: &Path) -> GuardedComman
     match decide_for_live_server(cargo_cwd).await {
         WrapperDecision::Keep => cmd,
         WrapperDecision::DegradeS3 => {
-            warn!(
-                "sccache server is bound to the S3 backend — the 2026-07-23 local-disk cutover \
-                 has regressed. Building direct (uncached) for this cargo spawn to avoid the \
-                 S3-latency pileup. Fix: unset SCCACHE_BUCKET/SCCACHE_REGION in the \
-                 session/launcher env and restart the daemon from a clean env \
-                 (plans/2026-08-04-sccache-daemon-wedge-and-s3-regression.md)."
-            );
-            // Empty value, matching `cargo-guard.sh`'s `export RUSTC_WRAPPER=""`:
-            // cargo treats an empty wrapper as no wrapper.
-            cmd.env("RUSTC_WRAPPER", "")
+            warn_degraded();
+            cmd.env(DEGRADE_ENV.0, DEGRADE_ENV.1)
         }
+    }
+}
+
+/// The same degrade for a cargo spawn that is NOT a [`GuardedCommand`].
+///
+/// `build_submissions::run_submission` (`POST /build/submit`, `submit_detached`
+/// from the runner/runners routes, and `submit_spawn` on the **spawn-test**
+/// path) drives a bare `tokio::process::Command` so it can pipe stdout and
+/// stderr into its own bounded tail buffers. It inherits the supervisor's
+/// sccache env by design — which is exactly the polluted-env inheritance this
+/// guard exists to break, so it must not be left out. It was, in the first cut
+/// of Phase 1.3, because that pass searched for `GuardedCommand::new("cargo",
+/// …)` and this call site does not match; an S3-latched daemon would then have
+/// stalled `/build/submit` and every `spawn-test {rebuild:true}` silently while
+/// the pool build beside it degraded and logged — a split posture that is worse
+/// to diagnose than a uniformly slow one.
+///
+/// Call it after the command is configured and before `spawn()`.
+pub async fn degrade_cargo_env_if_s3(cmd: &mut tokio::process::Command, cargo_cwd: &Path) {
+    if decide_for_live_server(cargo_cwd).await == WrapperDecision::DegradeS3 {
+        warn_degraded();
+        cmd.env(DEGRADE_ENV.0, DEGRADE_ENV.1);
     }
 }
 
@@ -344,6 +425,18 @@ Max cache size                   40 GiB
     fn s3_marker_is_recognised_case_insensitively() {
         assert!(stats_report_s3_backend(S3_STATS));
         assert!(stats_report_s3_backend("cache location   s3, bucket: x"));
+    }
+
+    /// The marker is deliberately broad, which is WHY the probe feeds it stdout
+    /// only. An sccache diagnostic naming a bucket — the sort of line that goes
+    /// to stderr — matches it, so folding stderr into the search would degrade
+    /// a healthy local-disk server and silently uncache every supervisor build
+    /// until the daemon restarted.
+    #[test]
+    fn a_diagnostic_naming_a_bucket_would_match_which_is_why_stderr_is_excluded() {
+        assert!(stats_report_s3_backend(
+            "error: failed to create S3, bucket qontinui-sccache: credentials expired"
+        ));
     }
 
     /// The post-cutover state must NEVER degrade — a guard that fires on a

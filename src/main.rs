@@ -35,6 +35,9 @@ mod log_capture;
 mod otel;
 mod pii_scrub;
 mod process;
+/// Pure build-provenance classification, `include!`d by `build.rs` so the
+/// stamping rules and the reading rules are one source.
+mod provenance_stamp;
 mod reapi;
 mod routes;
 /// S3-backend degrade guard for the supervisor's own in-process cargo spawns

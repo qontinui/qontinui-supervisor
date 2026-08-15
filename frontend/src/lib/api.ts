@@ -276,16 +276,20 @@ export interface HealthResponse {
   supervisor: {
     version: string;
     project_dir: string;
-    /// The commit THIS supervisor binary was built from: a bare full-length git
-    /// sha, or `null` when the build could not establish one (`null` = UNKNOWN,
-    /// never "clean"). Stamped at compile time by `build.rs`; see
-    /// `qontinui-supervisor::self_provenance` for the shape contract. Optional
-    /// here because a supervisor built before 2026-08-04 omits the field
-    /// entirely — absent means "too old to say", same as null.
+    /**
+     * The commit THIS supervisor binary was built from: a bare lowercase-hex
+     * git sha, or `null` when the build could not establish one (`null` =
+     * UNKNOWN, never "clean"). Stamped at compile time by `build.rs`; see
+     * `qontinui-supervisor::self_provenance` for the shape contract. Optional
+     * here because a supervisor built before 2026-08-04 omits the field
+     * entirely — absent means "too old to say", same as null.
+     */
     built_from_sha?: string | null;
-    /// Whether the working tree had modified tracked files at build time;
-    /// `null`/absent = unknown. Separate from the sha on purpose, so the sha
-    /// stays directly resolvable by git.
+    /**
+     * Whether the working tree had modified tracked files at build time;
+     * `null`/absent = unknown. Separate from the sha on purpose, so the sha
+     * stays directly resolvable by git.
+     */
     built_from_dirty?: boolean | null;
   };
   runners?: RunnerInstanceHealth[];

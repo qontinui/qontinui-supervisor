@@ -726,6 +726,15 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
     // Inherit sccache + path-remap env from the supervisor's shell. The
     // .cargo/config.toml inside the worktree adds --remap-path-prefix
     // (Row 2 Phase 3) automatically; this command path doesn't override it.
+    //
+    // ...with ONE exception: inheriting the supervisor's sccache env is also
+    // how an S3-latched daemon reaches this build. `/build/submit` and the
+    // spawn-test submit path would otherwise be the one compiling cargo spawn
+    // with no S3 degrade, stalling on 3-4s/op round-trips while the pool build
+    // beside it degraded and logged — a split posture that reads as an
+    // unexplained stall. Same predicate, same fail-open, same WARN as the
+    // GuardedCommand seam; this one just isn't a GuardedCommand.
+    crate::sccache_guard::degrade_cargo_env_if_s3(&mut cmd, &worktree_path).await;
 
     let spawn_result = cmd.spawn();
     let mut child = match spawn_result {
