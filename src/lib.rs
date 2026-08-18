@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod evaluation;
 pub mod expo;
+pub mod external_volume;
 pub mod footprint;
 pub mod fs_atomic;
 pub mod git_provenance;

@@ -53,6 +53,13 @@ const MAX_KILL_EVENTS_PER_PASS: usize = 10;
 ///   was a disk that was demonstrably near-full; a probe that returns *nothing*
 ///   is a different (rare) failure and blocking all builds on it is worse than
 ///   the status quo.
+///
+/// **This is the INTERNAL-volume policy.** For a pool root on a declared
+/// removable volume the polarity inverts — see [`disk_guard_allows_for`],
+/// which is what the live caller uses. This function is kept as the pure
+/// internal-only core so the pre-existing tests and reasoning stay valid
+/// verbatim: with no external volume declared, `disk_guard_allows_for`
+/// delegates here and behaviour is byte-identical to before.
 pub fn disk_guard_allows(disk_free_bytes: Option<u64>, min_free_gb: u64) -> bool {
     if min_free_gb == 0 {
         return true;
@@ -62,6 +69,76 @@ pub fn disk_guard_allows(disk_free_bytes: Option<u64>, min_free_gb: u64) -> bool
         Some(free) => {
             let required = min_free_gb.saturating_mul(1024 * 1024 * 1024);
             free >= required
+        }
+    }
+}
+
+/// The disk guard, aware of whether the pool root sits on a **declared
+/// external volume** (plan
+/// `2026-08-07-external-storage-tiering-for-fleet-disk-pressure`, Phase 5).
+///
+/// `external` is `None` when no external volume is declared, or when the
+/// probed path is not under it — which on a machine with no dock is every
+/// path. In that case this is exactly [`disk_guard_allows`] and nothing
+/// changes.
+///
+/// When the path IS external, two things change, both fail-CLOSED:
+///
+/// 1. A volume that is not provably `Present` refuses **regardless of the
+///    free-space reading** — because when the volume is detached, the reading
+///    describes the un-mounted stub on the *internal* disk, so "plenty of
+///    room" is an answer to the wrong question.
+/// 2. An unresolvable probe (`None`) refuses instead of allowing. On internal
+///    storage the cost of proceeding is a failed build; on a removable volume
+///    it is a partially written artifact tree on a volume that just went away.
+///    A refusal is recoverable, and the plan's `disconnect behaviour` section
+///    argues the asymmetry in full.
+///
+/// Returns `Ok(())` to proceed, or `Err(reason)` with the operator-readable
+/// refusal. Pure — the caller supplies both the reading and the volume state,
+/// so every branch is unit-testable with no filesystem and **no dock
+/// attached**.
+pub fn disk_guard_allows_for(
+    disk_free_bytes: Option<u64>,
+    min_free_gb: u64,
+    external: Option<&crate::external_volume::ExternalVolumeState>,
+    probed_path: &std::path::Path,
+) -> Result<(), String> {
+    // The disable switch still wins: an operator who set the floor to 0 has
+    // turned the guard off, and silently re-arming it for external paths would
+    // make `min_free_gb=0` mean two different things.
+    if min_free_gb == 0 {
+        return Ok(());
+    }
+
+    if let Some(state) = external {
+        if let Some(reason) = state.refusal_reason(probed_path) {
+            return Err(format!(
+                "Pre-permit disk guard: refusing build — {reason}. Reclaim or reattach; \
+                 a build must not start against a volume that is not provably present."
+            ));
+        }
+    }
+
+    match disk_free_bytes {
+        None if external.is_some() => Err(format!(
+            "Pre-permit disk guard: refusing build — could not resolve free disk for {}, \
+             which is on the declared EXTERNAL volume. This fails CLOSED: an unresolvable \
+             probe is exactly the condition under which a build on a removable volume must \
+             not start.",
+            probed_path.display()
+        )),
+        other => {
+            if disk_guard_allows(other, min_free_gb) {
+                Ok(())
+            } else {
+                let free = other.unwrap_or(0);
+                Err(format!(
+                    "Pre-permit disk guard: refusing build — {} GB free, need at least \
+                     {min_free_gb} GB (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
+                    free / (1024 * 1024 * 1024)
+                ))
+            }
         }
     }
 }
@@ -296,9 +373,15 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
     };
     let free = crate::footprint::disk_free_bytes_for(&probe);
 
-    if disk_guard_allows(free, min_free_gb) {
-        return Ok(());
-    }
+    // Is the pool root on a declared external volume? `None` on a machine with
+    // no declaration, which makes the call below identical to the previous
+    // `disk_guard_allows(free, min_free_gb)`.
+    let external = crate::external_volume::external_state_for(&probe);
+
+    let refusal = match disk_guard_allows_for(free, min_free_gb, external.as_ref(), &probe) {
+        Ok(()) => return Ok(()),
+        Err(reason) => reason,
+    };
 
     let required_bytes = min_free_gb.saturating_mul(1024 * 1024 * 1024);
     let free_bytes = free.unwrap_or(0);
@@ -310,11 +393,8 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
         .and_then(|s| serde_json::to_value(s).ok());
 
     let msg = format!(
-        "Pre-permit disk guard: refusing build — {} GB free, need at least {} GB \
-         (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB). Reclaim space via \
-         DELETE /spawn-worktrees or POST /builds/slots/{{id}}/clean.",
-        free_bytes / (1024 * 1024 * 1024),
-        min_free_gb,
+        "{refusal} Reclaim space via DELETE /spawn-worktrees or \
+         POST /builds/slots/{{id}}/clean."
     );
     warn!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
@@ -3762,6 +3842,120 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // ---------------------------------------------------------------
+    // External-volume fail-closed guard — plan
+    // `2026-08-07-external-storage-tiering-for-fleet-disk-pressure`,
+    // Phase 5. Every case runs with NO dock attached and no filesystem
+    // access; that is the point, since the plan's HW-ABSENT branch must
+    // be fully verifiable on a box with no external drive.
+    // ---------------------------------------------------------------
+    use super::{disk_guard_allows, disk_guard_allows_for};
+    use crate::external_volume::ExternalVolumeState;
+    use std::path::Path;
+
+    const GB: u64 = 1024 * 1024 * 1024;
+    const POOL: &str = "D:/qontinui-ext/target-pool";
+
+    #[test]
+    fn no_declaration_means_byte_identical_to_the_old_guard() {
+        // The shipping guarantee: on a machine with no external volume,
+        // `disk_guard_allows_for` must agree with `disk_guard_allows` on
+        // every input, including the fail-open None.
+        let pool = Path::new("D:/qontinui-root/qontinui-runner/target-pool");
+        for free in [None, Some(0), Some(29 * GB), Some(30 * GB), Some(900 * GB)] {
+            for floor in [0u64, 30] {
+                let old = disk_guard_allows(free, floor);
+                let new = disk_guard_allows_for(free, floor, None, pool).is_ok();
+                assert_eq!(old, new, "divergence at free={free:?} floor={floor}");
+            }
+        }
+    }
+
+    #[test]
+    fn external_path_with_unresolvable_probe_refuses() {
+        // The inversion. Internally this same input proceeds (asserted
+        // in the equivalence test above).
+        let err = disk_guard_allows_for(
+            None,
+            30,
+            Some(&ExternalVolumeState::Present),
+            Path::new(POOL),
+        )
+        .expect_err("an unresolvable probe on an external volume must refuse");
+        assert!(err.contains("EXTERNAL"), "reason was: {err}");
+        assert!(err.contains("fails CLOSED"), "reason was: {err}");
+    }
+
+    #[test]
+    fn absent_external_volume_refuses_despite_ample_free_space() {
+        // 3.9 TB "free" — on the un-mounted stub, i.e. on the internal disk
+        // this plan exists to protect. Free space is the wrong question.
+        let err = disk_guard_allows_for(
+            Some(3900 * GB),
+            30,
+            Some(&ExternalVolumeState::Absent),
+            Path::new(POOL),
+        )
+        .expect_err("an absent external volume must refuse even with free space");
+        assert!(err.contains("NOT mounted"), "reason was: {err}");
+    }
+
+    #[test]
+    fn mismatched_external_volume_refuses_and_does_not_read_as_a_disconnect() {
+        let err = disk_guard_allows_for(
+            Some(3900 * GB),
+            30,
+            Some(&ExternalVolumeState::Mismatched {
+                expected: "{d913fcde}".into(),
+                found: "{ffffffff}".into(),
+            }),
+            Path::new(POOL),
+        )
+        .expect_err("a wrong volume must refuse");
+        assert!(err.contains("WRONG volume"), "reason was: {err}");
+        assert!(
+            !err.contains("NOT mounted"),
+            "an operator told 'not mounted' will plug the drive in, which is not the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn present_external_volume_above_the_floor_proceeds() {
+        assert!(disk_guard_allows_for(
+            Some(3900 * GB),
+            30,
+            Some(&ExternalVolumeState::Present),
+            Path::new(POOL)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_floor_still_bites_on_a_present_external_volume() {
+        let err = disk_guard_allows_for(
+            Some(1 * GB),
+            30,
+            Some(&ExternalVolumeState::Present),
+            Path::new(POOL),
+        )
+        .expect_err("1 GB is below the 30 GB floor");
+        assert!(err.contains("need at least 30 GB"), "reason was: {err}");
+    }
+
+    #[test]
+    fn disabling_the_guard_still_disables_it_on_an_external_volume() {
+        // `min_free_gb == 0` is the operator's off switch. Silently
+        // re-arming it for external paths would make one setting mean two
+        // different things depending on where the pool happens to live.
+        assert!(disk_guard_allows_for(
+            None,
+            0,
+            Some(&ExternalVolumeState::Absent),
+            Path::new(POOL)
+        )
+        .is_ok());
+    }
 
     /// The phase marker must round-trip through `as_u8`/`from_u8` and produce a
     /// phase-accurate queue-timeout message for each phase. This guards the

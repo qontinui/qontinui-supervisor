@@ -18,6 +18,7 @@ mod diagnostics;
 mod error;
 mod evaluation;
 mod expo;
+mod external_volume;
 mod footprint;
 // Row 2 Phase 1 (fleet topology): detects CPU/RAM/disk and POSTs
 // `max_concurrent_builds` to coord on startup. See
