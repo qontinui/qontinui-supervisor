@@ -14,16 +14,24 @@
 //! hardcoded `~/actions-runner/.runner` check therefore answered `false` for a
 //! host that demonstrably has runners — see [`is_runner_installed`].
 //!
-//! Every `wsl` call here goes through [`crate::wsl_util::wsl_command`], which
-//! since plan `2026-08-21-supervisor-watchdog-observer-effect` refuses to spawn
-//! when the distro is down. These functions can therefore no longer wake the
-//! distro to answer a question about it; a distro-down call is an `Err`, never
-//! a `false`.
+//! Every `wsl` call here goes through
+//! [`crate::wsl_util::wsl_command_may_start`], **not** the gated
+//! [`crate::wsl_util::wsl_command`] the probe uses. Everything in this module is
+//! operator-initiated (`POST /ci-runner/{enable,start,stop,update,disable}`),
+//! and a runner service cannot be started inside a distro that is not running —
+//! so refusing to wake it would leave the supervisor unable to act at all. The
+//! observer rule from plan `2026-08-21-supervisor-watchdog-observer-effect`
+//! constrains the 30 s *monitor*, not a request the operator just issued.
+//!
+//! Nothing here may be called from a timer. In particular the probe no longer
+//! calls [`is_runner_installed`] — it derives the same fact from its own single
+//! collapsed script — which is what closed the cross-module distro-waking path
+//! (D8).
 
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
-use crate::wsl_util::wsl_command;
+use crate::wsl_util::wsl_command_may_start;
 
 // ---------------------------------------------------------------------------
 // WSL helper
@@ -32,8 +40,7 @@ use crate::wsl_util::wsl_command;
 /// Execute a command inside the default WSL distribution via
 /// `wsl -e bash -c "..."`. Returns trimmed stdout on success.
 fn wsl_exec(cmd: &str) -> Result<String> {
-    let output = wsl_command()
-        .context("WSL is not available")?
+    let output = wsl_command_may_start()
         .args(["-e", "bash", "-c", cmd])
         .output()
         .context("failed to spawn wsl process")?;
@@ -64,11 +71,18 @@ fn wsl_exec(cmd: &str) -> Result<String> {
 /// `/home/runner/actions-runner-<repo>/`, and root installs, with no single
 /// path assumption left.
 ///
-/// Returns `Err` when WSL could not answer (including a distro that is not
-/// running). That is UNKNOWN, and callers must not read it as "not installed".
+/// The unprivileged globs cannot see a runner installed under its own account:
+/// MSI's `/home/runner/` is `0750`, so `/home/*/actions-runner*/.runner` does
+/// not even expand for the default WSL user, and this answered `false` on a host
+/// with two installed runners. A `sudo -n` retry covers that layout without ever
+/// prompting; a host with no passwordless sudo degrades to the unprivileged
+/// answer rather than hanging.
+///
+/// Returns `Err` when WSL could not answer at all. That is UNKNOWN, and callers
+/// must not read it as "not installed".
 pub fn is_runner_installed() -> Result<bool> {
     let found = wsl_exec(
-        r#"fb=0; for f in "$HOME"/actions-runner*/.runner /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then fb=1; break; fi; done; printf '%s' "$fb""#,
+        r#"fb=0; for f in "$HOME"/actions-runner*/.runner /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then fb=1; break; fi; done; if [ "$fb" = 0 ]; then if sudo -n sh -c 'for f in /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then exit 0; fi; done; exit 1' >/dev/null 2>&1; then fb=1; fi; fi; printf '%s' "$fb""#,
     )?;
     Ok(found.trim() == "1")
 }

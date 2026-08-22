@@ -108,6 +108,11 @@ static GATED_SPAWNS: AtomicU64 = AtomicU64::new(0);
 /// Number of non-waking `wsl --list` invocations the gate itself has made.
 static GATE_SPAWNS: AtomicU64 = AtomicU64::new(0);
 
+/// Number of deliberately distro-waking commands handed out by
+/// [`wsl_command_may_start`]. Kept separate from [`GATED_SPAWNS`] so the
+/// observer-effect assertions can never be satisfied by an operator path.
+static WAKING_SPAWNS: AtomicU64 = AtomicU64::new(0);
+
 /// Count of gated `wsl` commands constructed so far (process-wide).
 pub fn gated_spawn_count() -> u64 {
     GATED_SPAWNS.load(Ordering::Relaxed)
@@ -116,6 +121,11 @@ pub fn gated_spawn_count() -> u64 {
 /// Count of the gate's own non-waking `wsl --list` invocations.
 pub fn gate_spawn_count() -> u64 {
     GATE_SPAWNS.load(Ordering::Relaxed)
+}
+
+/// Count of deliberately distro-waking commands (operator lifecycle actions).
+pub fn waking_spawn_count() -> u64 {
+    WAKING_SPAWNS.load(Ordering::Relaxed)
 }
 
 /// A cached reading of which distros are running.
@@ -189,6 +199,28 @@ fn wsl_command_ungated() -> Command {
     }
 }
 
+/// The distro named by [`DISTRO_ENV`], if set.
+fn distro_override() -> Option<String> {
+    std::env::var(DISTRO_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// A `wsl` command aimed at the distro the gate actually asked about.
+///
+/// When [`DISTRO_ENV`] names a distro we pass `-d <name>`, so the command
+/// targets the distro whose liveness was checked. Without this the override
+/// asserted one distro's state while `wsl -e` went to the *default* one --
+/// which could then be woken by a gate that had said yes about something else.
+fn targeted_command() -> Command {
+    let mut cmd = wsl_command_ungated();
+    if let Some(name) = distro_override() {
+        cmd.args(["-d", &name]);
+    }
+    cmd
+}
+
 /// Build a `Command` for `wsl`, suppressing the transient console window on
 /// Windows, **after** confirming the target distro is already running.
 ///
@@ -199,7 +231,24 @@ fn wsl_command_ungated() -> Command {
 pub fn wsl_command() -> Result<Command, WslUnavailable> {
     ensure_distro_running()?;
     GATED_SPAWNS.fetch_add(1, Ordering::Relaxed);
-    Ok(wsl_command_ungated())
+    Ok(targeted_command())
+}
+
+/// Build a `wsl` command for an **operator-initiated** action that legitimately
+/// needs the distro, starting it if it is down.
+///
+/// The observer argument behind [`wsl_command`] is about a *monitor*: a health
+/// probe must not manufacture the liveness it reports. It does not hold for a
+/// request the operator just issued -- `POST /ci-runner/start` cannot start a
+/// runner service inside a distro that is not running, and refusing would leave
+/// the supervisor with no way to act at all. Deliberate waking is therefore
+/// available, but only through a separately named door that no probe path
+/// calls, so the invariant stays structural for everything that observes.
+///
+/// **Do not call this from anything that runs on a timer.**
+pub fn wsl_command_may_start() -> Command {
+    WAKING_SPAWNS.fetch_add(1, Ordering::Relaxed);
+    targeted_command()
 }
 
 /// The non-waking liveness gate: `Ok(())` iff the distro `wsl -e` targets is
@@ -222,31 +271,56 @@ pub fn ensure_distro_running() -> Result<(), WslUnavailable> {
 }
 
 /// Return a snapshot no older than [`SNAPSHOT_TTL`], refreshing it if needed.
+///
+/// The lock is **released before the refresh spawns anything**.
+/// `Command::output()` has no timeout and a cold `wsl.exe` has been measured at
+/// 18-35 s on this fleet, so holding the mutex across the spawn would block
+/// every gated caller in the process -- including an HTTP handler -- behind one
+/// wedged subprocess. Two threads racing a refresh is harmless: the reads are
+/// idempotent and the later writer simply wins.
 fn current_snapshot() -> Result<DistroSnapshot, WslUnavailable> {
-    let mut slot = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = slot.as_ref() {
-        if existing.taken_at.elapsed() < SNAPSHOT_TTL {
-            return Ok(existing.clone());
+    {
+        let slot = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            if existing.taken_at.elapsed() < SNAPSHOT_TTL {
+                return Ok(existing.clone());
+            }
         }
     }
     let fresh = take_snapshot()?;
+    let mut slot = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
     *slot = Some(fresh.clone());
     Ok(fresh)
 }
 
 /// Take a fresh reading with `wsl --list`. Neither invocation starts a distro.
+///
+/// Two reads, and the first doubles as a **health signal**: `wsl.exe` exists on
+/// every Windows box even when the WSL feature is broken or absent, and its
+/// failure output is prose that the name parser discards -- so an empty running
+/// list on its own cannot distinguish "the distro is stopped" from "WSL itself
+/// is not working". A successful enumeration settles it: WSL works, therefore
+/// an empty running list really does mean nothing is running.
 fn take_snapshot() -> Result<DistroSnapshot, WslUnavailable> {
+    let enumeration = read_distro_enumeration();
     let running = read_running_distros()?;
-    let target = match std::env::var(DISTRO_ENV) {
-        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
-        // A failure to resolve the default distro is not fatal: the gate
-        // degrades to "is anything running at all", which is still strictly
-        // better than waking one.
-        _ => read_default_distro(),
+
+    let default = match &enumeration {
+        Ok(e) => e.default.clone(),
+        Err(e) => {
+            if running.is_empty() {
+                return Err(WslUnavailable::GateFailed(format!(
+                    "{e}, and no running distro was reported - cannot tell a stopped \
+                     distro from a broken WSL"
+                )));
+            }
+            None
+        }
     };
+
     Ok(DistroSnapshot {
         taken_at: Instant::now(),
-        target,
+        target: distro_override().or(default),
         running,
     })
 }
@@ -259,18 +333,13 @@ fn read_running_distros() -> Result<Vec<String>, WslUnavailable> {
         .output()
         .map_err(|e| WslUnavailable::GateFailed(format!("failed to spawn `wsl --list`: {e}")))?;
 
-    // `wsl --list --running --quiet` exits non-zero when NO distro is running
-    // (it prints a localized "no running distributions" notice). That is a
-    // legitimate answer, not a gate failure, so an empty parse of a non-zero
-    // exit is treated as "nothing running" rather than UNKNOWN.
-    let parsed = parse_running_distros(&String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() && !parsed.is_empty() {
-        return Err(WslUnavailable::GateFailed(format!(
-            "`wsl --list --running --quiet` exited {} with output",
-            output.status
-        )));
-    }
-    Ok(parsed)
+    // A non-zero exit is NOT an error here: WSL exits non-zero with a localized
+    // prose notice when nothing is running. Only a failure to spawn is a gate
+    // failure; whether WSL ITSELF is broken is settled by the enumeration in
+    // `take_snapshot`.
+    Ok(parse_running_distros(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 /// `wsl --list --verbose` — used only to learn WHICH distro is the default,
@@ -279,13 +348,20 @@ fn read_running_distros() -> Result<Vec<String>, WslUnavailable> {
 /// Deliberately reads only the `*` marker and the name: the STATE column is
 /// localized (this fleet has a German-locale box), so nothing here may depend
 /// on the word "Running".
-fn read_default_distro() -> Option<String> {
+fn read_distro_enumeration() -> Result<DistroEnumeration, String> {
     GATE_SPAWNS.fetch_add(1, Ordering::Relaxed);
     let output = wsl_command_ungated()
         .args(["--list", "--verbose"])
         .output()
-        .ok()?;
-    parse_default_distro(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| format!("`wsl --list --verbose` could not be spawned: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("`wsl --list --verbose` exited {}", output.status));
+    }
+    let parsed = parse_distro_enumeration(&String::from_utf8_lossy(&output.stdout));
+    if parsed.names.is_empty() {
+        return Err("`wsl --list --verbose` listed no distros".to_string());
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,18 +394,50 @@ pub fn parse_running_distros(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse `wsl --list --verbose` for the default distro (the line marked `*`).
+/// Every distro `wsl --list --verbose` reported, plus the one marked `*`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DistroEnumeration {
+    /// Every distro name WSL knows about, in listing order.
+    pub names: Vec<String>,
+    /// The default distro -- the one a bare `wsl -e` targets.
+    pub default: Option<String>,
+}
+
+/// Parse `wsl --list --verbose` into [`DistroEnumeration`].
 ///
-/// Only the marker and the name are read; the STATE column is localized and
-/// must never be depended on.
-pub fn parse_default_distro(raw: &str) -> Option<String> {
-    normalize_wsl_list(raw)
+/// Only the `*` marker and the name are read; the STATE column is localized
+/// (this fleet has a German-locale box) and must never be depended on. A
+/// successful parse is also the signal that WSL itself is working -- see
+/// [`take_snapshot`].
+pub fn parse_distro_enumeration(raw: &str) -> DistroEnumeration {
+    let normalized = normalize_wsl_list(raw);
+    let mut names = Vec::new();
+    let mut default = None;
+
+    // The first non-empty line is the (localized) NAME/STATE/VERSION header.
+    for line in normalized
         .lines()
         .map(str::trim)
-        .filter_map(|line| line.strip_prefix('*'))
-        .map(str::trim)
-        .find_map(|rest| rest.split_whitespace().next().map(str::to_string))
-        .filter(|name| !name.is_empty())
+        .filter(|l| !l.is_empty())
+        .skip(1)
+    {
+        let (is_default, rest) = match line.strip_prefix('*') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, line),
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if is_default {
+            default = Some(name.to_string());
+        }
+        names.push(name.to_string());
+    }
+
+    DistroEnumeration { names, default }
 }
 
 /// The gate's decision, split out as a pure function so it is testable without
@@ -346,10 +454,6 @@ pub fn distro_gate_verdict(target: Option<&str>, running: &[String]) -> Result<(
         return down();
     }
     match target {
-        // The default distro could not be resolved. "Something is running" is
-        // a weaker answer than we would like, but it never wakes a distro and
-        // it is the honest limit of what we know.
-        None => Ok(()),
         Some(name) => {
             if running.iter().any(|r| r.eq_ignore_ascii_case(name)) {
                 Ok(())
@@ -357,6 +461,19 @@ pub fn distro_gate_verdict(target: Option<&str>, running: &[String]) -> Result<(
                 down()
             }
         }
+        // The default distro could not be resolved. "Something is running,
+        // therefore go ahead" is NOT a safe degrade: a box with Docker Desktop
+        // keeps `docker-desktop` running essentially always, so that rule would
+        // admit every spawn and wake the runner's distro every 30 s -- exactly
+        // the bug the gate exists to close. Only an unambiguous single running
+        // distro is safe to assume; anything else is UNKNOWN.
+        None if running.len() == 1 => Ok(()),
+        None => Err(WslUnavailable::GateFailed(format!(
+            "could not resolve the default WSL distro and {} distros are running ({}) - \
+             refusing to guess which one `wsl -e` would target",
+            running.len(),
+            running.join(", ")
+        ))),
     }
 }
 
@@ -422,30 +539,49 @@ mod tests {
     }
 
     #[test]
-    fn parses_default_distro_from_verbose_output() {
+    fn parses_enumeration_from_verbose_output() {
         let raw = utf16ish(&[
             "  NAME            STATE           VERSION",
             "* Ubuntu-24.04    Running         2",
             "  docker-desktop  Stopped         2",
         ]);
-        assert_eq!(parse_default_distro(&raw).as_deref(), Some("Ubuntu-24.04"));
+        let e = parse_distro_enumeration(&raw);
+        assert_eq!(e.default.as_deref(), Some("Ubuntu-24.04"));
+        assert_eq!(
+            e.names,
+            vec!["Ubuntu-24.04".to_string(), "docker-desktop".to_string()]
+        );
     }
 
     #[test]
-    fn parses_default_distro_with_localized_state_column() {
+    fn parses_enumeration_with_localized_state_column() {
         // The STATE column is localized; only the `*` and the name are read.
         let raw = utf16ish(&[
             "  NAME            STATUS          VERSION",
             "* Ubuntu-24.04    Wird ausgeführt 2",
         ]);
-        assert_eq!(parse_default_distro(&raw).as_deref(), Some("Ubuntu-24.04"));
+        let e = parse_distro_enumeration(&raw);
+        assert_eq!(e.default.as_deref(), Some("Ubuntu-24.04"));
+        assert_eq!(e.names, vec!["Ubuntu-24.04".to_string()]);
     }
 
     #[test]
-    fn default_distro_absent_when_no_marker() {
+    fn enumeration_has_no_default_when_no_marker() {
         let raw = utf16ish(&["  NAME  STATE  VERSION", "  Ubuntu-24.04  Stopped  2"]);
-        assert_eq!(parse_default_distro(&raw), None);
-        assert_eq!(parse_default_distro(""), None);
+        let e = parse_distro_enumeration(&raw);
+        assert_eq!(e.default, None);
+        assert_eq!(e.names, vec!["Ubuntu-24.04".to_string()]);
+    }
+
+    #[test]
+    fn empty_verbose_output_enumerates_nothing() {
+        // An empty enumeration is what `take_snapshot` reads as "WSL itself is
+        // not working", so it must never come back looking populated.
+        assert_eq!(parse_distro_enumeration(""), DistroEnumeration::default());
+        assert_eq!(
+            parse_distro_enumeration("  NAME  STATE  VERSION"),
+            DistroEnumeration::default()
+        );
     }
 
     #[test]
@@ -477,10 +613,29 @@ mod tests {
     }
 
     #[test]
-    fn gate_degrades_to_any_running_when_default_is_unknown() {
+    fn gate_admits_an_unambiguous_single_distro_when_the_default_is_unknown() {
         let running = vec!["Ubuntu-24.04".to_string()];
         assert!(distro_gate_verdict(None, &running).is_ok());
-        assert!(distro_gate_verdict(None, &[]).is_err());
+    }
+
+    #[test]
+    fn gate_refuses_to_guess_when_the_default_is_unknown_and_several_run() {
+        // The Docker Desktop shape: `docker-desktop` is up essentially always,
+        // so "something is running, therefore go ahead" would admit every spawn
+        // and wake the runner's distro on every tick.
+        let running = vec!["docker-desktop".to_string(), "Ubuntu-24.04".to_string()];
+        assert!(matches!(
+            distro_gate_verdict(None, &running),
+            Err(WslUnavailable::GateFailed(_))
+        ));
+    }
+
+    #[test]
+    fn gate_reports_nothing_running_as_down_even_without_a_known_default() {
+        assert!(matches!(
+            distro_gate_verdict(None, &[]),
+            Err(WslUnavailable::DistroDown { .. })
+        ));
     }
 
     #[test]

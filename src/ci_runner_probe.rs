@@ -119,10 +119,16 @@ pub struct CiRunnerState {
     pub labels: Vec<String>,
     pub service_names: Vec<String>,
     /// The subset of `service_names` that `systemctl is-active` reported
-    /// active in **this** tick's collapsed script. A service present in
-    /// `service_names` but absent here is confirmed inactive — which is the
-    /// only evidence the restart arm acts on.
+    /// `active` in **this** tick's collapsed script.
     pub active_service_names: Vec<String>,
+    /// The subset of `service_names` **confirmed** not running (`inactive`,
+    /// `failed`, `dead`). This is the restart arm's only trigger.
+    ///
+    /// It is a separate list rather than "everything not in
+    /// `active_service_names`" on purpose: a unit that is `activating`, or
+    /// whose `is-active` word never arrived, belongs to neither list, and
+    /// restarting it would be acting on an absence of evidence.
+    pub inactive_service_names: Vec<String>,
     /// Whether a CI runner is installed on this host. Derived by the probe
     /// from service discovery (a discovered `actions.runner.*` service is
     /// itself proof of an install), with a filesystem fallback for the
@@ -146,6 +152,7 @@ impl Default for CiRunnerState {
             labels: Vec::new(),
             service_names: Vec::new(),
             active_service_names: Vec::new(),
+            inactive_service_names: Vec::new(),
             installed: false,
         }
     }
@@ -203,12 +210,29 @@ impl RestartTracker {
 /// escapes rather than as literal control characters in the argument.
 ///
 /// Per unit it emits the unit name, its `is-active` word, and its
-/// `WorkingDirectory` (falling back to the directory of `ExecStart`'s path).
-/// That working directory is what removes the hardcoded `~/actions-runner`
+/// `WorkingDirectory` (falling back to the directory of `ExecStart`'s FIRST
+/// path -- a unit with two `ExecStart=` lines otherwise produced a two-line
+/// `dirname` result that split one record across two output lines). That
+/// working directory is what removes the hardcoded `~/actions-runner`
 /// assumption from label derivation (D6) instead of replacing it with a better
 /// guess. `--all` is load-bearing: without it `list-units` hides a *stopped*
 /// unit entirely, which is exactly the state the restart arm exists to detect.
-const PROBE_SCRIPT: &str = r#"units=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null | awk '{print $1}'); for u in $units; do case "$u" in actions.runner.*) ;; *) continue ;; esac; st=$(systemctl is-active "$u" 2>/dev/null || true); wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null || true); if [ -z "$wd" ]; then p=$(systemctl show -p ExecStart --value "$u" 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p'); if [ -n "$p" ]; then wd=$(dirname "$p"); fi; fi; printf 'UNIT\t%s\t%s\t%s\n' "$u" "$st" "$wd"; if [ -n "$wd" ] && [ -f "$wd/.runner" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$(tr -d '\n\r\t' < "$wd/.runner")"; fi; done; if pgrep -f 'Runner.Worker' >/dev/null 2>&1; then printf 'BUSY\t1\n'; else printf 'BUSY\t0\n'; fi; printf 'HOSTNAME\t%s\n' "$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || true)"; fb=0; for f in "$HOME"/actions-runner*/.runner /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then fb=1; break; fi; done; printf 'INSTALLED_FALLBACK\t%s\n' "$fb"; printf 'PROBE_END\t1\n'"#;
+///
+/// Two details are load-bearing and were each measured wrong first:
+///
+/// - **`pgrep -f '[R]unner\.Worker'`, never `'Runner.Worker'`.** The pattern is
+///   a literal inside this script, so it is in the wrapper `bash`'s own
+///   `/proc/<pid>/cmdline`; `pgrep` excludes only itself, never its parent. The
+///   plain spelling therefore matched the probe and reported `BUSY=1` on an
+///   idle host forever, so `Idle` was unreachable. The bracket makes the
+///   pattern not match its own text.
+/// - **`sudo -n` fallbacks for the `.runner` reads.** The probe runs as the
+///   default WSL user, and a runner installed under its own account lives in a
+///   `0750` home (MSI: `/home/runner/actions-runner-<repo>/`). The unprivileged
+///   glob does not even expand there, so both the label source and the
+///   installed fallback silently answered "nothing". `-n` never prompts, so a
+///   host without passwordless sudo degrades to the unprivileged answer.
+const PROBE_SCRIPT: &str = r#"units=$(systemctl list-units --type=service --plain --no-legend --all 'actions.runner.*' 2>/dev/null | awk '{print $1}'); for u in $units; do case "$u" in actions.runner.*) ;; *) continue ;; esac; st=$(systemctl is-active "$u" 2>/dev/null || true); wd=$(systemctl show -p WorkingDirectory --value "$u" 2>/dev/null || true); if [ -z "$wd" ]; then p=$(systemctl show -p ExecStart --value "$u" 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1); if [ -n "$p" ]; then wd=$(dirname "$p"); fi; fi; printf 'UNIT\t%s\t%s\t%s\n' "$u" "$st" "$wd"; if [ -n "$wd" ]; then rf=""; if [ -r "$wd/.runner" ]; then rf=$(tr -d '\n\r\t' < "$wd/.runner"); else rf=$(sudo -n cat "$wd/.runner" 2>/dev/null | tr -d '\n\r\t'); fi; if [ -n "$rf" ]; then printf 'RUNNERFILE\t%s\t%s\n' "$u" "$rf"; fi; fi; done; if pgrep -f '[R]unner\.Worker' >/dev/null 2>&1; then printf 'BUSY\t1\n'; else printf 'BUSY\t0\n'; fi; printf 'HOSTNAME\t%s\n' "$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || true)"; fb=0; for f in "$HOME"/actions-runner*/.runner /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then fb=1; break; fi; done; if [ "$fb" = 0 ]; then if sudo -n sh -c 'for f in /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then exit 0; fi; done; exit 1' >/dev/null 2>&1; then fb=1; fi; fi; printf 'INSTALLED_FALLBACK\t%s\n' "$fb"; printf 'PROBE_END\t1\n'"#;
 
 /// One discovered `actions.runner.*` systemd unit, as observed by a single
 /// run of [`PROBE_SCRIPT`].
@@ -223,9 +247,40 @@ pub struct UnitObservation {
     pub runner_file: Option<String>,
 }
 
+/// What a `systemctl is-active` word actually tells us about a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitActivity {
+    /// Confirmed running.
+    Active,
+    /// Confirmed not running -- the only state the restart arm may act on.
+    Inactive,
+    /// Mid-transition, or no word at all. NOT evidence of anything.
+    Unknown,
+}
+
+/// Classify a `systemctl is-active` word.
+///
+/// The empty string is deliberately `Unknown`: `is-active` writes its errors to
+/// the stderr this script discards, so a bus timeout mid-tick yields an empty
+/// field. Reading that as `Inactive` would restart a healthy unit on an absence
+/// of evidence -- the exact thing the honest-status model forbids. The
+/// transitional words are `Unknown` for a narrower reason: a unit that is
+/// already `activating` does not need a second `systemctl restart` on top.
+pub fn classify_active_state(word: &str) -> UnitActivity {
+    match word.trim() {
+        "active" => UnitActivity::Active,
+        "inactive" | "failed" | "dead" => UnitActivity::Inactive,
+        _ => UnitActivity::Unknown,
+    }
+}
+
 impl UnitObservation {
+    pub fn activity(&self) -> UnitActivity {
+        classify_active_state(&self.active_state)
+    }
+
     pub fn is_active(&self) -> bool {
-        self.active_state == "active"
+        self.activity() == UnitActivity::Active
     }
 }
 
@@ -317,7 +372,14 @@ pub fn parse_probe_output(raw: &str) -> Result<ProbeSnapshot, String> {
 }
 
 /// Extract `agentName` from a `.runner` JSON body.
+///
+/// The BOM strip is not defensive padding: `config.sh` writes `.runner` as
+/// UTF-8 **with** a BOM (confirmed on MSI, both runners), and `serde_json`
+/// rejects a leading `U+FEFF` outright. Without this the parse always failed
+/// and every label silently fell back to the unit-name derivation -- the same
+/// silent degradation, one layer in, that the hardcoded path caused.
 fn agent_name_from_runner_file(json: &str) -> Option<String> {
+    let json = json.trim_start_matches('\u{feff}').trim();
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
     parsed
         .get("agentName")
@@ -505,7 +567,13 @@ pub fn probe_ci_runners_with(
     let active_service_names: Vec<String> = snapshot
         .units
         .iter()
-        .filter(|u| u.is_active())
+        .filter(|u| u.activity() == UnitActivity::Active)
+        .map(|u| u.name.clone())
+        .collect();
+    let inactive_service_names: Vec<String> = snapshot
+        .units
+        .iter()
+        .filter(|u| u.activity() == UnitActivity::Inactive)
         .map(|u| u.name.clone())
         .collect();
 
@@ -515,6 +583,7 @@ pub fn probe_ci_runners_with(
         installed: derive_installed(&service_names, || snapshot.installed_fallback),
         service_names,
         active_service_names,
+        inactive_service_names,
     }
 }
 
@@ -587,6 +656,7 @@ pub fn decide_restart(
     previous_status_was_service_evidence: bool,
     service_names: &[String],
     active_service_names: &[String],
+    inactive_service_names: &[String],
 ) -> RestartDecision {
     if !status.is_service_evidence() {
         return RestartDecision::NoEvidence(match status {
@@ -603,11 +673,41 @@ pub fn decide_restart(
     if active_service_names.iter().any(|s| s == service) {
         return RestartDecision::StillActive;
     }
+    if inactive_service_names.iter().any(|s| s == service) {
+        return RestartDecision::Restart;
+    }
     if service_names.iter().any(|s| s == service) {
-        RestartDecision::Restart
+        // Discovered, but neither confirmed active nor confirmed inactive:
+        // mid-transition, or `is-active` produced no word. Not evidence.
+        RestartDecision::NoEvidence("unit activity could not be established")
     } else {
         RestartDecision::UnitGone
     }
+}
+
+/// The set of services the restart arm keeps watching into the next tick.
+///
+/// `service_names ∩ (previously_watched ∪ active)`. Keeping the *previously
+/// watched* half is what stops a unit being forgotten: a baseline of "whatever
+/// is active right now" drops a unit the moment it goes inactive, so any tick
+/// the arm could not act on (a distro-down blip, the one-tick deferral after
+/// the distro returns, a rate-limited or failed restart) silently retired the
+/// unit and it was never restarted again. Intersecting with `service_names`
+/// still retires a unit that is genuinely gone.
+pub fn next_watch_baseline(
+    previously_watched: &[String],
+    service_names: &[String],
+    active_service_names: &[String],
+) -> Vec<String> {
+    let mut watched: Vec<String> = previously_watched
+        .iter()
+        .chain(active_service_names.iter())
+        .filter(|s| service_names.contains(s))
+        .cloned()
+        .collect();
+    watched.sort();
+    watched.dedup();
+    watched
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +850,7 @@ pub async fn ci_runner_probe_loop(state: Arc<SupervisorState>) {
                 previous_was_service_evidence,
                 &new_state.service_names,
                 &new_state.active_service_names,
+                &new_state.inactive_service_names,
             ) {
                 RestartDecision::StillActive => {}
                 RestartDecision::UnitGone => {
@@ -806,7 +907,11 @@ pub async fn ci_runner_probe_loop(state: Arc<SupervisorState>) {
         // A tick with no service evidence leaves the baseline alone: we did not
         // learn that anything went offline.
         if new_state.status.is_service_evidence() {
-            previously_online = new_state.active_service_names.clone();
+            previously_online = next_watch_baseline(
+                &previously_online,
+                &new_state.service_names,
+                &new_state.active_service_names,
+            );
         }
         previous_was_service_evidence = new_state.status.is_service_evidence();
 
@@ -820,11 +925,15 @@ pub async fn ci_runner_probe_loop(state: Arc<SupervisorState>) {
         // box `wsl_exec_spawns_total` must advance by at most 1 per tick and
         // not at all while the distro is down, while `gate_reads_total` (the
         // non-waking `wsl --list` reads) may advance freely.
+        // `deliberate_wakes_total` counts operator lifecycle actions that were
+        // ALLOWED to start the distro — it should never move on its own, so a
+        // tick where it advanced explains an otherwise mysterious distro boot.
         tracing::debug!(
-            "ci_runner_probe: tick complete, status={}, wsl_exec_spawns_total={},              gate_reads_total={}",
+            "ci_runner_probe: tick complete, status={}, wsl_exec_spawns_total={},              gate_reads_total={}, deliberate_wakes_total={}",
             state.ci_runner_state.read().await.status.as_str(),
             crate::wsl_util::gated_spawn_count(),
-            crate::wsl_util::gate_spawn_count()
+            crate::wsl_util::gate_spawn_count(),
+            crate::wsl_util::waking_spawn_count()
         );
     }
 }
@@ -877,6 +986,7 @@ mod tests {
         assert!(state.labels.is_empty());
         assert!(state.service_names.is_empty());
         assert!(state.active_service_names.is_empty());
+        assert!(state.inactive_service_names.is_empty());
     }
 
     // -- rate limiting ------------------------------------------------------
@@ -1091,6 +1201,17 @@ mod tests {
         assert_eq!(agent_name_from_runner_file("{}"), None);
     }
 
+    #[test]
+    fn agent_name_extraction_handles_the_bom_config_sh_actually_writes() {
+        // Verbatim shape of MSI's `.runner` after the probe's newline strip:
+        // a UTF-8 BOM, then the flattened JSON. serde_json rejects the BOM.
+        let real = "\u{feff}{  \"agentId\": 22,  \"agentName\": \"msi-wsl\",  \"poolId\": 1}";
+        assert_eq!(
+            agent_name_from_runner_file(real).as_deref(),
+            Some("msi-wsl")
+        );
+    }
+
     // -- ProbeFailed vs Offline vs DistroDown -------------------------------
 
     fn distro_down() -> Result<(), WslUnavailable> {
@@ -1147,6 +1268,7 @@ mod tests {
         // A discovered unit is itself proof of an install.
         assert!(state.installed);
         assert_eq!(state.active_service_names.len(), 0);
+        assert_eq!(state.inactive_service_names.len(), 1);
         assert_eq!(state.service_names.len(), 1);
     }
 
@@ -1216,7 +1338,14 @@ mod tests {
     #[test]
     fn restart_fires_only_when_distro_is_up_and_unit_is_inactive() {
         assert_eq!(
-            decide_restart(SVC, &CiRunnerStatus::Offline, true, &[SVC.to_string()], &[]),
+            decide_restart(
+                SVC,
+                &CiRunnerStatus::Offline,
+                true,
+                &[SVC.to_string()],
+                &[],
+                &[SVC.to_string()],
+            ),
             RestartDecision::Restart
         );
     }
@@ -1231,13 +1360,14 @@ mod tests {
                 &CiRunnerStatus::DistroDown,
                 true,
                 &[SVC.to_string()],
-                &[]
+                &[],
+                &[SVC.to_string()],
             ),
             RestartDecision::NoEvidence(_)
         ));
         // …and not even when the distro-down reading left the lists empty.
         assert!(matches!(
-            decide_restart(SVC, &CiRunnerStatus::DistroDown, true, &[], &[]),
+            decide_restart(SVC, &CiRunnerStatus::DistroDown, true, &[], &[], &[]),
             RestartDecision::NoEvidence(_)
         ));
     }
@@ -1245,7 +1375,7 @@ mod tests {
     #[test]
     fn restart_never_fires_on_probe_failure() {
         assert!(matches!(
-            decide_restart(SVC, &CiRunnerStatus::ProbeFailed, true, &[], &[]),
+            decide_restart(SVC, &CiRunnerStatus::ProbeFailed, true, &[], &[], &[]),
             RestartDecision::NoEvidence(_)
         ));
     }
@@ -1260,7 +1390,27 @@ mod tests {
                 &CiRunnerStatus::Offline,
                 false,
                 &[SVC.to_string()],
-                &[]
+                &[],
+                &[SVC.to_string()],
+            ),
+            RestartDecision::NoEvidence(_)
+        ));
+    }
+
+    #[test]
+    fn restart_never_fires_on_an_unestablished_activity() {
+        // Discovered, but `is-active` said `activating` — or said nothing at
+        // all, because its stderr is discarded. Restarting here would act on an
+        // absence of evidence, and would stack a restart on a unit already
+        // coming up.
+        assert!(matches!(
+            decide_restart(
+                SVC,
+                &CiRunnerStatus::Offline,
+                true,
+                &[SVC.to_string()],
+                &[],
+                &[],
             ),
             RestartDecision::NoEvidence(_)
         ));
@@ -1274,7 +1424,8 @@ mod tests {
                 &CiRunnerStatus::Idle,
                 true,
                 &[SVC.to_string()],
-                &[SVC.to_string()]
+                &[SVC.to_string()],
+                &[],
             ),
             RestartDecision::StillActive
         );
@@ -1283,9 +1434,132 @@ mod tests {
     #[test]
     fn removed_unit_is_not_a_crash() {
         assert_eq!(
-            decide_restart(SVC, &CiRunnerStatus::Offline, true, &[], &[]),
+            decide_restart(SVC, &CiRunnerStatus::Offline, true, &[], &[], &[]),
             RestartDecision::UnitGone
         );
+    }
+
+    // -- the watch baseline -------------------------------------------------
+
+    #[test]
+    fn baseline_keeps_a_unit_that_went_inactive() {
+        // The defect this closes: a baseline of "whatever is active now" drops
+        // the unit on the very tick it goes down, so the next tick no longer
+        // considers it and it is NEVER restarted.
+        let watched = next_watch_baseline(&[SVC.to_string()], &[SVC.to_string()], &[]);
+        assert_eq!(watched, vec![SVC.to_string()]);
+    }
+
+    #[test]
+    fn baseline_survives_a_distro_down_blip_and_the_deferral_tick() {
+        let svc = SVC.to_string();
+        // Tick N: active.
+        let mut watched =
+            next_watch_baseline(&[], std::slice::from_ref(&svc), std::slice::from_ref(&svc));
+        assert_eq!(watched, vec![svc.clone()]);
+        // Tick N+1 is DistroDown: the loop leaves the baseline alone entirely.
+        // Tick N+2: distro back, unit inactive, restart deferred one tick.
+        watched = next_watch_baseline(&watched, std::slice::from_ref(&svc), &[]);
+        assert_eq!(
+            watched,
+            vec![svc.clone()],
+            "a unit must still be watched after the one-tick deferral, or the \
+             restart arm can never fire for it again"
+        );
+        // Tick N+3: still inactive — and still watched, so the arm can fire.
+        watched = next_watch_baseline(&watched, std::slice::from_ref(&svc), &[]);
+        assert_eq!(watched, vec![svc]);
+    }
+
+    #[test]
+    fn baseline_retires_a_unit_that_is_genuinely_gone() {
+        let watched = next_watch_baseline(&[SVC.to_string()], &[], &[]);
+        assert!(watched.is_empty());
+    }
+
+    #[test]
+    fn baseline_admits_newly_active_units_and_deduplicates() {
+        let a = "actions.runner.org-repo.a.service".to_string();
+        let b = "actions.runner.org-repo.b.service".to_string();
+        let watched = next_watch_baseline(
+            std::slice::from_ref(&a),
+            &[a.clone(), b.clone()],
+            &[a.clone(), b.clone()],
+        );
+        assert_eq!(watched, vec![a, b]);
+    }
+
+    // -- is-active classification -------------------------------------------
+
+    #[test]
+    fn active_state_classification() {
+        assert_eq!(classify_active_state("active"), UnitActivity::Active);
+        assert_eq!(classify_active_state("inactive"), UnitActivity::Inactive);
+        assert_eq!(classify_active_state("failed"), UnitActivity::Inactive);
+        assert_eq!(classify_active_state("dead"), UnitActivity::Inactive);
+        // Mid-transition and missing words are NOT evidence.
+        assert_eq!(classify_active_state("activating"), UnitActivity::Unknown);
+        assert_eq!(classify_active_state("deactivating"), UnitActivity::Unknown);
+        assert_eq!(classify_active_state("reloading"), UnitActivity::Unknown);
+        assert_eq!(classify_active_state(""), UnitActivity::Unknown);
+        assert_eq!(classify_active_state("  "), UnitActivity::Unknown);
+    }
+
+    #[test]
+    fn a_missing_is_active_word_is_never_read_as_inactive() {
+        // `is-active`'s stderr is discarded, so a bus timeout emits an empty
+        // field. The unit must land in neither list.
+        let state = probe_ci_runners_with(
+            false,
+            || Ok(()),
+            || {
+                Ok(
+                    "UNIT\tactions.runner.a.b.service\t\t/x\nBUSY\t0\nINSTALLED_FALLBACK\t0\nPROBE_END\t1"
+                        .to_string(),
+                )
+            },
+        );
+        assert_eq!(state.service_names.len(), 1);
+        assert!(state.active_service_names.is_empty());
+        assert!(
+            state.inactive_service_names.is_empty(),
+            "an empty is-active word must not read as confirmed-inactive"
+        );
+    }
+
+    // -- the probe script itself --------------------------------------------
+
+    #[test]
+    fn probe_script_pgrep_pattern_cannot_match_its_own_text() {
+        // The pattern is a literal inside the script, so it sits in the wrapper
+        // bash's own /proc/<pid>/cmdline. `pgrep` excludes only itself, never
+        // its parent — so the plain spelling matched the probe and pinned BUSY
+        // to 1 forever (measured on MSI). The bracket breaks the self-match.
+        assert!(
+            PROBE_SCRIPT.contains("[R]unner"),
+            "pgrep pattern must be bracket-escaped so it cannot match the script itself"
+        );
+        assert!(
+            !PROBE_SCRIPT.contains("'Runner.Worker'"),
+            "the self-matching pgrep spelling must not come back"
+        );
+    }
+
+    #[test]
+    fn probe_script_takes_only_the_first_exec_start_path() {
+        // Two `ExecStart=` lines make `--value` emit two lines; without
+        // `head -1` the `dirname` result is multi-line and splits one UNIT
+        // record across two output lines.
+        assert!(PROBE_SCRIPT.contains("| head -1"));
+    }
+
+    #[test]
+    fn probe_script_retries_unreadable_runner_paths_without_prompting() {
+        // A runner installed under its own 0750 home is invisible to the
+        // default WSL user; `-n` guarantees sudo never blocks on a prompt.
+        assert!(PROBE_SCRIPT.contains("sudo -n cat"));
+        assert!(PROBE_SCRIPT.contains("sudo -n sh -c"));
+        assert!(!PROBE_SCRIPT.contains("sudo cat"));
     }
 
     // -- keepalive reporting ------------------------------------------------
