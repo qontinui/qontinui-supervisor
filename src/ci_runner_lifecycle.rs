@@ -6,9 +6,19 @@
 //! `tokio::task::spawn_blocking` at the call-site (or by the async
 //! convenience functions in this module).
 //!
-//! The runner binary lives at `~/actions-runner/` inside the default WSL
-//! distribution. Configuration state is persisted by the runner itself in
-//! `~/actions-runner/.runner` (a JSON file written by `config.sh`).
+//! Install *writes* to `~/actions-runner/` inside the default WSL
+//! distribution, and configuration state is persisted by the runner itself in
+//! `<runner-dir>/.runner` (a JSON file written by `config.sh`). **Detection
+//! must not assume that path**: MSI's runners live at
+//! `/home/runner/actions-runner-<repo>/` under a separate `runner` user, and a
+//! hardcoded `~/actions-runner/.runner` check therefore answered `false` for a
+//! host that demonstrably has runners — see [`is_runner_installed`].
+//!
+//! Every `wsl` call here goes through [`crate::wsl_util::wsl_command`], which
+//! since plan `2026-08-21-supervisor-watchdog-observer-effect` refuses to spawn
+//! when the distro is down. These functions can therefore no longer wake the
+//! distro to answer a question about it; a distro-down call is an `Err`, never
+//! a `false`.
 
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
@@ -23,6 +33,7 @@ use crate::wsl_util::wsl_command;
 /// `wsl -e bash -c "..."`. Returns trimmed stdout on success.
 fn wsl_exec(cmd: &str) -> Result<String> {
     let output = wsl_command()
+        .context("WSL is not available")?
         .args(["-e", "bash", "-c", cmd])
         .output()
         .context("failed to spawn wsl process")?;
@@ -42,19 +53,24 @@ fn wsl_exec(cmd: &str) -> Result<String> {
 // Sync primitives (run inside spawn_blocking)
 // ---------------------------------------------------------------------------
 
-/// Check whether a runner is already configured (`.runner` sentinel exists).
-pub fn is_runner_installed() -> bool {
-    wsl_exec("test -f ~/actions-runner/.runner && echo yes || echo no")
-        .map(|s| s == "yes")
-        .unwrap_or(false)
-}
-
-/// Check whether the runner binary directory exists at all.
-#[allow(dead_code)]
-fn is_runner_dir_present() -> bool {
-    wsl_exec("test -d ~/actions-runner && echo yes || echo no")
-        .map(|s| s == "yes")
-        .unwrap_or(false)
+/// Check whether a runner is already configured — i.e. a `.runner` sentinel
+/// exists under *any* runner directory on this host.
+///
+/// This used to read a hardcoded `~/actions-runner/.runner` as the default WSL
+/// user. Commit `a7bbe73` demoted it to a fallback behind service discovery but
+/// left the path intact, which is only safe while discovery succeeds — and the
+/// one case it does not is precisely a distro that is down. The glob covers the
+/// classic tarball layout, per-user layouts like MSI's
+/// `/home/runner/actions-runner-<repo>/`, and root installs, with no single
+/// path assumption left.
+///
+/// Returns `Err` when WSL could not answer (including a distro that is not
+/// running). That is UNKNOWN, and callers must not read it as "not installed".
+pub fn is_runner_installed() -> Result<bool> {
+    let found = wsl_exec(
+        r#"fb=0; for f in "$HOME"/actions-runner*/.runner /home/*/actions-runner*/.runner /root/actions-runner*/.runner; do if [ -f "$f" ]; then fb=1; break; fi; done; printf '%s' "$fb""#,
+    )?;
+    Ok(found.trim() == "1")
 }
 
 /// Download and extract the latest GitHub Actions runner binary into
@@ -142,7 +158,7 @@ fn unconfigure_runner(token: &str) -> Result<()> {
 /// runner is already configured (`.runner` exists), this is a no-op.
 pub async fn install_runner(token: &str, org: &str, labels: &[String], name: &str) -> Result<()> {
     // 1. Check if already configured.
-    let already = tokio::task::spawn_blocking(is_runner_installed).await?;
+    let already = tokio::task::spawn_blocking(is_runner_installed).await??;
     if already {
         info!("install_runner: runner already configured, skipping install");
         return Ok(());

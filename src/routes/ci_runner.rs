@@ -237,14 +237,18 @@ async fn fetch_registration_token(auth: &HeaderValue) -> Result<String, FetchTok
 
 fn resolve_runner_name() -> String {
     // Try the WSL hostname first; fall back to the Windows COMPUTERNAME env var.
-    if let Ok(output) = crate::wsl_util::wsl_command()
-        .args(["-e", "hostname"])
-        .output()
-    {
-        if output.status.success() {
-            let h = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !h.is_empty() {
-                return h;
+    //
+    // `wsl_command()` is gated on the distro already running, so this
+    // request-triggered path can no longer boot a stopped distro just to read a
+    // hostname (plan `2026-08-21-supervisor-watchdog-observer-effect` §1) — it
+    // falls through to COMPUTERNAME instead.
+    if let Ok(mut cmd) = crate::wsl_util::wsl_command() {
+        if let Ok(output) = cmd.args(["-e", "hostname"]).output() {
+            if output.status.success() {
+                let h = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !h.is_empty() {
+                    return h;
+                }
             }
         }
     }

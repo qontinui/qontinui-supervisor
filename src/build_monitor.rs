@@ -3934,7 +3934,7 @@ mod tests {
     #[test]
     fn the_floor_still_bites_on_a_present_external_volume() {
         let err = disk_guard_allows_for(
-            Some(1 * GB),
+            Some(GB),
             30,
             Some(&ExternalVolumeState::Present),
             Path::new(POOL),

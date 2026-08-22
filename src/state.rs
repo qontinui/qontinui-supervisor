@@ -384,8 +384,18 @@ pub struct SupervisorState {
     /// divergence path during manual tests, not durable delivery.
     pub synthetic_build_id_tx: broadcast::Sender<String>,
     /// CI runner state probed via WSL. Updated every 30s by
-    /// `ci_runner_probe::ci_runner_probe_loop`. Read by the fleet
-    /// heartbeat to include CI runner info in the budget POST.
+    /// `ci_runner_probe::ci_runner_probe_loop`.
+    ///
+    /// **The fleet heartbeat does NOT read this** — that claim was stale. The
+    /// `ci_runner_labels` / `ci_runner_status` keys were deleted from the budget
+    /// payload because coord's `BudgetPublishRequest` declares no such fields
+    /// and `upsert_budget` never wrote them (see `fleet.rs:45-53`, pinned by a
+    /// test at `fleet.rs:637`). The single consumer is `GET /ci-runner/status`,
+    /// which the runner's CI Runner settings panel polls every 10 s.
+    /// `coord.devices.ci_runner_status` is written independently by coord's
+    /// `ci_runner_registrar` from GitHub's runners API, so the honest
+    /// `distro_down` / `probe_failed` readings are a LOCAL view and never reach
+    /// fleet metrics.
     pub ci_runner_state: RwLock<CiRunnerState>,
     /// Submission id of the most recent in-flight `POST /runner/fix-and-rebuild`
     /// detached rebuild, if any. `fix-and-rebuild` rebuilds the *single* live
