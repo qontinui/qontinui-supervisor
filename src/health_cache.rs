@@ -76,7 +76,7 @@ pub struct RecentCrashSummary {
 /// Raw /health response body shape we care about. Uses `serde(default)` so
 /// older runners (without `ui_error` / `derived_status` / `recent_crash`) still
 /// parse cleanly.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RunnerHealthBody {
     #[serde(default)]
     status: Option<String>,
@@ -86,6 +86,78 @@ struct RunnerHealthBody {
     ui_error: Option<UiErrorSummary>,
     #[serde(default)]
     recent_crash: Option<RecentCrashSummary>,
+    /// `/health.embeddingService` — one of the inputs that can produce
+    /// `derived_status: "degraded"`.
+    #[serde(default, rename = "embeddingService")]
+    embedding_service: Option<ReachableFlag>,
+    /// `/health.database` — bounded PG liveness, another degraded input.
+    #[serde(default)]
+    database: Option<ReachableFlag>,
+    /// `/health.webIntegration` — the backend WS relay. `connected: null`
+    /// means no relay is EXPECTED (tier below qontinui_account, or
+    /// web-integration disabled), which is not a fault.
+    #[serde(default, rename = "webIntegration")]
+    web_integration: Option<WebIntegrationSummary>,
+}
+
+/// A `{ "reachable": bool|null }` sub-object on `/health`.
+#[derive(Debug, Deserialize)]
+struct ReachableFlag {
+    #[serde(default)]
+    reachable: Option<bool>,
+}
+
+/// The `/health.webIntegration` block.
+#[derive(Debug, Deserialize)]
+struct WebIntegrationSummary {
+    #[serde(default)]
+    connected: Option<bool>,
+    #[serde(default, rename = "lastError")]
+    last_error: Option<String>,
+}
+
+/// Name WHICH subsystem is down, rather than restating the verdict.
+///
+/// `derived_status: "degraded"` is a fold over several independent inputs,
+/// so "runner reported derived_status=degraded" told an operator only what
+/// they already knew from the badge colour. A dead relay, an unreachable
+/// embedding service and a dead data layer all rendered identically, and
+/// the relay case is the one that is otherwise hardest to see: it costs the
+/// runner every cloud client while local work keeps succeeding.
+///
+/// Every field is `serde(default)`, so a runner too old to publish these
+/// blocks yields no causes and falls back to the original wording — no
+/// regression for a mixed-version fleet.
+fn degraded_reason(body: &RunnerHealthBody) -> String {
+    let mut causes: Vec<String> = Vec::new();
+
+    if body.embedding_service.as_ref().and_then(|f| f.reachable) == Some(false) {
+        causes.push("embedding service unreachable".to_string());
+    }
+    if body.database.as_ref().and_then(|f| f.reachable) == Some(false) {
+        causes.push("database unreachable".to_string());
+    }
+    if let Some(wi) = body.web_integration.as_ref() {
+        // Only `Some(false)` is a fault. `None` means no relay is expected.
+        if wi.connected == Some(false) {
+            causes.push(match wi.last_error.as_deref() {
+                // Reuses the file's existing truncator so a relay
+                // `last_error` cannot dominate the status line; the full text
+                // stays on the runner's own `/web-integration/status`.
+                Some(e) if !e.trim().is_empty() => {
+                    format!("backend relay down ({})", truncate_reason(e.trim(), 120))
+                }
+                _ => "backend relay down".to_string(),
+            });
+        }
+    }
+
+    if causes.is_empty() {
+        // Either an older runner, or a degraded input this supervisor build
+        // does not know about. Say the verdict, and do NOT invent a cause.
+        return "runner reported derived_status=degraded".to_string();
+    }
+    format!("runner degraded: {}", causes.join("; "))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -221,7 +293,7 @@ fn derive_runner_status(
             }
             if ds.eq_ignore_ascii_case("degraded") {
                 return RunnerStatus::Degraded {
-                    reason: "runner reported derived_status=degraded".to_string(),
+                    reason: degraded_reason(body),
                 };
             }
         }
@@ -568,6 +640,91 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 mod tests {
     use super::*;
 
+    /// Parse a `/health` body the way the real path does, so these tests
+    /// exercise the serde renames (`embeddingService`, `webIntegration`,
+    /// `lastError`) rather than a hand-built struct that could drift.
+    fn body(json: &str) -> RunnerHealthBody {
+        serde_json::from_str(json).expect("health body must parse")
+    }
+
+    #[test]
+    fn degraded_reason_names_the_relay_rather_than_restating_the_verdict() {
+        let b = body(
+            r#"{"derived_status":"degraded",
+                "embeddingService":{"reachable":true},
+                "database":{"reachable":true},
+                "webIntegration":{"connected":false,"wsConnected":false,
+                  "lastError":"Backend closed the WS before the `connected` ack"}}"#,
+        );
+        let r = degraded_reason(&b);
+        assert!(r.contains("backend relay down"), "{r}");
+        assert!(r.contains("connected` ack"), "the cause must survive: {r}");
+        assert!(
+            !r.contains("derived_status=degraded"),
+            "must not restate: {r}"
+        );
+    }
+
+    #[test]
+    fn degraded_reason_distinguishes_the_three_causes() {
+        let relay = degraded_reason(&body(r#"{"webIntegration":{"connected":false}}"#));
+        let embed = degraded_reason(&body(r#"{"embeddingService":{"reachable":false}}"#));
+        let db = degraded_reason(&body(r#"{"database":{"reachable":false}}"#));
+
+        assert!(relay.contains("relay"), "{relay}");
+        assert!(embed.contains("embedding"), "{embed}");
+        assert!(db.contains("database"), "{db}");
+        // The whole point: a dead relay must not read like a PG outage.
+        assert_ne!(relay, embed);
+        assert_ne!(relay, db);
+        assert_ne!(embed, db);
+    }
+
+    #[test]
+    fn a_relay_that_is_not_expected_is_not_a_cause() {
+        // `connected: null` = no relay expected (tier below qontinui_account,
+        // or web-integration disabled). Reporting that as a fault would make
+        // every deliberately local-only runner look broken.
+        let r = degraded_reason(&body(
+            r#"{"embeddingService":{"reachable":false},
+                "webIntegration":{"connected":null,"wsConnected":false}}"#,
+        ));
+        assert!(r.contains("embedding"), "{r}");
+        assert!(
+            !r.contains("relay"),
+            "an unexpected relay is not a cause: {r}"
+        );
+    }
+
+    #[test]
+    fn degraded_reason_lists_every_simultaneous_cause() {
+        let r = degraded_reason(&body(
+            r#"{"embeddingService":{"reachable":false},
+                "database":{"reachable":false},
+                "webIntegration":{"connected":false}}"#,
+        ));
+        assert!(r.contains("embedding"), "{r}");
+        assert!(r.contains("database"), "{r}");
+        assert!(r.contains("relay"), "{r}");
+    }
+
+    #[test]
+    fn an_older_runner_falls_back_to_the_original_wording() {
+        // A runner too old to publish these blocks yields no causes. Say the
+        // verdict and invent nothing — a mixed-version fleet must not get a
+        // fabricated cause.
+        let r = degraded_reason(&body(r#"{"derived_status":"degraded"}"#));
+        assert_eq!(r, "runner reported derived_status=degraded");
+    }
+
+    #[test]
+    fn a_blank_last_error_does_not_produce_empty_parentheses() {
+        let r = degraded_reason(&body(
+            r#"{"webIntegration":{"connected":false,"lastError":"   "}}"#,
+        ));
+        assert_eq!(r, "runner degraded: backend relay down");
+    }
+
     #[test]
     fn test_cached_port_health_default_all_false() {
         let health = CachedPortHealth::default();
@@ -645,6 +802,7 @@ mod tests {
                 count: 1,
             }),
             recent_crash: None,
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
@@ -664,6 +822,7 @@ mod tests {
             derived_status: None,
             ui_error: None,
             recent_crash: None,
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Starting));
@@ -676,6 +835,7 @@ mod tests {
             derived_status: Some("ERRORED".to_string()), // case-insensitive
             ui_error: None,
             recent_crash: None,
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Errored { .. }));
@@ -688,6 +848,7 @@ mod tests {
             derived_status: Some("Degraded".to_string()), // case-insensitive
             ui_error: None,
             recent_crash: None,
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
@@ -711,6 +872,7 @@ mod tests {
                 panic_message: Some("no reactor running".to_string()),
                 thread: Some("main".to_string()),
             }),
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
@@ -737,6 +899,7 @@ mod tests {
                 panic_message: None,
                 thread: None,
             }),
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
@@ -770,6 +933,7 @@ mod tests {
                 panic_message: Some("stale crash".to_string()),
                 thread: None,
             }),
+            ..Default::default()
         };
         let status = derive_runner_status(true, true, Some(&body));
         match status {
