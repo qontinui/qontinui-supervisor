@@ -1,8 +1,19 @@
 name: CI
 
+# The merge-candidate/** globs below are load-bearing, not decorative: coord
+# validates a land by pushing the rebased tip to
+# refs/heads/merge-candidate/<proposal_id> (or the -spec/-batch variants) and
+# waiting for that ref's CI before merging. Without a matching push trigger the
+# candidate push matches no workflow, no checks are ever reported, and the
+# proposal livelocks waiting on a run that will never start — the 2026-06-13
+# qontinui-runner #566 incident class. Same spelling qontinui-runner uses.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
   pull_request:
     branches: [main]
 
