@@ -967,8 +967,14 @@ async fn run_build_inner(
     // `<wt>/dist/index.html` (the empirical 2026-05-21 manual-test failure
     // mode this gate exists to prevent).
     //
-    // Runs ONLY when `build_dir_override` is set. The live-tree code path
-    // below is unchanged byte-for-byte.
+    // Runs ONLY when `build_dir_override` is set. The two paths install their
+    // frontend deps by DIFFERENT mechanisms, so neither is a subset of the
+    // other: the worktree path uses `prebuild_worktree_frontend` (a freshness
+    // gate — sidecar marker + lockfile hash, so a warm worktree skips the
+    // install), while the live-tree path runs an unconditional
+    // `pnpm install --frozen-lockfile` further down (gated on
+    // `build_dir_override.is_none()`, inside the npm lock) because a live tree
+    // has no marker and would otherwise build against stale node_modules.
     if let Some(src_tauri) = build_dir_override {
         let wt_root: PathBuf = src_tauri.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
             SupervisorError::Other(format!(

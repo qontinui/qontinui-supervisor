@@ -25,7 +25,7 @@ use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::settings;
-use crate::state::{ManagedRunner, SharedState, SseConnectionGuard};
+use crate::state::{ManagedRunner, SharedState, SpawnDedupKey, SseConnectionGuard};
 use qontinui_types::wire::runner_kind::RunnerKind;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -1955,6 +1955,63 @@ fn resolve_spawn_build_source(
     SpawnBuildSource::DefaultOriginMain
 }
 
+/// The `build_target` half of a [`SpawnDedupKey`]: what this request will
+/// actually compile, spelled so that two requests join **only** when the
+/// artifact one produces is the artifact the other asked for.
+///
+/// Derived from the resolved [`SpawnBuildSource`], so the four sources are four
+/// distinct targets — and `ExplicitRef` / `WorktreePath` carry their operand,
+/// because `git_ref: "main"` and `git_ref: "feature/x"` are different builds.
+///
+/// `frontend_only` is part of the target, not the source: it re-embeds a fresh
+/// `dist/` into the same tree. A `frontend_only` request joined to a plain build
+/// of that tree would be handed a binary carrying the dist the caller asked to
+/// have replaced — the exact staleness `frontend_only` exists to defeat.
+fn spawn_build_target(source: &SpawnBuildSource, frontend_only: bool) -> String {
+    let tree = match source {
+        SpawnBuildSource::DefaultOriginMain => "origin_main".to_string(),
+        SpawnBuildSource::ExplicitRef(r) => format!("git_ref:{r}"),
+        SpawnBuildSource::WorktreePath(p) => format!("worktree_path:{p}"),
+        SpawnBuildSource::LiveTree => "live_tree".to_string(),
+    };
+    if frontend_only {
+        format!("{tree}+frontend_only")
+    } else {
+        tree
+    }
+}
+
+/// The single-flight key for one spawn-test request, or `None` when the request
+/// must never join another.
+///
+/// Two requests are refused a key:
+///
+/// * **Anonymous** (`requester_id` absent or blank). There is no way to tell
+///   one anonymous caller retrying from two unrelated anonymous callers, and
+///   collapsing the second case would hand a caller someone else's runner. So
+///   anonymous requests never join — not each other, and not a keyed request.
+/// * **`rebuild: false`**, which claims no build-pool slot at all (the exe comes
+///   from a slot or the LKG). The scarce resource this index protects is the
+///   three-slot build pool; a request that spends none of it is just a runner
+///   reservation, and two of those legitimately want two runners.
+///
+/// Pure, so the whole matrix is unit-testable.
+fn spawn_dedup_key(
+    requester_id: Option<&str>,
+    rebuild: bool,
+    frontend_only: bool,
+    source: &SpawnBuildSource,
+) -> Option<SpawnDedupKey> {
+    let requester_id = requester_id?.trim();
+    if requester_id.is_empty() || !rebuild {
+        return None;
+    }
+    Some(SpawnDedupKey {
+        requester_id: requester_id.to_string(),
+        build_target: spawn_build_target(source, frontend_only),
+    })
+}
+
 /// Resolve a spawn-test request's provenance into `(source_label, source_root)`
 /// — the pair recorded on the build submission and surfaced by
 /// `GET /build/{id}/status`.
@@ -2377,6 +2434,64 @@ pub async fn spawn_test(
         ));
     }
 
+    // Single-flight admission, keyed by (requester, build target).
+    //
+    // The build pool has three slots. A `curl` that appears to have returned
+    // nothing (dropped connection, client-side timeout, swallowed 202) may
+    // already have registered a build; the retry used to claim a SECOND slot to
+    // compile the identical tree for the identical caller. Now it JOINS: same
+    // `build_id`, same runner, `"deduplicated": true`.
+    //
+    // The claim guard holds the index's write lock until the submission is
+    // registered below, so two concurrent same-key requests cannot both start.
+    // Any `?` between here and `commit` drops the guard, freeing the key.
+    let dedup_key = spawn_dedup_key(
+        body.requester_id.as_deref(),
+        body.rebuild,
+        body.frontend_only,
+        &build_source,
+    );
+    let spawn_claim = match state.claim_spawn_build(dedup_key.clone()).await {
+        crate::state::SpawnTicket::Join(existing) => {
+            let existing_id = existing.submission_id;
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!(
+                        "spawn-test: build {existing_id} for requester {:?} target {:?} is already \
+                         in flight — joining it (no second build-pool slot claimed)",
+                        dedup_key.as_ref().map(|k| &k.requester_id),
+                        dedup_key.as_ref().map(|k| &k.build_target),
+                    ),
+                )
+                .await;
+            return Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "queued",
+                    "deduplicated": true,
+                    "build_id": existing_id.to_string(),
+                    "submission_id": existing_id.to_string(),
+                    "id": existing.runner_id,
+                    "port": existing.port,
+                    "api_url": format!("http://localhost:{}", existing.port),
+                    "ui_bridge_url": format!("http://localhost:{}/ui-bridge", existing.port),
+                    "poll_url": format!("/build/{}/status", existing_id),
+                    "message": format!(
+                        "an identical spawn-test build ({}) is already in flight for this \
+                         requester and target; joined it instead of claiming a second build-pool \
+                         slot — poll GET /build/{}/status for the terminal outcome",
+                        existing_id, existing_id
+                    ),
+                })),
+            )
+                .into_response());
+        }
+        crate::state::SpawnTicket::Claim(claim) => claim,
+    };
+
     // Atomically reserve a free port AND insert a placeholder ManagedRunner
     // into the registry under a single write lock. Without this, two
     // concurrent `spawn-test` calls with `rebuild: true` would both scan the
@@ -2518,6 +2633,14 @@ pub async fn spawn_test(
     // flight.
     let (source_label, worktree_label) =
         resolve_spawn_source(&state.config.project_dir, &build_source);
+    // Single-flight release. The submission id does not exist until
+    // `submit_spawn` returns, so the exec future reads it from this cell — which
+    // is filled below while the claim guard is still held, i.e. strictly before
+    // any releaser can take the index lock.
+    let release_key = dedup_key.clone();
+    let release_id: Arc<std::sync::OnceLock<uuid::Uuid>> = Arc::new(std::sync::OnceLock::new());
+    let exec_release_id = release_id.clone();
+    let exec_release_state = state.clone();
     let (submission_id, sub_arc) = crate::build_submissions::submit_spawn(
         store,
         worktree_label,
@@ -2527,9 +2650,22 @@ pub async fn spawn_test(
         async move {
             let (status, body_json, stderr_tail) =
                 execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
+            // The build is over (succeeded or failed): free the key so the next
+            // request for it starts a fresh build instead of joining a corpse.
+            if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
+                exec_release_state.release_spawn_inflight(&key, id).await;
+            }
             (status.as_u16(), body_json, stderr_tail)
         },
     );
+    let _ = release_id.set(submission_id);
+    // Publish the claim: from here a duplicate request for this key joins this
+    // build. Dropping the guard also releases the index write lock.
+    spawn_claim.commit(crate::state::SpawnInflight {
+        submission_id,
+        runner_id: id.clone(),
+        port,
+    });
 
     if want_async {
         return Ok((
@@ -7992,5 +8128,184 @@ mod tests {
             runners.get(&id).expect("still registered").config.port
         };
         assert_eq!(port_now, 9877, "a live runner's port is immutable");
+    }
+    // -------------------------------------------------------------------
+    // spawn-test single flight, keyed by (requester_id, build target).
+    //
+    // Three pool slots is the scarce resource: a retry of a `curl` that looked
+    // like it returned nothing must JOIN the build already running for that
+    // key, not claim a second slot to compile the identical tree.
+    // -------------------------------------------------------------------
+
+    /// Anonymous requests never join — not each other, and not a keyed build.
+    /// With no requester there is no way to tell one caller retrying from two
+    /// unrelated callers, and collapsing the latter hands a caller someone
+    /// else's runner.
+    #[test]
+    fn spawn_dedup_key_is_none_for_anonymous_requests() {
+        use super::{spawn_dedup_key as k, SpawnBuildSource};
+        assert!(k(None, true, false, &SpawnBuildSource::DefaultOriginMain).is_none());
+        assert!(k(Some(""), true, false, &SpawnBuildSource::DefaultOriginMain).is_none());
+        assert!(
+            k(
+                Some("   "),
+                true,
+                false,
+                &SpawnBuildSource::DefaultOriginMain
+            )
+            .is_none(),
+            "a whitespace-only requester is anonymous, not an identity"
+        );
+    }
+
+    /// A request that claims no build-pool slot is not worth single-flighting:
+    /// `rebuild:false` spawns from an existing slot exe / the LKG, and two such
+    /// callers legitimately want two runners.
+    #[test]
+    fn spawn_dedup_key_is_none_without_rebuild() {
+        use super::{spawn_dedup_key as k, SpawnBuildSource};
+        assert!(k(Some("agent-1"), false, false, &SpawnBuildSource::LiveTree).is_none());
+    }
+
+    /// Every distinct build target is its own single flight: the four sources,
+    /// the operands of the two that carry one, and the `frontend_only` variant
+    /// of a tree (which would otherwise be handed the stale dist it asked to
+    /// have replaced).
+    #[test]
+    fn spawn_dedup_key_distinguishes_every_build_target() {
+        use super::{spawn_dedup_key as k, SpawnBuildSource};
+        let key = |rebuild, frontend_only, source: &SpawnBuildSource| {
+            k(Some("agent-1"), rebuild, frontend_only, source).expect("keyed")
+        };
+        let targets: Vec<String> = vec![
+            key(true, false, &SpawnBuildSource::DefaultOriginMain),
+            key(true, false, &SpawnBuildSource::LiveTree),
+            key(true, false, &SpawnBuildSource::ExplicitRef("feat/x".into())),
+            key(true, false, &SpawnBuildSource::ExplicitRef("feat/y".into())),
+            key(true, false, &SpawnBuildSource::WorktreePath("D:/a".into())),
+            key(true, false, &SpawnBuildSource::WorktreePath("D:/b".into())),
+            key(true, true, &SpawnBuildSource::DefaultOriginMain),
+        ]
+        .into_iter()
+        .map(|k| k.build_target)
+        .collect();
+
+        let unique: std::collections::HashSet<&String> = targets.iter().collect();
+        assert_eq!(
+            unique.len(),
+            targets.len(),
+            "every distinct build target must be its own single flight: {targets:?}"
+        );
+
+        // ...while the SAME request twice is the same key — that is the join.
+        assert_eq!(
+            key(true, false, &SpawnBuildSource::DefaultOriginMain),
+            key(true, false, &SpawnBuildSource::DefaultOriginMain)
+        );
+        // A different requester on the same target is a different key.
+        assert_ne!(
+            k(
+                Some("agent-1"),
+                true,
+                false,
+                &SpawnBuildSource::DefaultOriginMain
+            ),
+            k(
+                Some("agent-2"),
+                true,
+                false,
+                &SpawnBuildSource::DefaultOriginMain
+            )
+        );
+    }
+
+    /// End-to-end through the handler: a second `spawn-test` for a key whose
+    /// build is still running returns 202 + `deduplicated: true` carrying the
+    /// EXISTING `build_id`, runner id and port — and starts no build, so the
+    /// test is deterministic (this path returns before any port reservation).
+    #[tokio::test]
+    async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        let state = make_state();
+
+        // A live build for (agent-1, origin_main) — what a plain
+        // `{requester_id, rebuild:true}` request resolves to.
+        let existing_id = uuid::Uuid::new_v4();
+        state
+            .build_submissions
+            .insert(crate::build_submissions::BuildSubmission {
+                id: existing_id,
+                worktree_path: std::path::PathBuf::from("/tmp/test/src-tauri"),
+                source: None,
+                build_kind: crate::build_submissions::BuildKind::Build,
+                agent_id: Some("agent-1".to_string()),
+                package: None,
+                features: vec![],
+                base_ref: None,
+                submitted_at: chrono::Utc::now(),
+                status: crate::build_submissions::BuildStatus::Running {
+                    started_at: chrono::Utc::now(),
+                },
+                cache_key: None,
+                cache_outcome: None,
+                cache_hit: false,
+                stdout_tail: vec![],
+                stderr_tail: vec![],
+                spawn: None,
+                detached: None,
+            })
+            .await;
+        state.spawn_test_inflight.write().await.insert(
+            crate::state::SpawnDedupKey {
+                requester_id: "agent-1".to_string(),
+                build_target: "origin_main".to_string(),
+            },
+            crate::state::SpawnInflight {
+                submission_id: existing_id,
+                runner_id: "test-abc".to_string(),
+                port: 9880,
+            },
+        );
+
+        let resp = super::spawn_test(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::Json(serde_json::json!({"requester_id": "agent-1", "rebuild": true})),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+
+        assert_eq!(
+            status, 202,
+            "a joined request is an accept, not a new build"
+        );
+        assert_eq!(body["deduplicated"], true);
+        assert_eq!(
+            body["build_id"], body["submission_id"],
+            "build_id IS the submission id — one build identity"
+        );
+        assert_eq!(
+            body["build_id"],
+            existing_id.to_string(),
+            "the joiner must be handed the EXISTING build_id, not a fresh one"
+        );
+        assert_eq!(body["id"], "test-abc", "and the existing runner");
+        assert_eq!(body["port"], 9880);
+
+        // No second runner was reserved: the registry still holds only the
+        // configured primary, and the index still points at the one build.
+        assert_eq!(
+            state.spawn_test_inflight.read().await.len(),
+            1,
+            "joining must not record a second in-flight build"
+        );
     }
 }

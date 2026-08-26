@@ -406,6 +406,24 @@ pub struct SupervisorState {
     /// off a duplicate build. Cleared/overwritten when a new rebuild is started
     /// (the previous id having reached terminal). `None` until the first rebuild.
     pub fix_and_rebuild_inflight: RwLock<Option<uuid::Uuid>>,
+    /// Single-flight index for `POST /runners/spawn-test`, keyed by
+    /// **(requester, build target)** — see [`SpawnDedupKey`].
+    ///
+    /// The build pool has three slots. A caller whose `curl` appears to have
+    /// returned nothing (a dropped connection, a client-side timeout, a
+    /// swallowed 202) retries — and before this index the retry claimed a
+    /// SECOND slot to compile the exact same tree for the exact same caller,
+    /// spending a third of the pool on a build whose output already existed.
+    ///
+    /// [`SupervisorState::admit_spawn_build`] is the only door: a request whose
+    /// key is already present JOINS the running build (same `build_id`, same
+    /// runner, `"deduplicated": true`) instead of starting a second one. The
+    /// entry is removed when the build reaches a terminal state.
+    ///
+    /// Generalises the global `fix_and_rebuild_inflight` above: that one
+    /// single-flights the *one* live-tree rebuild with no key at all, which is
+    /// only correct because there is exactly one such tree.
+    pub spawn_test_inflight: RwLock<HashMap<SpawnDedupKey, SpawnInflight>>,
     /// Spawn-worktree containers (`<workspace_root>/.spawn-<ref>/`) that are
     /// currently being built. A `git_ref` spawn-test materializes such a
     /// container, then holds a build-pool slot while compiling the tree inside
@@ -1146,7 +1164,133 @@ pub fn load_or_create_boot_id() -> String {
     load_or_create_boot_id_at(&default_boot_id_path())
 }
 
+/// Identity of a spawn-test build for single-flight purposes: **who** asked,
+/// and **what tree** they asked to have compiled.
+///
+/// Both halves are load-bearing:
+///
+/// * `requester_id` — two different agents that happen to want the same tree
+///   each want their OWN runner, so they must not collapse. A request with no
+///   `requester_id` produces no key at all (see
+///   `routes::runners::spawn_dedup_key`): anonymous requests are
+///   indistinguishable from one another, and joining them would hand one
+///   caller a runner another caller owns.
+/// * `build_target` — derived from the resolved `SpawnBuildSource` (plus the
+///   `frontend_only` flag, which changes what is compiled from the same tree),
+///   so `origin/main`, an explicit ref, a caller's worktree path and the live
+///   tree are four distinct targets that never join each other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SpawnDedupKey {
+    pub requester_id: String,
+    pub build_target: String,
+}
+
+/// The in-flight spawn-test build that a duplicate request joins: the same
+/// `build_id` (= submission id) and the same reserved runner.
+#[derive(Debug, Clone)]
+pub struct SpawnInflight {
+    /// `build_id` — the build-submission id, identical on the sync, async and
+    /// poll paths.
+    pub submission_id: uuid::Uuid,
+    /// Registry id of the runner reserved for this build.
+    pub runner_id: String,
+    /// Port reserved for that runner.
+    pub port: u16,
+}
+
+/// Result of asking for the spawn-test single flight for one key.
+pub enum SpawnTicket<'a> {
+    /// An equivalent build is already running: join it. Nothing was claimed.
+    Join(SpawnInflight),
+    /// This request owns the key. It MUST call [`SpawnClaimGuard::commit`] once
+    /// its build is registered, or drop the guard to abandon the claim.
+    Claim(SpawnClaimGuard<'a>),
+}
+
+/// Exclusive hold on one [`SpawnDedupKey`] while its build is being registered.
+///
+/// The index's write lock is held for the guard's whole life, so a concurrent
+/// same-key request blocks here and then observes the committed entry rather
+/// than starting a second build. Dropping the guard without committing (the
+/// handler bailed out on a validation error, no port was free, …) leaves the
+/// key free for the next request — an abandoned claim never wedges a key.
+///
+/// An unkeyed request (anonymous, or one that claims no build slot) gets a
+/// guard with `key: None`: it still passes through the same code path, and
+/// `commit` records nothing.
+pub struct SpawnClaimGuard<'a> {
+    key: Option<SpawnDedupKey>,
+    index: tokio::sync::RwLockWriteGuard<'a, HashMap<SpawnDedupKey, SpawnInflight>>,
+}
+
+impl SpawnClaimGuard<'_> {
+    /// Record the build this claim started, so duplicates can join it.
+    pub fn commit(mut self, inflight: SpawnInflight) {
+        if let Some(key) = self.key.take() {
+            self.index.insert(key, inflight);
+        }
+    }
+}
+
 impl SupervisorState {
+    /// Enter the `(requester, build target)` single flight for a spawn-test
+    /// request: either join the build already running for that key, or take an
+    /// exclusive claim on it.
+    ///
+    /// `key: None` (anonymous request, or one that claims no build-pool slot)
+    /// always yields a claim that records nothing — such requests never join
+    /// and are never joined.
+    ///
+    /// This serializes spawn-test *admission*, not the builds themselves (which
+    /// run detached on the build pool). The handler already serializes on the
+    /// runner-registry write lock immediately afterwards, so no new class of
+    /// contention is introduced.
+    pub async fn claim_spawn_build(&self, key: Option<SpawnDedupKey>) -> SpawnTicket<'_> {
+        let mut index = self.spawn_test_inflight.write().await;
+        if let Some(key) = &key {
+            if let Some(existing) = index.get(key).cloned() {
+                if self.spawn_build_in_flight(existing.submission_id).await {
+                    return SpawnTicket::Join(existing);
+                }
+                // Terminal but never released — only reachable if a release was
+                // lost. Drop it rather than refusing this key forever.
+                index.remove(key);
+            }
+        }
+        SpawnTicket::Claim(SpawnClaimGuard { key, index })
+    }
+
+    /// Is this build submission still running?
+    ///
+    /// An id the store does not know is **UNKNOWN, not finished**:
+    /// `build_submissions::submit_spawn` registers the submission from a
+    /// spawned task, so a just-started build is briefly absent from the store.
+    /// Reading that absence as "terminal" would let a retry arriving in exactly
+    /// that window start the duplicate build this index exists to prevent.
+    /// Entries are removed on completion, so a genuinely finished build has no
+    /// index entry to consult in the first place.
+    async fn spawn_build_in_flight(&self, submission_id: uuid::Uuid) -> bool {
+        match self.build_submissions.get(&submission_id).await {
+            Some(arc) => !arc.read().await.status.is_terminal(),
+            None => true,
+        }
+    }
+
+    /// Drop a spawn-test single-flight entry once its build is terminal, so the
+    /// next request for the same key starts a fresh build.
+    ///
+    /// Removes only an entry that still points at `submission_id`, so a build
+    /// finishing after a newer one claimed the key cannot evict its successor.
+    pub async fn release_spawn_inflight(&self, key: &SpawnDedupKey, submission_id: uuid::Uuid) {
+        let mut index = self.spawn_test_inflight.write().await;
+        if index
+            .get(key)
+            .is_some_and(|e| e.submission_id == submission_id)
+        {
+            index.remove(key);
+        }
+    }
+
     pub fn new(config: SupervisorConfig) -> Self {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
@@ -1266,6 +1410,7 @@ impl SupervisorState {
             synthetic_build_id_tx,
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
+            spawn_test_inflight: RwLock::new(HashMap::new()),
             active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
             spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             footprint: RwLock::new(None),
@@ -2146,5 +2291,243 @@ mod tests {
         let st = RunnerState::new();
         assert_eq!(st.liveness(false), RunnerLiveness::Unknown);
         assert_eq!(st.liveness(true), RunnerLiveness::Unknown);
+    }
+    // --- spawn-test single flight ---
+
+    fn dedup_key(requester: &str, target: &str) -> SpawnDedupKey {
+        SpawnDedupKey {
+            requester_id: requester.to_string(),
+            build_target: target.to_string(),
+        }
+    }
+
+    fn spawn_state() -> Arc<SupervisorState> {
+        Arc::new(SupervisorState::new(make_test_config()))
+    }
+
+    /// A submission the store will report as still running.
+    fn running_submission(id: uuid::Uuid) -> crate::build_submissions::BuildSubmission {
+        crate::build_submissions::BuildSubmission {
+            id,
+            worktree_path: PathBuf::from("/tmp/test/src-tauri"),
+            source: None,
+            build_kind: crate::build_submissions::BuildKind::Build,
+            agent_id: None,
+            package: None,
+            features: vec![],
+            base_ref: None,
+            submitted_at: Utc::now(),
+            status: crate::build_submissions::BuildStatus::Running {
+                started_at: Utc::now(),
+            },
+            cache_key: None,
+            cache_outcome: None,
+            cache_hit: false,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+            spawn: None,
+            detached: None,
+        }
+    }
+
+    fn finished_submission(id: uuid::Uuid) -> crate::build_submissions::BuildSubmission {
+        let mut sub = running_submission(id);
+        sub.status = crate::build_submissions::BuildStatus::Succeeded {
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration_secs: 1.0,
+        };
+        sub
+    }
+
+    fn inflight(id: uuid::Uuid, port: u16) -> SpawnInflight {
+        SpawnInflight {
+            submission_id: id,
+            runner_id: format!("test-{port}"),
+            port,
+        }
+    }
+
+    /// The property the whole index exists for: two rapid same-key spawn-test
+    /// requests must produce ONE build, and both must see the same `build_id`.
+    /// Raced through a barrier so the second genuinely contends for the claim.
+    #[tokio::test]
+    async fn two_concurrent_same_key_spawns_start_one_build_with_one_build_id() {
+        let state = spawn_state();
+        let key = dedup_key("agent-1", "origin_main");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let state = state.clone();
+            let key = key.clone();
+            let starts = starts.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                match state.claim_spawn_build(Some(key)).await {
+                    SpawnTicket::Join(existing) => existing.submission_id,
+                    SpawnTicket::Claim(claim) => {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        let id = uuid::Uuid::new_v4();
+                        // Stand in for `submit_spawn`: register a live build,
+                        // then publish the claim (both under the guard, exactly
+                        // as `spawn_test` does).
+                        state.build_submissions.insert(running_submission(id)).await;
+                        claim.commit(inflight(id, 9877));
+                        id
+                    }
+                }
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for h in handles {
+            ids.push(h.await.expect("task"));
+        }
+
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "exactly one of two concurrent same-key spawns may claim a build slot"
+        );
+        assert_eq!(
+            ids[0], ids[1],
+            "the joining request must be handed the SAME build_id, not a fresh one"
+        );
+    }
+
+    /// Different build targets are different builds: same requester, four
+    /// distinct targets, four independent claims.
+    #[tokio::test]
+    async fn different_build_targets_never_join_each_other() {
+        let state = spawn_state();
+        let occupied = dedup_key("agent-1", "origin_main");
+        let id = uuid::Uuid::new_v4();
+        state.build_submissions.insert(running_submission(id)).await;
+        match state.claim_spawn_build(Some(occupied.clone())).await {
+            SpawnTicket::Claim(claim) => claim.commit(inflight(id, 9877)),
+            SpawnTicket::Join(_) => panic!("first claim on an empty index must not join"),
+        }
+
+        for target in ["live_tree", "git_ref:feature/x", "worktree_path:D:/wt"] {
+            match state
+                .claim_spawn_build(Some(dedup_key("agent-1", target)))
+                .await
+            {
+                SpawnTicket::Claim(_) => {}
+                SpawnTicket::Join(_) => {
+                    panic!("target {target} must not join a build of a different target")
+                }
+            }
+        }
+
+        // A different requester on the SAME target is also its own build — two
+        // agents each want their own runner.
+        match state
+            .claim_spawn_build(Some(dedup_key("agent-2", "origin_main")))
+            .await
+        {
+            SpawnTicket::Claim(_) => {}
+            SpawnTicket::Join(_) => panic!("a different requester must never join another's build"),
+        };
+    }
+
+    /// Anonymous requests are indistinguishable from one another, so they never
+    /// join — not each other, and not a keyed build. They also record nothing.
+    #[tokio::test]
+    async fn anonymous_requests_never_join_and_never_record() {
+        let state = spawn_state();
+        for _ in 0..3 {
+            match state.claim_spawn_build(None).await {
+                SpawnTicket::Claim(claim) => claim.commit(inflight(uuid::Uuid::new_v4(), 9877)),
+                SpawnTicket::Join(_) => panic!("an unkeyed request must never join"),
+            }
+        }
+        assert!(
+            state.spawn_test_inflight.read().await.is_empty(),
+            "an unkeyed claim must record nothing — otherwise the next anonymous \
+             request would be handed another caller's runner"
+        );
+    }
+
+    /// A finished build is not joinable: its entry is dropped and the new
+    /// request starts a real build.
+    #[tokio::test]
+    async fn a_terminal_build_is_replaced_not_joined() {
+        let state = spawn_state();
+        let key = dedup_key("agent-1", "origin_main");
+        let old = uuid::Uuid::new_v4();
+        state
+            .build_submissions
+            .insert(finished_submission(old))
+            .await;
+        state
+            .spawn_test_inflight
+            .write()
+            .await
+            .insert(key.clone(), inflight(old, 9877));
+
+        match state.claim_spawn_build(Some(key.clone())).await {
+            SpawnTicket::Claim(claim) => claim.commit(inflight(uuid::Uuid::new_v4(), 9878)),
+            SpawnTicket::Join(_) => panic!("a terminal build must not be joined"),
+        }
+        assert_ne!(
+            state.spawn_test_inflight.read().await[&key].submission_id,
+            old,
+            "the stale entry must be replaced by the new build"
+        );
+    }
+
+    /// A build id the store has never heard of is UNKNOWN, not finished:
+    /// `submit_spawn` registers from a spawned task, so a just-started build is
+    /// briefly absent. Reading that as terminal would let the retry arriving in
+    /// exactly that window start the duplicate build.
+    #[tokio::test]
+    async fn an_unregistered_submission_reads_as_in_flight() {
+        let state = spawn_state();
+        let key = dedup_key("agent-1", "origin_main");
+        let id = uuid::Uuid::new_v4();
+        state
+            .spawn_test_inflight
+            .write()
+            .await
+            .insert(key.clone(), inflight(id, 9877));
+
+        match state.claim_spawn_build(Some(key)).await {
+            SpawnTicket::Join(existing) => assert_eq!(existing.submission_id, id),
+            SpawnTicket::Claim(_) => {
+                panic!("an unregistered submission must read as in flight, not as terminal")
+            }
+        };
+    }
+
+    /// Releasing is scoped to the submission that owns the key, so a build
+    /// finishing late cannot evict the build that replaced it.
+    #[tokio::test]
+    async fn release_only_removes_its_own_submission() {
+        let state = spawn_state();
+        let key = dedup_key("agent-1", "origin_main");
+        let current = uuid::Uuid::new_v4();
+        state
+            .spawn_test_inflight
+            .write()
+            .await
+            .insert(key.clone(), inflight(current, 9878));
+
+        state
+            .release_spawn_inflight(&key, uuid::Uuid::new_v4())
+            .await;
+        assert!(
+            state.spawn_test_inflight.read().await.contains_key(&key),
+            "a stale build's release must not evict its successor"
+        );
+
+        state.release_spawn_inflight(&key, current).await;
+        assert!(
+            !state.spawn_test_inflight.read().await.contains_key(&key),
+            "the owning build's release must free the key"
+        );
     }
 }
