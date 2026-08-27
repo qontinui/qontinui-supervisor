@@ -363,13 +363,28 @@ pub async fn restart_runner(
 
                 // Phase A4: the rebuild is detached, so the resolved built sha
                 // does not exist when the 202 was sent. Evaluate origin/main
-                // drift HERE (on the live-tree HEAD that was just built) and
-                // attach it to the recorded outcome body — it surfaces via
-                // `GET /build/{id}/status` and seeds the next `GET /builds`.
-                // `warn!` is the loud signal for the rebuild path. Best-effort:
-                // a non-repo / missing remote yields `null` and never fails the
-                // restart.
-                let drift_json = match exec_state.config.project_dir.parent() {
+                // drift HERE and attach it to the recorded outcome body — it
+                // surfaces via `GET /build/{id}/status` and seeds the next
+                // `GET /builds`. `warn!` is the loud signal for the rebuild
+                // path. Best-effort: a non-repo / missing remote yields `null`
+                // and never fails the restart.
+                //
+                // ONLY meaningful for a `from_working_tree` rebuild. The
+                // DEFAULT primary rebuild compiles a supervisor-materialized
+                // `origin/main` worktree (`primary_rebuild_from_origin_main`),
+                // not the live checkout — probing the live tree there reports a
+                // sha this build never compiled and can raise a false "the
+                // primary may NOT be running latest main" alarm when the shared
+                // checkout is parked on someone's branch. Same wrong-tree
+                // defect as the build-time provenance warning. An origin/main
+                // worktree is at origin/main by construction, so there is
+                // nothing to compare: report `null` rather than a wrong sha.
+                let drift_json = match exec_state
+                    .config
+                    .project_dir
+                    .parent()
+                    .filter(|_| from_working_tree)
+                {
                     Some(repo_root) => {
                         let head = crate::build_monitor::rev_parse_head(repo_root).await;
                         match head {

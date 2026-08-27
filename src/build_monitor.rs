@@ -776,6 +776,7 @@ pub async fn run_cargo_build_with_dir_detailed(
                 &slot,
                 build_dir_override.as_deref(),
                 force_frontend_build,
+                &source_kind,
                 &phase,
             )
             .await
@@ -788,6 +789,7 @@ pub async fn run_cargo_build_with_dir_detailed(
         &slot,
         build_dir_override.as_deref(),
         force_frontend_build,
+        &source_kind,
         &phase,
     )
     .await;
@@ -949,6 +951,10 @@ async fn run_build_inner(
     slot: &Arc<BuildSlot>,
     build_dir_override: Option<&std::path::Path>,
     force_frontend_build: bool,
+    // Explicit provenance class of this build. Threaded in (rather than
+    // re-derived) so the pre-cargo provenance warning describes the SAME tree
+    // `compute_build_provenance` records afterwards.
+    source_kind: &BuildSourceKind,
     // Phase marker advanced through the npm-lock wait, frontend build, and
     // cargo compile so a route-level timeout can attribute the blocked phase.
     phase: &std::sync::atomic::AtomicU8,
@@ -1249,13 +1255,18 @@ async fn run_build_inner(
     // Frontend phase done (or skipped); the remainder is the cargo compile.
     BuildPhase::Compiling.store(phase);
 
-    // Diagnostic-only: emit a WARN if the runner working tree isn't on
+    // Diagnostic-only: emit a WARN if the tree THIS BUILD COMPILES isn't on
     // origin/main. Multi-agent flow can leave the tree on a feature branch
     // between sessions, and cargo silently compiles whatever's there. The
     // warn surfaces the mismatch in supervisor.log so a caller intending to
     // test main-side code has a chance to spot it before reading `git_sha`
     // on the spawn response. See qontinui-supervisor#21.
-    warn_if_working_tree_off_main(state, slot.id).await;
+    //
+    // `build_dir_override` + `source_kind` are passed so the probe reads the
+    // OVERRIDE tree on a spawn-test `git_ref`/`worktree_path` build. Reading
+    // the canonical checkout here (the previous behavior) made the warning
+    // assert a sha the build never compiled.
+    warn_if_working_tree_off_main(state, slot.id, build_dir_override, source_kind).await;
 
     info!(
         "GCMD: frontend step returned, starting cargo (slot={})",
@@ -2458,28 +2469,127 @@ fn dist_artifact_ok(npm_dir: &std::path::Path, rel: &str) -> bool {
     }
 }
 
-/// Emit a `WARN`-level log line when the qontinui-runner working tree's
-/// HEAD does not match `origin/main`. `cargo build` compiles whatever is
-/// on disk regardless of branch, so in a multi-agent setup where another
-/// session has `git switch`ed the runner tree to a feature branch a
-/// caller intending to test main-side code will silently get the feat
-/// branch's binary instead. The only existing signal is the `git_sha`
-/// field on the spawn-test response, which most callers don't compare.
+/// Which tree the build-time provenance warning must describe, and how.
 ///
-/// Best-effort: any git error (not a repo, no `origin/main` remote ref,
-/// git missing from PATH) returns without emitting. The warn is
-/// diagnostic, not gate. See [qontinui-supervisor#21] for context.
+/// [`warn_if_working_tree_off_main`] names a specific SHA and asserts what
+/// cargo is about to compile, so it MUST read the tree cargo actually compiles
+/// — `build_dir_override` when a spawn-test `git_ref` / `worktree_path`
+/// override is in play, the live working tree otherwise. Reading the canonical
+/// checkout while compiling an override tree produced a confidently WRONG
+/// warning naming the canonical checkout's HEAD ("working tree HEAD (...) ...
+/// This build will compile ..., NOT main") for a build that in fact compiled
+/// the override
+/// and correctly reported the override's sha as `build_sha`. A reader would
+/// conclude their branch was not being built and go chase a phantom problem.
 ///
-/// `project_dir` is `qontinui-runner/src-tauri`; the git repo root is
-/// the parent.
+/// Split out as a pure function so the tree selection is unit-testable without
+/// running git or cargo — this is exactly the sort of thread-through that
+/// silently regresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvenanceWarnTarget {
+    /// Git repo root of the tree that is actually being compiled. Always
+    /// [`provenance_tree_root`] of the same `(project_dir, build_dir_override)`
+    /// pair [`compute_build_provenance`] uses, so the warning and the recorded
+    /// [`BuildProvenance`] can never name different trees.
+    pub(crate) root: PathBuf,
+    /// Human label for the tree class, printed in the log line so a reader can
+    /// tell WHICH tree the sha came from.
+    pub(crate) label: &'static str,
+    /// True for a caller-owned override tree the supervisor does not vouch for
+    /// ([`BuildSourceKind::Override`]). Such a tree need not even be a git
+    /// checkout, so an unresolvable probe there renders an explicit UNKNOWN
+    /// rather than staying silent — the caller explicitly pointed the build at
+    /// that tree and is owed an answer about it.
+    pub(crate) is_override: bool,
+    /// Authoritative HEAD when the caller already knows it
+    /// ([`BuildSourceKind::OriginMain`]'s `resolved_sha`, the exact commit
+    /// `prepare_worktree` checked out); `None` ⇒ probe `git rev-parse HEAD` in
+    /// [`Self::root`].
+    pub(crate) known_sha: Option<String>,
+}
+
+/// Pure selection of the tree the provenance warning must describe. See
+/// [`ProvenanceWarnTarget`].
+pub(crate) fn provenance_warn_target(
+    project_dir: &std::path::Path,
+    build_dir_override: Option<&std::path::Path>,
+    source_kind: &BuildSourceKind,
+) -> ProvenanceWarnTarget {
+    let root = provenance_tree_root(project_dir, build_dir_override);
+    match source_kind {
+        BuildSourceKind::LiveTree => ProvenanceWarnTarget {
+            root,
+            label: "working tree",
+            is_override: false,
+            known_sha: None,
+        },
+        BuildSourceKind::OriginMain { resolved_sha } => ProvenanceWarnTarget {
+            root,
+            label: "origin/main worktree",
+            is_override: false,
+            known_sha: Some(resolved_sha.clone()),
+        },
+        BuildSourceKind::Override => ProvenanceWarnTarget {
+            root,
+            label: "override tree",
+            is_override: true,
+            known_sha: None,
+        },
+    }
+}
+
+/// Emit the build-time provenance warning to both tracing and the supervisor
+/// log stream.
+async fn emit_provenance_warn(state: &SharedState, msg: String) {
+    warn!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+}
+
+/// Resolve the HEAD sha of a [`ProvenanceWarnTarget`]: the caller-known sha
+/// when there is one, else a `git rev-parse HEAD` in the target's root.
+///
+/// `pub(crate)` and separate from the warn so the regression test can assert
+/// the OVERRIDE tree's sha comes back — not the canonical checkout's.
+pub(crate) async fn resolve_provenance_head(target: &ProvenanceWarnTarget) -> Option<String> {
+    match &target.known_sha {
+        Some(s) if !s.is_empty() => Some(s.clone()),
+        _ => rev_parse_head(&target.root).await,
+    }
+}
+
+/// Emit a `WARN`-level log line when the tree THIS BUILD COMPILES has a HEAD
+/// that is not `origin/main`. `cargo build` compiles whatever is on disk
+/// regardless of branch, so in a multi-agent setup where another session has
+/// `git switch`ed the runner tree to a feature branch a caller intending to
+/// test main-side code will silently get the feat branch's binary instead. The
+/// only other signal is the `git_sha` / `build_sha` field on the spawn-test
+/// response, which most callers don't compare.
+///
+/// The tree probed comes from [`provenance_warn_target`] — the override tree
+/// for a spawn-test `git_ref` / `worktree_path` build, the live tree
+/// otherwise. It was previously ALWAYS the canonical checkout
+/// (`project_dir.parent()`), which made the warning assert a sha the build
+/// never compiled.
+///
+/// Best-effort for a supervisor-owned tree: any git error (not a repo, no
+/// `origin/main` remote ref, git missing from PATH) returns without emitting.
+/// For an OVERRIDE tree the same failure emits an explicit "provenance NOT
+/// CHECKED / UNKNOWN" line instead of staying silent — a warning that cannot
+/// establish its fact must render UNKNOWN, never a confident default. The warn
+/// is diagnostic, not a gate. See [qontinui-supervisor#21] for context.
+///
+/// `project_dir` is `qontinui-runner/src-tauri`; the git repo root is the
+/// parent (the same relationship holds for an override `src-tauri`).
 ///
 /// [qontinui-supervisor#21]: https://github.com/qontinui/qontinui-supervisor/issues/21
-async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
-    let project_dir = &state.config.project_dir;
-    let git_dir = match project_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return,
-    };
+async fn warn_if_working_tree_off_main(
+    state: &SharedState,
+    slot_id: usize,
+    build_dir_override: Option<&std::path::Path>,
+    source_kind: &BuildSourceKind,
+) {
+    let target = provenance_warn_target(&state.config.project_dir, build_dir_override, source_kind);
+    let git_dir = target.root.clone();
 
     async fn run_git(args: &[&str], cwd: &std::path::Path) -> Option<String> {
         // git rev-parse is a fast leaf process that never forks a pipe-holding
@@ -2507,21 +2617,61 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    let head = match run_git(&["rev-parse", "HEAD"], &git_dir).await {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
+    let head = match resolve_provenance_head(&target).await {
+        Some(s) => s,
+        None => {
+            // UNKNOWN, not silence, for a tree the caller chose: a
+            // `worktree_path` need not even be a git checkout.
+            if target.is_override {
+                emit_provenance_warn(
+                    state,
+                    format!(
+                        "Slot {}: build provenance NOT CHECKED for the {} at {} — HEAD could \
+                         not be resolved there (not a git checkout, or git unavailable). This \
+                         build's HEAD/branch and its drift from origin/main are UNKNOWN. Read \
+                         `build_sha` on the spawn response for what actually compiled. See \
+                         qontinui-supervisor#21.",
+                        slot_id,
+                        target.label,
+                        git_dir.display()
+                    ),
+                )
+                .await;
+            }
+            return;
+        }
     };
 
     // Phase A: compute the full drift (behind-count + ancestor test) rather
     // than the old short-sha equality. `origin_main_drift` fetches origin first
     // (best-effort, offline-tolerant) so the origin/main ref is fresh — a stale
     // local origin/main is exactly how the 2026-06-07 incident hid the
-    // regression.
+    // regression. It runs in the BUILT tree, so the sha being compared is
+    // always present in the object db being queried.
     let drift = crate::git_provenance::origin_main_drift(&git_dir, &head).await;
 
-    // Not computable (no remote / no origin/main / not a repo) ⇒ skip silently,
-    // preserving the legacy best-effort tolerance.
+    let head_short: String = head.chars().take(12).collect();
+
+    // Not computable (no remote / no origin/main / not a repo) ⇒ skip silently
+    // for a supervisor-owned tree, preserving the legacy best-effort tolerance;
+    // for an override tree say so, rather than letting an absent compare read
+    // as "fine".
     if drift.origin_main_sha.is_empty() {
+        if target.is_override {
+            emit_provenance_warn(
+                state,
+                format!(
+                    "Slot {}: build provenance PARTIAL for the {} at {} — HEAD is {}, but \
+                     origin/main is not resolvable in that tree, so its drift from main is \
+                     UNKNOWN. See qontinui-supervisor#21.",
+                    slot_id,
+                    target.label,
+                    git_dir.display(),
+                    head_short
+                ),
+            )
+            .await;
+        }
         return;
     }
     // Up to date ⇒ nothing to warn about.
@@ -2534,7 +2684,6 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(unknown)".to_string());
 
-    let head_short: String = drift.built_sha.chars().take(12).collect();
     let main_short: String = drift.origin_main_sha.chars().take(12).collect();
 
     // `is_ancestor == false` is the more dangerous case (diverged / parked on a
@@ -2546,10 +2695,13 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         "behind"
     };
     let msg = format!(
-        "Slot {}: working tree HEAD ({}, branch={}) is {} origin/main ({}) by {} commit(s) \
-         (diverged={}). This build will compile {}, NOT main. Read `git_sha` from the spawn \
-         response to confirm what actually ran. See qontinui-supervisor#21.",
+        "Slot {}: {} at {} — HEAD ({}, branch={}) is {} origin/main ({}) by {} commit(s) \
+         (diverged={}). This build compiles {} from THAT tree, NOT main. Read `git_sha` / \
+         `build_sha` from the spawn response to confirm what actually ran. See \
+         qontinui-supervisor#21.",
         slot_id,
+        target.label,
+        git_dir.display(),
         head_short,
         branch,
         drift_kind,
@@ -2558,8 +2710,7 @@ async fn warn_if_working_tree_off_main(state: &SharedState, slot_id: usize) {
         drift.is_diverged(),
         head_short
     );
-    warn!("{}", msg);
-    state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    emit_provenance_warn(state, msg).await;
 }
 
 /// Resolve the qontinui-runner repo HEAD SHA. Returns `None` on any error
@@ -3839,9 +3990,9 @@ mod tests {
     use super::{
         classify_build_stderr, dep_hash_sidecar_path, dep_install_reason, dep_manifest_hash,
         dist_index_ok, merge_process_output, needs_frontend_prebuild, provenance_tree_root,
-        rev_parse_head, stderr_submission_tail, update_lkg_after_success, verify_frontend_built,
-        BuildPhase, BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
-        LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
+        provenance_warn_target, resolve_provenance_head, rev_parse_head, stderr_submission_tail,
+        update_lkg_after_success, verify_frontend_built, BuildPhase, BuildProvenance, BuildSource,
+        BuildSourceKind, StderrClass, LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::state::{SharedState, SupervisorState};
@@ -4109,6 +4260,166 @@ mod tests {
             rev_parse_head(&over_probe_root).await,
             Some(live_sha),
             "override probe must NOT return the live tree's sha"
+        );
+    }
+
+    /// REGRESSION (iteration-2): the pre-cargo provenance WARNING must describe
+    /// the tree that is actually compiled.
+    ///
+    /// The warning names a specific sha and asserts "This build compiles X, NOT
+    /// main". It used to read `project_dir.parent()` unconditionally, so an
+    /// override build emitted the CANONICAL checkout's HEAD and branch — a
+    /// confidently wrong claim, for a build whose recorded `build_sha` was (and
+    /// still is) the override's. This pins the selection to the built tree.
+    #[test]
+    fn provenance_warn_target_names_the_built_tree_not_the_canonical_checkout() {
+        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
+        let over = std::path::Path::new("/wt/mtl-iter1/qontinui-runner/src-tauri");
+
+        // Live tree: the canonical checkout, no known sha, not an override.
+        let live = provenance_warn_target(project_dir, None, &BuildSourceKind::LiveTree);
+        assert_eq!(live.root, std::path::Path::new("/ws/qontinui-runner"));
+        assert!(!live.is_override);
+        assert_eq!(live.known_sha, None);
+
+        // Foreign override (`worktree_path` / non-main `git_ref`): the OVERRIDE
+        // tree, flagged as an override so an unresolvable probe renders UNKNOWN.
+        let ovr = provenance_warn_target(project_dir, Some(over), &BuildSourceKind::Override);
+        assert_eq!(
+            ovr.root,
+            std::path::Path::new("/wt/mtl-iter1/qontinui-runner"),
+            "an override build's provenance must come from the override tree"
+        );
+        assert_ne!(
+            ovr.root,
+            std::path::Path::new("/ws/qontinui-runner"),
+            "it must NOT come from the canonical checkout"
+        );
+        assert!(ovr.is_override);
+        assert_eq!(ovr.known_sha, None);
+
+        // Supervisor-materialized origin/main worktree: the worktree root, with
+        // the resolved sha carried through rather than re-probed.
+        let om = provenance_warn_target(
+            project_dir,
+            Some(over),
+            &BuildSourceKind::OriginMain {
+                resolved_sha: "abc123".to_string(),
+            },
+        );
+        assert_eq!(
+            om.root,
+            std::path::Path::new("/wt/mtl-iter1/qontinui-runner")
+        );
+        assert!(!om.is_override);
+        assert_eq!(om.known_sha.as_deref(), Some("abc123"));
+
+        // The warn target and the RECORDED provenance must always name the same
+        // tree — they are two reports of one fact.
+        for (over_opt, kind) in [
+            (None, BuildSourceKind::LiveTree),
+            (Some(over), BuildSourceKind::Override),
+        ] {
+            assert_eq!(
+                provenance_warn_target(project_dir, over_opt, &kind).root,
+                provenance_tree_root(project_dir, over_opt),
+                "warn target must not drift from compute_build_provenance's root"
+            );
+        }
+    }
+
+    /// The same guard end-to-end over real git: given an override build root,
+    /// the HEAD the warning reports is the OVERRIDE's, never the canonical
+    /// checkout's. Two unrelated repos at different HEADs, so a wrong-tree read
+    /// cannot coincidentally pass.
+    #[tokio::test]
+    async fn provenance_warn_head_is_the_override_trees_not_the_canonical_checkouts() {
+        let base = TempDir::new().expect("tempdir");
+
+        let live_root = base.path().join("live").join("qontinui-runner");
+        let live_src_tauri = live_root.join("src-tauri");
+        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
+        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
+
+        let over_root = base.path().join("override").join("qontinui-runner");
+        let over_src_tauri = over_root.join("src-tauri");
+        fs::create_dir_all(&over_src_tauri).expect("mkdir override");
+        let over_sha = init_git_repo_one_commit(&over_root, "override-seed");
+        assert_ne!(live_sha, over_sha, "fixture must produce distinct HEADs");
+
+        let live_target = provenance_warn_target(&live_src_tauri, None, &BuildSourceKind::LiveTree);
+        assert_eq!(
+            resolve_provenance_head(&live_target).await,
+            Some(live_sha.clone())
+        );
+
+        let over_target = provenance_warn_target(
+            &live_src_tauri,
+            Some(over_src_tauri.as_path()),
+            &BuildSourceKind::Override,
+        );
+        let reported = resolve_provenance_head(&over_target).await;
+        assert_eq!(
+            reported,
+            Some(over_sha),
+            "the warning must report the override tree's HEAD"
+        );
+        assert_ne!(
+            reported,
+            Some(live_sha),
+            "reporting the canonical checkout's HEAD is the defect this pins"
+        );
+
+        // An origin/main worktree's sha is carried, not re-probed — so it is
+        // reported even though the fixture dir is not that worktree.
+        let om_target = provenance_warn_target(
+            &live_src_tauri,
+            Some(over_src_tauri.as_path()),
+            &BuildSourceKind::OriginMain {
+                resolved_sha: "0123456789abcdef".to_string(),
+            },
+        );
+        assert_eq!(
+            resolve_provenance_head(&om_target).await.as_deref(),
+            Some("0123456789abcdef")
+        );
+    }
+
+    /// A `worktree_path` need not be a git checkout at all. The provenance then
+    /// cannot be established — and must render UNKNOWN (no sha) rather than
+    /// falling back to some other tree's confident default.
+    #[tokio::test]
+    async fn provenance_warn_head_is_unknown_for_a_non_git_override_tree() {
+        let base = TempDir::new().expect("tempdir");
+
+        let live_root = base.path().join("live").join("qontinui-runner");
+        let live_src_tauri = live_root.join("src-tauri");
+        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
+        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
+
+        // Plain directories — no `git init`.
+        let over_src_tauri = base
+            .path()
+            .join("plain")
+            .join("qontinui-runner")
+            .join("src-tauri");
+        fs::create_dir_all(&over_src_tauri).expect("mkdir plain");
+
+        let target = provenance_warn_target(
+            &live_src_tauri,
+            Some(over_src_tauri.as_path()),
+            &BuildSourceKind::Override,
+        );
+        assert!(target.is_override, "an override must be flagged as one");
+        let head = resolve_provenance_head(&target).await;
+        assert_ne!(
+            head,
+            Some(live_sha),
+            "an unresolvable override must NEVER borrow the canonical checkout's sha"
+        );
+        assert_eq!(
+            head, None,
+            "unresolvable provenance is UNKNOWN, not a default"
         );
     }
 

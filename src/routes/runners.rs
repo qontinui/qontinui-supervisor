@@ -2193,6 +2193,35 @@ fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
     })
 }
 
+/// The git repo root whose object db + refs the spawn-response provenance
+/// compares must be run in: the tree that was ACTUALLY compiled.
+///
+/// `built_root` is `Some(<runner root>)` for a provenance build (`git_ref` /
+/// `worktree_path`) and `None` for a live-tree build. Running an ancestry
+/// compare in the canonical checkout while the build came from an override
+/// tree is the same wrong-tree defect the build-time provenance warning had
+/// (`build_monitor::warn_if_working_tree_off_main`): the override's sha is not
+/// guaranteed to exist in the canonical object db, and its `origin/main` is not
+/// guaranteed to be the same ref, so the compare is at best coincidentally
+/// right. Probing the built tree makes the sha always resolvable there.
+fn provenance_compare_root(
+    state: &SharedState,
+    built_root: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    match built_root {
+        Some(root) => root.to_path_buf(),
+        // `project_dir` is the runner's `src-tauri`; git resolves upward from
+        // any subdir, but use the repo root for parity with the other drift
+        // call sites.
+        None => state
+            .config
+            .project_dir
+            .parent()
+            .unwrap_or(&state.config.project_dir)
+            .to_path_buf(),
+    }
+}
+
 /// Build-vintage check for a `rebuild: true` spawn: is the tree that was just
 /// compiled OLDER than the LKG binary the supervisor already has?
 ///
@@ -2217,6 +2246,7 @@ fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 async fn build_older_than_lkg_json(
     state: &SharedState,
     built_sha: Option<&str>,
+    built_root: Option<&std::path::Path>,
 ) -> serde_json::Value {
     let Some(built_sha) = built_sha else {
         return json!({ "older": false, "reason": "built_sha_unknown" });
@@ -2226,15 +2256,9 @@ async fn build_older_than_lkg_json(
         return json!({ "older": false, "reason": "lkg_sha_unknown" });
     };
 
-    // `project_dir` is the runner's `src-tauri`; git resolves upward from any
-    // subdir, but use the repo root for parity with the other drift call sites
-    // (`build_monitor::warn_if_tree_behind_origin_main`, the detached rebuild).
-    let repo_root = state
-        .config
-        .project_dir
-        .parent()
-        .unwrap_or(&state.config.project_dir)
-        .to_path_buf();
+    // Run the compare in the tree that was actually compiled — an override
+    // build's sha need not exist in the canonical checkout's object db.
+    let repo_root = provenance_compare_root(state, built_root);
     let drift = crate::git_provenance::drift_against(&repo_root, built_sha, &lkg_sha).await;
 
     // Base unresolvable (not a repo / LKG sha absent from this object db, e.g.
@@ -2295,6 +2319,7 @@ async fn build_source_warning_json(
     state: &SharedState,
     build_source: &SpawnBuildSource,
     built_sha: Option<&str>,
+    built_root: Option<&std::path::Path>,
 ) -> serde_json::Value {
     // The default path materializes the worktree FROM `origin/main` moments
     // before compiling it, so there is nothing to compare — and paying a second
@@ -2306,14 +2331,9 @@ async fn build_source_warning_json(
         return serde_json::Value::Null;
     };
 
-    // `project_dir` is the runner's `src-tauri`; use the repo root for parity
-    // with the other drift call sites.
-    let repo_root = state
-        .config
-        .project_dir
-        .parent()
-        .unwrap_or(&state.config.project_dir)
-        .to_path_buf();
+    // Run the compare in the tree that was actually compiled — see
+    // `provenance_compare_root`.
+    let repo_root = provenance_compare_root(state, built_root);
     let drift = crate::git_provenance::origin_main_drift(&repo_root, built_sha).await;
     if drift.origin_main_sha.is_empty() || drift.is_up_to_date() {
         return serde_json::Value::Null;
@@ -4148,7 +4168,8 @@ async fn execute_spawn_build_inner(
                 crate::build_monitor::rev_parse_head(&repo_root).await
             }
         };
-        resp["build_older_than_lkg"] = build_older_than_lkg_json(state, built_sha.as_deref()).await;
+        resp["build_older_than_lkg"] =
+            build_older_than_lkg_json(state, built_sha.as_deref(), built_root.as_deref()).await;
 
         // Commit-based build provenance + the loud staleness signal.
         //
@@ -4167,8 +4188,13 @@ async fn execute_spawn_build_inner(
             Some(s) => json!(s),
             None => serde_json::Value::Null,
         };
-        resp["build_source_warning"] =
-            build_source_warning_json(state, &build_source, built_sha.as_deref()).await;
+        resp["build_source_warning"] = build_source_warning_json(
+            state,
+            &build_source,
+            built_sha.as_deref(),
+            built_root.as_deref(),
+        )
+        .await;
     } else {
         // No build happened (the exe came from a slot or the LKG), so there is
         // no build sha to report from THIS request. Emit the fields anyway with
@@ -7670,7 +7696,7 @@ mod tests {
         let state = make_state_at(root);
         seed_lkg(&state, Some(lkg_sha.clone())).await;
 
-        let out = super::build_older_than_lkg_json(&state, Some(&built)).await;
+        let out = super::build_older_than_lkg_json(&state, Some(&built), None).await;
         assert_eq!(out["older"], serde_json::json!(true), "got {out}");
         assert_eq!(out["behind_count"], serde_json::json!(2));
         assert_eq!(out["lkg_sha"], serde_json::json!(lkg_sha));
@@ -7701,9 +7727,71 @@ mod tests {
         let state = make_state_at(root);
         seed_lkg(&state, Some(lkg_sha)).await;
 
-        let out = super::build_older_than_lkg_json(&state, Some(&built)).await;
+        let out = super::build_older_than_lkg_json(&state, Some(&built), None).await;
         assert_eq!(out["older"], serde_json::json!(false), "got {out}");
         assert!(out.get("behind_count").is_none());
+    }
+
+    /// REGRESSION (iteration-2): the spawn-response vintage compare must run in
+    /// the tree that was ACTUALLY compiled, not in the canonical checkout.
+    ///
+    /// Two UNRELATED repos: the canonical checkout (whose HEAD is the LKG sha)
+    /// and a caller-supplied `worktree_path` override. The override's sha does
+    /// not exist in the canonical object db at all, so a compare run there is
+    /// not computable — while the same compare run in the override tree
+    /// resolves. Threading `built_root` is what makes the difference, and that
+    /// thread-through is exactly what silently regresses.
+    #[tokio::test]
+    async fn build_older_than_lkg_compares_in_the_override_tree_not_the_canonical_checkout() {
+        let canonical_tmp = tempfile::TempDir::new().unwrap();
+        let canonical = canonical_tmp.path();
+        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
+        git_in(canonical, &["init", "-q", "-b", "main"]);
+        git_in(canonical, &["config", "user.email", "test@example.com"]);
+        git_in(canonical, &["config", "user.name", "test"]);
+        let canonical_head = commit_file(canonical, "canonical.txt");
+
+        // A SEPARATE repo standing in for a caller-owned `worktree_path`. Its
+        // history is disjoint from the canonical checkout's.
+        let over_tmp = tempfile::TempDir::new().unwrap();
+        let over = over_tmp.path();
+        std::fs::create_dir_all(over.join("src-tauri")).unwrap();
+        git_in(over, &["init", "-q", "-b", "feature"]);
+        git_in(over, &["config", "user.email", "test@example.com"]);
+        git_in(over, &["config", "user.name", "test"]);
+        let over_built = commit_file(over, "seed.txt");
+        commit_file(over, "a.txt");
+        let over_lkg = commit_file(over, "b.txt");
+
+        let state = make_state_at(canonical);
+        seed_lkg(&state, Some(over_lkg.clone())).await;
+
+        // WITH the override root: both shas live in that repo, so the compare
+        // resolves and reports the override tree's real two-commit gap.
+        let out = super::build_older_than_lkg_json(&state, Some(&over_built), Some(over)).await;
+        assert_eq!(
+            out["older"],
+            serde_json::json!(true),
+            "the override tree's own history must be compared: {out}"
+        );
+        assert_eq!(out["behind_count"], serde_json::json!(2), "got {out}");
+        assert_eq!(out["built_sha"], serde_json::json!(over_built));
+
+        // WITHOUT it (the pre-fix behavior) the canonical checkout is probed,
+        // where the override's history does not exist. `git rev-parse` echoes a
+        // raw 40-hex sha verbatim even for an absent object, so the compare
+        // does not even fail loudly — it silently answers "not older". That
+        // false negative is precisely what threading `built_root` removes.
+        let wrong = super::build_older_than_lkg_json(&state, Some(&over_built), None).await;
+        assert_ne!(
+            wrong["older"],
+            serde_json::json!(true),
+            "fixture sanity: the canonical checkout cannot see the override tree's gap, which              is exactly why built_root must be threaded: {wrong}"
+        );
+        assert_ne!(
+            canonical_head, over_built,
+            "fixture sanity: the two trees must have different HEADs"
+        );
     }
 
     /// Best-effort: an LKG with no recorded sha (legacy sidecar / failed git
@@ -7714,7 +7802,7 @@ mod tests {
         let state = make_state_at(tmp.path());
         seed_lkg(&state, None).await;
 
-        let out = super::build_older_than_lkg_json(&state, Some("deadbeef")).await;
+        let out = super::build_older_than_lkg_json(&state, Some("deadbeef"), None).await;
         assert_eq!(out["older"], serde_json::json!(false));
         assert_eq!(out["reason"], serde_json::json!("lkg_sha_unknown"));
     }
