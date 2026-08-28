@@ -1276,6 +1276,38 @@ impl SupervisorState {
         }
     }
 
+    /// Snapshot the spawn-test single-flight index, optionally narrowed to one
+    /// requester.
+    ///
+    /// **Why this is public.** The index already holds exactly the triple a
+    /// caller needs to recover from a lost `POST /runners/spawn-test` answer —
+    /// `(submission_id, runner_id, port)` — keyed by the requester. A caller
+    /// whose connection died before the response was written (client timeout,
+    /// supervisor restart) otherwise has no way to learn the runner id it just
+    /// created, and without the id it cannot reach `/runners/{id}/logs` or
+    /// `/runners/{id}/stop`: it created a runner it cannot follow or clean up.
+    /// Polling `GET /runners` and pattern-matching on `requester_id` is the
+    /// workaround that recovery previously required, and it is a guess — it
+    /// cannot distinguish this request's runner from that requester's previous
+    /// one. This is the exact answer.
+    ///
+    /// Returns entries sorted by key so the response is stable across calls.
+    pub async fn spawn_inflight_snapshot(
+        &self,
+        requester_id: Option<&str>,
+    ) -> Vec<(SpawnDedupKey, SpawnInflight)> {
+        let index = self.spawn_test_inflight.read().await;
+        let mut out: Vec<(SpawnDedupKey, SpawnInflight)> = index
+            .iter()
+            .filter(|(k, _)| requester_id.is_none_or(|r| k.requester_id == r))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| {
+            (&a.0.requester_id, &a.0.build_target).cmp(&(&b.0.requester_id, &b.0.build_target))
+        });
+        out
+    }
+
     /// Drop a spawn-test single-flight entry once its build is terminal, so the
     /// next request for the same key starts a fresh build.
     ///
@@ -2529,5 +2561,51 @@ mod tests {
             !state.spawn_test_inflight.read().await.contains_key(&key),
             "the owning build's release must free the key"
         );
+    }
+
+    /// The recovery surface for a lost `POST /runners/spawn-test` answer.
+    ///
+    /// A caller whose connection died before the response was written (its own
+    /// timeout, or a supervisor restart during a 20-50 minute build) has
+    /// created a runner whose id it does not know — and the id is the only
+    /// handle on `/runners/{id}/logs` and `/runners/{id}/stop`. The index
+    /// already holds the exact triple; the snapshot is what lets the caller
+    /// read it back instead of polling `GET /runners` and guessing by
+    /// `requester_id`.
+    #[tokio::test]
+    async fn inflight_snapshot_answers_which_runner_a_requester_just_created() {
+        let state = spawn_state();
+        let mine = uuid::Uuid::new_v4();
+        {
+            let mut index = state.spawn_test_inflight.write().await;
+            index.insert(dedup_key("agent-1", "origin_main"), inflight(mine, 9878));
+            index.insert(
+                dedup_key("agent-2", "origin_main"),
+                inflight(uuid::Uuid::new_v4(), 9879),
+            );
+        }
+
+        let mine_only = state.spawn_inflight_snapshot(Some("agent-1")).await;
+        assert_eq!(mine_only.len(), 1, "must not leak a peer's spawn");
+        assert_eq!(mine_only[0].0.requester_id, "agent-1");
+        assert_eq!(mine_only[0].1.submission_id, mine);
+        assert_eq!(
+            mine_only[0].1.runner_id, "test-9878",
+            "the snapshot must name the RUNNER ID, which is the caller's only handle on \
+             /runners/{{id}}/logs and /runners/{{id}}/stop"
+        );
+        assert_eq!(mine_only[0].1.port, 9878);
+
+        // Unfiltered lists everything, stably ordered.
+        let all = state.spawn_inflight_snapshot(None).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0.requester_id, "agent-1");
+        assert_eq!(all[1].0.requester_id, "agent-2");
+
+        // A requester with nothing in flight gets an empty answer, not a peer's.
+        assert!(state
+            .spawn_inflight_snapshot(Some("agent-3"))
+            .await
+            .is_empty());
     }
 }

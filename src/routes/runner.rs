@@ -976,6 +976,24 @@ pub async fn supervisor_restart(
 
     match cmd.spawn() {
         Ok(_child) => {
+            // Signal the shutdown now that the replacement is confirmed
+            // spawned — and BEFORE the `std::process::exit(0)` below.
+            //
+            // This endpoint is spawn-and-exit: it hard-exits ~600ms from here.
+            // Every OTHER request in flight at that moment used to be dropped
+            // mid-connection with no response written — exactly the "`HTTP=000`,
+            // empty body" symptom reported against the synchronous
+            // `POST /runners/spawn-test`, whose handler holds its connection
+            // open for the whole cargo build. Signalling gives those handlers
+            // their shutdown wake-up inside this window, so they answer
+            // (spawn-test replies 503 `spawn_abandoned`, naming the runner id
+            // and port it reserved) instead of being cut off.
+            //
+            // Deliberately NOT signalled before `cmd.spawn()`: a failed spawn
+            // returns an error and leaves this supervisor running, and an
+            // already-latched shutdown would then take it down anyway.
+            state.signal_shutdown();
+
             // Give the new process a moment to start
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -1185,6 +1203,70 @@ mod tests {
         assert!(
             terminal,
             "the detached task must run to a terminal status independently of the handler"
+        );
+    }
+
+    /// Source guard: `supervisor_restart` must latch the shutdown before it
+    /// hard-exits, and only once the replacement is confirmed spawned.
+    ///
+    /// This endpoint is spawn-and-exit — it calls `std::process::exit(0)` ~600ms
+    /// after accepting the request. Every OTHER request in flight at that moment
+    /// is dropped mid-connection with no response written, which is exactly the
+    /// reported "HTTP=000, empty body" symptom against the synchronous
+    /// `POST /runners/spawn-test` (whose handler holds its connection open for
+    /// the whole cargo build). Latching the shutdown first wakes those handlers
+    /// inside the window so they answer instead of being cut off.
+    ///
+    /// The ordering half matters just as much: latching BEFORE `cmd.spawn()`
+    /// would take this supervisor down even when the replacement failed to
+    /// start, turning a failed restart into an outage.
+    #[test]
+    fn supervisor_restart_latches_the_shutdown_before_it_exits() {
+        let this_file = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runner.rs"),
+        )
+        .expect("this source file must be readable")
+        .replace("\r\n", "\n");
+
+        let body = this_file
+            .split_once("pub async fn supervisor_restart(")
+            .map(|(_, after)| after)
+            .expect("supervisor_restart must exist — did it get renamed?");
+        let body = body
+            .find("\n#[cfg(test)]")
+            .map(|end| &body[..end])
+            .unwrap_or(body);
+
+        let latch = body.find("state.signal_shutdown()").unwrap_or_else(|| {
+            panic!(
+                "supervisor_restart does not latch the shutdown before exiting. Without it, every \
+                 in-flight request — notably a synchronous spawn-test mid-build — is cut off with \
+                 no response at all (curl reports HTTP=000) and its caller never learns the \
+                 runner id it created. Body scanned:\n{body}"
+            )
+        });
+        let spawn = body
+            .find("cmd.spawn()")
+            .expect("supervisor_restart must spawn the replacement");
+        // `rfind`: the doc comment above the spawn also names
+        // `std::process::exit(0)` when explaining the JobObject teardown, and
+        // that mention sits BEFORE the latch. The last occurrence is the call.
+        let exit = body
+            .rfind("std::process::exit(0)")
+            .expect("supervisor_restart must still hard-exit after the handoff");
+
+        assert!(
+            spawn < latch,
+            "the shutdown must be latched only AFTER the replacement is confirmed spawned — \
+             latching first turns a failed replacement spawn into a supervisor outage"
+        );
+        assert!(
+            latch < exit,
+            "the shutdown must be latched BEFORE the hard exit, or in-flight handlers get no \
+             window in which to answer"
         );
     }
 }

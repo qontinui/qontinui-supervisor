@@ -869,6 +869,39 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
     // (the latched bool is monotonic and the broadcast is best-effort).
     state.signal_shutdown();
 
+    // Bounded drain. THIS is armed at signal time, not after the serve future
+    // resolves — the watchdog further down in `main` is armed only once
+    // `serve_future.await` has already returned, which is useless against the
+    // failure it looks like it covers: axum's graceful shutdown waits for
+    // in-flight CONNECTIONS, and the synchronous `POST /runners/spawn-test`
+    // holds one open for the entire cargo build (20-50 minutes on a cold
+    // `rebuild: true`).
+    //
+    // Unbounded, that produced the observed split brain: the listener socket is
+    // dropped the instant this signal fires, so the REPLACEMENT supervisor
+    // binds 9875 and starts answering with an empty registry ("Runner not
+    // found") while the OLD process stays alive for the rest of the build —
+    // still compiling, still holding the caller's connection, addressable by
+    // nobody. The caller's `curl` then reported `HTTP=000` when that zombie was
+    // finally force-killed.
+    //
+    // Bounding it converts that into a clean handoff: in-flight long-polls get
+    // a real answer (see `routes::runners::spawn_test`'s shutdown arm), and
+    // whatever has not drained inside the deadline dies with the process. That
+    // is also what reaps an in-flight cargo build — `GuardedCommand` wraps every
+    // build tree in a `KILL_ON_JOB_CLOSE` job, so process exit is precisely the
+    // thing that terminates it. Staying alive is what orphaned the build; exiting
+    // is what cleans it up.
+    const SHUTDOWN_DRAIN_DEADLINE_SECS: u64 = 10;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_DRAIN_DEADLINE_SECS)).await;
+        eprintln!(
+            "qontinui-supervisor: connection drain exceeded {SHUTDOWN_DRAIN_DEADLINE_SECS}s after \
+             the shutdown signal, forcing exit (in-flight builds are reaped with the process)"
+        );
+        std::process::exit(0);
+    });
+
     // Give clients a moment to receive the shutdown message and close
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
@@ -911,5 +944,71 @@ mod tests {
     #[test]
     fn auto_start_with_no_primary_is_noop() {
         assert_eq!(primary_to_boot_start(true, None), None);
+    }
+
+    /// Source guard: the connection-drain deadline must be armed inside
+    /// `shutdown_signal`, i.e. when the shutdown is SIGNALLED — not after
+    /// `serve_future.await` has already returned.
+    ///
+    /// The post-serve `HARD_EXIT_DEADLINE_SECS` watchdog further down reads like
+    /// it covers a hung shutdown, but it is armed only once the serve future
+    /// resolves, and the serve future is precisely what hangs: axum's graceful
+    /// shutdown waits for in-flight CONNECTIONS, and the synchronous
+    /// `POST /runners/spawn-test` holds one open for an entire cargo build
+    /// (20-50 minutes cold). Unbounded, that produced the reported split brain —
+    /// the listener socket is released the instant the signal fires, so a
+    /// replacement supervisor binds the port and answers from an empty registry
+    /// ("Runner not found") while the OLD process stays alive for the rest of
+    /// the build, still compiling, addressable by nobody. Exiting is also what
+    /// REAPS that build: `GuardedCommand` wraps every build tree in a
+    /// `KILL_ON_JOB_CLOSE` job, so staying alive is what orphaned it.
+    ///
+    /// A source assertion because the alternative is a test that waits out a
+    /// real deadline and calls `std::process::exit` in the test harness.
+    #[test]
+    fn drain_deadline_is_armed_when_the_shutdown_is_signalled() {
+        let this_file = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this source file must be readable")
+        .replace("\r\n", "\n");
+
+        let body = this_file
+            .split_once("async fn shutdown_signal(")
+            .map(|(_, after)| after)
+            .expect("shutdown_signal must exist — did it get renamed?");
+        let body = body
+            .find("\n#[cfg(test)]")
+            .map(|end| &body[..end])
+            .unwrap_or(body);
+
+        assert!(
+            body.contains("SHUTDOWN_DRAIN_DEADLINE_SECS"),
+            "shutdown_signal no longer arms a bounded connection drain. Without it, a shutdown \
+             during an in-flight synchronous spawn-test leaves a zombie supervisor compiling for \
+             up to 50 minutes AFTER its replacement has taken over the port — the caller gets \
+             HTTP=000 and the build is orphaned. Body scanned:\n{body}"
+        );
+        assert!(
+            body.contains("std::process::exit(0)"),
+            "the drain deadline in shutdown_signal must actually force the process to exit — an \
+             unenforced deadline is the same unbounded wait with a comment attached."
+        );
+
+        // Ordering: the deadline must be armed AFTER the shutdown is latched
+        // (so it only ever runs on a real shutdown) and inside this function
+        // (so it starts at signal time, not at serve-future resolution).
+        let latch = body
+            .find("state.signal_shutdown()")
+            .expect("shutdown_signal must latch the shutdown");
+        let deadline = body
+            .find("SHUTDOWN_DRAIN_DEADLINE_SECS")
+            .expect("checked above");
+        assert!(
+            latch < deadline,
+            "the drain deadline must be armed after `signal_shutdown()`, not before it"
+        );
     }
 }

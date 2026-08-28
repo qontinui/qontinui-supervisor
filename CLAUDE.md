@@ -412,7 +412,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | GET | `/` | React SPA dashboard |
 | GET | `/health` | Comprehensive status (runners, build, expo). `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. |
 | GET | `/health/stream` | SSE stream of real-time health data |
-| POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, then `std::process::exit(0)` closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner. |
+| POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, the shutdown is latched so in-flight handlers get a window to answer, then `std::process::exit(0)` closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner. The latch happens only AFTER the replacement spawn succeeds — latching first would turn a failed restart into an outage. |
 
 ### Runner Management
 
@@ -422,6 +422,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | POST | `/runners` | Add a runner config to the registry |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
+| GET | `/runners/spawn-test/in-flight` | The spawn-test builds running right now, each with the `id` + `port` reserved for it plus `build_id` / `logs_url` / `stop_url`. Optional `?requester_id=` narrows to one caller. **Recovery for a lost spawn-test answer** — see "A lost spawn-test answer" below. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive. Optional body `{requester_id?}` scopes the purge; a bodyless POST purges every stale test runner. |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
 | POST | `/runners/{id}/start` | Start a runner |
@@ -909,6 +910,64 @@ curl -X POST localhost:9875/runners/spawn-test \
 - **No-wait mode:** pass `X-Queue-Mode: no-wait` header for immediate 503 with queue info instead of blocking.
 
 If the build fails, the placeholder port reservation is cleaned up and the error is returned.
+
+**Every outcome names the runner it reserved.** `spawn_test` mints the runner id
+and reserves its port *before* the build begins, but only the success body used
+to name them: every failure body rendered from a `SupervisorError` carried
+`{"error": …}` and nothing else. Since the id is the caller's only handle on
+`GET /runners/{id}/logs` and `POST /runners/{id}/stop`, a caller whose spawn
+failed could not read why or clean up after itself.
+`routes::runners::attach_spawn_identity` now merges `id` / `port` / `api_url` /
+`ui_bridge_url` / `logs_url` / `stop_url` into **both** arms of
+`execute_spawn_build` — the same uniformity contract `attach_build_slot_id`
+already has, and pinned by the same style of test.
+
+### A lost spawn-test answer
+
+A synchronous `spawn-test {rebuild: true}` holds its HTTP connection open for
+the **entire** build (40-50 min cold) without writing a byte. That made a
+supervisor restart during a build produce a **split brain**, observed twice:
+
+1. Axum's `with_graceful_shutdown` drops the **listener** the instant a shutdown
+   is signalled, so port 9875 frees immediately and the **replacement**
+   supervisor binds it — answering `GET /runners/<id>/logs` with
+   `Runner not found` from its own empty in-memory registry.
+2. It then waits for in-flight **connections**, which this handler holds for the
+   rest of the build. The OLD process therefore stayed alive, still compiling,
+   addressable by nobody — the "orphaned build".
+3. When that zombie was finally force-killed (`restart-supervisor.ps1`
+   escalates ~10s after the graceful POST), the caller's connection closed with
+   no response written at all: `curl` reports `HTTP=000`.
+
+Three changes close it, and they are load-bearing together:
+
+- **`main::shutdown_signal` arms a bounded drain** (`SHUTDOWN_DRAIN_DEADLINE_SECS`,
+  10s) at **signal** time. The pre-existing `HARD_EXIT_DEADLINE_SECS` watchdog is
+  armed only after `serve_future.await` returns — i.e. after the very thing that
+  hangs — so it could never bound this. Exiting is also what **reaps the build**:
+  `GuardedCommand` wraps every build tree in a `KILL_ON_JOB_CLOSE` job, so
+  *staying alive* is what orphaned it.
+- **The synchronous wait is shutdown-aware.** It races `await_terminal` against
+  `state.shutdown_signal()` and answers **503** `spawn_abandoned` naming the
+  reserved `id`, `port` and `build_id`. "Abandoned" is deliberately distinct
+  from both "failed" and "succeeded" — the caller must be able to tell
+  *it did not happen* from *it worked and I was not told*.
+- **`GET /runners/spawn-test/in-flight`** recovers the id when no answer arrived
+  at all (a client-side timeout, a hard kill). It reads the single-flight index,
+  which already holds `(submission_id, runner_id, port)` keyed by requester, so
+  it is exact — unlike polling `GET /runners` and guessing by `requester_id`.
+
+**Registrations are deliberately NOT persisted across a restart.** A temp runner
+is terminated by the kill-on-exit JobObject when the supervisor process exits, so
+a persisted registration would point at a dead process — a different way of
+losing the state, dressed up as durability. The contract is instead: bound the
+abandonment window, reap the build with the process, and *tell the caller*.
+
+**Nothing in-process restarts the supervisor.** There is no watchdog, self-update
+or config-reload path that does — `POST /supervisor/restart` is reachable only
+over HTTP, and `symbol_watcher` is a separate binary that never touches
+supervisor lifetime. A restart observed around a spawn-test came from outside
+(`scripts/restart-supervisor.ps1`, `dev-start.ps1 -Supervisor`).
 
 **FIXED (2026-07-22): spawn-test `rebuild: true` no longer compiles the shared working checkout.** It builds a supervisor-owned `origin/main` worktree — see "Build provenance: spawn-test builds `origin/main` by DEFAULT" above. The old hazard (the supervisor didn't fetch, didn't compare against any expected ref, and silently produced a binary from whichever feature branch a peer session had `git switch`ed the shared checkout to) is structurally gone: the build source is no longer the shared checkout at all, so no amount of branch-parking by a peer can reach it.
 

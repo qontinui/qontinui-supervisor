@@ -76,6 +76,12 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
         summary: "Spawn ephemeral test runner on next free port",
     },
     EndpointEntry {
+        method: "GET",
+        path: "/runners/spawn-test/in-flight",
+        summary: "In-flight spawn-test builds with the runner id + port reserved \
+                  for each (recovery when a spawn-test answer was lost)",
+    },
+    EndpointEntry {
         method: "POST",
         path: "/runners/spawn-named",
         summary: "Spawn persistent named runner",
@@ -927,6 +933,13 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/runners/spawn-test",
             post(crate::routes::runners::spawn_test),
+        )
+        // Recovery for a lost spawn-test answer: the runner id + port reserved
+        // for each in-flight build. Static segments, so no conflict with
+        // `/runners/{id}/...`.
+        .route(
+            "/runners/spawn-test/in-flight",
+            get(crate::routes::runners::spawn_test_in_flight),
         )
         .route(
             "/runners/spawn-named",

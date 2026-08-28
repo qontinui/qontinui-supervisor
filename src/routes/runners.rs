@@ -2714,7 +2714,52 @@ pub async fn spawn_test(
 
     // Sync path: await the submission terminal state, then return its stored
     // spawn outcome (same shape as the legacy inline response).
-    crate::build_submissions::await_terminal(&sub_arc).await;
+    //
+    // SHUTDOWN RACE (the "HTTP=000 / empty body" defect). A cold
+    // `rebuild: true` build runs 20-50 minutes, and this await holds the HTTP
+    // connection open for all of it with not one byte written. Axum's
+    // `with_graceful_shutdown` drops the LISTENER the instant a shutdown is
+    // signalled but then waits for in-flight connections — so a supervisor
+    // restart during this window used to:
+    //
+    //   1. free port 9875 immediately, letting the REPLACEMENT supervisor bind
+    //      it and answer `GET /runners/<id>/logs` with `Runner not found`
+    //      (the registry is per-process and in-memory);
+    //   2. leave the OLD process alive for the rest of the build, still
+    //      compiling, invisible and unaddressable — the "orphaned build";
+    //   3. hand the caller nothing at all when that old process was eventually
+    //      force-killed: connection closed, no response, `HTTP=000`.
+    //
+    // So: race the terminal wait against the shutdown signal and ANSWER. The
+    // caller gets its runner id and port back plus `spawn_abandoned: true`,
+    // which is the difference between "it failed" and "it worked and I was not
+    // told". Returning here also lets the graceful drain actually complete
+    // instead of blocking for the whole build, which is what forced callers to
+    // escalate to a force-kill in the first place.
+    let terminal = crate::build_submissions::await_terminal(&sub_arc);
+    tokio::pin!(terminal);
+    tokio::select! {
+        _ = &mut terminal => {}
+        _ = state.shutdown_signal() => {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Warn,
+                    format!(
+                        "spawn-test {id} (build {submission_id}) abandoned: supervisor shutdown \
+                         signalled while the build was in flight; answering the caller with its \
+                         reserved id/port instead of dropping the connection"
+                    ),
+                )
+                .await;
+            return Ok((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(spawn_abandoned_body(&id, port, submission_id)),
+            )
+                .into_response());
+        }
+    }
     let outcome = {
         let sub = sub_arc.read().await;
         sub.spawn.clone()
@@ -2754,11 +2799,109 @@ pub async fn spawn_test(
             }
             Ok(response)
         }
-        None => Err(SupervisorError::Other(
-            "spawn-test submission reached terminal state without a spawn outcome (internal error)"
-                .to_string(),
-        )),
+        // Terminal with no stored outcome: an internal error, but the caller
+        // still created a runner and still needs its id to follow or stop it.
+        // Rendering this as a bare `SupervisorError` string threw that away.
+        None => {
+            let mut body = json!({
+                "error": "spawn_outcome_missing",
+                "message": "spawn-test submission reached terminal state without a spawn outcome \
+                            (internal error)",
+                "submission_id": submission_id.to_string(),
+                "build_id": submission_id.to_string(),
+                "poll_url": format!("/build/{submission_id}/status"),
+            });
+            attach_spawn_identity(&mut body, &id, port);
+            Ok((axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response())
+        }
     }
+}
+
+#[derive(Deserialize)]
+pub struct SpawnInflightQuery {
+    /// Narrow the listing to one requester. Omit to list every in-flight spawn.
+    #[serde(default)]
+    pub requester_id: Option<String>,
+}
+
+/// GET /runners/spawn-test/in-flight — the spawn-test builds running right now,
+/// each named by the runner id and port reserved for it.
+///
+/// **Recovery surface for a lost answer.** `POST /runners/spawn-test` mints the
+/// runner id and reserves the port before the (20-50 minute) build begins, but
+/// on the synchronous path it does not write a single byte until the build is
+/// terminal. A caller whose connection dies in that window — its own timeout, a
+/// supervisor restart — is left having created a runner whose id it does not
+/// know, and the id is the only handle on `/runners/{id}/logs` and
+/// `/runners/{id}/stop`. This answers "what did I just create?" directly,
+/// instead of forcing the caller to poll `GET /runners` and guess by
+/// `requester_id`.
+///
+/// The entries come from the single-flight index, so `build_id` here is the
+/// same token the sync body, the async 202 and `GET /build/{id}/status` all use.
+pub async fn spawn_test_in_flight(
+    State(state): State<SharedState>,
+    Query(q): Query<SpawnInflightQuery>,
+) -> Json<serde_json::Value> {
+    let entries = state
+        .spawn_inflight_snapshot(q.requester_id.as_deref())
+        .await;
+    let spawns: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(key, inflight)| {
+            json!({
+                "requester_id": key.requester_id,
+                "build_target": key.build_target,
+                "id": inflight.runner_id,
+                "port": inflight.port,
+                "build_id": inflight.submission_id.to_string(),
+                "submission_id": inflight.submission_id.to_string(),
+                "api_url": format!("http://localhost:{}", inflight.port),
+                "poll_url": format!("/build/{}/status", inflight.submission_id),
+                "logs_url": format!("/runners/{}/logs", inflight.runner_id),
+                "stop_url": format!("/runners/{}/stop", inflight.runner_id),
+            })
+        })
+        .collect();
+    Json(json!({
+        "count": spawns.len(),
+        "requester_id": q.requester_id,
+        "spawns": spawns,
+    }))
+}
+
+/// Body returned to a synchronous `spawn-test` caller whose build was still in
+/// flight when the supervisor began shutting down.
+///
+/// The caller MUST be able to read three things off this: **which runner was
+/// reserved for it** (`id` / `port`, so it can follow logs and stop the
+/// runner), **which build was abandoned** (`build_id`, so `GET
+/// /build/{id}/status` on the NEXT supervisor is at least an addressable
+/// question), and **that the answer is "abandoned", not "failed" and not
+/// "succeeded"** (`spawn_abandoned: true`). Anything less reproduces the
+/// original defect in a politer format.
+///
+/// Pure fn so the contract is unit-testable with no server, no build pool and
+/// no shutdown — the shape of this body is the whole fix.
+fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde_json::Value {
+    let mut body = json!({
+        "error": "spawn_abandoned",
+        "spawn_abandoned": true,
+        "status": "abandoned",
+        "submission_id": submission_id.to_string(),
+        "build_id": submission_id.to_string(),
+        "poll_url": format!("/build/{submission_id}/status"),
+        "message": format!(
+            "the supervisor began shutting down while this spawn-test build was in flight, so \
+             the build was abandoned. Runner '{id}' was reserved on port {port} but is NOT \
+             guaranteed to exist: supervisor-owned temp runners are terminated by the \
+             kill-on-exit JobObject when the supervisor process exits, and the build itself is \
+             reaped with it. Treat this spawn as failed and retry against the new supervisor; \
+             use GET /runners/{id}/logs and POST /runners/{id}/stop only to confirm cleanup."
+        ),
+    });
+    attach_spawn_identity(&mut body, id, port);
+    body
 }
 
 /// Build + spawn + probe + assemble the spawn-test response.
@@ -2797,11 +2940,13 @@ async fn execute_spawn_build(
     match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait, &mut side).await {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
         Err(e) => {
             let (status, mut body) = e.to_status_body();
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
     }
@@ -2863,6 +3008,42 @@ struct SpawnBuildSideChannel {
 fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usize>) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("build_slot_id".to_string(), json!(build_slot_id));
+    }
+}
+
+/// Merge the reserved runner IDENTITY (`id`, `port`, and the URLs derived from
+/// them) into an already-rendered spawn-test body — success, non-2xx `Ok`, or
+/// `SupervisorError::to_status_body()` error alike.
+///
+/// **Why this exists.** `spawn_test` mints the runner id and reserves its port
+/// BEFORE the build starts, but only the *success* body named them. Every
+/// failure body rendered from a `SupervisorError` carried `{"error": …}` and
+/// nothing else, so a caller whose spawn failed could not learn which runner id
+/// had been created on its behalf — and therefore could not call
+/// `GET /runners/{id}/logs` to find out why, or `POST /runners/{id}/stop` to
+/// clean it up. The id is the caller's only handle on the thing it just
+/// created; it must be present on every outcome, not only the happy one.
+///
+/// Values are inserted authoritatively (from the reservation), so the success
+/// body's identical keys are overwritten with the same values — the operation
+/// is idempotent, and a body can never disagree with the reservation.
+///
+/// Split out as a pure fn, mirroring [`attach_build_slot_id`], so the contract
+/// is unit-testable without a build pool.
+fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("id".to_string(), json!(id));
+        obj.insert("port".to_string(), json!(port));
+        obj.insert(
+            "api_url".to_string(),
+            json!(format!("http://localhost:{port}")),
+        );
+        obj.insert(
+            "ui_bridge_url".to_string(),
+            json!(format!("http://localhost:{port}/ui-bridge")),
+        );
+        obj.insert("logs_url".to_string(), json!(format!("/runners/{id}/logs")));
+        obj.insert("stop_url".to_string(), json!(format!("/runners/{id}/stop")));
     }
 }
 
@@ -6531,7 +6712,10 @@ mod tests {
     //! to catch. These tests pin the new contract: missing dist surfaces
     //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
     //! state as `None`.
-    use super::{attach_build_slot_id, check_dist_freshness, FrontendStaleReason};
+    use super::{
+        attach_build_slot_id, attach_spawn_identity, check_dist_freshness, spawn_abandoned_body,
+        FrontendStaleReason,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -6743,6 +6927,197 @@ mod tests {
             "{body}"
         );
         assert_eq!(body["build_slot_id"], serde_json::Value::Null);
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression: "a caller receives no answer, or a confidently useless one"
+    //
+    // `POST /runners/spawn-test` reserves the runner id and port BEFORE the
+    // (20-50 minute) build starts, but on the synchronous path it wrote nothing
+    // until the build was terminal. Two failures fell out of that:
+    //
+    //   * a supervisor restart mid-build closed the connection with no response
+    //     at all (`curl` reports `HTTP=000`), and
+    //   * every non-success body rendered from a `SupervisorError` named the
+    //     error and nothing else,
+    //
+    // so in both cases the caller could not learn the id of the runner it had
+    // just created — and the id is the only handle on `/runners/{id}/logs` and
+    // `/runners/{id}/stop`. These pin the contract: EVERY outcome names the
+    // runner, and "abandoned" is distinguishable from both "failed" and
+    // "succeeded".
+    // ---------------------------------------------------------------------
+
+    /// The canonical `SupervisorError` body carries `{"error": …}` and nothing
+    /// else. After the merge it must still name the runner that was reserved.
+    #[test]
+    fn spawn_error_body_names_the_runner_it_reserved() {
+        let mut body = serde_json::json!({ "error": "cargo build failed" });
+        attach_spawn_identity(&mut body, "test-abc123", 9878);
+
+        assert_eq!(body["id"], serde_json::json!("test-abc123"));
+        assert_eq!(body["port"], serde_json::json!(9878));
+        assert_eq!(body["api_url"], serde_json::json!("http://localhost:9878"));
+        // The two URLs a caller needs to follow and clean up its own runner.
+        assert_eq!(
+            body["logs_url"],
+            serde_json::json!("/runners/test-abc123/logs")
+        );
+        assert_eq!(
+            body["stop_url"],
+            serde_json::json!("/runners/test-abc123/stop")
+        );
+        // The original diagnosis is preserved, not replaced.
+        assert_eq!(body["error"], serde_json::json!("cargo build failed"));
+    }
+
+    /// The reservation is authoritative. A body that somehow disagrees with it
+    /// is corrected rather than trusted — a response naming a DIFFERENT runner
+    /// than the one reserved is the "confidently useless answer" failure mode,
+    /// which is worse than no answer.
+    #[test]
+    fn spawn_identity_is_authoritative_over_the_body_it_merges_into() {
+        let mut body = serde_json::json!({ "id": "stale-id", "port": 1234, "status": "healthy" });
+        attach_spawn_identity(&mut body, "test-real", 9880);
+
+        assert_eq!(body["id"], serde_json::json!("test-real"));
+        assert_eq!(body["port"], serde_json::json!(9880));
+        assert_eq!(body["status"], serde_json::json!("healthy"));
+    }
+
+    /// A non-object body is left alone rather than silently reshaped —
+    /// same contract as `attach_build_slot_id`.
+    #[test]
+    fn spawn_identity_leaves_a_non_object_body_alone() {
+        let mut body = serde_json::json!("not an object");
+        attach_spawn_identity(&mut body, "test-abc", 9877);
+        assert_eq!(body, serde_json::json!("not an object"));
+    }
+
+    /// The answer a synchronous caller gets when the supervisor starts shutting
+    /// down mid-build. It replaces a dropped connection (`HTTP=000`), so it has
+    /// to carry everything the caller lost: the runner id + port, the build id,
+    /// and an unambiguous "abandoned" verdict.
+    #[test]
+    fn abandoned_spawn_answer_names_the_runner_and_the_build() {
+        let submission = uuid::Uuid::new_v4();
+        let body = spawn_abandoned_body("test-1a0453e4740-2", 9879, submission);
+
+        // The handle on the runner.
+        assert_eq!(body["id"], serde_json::json!("test-1a0453e4740-2"));
+        assert_eq!(body["port"], serde_json::json!(9879));
+        assert_eq!(
+            body["logs_url"],
+            serde_json::json!("/runners/test-1a0453e4740-2/logs")
+        );
+        assert_eq!(
+            body["stop_url"],
+            serde_json::json!("/runners/test-1a0453e4740-2/stop")
+        );
+
+        // The handle on the build. `build_id` is the same token the sync body,
+        // the async 202 and `GET /build/{id}/status` all use.
+        assert_eq!(body["build_id"], serde_json::json!(submission.to_string()));
+        assert_eq!(
+            body["submission_id"],
+            serde_json::json!(submission.to_string())
+        );
+        assert_eq!(
+            body["poll_url"],
+            serde_json::json!(format!("/build/{submission}/status"))
+        );
+
+        // The verdict: not "failed", not "succeeded", and machine-readable.
+        assert_eq!(body["spawn_abandoned"], serde_json::json!(true));
+        assert_eq!(body["error"], serde_json::json!("spawn_abandoned"));
+        assert_eq!(body["status"], serde_json::json!("abandoned"));
+    }
+
+    /// Source guard: `execute_spawn_build` must merge the identity on BOTH
+    /// arms.
+    ///
+    /// The `Err` arm is the one that matters — it renders through
+    /// `SupervisorError::to_status_body()`, which knows nothing about the
+    /// reservation — but a merge on only one arm is exactly the "uniform on
+    /// some paths and not others" state this fix exists to remove, so pin both.
+    /// Mirrors the `attach_build_slot_id` contract, which was lost the same way.
+    #[test]
+    fn execute_spawn_build_attaches_identity_on_both_arms() {
+        let body = fn_source("async fn execute_spawn_build(");
+        let merges = body
+            .matches("attach_spawn_identity(&mut body, &id, port)")
+            .count();
+        assert_eq!(
+            merges, 2,
+            "execute_spawn_build must call `attach_spawn_identity` on the Ok arm AND the Err \
+             arm (found {merges}). The Err arm renders through \
+             `SupervisorError::to_status_body()`, which emits `{{\"error\": …}}` and nothing \
+             else — without the merge, a caller whose spawn FAILED cannot learn the id of the \
+             runner reserved for it, and so cannot read its logs or stop it. Body scanned:\n\
+             {body}"
+        );
+    }
+
+    /// Source guard: the SYNCHRONOUS spawn-test path must race its terminal
+    /// wait against the shutdown signal.
+    ///
+    /// A bare `await_terminal(&sub_arc).await` holds the HTTP connection open
+    /// for the whole cargo build with nothing written. Axum's graceful shutdown
+    /// drops the LISTENER immediately but waits for in-flight connections, so
+    /// during a restart that produced the reported incident: the replacement
+    /// supervisor bound the port and answered `Runner not found` from an empty
+    /// registry, while the old process stayed alive compiling, holding this
+    /// connection, addressable by nobody — and the caller got `HTTP=000` when it
+    /// was finally force-killed. The race is what turns that into an answer.
+    #[test]
+    fn sync_spawn_test_wait_is_shutdown_aware() {
+        let body = fn_source("pub async fn spawn_test(");
+        assert!(
+            body.contains("await_terminal"),
+            "spawn_test's sync path no longer awaits the submission's terminal state — did the \
+             handler get restructured? Re-point this guard at whatever replaced it."
+        );
+        assert!(
+            body.contains("state.shutdown_signal()"),
+            "spawn_test's synchronous terminal wait is not raced against \
+             `state.shutdown_signal()`. Without that race a supervisor shutdown during a \
+             20-50 minute build drops the caller's connection with no response written at all \
+             (`curl` reports HTTP=000) and the caller never learns the runner id it created. \
+             Body scanned:\n{body}"
+        );
+        assert!(
+            body.contains("spawn_abandoned_body"),
+            "spawn_test observes the shutdown but does not answer with \
+             `spawn_abandoned_body`. Detecting the shutdown and still returning nothing useful \
+             reproduces the defect in a politer form: the caller must be able to tell \
+             'abandoned' from 'failed' and from 'it worked and I was not told'."
+        );
+    }
+
+    /// Read one function's body out of this source file, bounded at the next
+    /// top-level `fn` so a match in a LATER function can never satisfy an
+    /// assertion. Same technique as
+    /// `no_spawn_site_mints_a_port_derived_instance_name`'s positive half.
+    fn fn_source(signature: &str) -> String {
+        let this_file = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners.rs"),
+        )
+        .expect("this source file must be readable")
+        .replace("\r\n", "\n");
+        let after = this_file
+            .split_once(signature)
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| panic!("`{signature}` must exist — did it get renamed?"))
+            .to_string();
+        ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
+            .iter()
+            .filter_map(|marker| after.find(marker))
+            .min()
+            .map(|end| after[..end].to_string())
+            .unwrap_or(after)
     }
 
     fn write_file(path: &std::path::Path, contents: &[u8]) {
