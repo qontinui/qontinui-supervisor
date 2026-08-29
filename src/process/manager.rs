@@ -848,6 +848,123 @@ pub fn detect_target_debug_staleness(
     compute_target_debug_staleness(legacy_exe_path, legacy_mtime, &slot_mtimes)
 }
 
+/// The picked build-pool slot exe is OLDER than a local `target/debug` build —
+/// i.e. the operator compiled fresh code that the supervisor is about to ignore.
+///
+/// This is the INVERSE of [`TargetDebugStaleness`], and it is the direction that
+/// actually costs the operator a rebuild. `dev-start.ps1` runs
+/// `cargo build --bin qontinui-runner --features custom-protocol` with no
+/// `CARGO_TARGET_DIR`, so its artifact lands at `target/debug/` — which
+/// [`resolve_source_exe_detailed`] uses only as preference 3, "when NO slot has
+/// an exe at all". While any slot exe exists the local build is discarded *by
+/// construction*, and the console still prints "Runner binary rebuilt".
+///
+/// Measured live 2026-08-29: the operator's build landed at 15:59Z; the
+/// supervisor then resolved slot 0 (`61be4b001cee`, built the previous day at
+/// 22:31Z) and ran that. Two operator "rebuilds" in a row silently ran
+/// 17.5-hour-old code, and nothing in any log said so — only the opposite
+/// direction was ever checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolBehindLocalBuild {
+    pub legacy_path: std::path::PathBuf,
+    pub legacy_mtime: std::time::SystemTime,
+    pub picked_slot_id: usize,
+    pub picked_slot_mtime: std::time::SystemTime,
+}
+
+/// Detect that the picked slot exe is strictly older than the local
+/// `target/debug` exe.
+///
+/// Strict `>` on the legacy side — equal mtimes are the same build wave and are
+/// NOT a finding (mirrors [`compute_target_debug_staleness`]). Unreadable
+/// mtimes yield `None`: an unknown timestamp is never reported as a finding.
+pub fn compute_pool_behind_local_build(
+    legacy_path: &std::path::Path,
+    legacy_mtime: Option<std::time::SystemTime>,
+    picked_slot_id: usize,
+    picked_slot_mtime: Option<std::time::SystemTime>,
+) -> Option<PoolBehindLocalBuild> {
+    let legacy = legacy_mtime?;
+    let picked = picked_slot_mtime?;
+    if legacy > picked {
+        Some(PoolBehindLocalBuild {
+            legacy_path: legacy_path.to_path_buf(),
+            legacy_mtime: legacy,
+            picked_slot_id,
+            picked_slot_mtime: picked,
+        })
+    } else {
+        None
+    }
+}
+
+/// Is a local build ADOPTABLE — may the supervisor run it in place of the
+/// staler slot exe?
+///
+/// Only when it carries a provenance sidecar that demonstrably describes THIS
+/// file. Two independent conditions, both required:
+///
+/// 1. **A vouched source.** [`BuildSource::is_vouched`] — a `live_tree` or
+///    `origin_main` build. An `override` tree is foreign by definition.
+/// 2. **The sidecar is not stale relative to the exe.** `npm run tauri dev`
+///    writes the SAME path with `--no-default-features` (no `custom-protocol`),
+///    producing a binary that loads its frontend from the Vite dev server and
+///    shows "refused to connect" when the supervisor launches it standalone
+///    (observed 2026-08-05). Such a build writes no sidecar — but it can
+///    OVERWRITE an exe whose sidecar is still lying around. Requiring the
+///    sidecar to be at least as new as the exe rejects that case, so a dev-mode
+///    binary can never be adopted on the strength of an earlier stamp.
+///
+/// Everything else is refused and merely warned about. An unidentified artifact
+/// is never promoted over a slot on the strength of its mtime alone — mtime says
+/// when a file was written, not what is in it.
+pub fn local_build_is_adoptable(
+    provenance: Option<&BuildProvenance>,
+    sidecar_mtime: Option<std::time::SystemTime>,
+    legacy_mtime: std::time::SystemTime,
+) -> bool {
+    let Some(p) = provenance else { return false };
+    if !p.source.is_vouched() {
+        return false;
+    }
+    match sidecar_mtime {
+        Some(t) => t >= legacy_mtime,
+        None => false,
+    }
+}
+
+/// Format a [`PoolBehindLocalBuild`] for the operator, saying what will happen.
+pub fn format_pool_behind_local_build_warning(s: &PoolBehindLocalBuild, adopted: bool) -> String {
+    let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
+    let slot_iso: chrono::DateTime<chrono::Utc> = s.picked_slot_mtime.into();
+    if adopted {
+        format!(
+            "pool_behind_local_build: local build {} (mtime {}) is NEWER than \
+             picked slot {} (mtime {}) — running the local build, because a \
+             rebuild must take the latest code. It carries a vouched provenance \
+             sidecar describing this exact file. Pass use_lkg:true to pin the \
+             last-known-good binary instead.",
+            s.legacy_path.display(),
+            legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            s.picked_slot_id,
+            slot_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    } else {
+        format!(
+            "pool_behind_local_build: local build {} (mtime {}) is NEWER than \
+             picked slot {} (mtime {}), but carries no vouched provenance sidecar \
+             describing this file — running the SLOT exe, so your local build is \
+             NOT what is running. Rebuild through the supervisor (POST \
+             /runner/restart {{\"rebuild\": true}}) to put the latest code \
+             in a slot.",
+            s.legacy_path.display(),
+            legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            s.picked_slot_id,
+            slot_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+}
+
 /// Format a [`TargetDebugStaleness`] as a human-readable warning line.
 pub fn format_target_debug_warning(s: &TargetDebugStaleness) -> String {
     let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
@@ -1185,6 +1302,77 @@ pub async fn resolve_source_exe_detailed(
                 .logs
                 .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                 .await;
+        }
+
+        // ── "A rebuild must take the latest code." ──────────────────────
+        //
+        // The slot pool is the supervisor's own artifact store, but it is NOT
+        // the only place a runner exe gets built: `dev-start.ps1` compiles the
+        // runner straight into `target/debug/` on every start. Preference 3
+        // means that artifact is used only when NO slot exists, so a fresh
+        // local build was silently discarded in favour of an arbitrarily old
+        // slot — the operator rebuilt, was told "Runner binary rebuilt", and
+        // ran day-old code anyway.
+        //
+        // When the local build is NEWER than the slot we picked, prefer it —
+        // but only when it can prove what it is (see
+        // [`local_build_is_adoptable`]). An unidentifiable artifact is warned
+        // about and NOT run: serving a stale-but-known slot beats launching an
+        // unknown binary, and the operator is told plainly that their build is
+        // not the one running.
+        //
+        // An explicit LKG request never reaches here — `source_exe_override`
+        // short-circuits resolution upstream — so "unless the operator asks for
+        // the LKG binary" holds by construction.
+        let (legacy_src, legacy_exe) = state.config.runner_exe_path_resolved();
+        if let Some(finding) = compute_pool_behind_local_build(
+            &legacy_exe,
+            file_mtime(&legacy_exe),
+            picked_id,
+            file_mtime(&picked_path),
+        ) {
+            let legacy_provenance = read_provenance_beside_exe(&legacy_exe);
+            // Derive the sidecar path from the same parent the provenance read
+            // uses. No `unwrap_or_else(exe)` fallback: statting the exe AS its
+            // own sidecar is meaningless, and a parentless exe path has no
+            // sidecar to find — `None` says exactly that.
+            let sidecar_mtime = legacy_exe
+                .parent()
+                .map(|d| d.join(SLOT_PROVENANCE_SIDECAR_FILENAME))
+                .and_then(|p| file_mtime(&p));
+            let adopt = local_build_is_adoptable(
+                legacy_provenance.as_ref(),
+                sidecar_mtime,
+                finding.legacy_mtime,
+            );
+            let msg = format_pool_behind_local_build_warning(&finding, adopt);
+            // Adoption is the HEALTHY outcome this fix exists to produce — the
+            // operator built, and the operator's build is running. Logging that
+            // at WARN on every resolution would train the reader to skim past
+            // the line that matters: the REFUSED case, where their build is
+            // silently not running.
+            if adopt {
+                info!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                    .await;
+            } else {
+                warn!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                    .await;
+            }
+            if adopt {
+                return Ok(ResolvedRunnerExe {
+                    mtime: Some(finding.legacy_mtime),
+                    path: legacy_exe,
+                    origin: ExeOrigin::CargoTargetDir(legacy_src),
+                    provenance: legacy_provenance,
+                    unverified_warning: None,
+                });
+            }
         }
 
         let provenance = state
@@ -6088,6 +6276,176 @@ mod tests {
             compute_target_debug_staleness(&legacy_p(), None, &slots).is_none(),
             "missing legacy must yield None"
         );
+    }
+
+    // ── "A rebuild must take the latest code" ──────────────────────────
+    //
+    // The inverse of the staleness check above: the operator built fresh code
+    // locally and the supervisor was about to run an older slot exe instead.
+    // Only the stale-legacy direction was ever detected, which is why two
+    // consecutive operator rebuilds silently ran 17.5-hour-old code with no
+    // log line anywhere saying so.
+
+    fn t(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// THE DEFECT. A local build newer than the picked slot must be detected.
+    #[test]
+    fn pool_behind_local_build_detects_a_newer_local_build() {
+        let f = compute_pool_behind_local_build(&legacy_p(), Some(t(2_000)), 0, Some(t(1_000)))
+            .expect("newer legacy than picked slot must be a finding");
+        assert_eq!(f.picked_slot_id, 0);
+        assert_eq!(f.legacy_mtime, t(2_000));
+        assert_eq!(f.picked_slot_mtime, t(1_000));
+    }
+
+    /// The healthy case: the slot IS the freshest artifact. Silent.
+    #[test]
+    fn pool_behind_local_build_silent_when_slot_is_newer() {
+        assert!(
+            compute_pool_behind_local_build(&legacy_p(), Some(t(1_000)), 0, Some(t(2_000)))
+                .is_none()
+        );
+    }
+
+    /// Equal mtimes are one build wave, not a finding (mirrors the staleness
+    /// check's strict comparison).
+    #[test]
+    fn pool_behind_local_build_equal_mtimes_are_not_a_finding() {
+        assert!(
+            compute_pool_behind_local_build(&legacy_p(), Some(t(1_000)), 0, Some(t(1_000)))
+                .is_none()
+        );
+    }
+
+    /// An unknown timestamp is never reported as a finding.
+    #[test]
+    fn pool_behind_local_build_silent_on_unreadable_mtimes() {
+        assert!(compute_pool_behind_local_build(&legacy_p(), None, 0, Some(t(1_000))).is_none());
+        assert!(compute_pool_behind_local_build(&legacy_p(), Some(t(1_000)), 0, None).is_none());
+    }
+
+    /// A vouched sidecar at least as new as the exe is adoptable — this is what
+    /// makes the operator's rebuild actually run.
+    #[test]
+    fn a_vouched_sidecar_describing_this_exe_is_adoptable() {
+        for source in [BuildSource::LiveTree, BuildSource::OriginMain] {
+            assert!(
+                local_build_is_adoptable(Some(&prov(source)), Some(t(2_000)), t(2_000)),
+                "{source:?} sidecar written with the exe must be adoptable"
+            );
+            assert!(local_build_is_adoptable(
+                Some(&prov(source)),
+                Some(t(2_001)),
+                t(2_000)
+            ));
+        }
+    }
+
+    /// No sidecar ⇒ never adopted. mtime says WHEN a file was written, not what
+    /// is in it, so an unidentified artifact is never promoted over a slot.
+    #[test]
+    fn an_unstamped_local_build_is_never_adopted() {
+        assert!(!local_build_is_adoptable(None, Some(t(2_000)), t(2_000)));
+        assert!(!local_build_is_adoptable(None, None, t(2_000)));
+    }
+
+    /// A foreign `override` tree is not vouched, so it cannot be adopted even
+    /// with a perfectly fresh sidecar.
+    #[test]
+    fn an_override_tree_build_is_not_adoptable() {
+        assert!(!local_build_is_adoptable(
+            Some(&prov(BuildSource::Override)),
+            Some(t(2_000)),
+            t(2_000)
+        ));
+    }
+
+    /// **The `tauri dev` trap.** `npm run tauri dev` rebuilds the SAME path
+    /// without `custom-protocol` (blank window, frontendReady:false — observed
+    /// 2026-08-05) and writes no sidecar. If it overwrites an exe whose older
+    /// sidecar is still lying around, adopting on the strength of that stamp
+    /// would launch a dev-mode binary as the primary. A sidecar older than the
+    /// exe it claims to describe must be refused.
+    #[test]
+    fn a_sidecar_older_than_the_exe_is_refused() {
+        assert!(!local_build_is_adoptable(
+            Some(&prov(BuildSource::LiveTree)),
+            Some(t(1_999)),
+            t(2_000)
+        ));
+    }
+
+    /// **The interaction that makes adoption actually work.** Resolution and
+    /// the START GATE are two separate predicates, and adoption is only useful
+    /// if they agree: `resolve_source_exe_detailed` hands back an adopted local
+    /// build as `ExeOrigin::CargoTargetDir`, and the start path routes exactly
+    /// that origin into [`unverified_exe_gate`], which REFUSES a non-pool exe
+    /// it cannot identify. If the gate refused what resolution adopted, the
+    /// primary would resolve a binary and then fail to launch it at all —
+    /// strictly worse than the stale-code bug this change fixes.
+    ///
+    /// They agree because both key on the same fact: `local_build_is_adoptable`
+    /// requires `source.is_vouched()`, and that is precisely the gate's allow
+    /// condition. This test pins the agreement so a later tightening of the
+    /// gate cannot silently brick the start path.
+    #[test]
+    fn an_adopted_local_build_passes_the_unverified_exe_gate() {
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        for source in [BuildSource::LiveTree, BuildSource::OriginMain] {
+            let p = prov(source);
+            assert!(
+                local_build_is_adoptable(Some(&p), Some(mtime), mtime),
+                "{source:?} must be adoptable"
+            );
+            let resolved = ResolvedRunnerExe {
+                mtime: Some(mtime),
+                path: legacy_p(),
+                origin: ExeOrigin::CargoTargetDir(TargetDirSource::WorkspaceDefault),
+                provenance: Some(p),
+                unverified_warning: None,
+            };
+            assert_eq!(
+                unverified_exe_gate(false, &resolved).expect("must not refuse an adopted build"),
+                ExeIdentityVerdict::Verified,
+                "{source:?}: resolution adopted it, so the gate must not refuse it"
+            );
+        }
+    }
+
+    /// **Cross-repo contract.** This is the literal sidecar `dev-start.ps1`
+    /// writes (captured from a real run, 2026-08-29). If either side drifts —
+    /// a serde rename here, a key change there — adoption silently stops
+    /// firing and the operator is back to running stale code with no error
+    /// anywhere. Parsing the real bytes is the only thing that catches it.
+    #[test]
+    fn the_sidecar_dev_start_writes_deserializes_as_provenance() {
+        let written = r#"{"sha":"65082b7f50fdeb26c2e9105695a017b40be4d764","source":"live_tree","built_from":"D:\\qontinui-root\\qontinui-runner","built_at":"2026-08-29T09:47:40.6091322Z"}"#;
+        let p: BuildProvenance =
+            serde_json::from_str(written).expect("dev-start.ps1's sidecar must parse");
+        assert_eq!(p.source, BuildSource::LiveTree);
+        assert!(p.source.is_vouched(), "live_tree must be adoptable");
+        assert_eq!(
+            p.sha.as_deref(),
+            Some("65082b7f50fdeb26c2e9105695a017b40be4d764")
+        );
+        assert_eq!(p.built_from, r"D:\qontinui-root\qontinui-runner");
+    }
+
+    /// The two warning texts must be distinguishable: one says the local build
+    /// IS running, the other says it is NOT. Reporting the wrong one is worse
+    /// than silence, because the operator would stop looking.
+    #[test]
+    fn the_warning_states_which_binary_actually_runs() {
+        let f = compute_pool_behind_local_build(&legacy_p(), Some(t(2_000)), 0, Some(t(1_000)))
+            .expect("finding");
+        let adopted = format_pool_behind_local_build_warning(&f, true);
+        let refused = format_pool_behind_local_build_warning(&f, false);
+        assert!(adopted.contains("running the local build"), "{adopted}");
+        assert!(refused.contains("running the SLOT exe"), "{refused}");
+        assert!(refused.contains("NOT what is running"), "{refused}");
+        assert_ne!(adopted, refused);
     }
 
     /// No slot exes exist — silent (no baseline to compare against).
