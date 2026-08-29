@@ -40,6 +40,7 @@ mod process;
 /// stamping rules and the reading rules are one source.
 mod provenance_stamp;
 mod reapi;
+mod restart_readiness;
 mod routes;
 /// S3-backend degrade guard for the supervisor's own in-process cargo spawns
 /// (`plans/2026-08-04-landed-infra-fixes-not-in-effect-on-this-machine.md`

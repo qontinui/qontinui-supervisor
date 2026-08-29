@@ -426,8 +426,8 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive. Optional body `{requester_id?}` scopes the purge; a bodyless POST purges every stale test runner. |
 | DELETE | `/runners/{id}` | Remove a runner from the registry |
 | POST | `/runners/{id}/start` | Start a runner |
-| POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). |
-| POST | `/runners/{id}/restart` | Restart a runner |
+| POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). **`force` is the restart-readiness override** — see "The restart-readiness gate". |
+| POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?}`. **`force` is the restart-readiness override** — see "The restart-readiness gate". |
 | POST | `/runners/{id}/protect` | Toggle protection on a runner |
 | POST | `/runners/{id}/watchdog` | Control watchdog for a specific runner |
 | GET | `/runners/{id}/logs` | Log history for a specific runner |
@@ -437,6 +437,70 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 **Queue behavior for spawn-test and spawn-named:**
 - **Default (blocking):** If all build slots are busy, the HTTP request holds open until a slot frees. Optional `queue_timeout_secs` bounds the wait and returns 504 on timeout.
 - **`X-Queue-Mode: no-wait` header:** Returns immediately with **503 Service Unavailable** and body `{error: "build_pool_full", queue_position, active_builds: [...]}`.
+
+### The restart-readiness gate
+
+**Before the supervisor stops or restarts a runner it asks that runner whether
+it is safe to**, by GETting `http://127.0.0.1:<runner-port>/restart-readiness`
+(IPv4 loopback, never `localhost`). A verdict of `safe_to_restart: false`
+**refuses** the operation with `409`; the long-advertised `force: true` on the
+request body is the documented override. Code: `src/restart_readiness.rs`; plan
+`2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`, Phase 3.
+
+**What this replaced was not a weaker check — it was nothing at all.**
+`manager::restart_runner_by_id` declared the parameter `_force: bool` and never
+read it; `manager::stop_runner_by_id` took no force parameter; `stop_runner`'s
+`_force` was dead the same way; `RebuildAndRestartRequest::force` was documented
+as "currently a no-op"; and `ManagedRunner::is_protected()` was read only to
+render a flag on `GET /runners`, never inside a stop/restart decision. The doc
+comment on the restart handler nevertheless asserted *"Protected runners require
+`force: true` in the request body."* An operator sending `force: false` got
+exactly what one sending `force: true` got. The plan's "every advertised restart
+protection in this fleet is inert" finding, instance 3 of 3.
+
+**Every unknown refuses.** Unreachable, non-2xx, unparseable JSON, and JSON
+missing `safe_to_restart` are all UNKNOWN — and UNKNOWN is a refusal, because
+this gate is consulted precisely when the next step is destructive. `404` is
+UNKNOWN too, but reported with its own message (*"THIS RUNNER'S BUILD PREDATES
+the restart-readiness endpoint … This is an OLD RUNNER, not an idle one"*) so an
+operator can tell an old build from a busy runner. **No error path resolves to
+"safe."**
+
+**The refusal never recommends a drain it cannot honour.** `POST /drain` acts on
+the AI/task-run plane; the census that counts terminal-hosted agent sessions
+explicitly exempts that plane, so a drain is a documented fast no-op for the
+population most restarts destroy. With terminal sessions live the refusal says
+so — *"there is NO graceful path for this plane … Do not drain and retry"* — and
+names the drain as a remedy **only** when the runner itself reported a non-empty
+AI plane that a drain covers. Recommending a no-op drain would manufacture the
+false confidence the plan exists to destroy, carrying the runner's own
+authority. Pinned by `terminal_sessions_refusal_never_recommends_a_drain`.
+
+**Refusal bodies** are `409` with `{error, cause, runner_id, action, message,
+would_be_lost: {terminal_sessions, ai_sessions}, drain, boundary, readiness,
+readiness_url, override}`. `cause` is `sessions_live` |
+`readiness_endpoint_absent` | `readiness_unreachable` | `readiness_error_status`
+| `readiness_unparseable`. On an UNKNOWN, `would_be_lost` and `readiness` are
+**`null`, not zero** — the counts were never learned.
+
+**Three exemptions, each decided from supervisor state before any probe** (an
+exemption is not an error path; a failed probe is UNKNOWN and refuses):
+
+| Skip | Why |
+|---|---|
+| `temp_runner` | The supervisor's own lifecycle stops `test-*` runners constantly (failed-probe teardown, frontend-stale teardown, `purge-stale`, the max-age reaper, the build-slot exe-lock breaker). Gating those would make `spawn-test` unusable and leak a zombie on every failed spawn. Note every temp is minted `protected: true`, so a protection-keyed exemption would not work here — the same reasoning the max-age reaper already records. |
+| `runner_not_protected` | `POST /runners/{id}/protect {"protected": false}` is an explicit operator statement that this runner may be stopped without ceremony. **This is the only place `is_protected()` has ever participated in a stop/restart decision.** |
+| `runner_not_running` | Neither tracked-running nor API-responding: no in-flight work to destroy. Both signals must be negative, because an ADOPTED runner can sit at `running: false` while alive and its `/health` is what says so. |
+
+**Every refusal, every override, and every allow is logged with the verdict**
+that produced it — refusals at `Warn`, overrides at `Error` (the override is the
+louder one: it is the line that destroys work), allows at `Info`. A gate that
+recorded only what it blocked could not be audited for what it let through.
+
+The probe timeout is **15s**, sized against the tail: `/health` on a loaded box
+has been sampled between 296 ms and 10120 ms, and `/restart-readiness` computes
+a fresh process-table cross-reference rather than serving the 600 s census
+cache. An under-sized timeout converts load into false refusals.
 
 ### Optional request bodies — `OptionalJson`, not `Option<Json<T>>`
 
@@ -469,8 +533,8 @@ reporting all 9 assertions passed (2026-08-09, PR #138 fixed that one caller).
 
 The last row is a deliberate behavior change: a body sent with no `Content-Type`
 is now refused instead of vanishing. Silently dropping `force: true` on a stop
-turns an operator's deliberate force-stop of a protected runner into a confusing
-"runner is protected" refusal — the same reason `spawn-test` answers 400 on a
+turns an operator's deliberate force-stop into a `409` restart-readiness refusal
+they explicitly overrode — the same reason `spawn-test` answers 400 on a
 misspelled provenance selector rather than ignoring it.
 
 Browser `fetch(url, {method: 'POST'})` sends no `Content-Type` and no body, so
@@ -659,7 +723,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 |--------|------|-------------|
 | GET/POST/DELETE | `/test-login` | Get/set/clear test login credentials for runner spawning |
 | GET | `/ws` | WebSocket endpoint |
-| POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint). Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies"). |
+| POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint, targets the primary). Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies"). `force` is the restart-readiness override — it reaches `manager::stop_runner`, where it used to be a dead `_force`. |
 | POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?}`. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"rebuilding", build_id, poll:"/builds"}` immediately and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll}` immediately; the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |

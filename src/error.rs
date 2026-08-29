@@ -64,6 +64,21 @@ pub enum SupervisorError {
     #[error("{}", .0.detail)]
     UnverifiedExe(Box<UnverifiedExeInfo>),
 
+    /// The runner reported it is NOT safe to stop (or could not be asked), and
+    /// the caller did not pass `force: true`. Mapped to `409 CONFLICT`: the
+    /// request is well-formed, the runner's state is not.
+    ///
+    /// This is the refusal that makes the long-advertised `force` field on
+    /// `POST /runners/{id}/stop` and `POST /runners/{id}/restart` real — see
+    /// [`crate::restart_readiness`] for what was inert before it and why every
+    /// UNKNOWN resolves here rather than to "safe".
+    ///
+    /// Boxed for the same reason `InsufficientDisk` and `UnverifiedExe` are:
+    /// every `Result<_, SupervisorError>` in the crate pays for the largest
+    /// variant (`clippy::result_large_err`).
+    #[error("{}", .0.message)]
+    RestartUnsafe(Box<crate::restart_readiness::RefusalDetail>),
+
     #[error("Process error: {0}")]
     Process(String),
 
@@ -193,6 +208,13 @@ impl SupervisorError {
             return (StatusCode::CONFLICT, body);
         }
 
+        if let SupervisorError::RestartUnsafe(detail) = self {
+            // The payload is already the exact wire shape (built in
+            // `restart_readiness::decide`) so the body a caller reads and the
+            // body the log line carries can never drift.
+            return (StatusCode::CONFLICT, detail.payload.clone());
+        }
+
         let status = match self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
@@ -201,6 +223,7 @@ impl SupervisorError {
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
+            SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
