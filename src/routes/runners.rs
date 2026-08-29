@@ -55,14 +55,23 @@ pub struct RestartRunnerRequest {
     /// Source of the restart request. Defaults to "manual".
     #[serde(default = "default_source_manual")]
     pub source: String,
-    /// Force restart even if the runner is protected.
+    /// Proceed even though the runner reports it is NOT safe to restart — or
+    /// could not be asked at all.
+    ///
+    /// The supervisor consults the runner's own `GET /restart-readiness`
+    /// verdict first and refuses with `409 restart_refused_unsafe` /
+    /// `409 restart_refused_unknown` unless this is set. The override is
+    /// logged at `Error` with the verdict it overrode. See
+    /// [`crate::restart_readiness`].
     #[serde(default)]
     pub force: bool,
 }
 
 #[derive(Deserialize, Default)]
 pub struct StopRunnerRequest {
-    /// Force stop even if the runner is protected.
+    /// Proceed even though the runner reports it is NOT safe to stop — or
+    /// could not be asked at all. Same contract as
+    /// [`RestartRunnerRequest::force`].
     #[serde(default)]
     pub force: bool,
 }
@@ -92,11 +101,12 @@ pub struct RebuildAndRestartRequest {
     /// Optional source label, recorded in diagnostic events.
     #[serde(default)]
     pub source: String,
-    /// Reserved for future "force unprotect" semantics. Currently a no-op
-    /// since the rebuild-and-restart cycle goes through `stop_runner_by_id`
-    /// which already respects protection.
+    /// Readiness-gate override, same meaning as on `/runners/{id}/stop` and
+    /// `/runners/{id}/restart`: proceed even though the runner reports live
+    /// agent sessions (or could not be asked). Passed to `stop_runner_by_id`,
+    /// which enforces the gate. Was documented as a reserved no-op until the
+    /// gate existed to give it something to override.
     #[serde(default)]
-    #[allow(dead_code)]
     pub force: bool,
     /// If true, after starting the runner block until its `/health` returns
     /// 200 OK or `wait_timeout_secs` elapses.
@@ -1052,7 +1062,7 @@ pub async fn stop_runner(
     Path(id): Path<String>,
     body: OptionalJson<StopRunnerRequest>,
 ) -> Result<impl IntoResponse, SupervisorError> {
-    let _force = body.into_inner_or_default().force;
+    let force = body.into_inner_or_default().force;
 
     // Capture the early-log path BEFORE stopping — for test-* runners the
     // stop also removes them from the registry, after which we can no longer
@@ -1064,7 +1074,7 @@ pub async fn stop_runner(
         None
     };
 
-    manager::stop_runner_by_id(&state, &id).await?;
+    manager::stop_runner_by_id(&state, &id, force).await?;
 
     // Explicit user-facing /stop is the only path that deletes the
     // early-log file. The spawn-test failed-probe cleanup path also calls
@@ -1084,7 +1094,26 @@ pub async fn stop_runner(
 }
 
 /// POST /runners/{id}/restart — restart a specific runner.
-/// Protected runners require `force: true` in the request body.
+///
+/// **The runner is asked first.** Before anything is stopped the supervisor
+/// GETs `http://127.0.0.1:<runner-port>/restart-readiness` and refuses with
+/// `409` when the verdict is `safe_to_restart: false` — or when no verdict can
+/// be established (unreachable, non-2xx, unparseable, or a `404` from a runner
+/// whose build predates the endpoint; all four are UNKNOWN, and UNKNOWN
+/// refuses). `force: true` in the request body is the documented override; it
+/// proceeds and logs the verdict it overrode.
+///
+/// The gate is skipped, without a probe, for temp (`test-*`) runners, for
+/// runners explicitly marked `protected: false` via
+/// `POST /runners/{id}/protect`, and for runners the supervisor has no evidence
+/// are alive. [`crate::restart_readiness`] states why for each.
+///
+/// > This doc comment used to read *"Protected runners require `force: true` in
+/// > the request body"*, which was false for the entire life of the endpoint:
+/// > `manager::restart_runner_by_id` declared the parameter `_force` and never
+/// > read it, and `is_protected()` was never consulted in a stop/restart
+/// > decision. Plan
+/// > `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`, Phase 3.
 ///
 /// **`rebuild: true` is detached from the HTTP connection** (mirrors the
 /// primary `/runner/restart` path in `routes/runner.rs`). A per-id rebuild runs
@@ -3887,8 +3916,12 @@ async fn execute_spawn_build_inner(
                     crate::process::stopped_cache::insert_and_evict(&mut cache, snapshot);
                 }
 
-                // Stop & clean up so we don't leak a zombie.
-                let _ = manager::stop_runner_by_id(state, id).await;
+                // Stop & clean up so we don't leak a zombie. `force: true`:
+                // this is a temp runner we spawned seconds ago whose health
+                // probe just failed — there is no session on it to protect,
+                // and a readiness refusal here would leak the zombie this
+                // line exists to prevent.
+                let _ = manager::stop_runner_by_id(state, id, true).await;
                 {
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
@@ -4059,8 +4092,9 @@ async fn execute_spawn_build_inner(
     let dist_missing = matches!(stale_reason, Some(FrontendStaleReason::DistMissing));
     if frontend_stale && (dist_missing || body.frontend_strict) {
         // Stop the runner we just spawned — we will not ship a broken/stale
-        // UI to the caller.
-        let _ = manager::stop_runner_by_id(state, id).await;
+        // UI to the caller. `force: true` for the same reason as the
+        // failed-probe teardown above: nothing has ever run on this runner.
+        let _ = manager::stop_runner_by_id(state, id, true).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(id);
@@ -5149,7 +5183,12 @@ pub async fn spawn_named(
     // entry so it doesn't resurrect on the next supervisor restart) and
     // return 503 instead of reporting a blank UI as healthy.
     if frontend_stale && matches!(stale_reason, Some(FrontendStaleReason::DistMissing)) {
-        let _ = manager::stop_runner_by_id(&state, &id).await;
+        // `force: true`: a NAMED runner, so the gate would otherwise apply —
+        // but this is the teardown of a runner spawned moments ago that we are
+        // refusing to hand back because it embeds no frontend. It has never
+        // hosted a session, and leaving it running while also returning 503
+        // would leak it.
+        let _ = manager::stop_runner_by_id(&state, &id, true).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(&id);

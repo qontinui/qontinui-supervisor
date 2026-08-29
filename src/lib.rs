@@ -32,6 +32,11 @@ pub mod process;
 /// script's logic is covered by the merge-blocking CI gate).
 pub mod provenance_stamp;
 pub mod reapi;
+/// The restart-readiness gate: the supervisor consults the runner's own
+/// `GET /restart-readiness` verdict before stopping or restarting it, and the
+/// long-advertised (and until now inert) `force` field is the override. Plan
+/// `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`, Phase 3.
+pub mod restart_readiness;
 pub mod routes;
 /// S3-backend degrade guard for the supervisor's own in-process cargo spawns
 /// (`plans/2026-08-04-landed-infra-fixes-not-in-effect-on-this-machine.md`

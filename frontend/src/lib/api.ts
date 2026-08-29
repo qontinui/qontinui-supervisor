@@ -11,10 +11,40 @@ function bearer(jwt: string | undefined): RequestInit | undefined {
   return t ? { headers: { Authorization: `Bearer ${t}` } } : undefined;
 }
 
+/**
+ * Structured refusals whose whole value is the prose the supervisor wrote.
+ *
+ * The generic error path slices the body at 200 chars, which is fine for a
+ * one-line `{"error": "..."}` and destructive for the restart-readiness
+ * refusal: the sentence naming what would be lost, the statement that no
+ * graceful path exists for terminal-hosted sessions, and the `force: true`
+ * override all live PAST character 200. A refusal the operator cannot finish
+ * reading is a refusal they will work around, which is exactly the "Phase 3
+ * friction" failure the plan names. So for these, surface `message` in full.
+ */
+const FULL_MESSAGE_ERRORS = new Set(['restart_refused_unsafe', 'restart_refused_unknown']);
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
+    // Parse defensively and OUTSIDE the throw: a non-JSON body (an HTML error
+    // page from a proxy, say) must fall through to the generic path, not become
+    // a parse error of its own.
+    let parsed: { error?: unknown; message?: unknown } | null = null;
+    try {
+      parsed = JSON.parse(body) as { error?: unknown; message?: unknown };
+    } catch {
+      parsed = null;
+    }
+    if (
+      parsed &&
+      typeof parsed.error === 'string' &&
+      FULL_MESSAGE_ERRORS.has(parsed.error) &&
+      typeof parsed.message === 'string'
+    ) {
+      throw new Error(parsed.message);
+    }
     throw new Error(`${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`);
   }
   const text = await res.text();

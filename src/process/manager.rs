@@ -3898,14 +3898,40 @@ async fn verify_kill_target(
 }
 
 /// Stop a specific runner by ID. Kills by PID (not by process name).
+///
+/// # `force` is real now
+///
+/// `force: false` (the default a caller gets by sending no body) consults the
+/// runner's own `GET /restart-readiness` verdict first and **refuses** with
+/// [`SupervisorError::RestartUnsafe`] when the runner reports live agent
+/// sessions — or when the verdict cannot be established at all, which is
+/// UNKNOWN and therefore also a refusal. `force: true` proceeds and logs the
+/// verdict it overrode.
+///
+/// This function previously took **no** force parameter, while the routes above
+/// it parsed one and threw it away. See [`crate::restart_readiness`] for the
+/// exemptions (temp runners, explicitly-unprotected runners, and runners the
+/// supervisor has no evidence are alive).
 pub async fn stop_runner_by_id(
     state: &SharedState,
     runner_id: &str,
+    force: bool,
 ) -> Result<(), SupervisorError> {
     let managed = state
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
+
+    // The gate runs BEFORE `stop_requested` is latched and before any kill
+    // rung: a refused stop must leave the runner — and the crash-watchdog's
+    // stop-intent marker — exactly as it found them.
+    crate::restart_readiness::enforce(
+        state,
+        &managed,
+        crate::restart_readiness::GateAction::Stop,
+        force,
+    )
+    .await?;
 
     let runner_name = managed.config.name.clone();
     let port = managed.config.port;
@@ -4416,7 +4442,7 @@ pub async fn restart_runner_by_id(
     runner_id: &str,
     rebuild: bool,
     source: RestartSource,
-    _force: bool,
+    force: bool,
     from_working_tree: bool,
 ) -> Result<(), SupervisorError> {
     if !is_temp_runner(runner_id) && !source.is_manual() {
@@ -4465,6 +4491,30 @@ pub async fn restart_runner_by_id(
         }
     };
 
+    // Readiness gate. Evaluated here, at the restart boundary, rather than being
+    // left to the nested `stop_runner_by_id` call below — a restart that is
+    // going to be refused must be refused BEFORE `restart_requested` is
+    // latched, and before a `rebuild` kicks off a 40-minute cargo build whose
+    // whole point was to be started.
+    if let Err(e) = crate::restart_readiness::enforce(
+        state,
+        &managed,
+        crate::restart_readiness::GateAction::Restart,
+        force,
+    )
+    .await
+    {
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::RestartFailed {
+                source,
+                error: e.to_string(),
+            });
+        return Err(e);
+    }
+
     {
         let mut runner = managed.runner.write().await;
         runner.restart_requested = true;
@@ -4475,7 +4525,12 @@ pub async fn restart_runner_by_id(
         let runner = managed.runner.read().await;
         if runner.running {
             drop(runner);
-            if let Err(e) = stop_runner_by_id(state, runner_id).await {
+            // `force: true` — NOT a bypass. The readiness verdict was already
+            // evaluated (and logged) at the restart boundary a few lines up;
+            // re-probing here would pay a second HTTP round trip and, worse,
+            // could refuse a restart the caller was already granted because a
+            // session appeared in between. One decision per operator request.
+            if let Err(e) = stop_runner_by_id(state, runner_id, true).await {
                 state
                     .diagnostics
                     .write()
@@ -4575,7 +4630,10 @@ pub async fn stop_all_temp_runners(state: &SharedState) -> Result<(), Supervisor
         }
         let running = managed.runner.read().await.running;
         if running {
-            if let Err(e) = stop_runner_by_id(state, &managed.config.id).await {
+            // Temp-only sweep, and the gate exempts temp runners anyway;
+            // `false` keeps the honest value rather than asserting an
+            // override that is never consulted.
+            if let Err(e) = stop_runner_by_id(state, &managed.config.id, false).await {
                 errors.push(format!("'{}': {}", managed.config.name, e));
             }
         }
@@ -4634,13 +4692,15 @@ pub async fn restart_all(
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
 /// Legacy stop — targets the primary runner. Allowed for manual use.
-pub async fn stop_runner(state: &SharedState, _force: bool) -> Result<(), SupervisorError> {
+/// `force` was `_force` here too — parsed by `POST /runner/stop`, threaded all
+/// the way down, and dropped on the floor. It now reaches the readiness gate.
+pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    stop_runner_by_id(state, &primary.config.id).await
+    stop_runner_by_id(state, &primary.config.id, force).await
 }
 
 /// Legacy restart wrapper — targets the primary runner.
@@ -4724,7 +4784,11 @@ pub async fn rebuild_and_restart_by_id(
     // Step 1: stop. Best-effort — if the runner is already stopped this
     // returns NotRunning which we tolerate.
     let stopped_at = chrono::Utc::now();
-    match stop_runner_by_id(state, runner_id).await {
+    // `body.force` was documented as "Reserved for future 'force unprotect'
+    // semantics. Currently a no-op" and carried `#[allow(dead_code)]`. It is
+    // no longer a no-op: it is the readiness-gate override, same meaning as on
+    // `/runners/{id}/stop` and `/runners/{id}/restart`.
+    match stop_runner_by_id(state, runner_id, body.force).await {
         Ok(()) | Err(SupervisorError::RunnerNotRunning) => {}
         Err(e) => return Err(e),
     }
