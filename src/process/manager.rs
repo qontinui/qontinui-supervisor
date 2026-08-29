@@ -525,7 +525,12 @@ fn sha_short(s: &str) -> &str {
     &s[..cut]
 }
 
-fn source_label(src: BuildSource) -> &'static str {
+/// Stable machine-readable label for a [`BuildSource`], mirrored in logs, in
+/// refusal messages, and in the `GET /builds` / `GET /runners` JSON. `pub` so
+/// the route layer renders the same strings instead of keeping its own copies —
+/// two spellings of one vocabulary is how a consumer's match arm silently stops
+/// matching.
+pub fn source_label(src: BuildSource) -> &'static str {
     match src {
         BuildSource::LiveTree => "live_tree",
         BuildSource::OriginMain => "origin_main",
@@ -714,6 +719,16 @@ pub struct SlotFreshness {
     /// operator-facing recovery is documented in the `feedback_runner_manual_build`
     /// memory.
     pub target_debug_staleness: Option<TargetDebugStaleness>,
+    /// The OPPOSITE direction, and the consequential one: the picked slot exe
+    /// is older than a local `target/debug` build, i.e. the operator compiled
+    /// code the supervisor may be about to ignore. Carries `adopted` — whether
+    /// resolution will run the local build or the slot — so a reader can answer
+    /// "is my build what runs?" without starting a runner and reading the log.
+    ///
+    /// The two fields are mutually exclusive by construction: `target_debug_staleness`
+    /// needs the legacy exe OLDER than every slot, this one needs it NEWER than
+    /// the picked slot.
+    pub local_build_adoption: Option<LocalBuildAdoption>,
 }
 
 /// Compute the cross-slot SHA snapshot. Used by both `resolve_source_exe`
@@ -742,11 +757,21 @@ pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
         detect_slot_sha_drift(pid, &picked, &slot_provenance)
     });
     let target_debug_staleness = compute_target_debug_staleness_for_state(state);
+    // Same evaluator the start path runs, so `GET /builds` reports the decision
+    // resolution will actually make rather than a second derivation of it.
+    let local_build_adoption = picked_slot_id.and_then(|pid| {
+        evaluate_local_build_adoption(
+            &state.config,
+            pid,
+            &state.config.runner_exe_path_for_slot(pid),
+        )
+    });
     SlotFreshness {
         picked_slot_id,
         slot_provenance,
         drift,
         target_debug_staleness,
+        local_build_adoption,
     }
 }
 
@@ -765,10 +790,22 @@ pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
 // This module surfaces the staleness as observability — same shape as the
 // cross-slot SHA drift check, on the adjacent surface. It does NOT promote
 // the legacy path to a resolution source.
+//
+// Scope note (since local-build adoption landed): the legacy path CAN now beat
+// a slot, but only through `evaluate_local_build_adoption`, which requires the
+// legacy exe to be NEWER than the picked slot. That is the exact negation of
+// this module's precondition, so the two can never both fire and nothing here
+// promotes anything. The promoting direction lives in `PoolBehindLocalBuild` /
+// `local_build_is_adoptable`.
 
 /// Structured warning produced when the legacy `target/debug/qontinui-runner.exe`
 /// is older than every build-pool slot exe. Pure data — emitted to logs and
-/// `/builds`; never alters resolution. The legacy path is observability-only.
+/// `/builds`; never alters resolution.
+///
+/// "Never alters resolution" is a claim about THIS finding, not about the
+/// legacy path in general: a legacy exe NEWER than the picked slot can be
+/// adopted over it ([`local_build_is_adoptable`]), and that condition is the
+/// negation of this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDebugStaleness {
     /// Absolute path to the legacy exe (`<workspace>/target/debug/qontinui-runner.exe`).
@@ -821,11 +858,13 @@ pub fn compute_target_debug_staleness(
 /// in [`newest_slot_binary_mtime`]). If all slot reads fail, treat that as
 /// "no baseline" and return `None`.
 ///
-/// **Observability only** — it never alters which artifact wins. The non-pool
-/// exe IS a resolution source ([`resolve_source_exe`] preference 3), but only
-/// when NO slot has an exe at all; whenever this warning can fire (i.e. at
-/// least one slot exe exists) a slot always wins. When it does get reached,
-/// [`unverified_exe_gate`] refuses it rather than launching it silently.
+/// **Observability only** — this finding never alters which artifact wins.
+/// The non-pool exe reaches resolution two ways and NEITHER is available while
+/// this warning can fire: as preference 3, only when no slot has an exe at all
+/// (and then [`unverified_exe_gate`] refuses it rather than launching it
+/// silently); or by ADOPTION over a staler slot, which requires the legacy exe
+/// to be NEWER than the picked slot — the negation of the condition here. So
+/// whenever this fires, a slot still wins.
 pub fn detect_target_debug_staleness(
     legacy_exe_path: &std::path::Path,
     slot_exe_paths: &[(usize, &std::path::Path)],
@@ -965,17 +1004,105 @@ pub fn format_pool_behind_local_build_warning(s: &PoolBehindLocalBuild, adopted:
     }
 }
 
+/// The `pool_behind_local_build` finding together with the decision resolution
+/// will act on.
+///
+/// Computed in exactly ONE place ([`evaluate_local_build_adoption`]) so the
+/// observability surface (`GET /builds`) can never disagree with what the start
+/// path is about to do. Two independent copies of this decision would be a worse
+/// failure than the one they report: an operator told "your build IS running" by
+/// a route that re-derived it differently has no way to notice.
+#[derive(Debug, Clone)]
+pub struct LocalBuildAdoption {
+    /// The mtime comparison: the local build is newer than the picked slot.
+    pub finding: PoolBehindLocalBuild,
+    /// Will resolution actually RUN the local build instead of the picked slot?
+    /// `false` = the slot still wins and the operator's build is NOT running.
+    pub adopted: bool,
+    /// Which cargo target-dir precedence level produced the local build.
+    pub target_dir_source: TargetDirSource,
+    /// The provenance sidecar beside the local build. `None` is an honest
+    /// UNKNOWN — and is also exactly why `adopted` is then `false`.
+    pub provenance: Option<BuildProvenance>,
+}
+
+impl LocalBuildAdoption {
+    /// The operator-facing line, which states WHICH binary actually runs.
+    pub fn message(&self) -> String {
+        format_pool_behind_local_build_warning(&self.finding, self.adopted)
+    }
+}
+
+/// Is the local `target/debug` build newer than the slot resolution picked, and
+/// if so may it be adopted over that slot?
+///
+/// `None` when there is nothing to say: no readable local build, no readable
+/// slot mtime, or the slot is at least as new (the healthy steady state).
+pub fn evaluate_local_build_adoption(
+    config: &crate::config::SupervisorConfig,
+    picked_slot_id: usize,
+    picked_slot_path: &std::path::Path,
+) -> Option<LocalBuildAdoption> {
+    let (target_dir_source, legacy_exe) = config.runner_exe_path_resolved();
+    evaluate_local_build_adoption_at(
+        &legacy_exe,
+        target_dir_source,
+        picked_slot_id,
+        picked_slot_path,
+    )
+}
+
+/// Filesystem core of [`evaluate_local_build_adoption`], taking explicit paths
+/// instead of reading them off `SupervisorConfig`.
+///
+/// Separated so the composition — finding, sidecar read, freshness rule,
+/// adoption verdict — is testable against a `tempfile` tree without mutating
+/// `CARGO_TARGET_DIR`, which `runner_exe_path_resolved` reads at level-1
+/// precedence and which no test may set without breaking its neighbours.
+pub fn evaluate_local_build_adoption_at(
+    legacy_exe: &std::path::Path,
+    target_dir_source: TargetDirSource,
+    picked_slot_id: usize,
+    picked_slot_path: &std::path::Path,
+) -> Option<LocalBuildAdoption> {
+    let finding = compute_pool_behind_local_build(
+        legacy_exe,
+        file_mtime(legacy_exe),
+        picked_slot_id,
+        file_mtime(picked_slot_path),
+    )?;
+    let provenance = read_provenance_beside_exe(legacy_exe);
+    // Derive the sidecar path from the same parent the provenance read uses.
+    // No `unwrap_or_else(exe)` fallback: statting the exe AS its own sidecar is
+    // meaningless, and a parentless exe path has no sidecar to find — `None`
+    // says exactly that.
+    let sidecar_mtime = legacy_exe
+        .parent()
+        .map(|d| d.join(SLOT_PROVENANCE_SIDECAR_FILENAME))
+        .and_then(|p| file_mtime(&p));
+    let adopted =
+        local_build_is_adoptable(provenance.as_ref(), sidecar_mtime, finding.legacy_mtime);
+    Some(LocalBuildAdoption {
+        finding,
+        adopted,
+        target_dir_source,
+        provenance,
+    })
+}
+
 /// Format a [`TargetDebugStaleness`] as a human-readable warning line.
 pub fn format_target_debug_warning(s: &TargetDebugStaleness) -> String {
     let legacy_iso: chrono::DateTime<chrono::Utc> = s.legacy_mtime.into();
     let oldest_iso: chrono::DateTime<chrono::Utc> = s.oldest_slot_mtime.into();
     format!(
         "target_debug_staleness: non-pool exe {} (mtime {}) is older than every \
-         slot exe (oldest slot mtime {}). While a slot exe exists it is not used; \
-         if every slot is emptied, spawn-test {{rebuild:false}} falls through to \
-         it (preference 3) and it is then refused unless allow_stale_fallback is \
-         set. Either rebuild via supervisor (build into a slot) or delete the \
-         stale exe. See feedback_runner_manual_build.",
+         slot exe (oldest slot mtime {}). Being OLDER is what makes it unused: \
+         a non-pool exe NEWER than the picked slot can be adopted over that \
+         slot, but this one loses to every slot. If every slot is emptied, \
+         spawn-test {{rebuild:false}} falls through to it (preference 3) and it \
+         is then refused unless allow_stale_fallback is set. Either rebuild via \
+         supervisor (build into a slot) or delete the stale exe. See \
+         feedback_runner_manual_build.",
         s.legacy_path.display(),
         legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1021,7 +1148,27 @@ pub enum ExeOrigin {
     /// The non-pool cargo target dir — preference 3 — resolved through cargo's
     /// own target-dir precedence. The variant carries WHICH precedence level
     /// won (`CARGO_TARGET_DIR`, `build.target-dir`, workspace default).
+    ///
+    /// **Last-resort fallthrough only.** Reaching it means every build-pool
+    /// slot was empty, so resolution landed on the artifact nobody maintains.
+    /// This is the origin the `LEGACY_EXE_FALLBACK` dev-state names.
     CargoTargetDir(TargetDirSource),
+    /// The SAME path as [`ExeOrigin::CargoTargetDir`], reached deliberately: a
+    /// local build NEWER than the picked slot that carried a vouched provenance
+    /// sidecar describing itself, so resolution ADOPTED it over the slot (see
+    /// [`local_build_is_adoptable`]).
+    ///
+    /// **Why a distinct variant and not a flag on `CargoTargetDir`.** The two
+    /// are the same *path* under opposite *conditions*: the fallthrough means
+    /// "nothing better existed and this artifact has no identity", adoption
+    /// means "something better DID exist and it proved what it is". Adoption
+    /// landed reporting itself as `CargoTargetDir`, and `slot_id() == None` is
+    /// precisely what `LEGACY_EXE_FALLBACK` keys on — so every healthy
+    /// `dev-start.ps1` adoption raised the 2026-06-07 white-screen incident
+    /// state, feeding a risk model that can route a start to the LKG binary.
+    /// That re-creates the exact defect adoption exists to fix, through the
+    /// dev-action door instead of the resolution one.
+    AdoptedLocalBuild(TargetDirSource),
     /// A per-runner `source_exe_override` (today: the LKG pin).
     PinnedOverride,
 }
@@ -1032,6 +1179,9 @@ impl ExeOrigin {
         match self {
             ExeOrigin::Slot(id) => format!("slot-{id}"),
             ExeOrigin::CargoTargetDir(src) => format!("cargo_target_dir:{}", src.label()),
+            ExeOrigin::AdoptedLocalBuild(src) => {
+                format!("adopted_local_build:{}", src.label())
+            }
             ExeOrigin::PinnedOverride => "pinned_override".to_string(),
         }
     }
@@ -1042,6 +1192,27 @@ impl ExeOrigin {
             ExeOrigin::Slot(id) => Some(id),
             _ => None,
         }
+    }
+
+    /// The cargo target-dir precedence level, for the two origins that resolve
+    /// to the non-pool path. `None` for a slot or a pinned override.
+    pub fn target_dir_source(self) -> Option<TargetDirSource> {
+        match self {
+            ExeOrigin::CargoTargetDir(src) | ExeOrigin::AdoptedLocalBuild(src) => Some(src),
+            ExeOrigin::Slot(_) | ExeOrigin::PinnedOverride => None,
+        }
+    }
+
+    /// Did resolution fall THROUGH to the unmaintained non-pool artifact
+    /// because no build-pool slot had an exe at all?
+    ///
+    /// The `LEGACY_EXE_FALLBACK` dev-state predicate — and deliberately NOT
+    /// `slot_id().is_none()`. Since local-build adoption landed there are two
+    /// slot-less origins with opposite meanings, and conflating them reports
+    /// the 2026-06-07 white-screen incident state on the healthy path. See
+    /// [`ExeOrigin::AdoptedLocalBuild`].
+    pub fn is_legacy_fallback(self) -> bool {
+        matches!(self, ExeOrigin::CargoTargetDir(_))
     }
 }
 
@@ -1134,15 +1305,19 @@ pub enum ExeIdentityVerdict {
 /// Refuse to start a runner from an artifact that cannot be shown to be what
 /// was asked for.
 ///
-/// **Scope: the non-pool (`ExeOrigin::CargoTargetDir`) artifact only.** Slot
+/// **Scope: the two non-pool origins only** (`ExeOrigin::CargoTargetDir` and
+/// `ExeOrigin::AdoptedLocalBuild` — the same path, reached by fallthrough and
+/// by adoption respectively; both run this gate). Slot
 /// artifacts keep their existing posture ([`start_provenance_gate`]: refuse only
 /// on POSITIVE evidence of a foreign tree, warn-and-proceed on absence), because
 /// a slot exe at least came from a supervisor build and a refusal there would
 /// brick the normal path.
 ///
-/// **Why absence refuses HERE and warns THERE.** The non-pool artifact is
-/// reached only when NO slot has an exe at all — an already-degenerate state —
-/// and it is the artifact nobody maintains: on the fleet box it was a 54-day-old
+/// **Why absence refuses HERE and warns THERE.** Absence can only arise on the
+/// FALLTHROUGH arm — an adopted local build carries a vouched sidecar by
+/// construction, which is this gate's own allow condition — and fallthrough
+/// happens only when NO slot has an exe at all, an already-degenerate state.
+/// It is then the artifact nobody maintains: on the fleet box it was a 54-day-old
 /// binary that started healthy, served the UI Bridge, and made a
 /// `spawn-test {rebuild:false}` measure code from June while the caller believed
 /// it was testing a branch. Warning about that and launching it anyway is
@@ -1160,7 +1335,13 @@ pub fn unverified_exe_gate(
     let target_dir_source = match resolved.origin {
         // Slots and explicit pins are governed elsewhere.
         ExeOrigin::Slot(_) | ExeOrigin::PinnedOverride => return Ok(ExeIdentityVerdict::Verified),
-        ExeOrigin::CargoTargetDir(src) => src,
+        // Both non-pool origins run the SAME gate. An adopted local build is
+        // vouched by construction, so it takes the allow arm below — but it is
+        // routed through the identical predicate rather than short-circuited,
+        // so a future tightening of the gate cannot be bypassed by having been
+        // adopted. `an_adopted_local_build_passes_the_unverified_exe_gate`
+        // pins the agreement between the two.
+        ExeOrigin::CargoTargetDir(src) | ExeOrigin::AdoptedLocalBuild(src) => src,
     };
 
     // Positive evidence of a vouched supervisor build — allow.
@@ -1237,8 +1418,15 @@ pub async fn resolve_source_exe(
     resolve_source_exe_detailed(state).await.map(|r| r.path)
 }
 
-/// [`resolve_source_exe`] variant that ALSO returns which build-pool slot the
-/// exe came from (`None` for the non-pool preference-3 fallback).
+/// [`resolve_source_exe`] variant that ALSO returns the [`ExeOrigin`] the exe
+/// came from.
+///
+/// It returns the ORIGIN rather than a bare `Option<usize>` slot id because
+/// there are now two slot-less origins with opposite meanings — the
+/// preference-3 fallthrough and an adopted local build — and a caller handed
+/// only `None` cannot tell the incident from the healthy outcome. Callers that
+/// want the slot id call [`ExeOrigin::slot_id`]; callers asking "did we fall
+/// through to the unmaintained artifact?" call [`ExeOrigin::is_legacy_fallback`].
 ///
 /// Exists so the start-path provenance gate can be evaluated on the SAME pick
 /// the resolution deploys: the previous shape (gate runs its own
@@ -1248,12 +1436,12 @@ pub async fn resolve_source_exe(
 /// evaluated. A freshly-succeeded OVERRIDE build is exactly what moves
 /// `last_successful_slot`, i.e. the race window reintroduced the incident
 /// class the gate exists to kill. One pick, gate and path from the same id.
-pub async fn resolve_source_exe_with_slot(
+pub async fn resolve_source_exe_with_origin(
     state: &SharedState,
-) -> Result<(Option<usize>, std::path::PathBuf), SupervisorError> {
+) -> Result<(ExeOrigin, std::path::PathBuf), SupervisorError> {
     resolve_source_exe_detailed(state)
         .await
-        .map(|r| (r.slot_id(), r.path))
+        .map(|r| (r.origin, r.path))
 }
 
 /// Full resolution: the winning path, WHICH source produced it, its mtime and
@@ -1324,28 +1512,11 @@ pub async fn resolve_source_exe_detailed(
         // An explicit LKG request never reaches here — `source_exe_override`
         // short-circuits resolution upstream — so "unless the operator asks for
         // the LKG binary" holds by construction.
-        let (legacy_src, legacy_exe) = state.config.runner_exe_path_resolved();
-        if let Some(finding) = compute_pool_behind_local_build(
-            &legacy_exe,
-            file_mtime(&legacy_exe),
-            picked_id,
-            file_mtime(&picked_path),
-        ) {
-            let legacy_provenance = read_provenance_beside_exe(&legacy_exe);
-            // Derive the sidecar path from the same parent the provenance read
-            // uses. No `unwrap_or_else(exe)` fallback: statting the exe AS its
-            // own sidecar is meaningless, and a parentless exe path has no
-            // sidecar to find — `None` says exactly that.
-            let sidecar_mtime = legacy_exe
-                .parent()
-                .map(|d| d.join(SLOT_PROVENANCE_SIDECAR_FILENAME))
-                .and_then(|p| file_mtime(&p));
-            let adopt = local_build_is_adoptable(
-                legacy_provenance.as_ref(),
-                sidecar_mtime,
-                finding.legacy_mtime,
-            );
-            let msg = format_pool_behind_local_build_warning(&finding, adopt);
+        if let Some(adoption) =
+            evaluate_local_build_adoption(&state.config, picked_id, &picked_path)
+        {
+            let adopt = adoption.adopted;
+            let msg = adoption.message();
             // Adoption is the HEALTHY outcome this fix exists to produce — the
             // operator built, and the operator's build is running. Logging that
             // at WARN on every resolution would train the reader to skim past
@@ -1365,11 +1536,17 @@ pub async fn resolve_source_exe_detailed(
                     .await;
             }
             if adopt {
+                // `AdoptedLocalBuild`, NOT `CargoTargetDir`: same path, opposite
+                // condition. `CargoTargetDir` means resolution fell THROUGH to
+                // the artifact nobody maintains, and that is what the
+                // `LEGACY_EXE_FALLBACK` dev-state names — reporting it here
+                // flags every healthy adoption as the 2026-06-07 white-screen
+                // incident state.
                 return Ok(ResolvedRunnerExe {
-                    mtime: Some(finding.legacy_mtime),
-                    path: legacy_exe,
-                    origin: ExeOrigin::CargoTargetDir(legacy_src),
-                    provenance: legacy_provenance,
+                    mtime: Some(adoption.finding.legacy_mtime),
+                    path: adoption.finding.legacy_path,
+                    origin: ExeOrigin::AdoptedLocalBuild(adoption.target_dir_source),
+                    provenance: adoption.provenance,
                     unverified_warning: None,
                 });
             }
@@ -2550,7 +2727,7 @@ async fn start_exe_mode_for_runner(
                     // `spawn-test {rebuild:false}` iteration measure the wrong
                     // code. Two explicit opt-ins keep the "whatever exists"
                     // case available, and both state the staleness.
-                    ExeOrigin::CargoTargetDir(_) => {
+                    ExeOrigin::CargoTargetDir(_) | ExeOrigin::AdoptedLocalBuild(_) => {
                         let allow = *managed.allow_unverified_exe.read().await
                             || allow_unverified_exe_env();
                         match unverified_exe_gate(allow, &resolved)? {
@@ -6402,7 +6579,10 @@ mod tests {
             let resolved = ResolvedRunnerExe {
                 mtime: Some(mtime),
                 path: legacy_p(),
-                origin: ExeOrigin::CargoTargetDir(TargetDirSource::WorkspaceDefault),
+                // The origin resolution ACTUALLY hands back for an adoption.
+                // Pinning `CargoTargetDir` here would test the gate against a
+                // shape the start path never sees.
+                origin: ExeOrigin::AdoptedLocalBuild(TargetDirSource::WorkspaceDefault),
                 provenance: Some(p),
                 unverified_warning: None,
             };
@@ -6431,6 +6611,206 @@ mod tests {
             Some("65082b7f50fdeb26c2e9105695a017b40be4d764")
         );
         assert_eq!(p.built_from, r"D:\qontinui-root\qontinui-runner");
+    }
+
+    /// **The two slot-less origins must be distinguishable.** Adoption landed
+    /// reporting itself as `CargoTargetDir`, so nothing separated "the
+    /// operator's fresh vouched build is running" from "we fell through to the
+    /// artifact nobody maintains" — and `slot_id().is_none()`, which the
+    /// `LEGACY_EXE_FALLBACK` dev-state keys on, said the incident had happened
+    /// in both cases.
+    #[test]
+    fn the_two_slotless_origins_report_opposite_legacy_fallback_verdicts() {
+        let src = TargetDirSource::WorkspaceDefault;
+        let fallthrough = ExeOrigin::CargoTargetDir(src);
+        let adopted = ExeOrigin::AdoptedLocalBuild(src);
+
+        // Both are slot-less — which is exactly why the old rule conflated them.
+        assert_eq!(fallthrough.slot_id(), None);
+        assert_eq!(adopted.slot_id(), None);
+
+        // ...and they now answer the incident question oppositely.
+        assert!(fallthrough.is_legacy_fallback());
+        assert!(!adopted.is_legacy_fallback());
+
+        // A slot and a pin are never the fallthrough either.
+        assert!(!ExeOrigin::Slot(0).is_legacy_fallback());
+        assert!(!ExeOrigin::PinnedOverride.is_legacy_fallback());
+
+        // Machine-readable labels differ, so logs and API responses can tell
+        // them apart too.
+        assert_ne!(fallthrough.label(), adopted.label());
+        assert_eq!(adopted.label(), "adopted_local_build:workspace_default");
+    }
+
+    /// Both non-pool origins report WHICH cargo precedence level produced them.
+    /// `source_exe_json` renders this field, and it returned `null` for an
+    /// adoption — withholding the env-override-vs-workspace-default split on
+    /// precisely the path where an operator's own build is running.
+    #[test]
+    fn both_non_pool_origins_carry_their_target_dir_source() {
+        for src in [
+            TargetDirSource::CargoTargetDirEnv,
+            TargetDirSource::CargoConfigBuildTargetDir,
+            TargetDirSource::WorkspaceDefault,
+        ] {
+            assert_eq!(
+                ExeOrigin::CargoTargetDir(src).target_dir_source(),
+                Some(src)
+            );
+            assert_eq!(
+                ExeOrigin::AdoptedLocalBuild(src).target_dir_source(),
+                Some(src)
+            );
+        }
+        assert_eq!(ExeOrigin::Slot(1).target_dir_source(), None);
+        assert_eq!(ExeOrigin::PinnedOverride.target_dir_source(), None);
+    }
+
+    /// Write a fake local build plus an optional sidecar. The sidecar is
+    /// written AFTER the exe, so its mtime is >= the exe's — the freshness rule
+    /// adoption requires.
+    fn plant_local_build(
+        dir: &std::path::Path,
+        sidecar: Option<BuildSource>,
+    ) -> std::path::PathBuf {
+        let exe = dir.join(crate::config::RUNNER_BIN_NAME);
+        std::fs::write(&exe, b"exe").expect("write exe");
+        if let Some(source) = sidecar {
+            let body = serde_json::to_string(&prov(source)).expect("serialize provenance");
+            std::fs::write(dir.join(SLOT_PROVENANCE_SIDECAR_FILENAME), body)
+                .expect("write sidecar");
+        }
+        exe
+    }
+
+    /// Plant a slot exe and backdate it, so the comparison is deterministic
+    /// regardless of filesystem timestamp granularity.
+    fn plant_backdated_exe(path: &std::path::Path, body: &[u8]) {
+        std::fs::write(path, body).expect("write exe");
+        backdate(path);
+    }
+
+    /// Push a file's mtime an hour into the past. Explicit rather than relying
+    /// on write ORDER: NTFS timestamp granularity is coarse enough that two
+    /// writes microseconds apart can land on the same mtime, and the comparison
+    /// under test uses a strict `>`.
+    fn backdate(path: &std::path::Path) {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for backdate");
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3_600))
+            .expect("backdate exe");
+    }
+
+    /// **End-to-end composition, on a real tree.** `GET /builds` and the start
+    /// path both go through this, so a defect here is a defect in what the
+    /// operator is told AND in which binary runs. A vouched sidecar written
+    /// with the exe ⇒ adopted.
+    #[test]
+    fn evaluate_local_build_adoption_adopts_a_vouched_newer_local_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local = root.path().join("target").join("debug");
+        let slot = root.path().join("slot-0").join("debug");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        std::fs::create_dir_all(&slot).expect("mkdir slot");
+
+        let slot_exe = slot.join(crate::config::RUNNER_BIN_NAME);
+        plant_backdated_exe(&slot_exe, b"slot");
+        let local_exe = plant_local_build(&local, Some(BuildSource::LiveTree));
+
+        let a = evaluate_local_build_adoption_at(
+            &local_exe,
+            TargetDirSource::WorkspaceDefault,
+            0,
+            &slot_exe,
+        )
+        .expect("a newer local build must produce a finding");
+        assert!(a.adopted, "vouched sidecar written with the exe must adopt");
+        assert_eq!(a.finding.picked_slot_id, 0);
+        assert_eq!(a.target_dir_source, TargetDirSource::WorkspaceDefault);
+        assert_eq!(
+            a.provenance.as_ref().map(|p| p.source),
+            Some(BuildSource::LiveTree)
+        );
+        let msg = a.message();
+        assert!(msg.contains("running the local build"), "{msg}");
+    }
+
+    /// The unstamped case — a hand-run `cargo build`, or `npm run tauri dev`
+    /// overwriting the path. Still REPORTED (the operator must learn their
+    /// build is not running), but not adopted.
+    #[test]
+    fn evaluate_local_build_adoption_refuses_an_unstamped_newer_local_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local = root.path().join("target").join("debug");
+        let slot = root.path().join("slot-1").join("debug");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        std::fs::create_dir_all(&slot).expect("mkdir slot");
+
+        let slot_exe = slot.join(crate::config::RUNNER_BIN_NAME);
+        plant_backdated_exe(&slot_exe, b"slot");
+        let local_exe = plant_local_build(&local, None);
+
+        let a = evaluate_local_build_adoption_at(
+            &local_exe,
+            TargetDirSource::CargoTargetDirEnv,
+            1,
+            &slot_exe,
+        )
+        .expect("the finding is reported even when adoption is refused");
+        assert!(!a.adopted, "no sidecar must never adopt");
+        assert!(a.provenance.is_none());
+        let msg = a.message();
+        assert!(msg.contains("running the SLOT exe"), "{msg}");
+        assert!(msg.contains("NOT what is running"), "{msg}");
+    }
+
+    /// The healthy steady state: the slot IS the freshest artifact. Nothing to
+    /// report, so `GET /builds` renders `null` rather than a reassuring-looking
+    /// object.
+    #[test]
+    fn evaluate_local_build_adoption_is_silent_when_the_slot_is_newer() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let local = root.path().join("target").join("debug");
+        let slot = root.path().join("slot-0").join("debug");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        std::fs::create_dir_all(&slot).expect("mkdir slot");
+
+        let local_exe = plant_local_build(&local, Some(BuildSource::LiveTree));
+        // Backdate the LOCAL build this time; the slot is written after it.
+        backdate(&local_exe);
+        let slot_exe = slot.join(crate::config::RUNNER_BIN_NAME);
+        std::fs::write(&slot_exe, b"slot").expect("write slot exe");
+
+        assert!(evaluate_local_build_adoption_at(
+            &local_exe,
+            TargetDirSource::WorkspaceDefault,
+            0,
+            &slot_exe,
+        )
+        .is_none());
+    }
+
+    /// A missing local build is not a finding — an unreadable mtime is UNKNOWN,
+    /// and unknown is never rendered as "your build is not running".
+    #[test]
+    fn evaluate_local_build_adoption_is_silent_without_a_local_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let slot = root.path().join("slot-0").join("debug");
+        std::fs::create_dir_all(&slot).expect("mkdir slot");
+        let slot_exe = slot.join(crate::config::RUNNER_BIN_NAME);
+        plant_backdated_exe(&slot_exe, b"slot");
+        let absent = root.path().join("target").join("debug").join("nope.exe");
+
+        assert!(evaluate_local_build_adoption_at(
+            &absent,
+            TargetDirSource::WorkspaceDefault,
+            0,
+            &slot_exe,
+        )
+        .is_none());
     }
 
     /// The two warning texts must be distinguishable: one says the local build

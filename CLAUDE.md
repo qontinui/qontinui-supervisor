@@ -767,7 +767,7 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 
 **Why `--features custom-protocol` is mandatory:** without it, the `tauri` crate compiles with `cfg(dev)` active and the binary loads the frontend from `devUrl` (`http://localhost:1420`) instead of embedding `dist/`. No Vite dev server is running, so the webview would show `ERR_CONNECTION_REFUSED`.
 
-**Why you must build into a slot dir:** the supervisor's `resolve_source_exe` picks the source exe from `last_successful_slot` first, then scans other slots, and only falls back to the non-pool cargo target dir last. On every runner start it copies the source over `target/debug/qontinui-runner-{id}.exe` — so building into a non-pool `target/` means the supervisor may overwrite it with a stale slot exe. It is also the only build that produces **no provenance sidecar**, so if resolution ever does reach it, the start is refused as unverified (see "Exe resolution order" below) unless you opt in explicitly.
+**Why you must build into a slot dir:** the supervisor's `resolve_source_exe` picks the source exe from `last_successful_slot` first, then scans other slots, and reaches the non-pool cargo target dir only as a last-resort fallback — or by adopting it over a staler slot, which requires a vouched provenance sidecar your manual build does not write. On every runner start it copies the source over `target/debug/qontinui-runner-{id}.exe` — so building into a non-pool `target/` means the supervisor may overwrite it with a stale slot exe. It is also the only build that produces **no provenance sidecar**, so if resolution ever does reach it, the start is refused as unverified (see "Exe resolution order" below) unless you opt in explicitly.
 
 **Supervisor source of truth:** the exact args are assembled in `src/build_monitor.rs::run_build_inner`. If this doc drifts from that code, that file wins.
 
@@ -778,7 +778,7 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 | Directory | Purpose | Who writes it |
 |-----------|---------|---------------|
 | `target-pool/slot-{0,1,2}/debug/` | Supervisor parallel build pool (default 3 slots). Each spawn with `rebuild: true` claims a slot and sets `CARGO_TARGET_DIR` to the slot dir. | Supervisor via `run_cargo_build` |
-| `target/debug/` | Legacy / manual `cargo build` output. Fallback only if no slot exe exists. | Manual `cargo build` |
+| `target/debug/` | Non-pool build output — a manual `cargo build`, and everything `dev-start.ps1` compiles. Used as a last-resort fallback when no slot exe exists, **or** adopted over a staler slot when it proves what it is (see "A newer local build wins" below). | Manual `cargo build`, `dev-start.ps1` |
 
 ### Exe resolution order (when `rebuild: false`)
 
@@ -790,6 +790,61 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
    precedence — `CARGO_TARGET_DIR` → `build.target-dir` from the applicable
    `.cargo/config.toml` → the workspace default `<runner>/target` — taking the
    first candidate that actually holds a runner exe.
+
+…with one **override on 1/2**: a non-pool build that is NEWER than the picked
+slot and can prove what it is beats that slot. See the next section.
+
+#### A newer local build wins over a staler slot
+
+`dev-start.ps1` compiles the runner with **no `CARGO_TARGET_DIR`**, so its
+artifact lands in the non-pool `target/debug/`. While that path was reachable
+only as preference 3 ("no slot has an exe"), and slots effectively always
+exist, an operator rebuild was discarded *by construction* while the console
+printed "Runner binary rebuilt". Measured 2026-08-29: the operator's build
+landed at 15:59Z, the supervisor resolved slot 0 (built 22:31Z the previous
+day), and two rebuilds in a row silently ran 17.5-hour-old code.
+
+Resolution now compares the two and **prefers the newer local build**, but only
+when `local_build_is_adoptable` — a vouched (`live_tree` / `origin_main`)
+provenance sidecar that is **at least as new as the exe it describes**. mtime
+says *when* a file was written, not *what is in it*, so an unidentified artifact
+is never promoted over a slot on mtime alone. The sidecar-freshness half is what
+stops `npm run tauri dev` — which rewrites the same path without
+`custom-protocol`, writes no sidecar, and shows "refused to connect" when
+launched standalone — from being adopted on the strength of an older stamp it
+did not write.
+
+When the local build is newer but NOT adoptable, the slot still wins and the
+operator is told plainly, at WARN, that their build is not what is running.
+Adoption itself logs at INFO — it is the healthy outcome, and putting it at WARN
+would train the reader to skim past the line that matters.
+
+**The two outcomes are different `ExeOrigin`s, and the difference is
+load-bearing.** Adoption reports `adopted_local_build:<precedence-level>`;
+the last-resort fallthrough reports `cargo_target_dir:<precedence-level>`. They
+are the same *path* under opposite *conditions* — "something better existed and
+proved itself" versus "nothing better existed and this has no identity" — and
+both are slot-less. The `LEGACY_EXE_FALLBACK` dev-state
+(`src/dev_action/states.rs`) keys on the FALLTHROUGH origin via
+`ExeOrigin::is_legacy_fallback()`, **never** on `slot_id.is_none()`: that
+spelling reported the 2026-06-07 white-screen incident state on every healthy
+`dev-start.ps1` rebuild, feeding a risk model (`dev_action::policy`) that can
+route a start to the LKG binary — i.e. to code OLDER than the operator just
+built, re-creating the defect adoption exists to fix.
+
+An explicit LKG request never reaches any of this: `source_exe_override`
+short-circuits resolution upstream.
+
+**`GET /builds` answers "is my build what runs?" without starting anything.**
+`pool_behind_local_build` is non-null whenever the picked slot is older than the
+local build, and carries `adopted` (true = the local build runs; false = the
+slot runs and your build does not), plus `legacy_path`, both mtimes,
+`picked_slot_id`, `target_dir_source`, `local_build_sha` / `local_build_source`
+(`null` = no sidecar, which is also *why* `adopted` is false) and the same
+message the log carries. It is derived from the same evaluator the start path
+runs, so the two can never disagree. The adjacent `legacy_target_debug_warning`
+is the **opposite** direction (legacy older than every slot) and the two are
+mutually exclusive by construction.
 
 **Preference 3 used to be a hardcoded `<runner>/target/debug/`, and that was a
 verification-integrity defect.** Every build on this fleet exports
@@ -809,7 +864,9 @@ the test simply measured the wrong code. Repointing the constant at
 `src-tauri/target` would have inverted the bug onto every environment that sets
 no override, hence the precedence ladder.
 
-**Preference 3 now REFUSES rather than spawning silently.** A non-pool artifact
+**The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
+adopted local build is unaffected — it carries a vouched sidecar by
+construction, which is this gate's own allow condition.) A fallthrough artifact
 carries no provenance sidecar, so its build identity is unknown — and unknown
 reads as *refuse*, not as *fine* (`unverified_exe_gate`). The start fails with
 `409 {"error": "unverified_runner_exe"}` naming the resolved path, its mtime,
@@ -824,7 +881,10 @@ response** instead of going quiet:
 
 **Every spawn response (and `GET /runners`) now carries `source_exe`** —
 `{path, origin, slot_id, target_dir_source, mtime, build_sha, build_source,
-unverified_warning}`. Nothing reported the path before, which is the whole
+unverified_warning}`. `origin` distinguishes `slot-N` /
+`adopted_local_build:<level>` / `cargo_target_dir:<level>` / `pinned_override`;
+`target_dir_source` is non-null for BOTH non-pool origins, so the
+env-override-vs-workspace-default split is visible on the adoption path too. Nothing reported the path before, which is the whole
 reason the stale spawn survived a full manual-test iteration.
 
 Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process. The `qontinui-shim.exe` sidecar rides along on every start: the supervisor builds it into the same slot right after the runner build (fail-open), preserves it in the LKG dir, and copies it from next to the source exe to next to the exe copy (`deploy_shim_sidecar` in `src/process/manager.rs`). The runner materializes terminal identity shims from the stub next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed shim build/copy logs a WARN ("identity shims will be stale") but never fails the build or start.

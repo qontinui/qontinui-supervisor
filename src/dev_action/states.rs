@@ -11,13 +11,22 @@
 //!
 //! # The genuinely-new signal
 //!
-//! `LEGACY_EXE_FALLBACK` is the signal §2 of the plan calls out as missing: the
-//! `Option<usize>` slot id returned by
-//! [`crate::process::manager::resolve_source_exe_with_slot`] is `None` exactly
-//! when resolution fell back to the legacy `target/debug` exe (preference 3) —
-//! the months-old binary with no embedded assets that white-screened the
-//! primary on 2026-06-07. This is distinct from `compute_stale_binary`
-//! (slot-drift), which is structurally incapable of catching the no-slot case.
+//! `LEGACY_EXE_FALLBACK` is the signal §2 of the plan calls out as missing:
+//! resolution fell back to the legacy `target/debug` exe (preference 3) — the
+//! months-old binary with no embedded assets that white-screened the primary on
+//! 2026-06-07. This is distinct from `compute_stale_binary` (slot-drift), which
+//! is structurally incapable of catching the no-slot case.
+//!
+//! It is read from the [`ExeOrigin`] returned by
+//! [`crate::process::manager::resolve_source_exe_with_origin`], **not** from a
+//! `None` slot id. A `None` slot id used to mean the fallthrough and nothing
+//! else; since local-build adoption landed it ALSO means the supervisor
+//! deliberately ran a vouched local build that was newer than the picked slot —
+//! the healthy outcome. Keying on `slot_id.is_none()` therefore reported the
+//! 2026-06-07 incident state on every `dev-start.ps1` rebuild, into a risk model
+//! (`dev_action::policy`) that can route a start to the LKG binary — which would
+//! have re-created the stale-code defect adoption exists to fix.
+//! [`ExeOrigin::is_legacy_fallback`] is the predicate that tells them apart.
 //!
 //! # Pure cores + an async gatherer
 //!
@@ -31,6 +40,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::dev_action::record::{DevState, DevStateEval, Eval};
+use crate::process::manager::ExeOrigin;
 use crate::state::SharedState;
 
 /// Convert a bool to an [`Eval`] (`True`/`False`). For predicates where a
@@ -44,12 +54,15 @@ fn eval_bool(b: bool) -> Eval {
     }
 }
 
-/// `LEGACY_EXE_FALLBACK` from the resolved slot id. `None` ⇒ legacy fallback
-/// (the genuinely-new signal). Pure — the caller supplies the slot id from
-/// `resolve_source_exe_with_slot`. A resolution *error* (no exe anywhere) is
-/// surfaced by the caller as `Unknown`, not by this function.
-pub fn legacy_exe_fallback_from_slot(slot_id: Option<usize>) -> Eval {
-    eval_bool(slot_id.is_none())
+/// `LEGACY_EXE_FALLBACK` from the resolved [`ExeOrigin`]. Pure — the caller
+/// supplies the origin from `resolve_source_exe_with_origin`. A resolution
+/// *error* (no exe anywhere) is surfaced by the caller as `Unknown`, not by
+/// this function.
+///
+/// Delegates to [`ExeOrigin::is_legacy_fallback`] rather than re-deriving the
+/// rule, so the state can never drift from what resolution means by it.
+pub fn legacy_exe_fallback_from_origin(origin: ExeOrigin) -> Eval {
+    eval_bool(origin.is_legacy_fallback())
 }
 
 /// `SLOTS_EMPTY`: true when none of the given slot exe paths exist on disk.
@@ -147,11 +160,11 @@ fn newest_frontend_src_mtime(npm_dir: &Path) -> Option<SystemTime> {
 /// Evaluate the full supervisor-scoped seed set at action time.
 ///
 /// Cheap reads of in-memory + on-disk facts — the green path stays
-/// non-blocking (success criterion 6). The `slot_id` argument is the
-/// `Option<usize>` from `resolve_source_exe_with_slot`; pass `None` if
-/// resolution was not run for this action (then `LEGACY_EXE_FALLBACK` is
-/// reported `Unknown` rather than falsely `True`).
-pub async fn evaluate_all(state: &SharedState, slot_id: SlotResolution) -> Vec<DevStateEval> {
+/// non-blocking (success criterion 6). The `origin` argument is the
+/// [`ExeOrigin`] from `resolve_source_exe_with_origin`; pass
+/// [`SlotResolution::NotEvaluated`] if resolution was not run for this action
+/// (then `LEGACY_EXE_FALLBACK` is reported `Unknown` rather than falsely `True`).
+pub async fn evaluate_all(state: &SharedState, resolution: SlotResolution) -> Vec<DevStateEval> {
     let npm_dir = state.config.runner_npm_dir();
 
     // SLOTS_EMPTY — do any build-pool slot exes exist?
@@ -167,9 +180,11 @@ pub async fn evaluate_all(state: &SharedState, slot_id: SlotResolution) -> Vec<D
         .collect();
     let slots_empty = slots_empty_from_paths(&slot_exe_paths);
 
-    // LEGACY_EXE_FALLBACK — None slot id from resolution ⇒ legacy fallback.
-    let legacy_fallback = match slot_id {
-        SlotResolution::Resolved(id) => legacy_exe_fallback_from_slot(id),
+    // LEGACY_EXE_FALLBACK — the preference-3 fallthrough origin. NOT a `None`
+    // slot id: an adopted local build is also slot-less and is the HEALTHY
+    // outcome (see the module docs).
+    let legacy_fallback = match resolution {
+        SlotResolution::Resolved(origin) => legacy_exe_fallback_from_origin(origin),
         SlotResolution::NotEvaluated => Eval::Unknown,
     };
 
@@ -221,8 +236,10 @@ pub async fn evaluate_all(state: &SharedState, slot_id: SlotResolution) -> Vec<D
 /// signal, not `Unknown`, for the motivating restart case.
 #[derive(Debug, Clone, Copy)]
 pub enum SlotResolution {
-    /// Resolution ran; carries the `Option<usize>` slot id (`None` = legacy).
-    Resolved(Option<usize>),
+    /// Resolution ran; carries the [`ExeOrigin`] it picked. The origin (not a
+    /// bare slot id) because two different origins are slot-less and mean
+    /// opposite things — see the module docs.
+    Resolved(ExeOrigin),
     /// Resolution was not run for this action.
     NotEvaluated,
 }
@@ -233,13 +250,68 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    use crate::config::TargetDirSource;
+
     #[test]
-    fn legacy_fallback_true_when_slot_none_false_otherwise() {
-        // `None` slot id ⇒ legacy fallback — the genuinely-new signal.
-        assert_eq!(legacy_exe_fallback_from_slot(None), Eval::True);
-        // A real slot id ⇒ not a fallback.
-        assert_eq!(legacy_exe_fallback_from_slot(Some(0)), Eval::False);
-        assert_eq!(legacy_exe_fallback_from_slot(Some(2)), Eval::False);
+    fn legacy_fallback_true_on_the_fallthrough_false_for_a_slot() {
+        // The preference-3 fallthrough ⇒ legacy fallback — the genuinely-new
+        // signal.
+        assert_eq!(
+            legacy_exe_fallback_from_origin(ExeOrigin::CargoTargetDir(
+                TargetDirSource::WorkspaceDefault
+            )),
+            Eval::True
+        );
+        // A real slot ⇒ not a fallback.
+        assert_eq!(
+            legacy_exe_fallback_from_origin(ExeOrigin::Slot(0)),
+            Eval::False
+        );
+        assert_eq!(
+            legacy_exe_fallback_from_origin(ExeOrigin::Slot(2)),
+            Eval::False
+        );
+    }
+
+    /// **The regression this predicate was rewritten for.** An adopted local
+    /// build is slot-less, exactly like the preference-3 fallthrough — so while
+    /// the state was derived from `slot_id.is_none()`, every healthy
+    /// `dev-start.ps1` rebuild reported `LEGACY_EXE_FALLBACK`, i.e. the
+    /// 2026-06-07 white-screen incident state. `dev_action::policy` treats that
+    /// state as incident context and can route the start to the LKG binary,
+    /// which would have run OLDER code than the operator just built — the very
+    /// defect adoption exists to fix, re-entered through the dev-action door.
+    ///
+    /// Adoption is the healthy outcome and must read `False`.
+    #[test]
+    fn an_adopted_local_build_is_not_a_legacy_fallback() {
+        for src in [
+            TargetDirSource::WorkspaceDefault,
+            TargetDirSource::CargoTargetDirEnv,
+            TargetDirSource::CargoConfigBuildTargetDir,
+        ] {
+            assert_eq!(
+                legacy_exe_fallback_from_origin(ExeOrigin::AdoptedLocalBuild(src)),
+                Eval::False,
+                "an adopted local build ({src:?}) is the HEALTHY outcome, never the incident state"
+            );
+            // ...and the fallthrough on the SAME precedence level still is one,
+            // so the distinction is the origin and not the target-dir source.
+            assert_eq!(
+                legacy_exe_fallback_from_origin(ExeOrigin::CargoTargetDir(src)),
+                Eval::True
+            );
+        }
+    }
+
+    /// A pinned override (the LKG pin) is slot-less too, and was equally
+    /// mis-reported by the old `slot_id.is_none()` rule.
+    #[test]
+    fn a_pinned_override_is_not_a_legacy_fallback() {
+        assert_eq!(
+            legacy_exe_fallback_from_origin(ExeOrigin::PinnedOverride),
+            Eval::False
+        );
     }
 
     #[test]

@@ -103,8 +103,8 @@ async fn mint_primary_action(
     // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
     // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
     // unevaluated so the state surfaces as `Unknown`, never a false `False`.
-    let slot_resolution = match manager::resolve_source_exe_with_slot(state).await {
-        Ok((slot_id, _)) => SlotResolution::Resolved(slot_id),
+    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+        Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
     let states = evaluate_all(state, slot_resolution).await;

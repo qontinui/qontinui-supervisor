@@ -496,9 +496,14 @@ pub async fn source_exe_json(managed: &crate::state::ManagedRunner) -> serde_jso
     let Some(r) = managed.resolved_exe.read().await.clone() else {
         return serde_json::Value::Null;
     };
-    let target_dir_source = match r.origin {
-        crate::process::manager::ExeOrigin::CargoTargetDir(src) => json!(src.label()),
-        _ => serde_json::Value::Null,
+    // Both non-pool origins resolve through cargo's precedence ladder, so both
+    // report which level won. Matching only `CargoTargetDir` here reported
+    // `null` for an adopted local build — precisely the
+    // env-override-vs-workspace-default split this field exists to make
+    // visible, withheld on the path where an operator's own build is running.
+    let target_dir_source = match r.origin.target_dir_source() {
+        Some(src) => json!(src.label()),
+        None => serde_json::Value::Null,
     };
     json!({
         "path": r.path.display().to_string(),
@@ -2130,8 +2135,8 @@ async fn mint_spawn_action(
     // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
     // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
     // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
-    let slot_resolution = match manager::resolve_source_exe_with_slot(state).await {
-        Ok((slot_id, _)) => SlotResolution::Resolved(slot_id),
+    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+        Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
     let states = evaluate_all(state, slot_resolution).await;
@@ -5528,11 +5533,10 @@ pub async fn list_builds(
         ),
     };
     let slot_freshness_warning = freshness.drift.as_ref().map(|d| {
-        let source_label = |s: &crate::process::manager::BuildSource| match s {
-            crate::process::manager::BuildSource::LiveTree => "live_tree",
-            crate::process::manager::BuildSource::OriginMain => "origin_main",
-            crate::process::manager::BuildSource::Override => "override",
-        };
+        // The shared vocabulary, not a local copy of it — see
+        // `manager::source_label`.
+        let source_label =
+            |s: &crate::process::manager::BuildSource| crate::process::manager::source_label(*s);
         json!({
             "picked_slot_id": d.picked_slot_id,
             "picked_sha": d.picked_sha,
@@ -5556,6 +5560,37 @@ pub async fn list_builds(
             "legacy_mtime": legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             "oldest_slot_mtime": oldest_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             "message": crate::process::manager::format_target_debug_warning(s),
+        })
+    });
+    // The OPPOSITE direction, and the one that actually costs an operator a
+    // rebuild: the picked slot exe is OLDER than a local `target/debug` build.
+    // `adopted` says which binary resolution will actually run — the whole
+    // question an operator has after typing `dev-start.ps1`. Without this the
+    // answer lived only in supervisor.log, discoverable only by knowing to grep
+    // for it, while the strictly less consequential opposite direction had a
+    // JSON field. Derived from the SAME evaluator the start path runs, so the
+    // two can never disagree.
+    let pool_behind_local_build = freshness.local_build_adoption.as_ref().map(|a| {
+        let legacy_iso: chrono::DateTime<chrono::Utc> = a.finding.legacy_mtime.into();
+        let slot_iso: chrono::DateTime<chrono::Utc> = a.finding.picked_slot_mtime.into();
+        json!({
+            "legacy_path": a.finding.legacy_path.to_string_lossy(),
+            "legacy_mtime": legacy_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "picked_slot_id": a.finding.picked_slot_id,
+            "picked_slot_mtime": slot_iso.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "target_dir_source": a.target_dir_source.label(),
+            // true  = resolution runs the LOCAL build (the operator's rebuild wins)
+            // false = resolution runs the SLOT exe (the operator's build is NOT running)
+            "adopted": a.adopted,
+            // Why it was or was not adoptable. `null` = no provenance sidecar
+            // beside the local build, which is an honest UNKNOWN and is itself
+            // the reason `adopted` is false — never read it as "fine".
+            "local_build_sha": a.provenance.as_ref().and_then(|p| p.sha.clone()),
+            "local_build_source": a
+                .provenance
+                .as_ref()
+                .map(|p| crate::process::manager::source_label(p.source)),
+            "message": a.message(),
         })
     });
 
@@ -5600,6 +5635,12 @@ pub async fn list_builds(
         "origin_main_drift_probe": origin_main_drift_probe,
         "slot_freshness_warning": slot_freshness_warning,
         "legacy_target_debug_warning": legacy_target_debug_warning,
+        // `legacy_target_debug_warning`'s opposite direction: the picked slot
+        // is OLDER than a local build. `adopted` says which binary actually
+        // runs. Mutually exclusive with the field above by construction — one
+        // needs the legacy exe older than every slot, the other needs it newer
+        // than the picked slot.
+        "pool_behind_local_build": pool_behind_local_build,
         // Build-artifact footprint snapshot (plan
         // 2026-06-05-supervisor-build-artifact-footprint). `null` until the
         // first refresh; carries its own `computed_at` for staleness. Force a
