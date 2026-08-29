@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useUIElement } from '@qontinui/ui-bridge/react';
-import { api, RecentCrashSummary, RunnerTaskRun, UiErrorSummary, RunnerDerivedStatus } from '../lib/api';
+import {
+  api,
+  RecentCrashSummary,
+  RunnerTaskRun,
+  UiErrorSummary,
+  RunnerDerivedStatus,
+} from '../lib/api';
 import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
 
 type ActionState = string | null;
@@ -163,6 +169,7 @@ export default function RunnerMonitor() {
   const [runnerHealth, setRunnerHealth] = useState<Record<string, unknown> | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [taskRuns, setTaskRuns] = useState<RunnerTaskRun[]>([]);
+  const [taskRunsScope, setTaskRunsScope] = useState<string | null>(null);
   const [taskRunsError, setTaskRunsError] = useState<string | null>(null);
   const [resultTitle, setResultTitle] = useState<string>('');
   const [resultContent, setResultContent] = useState<string>('');
@@ -208,12 +215,14 @@ export default function RunnerMonitor() {
     setBusy('Refresh Tasks');
     api
       .runnerTaskRunsRunning()
-      .then((runs) => {
-        setTaskRuns(Array.isArray(runs) ? runs : []);
+      .then((response) => {
+        setTaskRuns(response.task_runs);
+        setTaskRunsScope(response.scope);
         setTaskRunsError(null);
       })
       .catch((e) => {
         setTaskRuns([]);
+        setTaskRunsScope(null);
         setTaskRunsError(String(e));
       })
       .finally(() => setBusy(null));
@@ -312,6 +321,14 @@ export default function RunnerMonitor() {
               </button>
             </div>
           </div>
+          {taskRunsScope && (
+            <div
+              className="text-muted"
+              style={{ fontSize: '0.75rem', marginTop: '0.5rem', fontStyle: 'italic' }}
+            >
+              Scope: {taskRunsScope}
+            </div>
+          )}
           {taskRunsError && (
             <div
               className="text-mono text-danger"
@@ -322,7 +339,7 @@ export default function RunnerMonitor() {
           )}
           {taskRuns.length === 0 && !taskRunsError && (
             <div className="text-muted" style={{ marginTop: '0.5rem' }}>
-              No running task runs
+              No running task runs{taskRunsScope ? ` — ${taskRunsScope}` : ''}
             </div>
           )}
           {taskRuns.map((run) => (

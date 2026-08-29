@@ -736,6 +736,16 @@ export interface RunnerTaskRun {
   [key: string]: unknown;
 }
 
+// `GET /task-runs/running` response envelope. `scope` qualifies exactly what
+// `task_runs` covers: workflow task-runs on the runner API port (9876), NOT a
+// session census — an empty `task_runs` array means no workflow task-runs are
+// running, not that the runner is idle. See /restart-readiness for that
+// question. (Plan: 2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner.)
+export interface RunningTaskRunsResponse {
+  scope: string;
+  task_runs: RunnerTaskRun[];
+}
+
 export const api = {
   // Velocity
   ingest: () => fetchJson<IngestResult>('/velocity/ingest', { method: 'POST' }),
@@ -945,7 +955,8 @@ export const api = {
 
   // Runner Monitor (proxied to runner at port 9876)
   runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
-  runnerTaskRunsRunning: () => fetchJson<RunnerTaskRun[]>('/runner-api/task-runs/running'),
+  runnerTaskRunsRunning: () =>
+    fetchJson<RunningTaskRunsResponse>('/runner-api/task-runs/running'),
   runnerWorkflowState: (id: string) =>
     fetchJson<Record<string, unknown>>(
       `/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`,
