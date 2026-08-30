@@ -136,8 +136,13 @@ param(
     [switch]$Build,
     [switch]$SkipFrontend,
     [int]$Port = 9875,
-    [string]$ProjectDir = 'D:\qontinui-root\qontinui-runner\src-tauri',
-    [string]$LogFile = 'D:\qontinui-root\.dev-logs\runner-tauri.log',
+    # Derived, not hardcoded: $QONTINUI_ROOT if set, else the grandparent of
+    # this script (<root>/qontinui-supervisor/scripts). $PSScriptRoot IS bound
+    # during param-default evaluation -- verified, not assumed. An explicit
+    # -ProjectDir / -LogFile still wins, so behaviour is unchanged for callers
+    # that pass one.
+    [string]$ProjectDir = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) 'qontinui-runner\src-tauri'),
+    [string]$LogFile = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) '.dev-logs\runner-tauri.log'),
     [switch]$Watchdog = $true,
     [switch]$ForceKillRunners
 )

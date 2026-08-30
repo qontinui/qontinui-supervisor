@@ -365,7 +365,10 @@ param(
     # No default on purpose -- see .PARAMETER RunnerRepo. An unbound value is
     # resolved from GET /health, and an unresolvable one aborts the preflight.
     [string]$RunnerRepo = '',
-    [string]$ForeignTargetDir = 'D:\qontinui-root\qontinui-supervisor\target',
+    # Derived, not hardcoded -- see -ProjectDir in restart-supervisor.ps1 for the
+    # same idiom. This one names THIS repo's own target dir, so it follows the
+    # script rather than the operator's drive.
+    [string]$ForeignTargetDir = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) 'qontinui-supervisor\target'),
     [int]$PoolSize = 0,
     [switch]$SkipV1,
     [switch]$SkipV2,
