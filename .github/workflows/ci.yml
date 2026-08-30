@@ -14,8 +14,17 @@ on:
       - 'merge-candidate/**'
       - 'merge-candidate-spec/**'
       - 'merge-candidate-batch/**'
+  # Unfiltered on purpose. A PR based on another PR's head branch (a stacked
+  # PR) is still a PR whose tree coord may be asked to land, and a
+  # `branches: [main]` filter silently gives it ZERO checks — the structural
+  # CI gap plan 2026-08-23-stacked-pr-ci-parity Phase 5 closes. That plan
+  # scoped Phase 5 to ui-bridge and qontinui-runner and left this repo on
+  # Phase 4 (the merge-candidate globs above) alone, so supervisor was the
+  # one repo that got the candidate lane without the PR lane. Broadening
+  # rather than adding a separate fast lane is the ui-bridge arm of Phase 5,
+  # and it applies here for the same reason: this repo is PUBLIC, so Actions
+  # minutes are unbilled, and a full pass is ~6 wall-clock minutes.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
