@@ -579,7 +579,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     watchdog,
                     // Phase 3b — classified from the SAME tick's live listener
                     // probe, never from a remembered or assumed port state.
-                    liveness: runner_state.liveness(runner_port_open),
+                    liveness: runner_state.liveness(runner_port_open, runner_responding),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
                 });
                 drop(runner_state);

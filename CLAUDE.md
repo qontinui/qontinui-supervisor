@@ -27,7 +27,7 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Scope: primary only by default.** Under `--watchdog` the primary's per-runner `WatchdogState.enabled` defaults true; named/temp/external default false. Arm any runner explicitly via `POST /runners/{id}/watchdog {"enabled": true}`.
 - **Crash-loop guard:** exponential backoff 5s → 30s → 120s between attempts; max 3 auto-restarts per rolling 30 minutes, then the watchdog disarms itself (`disabled_reason: "crash loop — operator required"`, `enabled` left true so intent stays visible) with an ERROR log + diagnostics event. Reset via `POST /runners/{id}/watchdog {"enabled": true, "reset_attempts": true}`.
 - **Kill-switch:** env `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all crash auto-restarts without a rebuild.
-- **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream.
+- **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream. A runner that is alive but not answering is reported as `liveness.state: "wedged"` rather than as healthy — see "Liveness on `GET /runners`".
 
 - **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners. They are also the **only** kind subject to a max-age bound — see "Temp runner isolation and max age" below.
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
@@ -162,8 +162,8 @@ cargo clippy -- -D warnings    # Lint
 | `-w, --watchdog` | Enable health monitoring + crash-only auto-restart of the primary (implies `--auto-start`; see "Crash-only ambient watchdog"). Kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`. |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--expo-dir` | Path to Expo/React Native project directory |
-| `-l, --log-file` | Append the in-memory log buffer to this file (persistent supervisor log, no rotation). Overrides `<log-dir>/supervisor.log`. |
-| `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. No rotation. |
+| `-l, --log-file` | Append the in-memory log buffer to this file (persistent supervisor log; size+age rotated, see "Persistent Logs"). Overrides `<log-dir>/supervisor.log`. |
+| `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. Every file is size+age rotated with a retained-segment cap. |
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
 
@@ -399,7 +399,52 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 
 **Precedence:** `--log-file <PATH>` overrides the default `<log-dir>/supervisor.log` location but does NOT affect per-runner files; for per-runner files you must set `--log-dir`.
 
-**No rotation.** Files grow unbounded — rotate externally (logrotate, PowerShell scheduled task, etc.) if size becomes an issue. Supervisor reopens files with `O_APPEND` semantics, so rotating out-of-process with `copytruncate`-style tools is safe; rename+signal style rotation will keep writing to the moved file and you must restart the supervisor.
+**Rotation is built in** (`log_capture::RotatingLogFile`). Every capture file
+— `supervisor.log` and each per-runner `<runner-id>.log` — rolls over to
+`<stem>.<YYYYMMDDTHHMMSSmmmZ>-<nnn>.<ext>` before it would exceed **64 MiB**, or
+once the live segment has been open **24h**, whichever comes first; the **5**
+newest rolled-over segments are retained and older ones are deleted. That is a
+~384 MiB ceiling per log. Both parts of the rotated name are fixed-width so a
+lexicographic sort is a chronological sort — which is what makes pruning delete
+the OLDEST segment rather than an arbitrary one.
+
+**Why it is in-process and not left to logrotate.** It wasn't bounded at all,
+and `.dev-logs/primary.log` was measured at **1.85 GB** on 2026-08-30 after a
+wedged runner spent ~14h flooding it. "Rotate externally" is advice nothing on
+this fleet was following, on a box where every build slot shares the disk.
+
+| Knob | Default | Clamp |
+|---|---|---|
+| `QONTINUI_SUPERVISOR_LOG_MAX_BYTES` | 67108864 (64 MiB) | [1 MiB, 8 GiB] |
+| `QONTINUI_SUPERVISOR_LOG_MAX_AGE_SECS` | 86400 (24h) | [60, 2592000] |
+| `QONTINUI_SUPERVISOR_LOG_MAX_RETAINED` | 5 | [1, 100] |
+
+There is deliberately **no** value that disables rotation — unbounded growth is
+the defect, not a supported configuration.
+
+Details that are load-bearing rather than incidental:
+
+- **An already-oversized file rolls on the first line written.** `written` is
+  seeded from the file's length at open, so a restart onto a 1.85 GB file does
+  not append to it for another day.
+- **Rotation renames, never truncates**, and the age clock is a monotonic
+  `Instant` taken when THIS process opened the file — so a wall-clock
+  correction cannot make a segment immortal or roll every line. A supervisor
+  restart starts a fresh age window; the size bound is what caps disk.
+- **An empty segment never rolls**, or an expired-but-idle log would mint one
+  empty file per line and evict the real history through the retained cap.
+- **A line longer than `max_bytes` is written whole.** Truncating a log line
+  corrupts the record to honour a bound whose purpose is disk, not tidiness.
+- **Pruning only ever touches this log's own segments** (same directory, same
+  `<stem>.` prefix, same `.<ext>` suffix, never the live file), so one runner's
+  rotation cannot delete another's log.
+- **Every failure is best-effort and reported once per segment**, on stderr —
+  a `tracing::warn!` here can be captured back into the supervisor's own log
+  buffer and recurse into this very writer.
+
+Out-of-process `copytruncate`-style rotation still works alongside it (files are
+opened `O_APPEND`); rename+signal style rotation does not, and is now
+unnecessary.
 
 **Best-effort:** a missing/unwritable log path logs a warning once and continues — persistent logging never blocks supervisor startup.
 
@@ -418,7 +463,7 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/runners` | List all runners with status. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
+| GET | `/runners` | List all runners with status. **Read `liveness`, not `running`** — see "Liveness on `GET /runners`" below. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
 | POST | `/runners` | Add a runner config to the registry |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
@@ -433,6 +478,61 @@ The supervisor keeps only the last 500 log entries (configurable via `QONTINUI_S
 | GET | `/runners/{id}/logs` | Log history for a specific runner |
 | GET | `/runners/{id}/logs/stream` | SSE log stream for a specific runner |
 | GET/POST | `/runners/{id}/ui-bridge/{*path}` | Proxy UI Bridge requests to a specific runner |
+
+### Liveness on `GET /runners` — read `liveness`, not `running`
+
+Every row carries an **additive** `liveness` object beside the pre-existing
+`running` / `api_responding` / `pid` fields, which keep their meanings and
+values:
+
+```json
+"liveness": { "state": "wedged", "unresponsive_since": "2026-08-30T04:11:07.918+00:00" },
+"last_seen_responding_at": "2026-08-30T04:11:07.918Z",
+"port_open": true
+```
+
+| `state` | Meaning |
+|---|---|
+| `responding` | The API answered on the most recent probe. |
+| `wedged` | **The port is held and the API is silent** — the process is ALIVE and not answering. `unresponsive_since` is when it was last seen responding. |
+| `stopped` | The API is silent, the port is not held, and it HAS been seen responding before. Positive evidence of absence. |
+| `unknown` | No positive evidence either way — never seen responding, or the supervisor believes it spawned a process that has not bound its port yet. Never read this as "stopped". |
+
+`unresponsive_since` is `null` for every state but `wedged`; the key is always
+present, and `state` is always a string, so a consumer never branches on the
+JSON type to read the verdict.
+
+**Why this exists.** `running` is a two-state answer to a three-state question,
+and it answered "healthy" for a runner that was neither. On 2026-08-30 the
+primary sat alive for ~14h with 26178s of CPU, holding `:9876` and accepting
+TCP connections it never replied to (3x30s, 0 bytes); the mobile "Account
+Usage" widget errored and every liveness check on the box reported the runner
+healthy, because they all read `running`. `RunnerState::liveness` had
+classified it correctly since Phase 3b and the health refresher was already
+escalating it (`RUNNER WEDGED: port is held but the HTTP API has not answered
+for Ns`) — the classification simply never reached this response.
+
+**It is not a second liveness system.** Both inputs (`port_open`,
+`api_responding`) come from the same `managed.cached_health` snapshot the
+health refresher wrote, so this row and the escalation log cannot disagree. A
+runner the refresher has not reached yet reads `unknown`.
+
+**`running` is deliberately NOT redefined.** For a supervisor-managed
+(`test-*` / `named-*`) runner it is latched `true` at spawn, so a wedged temp
+runner reads `running: true, liveness.state: "wedged"`; for a user-managed
+runner the refresher syncs it down to the probe, so the wedged primary reads
+`running: false` with the same `wedged` verdict. Either way the wedge is now
+visible without reinterpreting a field existing consumers depend on.
+
+**One classification bug was fixed along the way.** `RunnerState::liveness`
+short-circuited on `self.running`, which is only synced to the probe for
+*user-managed* runners — so a wedged temp/named runner classified as
+`Responding`, the exact false-healthy the enum exists to prevent. It now takes
+the API-probe observation as a parameter: the bookkeeping flag says what the
+supervisor *believes it started*, only the probe says what answered. Relatedly,
+`stopped` is no longer claimed while the supervisor still believes it owns a
+live process — that is `unknown`, since `stopped` asserts positive evidence of
+absence.
 
 **Queue behavior for spawn-test and spawn-named:**
 - **Default (blocking):** If all build slots are busy, the HTTP request holds open until a slot frees. Optional `queue_timeout_secs` bounds the wait and returns 504 on timeout.
@@ -1124,6 +1224,9 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |
 | Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |
+| Log file segment size | 64 MiB (override: `QONTINUI_SUPERVISOR_LOG_MAX_BYTES`, clamped [1 MiB, 8 GiB]) |
+| Log file segment age | 24h (override: `QONTINUI_SUPERVISOR_LOG_MAX_AGE_SECS`, clamped [60, 2592000]) |
+| Retained rotated segments | 5 per log, live file excluded (override: `QONTINUI_SUPERVISOR_LOG_MAX_RETAINED`, clamped [1, 100]) |
 | Stopped-runners cache cap | 1000 entries (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP`, clamped [100, 100000]) |
 | Stopped-runners cache TTL | 3600s / 60min (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS`, clamped [60, 86400]) |
 | Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |

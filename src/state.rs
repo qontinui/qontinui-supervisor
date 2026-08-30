@@ -543,8 +543,7 @@ pub struct RunnerState {
 /// dashboard lost 7 hours to that conflation on 2026-08-08: it reported
 /// `running: false, pid: null` for a 411 MB process that was holding its port
 /// in the same JSON document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerLiveness {
     /// API answered on the most recent probe.
     Responding,
@@ -559,14 +558,83 @@ pub enum RunnerLiveness {
     Unknown,
 }
 
+impl RunnerLiveness {
+    /// The wire name for this state.
+    ///
+    /// `UnresponsiveSince` renders as **`wedged`** — the word operators
+    /// already use for it, and the one the escalation log
+    /// (`RUNNER WEDGED: …`) emits. The timestamp rides alongside in
+    /// `unresponsive_since` rather than being fused into the discriminant, so
+    /// a consumer can branch on a plain string.
+    pub fn state(&self) -> &'static str {
+        match self {
+            RunnerLiveness::Responding => "responding",
+            RunnerLiveness::UnresponsiveSince(_) => "wedged",
+            RunnerLiveness::Stopped => "stopped",
+            RunnerLiveness::Unknown => "unknown",
+        }
+    }
+
+    /// When the wedge window opened (the last time the API was seen
+    /// responding), or `None` for every non-wedged state.
+    pub fn unresponsive_since(&self) -> Option<DateTime<Utc>> {
+        match self {
+            RunnerLiveness::UnresponsiveSince(at) => Some(*at),
+            _ => None,
+        }
+    }
+}
+
+/// Serialized as a **uniform object**, never as a bare string or an
+/// externally-tagged variant:
+///
+/// ```json
+/// {"state": "wedged", "unresponsive_since": "2026-08-30T04:11:07.918+00:00"}
+/// ```
+///
+/// The derived (externally-tagged) form emitted `"responding"` for three
+/// variants and `{"unresponsive_since": …}` for the fourth — a field whose
+/// JSON *type* changes with its value, which every consumer would have to
+/// branch on before it could read the state at all. One shape, one `state`
+/// key, `unresponsive_since` always present (`null` when it does not apply).
+///
+/// The timestamp is rendered with `to_rfc3339()` rather than left to chrono's
+/// serde impl, which spells UTC as `Z`. Every other timestamp on the
+/// `GET /runners` row (`started_at`, `last_seen_responding_at`,
+/// `watchdog.last_restart_at`) goes through `to_rfc3339()`, and one field in a
+/// second spelling inside the same object is a parsing trap for no benefit.
+impl serde::Serialize for RunnerLiveness {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("RunnerLiveness", 2)?;
+        s.serialize_field("state", self.state())?;
+        s.serialize_field(
+            "unresponsive_since",
+            &self.unresponsive_since().map(|t| t.to_rfc3339()),
+        )?;
+        s.end()
+    }
+}
+
 impl RunnerState {
     /// Classify liveness from the API probe, the port observation, and the
     /// last-responding stamp.
     ///
-    /// `port_open` MUST come from an actual listener probe. Passing a stale
-    /// or assumed value re-creates the conflation this exists to remove.
-    pub fn liveness(&self, port_open: bool) -> RunnerLiveness {
-        if self.running {
+    /// `port_open` and `api_responding` MUST both come from the SAME tick's
+    /// actual probes. Passing a stale or assumed value re-creates the
+    /// conflation this exists to remove.
+    ///
+    /// **`api_responding` is a parameter and not `self.running` on purpose.**
+    /// It used to short-circuit on `self.running`, which is only synced to the
+    /// probe for *user-managed* runners (`health_cache`'s refresher guards
+    /// that sync on `!is_supervisor_managed`). For a temp/named runner
+    /// `running` is latched `true` at spawn and never cleared while the
+    /// process lives — so a wedged temp runner, the exact case this enum
+    /// exists to name, classified as `Responding`. The bookkeeping flag says
+    /// what the supervisor *believes it started*; only the probe says what
+    /// answered.
+    pub fn liveness(&self, port_open: bool, api_responding: bool) -> RunnerLiveness {
+        if api_responding {
             return RunnerLiveness::Responding;
         }
         match (port_open, self.last_seen_responding_at) {
@@ -574,6 +642,11 @@ impl RunnerState {
             // Port held but never seen responding: still alive-and-quiet, and
             // the honest stamp is when we started watching, not "stopped".
             (true, None) => RunnerLiveness::Unknown,
+            // Port closed. `Stopped` is a claim of POSITIVE evidence of
+            // absence, so it may not be made while the supervisor still
+            // believes it owns a live process: a spawned runner that has not
+            // bound its port yet is UNKNOWN, not gone.
+            (false, _) if self.running => RunnerLiveness::Unknown,
             (false, Some(_)) => RunnerLiveness::Stopped,
             (false, None) => RunnerLiveness::Unknown,
         }
@@ -2288,10 +2361,10 @@ mod tests {
     fn responding_runner_is_responding() {
         let mut st = RunnerState::new();
         st.running = true;
-        assert_eq!(st.liveness(true), RunnerLiveness::Responding);
+        assert_eq!(st.liveness(true, true), RunnerLiveness::Responding);
         // Even with the port probe somehow false, a positive API answer wins:
         // it is direct evidence the process is serving.
-        assert_eq!(st.liveness(false), RunnerLiveness::Responding);
+        assert_eq!(st.liveness(false, true), RunnerLiveness::Responding);
     }
 
     #[test]
@@ -2304,8 +2377,32 @@ mod tests {
         st.last_seen_responding_at = Some(seen);
         st.pid = Some(148320);
 
-        assert_eq!(st.liveness(true), RunnerLiveness::UnresponsiveSince(seen));
-        assert_ne!(st.liveness(true), RunnerLiveness::Stopped);
+        assert_eq!(
+            st.liveness(true, false),
+            RunnerLiveness::UnresponsiveSince(seen)
+        );
+        assert_ne!(st.liveness(true, false), RunnerLiveness::Stopped);
+    }
+
+    /// A **supervisor-managed** runner keeps `running: true` for its whole
+    /// life — the refresher only syncs that flag down to the probe for
+    /// user-managed runners. Classifying off the flag therefore called the
+    /// wedge `Responding`, which is the false-healthy this enum exists to
+    /// prevent. Only the probe decides.
+    #[test]
+    fn a_wedged_runner_that_still_reads_running_true_is_not_responding() {
+        let seen = Utc::now();
+        let mut st = RunnerState::new();
+        st.running = true; // latched at spawn, never cleared while alive
+        st.pid = Some(4242);
+        st.last_seen_responding_at = Some(seen);
+
+        assert_eq!(
+            st.liveness(true, false),
+            RunnerLiveness::UnresponsiveSince(seen),
+            "port held + API silent is a wedge no matter what `running` says"
+        );
+        assert_eq!(st.liveness(true, false).state(), "wedged");
     }
 
     #[test]
@@ -2313,7 +2410,18 @@ mod tests {
         let mut st = RunnerState::new();
         st.running = false;
         st.last_seen_responding_at = Some(Utc::now());
-        assert_eq!(st.liveness(false), RunnerLiveness::Stopped);
+        assert_eq!(st.liveness(false, false), RunnerLiveness::Stopped);
+    }
+
+    /// `Stopped` is a claim of positive evidence of absence. A runner the
+    /// supervisor believes it spawned, which has not bound its port yet, is
+    /// not evidence of absence — it is UNKNOWN.
+    #[test]
+    fn a_believed_running_process_with_no_port_yet_is_unknown_not_stopped() {
+        let mut st = RunnerState::new();
+        st.running = true;
+        st.last_seen_responding_at = Some(Utc::now());
+        assert_eq!(st.liveness(false, false), RunnerLiveness::Unknown);
     }
 
     #[test]
@@ -2321,8 +2429,36 @@ mod tests {
         // No stamp means we cannot distinguish "never started" from
         // "stopped before we looked" — say UNKNOWN rather than guessing.
         let st = RunnerState::new();
-        assert_eq!(st.liveness(false), RunnerLiveness::Unknown);
-        assert_eq!(st.liveness(true), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(false, false), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(true, false), RunnerLiveness::Unknown);
+    }
+
+    /// The wire shape is one object for all four states — a consumer reads
+    /// `.liveness.state` without first branching on the JSON type.
+    #[test]
+    fn liveness_serializes_as_a_uniform_state_object() {
+        let at = Utc::now();
+        let wedged =
+            serde_json::to_value(RunnerLiveness::UnresponsiveSince(at)).expect("serialize wedged");
+        assert_eq!(wedged["state"], "wedged");
+        assert_eq!(
+            wedged["unresponsive_since"],
+            at.to_rfc3339(),
+            "the same RFC3339 spelling every other timestamp on the row uses"
+        );
+
+        for (variant, name) in [
+            (RunnerLiveness::Responding, "responding"),
+            (RunnerLiveness::Stopped, "stopped"),
+            (RunnerLiveness::Unknown, "unknown"),
+        ] {
+            let v = serde_json::to_value(variant).expect("serialize");
+            assert_eq!(v["state"], name);
+            assert!(
+                v["unresponsive_since"].is_null(),
+                "{name} must carry an explicit null, never a missing key: {v}"
+            );
+        }
     }
     // --- spawn-test single flight ---
 

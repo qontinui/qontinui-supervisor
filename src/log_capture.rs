@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, RwLock};
@@ -59,15 +60,356 @@ pub fn record_auth_signal_if_matching(managed: Arc<ManagedRunner>, line: String)
     });
 }
 
-/// Append-only file writer shared across log readers. Uses a std::sync::Mutex
-/// because `write_all` is a blocking syscall — we only hold it long enough to
-/// write a single already-formatted line. No rotation: file grows unbounded.
-pub type FileWriter = Arc<StdMutex<File>>;
+/// When a capture file is rolled over, and how many rolled-over segments
+/// survive.
+///
+/// This exists because the runner-stdout capture had **no** bound at all:
+/// `.dev-logs/primary.log` was measured at **1.85 GB** on 2026-08-30 after a
+/// wedged runner spent ~14h flooding it. An unbounded append is not a logging
+/// strategy, it is a disk-exhaustion clock — and the disk it exhausts is the
+/// one every build slot shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotationPolicy {
+    /// Roll over before the live file would exceed this many bytes.
+    pub max_bytes: u64,
+    /// Roll over once the live segment has been open this long, however small
+    /// it is — so a low-traffic log still produces readable time slices.
+    ///
+    /// Measured from when THIS process opened the file (a monotonic
+    /// `Instant`, so a wall-clock correction cannot make a segment immortal
+    /// or roll every line). A supervisor restart therefore starts a fresh age
+    /// window; the size bound, not this one, is what caps disk.
+    pub max_age: StdDuration,
+    /// How many **rolled-over** segments to keep beside the live file. The
+    /// live file is not counted, so the on-disk ceiling for one log is
+    /// `max_bytes * (max_retained + 1)`, plus the tail of the single line that
+    /// triggered the last roll.
+    pub max_retained: usize,
+}
 
-/// Open (or create) a log file in append mode. Parent directory is created
-/// if missing. Returns `None` on any IO error after logging a warning, so a
-/// bad log path never prevents supervisor startup.
+impl RotationPolicy {
+    /// 64 MiB per segment: large enough to hold a full cold-build log (the
+    /// longest single burst this writer sees), small enough that a wedged
+    /// runner's flood is capped in minutes rather than hours.
+    pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+    /// 24h — one operator-day per segment when traffic is light.
+    pub const DEFAULT_MAX_AGE_SECS: i64 = 86_400;
+    /// 5 rolled-over segments => a ~384 MiB ceiling per log at the defaults.
+    pub const DEFAULT_MAX_RETAINED: usize = 5;
+
+    /// Read the policy from the environment, clamped to sane bounds.
+    ///
+    /// Knobs: `QONTINUI_SUPERVISOR_LOG_MAX_BYTES`,
+    /// `QONTINUI_SUPERVISOR_LOG_MAX_AGE_SECS`,
+    /// `QONTINUI_SUPERVISOR_LOG_MAX_RETAINED`. There is deliberately **no**
+    /// "disable rotation" value: unbounded growth is the defect this closes,
+    /// not a supported configuration.
+    pub fn from_env() -> Self {
+        let max_bytes = crate::config::parse_clamped_i64(
+            "QONTINUI_SUPERVISOR_LOG_MAX_BYTES",
+            Self::DEFAULT_MAX_BYTES as i64,
+            1024 * 1024,            // 1 MiB floor
+            8 * 1024 * 1024 * 1024, // 8 GiB ceiling
+        ) as u64;
+        let max_age_secs = crate::config::parse_clamped_i64(
+            "QONTINUI_SUPERVISOR_LOG_MAX_AGE_SECS",
+            Self::DEFAULT_MAX_AGE_SECS,
+            60,
+            30 * 86_400,
+        );
+        let max_retained = crate::config::parse_clamped_usize(
+            "QONTINUI_SUPERVISOR_LOG_MAX_RETAINED",
+            Self::DEFAULT_MAX_RETAINED,
+            1,
+            100,
+        );
+        Self {
+            max_bytes,
+            max_age: StdDuration::from_secs(max_age_secs as u64),
+            max_retained,
+        }
+    }
+}
+
+/// An append-only log file that rolls over on size or age and prunes its own
+/// history.
+///
+/// Every failure path is best-effort by construction: a failed rotate, a
+/// failed prune and a failed reopen are each reported once and then tolerated
+/// — persistent logging must never take the supervisor down, which is the
+/// posture `open_append_log` has always had toward a bad path.
+pub struct RotatingLogFile {
+    path: std::path::PathBuf,
+    /// `None` only between closing a handle and reopening it, or after a
+    /// reopen failed — in which case writes are dropped until one succeeds.
+    file: Option<File>,
+    /// Bytes in the live segment. Seeded from the file's existing length on
+    /// open, so an already-oversized file (the 1.85 GB one) rolls on the
+    /// first line written rather than growing for another day.
+    written: u64,
+    opened_at: Instant,
+    policy: RotationPolicy,
+    /// Rotation/prune failures are reported once per segment, never per line
+    /// — a broken log directory must not itself become a log flood.
+    reported_failure: bool,
+    /// The millisecond stamp and nonce of the segment this writer rotated to
+    /// most recently, so a repeated stamp keeps counting up instead of
+    /// restarting at 0 (see [`Self::rotated_path`]).
+    last_stamp: Option<String>,
+    last_nonce: u16,
+}
+
+impl RotatingLogFile {
+    /// Open (creating if needed) `path` in append mode under `policy`.
+    pub fn open(path: &Path, policy: RotationPolicy) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            written,
+            opened_at: Instant::now(),
+            policy,
+            reported_failure: false,
+            last_stamp: None,
+            last_nonce: 0,
+        })
+    }
+
+    /// Append one already-formatted line, rolling over first if this line
+    /// would breach the policy.
+    ///
+    /// The check runs BEFORE the write, so `max_bytes` is a ceiling the live
+    /// file does not cross rather than a threshold it overshoots by a line.
+    /// A single line longer than `max_bytes` is still written whole (into an
+    /// empty segment) — truncating a log line would corrupt the record to
+    /// honour a bound whose purpose is disk, not tidiness.
+    pub fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.should_rotate(bytes.len() as u64) {
+            self.rotate();
+        }
+        if self.file.is_none() {
+            // A previous reopen failed. Try once more; a transient
+            // permission / AV hold on Windows is the common case.
+            self.reopen();
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn should_rotate(&self, incoming: u64) -> bool {
+        // Never roll an empty segment: an age-triggered roll on an idle log
+        // would otherwise mint an empty file per line and evict the real
+        // history through the retained cap.
+        if self.written == 0 {
+            return false;
+        }
+        self.written.saturating_add(incoming) > self.policy.max_bytes
+            || self.opened_at.elapsed() >= self.policy.max_age
+    }
+
+    /// Close, rename the live file to a timestamped sibling, prune the oldest
+    /// siblings past the cap, then reopen a fresh live file.
+    fn rotate(&mut self) {
+        // Close FIRST. Windows refuses to rename a file that is open without
+        // `FILE_SHARE_DELETE`, which `std::fs::File` does not request — so a
+        // rename-while-open would fail on the platform this actually runs on.
+        drop(self.file.take());
+
+        let target = self.rotated_path();
+        match std::fs::rename(&self.path, &target) {
+            Ok(()) => {
+                self.reported_failure = false;
+                self.prune();
+            }
+            Err(e) => {
+                self.report_once(format!(
+                    "log_capture: failed to rotate {} -> {}: {} (continuing to append)",
+                    self.path.display(),
+                    target.display(),
+                    e
+                ));
+                // Reopening the un-renamed file keeps logging alive, and
+                // `written` is re-seeded from its real length below — so the
+                // next line retries the rotate instead of going unbounded.
+            }
+        }
+        self.reopen();
+    }
+
+    fn reopen(&mut self) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(f) => {
+                self.written = f.metadata().map(|m| m.len()).unwrap_or(0);
+                self.file = Some(f);
+                self.opened_at = Instant::now();
+            }
+            Err(e) => {
+                self.report_once(format!(
+                    "log_capture: failed to reopen {} after rotation: {} (log lines dropped \
+                     until it can be opened)",
+                    self.path.display(),
+                    e
+                ));
+                self.file = None;
+                self.written = 0;
+                self.opened_at = Instant::now();
+            }
+        }
+    }
+
+    /// `primary.log` -> `primary.20260830T041107123Z-000.log`.
+    ///
+    /// **Every part is fixed-width on purpose.** The stamp orders segments
+    /// across milliseconds and the zero-padded nonce orders them within one,
+    /// so a plain lexicographic name sort IS a chronological sort — which is
+    /// what [`Self::prune`] relies on to delete the OLDEST segment rather
+    /// than an arbitrary one. The nonce is always present (never elided for
+    /// the first segment of a millisecond) because a mix of suffixed and
+    /// un-suffixed names does not sort chronologically: `-` (0x2D) sorts
+    /// before `.` (0x2E), which would rank the first segment of a burst as
+    /// its newest.
+    ///
+    /// The nonce also stops a burst that crosses the cap repeatedly inside
+    /// one millisecond from clobbering the segment it just wrote.
+    fn rotated_path(&mut self) -> std::path::PathBuf {
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let (stem, ext) = self.stem_and_ext();
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+
+        // Resume the nonce within a repeated stamp instead of restarting at
+        // 0. `exists()` alone is not enough: prune may already have DELETED
+        // the low nonces, and reusing one would mint a name that sorts as the
+        // oldest segment while holding the newest bytes — the next prune
+        // would then evict the freshest history.
+        let mut nonce = if self.last_stamp.as_deref() == Some(stamp.as_str()) {
+            self.last_nonce.saturating_add(1)
+        } else {
+            0
+        };
+        let mut candidate = dir.join(format!("{stem}.{stamp}-{nonce:03}.{ext}"));
+        while candidate.exists() && nonce < 999 {
+            nonce += 1;
+            candidate = dir.join(format!("{stem}.{stamp}-{nonce:03}.{ext}"));
+        }
+        self.last_nonce = nonce;
+        self.last_stamp = Some(stamp);
+        candidate
+    }
+
+    fn stem_and_ext(&self) -> (String, String) {
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "log".to_string());
+        let ext = self
+            .path
+            .extension()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "log".to_string());
+        (stem, ext)
+    }
+
+    /// Delete rolled-over segments beyond `max_retained`, oldest first.
+    ///
+    /// Only files this writer could have produced are considered: same
+    /// directory, same `<stem>.` prefix, same `.<ext>` suffix, and never the
+    /// live file itself.
+    fn prune(&mut self) {
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let (stem, ext) = self.stem_and_ext();
+        let live = self.path.file_name().map(|s| s.to_owned());
+        let prefix = format!("{stem}.");
+        let suffix = format!(".{ext}");
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                self.report_once(format!(
+                    "log_capture: cannot list {} to prune rotated logs: {}",
+                    dir.display(),
+                    e
+                ));
+                return;
+            }
+        };
+
+        let mut rotated: Vec<std::ffi::OsString> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.file_name())
+            .filter(|name| {
+                if live.as_deref() == Some(name.as_os_str()) {
+                    return false;
+                }
+                let n = name.to_string_lossy();
+                n.starts_with(&prefix) && n.ends_with(&suffix)
+            })
+            .collect();
+
+        // Newest first — see `rotated_path`: the fixed-width stamp + nonce
+        // make a name sort a chronological sort. Then drop the tail, so what
+        // survives is the most RECENT history rather than an arbitrary slice
+        // of it.
+        rotated.sort_by(|a, b| b.cmp(a));
+        for stale in rotated.into_iter().skip(self.policy.max_retained) {
+            let victim = dir.join(&stale);
+            if let Err(e) = std::fs::remove_file(&victim) {
+                self.report_once(format!(
+                    "log_capture: failed to delete rotated log {}: {}",
+                    victim.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    /// Report at most one failure per segment, on stderr rather than through
+    /// `tracing` — a warning here can be captured back into the supervisor's
+    /// own log buffer and recurse into this very writer.
+    fn report_once(&mut self, message: String) {
+        if self.reported_failure {
+            return;
+        }
+        self.reported_failure = true;
+        eprintln!("{message}");
+    }
+}
+
+/// Append-only, **self-rotating** file writer shared across log readers. Uses
+/// a std::sync::Mutex because `write_all` is a blocking syscall — we only hold
+/// it long enough to write a single already-formatted line (plus, once per
+/// `max_bytes`, a rename and a directory listing).
+pub type FileWriter = Arc<StdMutex<RotatingLogFile>>;
+
+/// Open (or create) a log file in append mode under the environment's
+/// [`RotationPolicy`]. Parent directory is created if missing. Returns `None`
+/// on any IO error after logging a warning, so a bad log path never prevents
+/// supervisor startup.
 pub fn open_append_log(path: &Path) -> Option<FileWriter> {
+    open_append_log_with_policy(path, RotationPolicy::from_env())
+}
+
+/// [`open_append_log`] with an explicit policy — the seam the rotation tests
+/// drive with a small cap instead of waiting out a 24h soak.
+pub fn open_append_log_with_policy(path: &Path, policy: RotationPolicy) -> Option<FileWriter> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -76,7 +418,7 @@ pub fn open_append_log(path: &Path) -> Option<FileWriter> {
             }
         }
     }
-    match OpenOptions::new().create(true).append(true).open(path) {
+    match RotatingLogFile::open(path, policy) {
         Ok(f) => Some(Arc::new(StdMutex::new(f))),
         Err(e) => {
             warn!("Failed to open log file {}: {}", path.display(), e);
@@ -117,7 +459,7 @@ fn format_entry_line(entry: &LogEntry) -> String {
 fn write_entry_to_file(writer: &FileWriter, entry: &LogEntry) {
     let line = format_entry_line(entry);
     if let Ok(mut f) = writer.lock() {
-        if let Err(e) = f.write_all(line.as_bytes()) {
+        if let Err(e) = f.write_line(line.as_bytes()) {
             // Don't use warn!/tracing here — it could recurse back into the
             // supervisor's own log buffer. Use eprintln which is unobserved.
             eprintln!("log_capture: failed to append to log file: {}", e);
@@ -635,5 +977,308 @@ fn classify_log_level(line: &str) -> LogLevel {
         LogLevel::Debug
     } else {
         LogLevel::Info
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// The 24h soak the remediation item asks for is not runnable in CI, so
+    /// this drives the SAME rotation logic with a small cap: 200-byte
+    /// segments, 2 retained. Both triggers and the retained cap are asserted
+    /// from the filesystem, not from the writer's own bookkeeping.
+    fn tiny_policy(max_bytes: u64, max_retained: usize) -> RotationPolicy {
+        RotationPolicy {
+            max_bytes,
+            // Far larger than the test's runtime, so nothing rolls on age
+            // here — the size trigger is what is under test.
+            max_age: StdDuration::from_secs(3600),
+            max_retained,
+        }
+    }
+
+    fn rotated_segments(dir: &Path, live: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("list log dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != live)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn size_trigger_keeps_every_file_under_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        // 32-byte lines against a 100-byte cap: rolls every 4th line.
+        let mut f = RotatingLogFile::open(&path, tiny_policy(100, 50)).expect("open");
+        let line = [b'x'; 31];
+        let mut payload = line.to_vec();
+        payload.push(b'\n');
+        for _ in 0..40 {
+            f.write_line(&payload).expect("write");
+        }
+        drop(f);
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir.path()).expect("list") {
+            let entry = entry.expect("entry");
+            let len = entry.metadata().expect("metadata").len();
+            assert!(
+                len <= 100,
+                "{} is {len} bytes — rotation must cap every file at 100",
+                entry.path().display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 1,
+            "40 x 32 bytes against a 100-byte cap must have rotated at least once, \
+             saw {checked} file(s) — a passing assertion over ONE never-rotated file \
+             would be vacuous"
+        );
+    }
+
+    #[test]
+    fn retained_cap_bounds_how_many_rotated_segments_survive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        let mut f = RotatingLogFile::open(&path, tiny_policy(60, 2)).expect("open");
+        let payload = b"0123456789012345678901234567890123456789\n"; // 41 bytes
+
+        // 20 lines at 41 bytes against a 60-byte cap => ~19 rotations, which
+        // is far more than the cap of 2.
+        for _ in 0..20 {
+            f.write_line(payload).expect("write");
+        }
+        drop(f);
+
+        let rotated = rotated_segments(dir.path(), "primary.log");
+        assert_eq!(
+            rotated.len(),
+            2,
+            "max_retained=2 must leave exactly 2 rotated segments, saw {rotated:?}"
+        );
+        assert!(path.exists(), "the live file is not counted by the cap");
+
+        // The survivors are the NEWEST segments — pruning oldest-first is
+        // what makes a bounded log still useful for diagnosis.
+        for name in &rotated {
+            assert!(
+                name.starts_with("primary.") && name.ends_with(".log"),
+                "unexpected survivor {name}"
+            );
+        }
+    }
+
+    /// The cap must evict the OLDEST segment, not an arbitrary one — a
+    /// bounded log that keeps the wrong slice is no more diagnosable than an
+    /// unbounded one. Each segment here carries a distinguishable payload, so
+    /// the assertion is about identity rather than about a count.
+    #[test]
+    fn pruning_evicts_the_oldest_segment_not_an_arbitrary_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        // 8-byte lines against an 8-byte cap: every line after the first
+        // rolls, so segment N holds exactly the Nth marker.
+        let mut f = RotatingLogFile::open(&path, tiny_policy(8, 2)).expect("open");
+        for marker in ["aaaaaaa", "bbbbbbb", "ccccccc", "ddddddd"] {
+            f.write_line(format!("{marker}\n").as_bytes())
+                .expect("write");
+        }
+        drop(f);
+
+        let rotated = rotated_segments(dir.path(), "primary.log");
+        assert_eq!(rotated.len(), 2, "cap of 2 rotated segments: {rotated:?}");
+
+        let bodies: Vec<String> = rotated
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.path().join(n)).expect("read segment"))
+            .collect();
+        let live = std::fs::read_to_string(&path).expect("read live");
+
+        assert!(
+            bodies.iter().any(|b| b.contains("bbbbbbb")),
+            "the second-oldest surviving segment is kept: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("ccccccc")),
+            "the newest rotated segment is kept: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains("aaaaaaa")),
+            "the OLDEST segment is the one evicted: {bodies:?}"
+        );
+        assert!(live.contains("ddddddd"), "live file holds the newest line");
+    }
+
+    #[test]
+    fn age_trigger_rolls_a_segment_that_never_reaches_the_size_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        let policy = RotationPolicy {
+            max_bytes: 1024 * 1024, // never reached by this test
+            max_age: StdDuration::ZERO,
+            max_retained: 3,
+        };
+        let mut f = RotatingLogFile::open(&path, policy).expect("open");
+        for _ in 0..3 {
+            f.write_line(b"tiny\n").expect("write");
+        }
+        drop(f);
+
+        let rotated = rotated_segments(dir.path(), "primary.log");
+        assert!(
+            !rotated.is_empty(),
+            "an expired segment must roll on age even far below max_bytes"
+        );
+        assert!(
+            rotated.len() <= 3,
+            "the retained cap applies to age-triggered rolls too: {rotated:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_segment_never_rotates() {
+        // Otherwise an expired-but-idle log mints one empty file per line and
+        // evicts the real history through the retained cap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        let policy = RotationPolicy {
+            max_bytes: 10,
+            max_age: StdDuration::ZERO,
+            max_retained: 3,
+        };
+        let mut f = RotatingLogFile::open(&path, policy).expect("open");
+        f.write_line(b"a\n").expect("write");
+        drop(f);
+
+        assert!(
+            rotated_segments(dir.path(), "primary.log").is_empty(),
+            "the first line into a fresh empty file must not roll it"
+        );
+    }
+
+    #[test]
+    fn an_already_oversized_file_rolls_on_the_first_line() {
+        // The 1.85 GB case: the file exists and is already past the cap when
+        // the supervisor starts. `written` is seeded from its real length, so
+        // it rolls immediately instead of growing for another day.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        std::fs::write(&path, vec![b'x'; 5000]).expect("seed oversized log");
+
+        let mut f = RotatingLogFile::open(&path, tiny_policy(100, 2)).expect("open");
+        f.write_line(b"first line after restart\n").expect("write");
+        drop(f);
+
+        let rotated = rotated_segments(dir.path(), "primary.log");
+        assert_eq!(
+            rotated.len(),
+            1,
+            "the oversized file was rolled: {rotated:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("live metadata").len(),
+            25,
+            "the live file now holds only the new line"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join(&rotated[0]))
+                .expect("rotated metadata")
+                .len(),
+            5000,
+            "rotation renames, it never truncates — the old bytes survive until \
+             the retained cap evicts them"
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_the_cap_is_written_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        let mut f = RotatingLogFile::open(&path, tiny_policy(50, 3)).expect("open");
+        f.write_line(b"seed\n").expect("write");
+        let long = vec![b'y'; 500];
+        f.write_line(&long).expect("write long line");
+        drop(f);
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            500,
+            "a single line over the cap is never truncated — a corrupt record \
+             is worse than an oversized segment"
+        );
+    }
+
+    #[test]
+    fn pruning_ignores_files_that_are_not_this_log_s_segments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        std::fs::write(dir.path().join("secondary.log"), b"not ours").expect("write sibling");
+        std::fs::write(dir.path().join("primary.txt"), b"not ours").expect("write sibling");
+
+        let mut f = RotatingLogFile::open(&path, tiny_policy(20, 1)).expect("open");
+        for _ in 0..10 {
+            f.write_line(b"0123456789012345\n").expect("write");
+        }
+        drop(f);
+
+        assert!(
+            dir.path().join("secondary.log").exists(),
+            "another runner's log must never be pruned by this one"
+        );
+        assert!(
+            dir.path().join("primary.txt").exists(),
+            "a same-stem file with a different extension is not our segment"
+        );
+    }
+
+    #[test]
+    fn the_default_policy_is_bounded_in_all_three_dimensions() {
+        // A regression here would restore the unbounded growth this closes.
+        let p = RotationPolicy {
+            max_bytes: RotationPolicy::DEFAULT_MAX_BYTES,
+            max_age: StdDuration::from_secs(RotationPolicy::DEFAULT_MAX_AGE_SECS as u64),
+            max_retained: RotationPolicy::DEFAULT_MAX_RETAINED,
+        };
+        assert!(p.max_bytes > 0 && p.max_bytes <= 128 * 1024 * 1024);
+        assert!(p.max_age > StdDuration::ZERO);
+        assert!(p.max_retained > 0);
+        // The advertised on-disk ceiling for one log.
+        assert_eq!(
+            p.max_bytes * (p.max_retained as u64 + 1),
+            384 * 1024 * 1024,
+            "the documented ~384 MiB per-log ceiling"
+        );
+    }
+
+    #[test]
+    fn entries_still_land_in_the_live_file_through_the_writer_shim() {
+        // `write_entry_to_file` is the only path the log readers use; prove
+        // rotation did not break plain appending.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("primary.log");
+        let writer =
+            open_append_log_with_policy(&path, tiny_policy(1024 * 1024, 3)).expect("open writer");
+        write_entry_to_file(
+            &writer,
+            &LogEntry {
+                timestamp: Utc::now(),
+                source: LogSource::Runner,
+                level: LogLevel::Error,
+                message: "runner said something".to_string(),
+            },
+        );
+        drop(writer);
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        assert!(
+            body.contains("[runner] [ERROR] runner said something"),
+            "{body}"
+        );
     }
 }

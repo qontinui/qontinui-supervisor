@@ -443,6 +443,23 @@ pub async fn list_runners(
 
         let source_exe = source_exe_json(managed).await;
 
+        // The wedge signal. `running` above is a two-state answer to a
+        // three-state question: on 2026-08-30 the primary sat alive for ~14h
+        // with 26178s of CPU, holding :9876 and accepting TCP connections it
+        // never answered, and every liveness check on the box read
+        // `running` and called it healthy. The supervisor had already
+        // classified it (`RunnerState::liveness`, escalated by the health
+        // refresher as `RUNNER WEDGED`) — the classification simply never
+        // reached this response.
+        //
+        // Both inputs come from `managed.cached_health`, i.e. the SAME
+        // refresher tick that produced `api_responding` above, so this is not
+        // a second liveness system and cannot disagree with the escalation
+        // log. A runner the refresher has not reached yet reads
+        // `port_open: false, responding: false` and classifies as `unknown`,
+        // which is the honest answer.
+        let liveness = runner.liveness(cached.runner_port_open, cached.runner_responding);
+
         result.push(json!({
             "id": managed.config.id,
             "name": managed.config.name,
@@ -457,6 +474,16 @@ pub async fn list_runners(
             "kind": managed.config.kind(),
             "protected": is_protected,
             "running": effectively_running,
+            // ADDITIVE — `running` keeps its existing meaning and value so no
+            // current consumer breaks. `liveness` is the field to render:
+            // `{"state": "responding"|"wedged"|"stopped"|"unknown",
+            //   "unresponsive_since": <rfc3339>|null}`.
+            "liveness": liveness,
+            // The T behind "unresponsive since T", also present for the
+            // non-wedged states so a caller can age any verdict. `null` =
+            // never observed responding, which is UNKNOWN, not "never ran".
+            "last_seen_responding_at": runner.last_seen_responding_at.map(|t| t.to_rfc3339()),
+            "port_open": cached.runner_port_open,
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
             "api_responding": cached.runner_responding,
@@ -8429,6 +8456,130 @@ mod tests {
         assert!(
             r_b["requester_id"].is_null(),
             "an unowned runner reports requester_id: null"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // S1 — a deaf-but-listening runner must not report healthy.
+    //
+    // The wedge that motivated this: the primary alive ~14h with 26178s of
+    // CPU, holding :9876, accepting TCP connections and answering none of
+    // them. `RunnerState::liveness` already classified it and the health
+    // refresher already escalated it (`RUNNER WEDGED`), but `GET /runners`
+    // rendered neither, so every liveness check on the box read `running`
+    // and called it healthy.
+    // ------------------------------------------------------------------
+
+    /// Put a runner into the exact wedge shape: the supervisor believes the
+    /// process is up (`running: true`, a pid), the listener probe says the
+    /// port is held, and the API probe says nothing answered.
+    async fn insert_wedged_runner(
+        state: &crate::state::SharedState,
+        port: u16,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let id = format!("wedged-{port}");
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = id.clone();
+        config.name = id.clone();
+        config.port = port;
+        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+            config, false, None,
+        ));
+        {
+            let mut r = managed.runner.write().await;
+            r.running = true;
+            r.pid = Some(148320);
+            r.last_seen_responding_at = Some(last_seen);
+        }
+        {
+            let mut c = managed.cached_health.write().await;
+            c.runner_port_open = true;
+            c.runner_responding = false;
+        }
+        state.runners.write().await.insert(id.clone(), managed);
+        id
+    }
+
+    #[tokio::test]
+    async fn list_runners_reports_a_deaf_but_listening_runner_as_wedged() {
+        use axum::extract::State;
+        let state = make_state();
+        let last_seen = chrono::Utc::now() - chrono::Duration::hours(14);
+        let id = insert_wedged_runner(&state, 9876, last_seen).await;
+
+        let resp = super::list_runners(State(state.clone()))
+            .await
+            .expect("list must succeed");
+        let arr = resp.0.as_array().expect("array body").clone();
+        let row = arr
+            .iter()
+            .find(|r| r["id"] == id.as_str())
+            .expect("the wedged runner is listed");
+
+        assert_eq!(
+            row["liveness"]["state"], "wedged",
+            "a held port with a silent API is the wedge state, not health: {row}"
+        );
+        assert_eq!(
+            row["liveness"]["unresponsive_since"],
+            last_seen.to_rfc3339(),
+            "the wedge must carry the T behind \"unresponsive since T\""
+        );
+        assert_eq!(
+            row["running"], true,
+            "the supervisor still believes the process is up — `running` alone              is exactly why the wedge was invisible, and it keeps its value"
+        );
+        assert_eq!(row["api_responding"], false);
+        assert_eq!(row["port_open"], true);
+        assert_eq!(row["last_seen_responding_at"], last_seen.to_rfc3339());
+    }
+
+    /// The additive contract: every row carries `liveness` as an object with
+    /// a `state` string, whatever the runner's condition — a consumer never
+    /// has to branch on the JSON type before reading the verdict, and an
+    /// un-probed runner says `unknown` rather than going missing.
+    #[tokio::test]
+    async fn every_runner_row_carries_a_liveness_object_with_a_state_string() {
+        use axum::extract::State;
+        let state = make_state(); // already seeds the configured primary
+        let wedged_id = insert_wedged_runner(&state, 9876, chrono::Utc::now()).await;
+        let temp_id = insert_temp_runner_owned(&state, 9877, None).await;
+
+        let resp = super::list_runners(State(state.clone()))
+            .await
+            .expect("list must succeed");
+        let arr = resp.0.as_array().expect("array body").clone();
+        assert!(
+            arr.len() >= 3,
+            "the seeded primary plus both inserts are listed: {arr:?}"
+        );
+        assert!(arr.iter().any(|r| r["id"] == wedged_id.as_str()));
+
+        for row in &arr {
+            let state_field = row["liveness"]["state"]
+                .as_str()
+                .unwrap_or_else(|| panic!("liveness.state must be a string: {row}"));
+            assert!(
+                matches!(state_field, "responding" | "wedged" | "stopped" | "unknown"),
+                "unexpected liveness state {state_field:?}: {row}"
+            );
+            assert!(
+                row["liveness"].get("unresponsive_since").is_some(),
+                "unresponsive_since is always present (null when N/A): {row}"
+            );
+            // The pre-existing fields are untouched by this addition.
+            assert!(row.get("running").is_some());
+            assert!(row.get("api_responding").is_some());
+        }
+
+        let unprobed = arr
+            .iter()
+            .find(|r| r["id"] == temp_id.as_str())
+            .expect("the never-probed temp runner is present");
+        assert_eq!(
+            unprobed["liveness"]["state"], "unknown",
+            "a runner the refresher has not reached is UNKNOWN, never `stopped`"
         );
     }
 
