@@ -212,4 +212,51 @@ describe('Dashboard', () => {
     expect(await screen.findByTestId('crash-restart-disarmed-badge')).toBeInTheDocument();
     expect(screen.queryByTestId('crash-loop-disarmed-badge')).not.toBeInTheDocument();
   });
+
+  // ------------------------------------------------------------------
+  // The wedge: alive, holding the port, answering nothing.
+  //
+  // The header line read `running` and then `api_responding`, so the primary
+  // that held :9876 for ~14h while replying to nothing printed a confident
+  // "stopped" — for a process the supervisor could see, in a payload that
+  // already carried the correct verdict.
+  // ------------------------------------------------------------------
+
+  it('reports a wedged primary as WEDGED, not stopped', async () => {
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'degraded',
+      runner: {
+        // `running` is synced down to the probe for the user-managed primary,
+        // which is exactly why this line used to fall through to "stopped".
+        running: false,
+        pid: 148320,
+        api_responding: false,
+        liveness: { state: 'wedged', unresponsive_since: '2026-08-30T04:11:07.918+00:00' },
+        last_seen_responding_at: '2026-08-30T04:11:07.918+00:00',
+      },
+      ports: { api_port: { port: 9876, in_use: true } },
+      watchdog: {
+        enabled: true,
+        restart_attempts: 0,
+        crash_count: 0,
+        crash_restart_armed: true,
+      },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+
+    expect(await screen.findByText(/WEDGED \(alive, API silent\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Runner: stopped/)).not.toBeInTheDocument();
+  });
+
+  it('is unchanged for a healthy primary from a supervisor that omits liveness', async () => {
+    // Default mock carries no `liveness` field at all (an older supervisor).
+    // An absent verdict must never change what the header says.
+    renderDashboard();
+    expect(await screen.findByText(/running/)).toBeInTheDocument();
+    expect(screen.queryByText(/WEDGED/)).not.toBeInTheDocument();
+  });
 });

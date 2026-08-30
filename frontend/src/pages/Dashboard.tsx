@@ -10,6 +10,7 @@ import {
   RecentPanicSummary,
   RunnerDerivedStatus,
   RunnerKindWire,
+  RunnerLivenessWire,
   StaleBinarySummary,
   UiErrorSummary,
   WatchdogHealthWire,
@@ -256,6 +257,13 @@ interface RunnerInstance {
   // a `RunnerWatchdogBadge` (#111/#113 per-runner completion). Optional so the
   // panel keeps rendering against an older supervisor that omits it.
   watchdog?: WatchdogHealthWire;
+  // The supervisor's liveness verdict for this runner
+  // (`{state, unresponsive_since}`). Optional so the panel keeps rendering
+  // against an older supervisor that omits it — an ABSENT verdict is unknown,
+  // never healthy.
+  liveness?: RunnerLivenessWire;
+  last_seen_responding_at?: string | null;
+  port_open?: boolean;
 }
 
 // ─── Per-runner watchdog badge (#111/#113 per-runner completion) ────────────
@@ -671,7 +679,16 @@ function RunnerRow({
   onRemove,
   onProtect,
 }: RunnerRowProps) {
-  const isUp = r.running || r.api_responding;
+  // A wedged runner is ALIVE — it is holding its port and answering nothing.
+  // It therefore belongs on the "up" side of the action gating (offer Stop and
+  // Restart, never Start), while the status dot and badge below must say the
+  // opposite of healthy. `running || api_responding` alone could not express
+  // that: for a temp/named runner `running` is latched true at spawn, so the
+  // wedge rendered as up; for the primary the refresher syncs `running` down to
+  // the probe, so the same wedge rendered as down and offered Start for a
+  // process that was already running.
+  const isWedged = r.liveness?.state === 'wedged';
+  const isUp = r.running || r.api_responding || isWedged;
   const isPrimary = r.kind.type === 'primary';
   // A detached rebuild for this runner is in flight (driven off /build/:id/status
   // polling). While building, every action button stays disabled and the Rebuild
@@ -753,9 +770,10 @@ function RunnerRow({
       <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
       <td>
         <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-          <StatusDot up={isUp} />
+          <StatusDot up={isUp && !isWedged} error={isWedged} />
           <RunnerStatusBadge
             derivedStatus={r.derived_status}
+            liveness={r.liveness}
             uiError={r.ui_error}
             recentCrash={r.recent_crash}
             fallbackUp={isUp}
@@ -1358,17 +1376,32 @@ function DashboardInner() {
             padding: '0.6rem 1rem',
           }}
         >
-          <StatusDot up={h.status === 'healthy' || h.status === 'external'} />
+          <StatusDot
+            up={
+              h.runner.liveness?.state !== 'wedged' &&
+              (h.status === 'healthy' || h.status === 'external')
+            }
+            error={h.runner.liveness?.state === 'wedged'}
+          />
           <span style={{ fontWeight: 600, textTransform: 'capitalize', color: statusColor }}>
             {h.status}
           </span>
           <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-            Runner: {h.runner.running
-              ? 'running'
-              : h.runner.api_responding
-                ? 'external (not supervised)'
-                : 'stopped'}
-            {h.runner.api_responding && h.runner.running ? ' (API ok)' : ''}
+            {/* The wedge is checked FIRST. This line used to read `running`
+                and then `api_responding`, so the primary that held :9876 for
+                ~14h answering nothing printed a confident "stopped" — the
+                supervisor knew better on the same payload. */}
+            Runner:{' '}
+            {h.runner.liveness?.state === 'wedged'
+              ? 'WEDGED (alive, API silent)'
+              : h.runner.running
+                ? 'running'
+                : h.runner.api_responding
+                  ? 'external (not supervised)'
+                  : 'stopped'}
+            {h.runner.liveness?.state !== 'wedged' && h.runner.api_responding && h.runner.running
+              ? ' (API ok)'
+              : ''}
             {' | '}Build: {h.build.in_progress ? 'in progress' : 'idle'}
           </span>
           {/* Crash-restart disarmed indicator (#111 follow-up). The supervisor

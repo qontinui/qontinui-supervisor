@@ -237,6 +237,23 @@ export type RunnerKindWire =
 /// One runner's entry as surfaced by the supervisor `/health` endpoint's
 /// `runners[]` array and by `/runners`. Mirrors
 /// `qontinui-supervisor::routes::health::RunnerInstanceHealth`.
+/// The supervisor's three-state answer to "is this runner alive?", as served
+/// on `GET /runners`, `GET /health` and the SSE health stream.
+///
+/// `running` is a two-state answer to a three-state question and it answered
+/// "healthy" for a runner that was neither: on 2026-08-30 the primary held
+/// `:9876` for ~14h accepting TCP connections it never replied to. Render
+/// this, not `running`.
+export type RunnerLivenessState = 'responding' | 'wedged' | 'stopped' | 'unknown';
+
+export interface RunnerLivenessWire {
+  /// Always a string, for all four states — never branch on the JSON type.
+  state: RunnerLivenessState;
+  /// When the wedge window opened (the last time the API answered). Always
+  /// present; `null` for every state but `wedged`.
+  unresponsive_since: string | null;
+}
+
 export interface RunnerInstanceHealth {
   id: string;
   name: string;
@@ -249,6 +266,11 @@ export interface RunnerInstanceHealth {
   ui_error?: UiErrorSummary | null;
   recent_crash?: RecentCrashSummary | null;
   derived_status: RunnerDerivedStatus;
+  /// Optional so a payload from an older supervisor still type-checks. An
+  /// ABSENT verdict is unknown, never healthy.
+  liveness?: RunnerLivenessWire;
+  last_seen_responding_at?: string | null;
+  port_open?: boolean;
 }
 
 /// Watchdog health as surfaced by the supervisor. The top-level
@@ -285,6 +307,9 @@ export interface HealthResponse {
     pid?: number;
     started_at?: string;
     api_responding: boolean;
+    /// The PRIMARY's liveness verdict. Optional for older supervisors.
+    liveness?: RunnerLivenessWire;
+    last_seen_responding_at?: string | null;
   };
   ports: {
     api_port: { port: number; in_use: boolean };
@@ -912,6 +937,12 @@ export const api = {
         /// payload from an older supervisor that predates per-runner watchdog
         /// serialization still type-checks.
         watchdog?: WatchdogHealthWire;
+        /// The wedge verdict — **read this, not `running`**. Same object as on
+        /// `GET /health`. Optional for an older supervisor; an absent verdict
+        /// is unknown, never healthy.
+        liveness?: RunnerLivenessWire;
+        last_seen_responding_at?: string | null;
+        port_open?: boolean;
       }[]
     >('/runners'),
   protectRunner: (id: string, isProtected: boolean) =>

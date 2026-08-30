@@ -106,6 +106,24 @@ pub struct RunnerInstanceHealth {
     /// starting). Combines process liveness with the runner's self-reported
     /// `ui_error` + `derived_status` + `recent_crash`.
     pub derived_status: RunnerStatus,
+    /// The wedge verdict, identical in shape and value to the one on
+    /// `GET /runners`: `{"state": "responding"|"wedged"|"stopped"|"unknown",
+    /// "unresponsive_since": <rfc3339>|null}`.
+    ///
+    /// The health refresher has computed this on every tick since the field
+    /// was added to `CachedRunnerHealth` -- and the mapping into this struct
+    /// dropped it, so the one surface that says "healthy" out loud could not
+    /// see the state that most contradicts it. `running` + `api_responding`
+    /// below are unchanged; read `liveness`.
+    pub liveness: crate::state::RunnerLiveness,
+    /// When this runner's API was last seen responding, RFC3339. `null` =
+    /// never observed responding, which is UNKNOWN, not "never ran".
+    pub last_seen_responding_at: Option<String>,
+    /// Whether a listener held the runner's port on the most recent probe.
+    /// Together with `api_responding` this is the raw pair the verdict above
+    /// is derived from, so an operator can check the derivation rather than
+    /// trust it.
+    pub port_open: bool,
 }
 
 #[derive(Serialize)]
@@ -122,6 +140,13 @@ pub struct RunnerHealth {
     pub pid: Option<u32>,
     pub started_at: Option<String>,
     pub api_responding: bool,
+    /// The primary's wedge verdict -- same shape as `runners[].liveness` and
+    /// as `GET /runners`. This block is what the dashboard header renders, and
+    /// a header that reads `running` alone is exactly how a runner that held
+    /// its port for ~14h while answering nothing kept showing as healthy.
+    pub liveness: crate::state::RunnerLiveness,
+    /// When the primary's API was last seen responding, RFC3339.
+    pub last_seen_responding_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -321,6 +346,9 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 ui_error: r.ui_error.clone(),
                 recent_crash: r.recent_crash.clone(),
                 derived_status: r.derived_status.clone(),
+                liveness: r.liveness,
+                last_seen_responding_at: r.last_seen_responding_at.map(|t| t.to_rfc3339()),
+                port_open: r.port_open,
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -357,27 +385,47 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
 
     // Use primary ManagedRunner state (not the legacy state.runner which is never
     // updated for user-managed runners, causing "stopped" even when the runner is UP).
-    let (primary_running, primary_pid, primary_started_at, primary_watchdog) =
-        if let Some(primary) = state.get_primary().await {
-            let watchdog = {
-                let wd = primary.watchdog.read().await;
-                WatchdogHealth::from_state(
-                    &wd,
-                    crate::process::manager::crash_restart_globally_armed(&state.config),
-                )
-            };
-            let pr = primary.runner.read().await;
-            (pr.running, pr.pid, pr.started_at, watchdog)
-        } else {
-            // Fallback to legacy state.runner if no managed primary exists
-            let runner = state.runner.read().await;
-            (
-                runner.running,
-                runner.pid,
-                runner.started_at,
-                WatchdogHealth::unavailable(),
+    //
+    // `liveness` is classified from the SAME cached pair read just above
+    // (`api_in_use` / `api_responding`), which is the same pair
+    // `GET /runners` uses — so the two surfaces cannot disagree about
+    // whether the primary is wedged.
+    let (
+        primary_running,
+        primary_pid,
+        primary_started_at,
+        primary_watchdog,
+        primary_liveness,
+        primary_last_seen,
+    ) = if let Some(primary) = state.get_primary().await {
+        let watchdog = {
+            let wd = primary.watchdog.read().await;
+            WatchdogHealth::from_state(
+                &wd,
+                crate::process::manager::crash_restart_globally_armed(&state.config),
             )
         };
+        let pr = primary.runner.read().await;
+        (
+            pr.running,
+            pr.pid,
+            pr.started_at,
+            watchdog,
+            pr.liveness(api_in_use, api_responding),
+            pr.last_seen_responding_at,
+        )
+    } else {
+        // Fallback to legacy state.runner if no managed primary exists
+        let runner = state.runner.read().await;
+        (
+            runner.running,
+            runner.pid,
+            runner.started_at,
+            WatchdogHealth::unavailable(),
+            runner.liveness(api_in_use, api_responding),
+            runner.last_seen_responding_at,
+        )
+    };
 
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
@@ -416,6 +464,9 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             ui_error: cached.and_then(|c| c.ui_error.clone()),
             recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
+            liveness: mr.liveness(mc.runner_port_open, mc.runner_responding),
+            last_seen_responding_at: mr.last_seen_responding_at.map(|t| t.to_rfc3339()),
+            port_open: mc.runner_port_open,
         });
     }
     drop(cached_snapshots);
@@ -427,6 +478,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pid: primary_pid,
             started_at: primary_started_at.map(|t| t.to_rfc3339()),
             api_responding,
+            liveness: primary_liveness,
+            last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -517,6 +570,13 @@ fn try_build_sse_health(
     let primary_watchdog = primary_snapshot
         .map(|p| p.watchdog.clone())
         .unwrap_or_else(WatchdogHealth::unavailable);
+    // No snapshot yet (first ticks after boot, or a contended lock) is not
+    // evidence of health: it is `Unknown`, the same answer every other
+    // surface gives for an un-probed runner.
+    let (primary_liveness, primary_last_seen) = match primary_snapshot {
+        Some(p) => (p.liveness, p.last_seen_responding_at),
+        None => (crate::state::RunnerLiveness::Unknown, None),
+    };
 
     let overall_status =
         determine_overall_status(primary_running, api_responding, build.build_in_progress);
@@ -543,6 +603,8 @@ fn try_build_sse_health(
             pid: primary_pid,
             started_at: None, // Not available from cached snapshot
             api_responding,
+            liveness: primary_liveness,
+            last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -727,6 +789,8 @@ mod tests {
                 pid: Some(1234),
                 started_at: None,
                 api_responding: true,
+                liveness: crate::state::RunnerLiveness::Responding,
+                last_seen_responding_at: None,
             },
             ports: PortsHealth {
                 api_port: PortStatus {
@@ -843,6 +907,83 @@ mod tests {
         );
     }
 
+    /// `GET /health` must carry the wedge verdict, on the primary block AND
+    /// on every `runners[]` row — in the same shape `GET /runners` uses.
+    ///
+    /// The health refresher had computed `liveness` on every tick since the
+    /// field was added to `CachedRunnerHealth`, and both mappings into
+    /// `RunnerInstanceHealth` dropped it. So the endpoint whose whole job is
+    /// to answer "is this healthy?" was structurally unable to report the one
+    /// state that most contradicts health, while the value sat computed one
+    /// struct away.
+    #[test]
+    fn health_response_carries_the_liveness_verdict_on_the_primary_and_every_runner() {
+        let seen = chrono::Utc::now();
+        let mut response = build_minimal_health_response();
+        response.runner.liveness = crate::state::RunnerLiveness::UnresponsiveSince(seen);
+        response.runner.last_seen_responding_at = Some(seen.to_rfc3339());
+        response.runners.push(RunnerInstanceHealth {
+            id: "primary".to_string(),
+            name: "Primary".to_string(),
+            port: RUNNER_API_PORT,
+            kind: RunnerKind::Primary,
+            running: true,
+            pid: Some(148320),
+            started_at: None,
+            api_responding: false,
+            watchdog_status: WatchdogHealth::unavailable(),
+            ui_error: None,
+            recent_crash: None,
+            derived_status: RunnerStatus::default(),
+            liveness: crate::state::RunnerLiveness::UnresponsiveSince(seen),
+            last_seen_responding_at: Some(seen.to_rfc3339()),
+            port_open: true,
+        });
+
+        let value = serde_json::to_value(&response).expect("health response serializes");
+
+        assert_eq!(
+            value["runner"]["liveness"]["state"], "wedged",
+            "the primary block must render the verdict, not just `running`: {value}"
+        );
+        assert_eq!(
+            value["runner"]["liveness"]["unresponsive_since"],
+            seen.to_rfc3339()
+        );
+        assert_eq!(
+            value["runner"]["last_seen_responding_at"],
+            seen.to_rfc3339()
+        );
+
+        let row = &value["runners"][0];
+        assert_eq!(row["liveness"]["state"], "wedged", "row: {row}");
+        assert_eq!(row["port_open"], true);
+        assert_eq!(row["last_seen_responding_at"], seen.to_rfc3339());
+        // The pre-existing fields keep their meanings and values.
+        assert_eq!(row["running"], true);
+        assert_eq!(row["api_responding"], false);
+    }
+
+    /// Every state renders as an object with a `state` string and an
+    /// always-present `unresponsive_since`, on this surface too — a consumer
+    /// must never have to branch on the JSON type to read the verdict.
+    #[test]
+    fn health_liveness_is_the_same_uniform_object_as_on_get_runners() {
+        for (variant, name) in [
+            (crate::state::RunnerLiveness::Responding, "responding"),
+            (crate::state::RunnerLiveness::Stopped, "stopped"),
+            (crate::state::RunnerLiveness::Unknown, "unknown"),
+        ] {
+            let mut response = build_minimal_health_response();
+            response.runner.liveness = variant;
+            let value = serde_json::to_value(&response).expect("serializes");
+            assert_eq!(value["runner"]["liveness"]["state"], name);
+            assert!(
+                value["runner"]["liveness"]["unresponsive_since"].is_null(),
+                "{name} must carry an explicit null, never a missing key"
+            );
+        }
+    }
     /// Minimal `HealthResponse` for serialization-shape assertions.
     fn build_minimal_health_response() -> HealthResponse {
         HealthResponse {
@@ -852,6 +993,8 @@ mod tests {
                 pid: None,
                 started_at: None,
                 api_responding: false,
+                liveness: crate::state::RunnerLiveness::Unknown,
+                last_seen_responding_at: None,
             },
             ports: PortsHealth {
                 api_port: PortStatus {

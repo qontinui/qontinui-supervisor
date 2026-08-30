@@ -27,7 +27,7 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Scope: primary only by default.** Under `--watchdog` the primary's per-runner `WatchdogState.enabled` defaults true; named/temp/external default false. Arm any runner explicitly via `POST /runners/{id}/watchdog {"enabled": true}`.
 - **Crash-loop guard:** exponential backoff 5s → 30s → 120s between attempts; max 3 auto-restarts per rolling 30 minutes, then the watchdog disarms itself (`disabled_reason: "crash loop — operator required"`, `enabled` left true so intent stays visible) with an ERROR log + diagnostics event. Reset via `POST /runners/{id}/watchdog {"enabled": true, "reset_attempts": true}`.
 - **Kill-switch:** env `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all crash auto-restarts without a rebuild.
-- **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream. A runner that is alive but not answering is reported as `liveness.state: "wedged"` rather than as healthy — see "Liveness on `GET /runners`".
+- **Observability:** live counters (`enabled`, `restart_attempts`, `last_restart_at`, `crash_count`, `disabled_reason`) on `GET /runners` (per runner), `GET /health` (top-level = primary's; per-runner in `runners[]`), and the SSE health stream. A runner that is alive but not answering is reported as `liveness.state: "wedged"` rather than as healthy, on all three — see "Liveness".
 
 - **Temp runners** (`test-*`): Spawned via `POST /runners/spawn-test`, auto-cleaned on stop. Run with a visible Tauri window and an isolated WebView2 profile. The UI Bridge is fully functional on temp runners. They are also the **only** kind subject to a max-age bound — see "Temp runner isolation and max age" below.
 - **Named runners** (`named-*`): Spawned via `POST /runners/spawn-named`, persistent across supervisor restarts. Saved to settings. Not auto-cleaned. Support start/stop/restart/protect.
@@ -455,7 +455,7 @@ unnecessary.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | React SPA dashboard |
-| GET | `/health` | Comprehensive status (runners, build, expo). `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. |
+| GET | `/health` | Comprehensive status (runners, build, expo). The top-level `runner` block and every `runners[]` row carry `liveness` / `last_seen_responding_at` / `port_open` — **read `liveness`, not `running`**, see "Liveness". `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. |
 | GET | `/health/stream` | SSE stream of real-time health data |
 | POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, the shutdown is latched so in-flight handlers get a window to answer, then `std::process::exit(0)` closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner. The latch happens only AFTER the replacement spawn succeeds — latching first would turn a failed restart into an outage. |
 
@@ -463,7 +463,7 @@ unnecessary.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/runners` | List all runners with status. **Read `liveness`, not `running`** — see "Liveness on `GET /runners`" below. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
+| GET | `/runners` | List all runners with status. **Read `liveness`, not `running`** — see "Liveness" below. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
 | POST | `/runners` | Add a runner config to the registry |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
@@ -479,11 +479,13 @@ unnecessary.
 | GET | `/runners/{id}/logs/stream` | SSE log stream for a specific runner |
 | GET/POST | `/runners/{id}/ui-bridge/{*path}` | Proxy UI Bridge requests to a specific runner |
 
-### Liveness on `GET /runners` — read `liveness`, not `running`
+### Liveness — read `liveness`, not `running`
 
-Every row carries an **additive** `liveness` object beside the pre-existing
-`running` / `api_responding` / `pid` fields, which keep their meanings and
-values:
+Served on **`GET /runners`, `GET /health` (the top-level `runner` block AND
+every `runners[]` row) and the SSE health stream** — the same object, the same
+value, from the same refresher tick. Every row carries it as an **additive**
+field beside the pre-existing `running` / `api_responding` / `pid`, which keep
+their meanings and values:
 
 ```json
 "liveness": { "state": "wedged", "unresponsive_since": "2026-08-30T04:11:07.918+00:00" },
@@ -514,8 +516,20 @@ for Ns`) — the classification simply never reached this response.
 
 **It is not a second liveness system.** Both inputs (`port_open`,
 `api_responding`) come from the same `managed.cached_health` snapshot the
-health refresher wrote, so this row and the escalation log cannot disagree. A
-runner the refresher has not reached yet reads `unknown`.
+health refresher wrote, so every surface, and the escalation log, cannot
+disagree. A runner the refresher has not reached yet reads `unknown` — on the
+SSE path a missing snapshot (first ticks after boot, a contended lock) is
+`unknown` too, never healthy.
+
+**The dashboard renders it.** The fleet table shows a red `Wedged` badge that
+OVERRIDES `derived_status`, because `derived_status` is provably wrong here:
+`derive_runner_status` maps "believed up, API silent" to `starting`, so a
+runner wedged for 14 hours showed a blue *Starting* pill, and a wedged primary
+(whose `running` is synced down to the probe) showed a grey *Offline* one for a
+live process holding its port. The header line reads `WEDGED (alive, API
+silent)` instead of falling through to `stopped`. Action gating treats a wedge
+as UP — Stop and Restart are offered, Start is not — because the process is
+alive.
 
 **`running` is deliberately NOT redefined.** For a supervisor-managed
 (`test-*` / `named-*`) runner it is latched `true` at spawn, so a wedged temp
@@ -523,6 +537,35 @@ runner reads `running: true, liveness.state: "wedged"`; for a user-managed
 runner the refresher syncs it down to the probe, so the wedged primary reads
 `running: false` with the same `wedged` verdict. Either way the wedge is now
 visible without reinterpreting a field existing consumers depend on.
+
+**The stamp and the escalation are not gated on ownership.** Both
+`last_seen_responding_at` and the `RUNNER WEDGED` escalation used to live inside
+the health refresher's `!is_supervisor_managed` guard — which exists for the
+`running` sync (a latched supervisor-managed flag must never be synced to the
+probe) and has nothing to do with either. The consequence was that a temp or
+named runner never received a stamp, so a held port plus a silent API
+classified `(true, None) => Unknown` and `wedged` was **unreachable** for the
+whole class, with no escalation logged either. A supervisor-managed runner is
+exactly the kind an agent spawns and then waits on. The guard now covers only
+the `running` sync and the pid rules; `health_cache`'s
+`the_wedge_signal_is_not_gated_on_runner_ownership` pins it by scanning the
+guard's brace span, because a prose comment saying "every runner kind" cannot
+notice being moved back inside one. The escalation's "not restarting" reason is
+kind-aware: a supervisor-managed runner is not exempt because it is observed
+only — it is exempt because a wedge is not an exit (the crash-only watchdog
+does not cover it) and a restart destroys the in-flight work and the evidence.
+
+**The escalation is keyed on the classification, not on the raw probes.** It
+used to fire on `!responding && port_open`, which is BROADER than the `wedged`
+verdict: with no `last_seen_responding_at` stamp that same pair classifies
+`unknown`. Extending it to temp runners would therefore have reported
+*"the process is ALIVE and not responding — capture a thread dump"* about
+runners that had simply not finished booting, which every `spawn-test`
+produces (a runner holds its port through a 30s-per-stage PG bootstrap). Both
+states are still counted at 30s and re-escalated every ~5 min; they now say
+what they are — `RUNNER WEDGED` at ERROR for a runner that answered before and
+stopped, and a WARN naming the honest UNKNOWN (*"has held port N for Ns and has
+NEVER answered its HTTP API"*) for one that never answered at all.
 
 **One classification bug was fixed along the way.** `RunnerState::liveness`
 short-circuited on `self.running`, which is only synced to the probe for

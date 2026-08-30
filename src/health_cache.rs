@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::is_temp_runner;
 use crate::process::port;
-use crate::state::SupervisorState;
+use crate::state::{RunnerLiveness, SupervisorState};
 use qontinui_types::wire::runner_kind::RunnerKind;
 
 /// Returns true if this runner is a named runner managed by the supervisor.
@@ -203,6 +203,11 @@ pub struct CachedRunnerHealth {
     /// When the API was last seen responding — `None` if never seen.
     /// Gives "unresponsive since T" an actual T to show.
     pub last_seen_responding_at: Option<DateTime<Utc>>,
+    /// Whether a listener held the runner's port on THIS tick's probe — the
+    /// other half of the pair `liveness` is derived from. Carried so the
+    /// sync SSE path can publish the derivation alongside the verdict without
+    /// re-probing (it has no access to the per-runner `cached_health` lock).
+    pub port_open: bool,
 }
 
 /// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
@@ -366,12 +371,33 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     runner_responding,
                 };
 
+                // 3b — record WHEN it was last seen responding, so the three
+                // states the `running` boolean conflates can be told apart
+                // downstream: responding / alive but unresponsive since T /
+                // stopped.
+                //
+                // **Every runner kind, not just the user-managed ones.** This
+                // stamp is the ONLY input that lets `RunnerState::liveness`
+                // return `wedged` rather than `unknown` — with no stamp, a
+                // held port and a silent API classify as `(true, None) =>
+                // Unknown`. It used to live inside the `!is_supervisor_managed`
+                // block below, so a temp/named runner never got one and could
+                // never be reported as wedged, whatever the probes said. The
+                // guard exists for the `running` sync (which must NOT touch a
+                // latched supervisor-managed flag); the stamp has nothing to do
+                // with that flag and is a pure observation of what answered.
+                if runner_responding {
+                    let mut runner_state = managed.runner.write().await;
+                    runner_state.last_seen_responding_at = Some(Utc::now());
+                }
+
                 // For user-managed runners (not temp, not named), the supervisor only
                 // observes. The `running` flag is initialized once at startup from
                 // port-in-use and would otherwise go stale. Sync it to the observed
                 // API responsiveness so the header status reflects reality.
                 let runner_id = &managed.config.id;
                 let is_supervisor_managed = is_temp_runner(runner_id) || is_named_runner(runner_id);
+
                 if !is_supervisor_managed {
                     let needs_pid_recovery = {
                         let mut runner_state = managed.runner.write().await;
@@ -401,14 +427,6 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         // absence: the port is closed AND the API is silent.
                         if !runner_responding && !runner_port_open {
                             runner_state.pid = None;
-                        }
-
-                        // 3b — record WHEN it was last seen responding, so the
-                        // three states the `running` boolean conflates can be
-                        // told apart downstream: responding / alive but
-                        // unresponsive since T / stopped.
-                        if runner_responding {
-                            runner_state.last_seen_responding_at = Some(Utc::now());
                         }
 
                         // 3c — allow PID recovery while the port is listening
@@ -452,35 +470,70 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     }
                     #[cfg(not(target_os = "windows"))]
                     let _ = needs_pid_recovery;
+                }
 
-                    // 3e — ESCALATE a persistently unresponsive runner.
-                    //
-                    // "Alive but not answering" is the state that cost this
-                    // box 7 hours on 2026-08-08 while the dashboard quietly
-                    // said the runner was gone. It is not a normal state and
-                    // it must not be silent.
-                    //
-                    // NEVER auto-restart from here. The supervisor's contract
-                    // is that user-managed runners are observed, never
-                    // started/stopped/restarted unprompted — and a restart
-                    // would destroy in-flight sessions, which is an explicit
-                    // non-goal for this failure class. Escalate only.
-                    if !runner_responding && runner_port_open {
-                        let ticks = unresponsive_ticks
-                            .entry(runner_id.clone())
-                            .and_modify(|t| *t = t.saturating_add(1))
-                            .or_insert(1);
+                // 3e — ESCALATE a persistently unresponsive runner.
+                //
+                // "Alive but not answering" is the state that cost this
+                // box 7 hours on 2026-08-08 while the dashboard quietly
+                // said the runner was gone. It is not a normal state and
+                // it must not be silent.
+                //
+                // **Every runner kind, not just the user-managed ones.**
+                // This sat inside the `!is_supervisor_managed` guard above,
+                // so a wedged temp or named runner produced no escalation at
+                // all — and because the same guard also withheld its
+                // `last_seen_responding_at` stamp, it did not read as
+                // `wedged` on any surface either. A supervisor-managed runner
+                // is exactly the kind an agent spawns and then waits on, so
+                // silence there is the more expensive of the two.
+                //
+                // NEVER auto-restart from here, whoever owns the runner. For
+                // a user-managed runner the supervisor's contract is
+                // observation only. For a supervisor-managed one a restart is
+                // permitted in general but is still wrong HERE: a wedge is not
+                // an exit, so the crash-only watchdog deliberately does not
+                // cover it, and restarting destroys the in-flight work along
+                // with the evidence. Escalate only; the operator decides.
+                // Classified from the SAME probes the snapshot below
+                // publishes, so the log and the API can never disagree about
+                // whether this is a wedge. The condition used to be the raw
+                // pair `!responding && port_open`, which is BROADER than the
+                // `wedged` verdict: with no `last_seen_responding_at` stamp
+                // that pair classifies `Unknown`, not `UnresponsiveSince`.
+                // Escalating it as a wedge would claim "the process is ALIVE
+                // and not responding — capture a thread dump" about a runner
+                // that has simply not finished booting — which every
+                // `spawn-test` produces, since a runner holds its port through
+                // a 30s-per-stage PG bootstrap. Both states are still counted
+                // and still escalated; they just say what they are.
+                let liveness_now = {
+                    let runner_state = managed.runner.read().await;
+                    runner_state.liveness(runner_port_open, runner_responding)
+                };
+                let escalating = runner_port_open
+                    && matches!(
+                        liveness_now,
+                        RunnerLiveness::UnresponsiveSince(_) | RunnerLiveness::Unknown
+                    );
 
-                        let should_escalate = *ticks == UNRESPONSIVE_ESCALATION_TICKS
-                            || (*ticks > UNRESPONSIVE_ESCALATION_TICKS
-                                && (*ticks - UNRESPONSIVE_ESCALATION_TICKS)
-                                    .is_multiple_of(UNRESPONSIVE_REESCALATION_TICKS));
+                if escalating {
+                    let ticks = unresponsive_ticks
+                        .entry(runner_id.clone())
+                        .and_modify(|t| *t = t.saturating_add(1))
+                        .or_insert(1);
 
-                        if should_escalate {
-                            let (pid, since) = {
-                                let runner_state = managed.runner.read().await;
-                                (runner_state.pid, runner_state.last_seen_responding_at)
-                            };
+                    let should_escalate = *ticks == UNRESPONSIVE_ESCALATION_TICKS
+                        || (*ticks > UNRESPONSIVE_ESCALATION_TICKS
+                            && (*ticks - UNRESPONSIVE_ESCALATION_TICKS)
+                                .is_multiple_of(UNRESPONSIVE_REESCALATION_TICKS));
+
+                    if should_escalate {
+                        let (pid, since) = {
+                            let runner_state = managed.runner.read().await;
+                            (runner_state.pid, runner_state.last_seen_responding_at)
+                        };
+                        if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
                             tracing::error!(
                                 runner_id = %runner_id,
                                 port = runner_port,
@@ -489,10 +542,17 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                 unresponsive_for_secs = (*ticks * 2),
                                 "RUNNER WEDGED: port is held but the HTTP API has not answered \
                                  for {}s. The process is ALIVE and not responding — this is not \
-                                 a stopped runner. Not restarting (user-managed runners are \
-                                 observed only, and a restart destroys in-flight sessions); \
-                                 capture a thread dump before any manual restart.",
-                                *ticks * 2
+                                 a stopped runner. Not restarting ({}); capture a thread dump \
+                                 before any manual restart.",
+                                *ticks * 2,
+                                if is_supervisor_managed {
+                                    "a wedge is not an exit, so the crash-only watchdog does not \
+                                     cover it, and a restart destroys the in-flight work and the \
+                                     evidence"
+                                } else {
+                                    "user-managed runners are observed only, and a restart \
+                                     destroys in-flight sessions"
+                                }
                             );
                             state
                                 .logs
@@ -510,28 +570,49 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                     ),
                                 )
                                 .await;
+                        } else {
+                            // Port held, and it has NEVER been seen answering.
+                            // Not a wedge (there is no "since" — nothing has
+                            // been lost yet) and not stopped either. A start
+                            // that never binds its API is what the
+                            // first-healthy watchdog exists for, and a runner
+                            // stuck in PG bootstrap looks exactly like this.
+                            tracing::warn!(
+                                runner_id = %runner_id,
+                                port = runner_port,
+                                pid = ?pid,
+                                silent_for_secs = (*ticks * 2),
+                                "Runner has held port {} for {}s and has NEVER answered its \
+                                 HTTP API. UNKNOWN, not a wedge and not a stopped runner — \
+                                 most likely a start that has not finished (PG bootstrap \
+                                 holds the port through 30s-per-stage timeouts).",
+                                runner_port,
+                                *ticks * 2
+                            );
                         }
-                    } else if runner_responding {
-                        // Recovered (or never wedged) — reset, and say so if
-                        // we had previously escalated, so the log carries the
-                        // end of the window as well as the start.
-                        if let Some(prev) = unresponsive_ticks.remove(runner_id) {
-                            if prev >= UNRESPONSIVE_ESCALATION_TICKS {
-                                tracing::warn!(
-                                    runner_id = %runner_id,
-                                    port = runner_port,
-                                    wedged_for_secs = (prev * 2),
-                                    "Runner recovered from a wedge after {}s without any \
-                                     supervisor intervention",
-                                    prev * 2
-                                );
-                            }
-                        }
-                    } else {
-                        // Port not held either — that is a stopped runner,
-                        // not a wedge. Different condition, different signal.
-                        unresponsive_ticks.remove(runner_id);
                     }
+                } else if runner_responding {
+                    // Recovered (or never wedged) — reset, and say so if
+                    // we had previously escalated, so the log carries the
+                    // end of the window as well as the start.
+                    if let Some(prev) = unresponsive_ticks.remove(runner_id) {
+                        if prev >= UNRESPONSIVE_ESCALATION_TICKS {
+                            tracing::warn!(
+                                runner_id = %runner_id,
+                                port = runner_port,
+                                silent_for_secs = (prev * 2),
+                                "Runner started answering after {}s of silence, without any \
+                                 supervisor intervention. (The silence was a wedge only if a \
+                                 RUNNER WEDGED line names this runner; otherwise it had never \
+                                 answered.)",
+                                prev * 2
+                            );
+                        }
+                    }
+                } else {
+                    // Port not held either — that is a stopped runner,
+                    // not a wedge. Different condition, different signal.
+                    unresponsive_ticks.remove(runner_id);
                 }
 
                 // If the runner's TCP port is responsive, GET its /health to
@@ -581,6 +662,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // probe, never from a remembered or assumed port state.
                     liveness: runner_state.liveness(runner_port_open, runner_responding),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
+                    port_open: runner_port_open,
                 });
                 drop(runner_state);
 
@@ -593,6 +675,13 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     primary_health = new_health;
                 }
             }
+
+            // The wedge counter now sees EPHEMERAL runners too (3e covers
+            // every kind), and a temp runner removed while wedged would
+            // otherwise leave its entry behind forever — an unbounded map on a
+            // box that spawns temp runners all day. Drop whatever is no longer
+            // in the registry: this is per-tick bookkeeping, not state.
+            unresponsive_ticks.retain(|id, _| runners.iter().any(|m| &m.config.id == id));
 
             // If no runners exist, check legacy ports
             if runners.is_empty() {
@@ -1014,5 +1103,120 @@ mod tests {
     fn test_runner_status_default_is_offline() {
         let s: RunnerStatus = Default::default();
         assert!(matches!(s, RunnerStatus::Offline));
+    }
+
+    /// Return the byte range of the `if !is_supervisor_managed { .. }` block,
+    /// matching braces while ignoring anything inside a string literal, a line
+    /// comment or a block comment — all three occur inside that block.
+    fn user_managed_guard_span(src: &str) -> (usize, usize) {
+        // Every literal this test searches for is ASSEMBLED AT RUNTIME, never
+        // written out whole. `include_str!` embeds this file into itself, so a
+        // whole-literal needle would also match the test’s own copy of it —
+        // which is both an extra hit for the exactly-once check below and a
+        // way for the test to pass by finding itself.
+        let needle = ["if !is_supervisor_", "managed {"].concat();
+        let needle = needle.as_str();
+        let start = src.find(needle).expect(
+            "the refresher's user-managed guard must still exist — if it was renamed, \
+             re-point this test rather than deleting it",
+        );
+        let mut i = start + needle.len();
+        let mut depth = 1usize;
+        let b = src.as_bytes();
+        while i < b.len() && depth > 0 {
+            match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() {
+                        match b[i] {
+                            b'\\' => i += 2,
+                            b'"' => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced braces while scanning the guard block");
+        (start, i)
+    }
+
+    /// The `last_seen_responding_at` stamp and the `RUNNER WEDGED` escalation
+    /// must NOT sit inside the `!is_supervisor_managed` guard.
+    ///
+    /// Both did. The consequence was not a cosmetic one: that stamp is the only
+    /// input that lets `RunnerState::liveness` answer `wedged` rather than
+    /// `unknown`, so a temp or named runner — the kind an agent spawns and then
+    /// waits on — could never be reported as wedged on ANY surface, and no
+    /// escalation was ever logged for one either. A prose comment saying "every
+    /// runner kind" cannot notice being moved back inside a guard; this can.
+    #[test]
+    fn the_wedge_signal_is_not_gated_on_runner_ownership() {
+        let src = include_str!("health_cache.rs");
+        let (start, end) = user_managed_guard_span(src);
+
+        // Self-check FIRST: prove the span is real by finding something that
+        // genuinely IS inside the guard (the `running` sync, which must stay
+        // there — a latched supervisor-managed flag must never be synced to
+        // the probe). Without this, a scanner that returned an empty or
+        // degenerate span would make every assertion below vacuously pass.
+        let inside = ["runner_state.running = ", "runner_responding;"].concat();
+        let inside_at = src
+            .find(inside.as_str())
+            .expect("the `running` sync must still exist");
+        assert!(
+            inside_at > start && inside_at < end,
+            "the guard span {start}..{end} does not contain the `running` sync at \
+             {inside_at} — the brace scanner is wrong, not the code",
+        );
+        // Assembled at runtime for the reason given in `user_managed_guard_span`.
+        for marker in [
+            [
+                "runner_state.last_seen_responding_at = ",
+                "Some(Utc::now());",
+            ]
+            .concat(),
+            ["RUNNER ", "WEDGED: port is held"].concat(),
+        ] {
+            let marker = marker.as_str();
+            let at = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("marker vanished from health_cache.rs: {marker}"));
+            assert!(
+                at < start || at > end,
+                "`{marker}` is inside the `!is_supervisor_managed` guard (bytes {start}..{end}), \
+                 so temp and named runners lose the wedge signal entirely",
+            );
+            assert_eq!(
+                src.matches(marker).count(),
+                1,
+                "`{marker}` must appear exactly once, or this test can pass on a copy \
+                 while the gated original still runs",
+            );
+        }
     }
 }

@@ -1,6 +1,11 @@
 import React, { useState } from 'react';
 import { useUIElement } from '@qontinui/ui-bridge/react';
-import type { RecentCrashSummary, RunnerDerivedStatus, UiErrorSummary } from '../lib/api';
+import type {
+  RecentCrashSummary,
+  RunnerDerivedStatus,
+  RunnerLivenessWire,
+  UiErrorSummary,
+} from '../lib/api';
 
 interface RunnerStatusBadgeProps {
   /// Derived status published by the supervisor. Optional so callers reading
@@ -19,6 +24,14 @@ interface RunnerStatusBadgeProps {
   /// If the runner does not expose a derived_status (older supervisor build
   /// or degraded cache), fall back to this up/down boolean.
   fallbackUp?: boolean;
+  /// The supervisor's liveness verdict. When it reads `wedged` it OVERRIDES
+  /// `derivedStatus`, because `derivedStatus` is provably wrong in exactly
+  /// that case: `derive_runner_status` maps "process believed up, API silent"
+  /// to `Starting`, so a runner wedged for 14 hours rendered a blue
+  /// "Starting" pill, and a wedged primary (whose `running` is synced down to
+  /// the probe) rendered a grey "Offline" one for a live process holding its
+  /// port. Neither says the thing an operator needs to know.
+  liveness?: RunnerLivenessWire;
   /// Optional UI Bridge element id. When set, the badge is registered as a
   /// UI Bridge button and its `toggle` custom action flips the expanded
   /// detail panel — equivalent to a mouse click. Stable ids let automation
@@ -45,7 +58,13 @@ interface StatusDisplay {
 function statusDisplay(
   status: RunnerDerivedStatus | undefined,
   fallbackUp: boolean | undefined,
+  liveness?: RunnerLivenessWire,
 ): StatusDisplay {
+  // A wedge outranks every derived status: the process is ALIVE and not
+  // answering, which is neither "starting" nor "offline".
+  if (liveness?.state === 'wedged') {
+    return { label: 'Wedged', badgeClass: 'badge-danger' };
+  }
   if (!status) {
     // Older supervisor or lock contention — fall back to the up/down signal
     // the caller has at hand.
@@ -92,6 +111,17 @@ function buildCrashTooltip(crash: RecentCrashSummary): string {
   return `${msg}${loc}\n(dump at ${formatTimestamp(crash.reportedAt)})`;
 }
 
+/// Tooltip for a wedged runner. Says what is true (alive, port held, API
+/// silent) and what is NOT (stopped), because the whole cost of this failure
+/// class has been operators reading it as the latter.
+function buildWedgeTooltip(liveness: RunnerLivenessWire): string {
+  const since = liveness.unresponsive_since
+    ? `last answered ${formatTimestamp(liveness.unresponsive_since)}`
+    : 'never seen answering';
+  return `WEDGED: the process is ALIVE and holding its port, but its HTTP API is not answering (${since}).
+This is not a stopped runner. Capture a thread dump before restarting — a restart destroys the in-flight work and the evidence.`;
+}
+
 /// Status badge for a single runner. Clicking the badge when a ui_error or
 /// recent_crash is attached toggles an inline details panel (no modal);
 /// otherwise the badge is inert. When both are present, both panels stack.
@@ -101,21 +131,25 @@ export function RunnerStatusBadge({
   recentCrash,
   style,
   fallbackUp,
+  liveness,
   elementId,
   elementLabel,
 }: RunnerStatusBadgeProps) {
   const [expanded, setExpanded] = useState(false);
-  const { label, badgeClass } = statusDisplay(derivedStatus, fallbackUp);
+  const { label, badgeClass } = statusDisplay(derivedStatus, fallbackUp, liveness);
   const hasUiError = uiError != null;
   const hasCrash = recentCrash != null;
   const clickable = hasUiError || hasCrash;
   // Prefer the ui_error tooltip since it's usually the more actionable signal;
   // fall back to the crash tooltip when no ui_error is present.
-  const tooltip = hasUiError
-    ? buildTooltip(uiError)
-    : hasCrash
-      ? buildCrashTooltip(recentCrash)
-      : undefined;
+  const tooltip =
+    liveness?.state === 'wedged'
+      ? buildWedgeTooltip(liveness)
+      : hasUiError
+        ? buildTooltip(uiError)
+        : hasCrash
+          ? buildCrashTooltip(recentCrash)
+          : undefined;
 
   const toggle = () => {
     if (clickable) setExpanded((v) => !v);
