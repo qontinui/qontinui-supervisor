@@ -471,41 +471,92 @@ pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
 /// the endpoint returns as soon as the event is queued — if it hangs, the
 /// runner is already unhealthy and we want to fall through to kill quickly.
 pub const RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS: u64 = 500;
-// 90 minutes. Was 1800 (30 min) on the estimate that "cold Tauri builds on
-// Windows can run 11+ min" — measured cold `spawn-test {rebuild:true}` builds
-// on the MSI box are 2382s and 2974s (2026-07-31), i.e. 40-50 min, and CI's
-// Windows leg medians 77 min. 1800 killed BOTH of those builds.
+// --- Cargo build watchdogs ---
 //
-// Why this mattered more than "a build occasionally gets cut short": it closed
-// a loop. A rustc OOM abort poisons the slot's incremental cache, so the NEXT
-// build is cold; a cold build then exceeds 1800s and is killed; a killed build
-// leaves the cache poisoned, so the one after that is cold too. The lane never
-// recovers on its own, and raising memory alone would NOT have broken it.
-const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 5400;
+// A cargo build is bounded by TWO budgets, not one wall-clock cap:
+//
+//   * [`build_no_progress_timeout_secs`] — the real watchdog. It fires only
+//     after the build has produced NOTHING (no new cargo output, no new
+//     artifact under the slot's `CARGO_TARGET_DIR`) for that long. A build
+//     that is compiling is never killed by it, however slow the box is.
+//   * [`build_absolute_timeout_secs`] — a pure backstop for a build that is
+//     somehow producing churn forever. Deliberately far above any real build.
+//
+// Why the single wall-clock cap had to go. It was raised 1800 → 5400 on
+// 2026-07-31 because measured cold `spawn-test {rebuild:true}` builds on this
+// box are 2382s / 2974s. 5400 then killed a build at 2650 of ~2800 compile
+// units with rustc actively working (2026-08-03) — the box was carrying 6-7
+// concurrent peer cargo builds, so the cap was measuring LOAD, not a stuck
+// build. And the kill is not merely a lost build: the failure was classified
+// environmental, the slot's target dir was wiped, and the retry therefore
+// started COLD and took even longer. A wall-clock cap on a shared box is a
+// self-reinforcing loop; "has it made progress recently" is the question that
+// actually distinguishes a wedged build from a slow one.
+const DEFAULT_BUILD_NO_PROGRESS_SECS: u64 = 1200;
 
-/// Resolved cargo build timeout in seconds, read from
-/// `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` env var at first access.
-/// Clamped to [60, 7200], defaults to 5400 (90 minutes).
-pub fn build_timeout_secs() -> u64 {
+/// Backstop ceiling. 6h — an order of magnitude above the slowest observed
+/// real build (2974s), so it can only catch a pathological build that keeps
+/// emitting output forever. It must NEVER be the budget that ends a normal
+/// build; that is the no-progress watchdog's job.
+const DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS: u64 = 21600;
+
+/// Env var for the no-progress watchdog budget.
+pub const BUILD_NO_PROGRESS_SECS_ENV: &str = "QONTINUI_SUPERVISOR_BUILD_NO_PROGRESS_SECS";
+/// Env var for the absolute backstop. Keeps its historical name so an existing
+/// operator override keeps working — but it now bounds TOTAL wall-clock as a
+/// backstop, and is no longer what ends a slow-but-progressing build.
+pub const BUILD_ABSOLUTE_TIMEOUT_SECS_ENV: &str = "QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS";
+
+/// Resolve `env_var` as a `u64`, clamped to `[lo, hi]`, falling back to
+/// `default` when unset or unparseable (warning loudly on the latter).
+fn env_secs_or(env_var: &str, default: u64, lo: u64, hi: u64) -> u64 {
+    match std::env::var(env_var).ok() {
+        None => default,
+        Some(ref s) => match s.parse::<u64>() {
+            Ok(n) => n.clamp(lo, hi),
+            Err(_) => {
+                tracing::warn!(
+                    env_var,
+                    value = s.as_str(),
+                    default,
+                    "invalid value for env var, using default"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// Resolved NO-PROGRESS watchdog budget in seconds, read from
+/// [`BUILD_NO_PROGRESS_SECS_ENV`] at first access. Clamped to [60, 7200],
+/// defaults to 1200 (20 minutes of *complete silence* — no cargo output and no
+/// new artifact in the slot's target dir).
+pub fn build_no_progress_timeout_secs() -> u64 {
     use std::sync::OnceLock;
     static SECS: OnceLock<u64> = OnceLock::new();
     *SECS.get_or_init(|| {
-        let raw = std::env::var("QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS").ok();
-        match raw {
-            None => DEFAULT_BUILD_TIMEOUT_SECS,
-            Some(ref s) => match s.parse::<u64>() {
-                Ok(n) => n.clamp(60, 7200),
-                Err(_) => {
-                    tracing::warn!(
-                        env_var = "QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS",
-                        value = s.as_str(),
-                        default = DEFAULT_BUILD_TIMEOUT_SECS,
-                        "invalid value for env var, using default"
-                    );
-                    DEFAULT_BUILD_TIMEOUT_SECS
-                }
-            },
-        }
+        env_secs_or(
+            BUILD_NO_PROGRESS_SECS_ENV,
+            DEFAULT_BUILD_NO_PROGRESS_SECS,
+            60,
+            7200,
+        )
+    })
+}
+
+/// Resolved ABSOLUTE backstop in seconds, read from
+/// [`BUILD_ABSOLUTE_TIMEOUT_SECS_ENV`] at first access. Clamped to
+/// [300, 86400], defaults to 21600 (6 hours).
+pub fn build_absolute_timeout_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        env_secs_or(
+            BUILD_ABSOLUTE_TIMEOUT_SECS_ENV,
+            DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS,
+            300,
+            86400,
+        )
     })
 }
 const DEFAULT_PNPM_TIMEOUT_SECS: u64 = 1200; // 20 minutes — cold pnpm install + frontend build
@@ -514,7 +565,8 @@ const DEFAULT_GIT_TIMEOUT_SECS: u64 = 30; // git rev-parse / diff are fast; a ha
 /// Resolved frontend (pnpm) build timeout in seconds, read from
 /// `QONTINUI_SUPERVISOR_PNPM_TIMEOUT_SECS` at first access. Clamped to
 /// [30, 3600], defaults to 1200 (20 minutes). Distinct from
-/// [`build_timeout_secs`] (cargo) because pnpm install+build has a very
+/// the cargo budgets ([`build_no_progress_timeout_secs`] /
+/// [`build_absolute_timeout_secs`]) because pnpm install+build has a very
 /// different runtime profile; the frontend build had NO timeout before the
 /// build-pipeline consolidation, which is exactly the hang this guards.
 pub fn pnpm_timeout_secs() -> u64 {
@@ -1133,19 +1185,36 @@ mod tests {
     // --- Process constant tests ---
 
     #[test]
-    fn test_build_timeout_default_is_90_minutes() {
-        // Raised from 1800 on 2026-07-31: measured cold `spawn-test
-        // {rebuild:true}` builds are 2382s and 2974s, so 30 min killed them
-        // mid-compile — and a killed build leaves the slot's incremental cache
-        // poisoned, so the next one is cold too. See DEFAULT_BUILD_TIMEOUT_SECS.
-        assert_eq!(DEFAULT_BUILD_TIMEOUT_SECS, 5400);
+    fn test_build_watchdog_defaults() {
+        // The no-progress budget is what actually ends a wedged build: 20
+        // minutes of NO cargo output and NO new artifact. It must stay well
+        // under the absolute backstop, or the backstop becomes the de-facto
+        // wall-clock cap this design exists to remove.
+        assert_eq!(DEFAULT_BUILD_NO_PROGRESS_SECS, 1200);
+        assert_eq!(DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS, 21600);
+        // Ordering + headroom expressed with `min`/`max` rather than a bare
+        // `assert!(A < B)`: the latter is a constant expression, which clippy
+        // (correctly) flags as an assertion that can never fail at runtime.
+        assert_eq!(
+            DEFAULT_BUILD_NO_PROGRESS_SECS.min(DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS),
+            DEFAULT_BUILD_NO_PROGRESS_SECS,
+            "the no-progress budget must be the tighter of the two budgets"
+        );
+        // The absolute backstop must clear the slowest observed real build
+        // (2974s on this box) by a wide margin — it is a backstop, not a cap.
+        assert_eq!(
+            DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS.max(4 * 2974),
+            DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS,
+            "the absolute backstop must sit far above the slowest real build"
+        );
     }
 
     #[test]
-    fn test_build_timeout_default_is_within_clamp() {
-        // The default must survive its own clamp, or `build_timeout_secs()`
-        // would silently return something other than the declared default.
-        assert!((60..=7200).contains(&DEFAULT_BUILD_TIMEOUT_SECS));
+    fn test_build_watchdog_defaults_are_within_their_clamps() {
+        // Each default must survive its own clamp, or the resolver would
+        // silently return something other than the declared default.
+        assert!((60..=7200).contains(&DEFAULT_BUILD_NO_PROGRESS_SECS));
+        assert!((300..=86400).contains(&DEFAULT_BUILD_ABSOLUTE_TIMEOUT_SECS));
     }
 
     #[test]
@@ -1210,11 +1279,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_timeout_resolves() {
+    fn test_build_watchdog_budgets_resolve() {
         // No env override in unit-test env → returns the default.
-        // (Resolved value is memoized; this test still exercises the parse path.)
-        let resolved = build_timeout_secs();
-        assert!((60..=7200).contains(&resolved));
+        // (Resolved values are memoized; this still exercises the parse path.)
+        assert!((60..=7200).contains(&build_no_progress_timeout_secs()));
+        assert!((300..=86400).contains(&build_absolute_timeout_secs()));
+    }
+
+    #[test]
+    fn test_env_secs_or_clamps_and_falls_back() {
+        // Unset → default.
+        assert_eq!(
+            env_secs_or("QONTINUI_SUPERVISOR_NO_SUCH_VAR_FOR_TESTS", 42, 1, 100),
+            42
+        );
     }
 
     // --- AI_MODELS tests ---

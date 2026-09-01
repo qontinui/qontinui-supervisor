@@ -67,6 +67,22 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// poll cost negligible against a multi-minute build.
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Which budget ended a [`GuardedOutcome::TimedOut`] run.
+///
+/// The distinction is load-bearing for build call sites: a `NoProgress` kill
+/// says the build produced nothing for the whole idle window (genuinely
+/// wedged), while `Absolute` says it was still churning when the backstop
+/// fired. Only the former is even a candidate for "the slot state is bad";
+/// neither is evidence of a poisoned incremental cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// The process produced no new output and no new artifact for `idle`.
+    NoProgress { idle: Duration },
+    /// The absolute wall-clock backstop elapsed. The process may well have
+    /// been making progress right up to the kill.
+    Absolute,
+}
+
 /// Outcome of a [`GuardedCommand::run`].
 #[derive(Debug)]
 pub enum GuardedOutcome {
@@ -74,11 +90,13 @@ pub enum GuardedOutcome {
     /// captured `Output` (status + stdout + stderr bytes, read back from the
     /// redirect files).
     Exited(Output),
-    /// The wall-clock timeout elapsed; the process tree was killed. `partial`
-    /// is whatever stdout/stderr was captured (flushed to the files) before the
-    /// kill.
+    /// A timeout budget elapsed; the process tree was killed. `after` is the
+    /// total elapsed wall-clock, `kind` says WHICH budget fired, and `partial`
+    /// is whatever stdout/stderr was captured (flushed to the files) before
+    /// the kill.
     TimedOut {
         after: Duration,
+        kind: TimeoutKind,
         partial: PartialOutput,
     },
     /// The cancellation token fired; the process tree was killed. `partial` is
@@ -130,6 +148,28 @@ pub struct GuardedCommand {
     /// task in `build_monitor`). Lines are sent untagged; SSE framing is the
     /// consumer's job. Send errors (no subscribers) are ignored.
     stream_lines: Option<broadcast::Sender<String>>,
+    /// When set, the run is governed by a NO-PROGRESS watchdog: the kill fires
+    /// only after this long with no observed progress, and `timeout` degrades
+    /// to an absolute backstop. When `None`, `timeout` is a plain wall-clock
+    /// cap (the historical behaviour, kept for short leaf subprocesses).
+    no_progress_timeout: Option<Duration>,
+    /// Extra progress signal consulted by the no-progress watchdog, on top of
+    /// "the process wrote more stderr". Returns an opaque token; any CHANGE in
+    /// the token counts as progress. For a cargo build this is the newest
+    /// artifact mtime under the slot's `CARGO_TARGET_DIR`, which is what keeps
+    /// a long single-crate `rustc` (minutes of total silence, but writing
+    /// artifacts) from being read as wedged.
+    progress_probe: Option<ProgressProbe>,
+}
+
+/// Opaque progress token source — see [`GuardedCommand::progress_probe`].
+pub type ProgressProbe = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Poll cadence of the no-progress watchdog, derived from the budget so a
+/// 2-second budget in a test is still responsive while a 20-minute budget in
+/// production costs a handful of `stat`s per half-minute.
+fn progress_poll_interval(budget: Duration) -> Duration {
+    (budget / 8).clamp(Duration::from_millis(250), Duration::from_secs(30))
 }
 
 impl GuardedCommand {
@@ -145,7 +185,26 @@ impl GuardedCommand {
             cancel: None,
             job_guarded: true,
             stream_lines: None,
+            no_progress_timeout: None,
+            progress_probe: None,
         }
+    }
+
+    /// Govern this run with a NO-PROGRESS watchdog of `budget`: the tree is
+    /// killed only after `budget` elapses with no new stderr bytes and no
+    /// change in the [`progress_probe`](Self::progress_probe) token. The
+    /// `timeout` passed to [`new`](Self::new) becomes an absolute backstop.
+    pub fn no_progress_timeout(mut self, budget: Duration) -> Self {
+        self.no_progress_timeout = Some(budget);
+        self
+    }
+
+    /// Attach an extra progress signal for the no-progress watchdog (e.g. the
+    /// newest artifact mtime under a cargo target dir). Any change in the
+    /// returned token resets the idle window.
+    pub fn progress_probe(mut self, probe: ProgressProbe) -> Self {
+        self.progress_probe = Some(probe);
+        self
     }
 
     /// Control whether the spawned child is wrapped in a tree-kill job /
@@ -316,8 +375,18 @@ impl GuardedCommand {
         let timeout = self.timeout;
         let cancel = self.cancel.clone();
         let select_start = std::time::Instant::now();
+        let watchdog = TimeoutWatchdog {
+            absolute: timeout,
+            no_progress: self.no_progress_timeout,
+            stderr_path: stderr_path.to_path_buf(),
+            probe: self.progress_probe.clone(),
+        };
 
-        info!("GCMD: select enter timeout={}s", timeout.as_secs());
+        info!(
+            "GCMD: select enter absolute_timeout={}s no_progress={:?}",
+            timeout.as_secs(),
+            self.no_progress_timeout.map(|d| d.as_secs())
+        );
         let outcome = tokio::select! {
             wait_res = child.wait() => {
                 let status = wait_res?;
@@ -335,8 +404,13 @@ impl GuardedCommand {
                 );
                 GuardedOutcome::Exited(make_output(status, out, err))
             }
-            _ = tokio::time::sleep(timeout) => {
-                warn!("GCMD: TIMEOUT after {}s — killing tree", timeout.as_secs());
+            kind = watchdog.fire() => {
+                let elapsed = select_start.elapsed();
+                warn!(
+                    "GCMD: TIMEOUT kind={:?} after {}s — killing tree",
+                    kind,
+                    elapsed.as_secs()
+                );
                 kill_tree(&mut child).await;
                 stop_tail(tail_stop, tail_handle).await;
                 let (stdout, stderr) = read_back(stdout_path, stderr_path);
@@ -346,7 +420,8 @@ impl GuardedCommand {
                     stderr.len()
                 );
                 GuardedOutcome::TimedOut {
-                    after: timeout,
+                    after: elapsed,
+                    kind,
                     partial: PartialOutput { stdout, stderr },
                 }
             }
@@ -427,6 +502,72 @@ impl GuardedCommand {
         }
 
         wrap.spawn()
+    }
+}
+
+/// The timeout arm of [`GuardedCommand::drive`]'s `select!`.
+///
+/// With `no_progress: None` this is exactly the historical behaviour — one
+/// `sleep(absolute)`. With a no-progress budget it polls two progress signals
+/// and only fires once BOTH have been static for the whole budget:
+///
+/// 1. the length of the stderr redirect file (cargo's own output), and
+/// 2. the optional [`ProgressProbe`] token (for cargo: the newest artifact
+///    mtime under the slot's target dir).
+///
+/// Signal 2 is the one that matters for the motivating incident: a single
+/// long `rustc` on the runner's bin crate emits no cargo output for many
+/// minutes while steadily writing artifacts, so a stderr-only watchdog would
+/// still kill a perfectly healthy build.
+struct TimeoutWatchdog {
+    absolute: Duration,
+    no_progress: Option<Duration>,
+    stderr_path: PathBuf,
+    probe: Option<ProgressProbe>,
+}
+
+impl TimeoutWatchdog {
+    /// Current progress token: stderr bytes written so far, mixed with the
+    /// optional external probe. Any change means the process did something.
+    fn sample(&self) -> u64 {
+        let stderr_len = std::fs::metadata(&self.stderr_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let probed = self.probe.as_ref().map(|p| p()).unwrap_or(0);
+        stderr_len ^ probed.rotate_left(32)
+    }
+
+    /// Resolve when a budget is exhausted, reporting which one.
+    async fn fire(&self) -> TimeoutKind {
+        let Some(budget) = self.no_progress else {
+            tokio::time::sleep(self.absolute).await;
+            return TimeoutKind::Absolute;
+        };
+
+        let poll = progress_poll_interval(budget);
+        let started = std::time::Instant::now();
+        let mut last_token = self.sample();
+        let mut last_progress = started;
+
+        loop {
+            tokio::time::sleep(poll).await;
+
+            if started.elapsed() >= self.absolute {
+                return TimeoutKind::Absolute;
+            }
+
+            let token = self.sample();
+            if token != last_token {
+                last_token = token;
+                last_progress = std::time::Instant::now();
+                continue;
+            }
+
+            let idle = last_progress.elapsed();
+            if idle >= budget {
+                return TimeoutKind::NoProgress { idle };
+            }
+        }
     }
 }
 
@@ -559,7 +700,9 @@ async fn tail_stderr_to_broadcast(
 fn outcome_label(outcome: &GuardedOutcome) -> String {
     match outcome {
         GuardedOutcome::Exited(out) => format!("Exited(exit={})", out.status),
-        GuardedOutcome::TimedOut { after, .. } => format!("TimedOut({}s)", after.as_secs()),
+        GuardedOutcome::TimedOut { after, kind, .. } => {
+            format!("TimedOut({}s, {:?})", after.as_secs(), kind)
+        }
         GuardedOutcome::Cancelled { .. } => "Cancelled".to_string(),
     }
 }
@@ -929,6 +1072,153 @@ mod tests {
             }
             other => panic!("expected Exited, got {other:?}"),
         }
+    }
+
+    /// HEADLINE regression (2026-08-03): a process that keeps PRODUCING must
+    /// not be killed just because it outlived the budget. It emits a stderr
+    /// line every ~400ms for ~5s under a 2s no-progress budget — under the old
+    /// wall-clock semantics a 2s timeout killed it at 2s; with the watchdog it
+    /// runs to completion, because the idle window keeps resetting.
+    ///
+    /// This is the shape of the incident: a cargo build killed at 2650 of
+    /// ~2800 compile units with rustc actively working, on a box loaded by 6-7
+    /// peer builds.
+    #[tokio::test]
+    async fn no_progress_watchdog_spares_a_progressing_process() {
+        // One long-lived interpreter emitting every 500ms, rather than a
+        // `cmd` chain shelling out to `ping` for its sleeps: on a box under
+        // real build load a single `ping.exe` spawn measured >2s, which the
+        // watchdog correctly read as no progress. The budget below is sized
+        // to absorb interpreter startup on such a box while staying far under
+        // the ~10s the process actually runs.
+        #[cfg(windows)]
+        let cmd = GuardedCommand::new("powershell", Duration::from_secs(120)).args([
+            "-NoProfile",
+            "-Command",
+            "1..20 | ForEach-Object { [Console]::Error.WriteLine('tick'); \
+             Start-Sleep -Milliseconds 500 }",
+        ]);
+        // 20 x 0.4s ~= 8s of steady output: it MUST outlive the 6s
+        // no-progress budget, and the closing assertion below requires >= 7s
+        // elapsed for the test to prove anything. The original 12 iterations
+        // ran ~4.8s, so the assertion could never hold and the test failed on
+        // every Linux CI run (qontinui-supervisor #134, 2026-08-05).
+        #[cfg(not(windows))]
+        let cmd = GuardedCommand::new("sh", Duration::from_secs(60)).args([
+            "-c",
+            "i=0; while [ $i -lt 20 ]; do echo tick 1>&2; sleep 0.4; i=$((i+1)); done",
+        ]);
+
+        let start = std::time::Instant::now();
+        let outcome = cmd
+            .no_progress_timeout(Duration::from_secs(6))
+            .run()
+            .await
+            .expect("run() should not error");
+
+        match &outcome {
+            GuardedOutcome::Exited(out) => assert!(
+                out.status.success(),
+                "progressing process should exit cleanly, got {:?}",
+                out.status
+            ),
+            other => panic!(
+                "a progressing process must NOT be killed by the no-progress watchdog; got {other:?}"
+            ),
+        }
+        assert!(
+            start.elapsed() >= Duration::from_secs(7),
+            "test did not actually outlive the 6s budget, so it proved nothing; elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The other half: a genuinely SILENT process (no output, no probe signal)
+    /// is killed once the idle window is exhausted, and the outcome names the
+    /// no-progress reason rather than a bare wall-clock timeout.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn no_progress_watchdog_kills_a_silent_process() {
+        let start = std::time::Instant::now();
+        let outcome = GuardedCommand::new("cmd", Duration::from_secs(120))
+            .args(["/C", "ping -n 60 127.0.0.1 >nul"])
+            .no_progress_timeout(Duration::from_secs(2))
+            .run()
+            .await
+            .expect("run() should not error");
+
+        match outcome {
+            GuardedOutcome::TimedOut {
+                kind: TimeoutKind::NoProgress { idle },
+                ..
+            } => assert!(
+                idle >= Duration::from_secs(2),
+                "reported idle window must be at least the budget; got {idle:?}"
+            ),
+            other => panic!("expected TimedOut(NoProgress), got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the no-progress kill must fire on the 2s budget, not the 120s backstop; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A silent process whose EXTERNAL probe keeps changing (the cargo case: a
+    /// single long rustc emitting nothing while writing artifacts) is never
+    /// killed by the no-progress arm — only the absolute backstop ends it, and
+    /// the outcome says so.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn progress_probe_alone_keeps_a_silent_process_alive() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let ticks = std::sync::Arc::new(AtomicU64::new(0));
+        let probe_ticks = ticks.clone();
+
+        let outcome = GuardedCommand::new("cmd", Duration::from_secs(5))
+            .args(["/C", "ping -n 60 127.0.0.1 >nul"])
+            .no_progress_timeout(Duration::from_secs(1))
+            .progress_probe(std::sync::Arc::new(move || {
+                probe_ticks.fetch_add(1, Ordering::Relaxed) + 1
+            }))
+            .run()
+            .await
+            .expect("run() should not error");
+
+        assert!(
+            matches!(
+                outcome,
+                GuardedOutcome::TimedOut {
+                    kind: TimeoutKind::Absolute,
+                    ..
+                }
+            ),
+            "a probe that keeps moving must suppress the no-progress kill, leaving only the \
+             absolute backstop; got {outcome:?}"
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the probe was never called — the test proved nothing"
+        );
+    }
+
+    /// The poll cadence must stay responsive for small budgets and cheap for
+    /// production-sized ones.
+    #[test]
+    fn progress_poll_interval_is_bounded() {
+        assert_eq!(
+            progress_poll_interval(Duration::from_millis(100)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            progress_poll_interval(Duration::from_secs(8)),
+            Duration::from_secs(1)
+        );
+        // 20-minute production budget → capped at the 30s ceiling.
+        assert_eq!(
+            progress_poll_interval(Duration::from_secs(1200)),
+            Duration::from_secs(30)
+        );
     }
 
     /// SSE live-tail: stderr lines must be forwarded to the broadcast channel as
