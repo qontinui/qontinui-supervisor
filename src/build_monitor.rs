@@ -4,13 +4,12 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use crate::config::build_timeout_secs;
 use crate::diagnostics::DiagnosticEventKind;
 #[cfg(target_os = "windows")]
 use crate::diagnostics::ExeLockKillReason;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
-use crate::process::guarded_command::{GuardedCommand, GuardedOutcome};
+use crate::process::guarded_command::{GuardedCommand, GuardedOutcome, ProgressProbe, TimeoutKind};
 use crate::process::manager::{BuildProvenance, BuildSource};
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
@@ -18,6 +17,72 @@ use crate::process::windows::{
 };
 use crate::state::{BuildInfo, BuildSlot, LkgInfo, SharedState};
 use std::sync::Arc;
+
+/// Directories under a slot's `CARGO_TARGET_DIR` whose mtime moves whenever
+/// cargo/rustc produces something. On NTFS (and every filesystem we run on) a
+/// directory's mtime is bumped when an entry is created, renamed or removed,
+/// so a handful of `stat`s answers "did this build produce a new artifact"
+/// without walking a GB-scale tree.
+///
+/// `deps` and `incremental` are the load-bearing two: during the multi-minute
+/// single-`rustc` compile of the runner's bin crate cargo prints nothing, but
+/// codegen units land in `deps/` and the incremental session dir keeps
+/// filling. That is precisely the window in which the old wall-clock cap
+/// killed a healthy build.
+const ARTIFACT_PROGRESS_DIRS: &[&str] = &["deps", "incremental", "build", ".fingerprint"];
+
+/// Build the artifact-progress probe for a slot's target dir: the newest mtime
+/// (in seconds) across the slot's `debug/` output dirs. Any change counts as
+/// progress. Best-effort — an unreadable path contributes nothing, and a probe
+/// that can read NOTHING simply degrades to "stderr output is the only progress
+/// signal", never to a spurious kill (the watchdog only fires when *no* signal
+/// moved).
+fn artifact_progress_probe(target_dir: &std::path::Path) -> ProgressProbe {
+    let debug_dir = target_dir.join("debug");
+    let mut paths: Vec<PathBuf> = vec![target_dir.to_path_buf(), debug_dir.clone()];
+    paths.extend(ARTIFACT_PROGRESS_DIRS.iter().map(|d| debug_dir.join(d)));
+    Arc::new(move || newest_mtime_secs(&paths))
+}
+
+/// Newest mtime across `paths`, in whole seconds since the epoch. `0` when
+/// nothing could be stat'd.
+fn newest_mtime_secs(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Operator-facing reason for a killed cargo build, naming WHICH budget fired.
+///
+/// The distinction is the whole point of the 2026-08-03 change: "no progress
+/// for 20 minutes" is a diagnosis, while the old "timed out after 5400s" said
+/// nothing about whether the build was wedged or merely slow — and was in fact
+/// emitted for a build that was actively compiling.
+fn build_timeout_reason(after: Duration, kind: TimeoutKind) -> String {
+    match kind {
+        TimeoutKind::NoProgress { idle } => format!(
+            "Build killed after {}s by the no-progress watchdog: no cargo output and no new \
+             artifact for {}s (budget {}s). The build was NOT making progress — look for a \
+             wedged rustc/linker, an exhausted page file, or a lock held by another build.",
+            after.as_secs(),
+            idle.as_secs(),
+            crate::config::build_no_progress_timeout_secs()
+        ),
+        TimeoutKind::Absolute => format!(
+            "Build killed after {}s by the absolute backstop ({}s). It was still producing \
+             output/artifacts when killed, so this is a ceiling hit, NOT a stuck build — raise \
+             {} if builds on this box legitimately run this long.",
+            after.as_secs(),
+            crate::config::build_absolute_timeout_secs(),
+            crate::config::BUILD_ABSOLUTE_TIMEOUT_SECS_ENV
+        ),
+    }
+}
 
 /// Max per-process build-kill diagnostics events (`BuildProcessKilled` /
 /// `BuildKillFailed`) emitted by a SINGLE slot-cleanup pass.
@@ -306,6 +371,20 @@ impl BuildPhase {
 
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Is this phase a QUEUE wait — the request blocked on a lock, doing no
+    /// work of its own?
+    ///
+    /// `queue_timeout_secs` bounds exactly these phases. Once the build starts
+    /// doing work (`BuildingFrontend` / `Compiling`) the clock stops: the
+    /// caller's slot is held, the compile is in flight, and a 504 there would
+    /// abandon a live build mid-compile — which is what the field's old
+    /// whole-future semantics did, despite being documented as a queue wait.
+    /// Killing a compiling build also throws away everything it had compiled,
+    /// so the bounded wait cost the caller far more than the wait it bounded.
+    pub fn is_queue_wait(self) -> bool {
+        matches!(self, BuildPhase::AwaitingSlot | BuildPhase::AwaitingNpmLock)
     }
 
     /// Store this phase into the shared marker (Relaxed — the marker is a
@@ -1303,10 +1382,16 @@ async fn run_build_inner(
     // `stream_lines` and process each stderr line live (error classification
     // + `state.logs.emit` + fanout to the slot's SSE sender + collection),
     // preserving the exact live-logging behavior of the legacy reader task.
-    let timeout_secs = build_timeout_secs();
+    // Two budgets, not one wall-clock cap (2026-08-03). `no_progress_secs` is
+    // the watchdog that actually ends a wedged build; `absolute_secs` is a
+    // backstop far above any real build. See `config::build_no_progress_timeout_secs`
+    // for why a wall-clock cap on a box carrying 6-7 peer cargo builds measures
+    // LOAD rather than stuckness.
+    let absolute_secs = crate::config::build_absolute_timeout_secs();
+    let no_progress_secs = crate::config::build_no_progress_timeout_secs();
     info!(
-        "GCMD: cargo start slot={} cwd={:?} target={:?} timeout={}s",
-        slot.id, cargo_cwd, slot.target_dir, timeout_secs
+        "GCMD: cargo start slot={} cwd={:?} target={:?} no_progress={}s absolute={}s",
+        slot.id, cargo_cwd, slot.target_dir, no_progress_secs, absolute_secs
     );
 
     // Per-build line bus. `stream_lines` forwards cargo's merged stderr lines
@@ -1353,16 +1438,25 @@ async fn run_build_inner(
     // `sccache_guard::guarded_cargo`, not a bare `GuardedCommand::new("cargo", …)`:
     // it degrades RUSTC_WRAPPER for this spawn when the live sccache server is
     // S3-bound (Phase 1.3 — see the module docs for why the shell-side guards
-    // never covered this path).
-    let guarded = crate::sccache_guard::guarded_cargo(Duration::from_secs(timeout_secs), cargo_cwd)
-        .await
-        .args(CARGO_BUILD_ARGS)
-        .current_dir(cargo_cwd)
-        // Redirect cargo output to this slot's isolated target dir so
-        // concurrent builds on other slots don't contend on the same target/.
-        .env("CARGO_TARGET_DIR", &slot.target_dir)
-        .job_guarded(true)
-        .stream_lines(line_tx);
+    // never covered this path). The deadline is the ABSOLUTE backstop; the
+    // no-progress watchdog is what actually bounds a wedged build.
+    let guarded =
+        crate::sccache_guard::guarded_cargo(Duration::from_secs(absolute_secs), cargo_cwd)
+            .await
+            .args(CARGO_BUILD_ARGS)
+            .current_dir(cargo_cwd)
+            // Redirect cargo output to this slot's isolated target dir so
+            // concurrent builds on other slots don't contend on the same target/.
+            .env("CARGO_TARGET_DIR", &slot.target_dir)
+            .job_guarded(true)
+            .stream_lines(line_tx)
+            .no_progress_timeout(Duration::from_secs(no_progress_secs))
+            // Artifact progress. Cargo goes quiet for many minutes while the
+            // runner's single bin crate is compiled by one rustc, so "no stderr"
+            // is NOT "no progress" — the newest artifact mtime under the slot's
+            // target dir is. Without this the watchdog would still kill the exact
+            // build that motivated it.
+            .progress_probe(artifact_progress_probe(&slot.target_dir));
 
     let outcome = guarded.run().await;
     // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
@@ -1389,14 +1483,19 @@ async fn run_build_inner(
         // it, which is exactly where a timeout's cause lives (an OOM'd rustc
         // thrashing, a wedged linker). It is now persisted and rendered
         // through the same path a normal failure uses.
-        Ok(GuardedOutcome::TimedOut { after, partial }) => {
+        Ok(GuardedOutcome::TimedOut {
+            after,
+            kind,
+            partial,
+        }) => {
             warn!(
-                "GCMD: cargo TimedOut after {}s, killing — slot={}",
+                "GCMD: cargo TimedOut kind={:?} after {}s, killing — slot={}",
+                kind,
                 after.as_secs(),
                 slot.id
             );
             let partial_stderr = recover_partial_stderr(consumer, &partial.stderr).await;
-            let base = format!("Build timed out after {}s", after.as_secs());
+            let base = build_timeout_reason(after, kind);
             let detail = persist_and_render_incomplete_build(slot, &base, &partial_stderr).await;
             return Err(SupervisorError::Timeout(detail));
         }
@@ -2920,6 +3019,28 @@ pub fn classify_build_stderr(stderr: &str) -> StderrClass {
     }
 }
 
+/// Should the spawn-test poisoned-slot self-heal wipe the claimed slot's
+/// `CARGO_TARGET_DIR` and retry?
+///
+/// Two conditions, and the FIRST is the 2026-08-03 fix: a **timeout is never
+/// grounds for wiping the slot**. A timed-out build produces no compiler
+/// diagnostic, so it classified as `Environmental` and the self-heal deleted
+/// the slot's incremental cache — guaranteeing the retry started COLD and took
+/// longer than the build that had just been killed. That is the loop that made
+/// the lane unrecoverable. Since the watchdog rework a cargo timeout means
+/// either "no progress for the whole idle window" or "hit the absolute
+/// backstop while still progressing"; neither is evidence of a poisoned cache,
+/// and the second is evidence the cache is *good*.
+///
+/// Otherwise the original rule stands: only an `Environmental` failure (no
+/// `error[E####]`, no `could not compile`) is worth one cleaned-slot retry.
+pub fn should_self_heal_slot(err: &SupervisorError, class: StderrClass) -> bool {
+    if matches!(err, SupervisorError::Timeout(_)) {
+        return false;
+    }
+    class == StderrClass::Environmental
+}
+
 /// Outcome detail of a single cargo build attempt, returned by
 /// [`run_cargo_build_with_dir_detailed`] alongside the `Result`. Carries the
 /// slot id the build actually ran on (so the caller can clean + retry exactly
@@ -3991,16 +4112,21 @@ mod tests {
     //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
     //! the bug these guard against.
     use super::{
-        classify_build_stderr, dep_hash_sidecar_path, dep_install_reason, dep_manifest_hash,
-        dist_index_ok, merge_process_output, needs_frontend_prebuild, provenance_tree_root,
-        provenance_warn_target, resolve_provenance_head, rev_parse_head, stderr_submission_tail,
-        update_lkg_after_success, verify_frontend_built, BuildPhase, BuildProvenance, BuildSource,
-        BuildSourceKind, StderrClass, LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
+        artifact_progress_probe, build_timeout_reason, classify_build_stderr,
+        dep_hash_sidecar_path, dep_install_reason, dep_manifest_hash, dist_index_ok,
+        merge_process_output, needs_frontend_prebuild, provenance_tree_root,
+        provenance_warn_target, resolve_provenance_head, rev_parse_head, should_self_heal_slot,
+        stderr_submission_tail, update_lkg_after_success, verify_frontend_built, BuildPhase,
+        BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
+        LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+    use crate::error::SupervisorError;
+    use crate::process::guarded_command::TimeoutKind;
     use crate::state::{SharedState, SupervisorState};
     use std::fs;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     // ---------------------------------------------------------------
@@ -4115,6 +4241,103 @@ mod tests {
             Path::new(POOL)
         )
         .is_ok());
+    }
+
+    /// `queue_timeout_secs` may bound ONLY the phases in which the request is
+    /// blocked on a lock. Once the build is doing work, the clock must stop —
+    /// otherwise a small queue bound 504s an already-compiling slot and throws
+    /// away the compile.
+    #[test]
+    fn only_lock_waits_count_as_queue_time() {
+        assert!(BuildPhase::AwaitingSlot.is_queue_wait());
+        assert!(BuildPhase::AwaitingNpmLock.is_queue_wait());
+        assert!(
+            !BuildPhase::BuildingFrontend.is_queue_wait(),
+            "a running pnpm build is WORK, not queue time"
+        );
+        assert!(
+            !BuildPhase::Compiling.is_queue_wait(),
+            "a running cargo build is WORK, not queue time — this is the arm whose \
+             timeout abandoned live compiles"
+        );
+    }
+
+    /// A timeout must never trigger the poisoned-slot self-heal: wiping the
+    /// slot's target dir guarantees the retry starts cold, which is the loop
+    /// that made the build lane unrecoverable.
+    #[test]
+    fn timeouts_never_wipe_the_slot_cache() {
+        let timeout = SupervisorError::Timeout("no progress for 1200s".into());
+        assert!(
+            !should_self_heal_slot(&timeout, StderrClass::Environmental),
+            "a timed-out build classifies Environmental (no compiler diagnostic) — but its \
+             incremental cache is good and must be kept"
+        );
+        assert!(!should_self_heal_slot(
+            &timeout,
+            StderrClass::CompilerDiagnostic
+        ));
+        // Non-timeout failures keep the original rule.
+        let other = SupervisorError::Process("linker died".into());
+        assert!(should_self_heal_slot(&other, StderrClass::Environmental));
+        assert!(!should_self_heal_slot(
+            &other,
+            StderrClass::CompilerDiagnostic
+        ));
+    }
+
+    /// A killed build must say WHICH budget killed it — "no progress for N s"
+    /// is a diagnosis; the old "timed out after 5400s" was emitted for a build
+    /// that was actively compiling and said nothing.
+    #[test]
+    fn timeout_reason_names_the_budget_that_fired() {
+        let no_progress = build_timeout_reason(
+            Duration::from_secs(1500),
+            TimeoutKind::NoProgress {
+                idle: Duration::from_secs(1200),
+            },
+        );
+        assert!(
+            no_progress.contains("no-progress watchdog"),
+            "{no_progress}"
+        );
+        assert!(no_progress.contains("1200s"), "{no_progress}");
+        assert!(
+            no_progress.contains("NOT making progress"),
+            "the operator must be told the build was genuinely stuck: {no_progress}"
+        );
+
+        let absolute = build_timeout_reason(Duration::from_secs(21600), TimeoutKind::Absolute);
+        assert!(absolute.contains("absolute backstop"), "{absolute}");
+        assert!(
+            absolute.contains("NOT a stuck build"),
+            "a ceiling hit must not be reported as stuckness: {absolute}"
+        );
+        assert!(
+            absolute.contains(crate::config::BUILD_ABSOLUTE_TIMEOUT_SECS_ENV),
+            "the message must name the knob to raise: {absolute}"
+        );
+    }
+
+    /// The artifact probe must move when something is written under the slot's
+    /// target dir — that is the signal that keeps a silent multi-minute rustc
+    /// from being read as wedged.
+    #[test]
+    fn artifact_probe_moves_when_the_target_dir_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("slot-0");
+        std::fs::create_dir_all(target.join("debug").join("deps")).unwrap();
+        let probe = artifact_progress_probe(&target);
+        let before = probe();
+        // mtimes have 1s granularity on some filesystems; make the write
+        // unambiguously later.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(target.join("debug").join("deps").join("x.rcgu.o"), b"obj").unwrap();
+        let after = probe();
+        assert_ne!(
+            before, after,
+            "writing an artifact under debug/deps must register as progress"
+        );
     }
 
     /// The phase marker must round-trip through `as_u8`/`from_u8` and produce a

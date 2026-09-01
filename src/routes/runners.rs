@@ -1532,9 +1532,21 @@ pub struct SpawnTestRequest {
     /// Recorded with the active build info for `GET /builds` visibility.
     #[serde(default)]
     pub requester_id: Option<String>,
-    /// Maximum seconds to wait in the build queue before giving up with 504.
-    /// Only meaningful when `rebuild: true` and all slots are busy.
-    /// `None` means wait indefinitely (the default).
+    /// Maximum seconds to spend WAITING IN THE QUEUE before giving up with 504.
+    /// Only meaningful when `rebuild: true`. `None` means wait indefinitely
+    /// (the default).
+    ///
+    /// It bounds only the queue phases — waiting on a cargo build permit and,
+    /// after that, on the serialized frontend (pnpm) lock. **The clock stops
+    /// the moment the build starts doing work**: a build that has its slot and
+    /// is compiling can no longer be 504'd out from under itself, however
+    /// small a value you pass. Until 2026-08-03 this bounded the whole
+    /// build+spawn future despite its name and docs, so a caller asking "don't
+    /// make me queue for more than 60s" also got their compiling build
+    /// abandoned at 60s — losing everything it had compiled.
+    ///
+    /// Use `wait_timeout_secs` to bound the post-spawn health wait; there is
+    /// deliberately no knob that kills a healthy in-flight compile.
     #[serde(default)]
     pub queue_timeout_secs: Option<u64>,
     /// Optional post-spawn health probe window in milliseconds.
@@ -2158,6 +2170,40 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
         }
     }
     Ok(())
+}
+
+/// How often the queue-timeout watcher re-reads the build's phase marker.
+/// Small relative to any sane `queue_timeout_secs`, so the reported wait is
+/// accurate to well under a second.
+const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolve only if `timeout` elapses while the build is STILL in a queue phase
+/// (see [`crate::build_monitor::BuildPhase::is_queue_wait`]); returns the phase
+/// that was blocking so the caller can compose a phase-accurate message.
+///
+/// Once the build leaves its queue phases — the cargo permit and, after it, the
+/// frontend lock are both held and real work has started — this future never
+/// resolves, so `queue_timeout_secs` can no longer 504 a build that is
+/// compiling. Phases advance monotonically within one attempt, so "left the
+/// queue" is a latch, not a sample that can flap back.
+async fn wait_out_queue_timeout(
+    timeout: std::time::Duration,
+    marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> crate::build_monitor::BuildPhase {
+    let start = std::time::Instant::now();
+    loop {
+        let phase = crate::build_monitor::BuildPhase::from_u8(
+            marker.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if !phase.is_queue_wait() {
+            // Work has started — stop counting, forever.
+            std::future::pending::<()>().await;
+        }
+        if start.elapsed() >= timeout {
+            return phase;
+        }
+        tokio::time::sleep(QUEUE_PHASE_POLL).await;
+    }
 }
 
 /// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
@@ -3455,13 +3501,21 @@ async fn execute_spawn_build_inner(
                 );
                 match queue_timeout_secs {
                     Some(secs) => {
+                        // `queue_timeout_secs` bounds the QUEUE, not the build.
+                        // It used to wrap the whole future, so a caller passing
+                        // a small bound to say "don't make me wait for a busy
+                        // pool" got a 504 that ALSO abandoned an already-
+                        // compiling slot — throwing away a live build (and
+                        // everything it had compiled) for a wait that had
+                        // already ended. The watcher below stops counting the
+                        // moment the build leaves its queue phases, so the
+                        // field now means what it is documented to mean.
                         let timeout = std::time::Duration::from_secs(secs);
-                        match tokio::time::timeout(timeout, fut).await {
-                            Ok(r) => r,
-                            Err(_) => {
-                                let phase = crate::build_monitor::BuildPhase::from_u8(
-                                    phase_marker.load(std::sync::atomic::Ordering::Relaxed),
-                                );
+                        let watcher = wait_out_queue_timeout(timeout, phase_marker.clone());
+                        tokio::pin!(fut);
+                        tokio::select! {
+                            r = &mut fut => r,
+                            phase = watcher => {
                                 let available_permits =
                                     state.build_pool.permits.available_permits();
                                 Err((
@@ -3488,7 +3542,7 @@ async fn execute_spawn_build_inner(
         // exact slot's `CARGO_TARGET_DIR` and retry the build ONCE before
         // surfacing the 500. A genuine compiler error returns immediately (no
         // wasteful retry). Both outcomes are logged via `tracing`.
-        if let Err((_, ref attempt)) = build_result {
+        if let Err((ref build_err, ref attempt)) = build_result {
             // Record the FIRST attempt's slot before any retry can overwrite
             // `build_result`. A retry that is refused before claiming a slot
             // returns `BuildAttempt::default()` (`slot_id: None`) — queue
@@ -3500,7 +3554,7 @@ async fn execute_spawn_build_inner(
             side.slot_id = attempt.slot_id.or(side.slot_id);
             let stderr_for_class = attempt.full_stderr.clone().unwrap_or_default();
             let class = crate::build_monitor::classify_build_stderr(&stderr_for_class);
-            if class == crate::build_monitor::StderrClass::Environmental {
+            if crate::build_monitor::should_self_heal_slot(build_err, class) {
                 if let Some(slot_id) = attempt.slot_id {
                     if let Some(slot) = state.build_pool.slots.get(slot_id).cloned() {
                         tracing::warn!(
@@ -3565,6 +3619,16 @@ async fn execute_spawn_build_inner(
                         build_result = retry;
                     }
                 }
+            } else if matches!(build_err, SupervisorError::Timeout(_)) {
+                // A timeout is NEVER evidence of a poisoned incremental cache
+                // — and wiping the slot guarantees the retry starts cold. See
+                // `build_monitor::should_self_heal_slot`.
+                tracing::warn!(
+                    slot_id = ?attempt.slot_id,
+                    "spawn-test build timed out; keeping the slot's incremental cache intact \
+                     (no clean, no retry) so a retry starts WARM: {}",
+                    build_err
+                );
             } else {
                 tracing::info!(
                     "spawn-test build failed with a compiler diagnostic; returning immediately (no poisoned-slot retry)"
@@ -6821,9 +6885,13 @@ mod tests {
     //! state as `None`.
     use super::{
         attach_build_slot_id, attach_spawn_identity, check_dist_freshness, spawn_abandoned_body,
-        FrontendStaleReason,
+        wait_out_queue_timeout, FrontendStaleReason,
     };
+    use crate::build_monitor::BuildPhase;
     use std::fs;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Walk every `.rs` file under `src/`, returning `(path, line_no, line)` for
@@ -7001,6 +7069,57 @@ mod tests {
              that stops using it re-opens the port-recycling inheritance even if the \
              negative grep above still passes."
         );
+    }
+
+    /// HEADLINE regression (2026-08-03): `queue_timeout_secs` must stop
+    /// counting once the build holds its slot and is compiling. Before this,
+    /// the bound wrapped the whole build future, so a caller who passed a
+    /// small bound to avoid queueing got a 504 that ALSO abandoned a live
+    /// compile.
+    #[tokio::test]
+    async fn queue_timeout_never_fires_once_the_build_is_compiling() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+        // The build acquires its permit and starts compiling almost at once.
+        BuildPhase::Compiling.store(&marker);
+
+        let fired = tokio::time::timeout(
+            Duration::from_millis(900),
+            wait_out_queue_timeout(Duration::from_millis(100), marker),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "the queue watcher fired against a COMPILING build — that 504s a live compile"
+        );
+    }
+
+    /// The other half: while the request really is queued, the bound still
+    /// fires, and it names the phase that was blocking.
+    #[tokio::test]
+    async fn queue_timeout_still_fires_while_actually_queued() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+        let phase = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_out_queue_timeout(Duration::from_millis(150), marker),
+        )
+        .await
+        .expect("a genuinely queued request must still time out");
+        assert_eq!(phase, BuildPhase::AwaitingSlot);
+    }
+
+    /// A build blocked on the serialized frontend (pnpm) lock is still queued
+    /// — no work of its own is happening — so the bound applies there too, and
+    /// the reported phase distinguishes it from cargo-slot exhaustion.
+    #[tokio::test]
+    async fn queue_timeout_covers_the_frontend_lock_wait() {
+        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingNpmLock.as_u8()));
+        let phase = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_out_queue_timeout(Duration::from_millis(150), marker),
+        )
+        .await
+        .expect("a frontend-lock wait is still a queue wait");
+        assert_eq!(phase, BuildPhase::AwaitingNpmLock);
     }
 
     /// A FAILED spawn-test build that had already claimed a slot must still

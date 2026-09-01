@@ -695,20 +695,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Maximum seconds a build slot may be "busy" before the reaper clears it.
-/// Normal builds take 3-8 minutes; 15 minutes is a generous ceiling.
-/// Margin added to the configured build timeout when the reaper decides a
-/// slot is stuck. The reaper is a backstop for leaked slots; cargo's own
-/// timeout (`build_timeout_secs()`) should always fire first on a real
-/// long-running build. The margin gives cargo room to finish even if it's
-/// slightly over its own timeout (e.g. a slow link step).
+/// Margin added to the configured build backstop when the reaper decides a
+/// slot is stuck. The reaper is a backstop for LEAKED slots (a slot marked
+/// busy with no build behind it); cargo's own watchdogs should always fire
+/// first on a real long-running build. The margin gives cargo room to finish
+/// even if it's slightly over its own budget (e.g. a slow link step).
 const REAPER_MARGIN_SECS: i64 = 600;
 
 /// Compute the threshold at which the reaper considers a slot stuck.
-/// Always strictly greater than `build_timeout_secs()` so cargo gets to
-/// fail on its own first.
+///
+/// Anchored to `build_absolute_timeout_secs()` — the LAST budget a cargo build
+/// can hit — so the reaper can never clear a slot out from under a build that
+/// is still progressing. Anchoring it to the no-progress budget instead would
+/// reintroduce exactly the wall-clock kill that budget exists to remove.
 fn max_build_age_secs() -> i64 {
-    config::build_timeout_secs() as i64 + REAPER_MARGIN_SECS
+    config::build_absolute_timeout_secs() as i64 + REAPER_MARGIN_SECS
 }
 
 /// Decide which runner id (if any) the boot-start path should start.
@@ -738,8 +739,9 @@ fn primary_to_boot_start(auto_start: bool, primary: Option<(&str, bool)>) -> Opt
 /// shorter than the configured cargo build timeout (30 min default). On a
 /// cold-cache Tauri build the reaper would kill cargo before cargo's own
 /// timeout fired, leaving the slot's history without a record. The reaper
-/// is now strictly above `build_timeout_secs()` so cargo always gets to
-/// finish (or fail) on its own first.
+/// is now strictly above `build_absolute_timeout_secs()` — the last budget a
+/// cargo build can hit — so cargo always gets to finish (or fail) on its own
+/// first, and a build that is still making progress is never reaped.
 async fn reap_stuck_build_slots(state: state::SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
     interval.tick().await; // skip the immediate first tick
