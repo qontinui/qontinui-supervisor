@@ -37,6 +37,18 @@ pub mod slot_territory;
 /// needs no dead-code exemption.
 pub mod stop_ledger;
 pub mod stopped_cache;
+/// Cross-platform on purpose — see the module docs. The census is the
+/// readiness source that survives the runner's wedged HTTP door, and its walk
+/// and name predicate must be covered by the Linux-only gate that blocks
+/// merges.
+///
+/// The `allow` is temporary: Phase 1 of plan
+/// `2026-09-03-runner-zombie-serving-watchdog` lands the module with no
+/// in-tree consumer, and this is a bin crate, so `-D warnings` would reject
+/// every item as dead code. Phase 2 (`restart_readiness`'s census fallback)
+/// consumes it and removes this attribute.
+#[allow(dead_code)]
+pub mod subtree_census;
 #[cfg(not(target_os = "windows"))]
 pub mod unix_kill;
 #[cfg(target_os = "windows")]
