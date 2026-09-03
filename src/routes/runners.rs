@@ -508,6 +508,10 @@ pub async fn list_runners(
                 "disabled_reason": watchdog.disabled_reason.clone(),
                 "crash_count": watchdog.crash_history.len(),
                 "crash_restart_armed": crate::process::manager::crash_restart_globally_armed(&state.config),
+                "serving_restart_armed": crate::process::manager::serving_restart_globally_armed(&state.config),
+                "serving_restart_attempts": watchdog.serving_restart_attempts,
+                "last_serving_restart_at": watchdog.last_serving_restart_at.map(|t| t.to_rfc3339()),
+                "serving_disabled_reason": watchdog.serving_disabled_reason.clone(),
             }
         }));
     }
@@ -1328,15 +1332,15 @@ pub async fn control_runner_watchdog(
         wd.enabled = body.enabled;
 
         if body.reset_attempts {
-            wd.restart_attempts = 0;
-            wd.disabled_reason = None;
-            wd.crash_history.clear();
+            // Both arms — see `WatchdogState::reset_attempts`.
+            wd.reset_attempts();
         }
 
         json!({
             "watchdog": {
                 "enabled": wd.enabled,
                 "restart_attempts": wd.restart_attempts,
+                "serving_restart_attempts": wd.serving_restart_attempts,
             }
         })
     };

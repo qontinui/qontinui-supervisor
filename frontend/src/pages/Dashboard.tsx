@@ -336,6 +336,38 @@ export function RunnerWatchdogBadge({
     );
   }
 
+  // The SERVING arm's own disarm. Red like the crash-loop disarm and checked
+  // straight after it, because a serving-loop disarm means a runner that
+  // WEDGES again will now sit wedged — the 12-hour-to-5-day condition this
+  // badge exists to make un-silent.
+  const servingLoopDisarmed =
+    !!watchdog.serving_disabled_reason && watchdog.serving_restart_armed !== false;
+  if (servingLoopDisarmed) {
+    const attempts = watchdog.serving_restart_attempts ?? 0;
+    return (
+      <span
+        title={`Serving-restart AUTO-DISARMED: ${watchdog.serving_disabled_reason}. This runner wedged repeatedly (${attempts} serving auto-restart${
+          attempts === 1 ? '' : 's'
+        }) and will NOT be auto-restarted on the next wedge until an operator resets it (POST /runners/{id}/watchdog {reset_attempts:true}).`}
+        aria-label={`Serving-loop disarmed: ${watchdog.serving_disabled_reason}. This runner will not be auto-restarted when its API next goes silent, until an operator resets the watchdog.`}
+        data-testid="runner-serving-loop-disarmed-badge"
+        style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em',
+          color: 'var(--danger, #ef4444)',
+          border: '1px solid var(--danger, #ef4444)',
+          borderRadius: '4px',
+          padding: '0.05rem 0.35rem',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        ⚠ serving-loop disarmed
+      </span>
+    );
+  }
+
   const armedButGlobalOff =
     !isPrimary &&
     running &&
@@ -360,6 +392,37 @@ export function RunnerWatchdogBadge({
         }}
       >
         ⚠ crash-restart disarmed
+      </span>
+    );
+  }
+
+  // The serving arm is off while this runner is armed. Amber, like its crash
+  // twin, and `=== false` (not falsy) so a supervisor that predates the
+  // serving arm — which reports `undefined` — never false-alarms.
+  const servingArmOff =
+    !isPrimary &&
+    running &&
+    watchdog.enabled === true &&
+    watchdog.serving_restart_armed === false;
+  if (servingArmOff) {
+    return (
+      <span
+        title="This runner is armed, but the supervisor's global SERVING-restart arm is off (launched without --watchdog, or QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1). If its HTTP API goes silent while the process holds its port, nothing will restart it."
+        aria-label="Serving-restart disarmed: if this runner's API goes silent while the process stays alive, nothing will restart it."
+        data-testid="runner-serving-restart-disarmed-badge"
+        style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+          letterSpacing: '0.03em',
+          color: 'var(--warning, #eab308)',
+          border: '1px solid var(--warning, #eab308)',
+          borderRadius: '4px',
+          padding: '0.05rem 0.35rem',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        ⚠ serving-restart disarmed
       </span>
     );
   }

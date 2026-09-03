@@ -1493,9 +1493,11 @@ mod tests {
                 retry_after_secs: Some(30)
             }
         );
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1, "no second request of any kind: {seen:?}");
-        assert_eq!(seen[0].path, AGENT_NOTIFICATIONS_PATH);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "no second request of any kind: {seen:?}");
+            assert_eq!(seen[0].path, AGENT_NOTIFICATIONS_PATH);
+        }
 
         // No header → `None`, still no retry.
         let (base, seen) = spawn_coord_mock(429, None).await;

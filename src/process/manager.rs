@@ -3217,6 +3217,478 @@ fn decide_crash_restart(
     }
 }
 
+// =============================================================================
+// Serving Watchdog — liveness is per-route SERVING, not process-exists
+// =============================================================================
+//
+// Plan `2026-09-03-runner-zombie-serving-watchdog`.
+//
+// The crash arm above is armed on process EXIT. Three times in nine days the
+// primary runner's HTTP API stopped answering while the process stayed alive
+// and kept its outbound work going, for 12 hours to 5 days, with
+// `crash_restart_armed: true, restart_attempts: 0` throughout — an armed
+// watchdog is not a recovery path for a process that never crashes. The
+// supervisor detected every occurrence correctly and had no route from that
+// signal to an actor permitted to use it.
+//
+// This is that route. It is deliberately narrower than the crash arm: it fires
+// only when the supervisor's OWN process-subtree census finds zero live
+// `claude` sessions under the runner — a zero census is the statement "there is
+// nothing to destroy", made from evidence a wedged door cannot corrupt. Every
+// prior plan's reason ("never destroy in-flight sessions") is preserved; what
+// is removed is the UNCONDITIONAL refusal, which had turned "protect sessions"
+// into "protect a process that has already lost them".
+
+/// Maximum serving restarts per rolling [`SERVING_RESTART_WINDOW_SECS`] window
+/// before the serving arm disarms itself.
+///
+/// No backoff ladder: the threshold IS the delay, and a recurrence inside the
+/// window is the runner's accept-path leak, which a fourth restart does not fix.
+const SERVING_RESTART_MAX_PER_WINDOW: usize = 3;
+
+/// Rolling window for [`SERVING_RESTART_MAX_PER_WINDOW`].
+const SERVING_RESTART_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// `serving_disabled_reason` set when the serving-loop guard trips. Distinct
+/// from [`CRASH_LOOP_DISABLED_REASON`] so the two arms never mask each other.
+pub const SERVING_LOOP_DISABLED_REASON: &str = "serving restart loop — operator required";
+
+/// Env kill-switch: `QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1`.
+///
+/// Separate from the crash arm's switch on purpose. The `--watchdog` CLI flag
+/// is shared (one operator intent: "supervise the primary"); the kill-switches
+/// are not, so an operator can disarm one arm without losing the other.
+pub fn serving_restart_env_disabled() -> bool {
+    std::env::var("QONTINUI_SUPERVISOR_NO_SERVING_RESTART")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// The global arm for serving restarts — the twin of
+/// [`crash_restart_globally_armed`], sharing `--watchdog` and nothing else.
+pub fn serving_restart_globally_armed(config: &crate::config::SupervisorConfig) -> bool {
+    config.watchdog_enabled_at_start && !serving_restart_env_disabled()
+}
+
+/// Outcome of the serving watchdog decision for one escalating tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingRestartDecision {
+    /// Restart now, subject to the readiness gate (which consults the census).
+    /// `attempt` is 1-based within the rolling window.
+    Restart { attempt: u32 },
+    /// Serving budget exhausted for the window — set
+    /// [`SERVING_LOOP_DISABLED_REASON`] and stop.
+    Disarm,
+    /// Not the wedge class. `Responding`, `Stopped`, and — per Design decision
+    /// 4 — `Unknown`, which is a runner that has NEVER answered: it has nothing
+    /// to prove it is this failure mode, so it is alerted, never restarted.
+    SkipNotWedged,
+    /// Wedged, but not for long enough yet.
+    SkipBelowThreshold,
+    /// A temp runner. The max-age reaper owns those.
+    SkipTempRunner,
+    /// An operator is already stopping or restarting this runner.
+    SkipOperatorIntent,
+    /// A serving restart taken on an earlier tick has not returned yet.
+    SkipInFlight,
+    /// Not globally armed (`--watchdog` absent, or the kill-switch is set).
+    SkipNotArmed,
+    /// Per-runner `WatchdogState.enabled` is false.
+    SkipDisabled,
+    /// The serving arm already disarmed itself.
+    SkipDisarmed,
+}
+
+/// Decide whether a wedged runner warrants a serving restart. Pure.
+///
+/// Priority mirrors [`decide_crash_restart`]: classification and operator
+/// intent first, arming next, the loop guard last, so `Disarm` only fires for a
+/// wedge that would otherwise have restarted.
+///
+/// `silent_for_secs` is `(now - at)` from
+/// [`RunnerLiveness::UnresponsiveSince(at)`](crate::state::RunnerLiveness) —
+/// **never a tick count.** The health-cache loop is not 2 s per tick when
+/// `health_cache_notify` fires an immediate refresh, and the stamp is the same
+/// value `/runners` publishes, so the log, the API and this decision cannot
+/// disagree about how long the runner has been silent.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_serving_restart(
+    liveness: crate::state::RunnerLiveness,
+    silent_for_secs: u64,
+    threshold_secs: u64,
+    kind: &qontinui_types::wire::runner_kind::RunnerKind,
+    stop_requested: bool,
+    restart_requested: bool,
+    in_flight: bool,
+    globally_armed: bool,
+    per_runner_enabled: bool,
+    already_disarmed: bool,
+    restarts_in_window: usize,
+) -> ServingRestartDecision {
+    if !matches!(liveness, crate::state::RunnerLiveness::UnresponsiveSince(_)) {
+        return ServingRestartDecision::SkipNotWedged;
+    }
+    if kind.is_temp() {
+        return ServingRestartDecision::SkipTempRunner;
+    }
+    if stop_requested || restart_requested {
+        return ServingRestartDecision::SkipOperatorIntent;
+    }
+    if in_flight {
+        return ServingRestartDecision::SkipInFlight;
+    }
+    if silent_for_secs < threshold_secs {
+        return ServingRestartDecision::SkipBelowThreshold;
+    }
+    if !globally_armed {
+        return ServingRestartDecision::SkipNotArmed;
+    }
+    if !per_runner_enabled {
+        return ServingRestartDecision::SkipDisabled;
+    }
+    if already_disarmed {
+        return ServingRestartDecision::SkipDisarmed;
+    }
+    if restarts_in_window >= SERVING_RESTART_MAX_PER_WINDOW {
+        return ServingRestartDecision::Disarm;
+    }
+    ServingRestartDecision::Restart {
+        attempt: restarts_in_window as u32 + 1,
+    }
+}
+
+/// Emit one serving-watchdog diagnostic event and — fire and forget — one coord
+/// alert.
+///
+/// **The alert is never awaited on a decision path.** A coord outage must not
+/// delay a restart by a single tick, so this spawns and returns; the
+/// diagnostics ring and the operator log buffer are the durable record on this
+/// box regardless of what coord does.
+#[allow(clippy::too_many_arguments)]
+async fn emit_serving_event(
+    state: &SharedState,
+    runner_id: &str,
+    port: u16,
+    pid: Option<u32>,
+    silent_for_secs: u64,
+    event: crate::diagnostics::ServingEvent,
+    census: Option<serde_json::Value>,
+    detail: Option<String>,
+) {
+    state
+        .diagnostics
+        .write()
+        .await
+        .emit(DiagnosticEventKind::ServingWatchdog {
+            runner_id: runner_id.to_string(),
+            event,
+            pid,
+            port,
+            silent_for_secs,
+            census: census.clone(),
+            detail: detail.clone(),
+        });
+
+    let notice = crate::fleet::ServingWatchdogNotice {
+        runner_id: runner_id.to_string(),
+        event,
+        pid,
+        port,
+        silent_for_secs,
+        census_json: census,
+        detail,
+    };
+    tokio::spawn(async move {
+        match crate::fleet::notify_serving_watchdog(&notice).await {
+            Ok(outcome) => {
+                debug!("serving watchdog alert delivered to coord: {outcome:?}");
+            }
+            Err(e) => {
+                // A coord failure of any kind is a Warn and nothing else.
+                warn!("serving watchdog alert could not reach coord: {e}");
+            }
+        }
+    });
+}
+
+/// The serving watchdog hook, called from the health-cache escalation loop on
+/// every escalating tick for a runner.
+///
+/// `should_alert` carries the loop's existing re-escalation cadence
+/// (`UNRESPONSIVE_ESCALATION_TICKS`, then every `UNRESPONSIVE_REESCALATION_TICKS`).
+/// **Two cadences, deliberately:** the DECISION is evaluated every escalating
+/// tick — it is a pure function over state already held, with no I/O — because
+/// evaluating it only on the alert cadence would make the effective threshold
+/// floor 330 s no matter what the operator configured. The ALERT keeps the
+/// slower cadence so a long wedge does not spam coord.
+pub async fn maybe_serving_restart(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    liveness: crate::state::RunnerLiveness,
+    should_alert: bool,
+) {
+    use crate::diagnostics::ServingEvent;
+
+    let runner_id = managed.config.id.clone();
+    let runner_name = managed.config.name.clone();
+    let port = managed.config.port;
+    let kind = managed.config.kind();
+    let now = chrono::Utc::now();
+
+    let silent_for_secs = match liveness {
+        crate::state::RunnerLiveness::UnresponsiveSince(at) => {
+            (now - at).num_seconds().max(0) as u64
+        }
+        _ => 0,
+    };
+
+    let (pid, stop_requested, restart_requested, adopted) = {
+        let r = managed.runner.read().await;
+        (
+            r.pid,
+            r.stop_requested,
+            r.restart_requested,
+            r.process.is_none(),
+        )
+    };
+
+    // Design decision 4: an ADOPTED runner that holds its port and has NEVER
+    // answered reads `Unknown` forever (adoption stamps `running`/`pid` from a
+    // port probe and never stamps `last_seen_responding_at`). That shape is
+    // occurrence 1's, and it is never restarted — the supervisor cannot back
+    // the classification — but it is never SILENT again either.
+    if matches!(liveness, crate::state::RunnerLiveness::Unknown) {
+        if adopted && should_alert {
+            let msg = format!(
+                "serving watchdog: adopted runner '{runner_name}' (port {port}, pid {pid:?}) \
+                 holds its port and has NEVER answered its HTTP API. Alerting, not restarting — \
+                 the supervisor cannot classify this as a wedge, so it will not act on it."
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                .await;
+            emit_serving_event(
+                state,
+                &runner_id,
+                port,
+                pid,
+                silent_for_secs,
+                ServingEvent::NeverAnsweredSinceAdoption,
+                None,
+                Some("never-answered-since-adoption".to_string()),
+            )
+            .await;
+        }
+        return;
+    }
+
+    let threshold_secs = crate::config::serving_restart_after_secs();
+    let globally_armed = serving_restart_globally_armed(&state.config);
+
+    // Decide + bookkeep under ONE watchdog write lock, so two escalating ticks
+    // can never both observe the same window count or the same in-flight bit.
+    let decision = {
+        let mut wd = managed.watchdog.write().await;
+        wd.serving_history
+            .retain(|t| (now - *t).num_seconds() < SERVING_RESTART_WINDOW_SECS);
+        let decision = decide_serving_restart(
+            liveness,
+            silent_for_secs,
+            threshold_secs,
+            &kind,
+            stop_requested,
+            restart_requested,
+            wd.serving_restart_in_flight,
+            globally_armed,
+            wd.enabled,
+            wd.serving_disabled_reason.is_some(),
+            wd.serving_history.len(),
+        );
+        match decision {
+            ServingRestartDecision::Restart { .. } => {
+                wd.serving_restart_attempts += 1;
+                wd.last_serving_restart_at = Some(now);
+                wd.serving_history.push(now);
+                wd.serving_restart_in_flight = true;
+            }
+            ServingRestartDecision::Disarm => {
+                wd.serving_disabled_reason = Some(SERVING_LOOP_DISABLED_REASON.to_string());
+            }
+            _ => {}
+        }
+        decision
+    };
+
+    match decision {
+        ServingRestartDecision::Restart { attempt } => {
+            let msg = format!(
+                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) has held its \
+                 port with a silent HTTP API for {silent_for_secs}s (threshold {threshold_secs}s) \
+                 — attempting restart {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}. The restart is \
+                 still gated: it proceeds only if the supervisor's process-subtree census finds \
+                 ZERO live `claude` sessions under this runner."
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+            state.notify_health_change();
+
+            emit_serving_event(
+                state,
+                &runner_id,
+                port,
+                pid,
+                silent_for_secs,
+                ServingEvent::Threshold,
+                None,
+                Some(format!(
+                    "attempt {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}, threshold \
+                     {threshold_secs}s"
+                )),
+            )
+            .await;
+
+            let state = state.clone();
+            let managed = managed.clone();
+            tokio::spawn(async move {
+                let result = restart_runner_by_id(
+                    &state,
+                    &runner_id,
+                    false,
+                    RestartSource::ServingWatchdog,
+                    false,
+                    true,
+                )
+                .await;
+
+                // The latch is released on EVERY path — a restart that failed
+                // must not silence the arm for the runner's lifetime.
+                managed.watchdog.write().await.serving_restart_in_flight = false;
+
+                match result {
+                    Ok(()) => {
+                        let msg = format!(
+                            "serving watchdog RESTARTED runner '{runner_name}' \
+                             (attempt {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}) after \
+                             {silent_for_secs}s of a held port with a silent API."
+                        );
+                        warn!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                            .await;
+                        emit_serving_event(
+                            &state,
+                            &runner_id,
+                            port,
+                            pid,
+                            silent_for_secs,
+                            ServingEvent::RestartTaken,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                    // The readiness gate refused: the census counted live
+                    // sessions (or could not be taken). NOT an attempt that
+                    // failed — a refusal, which is the safeguard working.
+                    Err(SupervisorError::RestartUnsafe(detail)) => {
+                        let msg = format!(
+                            "serving watchdog REFUSED to restart runner '{runner_name}': \
+                             {}",
+                            detail.message
+                        );
+                        warn!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                            .await;
+                        // Give the attempt back: a refusal must not consume the
+                        // window budget, or three busy runners would disarm the
+                        // arm without a single restart having been taken.
+                        {
+                            let mut wd = managed.watchdog.write().await;
+                            wd.serving_restart_attempts =
+                                wd.serving_restart_attempts.saturating_sub(1);
+                            wd.serving_history.pop();
+                        }
+                        emit_serving_event(
+                            &state,
+                            &runner_id,
+                            port,
+                            pid,
+                            silent_for_secs,
+                            ServingEvent::RestartRefusedSessionsLive,
+                            detail.payload.get("census").cloned(),
+                            Some(detail.cause.to_string()),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "serving watchdog FAILED to restart runner '{runner_name}' \
+                             (attempt {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}): {e}"
+                        );
+                        error!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                            .await;
+                        emit_serving_event(
+                            &state,
+                            &runner_id,
+                            port,
+                            pid,
+                            silent_for_secs,
+                            ServingEvent::RestartFailed,
+                            None,
+                            Some(e.to_string()),
+                        )
+                        .await;
+                    }
+                }
+                state.notify_health_change();
+            });
+        }
+        ServingRestartDecision::Disarm => {
+            let msg = format!(
+                "serving watchdog DISARMED for runner '{runner_name}': \
+                 {SERVING_RESTART_MAX_PER_WINDOW} serving restarts inside \
+                 {SERVING_RESTART_WINDOW_SECS}s. A fourth restart does not fix a recurring \
+                 wedge — an operator is required (POST /runners/{runner_id}/watchdog \
+                 {{\"enabled\": true, \"reset_attempts\": true}})."
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                .await;
+            state.notify_health_change();
+            emit_serving_event(
+                state,
+                &runner_id,
+                port,
+                pid,
+                silent_for_secs,
+                ServingEvent::Disarmed,
+                None,
+                Some(SERVING_LOOP_DISABLED_REASON.to_string()),
+            )
+            .await;
+        }
+        other => {
+            debug!(
+                "serving watchdog: no action for runner '{}' ({:?}, silent {}s/{}s)",
+                runner_id, other, silent_for_secs, threshold_secs
+            );
+        }
+    }
+}
+
 /// Crash-only ambient watchdog hook, called by `monitor_runner_process_exit`
 /// after every observed exit of a supervisor-spawned runner. Evaluates
 /// [`decide_crash_restart`], does the `WatchdogState` bookkeeping, and — for
@@ -4460,7 +4932,7 @@ async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), Sup
 ///   process-subtree census. That decision is the supervisor's own, not a
 ///   caller's claim, which is the whole difference.
 pub fn automated_restart_blocked(is_temp: bool, source: &RestartSource) -> bool {
-    !is_temp && !(source.is_manual() || matches!(source, RestartSource::ServingWatchdog))
+    !(is_temp || source.is_manual() || matches!(source, RestartSource::ServingWatchdog))
 }
 
 /// Pure stop predicate for [`restart_runner_by_id`]: is there evidence of a
@@ -5761,6 +6233,341 @@ mod tests {
                 "benign skip {benign:?} must not be WARN-worthy"
             );
         }
+    }
+
+    // =========================================================================
+    // Serving watchdog decision table
+    // =========================================================================
+
+    use crate::state::RunnerLiveness;
+
+    fn primary_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+        qontinui_types::wire::runner_kind::RunnerKind::Primary
+    }
+
+    fn temp_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+        qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-1".to_string(),
+        }
+    }
+
+    /// The happy path: a wedge past the threshold, armed, nothing else in the
+    /// way. This is the decision that ends the outage class the plan exists for.
+    #[test]
+    fn serving_restart_fires_on_a_wedge_past_the_threshold() {
+        let wedged = RunnerLiveness::UnresponsiveSince(chrono::Utc::now());
+        assert_eq!(
+            decide_serving_restart(
+                wedged,
+                301,
+                300,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::Restart { attempt: 1 }
+        );
+        // The attempt number is 1-based within the rolling window.
+        assert_eq!(
+            decide_serving_restart(
+                wedged,
+                301,
+                300,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                2
+            ),
+            ServingRestartDecision::Restart { attempt: 3 }
+        );
+    }
+
+    /// Every skip variant, in priority order. Classification and operator
+    /// intent win over arming; the loop guard is evaluated last so `Disarm`
+    /// only fires for a wedge that would otherwise have restarted.
+    #[test]
+    fn serving_restart_decision_table() {
+        let wedged = RunnerLiveness::UnresponsiveSince(chrono::Utc::now());
+        let d = |liveness,
+                 silent,
+                 kind: &qontinui_types::wire::runner_kind::RunnerKind,
+                 stop,
+                 restart,
+                 in_flight,
+                 armed,
+                 enabled,
+                 disarmed,
+                 window| {
+            decide_serving_restart(
+                liveness, silent, 300, kind, stop, restart, in_flight, armed, enabled, disarmed,
+                window,
+            )
+        };
+
+        // Not the wedge class. `Unknown` is excluded on purpose (Design
+        // decision 4): a runner that has NEVER answered has nothing to prove it
+        // is this failure mode, so it is alerted, never restarted.
+        for liveness in [
+            RunnerLiveness::Responding,
+            RunnerLiveness::Stopped,
+            RunnerLiveness::Unknown,
+        ] {
+            assert_eq!(
+                d(
+                    liveness,
+                    99_999,
+                    &primary_kind(),
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    false,
+                    0
+                ),
+                ServingRestartDecision::SkipNotWedged,
+                "{liveness:?} must never reach a restart"
+            );
+        }
+
+        // Temp runners belong to the max-age reaper.
+        assert_eq!(
+            d(
+                wedged,
+                99_999,
+                &temp_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipTempRunner
+        );
+
+        // Operator intent beats arming.
+        assert_eq!(
+            d(
+                wedged,
+                99_999,
+                &primary_kind(),
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipOperatorIntent
+        );
+        assert_eq!(
+            d(
+                wedged,
+                99_999,
+                &primary_kind(),
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipOperatorIntent
+        );
+
+        // A restart already in flight: the tick that follows 2s later must not
+        // schedule a second one. `restart_requested` cannot carry this — it is
+        // set inside `restart_runner_by_id`, after the task is already spawned.
+        assert_eq!(
+            d(
+                wedged,
+                99_999,
+                &primary_kind(),
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipInFlight
+        );
+
+        // Threshold boundary: strictly-below skips, equal fires.
+        assert_eq!(
+            d(
+                wedged,
+                299,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipBelowThreshold
+        );
+        assert_eq!(
+            d(
+                wedged,
+                300,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::Restart { attempt: 1 }
+        );
+
+        // Arming.
+        assert_eq!(
+            d(
+                wedged,
+                301,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipNotArmed
+        );
+        assert_eq!(
+            d(
+                wedged,
+                301,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                0
+            ),
+            ServingRestartDecision::SkipDisabled
+        );
+        assert_eq!(
+            d(
+                wedged,
+                301,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                0
+            ),
+            ServingRestartDecision::SkipDisarmed
+        );
+
+        // Window exhaustion — evaluated LAST.
+        assert_eq!(
+            d(
+                wedged,
+                301,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                SERVING_RESTART_MAX_PER_WINDOW
+            ),
+            ServingRestartDecision::Disarm
+        );
+        // …but a runner that would have skipped for a benign reason never
+        // disarms the arm for every other runner's sake.
+        assert_eq!(
+            d(
+                RunnerLiveness::Responding,
+                301,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                SERVING_RESTART_MAX_PER_WINDOW
+            ),
+            ServingRestartDecision::SkipNotWedged
+        );
+    }
+
+    /// The two kill-switches are independent: `--watchdog` is shared (one
+    /// operator intent, "supervise the primary"), the env switches are not.
+    #[test]
+    fn the_two_arms_share_the_cli_flag_and_nothing_else() {
+        let mut config = crate::config::SupervisorConfig::from_args(
+            <crate::config::CliArgs as clap::Parser>::parse_from(["test", "--project-dir", "."]),
+        );
+        config.watchdog_enabled_at_start = false;
+        assert!(!serving_restart_globally_armed(&config));
+        assert!(!crash_restart_globally_armed(&config));
+        config.watchdog_enabled_at_start = true;
+        // Both arms follow the shared flag; the env switches (read from the
+        // process environment, which tests must not mutate) are asserted by
+        // their own parse functions.
+        assert_eq!(
+            serving_restart_globally_armed(&config),
+            !serving_restart_env_disabled()
+        );
+        assert_ne!(SERVING_LOOP_DISABLED_REASON, CRASH_LOOP_DISABLED_REASON);
+    }
+
+    /// The operator reset clears BOTH arms. A reset that cleared only the crash
+    /// arm would leave a serving-loop disarm latched with no route to clear it.
+    #[test]
+    fn the_operator_reset_clears_both_arms() {
+        let mut wd = crate::state::WatchdogState::new(true);
+        wd.restart_attempts = 2;
+        wd.disabled_reason = Some(CRASH_LOOP_DISABLED_REASON.to_string());
+        wd.crash_history.push(chrono::Utc::now());
+        wd.serving_restart_attempts = 3;
+        wd.last_serving_restart_at = Some(chrono::Utc::now());
+        wd.serving_history.push(chrono::Utc::now());
+        wd.serving_disabled_reason = Some(SERVING_LOOP_DISABLED_REASON.to_string());
+        wd.serving_restart_in_flight = true;
+
+        wd.reset_attempts();
+
+        assert_eq!(wd.restart_attempts, 0);
+        assert!(wd.disabled_reason.is_none());
+        assert!(wd.crash_history.is_empty());
+        assert_eq!(wd.serving_restart_attempts, 0);
+        assert!(wd.last_serving_restart_at.is_none());
+        assert!(wd.serving_history.is_empty());
+        assert!(wd.serving_disabled_reason.is_none());
+        assert!(!wd.serving_restart_in_flight);
+        // The operator's intent bit is NOT what a reset clears.
+        assert!(wd.enabled);
     }
 
     // =========================================================================

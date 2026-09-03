@@ -659,6 +659,27 @@ pub struct WatchdogState {
     pub last_restart_at: Option<DateTime<Utc>>,
     pub crash_history: Vec<DateTime<Utc>>,
     pub disabled_reason: Option<String>,
+
+    // ── The serving arm (plan 2026-09-03-runner-zombie-serving-watchdog) ──
+    //
+    // Kept in the SAME struct as the crash arm — one watchdog, two triggers —
+    // but with its OWN counters and its own disarm reason, so a crash loop and
+    // a serving loop can never mask each other.
+    /// Restarts taken by the serving arm, for the life of the process.
+    pub serving_restart_attempts: u32,
+    pub last_serving_restart_at: Option<DateTime<Utc>>,
+    /// Rolling window of serving restarts, pruned like `crash_history`.
+    pub serving_history: Vec<DateTime<Utc>>,
+    /// Set when the serving-loop guard trips. Distinct from `disabled_reason`.
+    pub serving_disabled_reason: Option<String>,
+    /// True from the moment a serving `Restart` decision is taken until the
+    /// detached task that runs it returns — either way.
+    ///
+    /// `restart_requested` cannot carry this: it is set INSIDE
+    /// `restart_runner_by_id`, i.e. only after the task has been spawned, so
+    /// two escalating ticks 2 s apart could both decide to restart before the
+    /// first one latched anything.
+    pub serving_restart_in_flight: bool,
 }
 
 pub struct BuildState {
@@ -1738,7 +1759,29 @@ impl WatchdogState {
             last_restart_at: None,
             crash_history: Vec::new(),
             disabled_reason: None,
+            serving_restart_attempts: 0,
+            last_serving_restart_at: None,
+            serving_history: Vec::new(),
+            serving_disabled_reason: None,
+            serving_restart_in_flight: false,
         }
+    }
+
+    /// Clear BOTH arms' counters and disarm reasons — what
+    /// `POST /runners/{id}/watchdog {"reset_attempts": true}` means.
+    ///
+    /// The operator reset has always been "put this watchdog back to zero"; a
+    /// reset that cleared only the crash arm would leave a serving-loop disarm
+    /// latched with no route to clear it.
+    pub fn reset_attempts(&mut self) {
+        self.restart_attempts = 0;
+        self.disabled_reason = None;
+        self.crash_history.clear();
+        self.serving_restart_attempts = 0;
+        self.last_serving_restart_at = None;
+        self.serving_history.clear();
+        self.serving_disabled_reason = None;
+        self.serving_restart_in_flight = false;
     }
 }
 

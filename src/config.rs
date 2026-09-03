@@ -754,6 +754,57 @@ pub fn temp_runner_max_age() -> Option<std::time::Duration> {
     })
 }
 
+/// Default serving-restart threshold: 300 s of a HELD PORT WITH A SILENT API
+/// before the serving watchdog will consider a restart.
+///
+/// Five minutes is chosen against the measured costs on both sides. A real
+/// wedge has run 12 h to 5 days with zero recoveries, so ≤5 min plus one
+/// restart is a rounding error against that. A 4-minute GC pause or a `/health`
+/// tail (sampled to 10 120 ms on a loaded box) costs nothing — the 30 s wedge
+/// escalation still logs, the restart simply does not fire.
+const DEFAULT_SERVING_RESTART_AFTER_SECS: u64 = 300;
+
+/// How long a runner's API must have been silent (with its port still held)
+/// before the serving watchdog will restart it.
+///
+/// Env: `QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS`. Default
+/// [`DEFAULT_SERVING_RESTART_AFTER_SECS`], clamped to `[60, 86_400]`.
+///
+/// **`0` is NOT "disabled" here.** The off-switch is a separate variable
+/// (`QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1`), because a threshold that
+/// doubles as a kill-switch means a fat-fingered `0` silently removes the
+/// protection instead of setting a fast one.
+///
+/// The 60 s floor is not cosmetic: `UNRESPONSIVE_ESCALATION_TICKS × 2 s = 30 s`
+/// must have elapsed (so the wedge has been escalated at least once) PLUS
+/// `READINESS_TIMEOUT = 15 s` (so one full readiness probe has had time to
+/// fail) before a restart can be correct. 60 s is the smallest round number
+/// above that sum.
+///
+/// Memoized via `OnceLock`; tests drive [`parse_serving_restart_after`].
+pub fn serving_restart_after_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        parse_serving_restart_after(
+            std::env::var("QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS").ok(),
+        )
+    })
+}
+
+/// Pure parse/clamp core behind [`serving_restart_after_secs`].
+pub(crate) fn parse_serving_restart_after(raw: Option<String>) -> u64 {
+    const MIN_SECS: u64 = 60;
+    const MAX_SECS: u64 = 24 * 60 * 60;
+    match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(n)) => n.clamp(MIN_SECS, MAX_SECS),
+        // Missing OR unparseable → the default. An unreadable knob must never
+        // silently disarm the watchdog, and `0` clamps UP to the floor rather
+        // than meaning "immediately" or "never".
+        _ => DEFAULT_SERVING_RESTART_AFTER_SECS,
+    }
+}
+
 /// Pure decision core behind [`temp_runner_max_age`]; see it for the contract.
 /// Takes the raw env value so the parse/clamp/disable logic is unit-testable
 /// without the `OnceLock` (which memoizes its first read process-wide) and
@@ -1096,6 +1147,40 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Serving-restart threshold ---
+
+    #[test]
+    fn serving_restart_after_defaults_and_never_silently_disarms() {
+        assert_eq!(
+            parse_serving_restart_after(None),
+            DEFAULT_SERVING_RESTART_AFTER_SECS
+        );
+        // Unreadable knob → default, never "off" and never "immediately".
+        for junk in ["", "  ", "abc", "-1", "12.5", "1e6"] {
+            assert_eq!(
+                parse_serving_restart_after(Some(junk.to_string())),
+                DEFAULT_SERVING_RESTART_AFTER_SECS,
+                "{junk:?} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_restart_after_clamps_to_the_escalation_plus_probe_floor() {
+        // `0` is NOT a disable — the off-switch is a separate env var. It
+        // clamps UP to the floor, which sits above
+        // UNRESPONSIVE_ESCALATION_TICKS*2s + READINESS_TIMEOUT = 45s.
+        assert_eq!(parse_serving_restart_after(Some("0".to_string())), 60);
+        assert_eq!(parse_serving_restart_after(Some("1".to_string())), 60);
+        assert_eq!(parse_serving_restart_after(Some("45".to_string())), 60);
+        assert_eq!(parse_serving_restart_after(Some("60".to_string())), 60);
+        assert_eq!(parse_serving_restart_after(Some(" 900 ".to_string())), 900);
+        assert_eq!(
+            parse_serving_restart_after(Some("999999".to_string())),
+            24 * 60 * 60
+        );
+    }
 
     // --- Temp-runner max-age bound ---
 

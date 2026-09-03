@@ -488,13 +488,24 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // is exactly the kind an agent spawns and then waits on, so
                 // silence there is the more expensive of the two.
                 //
-                // NEVER auto-restart from here, whoever owns the runner. For
-                // a user-managed runner the supervisor's contract is
-                // observation only. For a supervisor-managed one a restart is
-                // permitted in general but is still wrong HERE: a wedge is not
-                // an exit, so the crash-only watchdog deliberately does not
-                // cover it, and restarting destroys the in-flight work along
-                // with the evidence. Escalate only; the operator decides.
+                // ESCALATE FIRST, then restart — but ONLY on a zero census,
+                // and NEVER on a session count the wedged door reported.
+                //
+                // This comment used to read "NEVER auto-restart from here,
+                // whoever owns the runner … Escalate only; the operator
+                // decides." That doctrine's cost is now measured: three
+                // occurrences in nine days, 12 hours to 5 days each, zero
+                // recoveries, and each one taking out every coord transport on
+                // the box (they all root on the runner's :9876). Its REASON —
+                // a restart destroys in-flight sessions — is preserved intact
+                // by `manager::maybe_serving_restart`, which acts only when
+                // the supervisor's own process-subtree census finds zero live
+                // `claude` sessions under the runner. A zero census is the
+                // statement "there is nothing to destroy", made from evidence
+                // the wedged door cannot corrupt. What was removed is the
+                // UNCONDITIONAL refusal, which had converted "protect
+                // sessions" into "protect a process that has already lost
+                // them". Plan `2026-09-03-runner-zombie-serving-watchdog`.
                 // Classified from the SAME probes the snapshot below
                 // publishes, so the log and the API can never disagree about
                 // whether this is a wedge. The condition used to be the raw
@@ -527,6 +538,23 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         || (*ticks > UNRESPONSIVE_ESCALATION_TICKS
                             && (*ticks - UNRESPONSIVE_ESCALATION_TICKS)
                                 .is_multiple_of(UNRESPONSIVE_REESCALATION_TICKS));
+
+                    // TWO CADENCES, deliberately. The serving DECISION runs on
+                    // every escalating tick — it is a pure function over state
+                    // already held, and gating it on `should_escalate` would
+                    // make the effective threshold floor 330 s whatever the
+                    // operator configured, so the 60 s clamp floor would be
+                    // unreachable. The ALERT keeps `should_escalate`'s slower
+                    // cadence, which is passed in rather than recomputed.
+                    if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
+                        crate::process::manager::maybe_serving_restart(
+                            &state,
+                            managed,
+                            liveness_now,
+                            should_escalate,
+                        )
+                        .await;
+                    }
 
                     if should_escalate {
                         let (pid, since) = {
@@ -633,9 +661,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // Snapshot the crash-only watchdog state for SSE consumers.
                 let watchdog = {
                     let wd = managed.watchdog.read().await;
-                    crate::routes::health::WatchdogHealth::from_state(
+                    crate::routes::health::WatchdogHealth::from_state_with_arms(
                         &wd,
                         crate::process::manager::crash_restart_globally_armed(&state.config),
+                        crate::process::manager::serving_restart_globally_armed(&state.config),
                     )
                 };
 

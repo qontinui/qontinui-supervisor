@@ -439,6 +439,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Twin of the crash-arm posture warning above, for the SERVING arm. A
+    // wedged primary that will not be auto-restarted is the exact condition
+    // this fleet spent 12 hours to 5 days in, three times, with nothing said —
+    // so the disarmed posture is loud at boot rather than discoverable only by
+    // a session that happens to probe :9875.
+    if !process::manager::serving_restart_globally_armed(&state.config) {
+        let has_primary = {
+            let runners = state.runners.read().await;
+            runners.values().any(|r| r.config.kind().is_primary())
+        };
+        if has_primary {
+            let msg = "serving-restart DISARMED: a primary is managed but a WEDGED runner                        (port held, HTTP API silent) will NOT be auto-restarted — relaunch with                        --watchdog, and unset QONTINUI_SUPERVISOR_NO_SERVING_RESTART, to arm."
+                .to_string();
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+    }
+
     // Background reaper: periodically purge stale/crashed test runners so they
     // don't exhaust the port range (9877-9899). Runs every 5 minutes.
     {

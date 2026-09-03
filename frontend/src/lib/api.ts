@@ -298,6 +298,20 @@ export interface WatchdogHealthWire {
   /// Optional so a health payload from an older supervisor (pre-#111) still
   /// type-checks.
   crash_restart_armed?: boolean;
+
+  /// The TRUE global arm for SERVING restarts — the supervisor restarting a
+  /// runner whose port is held while its HTTP API has gone silent (a "wedge").
+  /// Armed by `--watchdog` with `QONTINUI_SUPERVISOR_NO_SERVING_RESTART` unset.
+  /// Independent of `crash_restart_armed`: a wedge is not an exit, so the
+  /// crash arm never covers it. Optional so an older supervisor's payload
+  /// still type-checks — and `undefined` means "this supervisor predates the
+  /// serving arm", NOT "the arm is off".
+  serving_restart_armed?: boolean;
+  serving_restart_attempts?: number;
+  last_serving_restart_at?: string;
+  /// Set when the SERVING-loop guard self-disarmed. Distinct from
+  /// `disabled_reason`, which is the crash arm's.
+  serving_disabled_reason?: string;
 }
 
 export interface HealthResponse {

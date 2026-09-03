@@ -5,6 +5,8 @@ import type { WatchdogHealthWire } from '../lib/api';
 
 const RED = 'runner-crash-loop-disarmed-badge';
 const AMBER = 'runner-crash-restart-disarmed-badge';
+const SERVING_RED = 'runner-serving-loop-disarmed-badge';
+const SERVING_AMBER = 'runner-serving-restart-disarmed-badge';
 
 function wd(overrides: Partial<WatchdogHealthWire> = {}): WatchdogHealthWire {
   return {
@@ -157,5 +159,53 @@ describe('RunnerWatchdogBadge', () => {
       />,
     );
     expect(screen.getByTestId(RED)).toBeInTheDocument();
+  });
+
+  it('shows the RED serving-loop badge when the serving arm has self-disarmed', () => {
+    render(
+      <RunnerWatchdogBadge
+        watchdog={wd({
+          enabled: true,
+          crash_restart_armed: true,
+          serving_restart_armed: true,
+          serving_restart_attempts: 3,
+          serving_disabled_reason: 'serving restart loop — operator required',
+        })}
+        running={true}
+        isPrimary={false}
+      />,
+    );
+    expect(screen.getByTestId(SERVING_RED)).toBeInTheDocument();
+    // A serving-loop disarm is not a crash-loop disarm.
+    expect(screen.queryByTestId(RED)).not.toBeInTheDocument();
+  });
+
+  it('shows the AMBER serving badge when this runner is armed but the global serving arm is off', () => {
+    render(
+      <RunnerWatchdogBadge
+        watchdog={wd({
+          enabled: true,
+          crash_restart_armed: true,
+          serving_restart_armed: false,
+        })}
+        running={true}
+        isPrimary={false}
+      />,
+    );
+    expect(screen.getByTestId(SERVING_AMBER)).toBeInTheDocument();
+  });
+
+  it('says nothing about the serving arm when the supervisor predates it (field omitted)', () => {
+    // `undefined` means "this supervisor has no serving arm", never "off" —
+    // an absent field must not render as a missing protection.
+    render(
+      <RunnerWatchdogBadge
+        watchdog={wd({ enabled: true, crash_restart_armed: true })}
+        running={true}
+        isPrimary={false}
+      />,
+    );
+    expect(screen.queryByTestId(SERVING_AMBER)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(SERVING_RED)).not.toBeInTheDocument();
   });
 });
