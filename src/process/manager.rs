@@ -3442,10 +3442,11 @@ pub async fn maybe_serving_restart(
         _ => 0,
     };
 
-    let (pid, stop_requested, restart_requested, adopted) = {
+    let (pid, started_at, stop_requested, restart_requested, adopted) = {
         let r = managed.runner.read().await;
         (
             r.pid,
+            r.started_at,
             r.stop_requested,
             r.restart_requested,
             r.process.is_none(),
@@ -3555,15 +3556,85 @@ pub async fn maybe_serving_restart(
             let state = state.clone();
             let managed = managed.clone();
             tokio::spawn(async move {
-                let result = restart_runner_by_id(
-                    &state,
-                    &runner_id,
-                    false,
-                    RestartSource::ServingWatchdog,
-                    false,
-                    true,
-                )
-                .await;
+                // The census safeguard must hold UNCONDITIONALLY for this arm.
+                //
+                // The readiness gate normally supplies it, but `enforce`
+                // exempts an explicitly unprotected runner
+                // (`POST /runners/{id}/protect {"protected": false}`) — an
+                // operator opt-out that means "I can stop this without being
+                // nagged", NOT "a background watchdog may kill it while
+                // sessions are live". Without this pre-check an unprotected
+                // wedged runner would be auto-restarted with NO evidence at
+                // all, and this plan's central guarantee — restart only on a
+                // zero census — would quietly not hold. A protected runner
+                // (the primary is `protected: true` by default) skips it and
+                // pays nothing: the gate answers for it.
+                let unprotected_refusal = if managed.is_protected().await {
+                    None
+                } else {
+                    match crate::process::subtree_census::take_census_for_port(
+                        pid,
+                        port,
+                        started_at.map(|t| t.timestamp()),
+                    )
+                    .await
+                    {
+                        Ok(census)
+                            if matches!(
+                                census.verdict(),
+                                crate::process::subtree_census::CensusVerdict::Idle
+                            ) =>
+                        {
+                            None
+                        }
+                        Ok(census) => Some((
+                            format!(
+                                "serving watchdog refuses to restart UNPROTECTED runner \
+                                 '{runner_name}': its own process-subtree census counted {} live \
+                                 `claude` process(es). The readiness gate exempts an unprotected \
+                                 runner, so this arm counts for itself.",
+                                census.live.len()
+                            ),
+                            Some(census.to_json()),
+                        )),
+                        Err(e) => Some((
+                            format!(
+                                "serving watchdog refuses to restart UNPROTECTED runner \
+                                 '{runner_name}': its process-subtree census could not be taken \
+                                 ({e}), so nothing is known about what is live on it."
+                            ),
+                            None,
+                        )),
+                    }
+                };
+
+                let result = match unprotected_refusal {
+                    None => {
+                        restart_runner_by_id(
+                            &state,
+                            &runner_id,
+                            false,
+                            RestartSource::ServingWatchdog,
+                            false,
+                            true,
+                        )
+                        .await
+                    }
+                    Some((message, census)) => Err(SupervisorError::RestartUnsafe(Box::new(
+                        crate::restart_readiness::RefusalDetail {
+                            cause: "sessions_live",
+                            payload: serde_json::json!({
+                                "error": "restart_refused_unsafe",
+                                "cause": "sessions_live",
+                                "source": "supervisor_census",
+                                "runner_id": runner_id,
+                                "message": message,
+                                "census": census,
+                            }),
+                            message,
+                        },
+                    ))),
+                };
 
                 // Bookkeeping and the latch release happen under ONE lock.
                 //
