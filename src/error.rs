@@ -79,6 +79,24 @@ pub enum SupervisorError {
     #[error("{}", .0.message)]
     RestartUnsafe(Box<crate::restart_readiness::RefusalDetail>),
 
+    /// A start was refused because the runner's port is already held by a
+    /// LIVE `qontinui-runner` process. Spawning a second runner against a held
+    /// port is the OPEN finding S2 (double-spawn, measured on PID 247696 —
+    /// `plans/2026-08-30-mobile-account-usage-relay-503-runner-runtime-starvation.md`
+    /// §S2): the restart funnel used to skip the stop for a wedged adopted
+    /// primary (`running == false` while the process owned the port) and go
+    /// straight to `start_managed_runner`, whose only guard was that same
+    /// flag. This variant is the belt to the stop-predicate fix's braces
+    /// (`manager::restart_should_stop`): it closes S2 for EVERY caller of
+    /// `start_managed_runner`, including the operator route. Mapped to
+    /// `409 CONFLICT` like its neighbours — the request is fine, the on-box
+    /// state is not. Recovery is a stop (or a restart, which now stops
+    /// first) of the runner that holds the port.
+    #[error(
+        "Refusing to start a runner on port {port}: a live qontinui-runner process          (PID {pid}) already holds it. Starting a second runner against a held port          is the S2 double-spawn; stop (or restart) that runner first."
+    )]
+    PortHeldByLiveRunner { port: u16, pid: u32 },
+
     #[error("Process error: {0}")]
     Process(String),
 
@@ -215,6 +233,22 @@ impl SupervisorError {
             return (StatusCode::CONFLICT, detail.payload.clone());
         }
 
+        if let SupervisorError::PortHeldByLiveRunner { port, pid } = self {
+            // Typed body: the caller can branch on `error` and read WHICH
+            // process holds the port without scraping prose.
+            let body = serde_json::json!({
+                "error": "port_held_by_live_runner",
+                "message": self.to_string(),
+                "port": port,
+                "pid": pid,
+                "recovery": [
+                    "POST /runners/{id}/stop",
+                    "POST /runners/{id}/restart",
+                ],
+            });
+            return (StatusCode::CONFLICT, body);
+        }
+
         let status = match self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
@@ -224,6 +258,7 @@ impl SupervisorError {
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
+            SupervisorError::PortHeldByLiveRunner { .. } => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,5 +279,30 @@ impl IntoResponse for SupervisorError {
         // between the two paths.
         let (status, body) = self.to_status_body();
         (status, axum::Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SupervisorError;
+    use axum::http::StatusCode;
+
+    /// `PortHeldByLiveRunner` maps to 409 with a typed body naming the port
+    /// and the holder, so a caller can branch on it rather than scrape prose.
+    #[test]
+    fn port_held_by_live_runner_maps_to_conflict_with_a_typed_body() {
+        let err = SupervisorError::PortHeldByLiveRunner {
+            port: 9876,
+            pid: 247696,
+        };
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "port_held_by_live_runner");
+        assert_eq!(body["port"], 9876);
+        assert_eq!(body["pid"], 247696);
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("port 9876"), "{message}");
+        assert!(message.contains("PID 247696"), "{message}");
+        assert!(body["recovery"].is_array());
     }
 }

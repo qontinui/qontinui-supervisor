@@ -2162,6 +2162,13 @@ pub async fn start_managed_runner(
     let port = managed.config.port;
     let runner_name = managed.config.name.clone();
 
+    // S2 guard: `running == false` is NOT "the port is free". A wedged,
+    // adopted primary reads `running: false` while its process holds the
+    // port, and this function used to spawn a second runner against it.
+    // Refuse on positive evidence of a live runner image on the port; every
+    // start path funnels through here, so one check covers them all.
+    refuse_if_port_held_by_live_runner(port).await?;
+
     state
         .logs
         .emit(
@@ -4434,9 +4441,126 @@ async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), Sup
     .await
 }
 
+/// Pure gate for [`restart_runner_by_id`]: is an automated restart of this
+/// runner refused outright?
+///
+/// Temp runners (`test-*`) are never blocked — the supervisor's own lifecycle
+/// restarts them. For every other runner:
+///
+/// - [`RestartSource::Manual`] is admitted: an operator asked.
+/// - [`RestartSource::Watchdog`] stays BLOCKED. It is the wire value
+///   (`{"source": "watchdog"}` on `POST /runners/{id}/restart`), so any HTTP
+///   caller can claim it, and "any caller may automate a restart of the
+///   operator's primary" is precisely what this block exists to refuse.
+/// - [`RestartSource::ServingWatchdog`] is admitted. It is unconstructible from
+///   the wire (`diagnostics::restart_source_from_wire` never yields it — pinned
+///   by test), so the only producer is the in-process serving-watchdog decision
+///   (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 4), which fires
+///   only on `UnresponsiveSince` past the serving threshold AND a zero
+///   process-subtree census. That decision is the supervisor's own, not a
+///   caller's claim, which is the whole difference.
+pub fn automated_restart_blocked(is_temp: bool, source: &RestartSource) -> bool {
+    !is_temp && !(source.is_manual() || matches!(source, RestartSource::ServingWatchdog))
+}
+
+/// Pure stop predicate for [`restart_runner_by_id`]: is there evidence of a
+/// live process to stop before starting?
+///
+/// The old predicate was `running` alone, and for a user-managed runner
+/// `running` is overwritten from the `/health` probe every health-cache tick —
+/// so a WEDGED primary (process alive, port held, API silent) read
+/// `running == false`, the stop was skipped, and `start_managed_runner` spawned
+/// a second runner against the held port (finding S2). Any of the three
+/// signals is evidence of life: the tracked flag, a known PID, or a listener
+/// on the runner's port (`CachedPortHealth::runner_port_open`, the same
+/// port-level fact the liveness classifier derives `UnresponsiveSince` from).
+/// `stop_runner_by_id` already copes with a runner it has no `Child` for; this
+/// predicate is what gets it *reached*.
+pub fn restart_should_stop(running: bool, pid: Option<u32>, port_open: bool) -> bool {
+    running || pid.is_some() || port_open
+}
+
+/// Pure half of [`refuse_if_port_held_by_live_runner`]: refuse only on
+/// POSITIVE evidence — a listener on the port AND the listener's PID resolved
+/// to a `qontinui-runner` image. A held port whose holder is not a runner (or
+/// could not be named) is left to the spawn's own bind failure, exactly as
+/// before; this guard exists to stop the S2 double-spawn, not to arbitrate
+/// every port collision.
+pub fn port_held_by_live_runner(listening: bool, pid_is_runner: bool) -> bool {
+    listening && pid_is_runner
+}
+
+/// Refuse a start when `port` is already held by a LIVE `qontinui-runner`
+/// process (finding S2: the double-spawn against a held port).
+///
+/// Called by [`start_managed_runner`] before it resolves an exe or spawns
+/// anything, so it covers every caller — manual start, `restart_all`, the
+/// `--watchdog` boot auto-start, the crash watchdog and the serving watchdog.
+/// Three probes, each honest about its own failure:
+///
+/// 1. [`crate::process::port::is_port_listening`] (bind probe). Not held →
+///    `Ok(())`.
+/// 2. [`crate::process::proc_kill::find_pid_on_port`]. `Ok(None)` (the probe
+///    RAN and named nobody) → `Ok(())`. `Err(_)` (the probe could not run —
+///    no `lsof`/`netstat`) → the holder is UNKNOWN; log it and proceed, since
+///    refusal keys on positive evidence only and the spawn's bind failure is
+///    the pre-existing backstop.
+/// 3. [`crate::process::proc_kill::is_qontinui_runner_pid`]. A runner image →
+///    [`SupervisorError::PortHeldByLiveRunner`]; anything else → `Ok(())`.
+///
+/// Note for tests: on Unix `find_pid_on_port` deliberately excludes the
+/// calling process's own PID, so a listener held by the test process itself
+/// resolves as `Ok(None)` (step 2), never as a runner.
+pub async fn refuse_if_port_held_by_live_runner(port: u16) -> Result<(), SupervisorError> {
+    if !crate::process::port::is_port_listening(port) {
+        return Ok(());
+    }
+    let pid = match crate::process::proc_kill::find_pid_on_port(port).await {
+        Ok(Some(pid)) => pid,
+        Ok(None) => {
+            debug!(
+                "port {} is held but the listener probe named no PID; not refusing the start \
+                 (refusal keys on a positively identified runner image)",
+                port
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                "port {} is held but the listener probe could not run ({}); the holder is \
+                 UNKNOWN — proceeding to the spawn, whose bind failure is the backstop",
+                port, e
+            );
+            return Ok(());
+        }
+    };
+    let pid_is_runner = crate::process::proc_kill::is_qontinui_runner_pid(pid);
+    if port_held_by_live_runner(true, pid_is_runner) {
+        return Err(SupervisorError::PortHeldByLiveRunner { port, pid });
+    }
+    debug!(
+        "port {} is held by non-runner PID {}; not refusing the start on its account",
+        port, pid
+    );
+    Ok(())
+}
+
 /// Restart a specific runner by ID.
-/// Automated sources (watchdog, workflow loop, smart rebuild) are rejected for
-/// non-temp runners — only manual API calls can restart user runners.
+///
+/// Automated sources are rejected for non-temp runners — see
+/// [`automated_restart_blocked`] for the one exception (the in-process serving
+/// watchdog) and why the wire `watchdog` value is not it.
+///
+/// `restart_requested` is latched `true` only while a restart is genuinely in
+/// flight: it is set after the readiness gate admits the request and cleared
+/// on EVERY exit of the stop → build → start sequence, success or failure
+/// (`restart_after_gate` is the single body; this wrapper clears the flag
+/// once, before matching its result). Before this shape the flag was cleared
+/// only on the success path, so one failed stop or start left it `true` for
+/// the runner's lifetime — and the serving watchdog's `SkipOperatorIntent`
+/// reads that flag, so its first failed attempt would have silenced it for
+/// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
+/// finding).
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -4445,10 +4569,11 @@ pub async fn restart_runner_by_id(
     force: bool,
     from_working_tree: bool,
 ) -> Result<(), SupervisorError> {
-    if !is_temp_runner(runner_id) && !source.is_manual() {
+    if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
             "Automated restart of non-temp runner '{}' blocked (source: {}). \
-             Only manual restarts are allowed for user runners.",
+             Only manual restarts — and the supervisor's own serving watchdog — \
+             are allowed for user runners.",
             runner_id, source
         );
         warn!("{}", msg);
@@ -4520,28 +4645,84 @@ pub async fn restart_runner_by_id(
         runner.restart_requested = true;
     }
 
-    // Stop if running
+    // The single in-flight body. Whatever it returns, the latch comes off
+    // BEFORE the result is inspected — there is exactly one exit from here.
+    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, from_working_tree).await;
+
     {
-        let runner = managed.runner.read().await;
-        if runner.running {
-            drop(runner);
-            // `force: true` — NOT a bypass. The readiness verdict was already
-            // evaluated (and logged) at the restart boundary a few lines up;
-            // re-probing here would pay a second HTTP round trip and, worse,
-            // could refuse a restart the caller was already granted because a
-            // session appeared in between. One decision per operator request.
-            if let Err(e) = stop_runner_by_id(state, runner_id, true).await {
-                state
-                    .diagnostics
-                    .write()
-                    .await
-                    .emit(DiagnosticEventKind::RestartFailed {
-                        source,
-                        error: e.to_string(),
-                    });
-                return Err(e);
-            }
+        let mut runner = managed.runner.write().await;
+        runner.restart_requested = false;
+    }
+
+    match outcome {
+        Ok(build_duration) => {
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartCompleted {
+                    source,
+                    rebuild,
+                    duration_secs: restart_start.elapsed().as_secs_f64(),
+                    build_duration_secs: build_duration,
+                });
+            Ok(())
         }
+        Err(e) => {
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartFailed {
+                    source,
+                    error: e.to_string(),
+                });
+            Err(e)
+        }
+    }
+}
+
+/// The stop → (build) → start body of [`restart_runner_by_id`], run only
+/// after the readiness gate admitted the request and `restart_requested` was
+/// latched. Returns the build duration (`None` when no rebuild was asked for).
+///
+/// Kept as a separate function so the caller can clear `restart_requested`
+/// exactly once regardless of which step failed — every `?` here lands on the
+/// same clearing line in the wrapper.
+async fn restart_after_gate(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+    rebuild: bool,
+    from_working_tree: bool,
+) -> Result<Option<f64>, SupervisorError> {
+    // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
+    // `running` mirrors the last `/health` probe, so a wedged primary — the
+    // process alive and holding its port, the API silent — reads
+    // `running == false`. Gating the stop on that flag skipped the stop and
+    // spawned a second runner against the held port (finding S2, PID 247696).
+    // The port-level fact comes from the per-runner `CachedPortHealth`
+    // (`managed.cached_health`), the same snapshot the liveness classifier
+    // reads — never from the SSE `CachedRunnerHealth` vector.
+    let (running, pid) = {
+        let runner = managed.runner.read().await;
+        (runner.running, runner.pid)
+    };
+    let port_open = managed.cached_health.read().await.runner_port_open;
+    if restart_should_stop(running, pid, port_open) {
+        if !running {
+            info!(
+                "Restart of runner '{}': tracked running=false but pid={:?}, port_open={} — \
+                 stopping the live process before starting (S2 guard)",
+                runner_id, pid, port_open
+            );
+        }
+        // `force: true` — NOT a bypass. The readiness verdict was already
+        // evaluated (and logged) at the restart boundary in the caller;
+        // re-probing here would pay a second HTTP round trip and, worse,
+        // could refuse a restart the caller was already granted because a
+        // session appeared in between. One decision per operator request.
+        stop_runner_by_id(state, runner_id, true).await?;
     }
 
     // Rebuild if requested (global — single binary).
@@ -4556,21 +4737,10 @@ pub async fn restart_runner_by_id(
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
         let build_origin_main = managed.config.kind().is_primary() && !from_working_tree;
-        let build_outcome = if build_origin_main {
-            primary_rebuild_from_origin_main(state).await
+        if build_origin_main {
+            primary_rebuild_from_origin_main(state).await?;
         } else {
-            crate::build_monitor::run_cargo_build(state).await
-        };
-        if let Err(e) = build_outcome {
-            state
-                .diagnostics
-                .write()
-                .await
-                .emit(DiagnosticEventKind::RestartFailed {
-                    source,
-                    error: e.to_string(),
-                });
-            return Err(e);
+            crate::build_monitor::run_cargo_build(state).await?;
         }
         Some(build_start.elapsed().as_secs_f64())
     } else {
@@ -4587,35 +4757,9 @@ pub async fn restart_runner_by_id(
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
-    if let Err(e) = start_managed_runner(state, &managed).await {
-        state
-            .diagnostics
-            .write()
-            .await
-            .emit(DiagnosticEventKind::RestartFailed {
-                source,
-                error: e.to_string(),
-            });
-        return Err(e);
-    }
+    start_managed_runner(state, managed).await?;
 
-    {
-        let mut runner = managed.runner.write().await;
-        runner.restart_requested = false;
-    }
-
-    state
-        .diagnostics
-        .write()
-        .await
-        .emit(DiagnosticEventKind::RestartCompleted {
-            source,
-            rebuild,
-            duration_secs: restart_start.elapsed().as_secs_f64(),
-            build_duration_secs: build_duration,
-        });
-
-    Ok(())
+    Ok(build_duration)
 }
 
 /// Stop all runners. Primary is stopped last.
@@ -7016,5 +7160,247 @@ mod tests {
             "warning must name the failure mode: {}",
             msg
         );
+    }
+
+    // ── Phase 3 of `2026-09-03-runner-zombie-serving-watchdog`: the restart
+    //    funnel can stop-then-start a wedged, adopted primary (closes S2). ──
+
+    /// The non-temp automated-restart block, three ways: `Manual` admitted,
+    /// `Watchdog` (the wire value any caller can claim) still blocked,
+    /// `ServingWatchdog` (unconstructible from the wire) admitted. Temp
+    /// runners are never blocked for any source.
+    #[test]
+    fn automated_restart_block_admits_manual_and_serving_watchdog_only() {
+        use crate::diagnostics::RestartSource;
+        assert!(!automated_restart_blocked(false, &RestartSource::Manual));
+        assert!(automated_restart_blocked(false, &RestartSource::Watchdog));
+        assert!(!automated_restart_blocked(
+            false,
+            &RestartSource::ServingWatchdog
+        ));
+        for source in [
+            RestartSource::Manual,
+            RestartSource::Watchdog,
+            RestartSource::ServingWatchdog,
+        ] {
+            assert!(
+                !automated_restart_blocked(true, &source),
+                "temp runners are never blocked ({source})"
+            );
+        }
+    }
+
+    /// The stop predicate keys on ANY evidence of life. The S2 shape —
+    /// `running=false` (overwritten from a silent `/health`), a PID, a held
+    /// port — must stop; only the all-negative row skips the stop.
+    #[test]
+    fn restart_stop_predicate_keys_on_evidence_of_life_not_on_running() {
+        // The S2 wedge: tracked flag false, process alive on the port.
+        assert!(restart_should_stop(false, Some(247_696), true));
+        // Linux adopted wedge: no PID recovered (the health cache's PID
+        // recovery is Windows-only), port still held.
+        assert!(restart_should_stop(false, None, true));
+        // A PID with no port: the process exists, stop it.
+        assert!(restart_should_stop(false, Some(1), false));
+        // Tracked running alone (the old predicate) still stops.
+        assert!(restart_should_stop(true, None, false));
+        // Nothing to stop.
+        assert!(!restart_should_stop(false, None, false));
+    }
+
+    /// Truth table of the pure half of the port-held guard: refusal needs BOTH
+    /// a listener and a positively identified runner image.
+    #[test]
+    fn port_held_by_live_runner_truth_table() {
+        assert!(port_held_by_live_runner(true, true));
+        assert!(!port_held_by_live_runner(true, false));
+        assert!(!port_held_by_live_runner(false, true));
+        assert!(!port_held_by_live_runner(false, false));
+    }
+
+    /// Negative branch, end to end: a listener on an ephemeral port that is
+    /// NOT a runner does not trigger the refusal. The test process holds the
+    /// listener (which the Unix `lsof` probe excludes by PID, so the probe
+    /// reports no holder) and a spawned `sleep` child stands in for "a live
+    /// process that is not a qontinui-runner" — `is_qontinui_runner_pid` is
+    /// false for it, which is the identity half of the same predicate. A
+    /// dead port is the trivially-allowed case.
+    #[tokio::test]
+    async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            crate::process::port::is_port_listening(port),
+            "the bind probe must see our own listener"
+        );
+
+        let mut sleeper = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let sleep_pid = sleeper.id().expect("sleep has a pid");
+        assert!(
+            !crate::process::proc_kill::is_qontinui_runner_pid(sleep_pid),
+            "`sleep` must not read as a qontinui-runner image"
+        );
+
+        match refuse_if_port_held_by_live_runner(port).await {
+            Ok(()) => {}
+            Err(SupervisorError::PortHeldByLiveRunner { .. }) => {
+                panic!("a non-runner listener must not produce PortHeldByLiveRunner")
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+
+        drop(listener);
+        let _ = sleeper.kill().await;
+
+        // A port nothing holds is allowed without consulting any probe.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        assert!(refuse_if_port_held_by_live_runner(dead_port).await.is_ok());
+    }
+
+    fn restart_test_state() -> SharedState {
+        use crate::config::{CliArgs, SupervisorConfig};
+        use clap::Parser;
+        let args = CliArgs::parse_from(["test", "--project-dir", "."]);
+        Arc::new(crate::state::SupervisorState::new(
+            SupervisorConfig::from_args(args),
+        ))
+    }
+
+    /// A registered, UNPROTECTED named runner on a port nothing listens on.
+    /// Unprotected so the readiness gate skips (`NotProtected`) and the
+    /// funnel reaches the latch; a dead port so any stop confirms instantly
+    /// and the start fails at exe resolution (this state has no build slot
+    /// and no cargo target-dir artifact).
+    async fn register_dead_named_runner(state: &SharedState, id: &str) -> Arc<ManagedRunner> {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = crate::config::RunnerConfig {
+            id: id.to_string(),
+            name: format!("Runner {id}"),
+            port,
+            kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+                name: id.to_string(),
+            },
+            protected: false,
+            server_mode: false,
+            restate_ingress_port: None,
+            restate_admin_port: None,
+            restate_service_port: None,
+            external_restate_admin_url: None,
+            external_restate_ingress_url: None,
+            extra_env: Default::default(),
+        };
+        let managed = Arc::new(ManagedRunner::new(config, false));
+        state
+            .runners
+            .write()
+            .await
+            .insert(id.to_string(), managed.clone());
+        managed
+    }
+
+    /// `restart_requested` is cleared on the FAILURE exit too. A manual
+    /// restart of a stopped runner whose exe cannot be resolved fails at
+    /// `start_managed_runner`; before Phase 3 the latch stayed `true` forever
+    /// (only the success path cleared it), which would have silenced the
+    /// serving watchdog's `SkipOperatorIntent` after one failed attempt.
+    #[tokio::test]
+    async fn failed_restart_clears_restart_requested() {
+        use crate::diagnostics::RestartSource;
+        let state = restart_test_state();
+        let managed = register_dead_named_runner(&state, "named-p3-start-fail").await;
+
+        let err = restart_runner_by_id(
+            &state,
+            "named-p3-start-fail",
+            false,
+            RestartSource::Manual,
+            false,
+            true,
+        )
+        .await
+        .expect_err("no exe can be resolved from an empty project dir");
+        assert!(
+            !matches!(err, SupervisorError::PortHeldByLiveRunner { .. }),
+            "a dead port must not be reported as held: {err}"
+        );
+
+        let runner = managed.runner.read().await;
+        assert!(
+            !runner.restart_requested,
+            "restart_requested must not stay latched after a failed start"
+        );
+        // No evidence of life → the stop was correctly skipped, so the
+        // stop-intent marker was never latched.
+        assert!(!runner.stop_requested);
+    }
+
+    /// The S2 fix end to end: with `running=false` but a held-port fact in
+    /// the cached snapshot, the funnel now REACHES `stop_runner_by_id`
+    /// (evidence: `stop_requested` latched, which only the stop path sets and
+    /// only a successful spawn clears) before the start — and the latch is
+    /// still cleared when that start fails.
+    #[tokio::test]
+    async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
+        use crate::diagnostics::RestartSource;
+        let state = restart_test_state();
+        let managed = register_dead_named_runner(&state, "named-p3-s2").await;
+        managed.cached_health.write().await.runner_port_open = true;
+        assert!(!managed.runner.read().await.running);
+
+        let err = restart_runner_by_id(
+            &state,
+            "named-p3-s2",
+            false,
+            RestartSource::Manual,
+            false,
+            true,
+        )
+        .await
+        .expect_err("the start still fails at exe resolution");
+        assert!(
+            !matches!(err, SupervisorError::PortHeldByLiveRunner { .. }),
+            "{err}"
+        );
+
+        let runner = managed.runner.read().await;
+        assert!(
+            runner.stop_requested,
+            "the stop must have been reached on port-held evidence alone"
+        );
+        assert!(
+            !runner.restart_requested,
+            "restart_requested must be cleared on the failure exit after a stop"
+        );
+    }
+
+    /// The wire `watchdog` source is still refused for a non-temp runner, and
+    /// the refusal happens BEFORE anything is latched or emitted.
+    #[tokio::test]
+    async fn wire_watchdog_source_is_still_blocked_for_non_temp_runners() {
+        use crate::diagnostics::RestartSource;
+        let state = restart_test_state();
+        let managed = register_dead_named_runner(&state, "named-p3-blocked").await;
+
+        let err = restart_runner_by_id(
+            &state,
+            "named-p3-blocked",
+            false,
+            RestartSource::Watchdog,
+            false,
+            true,
+        )
+        .await
+        .expect_err("wire watchdog must be blocked");
+        assert!(matches!(err, SupervisorError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("blocked"), "{err}");
+        assert!(!managed.runner.read().await.restart_requested);
     }
 }

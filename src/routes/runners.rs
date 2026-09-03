@@ -1156,10 +1156,10 @@ pub async fn restart_runner(
     Path(id): Path<String>,
     Json(body): Json<RestartRunnerRequest>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    let source = match body.source.as_str() {
-        "watchdog" => crate::diagnostics::RestartSource::Watchdog,
-        _ => crate::diagnostics::RestartSource::Manual,
-    };
+    // Closed mapping: `"watchdog"` → `Watchdog`, anything else → `Manual`.
+    // `RestartSource::ServingWatchdog` is deliberately unreachable from the
+    // wire — see `diagnostics::restart_source_from_wire` and its test.
+    let source = crate::diagnostics::restart_source_from_wire(&body.source);
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     if body.rebuild {

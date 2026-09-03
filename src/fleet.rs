@@ -68,6 +68,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::diagnostics::ServingEvent;
+
 /// §3.2 declared role for the supervisor. Always `Build` from the
 /// supervisor's POV — even on dev workstations where the runner has
 /// already published `Agent`.
@@ -444,7 +446,7 @@ fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
 /// pins that as measured fact rather than leaving it to be rediscovered.
 /// The publish's own error string formats the URL and the `reqwest::Error`
 /// only, neither of which carries headers.
-async fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) async fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     attach_resolved_bearer(rb, resolve_device_bearer().await)
 }
 
@@ -565,6 +567,388 @@ pub async fn publish_on_startup() {
     let resources = detect_resources();
     if let Err(e) = publish_budget(ROLE, resources, 0).await {
         warn!("fleet::publish_on_startup failed (non-fatal): {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serving-watchdog alert — plan `2026-09-03-runner-zombie-serving-watchdog`,
+// Phase 5. The supervisor tells coord, durably and without any agent session
+// in the loop, that a runner stopped SERVING while its process stayed alive.
+//
+// Why the alert originates HERE and not in coord: coord cannot infer a wedge
+// from the runner's silence, because the runner is not silent towards coord.
+// A wedged runner keeps its OUTBOUND work going — heartbeats, publishes, the
+// device-budget republisher — while its local `:9876` door stops answering.
+// Every local coord transport roots on that door (coord-mcp, the loopback
+// proxy, the REST write forwarder, the UI-Bridge device-JWT mint), so the
+// sessions that would otherwise report it are the first thing the wedge takes
+// out. Three occurrences, 12 h to 5 days each, were surfaced only by a
+// session's closeout. The supervisor is the one process on the box that
+// watches the door from outside AND holds a device-authed coord client
+// (`attach_device_auth`), so it is the only honest origin.
+//
+// Why `POST /coord/agent-notifications` with `action: "other"`: it is the
+// only door on coord `origin/main` that lands in the operator-pull surface
+// (the dashboard nav badge's `unread_count`) and it admits a DEVICE JWT — the
+// mount is behind `require_jwt`, which checks signature and revocation only,
+// and the handler resolves the tenant from the `device_id` claim. Its body
+// (`AgentNotificationBody`) is flat and `deny_unknown_fields`: `action` is a
+// closed set {publish, force_push, delete, rotate, other}, `artifact` is
+// required, `reversible` ∈ {no, roll-forward, restore} is optional, `checks`
+// is free text, and `repo` / `pr_number` are for PR-shaped events only. The
+// kind is hard-coded server-side to `agent_took_irreversible_action`, which
+// is exact for `RestartTaken` and stretched for the rest — so `checks` opens
+// with `serving_watchdog:<event>` and carries the true class until coord
+// grows a dedicated kind (a Follow-up in the plan).
+//
+// Why the fallback is `POST /coord/agent-findings`: if the notifications door
+// ever answers 401/403 at runtime (a tenant-scoping change, a revoked device)
+// the event must still land SOMEWHERE durable. A `status` finding on topic
+// `operator-notify` is a peer-session feed rather than an operator badge, but
+// it is device-authed by the same bearer and it is queryable. It is a
+// degraded arm, taken only on those two statuses and logged as such.
+//
+// Why callers must spawn this fire-and-forget: a coord outage must never
+// delay a restart by a single tick. Phase 4's `maybe_serving_restart` spawns
+// `notify_serving_watchdog` as a detached task and continues; the
+// `DiagnosticEventKind::ServingWatchdog` ring event it emits in the same
+// breath is the durable record on this box whether or not this call ever
+// completes. Nothing here retries: on 429 the local record already exists,
+// and a retry loop inside a detached task is exactly the unbounded work the
+// escalation cadence (one alert per re-escalation interval) is meant to
+// bound.
+// ---------------------------------------------------------------------------
+
+/// Coord's `MAX_POSTED_FIELD_CHARS` (`notifications.rs`, `findings.rs`): every
+/// posted string field is capped at this many CHARACTERS server-side, and an
+/// over-long one is a 400, not a silent trim. Enforced here on the client so a
+/// large census payload (dozens of PIDs with exe paths) can never turn the
+/// alert into a rejected request.
+const MAX_POSTED_FIELD_CHARS: usize = 2000;
+
+/// Appended when a field is cut, and counted inside the cap.
+const TRUNCATION_MARKER: char = '…';
+
+/// Whole-request budget for one alert POST — the `publish_budget` idiom. The
+/// caller has already detached us, so this bounds a leaked task, not a
+/// restart.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+const AGENT_NOTIFICATIONS_PATH: &str = "/coord/agent-notifications";
+const AGENT_FINDINGS_PATH: &str = "/coord/agent-findings";
+
+/// One serving-watchdog decision, in the shape the alert channel needs.
+///
+/// Mirrors the field set of `DiagnosticEventKind::ServingWatchdog` on purpose
+/// — Phase 4 builds both from the same locals — but is its own struct so the
+/// alert body can be built from a borrow without cloning the ring event.
+/// Carries no credential of any kind, so its `Debug` is safe to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingWatchdogNotice {
+    pub runner_id: String,
+    pub event: ServingEvent,
+    pub pid: Option<u32>,
+    pub port: u16,
+    /// `now - UnresponsiveSince(at)` at decision time.
+    pub silent_for_secs: u64,
+    /// The census / readiness verdict that backed the decision, verbatim.
+    pub census_json: Option<serde_json::Value>,
+    /// The error string for `RestartFailed`, the disarm reason for
+    /// `Disarmed`, free text otherwise.
+    pub detail: Option<String>,
+}
+
+/// How the alert landed. Every variant is a DELIVERY — the `Err` arm of
+/// [`notify_serving_watchdog`] is the only "it did not land" answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// `POST /coord/agent-notifications` answered 2xx. `notification_id` is
+    /// whatever the response body carried under `notification_id` (or `id`),
+    /// `None` when coord answered with no parsable id.
+    Notified { notification_id: Option<String> },
+    /// The notifications door refused the bearer (401/403) and the event
+    /// was recorded as a `status` finding on topic `operator-notify` instead.
+    FallbackFinding { finding_id: Option<String> },
+    /// Coord's per-tenant notification window is exhausted (429). Nothing was
+    /// retried and nothing else was posted: the diagnostics ring on this box
+    /// already holds the event, and the next re-escalation interval will try
+    /// again on its own cadence.
+    RateLimited { retry_after_secs: Option<u64> },
+}
+
+/// Cut a field to coord's per-field character cap, marking the cut.
+///
+/// Character-based, not byte-based: the census carries exe paths and the
+/// `detail` carries arbitrary error text, either of which can be non-ASCII,
+/// and a byte slice would land inside a code point.
+fn truncate_field(raw: &str) -> String {
+    if raw.chars().count() <= MAX_POSTED_FIELD_CHARS {
+        return raw.to_string();
+    }
+    let mut cut: String = raw.chars().take(MAX_POSTED_FIELD_CHARS - 1).collect();
+    cut.push(TRUNCATION_MARKER);
+    cut
+}
+
+/// The one-line `artifact` an operator reads on the dashboard badge.
+fn artifact_line(notice: &ServingWatchdogNotice) -> String {
+    let pid = notice
+        .pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    truncate_field(&format!(
+        "runner {} pid {pid} port {} — {} after {}s silent",
+        notice.runner_id, notice.port, notice.event, notice.silent_for_secs
+    ))
+}
+
+/// The `checks` field: the TRUE event class first (coord's kind is hard-coded
+/// to `agent_took_irreversible_action` for every class), then the detail,
+/// then the census/verdict JSON — so a truncation, if one happens, eats the
+/// tail of the census and never the class.
+fn checks_string(notice: &ServingWatchdogNotice) -> String {
+    let mut checks = format!("serving_watchdog:{} ", notice.event);
+    match notice.detail.as_deref() {
+        Some(detail) if !detail.is_empty() => {
+            checks.push_str("detail=");
+            checks.push_str(detail);
+            checks.push(' ');
+        }
+        _ => {}
+    }
+    match &notice.census_json {
+        Some(census) => {
+            checks.push_str("census=");
+            checks.push_str(&census.to_string());
+        }
+        None => checks.push_str("census=none"),
+    }
+    truncate_field(&checks)
+}
+
+/// Build EXACTLY the flat body coord's `AgentNotificationBody` accepts. Pure
+/// — no IO — so the golden test pins the wire shape against the real
+/// construction path.
+///
+/// The key set is `{action, artifact, checks}` plus `reversible` for
+/// `RestartTaken` ONLY. The door is `deny_unknown_fields`, so one extra key is
+/// a 400 that surfaces nowhere an operator looks; and `reversible` is omitted
+/// rather than sent for the non-restart classes because coord renders an
+/// absent value as "unrecorded" — the honest answer for a threshold or a
+/// refusal, which reversed nothing — whereas any present value would be a
+/// claim. `repo` / `pr_number` are never emitted (a runner is not a PR), and
+/// `kind` / `actor` are server-assigned and would be rejected.
+pub fn build_agent_notification_body(notice: &ServingWatchdogNotice) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("action".to_string(), serde_json::Value::from("other"));
+    body.insert(
+        "artifact".to_string(),
+        serde_json::Value::from(artifact_line(notice)),
+    );
+    if notice.event == ServingEvent::RestartTaken {
+        body.insert("reversible".to_string(), serde_json::Value::from("no"));
+    }
+    body.insert(
+        "checks".to_string(),
+        serde_json::Value::from(checks_string(notice)),
+    );
+    serde_json::Value::Object(body)
+}
+
+/// The degraded-arm body for `POST /coord/agent-findings`. `title` and `body`
+/// are the same two strings the notification would have carried, so the two
+/// records read alike; `resource_keys` names the runner and — when
+/// `~/.qontinui/machine.json` resolves one — the device, so a peer session
+/// can find the finding by either.
+fn build_fallback_finding_body(
+    notice: &ServingWatchdogNotice,
+    device_id: Option<&str>,
+) -> serde_json::Value {
+    let mut resource_keys = vec![format!("runner:{}", notice.runner_id)];
+    if let Some(device_id) = device_id.filter(|d| !d.is_empty()) {
+        resource_keys.push(format!("device:{device_id}"));
+    }
+    serde_json::json!({
+        "kind": "status",
+        "topic": "operator-notify",
+        "title": artifact_line(notice),
+        "body": checks_string(notice),
+        "resource_keys": resource_keys,
+    })
+}
+
+/// Alert coord that the serving watchdog decided something about a runner.
+///
+/// Resolves the coord base from the active profile (`coord_http_base`) and
+/// the device bearer through the usual cascade, then posts. See the block
+/// comment above for why this exists, why it is `action: other`, and why the
+/// caller MUST spawn it rather than await it on the restart path:
+///
+/// ```ignore
+/// tokio::spawn(async move {
+///     match fleet::notify_serving_watchdog(&notice).await {
+///         Ok(outcome) => info!(...),
+///         Err(e) => warn!("serving watchdog: coord alert not delivered: {e}"),
+///     }
+/// });
+/// ```
+///
+/// `Err` means the event did NOT land on coord by either door; the
+/// diagnostics ring event the caller emitted alongside is the record then.
+/// Never logs, formats or returns the `Authorization` value on any path.
+// Wired by Phase 4's `maybe_serving_restart` (`process::manager`), which
+// lands in a separate commit on the same branch; until it does, the lib
+// target reaches this through `lib.rs` and the bin target reports it dead.
+#[allow(dead_code)]
+pub async fn notify_serving_watchdog(
+    notice: &ServingWatchdogNotice,
+) -> Result<NotifyOutcome, String> {
+    let base = coord_http_base().ok_or_else(|| {
+        "no coord base: ~/.qontinui/profiles.json missing or the active profile has no coord_url"
+            .to_string()
+    })?;
+    notify_serving_watchdog_at(&base, notice).await
+}
+
+/// [`notify_serving_watchdog`] against an explicit coord base — the seam the
+/// tests drive against an in-process server. Resolves the device bearer and
+/// the device id ONCE and hands both to the request path, so the fallback
+/// arm cannot mint a second credential.
+#[allow(dead_code)] // reached through `notify_serving_watchdog`; see its note
+pub async fn notify_serving_watchdog_at(
+    base: &str,
+    notice: &ServingWatchdogNotice,
+) -> Result<NotifyOutcome, String> {
+    let bearer = resolve_device_bearer().await;
+    let device_id = load_machine_file().and_then(|m| m.device_id().map(str::to_string));
+    notify_serving_watchdog_with(base, notice, bearer, device_id.as_deref()).await
+}
+
+/// The request path with credential resolution factored out, so every arm
+/// (2xx, 401/403 → fallback, 429, other, network) is assertable against a
+/// mock without touching the environment, the credential file, or the live
+/// runner's mint door.
+async fn notify_serving_watchdog_with(
+    base: &str,
+    notice: &ServingWatchdogNotice,
+    bearer: Option<(String, &'static str)>,
+    device_id: Option<&str>,
+) -> Result<NotifyOutcome, String> {
+    let base = base.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(NOTIFY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("reqwest builder: {e}"))?;
+
+    let url = format!("{base}{AGENT_NOTIFICATIONS_PATH}");
+    let body = build_agent_notification_body(notice);
+    // `reqwest::Error`'s Display carries the URL and the error kind only —
+    // never headers — so this string is safe to log and to return.
+    let resp = attach_resolved_bearer(client.post(&url).json(&body), bearer.clone())
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let answer: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let notification_id = id_from_body(&answer, "notification_id");
+        info!(
+            "fleet::notify_serving_watchdog: coord notified ({status}) runner={} event={} \
+             notification_id={}",
+            notice.runner_id,
+            notice.event,
+            notification_id.as_deref().unwrap_or("-")
+        );
+        return Ok(NotifyOutcome::Notified { notification_id });
+    }
+
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after_secs = retry_after_secs(&resp);
+        warn!(
+            "fleet::notify_serving_watchdog: coord rate-limited the alert (429, Retry-After={}) \
+             runner={} event={} — not retrying; the diagnostics ring holds the event",
+            retry_after_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "absent".to_string()),
+            notice.runner_id,
+            notice.event
+        );
+        return Ok(NotifyOutcome::RateLimited { retry_after_secs });
+    }
+
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        warn!(
+            "fleet::notify_serving_watchdog: coord refused the device bearer at \
+             {AGENT_NOTIFICATIONS_PATH} ({status}) runner={} event={} — falling back to a \
+             `status` finding on topic operator-notify",
+            notice.runner_id, notice.event
+        );
+        return post_fallback_finding(&client, base, notice, bearer, device_id).await;
+    }
+
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "coord returned {status} for POST {AGENT_NOTIFICATIONS_PATH}: {}",
+        truncate_field(&text)
+    ))
+}
+
+/// The 401/403 degraded arm: the same event as a device-authed finding.
+async fn post_fallback_finding(
+    client: &reqwest::Client,
+    base: &str,
+    notice: &ServingWatchdogNotice,
+    bearer: Option<(String, &'static str)>,
+    device_id: Option<&str>,
+) -> Result<NotifyOutcome, String> {
+    let url = format!("{base}{AGENT_FINDINGS_PATH}");
+    let body = build_fallback_finding_body(notice, device_id);
+    let resp = attach_resolved_bearer(client.post(&url).json(&body), bearer)
+        .send()
+        .await
+        .map_err(|e| format!("fallback POST {url}: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        let answer: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let finding_id = id_from_body(&answer, "finding_id");
+        info!(
+            "fleet::notify_serving_watchdog: recorded as a finding ({status}) runner={} event={} \
+             finding_id={}",
+            notice.runner_id,
+            notice.event,
+            finding_id.as_deref().unwrap_or("-")
+        );
+        return Ok(NotifyOutcome::FallbackFinding { finding_id });
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "coord refused the notification AND the fallback finding: {status} for POST \
+         {AGENT_FINDINGS_PATH}: {}",
+        truncate_field(&text)
+    ))
+}
+
+/// `Retry-After` as delay-seconds. An HTTP-date form is legal but coord's
+/// typed 429 sends seconds; anything else reads as "absent".
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Pull an id out of a coord answer: the named key first, then a bare `id`.
+/// Accepts a string or an integer, since the two doors are not uniform.
+fn id_from_body(body: &serde_json::Value, key: &str) -> Option<String> {
+    let value = body.get(key).or_else(|| body.get("id"))?;
+    match value {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -810,5 +1194,444 @@ mod tests {
             "if HeaderMap ever starts redacting Authorization this test should be \
              re-examined — until then, NEVER {{:?}} a request in this module"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Serving-watchdog alert (Phase 5).
+    // -----------------------------------------------------------------------
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    const ALL_EVENTS: [ServingEvent; 6] = [
+        ServingEvent::Threshold,
+        ServingEvent::NeverAnsweredSinceAdoption,
+        ServingEvent::RestartTaken,
+        ServingEvent::RestartRefusedSessionsLive,
+        ServingEvent::RestartFailed,
+        ServingEvent::Disarmed,
+    ];
+
+    fn sample_notice(event: ServingEvent) -> ServingWatchdogNotice {
+        ServingWatchdogNotice {
+            runner_id: "primary".to_string(),
+            event,
+            pid: Some(48544),
+            port: 9876,
+            silent_for_secs: 301,
+            census_json: Some(serde_json::json!({
+                "source": "supervisor_subtree_census",
+                "root_pid": 48544,
+                "walked": 3,
+                "live_claude": [],
+                "verdict": "idle"
+            })),
+            detail: None,
+        }
+    }
+
+    /// One recorded request at the mock: which door, whether a bearer came
+    /// with it, and the parsed JSON body.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        path: &'static str,
+        authorization: Option<String>,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        notifications_status: u16,
+        retry_after: Option<&'static str>,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    fn record(st: &MockState, path: &'static str, headers: &HeaderMap, body: serde_json::Value) {
+        let authorization = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        st.seen.lock().unwrap().push(Seen {
+            path,
+            authorization,
+            body,
+        });
+    }
+
+    async fn mock_notifications(
+        State(st): State<MockState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        record(&st, AGENT_NOTIFICATIONS_PATH, &headers, body);
+        let status = StatusCode::from_u16(st.notifications_status).unwrap();
+        let mut resp = (
+            status,
+            Json(serde_json::json!({"notification_id": "n-1", "kind": "agent_took_irreversible_action"})),
+        )
+            .into_response();
+        if let Some(ra) = st.retry_after {
+            resp.headers_mut()
+                .insert("Retry-After", HeaderValue::from_static(ra));
+        }
+        resp
+    }
+
+    async fn mock_findings(
+        State(st): State<MockState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        record(&st, AGENT_FINDINGS_PATH, &headers, body);
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"finding_id": "f-1"})),
+        )
+            .into_response()
+    }
+
+    /// A coord stand-in on an ephemeral loopback port: answers the
+    /// notifications door with a fixed status (plus an optional
+    /// `Retry-After`) and the findings door with 201. Same shape as
+    /// `restart_readiness`'s `spawn_mock` — a real HTTP round trip, and the
+    /// real coord is never touched because the base URL is explicit.
+    async fn spawn_coord_mock(
+        notifications_status: u16,
+        retry_after: Option<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let st = MockState {
+            notifications_status,
+            retry_after,
+            seen: Arc::clone(&seen),
+        };
+        let app = Router::new()
+            .route(AGENT_NOTIFICATIONS_PATH, post(mock_notifications))
+            .route(AGENT_FINDINGS_PATH, post(mock_findings))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// A URL nothing is listening on.
+    async fn dead_base() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn keys(v: &serde_json::Value) -> Vec<&str> {
+        let mut k: Vec<&str> = v
+            .as_object()
+            .expect("body is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        k.sort_unstable();
+        k
+    }
+
+    /// GOLDEN: coord's `AgentNotificationBody` is `deny_unknown_fields`, so
+    /// one extra key is a 400 that no operator ever sees. Pin the exact key
+    /// set for every event class: `{action, artifact, checks}`, plus
+    /// `reversible` for `RestartTaken` ONLY — absent renders as "unrecorded"
+    /// on coord, and a threshold or refusal reversed nothing. Never `repo`,
+    /// `pr_number`, `kind` or `actor`.
+    #[test]
+    fn notification_body_carries_exactly_the_keys_coord_accepts() {
+        for event in ALL_EVENTS {
+            let body = build_agent_notification_body(&sample_notice(event));
+            let expected: Vec<&str> = if event == ServingEvent::RestartTaken {
+                vec!["action", "artifact", "checks", "reversible"]
+            } else {
+                vec!["action", "artifact", "checks"]
+            };
+            assert_eq!(keys(&body), expected, "event {event}: {body}");
+            assert_eq!(body["action"], "other", "event {event}");
+            if event == ServingEvent::RestartTaken {
+                assert_eq!(body["reversible"], "no");
+            }
+            let checks = body["checks"].as_str().unwrap();
+            assert!(
+                checks.starts_with(&format!("serving_watchdog:{event} ")),
+                "checks must open with the true class: {checks}"
+            );
+            assert!(checks.contains(r#""verdict":"idle""#), "{checks}");
+            for forbidden in ["repo", "pr_number", "kind", "actor"] {
+                assert!(body.get(forbidden).is_none(), "{forbidden} in {body}");
+            }
+        }
+
+        // The artifact line, exactly.
+        let body = build_agent_notification_body(&sample_notice(ServingEvent::RestartTaken));
+        assert_eq!(
+            body["artifact"],
+            "runner primary pid 48544 port 9876 — restart_taken after 301s silent"
+        );
+
+        // An unknown PID is spelled, not omitted; a detail lands in checks
+        // ahead of the census; no census is said, not left blank.
+        let mut notice = sample_notice(ServingEvent::RestartFailed);
+        notice.pid = None;
+        notice.census_json = None;
+        notice.detail = Some("port 9876 held by live runner pid 48544".to_string());
+        let body = build_agent_notification_body(&notice);
+        assert_eq!(
+            body["artifact"],
+            "runner primary pid unknown port 9876 — restart_failed after 301s silent"
+        );
+        assert_eq!(
+            body["checks"],
+            "serving_watchdog:restart_failed detail=port 9876 held by live runner pid 48544 \
+             census=none"
+        );
+    }
+
+    /// `checks` is cut to coord's `MAX_POSTED_FIELD_CHARS` (2000) with a
+    /// marker inside the cap, counted in characters — and the cut eats the
+    /// census tail, never the class prefix. A body under the cap is passed
+    /// through untouched.
+    #[test]
+    fn notification_checks_is_truncated_at_coords_field_cap_with_a_marker() {
+        let mut notice = sample_notice(ServingEvent::RestartRefusedSessionsLive);
+        // Non-ASCII on purpose: a byte-based cut would land inside a code point.
+        let long_exe = "é".repeat(5000);
+        notice.census_json = Some(serde_json::json!({
+            "verdict": "busy",
+            "live_claude": [{"pid": 7, "exe": long_exe}]
+        }));
+        let body = build_agent_notification_body(&notice);
+        let checks = body["checks"].as_str().unwrap();
+        assert_eq!(checks.chars().count(), MAX_POSTED_FIELD_CHARS, "{checks}");
+        assert!(checks.ends_with(TRUNCATION_MARKER), "{checks}");
+        assert!(checks.starts_with("serving_watchdog:restart_refused_sessions_live "));
+        assert!(
+            body["artifact"].as_str().unwrap().chars().count() < MAX_POSTED_FIELD_CHARS,
+            "the artifact line is short and must not be touched"
+        );
+
+        let short = build_agent_notification_body(&sample_notice(ServingEvent::Threshold));
+        let checks = short["checks"].as_str().unwrap();
+        assert!(checks.chars().count() < MAX_POSTED_FIELD_CHARS);
+        assert!(!checks.contains(TRUNCATION_MARKER), "{checks}");
+
+        // The helper itself, at the boundary.
+        let exact: String = "x".repeat(MAX_POSTED_FIELD_CHARS);
+        assert_eq!(truncate_field(&exact), exact);
+        let over: String = "x".repeat(MAX_POSTED_FIELD_CHARS + 1);
+        let cut = truncate_field(&over);
+        assert_eq!(cut.chars().count(), MAX_POSTED_FIELD_CHARS);
+        assert!(cut.ends_with(TRUNCATION_MARKER));
+    }
+
+    /// 2xx → `Notified` carrying the id coord answered with; exactly ONE
+    /// request, to the notifications door, carrying the resolved bearer and
+    /// the golden body.
+    #[tokio::test]
+    async fn notify_200_returns_notified_and_sends_the_bearer_once() {
+        let (base, seen) = spawn_coord_mock(200, None).await;
+        let notice = sample_notice(ServingEvent::RestartTaken);
+        let outcome = notify_serving_watchdog_with(
+            &base,
+            &notice,
+            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            Some("dev-1"),
+        )
+        .await
+        .expect("delivered");
+        assert_eq!(
+            outcome,
+            NotifyOutcome::Notified {
+                notification_id: Some("n-1".to_string())
+            }
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].path, AGENT_NOTIFICATIONS_PATH);
+        assert_eq!(seen[0].authorization.as_deref(), Some("Bearer aaa.bbb.ccc"));
+        assert_eq!(seen[0].body, build_agent_notification_body(&notice));
+    }
+
+    /// No resolvable credential → the request still goes out, anonymously
+    /// (the `attach_resolved_bearer` posture): coord decides, not us.
+    #[tokio::test]
+    async fn notify_without_a_credential_still_posts_and_is_notified_on_200() {
+        let (base, seen) = spawn_coord_mock(200, None).await;
+        let notice = sample_notice(ServingEvent::Threshold);
+        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+            .await
+            .expect("delivered");
+        assert!(
+            matches!(outcome, NotifyOutcome::Notified { .. }),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].authorization, None);
+    }
+
+    /// 429 → `RateLimited` with the parsed `Retry-After`, and NOTHING else is
+    /// sent: no retry, no fallback. The ring event on this box is the record.
+    #[tokio::test]
+    async fn notify_429_is_rate_limited_and_never_retried() {
+        let (base, seen) = spawn_coord_mock(429, Some("30")).await;
+        let notice = sample_notice(ServingEvent::Threshold);
+        let outcome = notify_serving_watchdog_with(&base, &notice, None, Some("dev-1"))
+            .await
+            .expect("a 429 is a delivery outcome, not an error");
+        assert_eq!(
+            outcome,
+            NotifyOutcome::RateLimited {
+                retry_after_secs: Some(30)
+            }
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "no second request of any kind: {seen:?}");
+        assert_eq!(seen[0].path, AGENT_NOTIFICATIONS_PATH);
+
+        // No header → `None`, still no retry.
+        let (base, seen) = spawn_coord_mock(429, None).await;
+        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NotifyOutcome::RateLimited {
+                retry_after_secs: None
+            }
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// 403 → exactly one fallback POST to the findings door, device-authed
+    /// with the SAME bearer, carrying the `status` / `operator-notify` shape
+    /// with the runner and device resource keys → `FallbackFinding`.
+    #[tokio::test]
+    async fn notify_403_falls_back_to_a_status_finding_exactly_once() {
+        let (base, seen) = spawn_coord_mock(403, None).await;
+        let notice = sample_notice(ServingEvent::RestartRefusedSessionsLive);
+        let outcome = notify_serving_watchdog_with(
+            &base,
+            &notice,
+            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            Some("dev-1"),
+        )
+        .await
+        .expect("the fallback landed");
+        assert_eq!(
+            outcome,
+            NotifyOutcome::FallbackFinding {
+                finding_id: Some("f-1".to_string())
+            }
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].path, AGENT_NOTIFICATIONS_PATH);
+        assert_eq!(seen[1].path, AGENT_FINDINGS_PATH);
+        assert_eq!(seen[1].authorization.as_deref(), Some("Bearer aaa.bbb.ccc"));
+        let finding = &seen[1].body;
+        assert_eq!(
+            keys(finding),
+            vec!["body", "kind", "resource_keys", "title", "topic"]
+        );
+        assert_eq!(finding["kind"], "status");
+        assert_eq!(finding["topic"], "operator-notify");
+        assert_eq!(finding["title"], artifact_line(&notice));
+        assert_eq!(finding["body"], checks_string(&notice));
+        assert_eq!(
+            finding["resource_keys"],
+            serde_json::json!(["runner:primary", "device:dev-1"])
+        );
+    }
+
+    /// 401 takes the same arm; with no device id the `device:` key is omitted
+    /// rather than sent empty.
+    #[tokio::test]
+    async fn notify_401_falls_back_and_omits_an_unresolvable_device_key() {
+        let (base, seen) = spawn_coord_mock(401, None).await;
+        let notice = sample_notice(ServingEvent::Disarmed);
+        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, NotifyOutcome::FallbackFinding { .. }),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].body["resource_keys"],
+            serde_json::json!(["runner:primary"])
+        );
+    }
+
+    /// Any other status is an `Err` naming it, with no fallback — a 500 is
+    /// coord's fault, not the bearer's, and a finding POST would hit the same
+    /// outage. And the error string must never carry the bearer: it formats
+    /// the status and the response body only. This is the guard from
+    /// `the_bearer_never_reaches_the_body_but_debug_would_expose_it` extended
+    /// to the alert path, whose strings DO get logged.
+    #[tokio::test]
+    async fn notify_500_is_an_error_without_fallback_and_never_leaks_the_bearer() {
+        let token = "notatoken.notatoken.notatoken";
+        let (base, seen) = spawn_coord_mock(500, None).await;
+        let notice = sample_notice(ServingEvent::RestartFailed);
+        let err = notify_serving_watchdog_with(
+            &base,
+            &notice,
+            Some((token.to_string(), "test source")),
+            Some("dev-1"),
+        )
+        .await
+        .expect_err("a 500 is not a delivery");
+        assert!(err.contains("500"), "{err}");
+        assert!(err.contains(AGENT_NOTIFICATIONS_PATH), "{err}");
+        assert!(
+            !err.contains(token),
+            "the error string must never carry the bearer: {err}"
+        );
+        assert!(!format!("{notice:?}").contains(token));
+        assert_eq!(seen.lock().unwrap().len(), 1, "no fallback on a 5xx");
+    }
+
+    /// A dead coord (connection refused) is an `Err`, not a hang: the client
+    /// has a 5 s budget and the caller has already detached us.
+    #[tokio::test]
+    async fn notify_network_error_is_an_error_naming_the_url() {
+        let base = dead_base().await;
+        let notice = sample_notice(ServingEvent::Threshold);
+        let err = notify_serving_watchdog_with(&base, &notice, None, None)
+            .await
+            .expect_err("nothing is listening");
+        assert!(err.starts_with("POST "), "{err}");
+        assert!(err.contains(AGENT_NOTIFICATIONS_PATH), "{err}");
+    }
+
+    #[test]
+    fn id_from_body_reads_the_named_key_then_id_and_accepts_numbers() {
+        assert_eq!(
+            id_from_body(
+                &serde_json::json!({"notification_id": "n-9"}),
+                "notification_id"
+            ),
+            Some("n-9".to_string())
+        );
+        assert_eq!(
+            id_from_body(&serde_json::json!({"id": 42}), "finding_id"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            id_from_body(&serde_json::json!({"id": ""}), "finding_id"),
+            None
+        );
+        assert_eq!(id_from_body(&serde_json::Value::Null, "finding_id"), None);
     }
 }

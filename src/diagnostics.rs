@@ -17,11 +17,26 @@ use std::collections::VecDeque;
 /// instead of a second hard-coded constant that can drift out of step.
 pub const DIAGNOSTICS_BUFFER_SIZE: usize = 500;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartSource {
     Manual,
     Watchdog,
+    /// The supervisor's own serving watchdog: a runner whose HTTP API has been
+    /// silent past the serving threshold while its process-subtree census
+    /// counted zero live `claude` sessions (plan
+    /// `2026-09-03-runner-zombie-serving-watchdog`, Design decision 1).
+    ///
+    /// **Unconstructible from the wire.** [`restart_source_from_wire`] maps
+    /// only `"watchdog"` → [`Self::Watchdog`] and everything else →
+    /// [`Self::Manual`]; the string `"serving_watchdog"` therefore yields
+    /// `Manual`, and the only producer of this variant is the in-process
+    /// serving-watchdog decision. That is what lets
+    /// `manager::automated_restart_blocked` admit it for a non-temp runner
+    /// while still refusing `Watchdog`, which any HTTP caller can claim.
+    /// `is_manual()` is `false`: it is an automated restart and is reported
+    /// as one.
+    ServingWatchdog,
 }
 
 impl RestartSource {
@@ -36,7 +51,24 @@ impl std::fmt::Display for RestartSource {
         match self {
             Self::Manual => write!(f, "manual request"),
             Self::Watchdog => write!(f, "watchdog"),
+            Self::ServingWatchdog => write!(f, "serving watchdog"),
         }
+    }
+}
+
+/// Map the `source` string of a `POST /runners/{id}/restart` (or the primary
+/// `/runner/restart`) body to a [`RestartSource`].
+///
+/// Deliberately a closed two-way mapping: `"watchdog"` → [`RestartSource::Watchdog`],
+/// anything else → [`RestartSource::Manual`]. [`RestartSource::ServingWatchdog`]
+/// is NOT reachable from here — a wire value that could claim it would let any
+/// caller bypass the non-temp automated-restart block in
+/// `manager::restart_runner_by_id`. Pure so the closure is unit-tested rather
+/// than asserted in a comment.
+pub fn restart_source_from_wire(source: &str) -> RestartSource {
+    match source {
+        "watchdog" => RestartSource::Watchdog,
+        _ => RestartSource::Manual,
     }
 }
 
@@ -188,6 +220,32 @@ pub enum DiagnosticEventKind {
         killed_pids: Vec<u32>,
         spared_pids: Vec<u32>,
     },
+
+    /// One decision of the serving watchdog (plan
+    /// `2026-09-03-runner-zombie-serving-watchdog`, Phase 5): the runner
+    /// holds its port but its HTTP API has been silent, and the supervisor
+    /// crossed the threshold, restarted, refused, failed, or disarmed.
+    ///
+    /// This is the DURABLE record on this box. The same decision is also
+    /// alerted to coord by `fleet::notify_serving_watchdog`, but that call is
+    /// fire-and-forget and coord may be unreachable — the ring is what an
+    /// operator on `:9875` reads regardless. `census` is the supervisor's
+    /// process-subtree census (or the runner's own readiness verdict) that
+    /// backed the decision, verbatim, so a refusal names the PIDs it counted.
+    ServingWatchdog {
+        runner_id: String,
+        event: ServingEvent,
+        /// The runner's PID when the registry or the port listener knew it.
+        pid: Option<u32>,
+        port: u16,
+        /// `now - UnresponsiveSince(at)` at decision time — the same stamp
+        /// `/runners` publishes, never a tick count.
+        silent_for_secs: u64,
+        census: Option<serde_json::Value>,
+        /// The error string for `RestartFailed`, the disarm reason for
+        /// `Disarmed`, free text otherwise.
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,17 +318,122 @@ impl DiagnosticEvent {
             | DiagnosticEventKind::ExeLockHolderKilled { .. }
             | DiagnosticEventKind::ExeLockKillFailed { .. }
             | DiagnosticEventKind::BuildCleanupSummary { .. } => "build_kill",
+
+            DiagnosticEventKind::ServingWatchdog { .. } => "serving_watchdog",
         }
+    }
+}
+
+/// What the serving watchdog decided about a runner whose HTTP API is silent
+/// while its process holds the port (plan
+/// `2026-09-03-runner-zombie-serving-watchdog`).
+///
+/// The wire string (`as_str`, `Display`, and the serde rename) is the same
+/// snake_case token everywhere so the diagnostics ring, the supervisor log
+/// and the coord alert's `checks` field agree on the class name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingEvent {
+    /// `UnresponsiveSince` crossed the configured serving threshold; the
+    /// restart decision is about to be evaluated.
+    Threshold,
+    /// An ADOPTED runner (no `Child`, no supervisor spawn this lifetime) has
+    /// held its port and read `RunnerLiveness::Unknown` for at least the
+    /// threshold. Alert-only by Design decision 4 — the supervisor cannot
+    /// back a restart on a classification it has never confirmed.
+    NeverAnsweredSinceAdoption,
+    /// The census found zero live `claude` sessions and the restart was
+    /// issued. The only irreversible event in the set.
+    RestartTaken,
+    /// The census (or the runner's own verdict) counted live sessions, so the
+    /// restart was refused. The `census` payload names them.
+    RestartRefusedSessionsLive,
+    /// A restart was attempted and the funnel returned an error (port held
+    /// by a live runner, provenance gate, stop failure, …); `detail` carries
+    /// the error string.
+    RestartFailed,
+    /// The serving-loop guard tripped (too many serving restarts in the
+    /// window) and the serving arm disarmed itself for this runner.
+    Disarmed,
+}
+
+impl ServingEvent {
+    /// The snake_case wire token — identical to the serde rename.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Threshold => "threshold",
+            Self::NeverAnsweredSinceAdoption => "never_answered_since_adoption",
+            Self::RestartTaken => "restart_taken",
+            Self::RestartRefusedSessionsLive => "restart_refused_sessions_live",
+            Self::RestartFailed => "restart_failed",
+            Self::Disarmed => "disarmed",
+        }
+    }
+}
+
+impl std::fmt::Display for ServingEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticEvent, DiagnosticEventKind, DiagnosticsState, ExeLockKillReason, KillMethod,
-        SlotMatch, DIAGNOSTICS_BUFFER_SIZE,
+        restart_source_from_wire, DiagnosticEvent, DiagnosticEventKind, DiagnosticsState,
+        ExeLockKillReason, KillMethod, RestartSource, ServingEvent, SlotMatch,
+        DIAGNOSTICS_BUFFER_SIZE,
     };
     use chrono::Utc;
+
+    /// The serving-watchdog source is an automated restart, reads as one, and
+    /// serialises under the name the diagnostics ring publishes.
+    #[test]
+    fn serving_watchdog_source_is_automated_and_serialises_snake_case() {
+        let src = RestartSource::ServingWatchdog;
+        assert!(!src.is_manual());
+        assert_eq!(src.to_string(), "serving watchdog");
+        assert_eq!(
+            serde_json::to_value(&src).unwrap(),
+            serde_json::json!("serving_watchdog")
+        );
+        // The pre-existing pair keeps its wire names.
+        assert_eq!(
+            serde_json::to_value(RestartSource::Manual).unwrap(),
+            serde_json::json!("manual")
+        );
+        assert_eq!(
+            serde_json::to_value(RestartSource::Watchdog).unwrap(),
+            serde_json::json!("watchdog")
+        );
+    }
+
+    /// `ServingWatchdog` must be unconstructible from the wire: the string
+    /// that names it maps to `Manual`, exactly like any other unknown value.
+    /// This closure is what makes it safe for `manager::restart_runner_by_id`
+    /// to admit the variant past the non-temp automated-restart block.
+    #[test]
+    fn wire_mapping_cannot_produce_the_serving_watchdog_source() {
+        assert_eq!(
+            restart_source_from_wire("watchdog"),
+            RestartSource::Watchdog
+        );
+        assert_eq!(restart_source_from_wire("manual"), RestartSource::Manual);
+        assert_eq!(restart_source_from_wire(""), RestartSource::Manual);
+        for spelling in [
+            "serving_watchdog",
+            "serving watchdog",
+            "ServingWatchdog",
+            "serving-watchdog",
+            "SERVING_WATCHDOG",
+        ] {
+            assert_eq!(
+                restart_source_from_wire(spelling),
+                RestartSource::Manual,
+                "{spelling:?} must not reach ServingWatchdog from the wire"
+            );
+        }
+    }
 
     /// The exact envelope + field names the Phase 3 verification harness reads.
     ///
@@ -589,5 +752,103 @@ mod tests {
         // must never be able to dominate the ring. A `const` block because the
         // comparison is constant — clippy rejects a runtime `assert!` on it.
         const { assert!(DIAGNOSTICS_BUFFER_SIZE >= 500) };
+    }
+    /// The serving-watchdog event is the durable record of a decision the
+    /// coord alert may never deliver. Pin the envelope and the field names an
+    /// operator (or a harness) reads out of `GET /diagnostics`, and that the
+    /// `event` class serializes as the same snake_case token `as_str` and
+    /// `Display` produce — the alert's `checks` field is built from those, so
+    /// the ring and the alert must not disagree about a class name.
+    #[test]
+    fn serving_watchdog_serializes_with_the_envelope_and_a_stable_event_token() {
+        let event = DiagnosticEvent {
+            timestamp: Utc::now(),
+            kind: DiagnosticEventKind::ServingWatchdog {
+                runner_id: "primary".to_string(),
+                event: ServingEvent::RestartRefusedSessionsLive,
+                pid: Some(48544),
+                port: 9876,
+                silent_for_secs: 301,
+                census: Some(serde_json::json!({
+                    "source": "supervisor_subtree_census",
+                    "verdict": "busy",
+                    "live_claude": [{"pid": 7, "name": "claude", "exe": "/usr/bin/claude"}]
+                })),
+                detail: None,
+            },
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["kind"], serde_json::json!("serving_watchdog"));
+        let data = value["data"].as_object().expect("`data` is a JSON object");
+        for key in [
+            "runner_id",
+            "event",
+            "pid",
+            "port",
+            "silent_for_secs",
+            "census",
+            "detail",
+        ] {
+            assert!(data.contains_key(key), "missing `{key}` in {value}");
+        }
+        assert_eq!(
+            data["event"],
+            serde_json::json!("restart_refused_sessions_live")
+        );
+        assert_eq!(data["pid"], serde_json::json!(48544));
+        assert_eq!(data["port"], serde_json::json!(9876));
+        assert_eq!(data["silent_for_secs"], serde_json::json!(301));
+        assert_eq!(data["census"]["verdict"], serde_json::json!("busy"));
+        assert_eq!(data["detail"], serde_json::Value::Null);
+
+        // Every class: the serde token, `as_str` and `Display` are one string.
+        for (ev, token) in [
+            (ServingEvent::Threshold, "threshold"),
+            (
+                ServingEvent::NeverAnsweredSinceAdoption,
+                "never_answered_since_adoption",
+            ),
+            (ServingEvent::RestartTaken, "restart_taken"),
+            (
+                ServingEvent::RestartRefusedSessionsLive,
+                "restart_refused_sessions_live",
+            ),
+            (ServingEvent::RestartFailed, "restart_failed"),
+            (ServingEvent::Disarmed, "disarmed"),
+        ] {
+            assert_eq!(ev.as_str(), token);
+            assert_eq!(ev.to_string(), token);
+            assert_eq!(serde_json::to_value(ev).unwrap(), serde_json::json!(token));
+        }
+    }
+
+    /// The serving-watchdog event has its own filter category so an operator
+    /// can fetch `GET /diagnostics?filter=serving_watchdog` without wading
+    /// through build kills, and so the `restart` category — which the
+    /// crash-only watchdog and the operator route share — is not polluted by
+    /// threshold/refusal events that restarted nothing.
+    #[test]
+    fn serving_watchdog_has_its_own_filter_category() {
+        let mut state = DiagnosticsState::new();
+        state.emit(DiagnosticEventKind::BuildStarted);
+        state.emit(DiagnosticEventKind::ServingWatchdog {
+            runner_id: "primary".to_string(),
+            event: ServingEvent::Threshold,
+            pid: None,
+            port: 9876,
+            silent_for_secs: 300,
+            census: None,
+            detail: None,
+        });
+
+        let serving = state.events(200, Some(&["serving_watchdog".to_string()]));
+        assert_eq!(serving.len(), 1);
+        assert!(state.events(200, Some(&["restart".to_string()])).is_empty());
+        assert_eq!(
+            state.events(200, Some(&["build".to_string()])).len(),
+            1,
+            "the `build` category must not absorb the serving event"
+        );
     }
 }
