@@ -59,10 +59,13 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::subtree_census::{CensusError, CensusVerdict, ClaudeCensus};
+use crate::state::RunnerLiveness;
 
 /// Path of the runner's readiness verdict (plan Phase 1).
 pub const READINESS_PATH: &str = "/restart-readiness";
@@ -187,6 +190,15 @@ pub enum ReadinessUnknown {
         detail: String,
         body_excerpt: String,
     },
+    /// The runner's door was wedged, so the supervisor fell back to its own
+    /// process-subtree census — and the census could not be taken either (the
+    /// root PID was absent, recycled, or the process table was unreadable).
+    ///
+    /// Both sources have now failed, so nothing is known about what is live on
+    /// the runner. Refuses, like every other `Unknown`. The census error's own
+    /// `code()` is carried inside `detail` so a log search can tell the three
+    /// census failure modes apart without a second enum.
+    CensusUnreadable { detail: String },
 }
 
 impl ReadinessUnknown {
@@ -198,11 +210,44 @@ impl ReadinessUnknown {
             ReadinessUnknown::Unreachable { .. } => "readiness_unreachable",
             ReadinessUnknown::ErrorStatus { .. } => "readiness_error_status",
             ReadinessUnknown::Unparseable { .. } => "readiness_unparseable",
+            ReadinessUnknown::CensusUnreadable { .. } => "readiness_census_unreadable",
+        }
+    }
+}
+
+/// Which arm produced a readiness verdict.
+///
+/// The whole point of the census fallback is that a verdict can now come from
+/// two places, so **every log line and every payload names the arm that
+/// answered**. A `safe` that came from the supervisor's own process table and
+/// a `safe` the runner reported are not the same claim, and an operator
+/// reading the log afterwards must be able to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessSource {
+    /// The runner answered `GET /restart-readiness` itself.
+    RunnerVerdict,
+    /// The runner's door was wedged and the supervisor walked the process
+    /// table instead ([`crate::process::subtree_census`]).
+    SupervisorCensus,
+}
+
+impl ReadinessSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadinessSource::RunnerVerdict => "runner_verdict",
+            ReadinessSource::SupervisorCensus => "supervisor_census",
         }
     }
 }
 
 /// The outcome of asking a runner whether it is safe to stop.
+///
+/// The two `Census*` variants are the wedged-door arm (plan
+/// `2026-09-03-runner-zombie-serving-watchdog` Phase 2). They are separate
+/// variants rather than an extra field on `Safe`/`Unsafe` because the census
+/// has no [`ReadinessReport`] to carry — it answers the same question from a
+/// different source, and conflating the two would let a census verdict be
+/// read as something the runner said.
 #[derive(Debug, Clone)]
 pub enum Readiness {
     Safe {
@@ -213,7 +258,34 @@ pub enum Readiness {
         report: ReadinessReport,
         raw: serde_json::Value,
     },
+    /// Zero live `claude` processes under the runner's PID: there is nothing
+    /// for a restart to destroy.
+    CensusSafe {
+        census: ClaudeCensus,
+    },
+    /// The census found live `claude` processes under the runner. Refuses —
+    /// exactly as an `Unsafe` verdict from the runner would.
+    CensusUnsafe {
+        census: ClaudeCensus,
+    },
     Unknown(ReadinessUnknown),
+}
+
+impl Readiness {
+    /// Which arm answered. `Unknown` is attributed to the census only when the
+    /// census itself is what failed.
+    pub fn source(&self) -> ReadinessSource {
+        match self {
+            Readiness::Safe { .. } | Readiness::Unsafe { .. } => ReadinessSource::RunnerVerdict,
+            Readiness::CensusSafe { .. } | Readiness::CensusUnsafe { .. } => {
+                ReadinessSource::SupervisorCensus
+            }
+            Readiness::Unknown(ReadinessUnknown::CensusUnreadable { .. }) => {
+                ReadinessSource::SupervisorCensus
+            }
+            Readiness::Unknown(_) => ReadinessSource::RunnerVerdict,
+        }
+    }
 }
 
 /// Keep body excerpts bounded — a runner that answers with an HTML error page
@@ -239,12 +311,19 @@ pub async fn probe(port: u16) -> Readiness {
 /// [`probe`] against an explicit base URL. Split out so the tests can drive a
 /// real HTTP server on an ephemeral port instead of requiring a live runner.
 pub async fn probe_at(base_url: &str) -> Readiness {
+    probe_at_with_timeout(base_url, READINESS_TIMEOUT).await
+}
+
+/// [`probe_at`] with an explicit timeout.
+///
+/// The timeout is a parameter only so the phase-2 signature of a wedge —
+/// a listener that ACCEPTS and never answers — can be exercised in a unit test
+/// without spending [`READINESS_TIMEOUT`] per case. Production callers use
+/// [`probe`]/[`probe_at`], which pass the constant.
+pub async fn probe_at_with_timeout(base_url: &str, timeout: Duration) -> Readiness {
     let url = format!("{}{}", base_url.trim_end_matches('/'), READINESS_PATH);
 
-    let client = match reqwest::Client::builder()
-        .timeout(READINESS_TIMEOUT)
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(e) => {
             // Could not even construct a client. Nothing was learned about the
@@ -314,6 +393,80 @@ pub async fn probe_at(base_url: &str) -> Readiness {
     }
 }
 
+// ── The census fallback: a readiness source that survives a wedged door ─────
+
+/// Is the supervisor's own census the right thing to consult for this probe
+/// result?
+///
+/// **Only when the door is wedged, never when it is merely disagreeing.** The
+/// two conditions are both required and both narrow:
+///
+/// - the probe came back [`ReadinessUnknown::Unreachable`] — the runner did
+///   not answer at all. A runner that answered `404`, a non-2xx, or garbage
+///   *answered*: its door is up and its verdict (or its refusal to give one)
+///   stands, and second-guessing it with a process walk would let the census
+///   overrule a live runner.
+/// - the supervisor has independently classified the runner as
+///   [`RunnerLiveness::UnresponsiveSince`] — port held, API silent, and
+///   previously seen responding. [`RunnerLiveness::Unknown`] is deliberately
+///   excluded (plan Design decision 4): a runner that has never answered has
+///   nothing to prove it is the wedge class.
+pub fn census_applies(probe: &Readiness, liveness: RunnerLiveness) -> bool {
+    matches!(
+        probe,
+        Readiness::Unknown(ReadinessUnknown::Unreachable { .. })
+    ) && matches!(liveness, RunnerLiveness::UnresponsiveSince(_))
+}
+
+/// Fold a census outcome into a readiness verdict. Pure — no I/O — so every
+/// arm is unit-testable with hand-built censuses.
+///
+/// `census` is `None` when [`census_applies`] said not to consult it, in which
+/// case the probe result passes through untouched.
+pub fn fold_census(
+    probe: Readiness,
+    census: Option<Result<ClaudeCensus, CensusError>>,
+) -> Readiness {
+    match census {
+        None => probe,
+        Some(Ok(census)) => match census.verdict() {
+            CensusVerdict::Idle => Readiness::CensusSafe { census },
+            CensusVerdict::Busy { .. } => Readiness::CensusUnsafe { census },
+        },
+        // Both sources have now failed. Fail closed, and carry the census
+        // error's own code so the three failure modes stay distinguishable.
+        Some(Err(e)) => Readiness::Unknown(ReadinessUnknown::CensusUnreadable {
+            detail: format!("{} ({})", e, e.code()),
+        }),
+    }
+}
+
+/// Ask the runner, and — if and only if its door is wedged — ask the operating
+/// system instead.
+///
+/// This is the readiness source the plan exists to add: before it, the verdict
+/// for a wedged runner was served by the very door that was wedged, so it was
+/// always `Unreachable` → `Unknown` → refuse, and the one recovery path the
+/// fleet has could never be taken.
+pub async fn probe_with_census_fallback(
+    port: u16,
+    liveness: RunnerLiveness,
+    root_pid: Option<u32>,
+    started_at: Option<DateTime<Utc>>,
+) -> Readiness {
+    let probe_result = probe(port).await;
+    if !census_applies(&probe_result, liveness) {
+        return probe_result;
+    }
+    let census = crate::process::subtree_census::take_census_for_port(
+        root_pid,
+        port,
+        started_at.map(|t| t.timestamp()),
+    )
+    .await;
+    fold_census(probe_result, Some(census))
+}
+
 /// Which destructive operation the gate is guarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateAction {
@@ -373,6 +526,53 @@ impl SkipReason {
             SkipReason::NotProtected => "runner_not_protected",
             SkipReason::NotRunning => "runner_not_running",
         }
+    }
+}
+
+/// The three exemptions, as a pure four-way decision. `None` means "probe".
+///
+/// # The defect this replaces
+///
+/// Exemption 3 used to read `!tracked_running && !api_responding` — a pair of
+/// booleans that, for the primary, is EXACTLY the signature of a wedge.
+/// `health_cache` overwrites `running` from the `/health` probe for a
+/// user-managed runner, so a wedged primary sits at `running: false,
+/// api_responding: false` while owning its port and hosting live sessions. The
+/// gate read that as *"not running, nothing to protect"* and let the restart
+/// through **with no gate at all** — the exact inverse of the failure the gate
+/// was built to prevent, and the more dangerous direction.
+///
+/// [`RunnerLiveness`] is the classifier that already knows the difference.
+/// `NotRunning` is now granted only where the supervisor can say the port is
+/// **not held**:
+///
+/// - [`RunnerLiveness::Stopped`] — positive evidence of absence (`state.rs`).
+/// - [`RunnerLiveness::Unknown`] with the port closed and nothing tracked
+///   running — a runner that has never answered and holds no socket. This is
+///   the rest of the old exemption, kept: it was never wrong, it was too wide.
+///
+/// What is REMOVED from the exemption is the port-held case:
+/// [`RunnerLiveness::UnresponsiveSince`] (the wedge) and `Unknown` **with the
+/// port still held** now fall through to the probe — and, for a wedge, on to
+/// the census. A process holding a socket is not a process with nothing to
+/// protect.
+pub fn decide_skip(
+    liveness: RunnerLiveness,
+    port_open: bool,
+    tracked_running: bool,
+    is_temp: bool,
+    protected: bool,
+) -> Option<SkipReason> {
+    if is_temp {
+        return Some(SkipReason::TempRunner);
+    }
+    if !protected {
+        return Some(SkipReason::NotProtected);
+    }
+    match liveness {
+        RunnerLiveness::Stopped => Some(SkipReason::NotRunning),
+        RunnerLiveness::Unknown if !port_open && !tracked_running => Some(SkipReason::NotRunning),
+        _ => None,
     }
 }
 
@@ -533,6 +733,11 @@ fn unknown_message(
             "restart_refused_unknown: runner '{runner_name}' (port {port}) answered {url} with \
              something that is not a readiness verdict ({detail}; body: {body_excerpt})."
         ),
+        ReadinessUnknown::CensusUnreadable { detail } => format!(
+            "restart_refused_unknown: runner '{runner_name}' (port {port}) did not answer {url} \
+             AND the supervisor's own process-subtree census could not be taken either \
+             ({detail}). BOTH readiness sources have failed."
+        ),
     };
 
     let tail = match unknown {
@@ -540,6 +745,11 @@ fn unknown_message(
             " Rebuild or update this runner to a build that serves GET /restart-readiness so the \
              question can be answered, or re-issue with {\"force\": true} to proceed without \
              knowing what is live on it."
+        }
+        ReadinessUnknown::CensusUnreadable { .. } => {
+            " Refusing: the wedged-door fallback exists precisely so a silent runner still gets \
+             an answer, and it did not get one here, so nothing at all is known about what is \
+             live on this runner. Re-issue with {\"force\": true} to proceed without knowing."
         }
         _ => {
             " Refusing: an unknown verdict is never treated as safe, because this gate is \
@@ -551,6 +761,43 @@ fn unknown_message(
     format!(
         "{head} Cannot determine whether {} this runner would destroy live work.{tail}",
         action.verb()
+    )
+}
+
+/// Refusal prose for a census `Busy` verdict.
+///
+/// Deliberately says WHERE the count came from. The runner never spoke here —
+/// its door was wedged — and a refusal that read like a runner verdict would
+/// misattribute a claim the runner did not make.
+fn census_refusal_message(
+    runner_name: &str,
+    port: u16,
+    action: GateAction,
+    census: &ClaudeCensus,
+) -> String {
+    let (count, pids) = match census.verdict() {
+        CensusVerdict::Busy { count, pids } => (count, pids),
+        CensusVerdict::Idle => (0, Vec::new()),
+    };
+    let pid_list = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "restart_refused_unsafe: runner '{runner_name}' (port {port}) did not answer \
+         {READINESS_PATH}, so the supervisor counted live sessions itself: {count} live \
+         `claude` process(es) (PID(s) {pid_list}) counted by the supervisor's process-subtree \
+         census because the runner's `{READINESS_PATH}` was unreachable. {} it now DESTROYS \
+         them — their unflushed turns and uncommitted worktrees are lost, and `POST /drain` \
+         cannot be reached to capture anything (the same door is wedged). To {} anyway and \
+         accept the loss, re-issue this request with {{\"force\": true}}; the override is \
+         logged with this verdict.",
+        match action {
+            GateAction::Stop => "Stopping",
+            GateAction::Restart => "Restarting",
+        },
+        action.as_str(),
     )
 }
 
@@ -567,7 +814,37 @@ pub fn decide(
     let url = format!("http://127.0.0.1:{}{}", port, READINESS_PATH);
 
     let refusal = match readiness {
-        Readiness::Safe { .. } => return GateDecision::Allowed,
+        Readiness::Safe { .. } | Readiness::CensusSafe { .. } => return GateDecision::Allowed,
+        Readiness::CensusUnsafe { census } => {
+            let message = census_refusal_message(runner_name, port, action, census);
+            RefusalDetail {
+                cause: "sessions_live",
+                payload: serde_json::json!({
+                    "error": "restart_refused_unsafe",
+                    "cause": "sessions_live",
+                    "source": ReadinessSource::SupervisorCensus.as_str(),
+                    "runner_id": runner_id,
+                    "runner_name": runner_name,
+                    "action": action.as_str(),
+                    "message": message,
+                    // The census cannot separate the two planes the runner
+                    // reports — one `claude` image covers both — so it reports
+                    // the total under its own key rather than guessing a split.
+                    "would_be_lost": {
+                        "live_claude_processes": census.live.len(),
+                    },
+                    "boundary": "supervisor process-subtree census: counts every `claude` image \
+                                 in the runner PID's inclusive subtree, which over-approximates \
+                                 (a lingering shim counts) and therefore only ever refuses more \
+                                 often, never less",
+                    "readiness_url": url,
+                    "readiness": serde_json::Value::Null,
+                    "census": census.to_json(),
+                    "override": "re-issue with {\"force\": true}",
+                }),
+                message,
+            }
+        }
         Readiness::Unsafe { report, raw } => {
             let message = refusal_message(runner_name, port, action, report);
             RefusalDetail {
@@ -575,6 +852,7 @@ pub fn decide(
                 payload: serde_json::json!({
                     "error": "restart_refused_unsafe",
                     "cause": "sessions_live",
+                    "source": ReadinessSource::RunnerVerdict.as_str(),
                     "runner_id": runner_id,
                     "runner_name": runner_name,
                     "action": action.as_str(),
@@ -608,6 +886,7 @@ pub fn decide(
                 payload: serde_json::json!({
                     "error": "restart_refused_unknown",
                     "cause": unknown.code(),
+                    "source": readiness.source().as_str(),
                     "runner_id": runner_id,
                     "runner_name": runner_name,
                     "action": action.as_str(),
@@ -660,60 +939,80 @@ pub async fn enforce(
     let runner_name = managed.config.name.clone();
     let port = managed.config.port;
 
-    // 1. Temp runners. The supervisor's own lifecycle stops these constantly
-    //    and they are the sanctioned way agents verify a change without
-    //    touching the primary.
-    if crate::process::manager::is_temp_runner(&runner_id) {
-        skip(&runner_id, action, SkipReason::TempRunner);
+    // The exemptions are decided from the supervisor's own state, before any
+    // probe is issued. `CachedPortHealth` (`managed.cached_health`) is the
+    // per-runner probe result — NOT `CachedRunnerHealth`, which is the SSE
+    // snapshot vector and carries a different pair of fields.
+    let (port_open, api_responding) = {
+        let h = managed.cached_health.read().await;
+        (h.runner_port_open, h.runner_responding)
+    };
+    let (liveness, tracked_running, root_pid, started_at) = {
+        let r = managed.runner.read().await;
+        (
+            r.liveness(port_open, api_responding),
+            r.running,
+            r.pid,
+            r.started_at,
+        )
+    };
+
+    if let Some(reason) = decide_skip(
+        liveness,
+        port_open,
+        tracked_running,
+        crate::process::manager::is_temp_runner(&runner_id),
+        managed.is_protected().await,
+    ) {
+        skip(&runner_id, action, reason);
         return Ok(());
     }
 
-    // 2. Explicitly unprotected. This is the one place `is_protected()` has
-    //    ever participated in a stop/restart decision — until now it only fed
-    //    a displayed flag on `GET /runners`, which is what made
-    //    `POST /runners/{id}/protect` a setter for nothing.
-    if !managed.is_protected().await {
-        skip(&runner_id, action, SkipReason::NotProtected);
-        return Ok(());
-    }
-
-    // 3. No evidence of life. Nothing in flight to destroy, so there is nothing
-    //    to protect. Both signals must be negative: an ADOPTED runner can sit
-    //    at `running: false` with no registry PID while very much alive, and
-    //    its `/health` is what says so.
-    let tracked_running = managed.runner.read().await.running;
-    let api_responding = managed.cached_health.read().await.runner_responding;
-    if !tracked_running && !api_responding {
-        skip(&runner_id, action, SkipReason::NotRunning);
-        return Ok(());
-    }
-
-    let readiness = probe(port).await;
+    // Ask the runner; fall back to the supervisor's own process table only
+    // when the runner's door is wedged (`census_applies`).
+    let readiness = probe_with_census_fallback(port, liveness, root_pid, started_at).await;
     match decide(&runner_id, &runner_name, port, action, force, &readiness) {
         GateDecision::Allowed => {
             // The allow path carries the verdict too, not just the refusals.
             // "Why was this stop permitted?" has to be answerable from the log
             // afterwards — a gate that records only what it blocked cannot be
             // audited for what it let through.
-            let (reason, terminal, ai, verdict) = match &readiness {
-                Readiness::Safe { report, raw } => (
-                    report
+            let msg = match &readiness {
+                Readiness::Safe { report, raw } => format!(
+                    "restart-readiness: runner '{runner_name}' reports safe_to_restart=true \
+                     (terminal_sessions={terminal}, ai_sessions={ai}, reason: {reason}) — \
+                     proceeding with {act} | source={src} | verdict={verdict}",
+                    terminal = report.terminal_count(),
+                    ai = report.ai_count(),
+                    reason = report
                         .reason
                         .clone()
                         .unwrap_or_else(|| "(none given)".to_string()),
-                    report.terminal_count(),
-                    report.ai_count(),
-                    raw.to_string(),
+                    act = action.as_str(),
+                    src = ReadinessSource::RunnerVerdict.as_str(),
+                    verdict = raw,
                 ),
-                // Unreachable: `decide` returns `Allowed` only for `Safe`.
-                _ => ("(none given)".to_string(), 0, 0, "null".to_string()),
+                // The census allow prints the same `verdict=` suffix as a
+                // runner allow, so the two are comparable in one log search —
+                // and names its source, so they are never confused.
+                Readiness::CensusSafe { census } => format!(
+                    "restart-readiness: runner '{runner_name}' did not answer \
+                     {READINESS_PATH} (wedged), and the supervisor's process-subtree census \
+                     found ZERO live `claude` processes under PID {root} — nothing to destroy, \
+                     proceeding with {act} | source={src} | verdict={verdict}",
+                    root = census.root_pid,
+                    act = action.as_str(),
+                    src = ReadinessSource::SupervisorCensus.as_str(),
+                    verdict = census.to_json(),
+                ),
+                // Unreachable: `decide` returns `Allowed` only for the two
+                // safe arms.
+                _ => format!(
+                    "restart-readiness: proceeding with {} for runner '{runner_name}' | \
+                     verdict=null",
+                    action.as_str()
+                ),
             };
-            let msg = format!(
-                "restart-readiness: runner '{runner_name}' reports safe_to_restart=true \
-                 (terminal_sessions={terminal}, ai_sessions={ai}, reason: {reason}) — \
-                 proceeding with {} | verdict={verdict}",
-                action.as_str()
-            );
             info!("{}", msg);
             state
                 .logs
@@ -1113,6 +1412,321 @@ mod tests {
         assert!(restart.message.contains("Restarting it now"));
         assert_eq!(stop.payload["action"], "stop");
         assert_eq!(restart.payload["action"], "restart");
+    }
+
+    // ── Phase 2: the census fallback ────────────────────────────────────────
+
+    use crate::process::subtree_census::{CensusEntry, ClaudeCensus, PidReuseGuard, RootSource};
+
+    fn census(live: &[u32]) -> ClaudeCensus {
+        ClaudeCensus {
+            root_pid: 4242,
+            root_source: RootSource::Registry,
+            walked: 9,
+            live: live
+                .iter()
+                .map(|pid| CensusEntry {
+                    pid: *pid,
+                    name: "claude".to_string(),
+                    exe: Some(std::path::PathBuf::from("/usr/bin/claude")),
+                })
+                .collect(),
+            pid_reuse_guard: PidReuseGuard::Checked,
+        }
+    }
+
+    fn wedged() -> RunnerLiveness {
+        RunnerLiveness::UnresponsiveSince(chrono::Utc::now())
+    }
+
+    /// (vii) The four-way exemption table, without any state.
+    #[test]
+    fn decide_skip_covers_the_four_way_table() {
+        // Temp wins over everything, including protection.
+        assert_eq!(
+            decide_skip(wedged(), true, true, true, true),
+            Some(SkipReason::TempRunner)
+        );
+        // Unprotected is next.
+        assert_eq!(
+            decide_skip(wedged(), true, true, false, false),
+            Some(SkipReason::NotProtected)
+        );
+        // Positive evidence of absence.
+        assert_eq!(
+            decide_skip(RunnerLiveness::Stopped, false, false, false, true),
+            Some(SkipReason::NotRunning)
+        );
+        // Never answered, port closed, nothing tracked: still exempt.
+        assert_eq!(
+            decide_skip(RunnerLiveness::Unknown, false, false, false, true),
+            Some(SkipReason::NotRunning)
+        );
+        // THE REGRESSION THIS PHASE EXISTS TO CLOSE: a wedge is `running:
+        // false, api_responding: false` for a user-managed runner, and the old
+        // pair read that as "nothing to protect" and skipped the gate
+        // entirely. It must now probe.
+        assert_eq!(decide_skip(wedged(), true, false, false, true), None);
+        // Never answered but HOLDING the port: also probes.
+        assert_eq!(
+            decide_skip(RunnerLiveness::Unknown, true, false, false, true),
+            None
+        );
+        // Responding: probes, obviously.
+        assert_eq!(
+            decide_skip(RunnerLiveness::Responding, true, true, false, true),
+            None
+        );
+    }
+
+    /// (iv)(v)(vi) The census is consulted ONLY for an unreachable probe on a
+    /// runner the supervisor has classified as wedged.
+    #[tokio::test]
+    async fn census_applies_only_to_an_unreachable_probe_on_a_wedged_runner() {
+        let unreachable = probe_at(&dead_url().await).await;
+        assert!(matches!(
+            unreachable,
+            Readiness::Unknown(ReadinessUnknown::Unreachable { .. })
+        ));
+
+        // (i)/(ii) shape: wedged + unreachable → consult.
+        assert!(census_applies(&unreachable, wedged()));
+        // (iv) The runner is answering elsewhere; a single failed probe is not
+        // a wedge and must not be second-guessed by a process walk.
+        assert!(!census_applies(&unreachable, RunnerLiveness::Responding));
+        // (v) Design decision 4: `Unknown` never reaches the census.
+        assert!(!census_applies(&unreachable, RunnerLiveness::Unknown));
+        assert!(!census_applies(&unreachable, RunnerLiveness::Stopped));
+
+        // (vi) A runner that ANSWERED — 404, non-2xx, or garbage — has a live
+        // door, and its answer stands.
+        let absent = probe_at(&spawn_mock(404, "not found").await).await;
+        assert!(matches!(
+            absent,
+            Readiness::Unknown(ReadinessUnknown::EndpointAbsent)
+        ));
+        assert!(!census_applies(&absent, wedged()));
+        let garbage = probe_at(&spawn_mock(200, "<html>nope</html>").await).await;
+        assert!(!census_applies(&garbage, wedged()));
+        let error = probe_at(&spawn_mock(503, "{}").await).await;
+        assert!(!census_applies(&error, wedged()));
+    }
+
+    /// (i) The census answers `Idle` → the gate ALLOWS what it used to refuse
+    /// forever, and says which arm answered.
+    #[test]
+    fn an_idle_census_allows_and_names_its_source() {
+        let folded = fold_census(
+            Readiness::Unknown(ReadinessUnknown::Unreachable {
+                detail: "connection refused".to_string(),
+            }),
+            Some(Ok(census(&[]))),
+        );
+        assert!(matches!(folded, Readiness::CensusSafe { .. }));
+        assert_eq!(folded.source(), ReadinessSource::SupervisorCensus);
+        assert!(matches!(
+            decide(
+                "primary",
+                "Primary",
+                9876,
+                GateAction::Restart,
+                false,
+                &folded
+            ),
+            GateDecision::Allowed
+        ));
+    }
+
+    /// (iii) A busy census refuses, and the refusal carries the PIDs, names the
+    /// census as the source, and still offers the documented override.
+    #[test]
+    fn a_busy_census_refuses_with_the_pids_it_counted() {
+        let folded = fold_census(
+            Readiness::Unknown(ReadinessUnknown::Unreachable {
+                detail: "connection refused".to_string(),
+            }),
+            Some(Ok(census(&[1111, 2222]))),
+        );
+        let GateDecision::Refused(detail) = decide(
+            "primary",
+            "Primary",
+            9876,
+            GateAction::Restart,
+            false,
+            &folded,
+        ) else {
+            panic!("a busy census must refuse");
+        };
+        assert_eq!(detail.cause, "sessions_live");
+        assert!(detail.message.contains("1111, 2222"), "{}", detail.message);
+        assert!(
+            detail
+                .message
+                .contains("process-subtree census because the runner's"),
+            "the refusal must say where the count came from: {}",
+            detail.message
+        );
+        assert!(detail.message.contains("{\"force\": true}"));
+        assert_eq!(detail.payload["source"], "supervisor_census");
+        assert_eq!(detail.payload["census"]["verdict"], "busy");
+        assert_eq!(detail.payload["census"]["live_claude"][1]["pid"], 2222);
+        // The runner said nothing here; the payload must not imply it did.
+        assert!(detail.payload["readiness"].is_null());
+    }
+
+    /// Both sources failing is UNKNOWN, and UNKNOWN refuses.
+    #[test]
+    fn an_unreadable_census_refuses_and_carries_the_census_error_code() {
+        let folded = fold_census(
+            Readiness::Unknown(ReadinessUnknown::Unreachable {
+                detail: "connection refused".to_string(),
+            }),
+            Some(Err(
+                crate::process::subtree_census::CensusError::Unreadable(
+                    "process table unavailable".to_string(),
+                ),
+            )),
+        );
+        assert_eq!(folded.source(), ReadinessSource::SupervisorCensus);
+        let GateDecision::Refused(detail) =
+            decide("primary", "Primary", 9876, GateAction::Stop, false, &folded)
+        else {
+            panic!("an unreadable census must refuse");
+        };
+        assert_eq!(detail.cause, "readiness_census_unreadable");
+        assert!(detail
+            .message
+            .contains("BOTH readiness sources have failed"));
+        assert!(
+            detail.message.contains("census_unreadable"),
+            "the census error's own code must survive into the refusal: {}",
+            detail.message
+        );
+    }
+
+    /// `None` (the census was not consulted) passes the probe result straight
+    /// through — the no-change path for every non-wedge caller.
+    #[test]
+    fn no_census_passes_the_probe_result_through() {
+        let folded = fold_census(Readiness::Unknown(ReadinessUnknown::EndpointAbsent), None);
+        assert!(matches!(
+            folded,
+            Readiness::Unknown(ReadinessUnknown::EndpointAbsent)
+        ));
+        assert_eq!(folded.source(), ReadinessSource::RunnerVerdict);
+    }
+
+    /// (i) End to end, phase-1 wedge signature: the port REFUSES connections
+    /// and the census walks this very test process, which hosts no `claude`.
+    #[tokio::test]
+    async fn phase_one_signature_refused_port_falls_back_to_a_real_census() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let r = probe_with_census_fallback(
+            port,
+            wedged(),
+            Some(std::process::id()),
+            // The reference instant is the runner's own `started_at`, so a
+            // healthy root's start time never postdates it. `Utc::now()` is
+            // the loosest honest reference for this test process.
+            Some(chrono::Utc::now()),
+        )
+        .await;
+
+        let Readiness::CensusSafe { census } = &r else {
+            panic!("expected a real census to answer for a refused port, got {r:?}");
+        };
+        assert_eq!(census.root_pid, std::process::id());
+        assert!(census.walked >= 1);
+        assert!(matches!(
+            decide("primary", "Primary", port, GateAction::Restart, false, &r),
+            GateDecision::Allowed
+        ));
+    }
+
+    /// (ii) End to end, phase-2 wedge signature: connections are ACCEPTED and
+    /// never answered. The probe must time out into `Unreachable` (not hang,
+    /// and not be mistaken for a live door) and the census must answer.
+    #[tokio::test]
+    async fn phase_two_signature_accept_and_hang_falls_back_to_a_real_census() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and hold every connection open forever, answering nothing.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{}", port);
+        let probed = probe_at_with_timeout(&base, Duration::from_millis(300)).await;
+        assert!(
+            matches!(
+                probed,
+                Readiness::Unknown(ReadinessUnknown::Unreachable { .. })
+            ),
+            "an accepted-but-unanswered connection must time out into Unreachable, got {probed:?}"
+        );
+        assert!(census_applies(&probed, wedged()));
+
+        let folded = fold_census(
+            probed,
+            Some(
+                crate::process::subtree_census::take_census_for_port(
+                    Some(std::process::id()),
+                    port,
+                    None,
+                )
+                .await,
+            ),
+        );
+        assert!(
+            matches!(folded, Readiness::CensusSafe { .. }),
+            "this test process hosts no `claude`, so the census is idle: {folded:?}"
+        );
+    }
+
+    /// The allow path logs the census verdict with the same `verdict=` suffix
+    /// a runner allow uses, and names the arm that answered.
+    #[tokio::test]
+    async fn enforce_allows_a_wedged_idle_runner_and_logs_the_census() {
+        let state = enforce_state();
+        let (managed, port) = managed_on_dead_port(
+            "primary",
+            qontinui_types::wire::runner_kind::RunnerKind::Primary,
+            true,
+            false,
+        )
+        .await;
+        {
+            // The wedge signature: port held, API silent, previously seen
+            // responding, and a PID the census can root on.
+            let mut h = managed.cached_health.write().await;
+            h.runner_port_open = true;
+            h.runner_responding = false;
+        }
+        {
+            let mut r = managed.runner.write().await;
+            r.last_seen_responding_at = Some(chrono::Utc::now() - chrono::Duration::minutes(30));
+            r.pid = Some(std::process::id());
+            r.started_at = Some(chrono::Utc::now());
+        }
+        assert!(port > 0);
+
+        enforce(&state, &managed, GateAction::Restart, false)
+            .await
+            .expect("a wedged runner with a zero census must be allowed to restart");
+
+        let logs = state.logs.history().await;
+        let line = logs
+            .iter()
+            .find(|e| e.message.contains("source=supervisor_census"))
+            .expect("the census allow must be on the operator log buffer");
+        assert!(line.message.contains("verdict="), "{}", line.message);
+        assert!(line.message.contains("ZERO live"), "{}", line.message);
     }
 
     #[test]
