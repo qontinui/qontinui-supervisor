@@ -3565,9 +3565,26 @@ pub async fn maybe_serving_restart(
                 )
                 .await;
 
+                // Bookkeeping and the latch release happen under ONE lock.
+                //
                 // The latch is released on EVERY path — a restart that failed
-                // must not silence the arm for the runner's lifetime.
-                managed.watchdog.write().await.serving_restart_in_flight = false;
+                // must not silence the arm for the runner's lifetime. And a
+                // REFUSAL gives its attempt back: the census counting live
+                // sessions is the safeguard working, not a restart that was
+                // taken, so three refusals must not disarm the arm without a
+                // single restart having happened. Releasing the latch first
+                // and refunding second would let the next 2 s tick push its
+                // own history entry in between, and the refund would pop the
+                // wrong one.
+                let refunded = matches!(result, Err(SupervisorError::RestartUnsafe(_)));
+                {
+                    let mut wd = managed.watchdog.write().await;
+                    if refunded {
+                        wd.serving_restart_attempts = wd.serving_restart_attempts.saturating_sub(1);
+                        wd.serving_history.pop();
+                    }
+                    wd.serving_restart_in_flight = false;
+                }
 
                 match result {
                     Ok(()) => {
@@ -3607,15 +3624,6 @@ pub async fn maybe_serving_restart(
                             .logs
                             .emit(LogSource::Supervisor, LogLevel::Error, msg)
                             .await;
-                        // Give the attempt back: a refusal must not consume the
-                        // window budget, or three busy runners would disarm the
-                        // arm without a single restart having been taken.
-                        {
-                            let mut wd = managed.watchdog.write().await;
-                            wd.serving_restart_attempts =
-                                wd.serving_restart_attempts.saturating_sub(1);
-                            wd.serving_history.pop();
-                        }
                         emit_serving_event(
                             &state,
                             &runner_id,

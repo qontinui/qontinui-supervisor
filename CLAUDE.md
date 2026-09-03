@@ -4,7 +4,7 @@ Rust-based build server and fleet dashboard for qontinui-runner. Provides parall
 
 ## CRITICAL: Runner Lifecycle Scope
 
-The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health but never starts, stops, or restarts them unprompted.
+The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health and **never restarts a user-managed runner that is serving**. The one exception, added 2026-09-03: a runner whose HTTP API has been silent for the serving threshold **while its process holds the port** is restarted only when the supervisor's own process-subtree census finds zero live `claude` sessions under it, and every such decision — restart, refusal, or disarm — is alerted to coord. See "Serving watchdog" below.
 
 With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it never auto-starts named/temp/external runners. If the startup orphan scan already adopted a surviving primary, boot-start is a no-op (`main::primary_to_boot_start`).
 
@@ -13,7 +13,7 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Temp runners** are supervisor-owned and still die with the supervisor — deliberately, since orphaned temps hold open slot binaries and break subsequent cargo builds.
 - **Primary, named, and external runners** are user-owned, are assigned to no job at all, and survive every supervisor exit path. A non-assignment is logged (`Runner 'Primary' (PID N) NOT assigned to the kill-on-exit JobObject`) so the next incident has forensics.
 - The **startup orphan scan** (`process::orphan_scan`) then adopts the survivor back into the registry. It no longer kills an adoptable orphan for having a stale binary — staleness is reported as a `Warn` naming the gap and the remedy (`POST /runner/restart {"rebuild": true}`), and the operator decides.
-- **Known gap:** an adopted runner has no `tokio::process::Child` handle (we did not spawn it), so the crash-only watchdog's **exit observation** does not cover an inherited primary until this supervisor starts it itself. HTTP health polling is unaffected. A `Child` is deliberately not synthesized.
+- **Known gap:** an adopted runner has no `tokio::process::Child` handle (we did not spawn it), so the crash-only watchdog's **exit observation** does not cover an inherited primary until this supervisor starts it itself. HTTP health polling is unaffected. A `Child` is deliberately not synthesized. **The serving watchdog DOES cover an adopted primary**: its census walks the OS process table from the runner's PID (or, when the registry has none, from the port's listener), so it needs no `Child` handle — which matters because the adopted primary is the case in all three recorded wedge occurrences.
 - **Stopping an adopted runner does NOT depend on that handle, and no longer depends on the registry PID either** (fixed 2026-07-31). `stop_runner_by_id` resolves its target up front through `process::stop_ledger::resolve_stop_target`, in order: the registry PID → the netstat listener probe on the runner's port → **image-path identity** (sysinfo: which live process is running this runner's deterministic `runner_exe_copy_path`). The third source needs no subprocess, no listening socket and no locale, so a stop still has a target when the first two are blind — which is exactly how `POST /runners/primary/stop` came to return 500 while PID 8872 sat alive on port 9876. An **ambiguous** exe match (two processes on the same image) is reported as unresolved rather than guessed at. Resolution is identification-only: the recovered PID goes through the normal `request_drain` → close-request → kill ladder instead of being hard-killed on the spot, so an adopted primary still gets its drain.
 
 **A failed stop reports what it ACTUALLY did.** The old message asserted a fixed "after PID kill, tree-kill, kill-by-port" regardless of whether any of those ran. The ladder now records each rung (`process::stop_ledger::StopLedger`) and derives the message from that record, with two distinct arms: a kill **ran and was refused** (a genuinely stubborn process) versus **no kill ever ran** ("the supervisor could not identify what to kill … NOT a process that resisted being killed"). The second arm names each rung's gap. Treat that wording as load-bearing — it is the difference between hunting an unkillable process and looking at the supervisor.
@@ -23,6 +23,15 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Never restarts a *running* runner** — this is exit-observation only, not health-based resurrection.
 - **Never restarts on operator stop.** Every operator-facing stop path latches `stop_requested` before the kill; the exit monitor reads it when the exit is observed. The flag is cleared on the next *start* (not at stop completion), so the marker is race-free — a failed stop (`StillHeld`) whose process dies later still counts as operator-intended.
 - **Never restarts a clean exit** (code 0 — window close, internal shutdown).
+
+**Serving watchdog** (plan `2026-09-03-runner-zombie-serving-watchdog`). Liveness is **per-route serving**, not process-exists. The crash arm above is armed on process **exit**; three times in nine days the primary's `:9876` stopped answering while the process stayed alive and kept its outbound work going, for 12 hours to 5 days, with `crash_restart_armed: true, restart_attempts: 0` throughout. An armed watchdog is not a recovery path for a process that never crashes. Under `--watchdog`, a runner classified `RunnerLiveness::UnresponsiveSince` (port held, API silent, previously seen responding) for longer than the serving threshold is restarted through `restart_runner_by_id` with the internal-only `RestartSource::ServingWatchdog`. Hard rules:
+
+- **Only on a zero census.** `process::subtree_census` walks the OS process table from the runner's PID and counts every `claude` image in its inclusive subtree — both session planes, since AI and terminal sessions both materialise as a `claude` child. A non-zero count REFUSES and alerts; so does a census that cannot be taken. The census over-approximates by design (a lingering shim counts), so its failure mode is refusing, never restarting over live work.
+- **The readiness gate has two sources now.** `restart_readiness::probe_with_census_fallback` asks the runner first and falls back to the census **only** when the door is wedged (probe `Unreachable` AND liveness `UnresponsiveSince`). A runner that ANSWERED — 404, non-2xx, or garbage — is never second-guessed. `RunnerLiveness::Unknown` never reaches the census: a runner that has never answered is **alerted, not restarted**.
+- **Never on a temp runner** (the max-age reaper owns those) and never against operator intent (`stop_requested` / `restart_requested`).
+- **Bounded**: 3 serving restarts per rolling 24 h, then the arm self-disarms with `serving restart loop — operator required` (`POST /runners/{id}/watchdog {"reset_attempts": true}` clears both arms). A refusal does not consume the budget.
+- **Alerted independently of any session** — `fleet::notify_serving_watchdog` posts to coord's `/coord/agent-notifications` with the device JWT, falling back to a `status` finding on 401/403. A coord failure never delays or blocks a restart.
+- `serving_restart_armed` is surfaced in `/health`, `/runners` and SSE beside `crash_restart_armed`, with a boot WARN when a primary is managed and the arm is off.
 - **Never restarts external/user-started runners** — restart requires the spawn provenance of a supervisor-held Child handle.
 - **Scope: primary only by default.** Under `--watchdog` the primary's per-runner `WatchdogState.enabled` defaults true; named/temp/external default false. Arm any runner explicitly via `POST /runners/{id}/watchdog {"enabled": true}`.
 - **Crash-loop guard:** exponential backoff 5s → 30s → 120s between attempts; max 3 auto-restarts per rolling 30 minutes, then the watchdog disarms itself (`disabled_reason: "crash loop — operator required"`, `enabled` left true so intent stays visible) with an ERROR log + diagnostics event. Reset via `POST /runners/{id}/watchdog {"enabled": true, "reset_attempts": true}`.
@@ -159,13 +168,20 @@ cargo clippy -- -D warnings    # Lint
 | Flag | Description |
 |------|-------------|
 | `-p, --project-dir` | Path to `qontinui-runner/src-tauri` (required) |
-| `-w, --watchdog` | Enable health monitoring + crash-only auto-restart of the primary (implies `--auto-start`; see "Crash-only ambient watchdog"). Kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`. |
+| `-w, --watchdog` | Enable health monitoring + **both** auto-restart arms for the primary: crash-only (see "Crash-only ambient watchdog") and serving (see "Serving watchdog"). Implies `--auto-start`. One flag, one operator intent ("supervise the primary"); the two arms have **separate** kill-switches: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` and `QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1`. |
 | `-a, --auto-start` | Start runner on supervisor launch |
 | `--expo-dir` | Path to Expo/React Native project directory |
 | `-l, --log-file` | Append the in-memory log buffer to this file (persistent supervisor log; size+age rotated, see "Persistent Logs"). Overrides `<log-dir>/supervisor.log`. |
 | `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. Every file is size+age rotated with a retained-segment cap. |
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
+
+## Serving-watchdog environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QONTINUI_SUPERVISOR_NO_SERVING_RESTART` | unset | `1` disables serving restarts entirely, leaving the crash arm alone. This is the off-switch — the threshold below is **not**. |
+| `QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS` | `300` | How long a runner's API must have been silent, with its port still held, before a serving restart is considered. Clamped to `[60, 86400]`; `0` clamps **up** to 60, it does not disable. The 60 s floor is the wedge escalation (30 s) plus one full readiness probe (`READINESS_TIMEOUT` 15 s) — below it the arm could fire before the wedge was ever escalated. |
 
 ## Restarting the supervisor
 
