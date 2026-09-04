@@ -35,3 +35,31 @@ __pycache__/
 # `merge --ff-only origin/main` — the supervisor sat 26 commits behind main for
 # weeks because of two stale command files.
 .claude/
+
+# The rest of the runner's machine-local artifact roster. That roster is
+# enumerated in code — qontinui-runner `src-tauri/src/fleet.rs`,
+# MANAGED_REPO_EXCLUDES — and has exactly four entries. `agent-worktrees/`
+# (line 12) and `.mcp.json` (line 17) above are two of them; these are the two
+# the earlier promotions left behind:
+#
+#   .agent-worktrees/  the dot-prefixed container. `agent-worktrees/` above does
+#                      NOT match it — a gitignore pattern matches a path
+#                      component literally, and `.agent-worktrees` is a
+#                      different name. No repo in the workspace has promoted
+#                      this one; it lives only in `.git/info/exclude`.
+#   .coord-mcp-status  the runner's one-line, spawn-time record that coord-mcp
+#                      provisioning was DEGRADED. Status, not source.
+#                      qontinui-claude-config promoted this one already
+#                      (its .gitignore line 30 on origin/main).
+#
+# Same rationale the `.mcp.json` entry above states for itself: the runner
+# writes these into `.git/info/exclude`, which is local-only and lost on a
+# fresh clone / in CI, and it writes them best-effort — `ensure_repo_info_exclude`
+# swallows every IO error. A tracked entry is the durable statement.
+#
+# Not cosmetic: `git status --porcelain` counts untracked files, so any one of
+# these left unignored makes dev-start.ps1's Resolve-PrimaryTreeStaleness read a
+# clean tree as WIP and skip its `merge --ff-only origin/main` — the defect that
+# held this repo 26 commits behind main (see the `.claude/` entry above, #166).
+.agent-worktrees/
+.coord-mcp-status
