@@ -25,3 +25,13 @@ agent-worktrees/
 # index before this entry existed.
 __pycache__/
 *.py[cod]
+
+# Claude Code's per-repo scaffolding: fleet-wide slash commands (canonical copy
+# lives in qontinui-claude-config/.claude/commands/) plus .claude/worktrees/.
+# Machine-local, never source — and every peer repo already ignores it
+# (qontinui-runner, -coord, -web, -schemas, ...). Left untracked here it made
+# `git status --porcelain` non-empty, so dev-start.ps1's
+# Resolve-PrimaryTreeStaleness read the tree as WIP and skipped its
+# `merge --ff-only origin/main` — the supervisor sat 26 commits behind main for
+# weeks because of two stale command files.
+.claude/
