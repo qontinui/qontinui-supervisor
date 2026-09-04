@@ -1435,6 +1435,61 @@ The supervisor's own inherited marker is reported once at startup
 entered the fleet. Clearing that requires launching the supervisor from a shell
 that does not carry it — a self-restart no longer propagates it.
 
+## Machine-local artifacts and tree cleanliness
+
+The runner drops machine-local artifacts into every repo it manages. The roster
+is enumerated in code — qontinui-runner
+`src-tauri/src/fleet.rs::MANAGED_REPO_EXCLUDES` — and has exactly four entries:
+`.mcp.json`, `agent-worktrees/`, `.agent-worktrees/`, `.coord-mcp-status`. None
+of them is source.
+
+**Why that is not cosmetic.** `dev-start.ps1`'s `Resolve-PrimaryTreeStaleness`
+reads a non-empty `git status --porcelain` as uncommitted WIP and *skips* its
+`merge --ff-only origin/main`. A single unignored artifact therefore pins the
+primary checkout behind main indefinitely — this repo sat 26 commits behind for
+weeks because of two stale `.claude/` command files (#166).
+
+The roster reached `.gitignore` in three separate rounds — `.mcp.json`, then
+`.claude/` (#166), then `.agent-worktrees/` and `.coord-mcp-status` (#167) —
+and each round left the next one behind, because nothing checked the roster as
+a whole. `tests/machine_local_artifacts.rs` now does, in CI: every entry must be
+ignored **by the tracked `.gitignore`** (not merely by `.git/info/exclude`,
+which is local-only, lost on a fresh clone and in CI, and which the runner
+writes best-effort while swallowing every IO error); none may have reached the
+index; and the roster is cross-checked against the runner's own constant
+whenever a `qontinui-runner` checkout sits beside this one. That cross-check
+reports **UNKNOWN, never a pass**, where the runner is out of reach — which is
+the case in CI, since `ci.yml` clones only `qontinui-schemas`.
+
+### A clean `.gitignore` is NOT sufficient — the tree is still dirty
+
+`Cargo.lock` is tracked (`25857fe`, to pin registry deps after a broken
+`tinyvec 1.13.0` reddened CI on every qontinui-schemas PR). It records a version
+for the `qontinui-types` **path dep**, resolved from the *shared*
+`../qontinui-schemas` checkout, and cargo rewrites that line on every build to
+whatever that sibling's manifest says. So the tree reads ` M Cargo.lock`
+whenever the sibling is not at exactly the committed version — which is most of
+the time: qontinui-schemas release-bumps roughly weekly, and the shared schemas
+checkout is **not** auto-fast-forwarded (`Resolve-PrimaryTreeStaleness` is
+called for Supervisor and Runner only).
+
+Measured 2026-09-04: committed `1.9.0`, shared checkout `1.8.0` (8 commits
+behind `origin/main`); the primary supervisor tree read ` M Cargo.lock` and was
+pinned 2 commits behind main — i.e. #166/#167 promoted every artifact they
+name and the auto-fast-forward they exist to unblock still did not run.
+qontinui-runner shows the same single-line churn in the **opposite** direction
+(committed `1.7.0`, sibling `1.8.0`), so **no single sibling version cleans
+both**. That is what makes this structural rather than a stale-checkout
+accident.
+
+There is no in-repo fix: cargo always records a path dep's resolved version,
+and the lock must stay tracked. The remaining blocker belongs to the *consumer*
+of the signal — `Resolve-PrimaryTreeStaleness` (qontinui-claude-config
+`scripts/dev-start.ps1`) tests "porcelain is empty" as a proxy for "there is WIP
+to protect", while `git merge --ff-only` already refuses on its own to clobber a
+locally-modified file. **Do not spend a fourth round on `.gitignore`; the
+remaining blocker is not there.**
+
 ## Code Standards
 
 - Idiomatic Rust, `Result` types for errors
