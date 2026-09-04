@@ -30,7 +30,9 @@ use std::time::Duration;
 use chrono::Utc;
 use qontinui_types::dev_signatures::DevSignature;
 
-use crate::dev_action::record::{ActionKind, ActionOutcome, ActionRecord, D3Category};
+use crate::dev_action::record::{
+    ActionKind, ActionOutcome, ActionRecord, ActionRunResult, D3Category,
+};
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::panic_log;
 use crate::state::SharedState;
@@ -49,9 +51,50 @@ pub const RESTART_WINDOW: Duration = Duration::from_secs(30);
 pub const SPAWN_WINDOW: Duration = Duration::from_secs(30);
 /// Build tail added on top of the build's own duration: 30s.
 pub const BUILD_TAIL_WINDOW: Duration = Duration::from_secs(30);
+/// Hard upper bound on a `build`-kind attribution window when the build's real
+/// duration is not known up front (which is EVERY caller today — both
+/// `mint_primary_action` sites pass `build_duration: None`).
+///
+/// Before this existed, `window_for(Build, None)` resolved to a flat
+/// [`BUILD_TAIL_WINDOW`] and every rebuild-restart's verdict was stamped 30
+/// seconds after submission — typically 10-20 minutes before the build it was
+/// judging had finished
+/// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md` §1-§2).
+/// The window now stays open until the action records its own terminal result
+/// ([`ActionRunResult`]); this is the backstop for the case where no path ever
+/// records one, so a watcher can never park forever. Sized well above the
+/// observed 10-20 minute runner rebuild.
+pub const BUILD_BACKSTOP_WINDOW: Duration = Duration::from_secs(45 * 60);
+
+/// The two timing knobs of a build attribution window, injectable so the
+/// regression tests can exercise the real waiting logic in milliseconds rather
+/// than minutes. Production always uses [`WindowTiming::default`].
+#[derive(Debug, Clone, Copy)]
+pub struct WindowTiming {
+    /// Grace period added AFTER the action's terminal result, during which
+    /// delayed effects (the 2026-06-07 asset error landed at t+5s) still count.
+    pub tail: Duration,
+    /// Upper bound on waiting for a terminal result that never arrives.
+    pub backstop: Duration,
+}
+
+impl Default for WindowTiming {
+    fn default() -> Self {
+        Self {
+            tail: BUILD_TAIL_WINDOW,
+            backstop: BUILD_BACKSTOP_WINDOW,
+        }
+    }
+}
 
 /// The attribution window for an action kind. `build` is `duration + 30s`
 /// keyed off the build-submission time; restart/spawn are flat 30s.
+///
+/// **`build_duration` is `None` at every live call site**, which is what made
+/// this a flat 30s window for builds. [`await_attribution_window`] is what the
+/// watcher actually waits on now: it holds a build's window open until the
+/// action's own terminal result lands. This function stays as the declared
+/// per-kind window (and the flat window restart/spawn still use verbatim).
 pub fn window_for(kind: ActionKind, build_duration: Option<Duration>) -> Duration {
     match kind {
         ActionKind::Restart => RESTART_WINDOW,
@@ -60,18 +103,40 @@ pub fn window_for(kind: ActionKind, build_duration: Option<Duration>) -> Duratio
     }
 }
 
-/// Classify a verdict from the observed signatures. Each signature carries its
-/// **default D3 category** in the shared registry
-/// ([`DevSignature::default_category`]): asset-missing / webview-refused /
-/// ui_error default to **Contradiction** (the ACK claimed success but the
-/// surface refutes it); panic / port-bind / compile-flake default to
-/// **Failure** (the action's own machinery failed). Phase-2b derives the verdict
-/// from those defaults instead of re-listing the mapping here. A clean window ⇒
+/// Classify a verdict from the action's own terminal result and the observed
+/// signatures.
+///
+/// `run` comes FIRST. If the action reports that it was refused or errored, the
+/// verdict is [`D3Category::Failure`] regardless of how clean the effect
+/// surfaces look — a refused restart never touched them, so their cleanliness
+/// is the absence of an observation, not evidence of success
+/// (`verification-and-evidence` `silent-empty-is-unknown`). This is the fix for
+/// the doc comment below having quietly assumed its own premise: "a clean
+/// window ⇒ Confirmed" only holds for a window that describes an action which
+/// actually ran.
+///
+/// **`Failure` is deliberately reused rather than a sixth `D3Category` variant
+/// added.** The enum lives in `qontinui-schemas` and its five wire values are
+/// pinned by a hard Postgres CHECK; a sixth value would fail coord's ingest
+/// INSERT, and the supervisor's fail-open ingest would swallow that into one
+/// `warn!` — making refusal snapshots the only rows silently missing from the
+/// durable ledger. See the plan's §5. The refusal/error distinction rides
+/// [`ActionRecord::run_result`] and [`ActionOutcome::evidence_ref`] instead.
+///
+/// With `run` absent or [`ActionRunResult::Ran`], the pre-existing precedence
+/// applies unchanged. Each signature carries its **default D3 category** in the
+/// shared registry ([`DevSignature::default_category`]): asset-missing /
+/// webview-refused / ui_error default to **Contradiction** (the ACK claimed
+/// success but the surface refutes it); panic / port-bind / compile-flake
+/// default to **Failure** (the action's own machinery failed). A clean window ⇒
 /// **Confirmed**. When multiple classes are present, Contradiction wins over
 /// Failure (a white screen behind a "success" ACK is the more misleading
 /// outcome and the one the operator most needs surfaced) — the precedence is
 /// applied here, since the registry only carries each signature's own default.
-pub fn classify(signatures: &[DevSignature]) -> D3Category {
+pub fn classify(run: Option<&ActionRunResult>, signatures: &[DevSignature]) -> D3Category {
+    if run.is_some_and(ActionRunResult::is_failure) {
+        return D3Category::Failure;
+    }
     let mut has_contradiction = false;
     let mut has_failure = false;
     for sig in signatures {
@@ -243,6 +308,108 @@ pub struct AttributionTargets {
     pub runner_id: Option<String>,
 }
 
+/// Wait for a terminal [`ActionRunResult`] on `record`, or until `cap` elapses.
+///
+/// Returns the result if one landed inside the budget, else `None`. The
+/// `Notify` permit is stored by [`ActionRecord::record_run_result`], so a
+/// result recorded *before* this is first awaited still completes immediately —
+/// the read-before-and-after-arming pair below is belt to that brace.
+async fn wait_for_run_result(record: &ActionRecord, cap: Duration) -> Option<ActionRunResult> {
+    let deadline = tokio::time::Instant::now() + cap;
+    loop {
+        if let Some(r) = record.run_result() {
+            return Some(r);
+        }
+        let notified = record.run_signal.notified();
+        if let Some(r) = record.run_result() {
+            return Some(r);
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            // Budget exhausted. Re-read once: the result may have landed in the
+            // same tick the timeout fired.
+            return record.run_result();
+        }
+    }
+}
+
+/// Wait out the attribution window, and report the action's terminal result if
+/// one landed inside it.
+///
+/// **This is the framing fix** (plan §6 Phase 2). `window_for(Build, None)` —
+/// a flat 30s — used to be the window for every rebuild-restart, so a build
+/// that fails at t+12min closed `Confirmed` at t+30s and the ledger's
+/// never-re-open rule made that permanent. Now:
+///
+/// - **`build`**: hold the window open until the action records its own
+///   terminal result, then add [`WindowTiming::tail`] so delayed effects still
+///   count. Capped at `build_duration + tail` when the real duration IS known,
+///   else at [`WindowTiming::backstop`] — so a path that never records a result
+///   still closes, exactly as it did before, instead of parking forever.
+/// - **`restart` / `spawn`**: the flat per-kind window, unchanged.
+///
+/// **[`ActionRunResult::Refused`] closes the window immediately, for every
+/// kind.** A refused action never ran, so no effect surface was touched and
+/// there is nothing left for the window to observe; waiting out the remainder
+/// would only delay a verdict that is already known.
+///
+/// The watcher only ever READS the result, so the never-re-open invariant
+/// (module docs; the ledger plan §3.2) is untouched: the verdict is still
+/// composed exactly once, at window close.
+async fn await_attribution_window(
+    record: &ActionRecord,
+    kind: ActionKind,
+    build_duration: Option<Duration>,
+    timing: WindowTiming,
+) -> Option<ActionRunResult> {
+    match kind {
+        ActionKind::Restart | ActionKind::Spawn => {
+            let flat = window_for(kind, build_duration);
+            match wait_for_run_result(record, flat).await {
+                // Nothing ran — close now.
+                Some(r @ ActionRunResult::Refused { .. }) => Some(r),
+                // Ran (well or badly): the effect surfaces still need the rest
+                // of the flat window to produce their signatures.
+                Some(other) => {
+                    tokio::time::sleep(remaining(record, flat)).await;
+                    Some(other)
+                }
+                None => record.run_result(),
+            }
+        }
+        ActionKind::Build => {
+            let cap = build_duration
+                .map(|d| d + timing.tail)
+                .unwrap_or(timing.backstop);
+            match wait_for_run_result(record, cap).await {
+                Some(r @ ActionRunResult::Refused { .. }) => Some(r),
+                Some(other) => {
+                    // Tail measured from the action's REAL end, and still
+                    // clamped by the cap so the window is bounded either way.
+                    let elapsed = elapsed_since_start(record);
+                    let room = cap.saturating_sub(elapsed);
+                    tokio::time::sleep(timing.tail.min(room)).await;
+                    Some(other)
+                }
+                None => record.run_result(),
+            }
+        }
+    }
+}
+
+/// How much of `window` is left, measured from the record's `started_at`.
+fn remaining(record: &ActionRecord, window: Duration) -> Duration {
+    window.saturating_sub(elapsed_since_start(record))
+}
+
+/// Wall-clock elapsed since the action was minted. A clock that has gone
+/// backwards reads as zero elapsed rather than as a negative (which would
+/// otherwise wrap into an enormous sleep).
+fn elapsed_since_start(record: &ActionRecord) -> Duration {
+    (Utc::now() - record.started_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
 /// Spawn the detached attribution watcher for a minted action.
 ///
 /// Sleeps the per-kind window, scans the effect surfaces, folds the verdict
@@ -257,12 +424,30 @@ pub fn spawn_attribution_watcher(
     targets: AttributionTargets,
     build_duration: Option<Duration>,
 ) {
+    spawn_attribution_watcher_with_timing(
+        state,
+        record,
+        targets,
+        build_duration,
+        WindowTiming::default(),
+    );
+}
+
+/// [`spawn_attribution_watcher`] with the window timing supplied explicitly.
+/// Production uses the `Default`; the regression tests use millisecond values
+/// so they exercise the real waiting logic without a 30-second sleep.
+pub fn spawn_attribution_watcher_with_timing(
+    state: SharedState,
+    record: Arc<ActionRecord>,
+    targets: AttributionTargets,
+    build_duration: Option<Duration>,
+    timing: WindowTiming,
+) {
     tokio::spawn(async move {
         let kind = record.kind;
-        let window = window_for(kind, build_duration);
         let window_open_at = record.started_at;
 
-        tokio::time::sleep(window).await;
+        let run_result = await_attribution_window(&record, kind, build_duration, timing).await;
 
         // Resolve the early-log path: prefer the managed runner's current path
         // (set during a fresh spawn after mint time), else the eagerly-captured
@@ -284,9 +469,21 @@ pub fn spawn_attribution_watcher(
         let (health_sigs, health_ev) = scan_health(&state, targets.runner_id.as_deref()).await;
         merge(&mut signatures, &mut evidence, health_sigs, health_ev);
 
-        let category = classify(&signatures);
+        let category = classify(run_result.as_ref(), &signatures);
         let ended_at = Utc::now();
         let duration_ms = (ended_at - record.started_at).num_milliseconds();
+
+        // Plan §5: the refusal/error distinction rides `evidence_ref`, not a
+        // sixth `D3Category`. A `DEV-*` signature's own excerpt wins when there
+        // is one (it names an observed effect); otherwise the action's terminal
+        // reason is the only evidence there is — and for a refusal it is the
+        // ONLY evidence there ever could be, since nothing ran.
+        if evidence.is_none() {
+            evidence = run_result
+                .as_ref()
+                .and_then(ActionRunResult::reason)
+                .map(|r| r.chars().take(400).collect::<String>());
+        }
 
         // The outcome's wire form carries the canonical `DEV-*` id strings.
         let signature_ids: Vec<String> =
@@ -329,17 +526,33 @@ pub fn spawn_attribution_watcher(
             D3Category::Contradiction | D3Category::Failure => LogLevel::Warn,
             _ => LogLevel::Info,
         };
+        // Name the action's terminal result on the operator log line. Without
+        // it a refusal reads as `verdict=Failure signatures=[]` — the same
+        // shape as an unexplained one — and the whole point of this plan is
+        // that the gate's verdict REACHES the caller.
+        let run_note = match run_result.as_ref() {
+            Some(r) => match r.reason() {
+                Some(reason) => format!(
+                    " run={} reason={:?}",
+                    run_kind(r),
+                    reason.chars().take(200).collect::<String>()
+                ),
+                None => format!(" run={}", run_kind(r)),
+            },
+            None => String::new(),
+        };
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 level,
                 format!(
-                    "dev-action {} ({}) verdict={:?} signatures={:?}",
+                    "dev-action {} ({}) verdict={:?} signatures={:?}{}",
                     record.action_id,
                     kind.as_str(),
                     category,
-                    signature_ids
+                    signature_ids,
+                    run_note
                 ),
             )
             .await;
@@ -348,6 +561,15 @@ pub fn spawn_attribution_watcher(
         // Phase-3 `events.dev_actions` WS push).
         state.notify_health_change();
     });
+}
+
+/// Stable log token for an [`ActionRunResult`] variant.
+fn run_kind(r: &ActionRunResult) -> &'static str {
+    match r {
+        ActionRunResult::Refused { .. } => "refused",
+        ActionRunResult::Errored { .. } => "errored",
+        ActionRunResult::Ran => "ran",
+    }
 }
 
 /// Merge a secondary `(signatures, evidence)` scan into the primary, preserving
@@ -372,6 +594,243 @@ fn merge(
 mod tests {
     use super::*;
 
+    // ── Regression tests for
+    //    `2026-09-04-supervisor-refused-restart-reports-confirmed` ──────────
+
+    /// Same minimal `SupervisorState` shape the route tests use.
+    fn watcher_test_state(root: &std::path::Path) -> SharedState {
+        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+        use crate::state::SupervisorState;
+        Arc::new(SupervisorState::new(SupervisorConfig {
+            project_dir: root.join("src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 8081,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: true,
+            no_webview: true,
+        }))
+    }
+
+    fn bare_record(kind: ActionKind) -> Arc<ActionRecord> {
+        Arc::new(ActionRecord::new(kind, None, "test".to_string(), &[]))
+    }
+
+    /// Poll a record's outcome until it is folded in, or give up.
+    async fn await_outcome(record: &ActionRecord, budget: Duration) -> ActionOutcome {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(o) = record.outcome.read().ok().and_then(|g| g.clone()) {
+                return o;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the attribution watcher never folded an outcome in"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Plan §6 Phase 5 test 1. THE bug: a readiness refusal leaves every effect
+    /// surface clean, and a clean window used to classify `Confirmed`. The
+    /// action's own terminal result now overrides that.
+    #[test]
+    fn refused_run_result_classifies_as_failure_not_confirmed() {
+        let refused = ActionRunResult::Refused {
+            reason: "restart_refused_unsafe: 1 terminal-hosted agent session is live".to_string(),
+        };
+        assert_eq!(
+            classify(Some(&refused), &[]),
+            D3Category::Failure,
+            "a refused action with a clean window must NOT be Confirmed"
+        );
+        // An errored action is the same class — and it is the expensive one:
+        // a build that fails at t+12min.
+        let errored = ActionRunResult::Errored {
+            reason: "cargo build failed".to_string(),
+        };
+        assert_eq!(classify(Some(&errored), &[]), D3Category::Failure);
+        // §5: `Failure` is REUSED. A sixth wire value would violate coord's
+        // hard Postgres CHECK and the fail-open ingest would swallow it.
+        assert_eq!(
+            serde_json::to_string(&classify(Some(&refused), &[])).unwrap(),
+            "\"failure\""
+        );
+    }
+
+    /// Plan §6 Phase 5 test 2. The existing meaning of a clean window is
+    /// preserved for an action that actually ran (or reported nothing).
+    #[test]
+    fn absent_or_ran_run_result_leaves_clean_window_confirmed() {
+        assert_eq!(classify(None, &[]), D3Category::Confirmed);
+        assert_eq!(
+            classify(Some(&ActionRunResult::Ran), &[]),
+            D3Category::Confirmed
+        );
+        // And a `Ran` action still defers to the effect surfaces.
+        assert_eq!(
+            classify(
+                Some(&ActionRunResult::Ran),
+                &[DevSignature::DevTauriAssetMissing]
+            ),
+            D3Category::Contradiction
+        );
+    }
+
+    /// Plan §6 Phase 5 test 3 + §8 acceptance: a readiness-refused restart must
+    /// leave an outcome on `GET /actions/{id}/outcome` that is NOT `confirmed`
+    /// and whose evidence names `restart_refused_unsafe`.
+    ///
+    /// Drives the real watcher. A `Refused` closes the window immediately
+    /// (nothing ran, so there is no effect window to wait out), which is also
+    /// what keeps this test sub-second against the flat 30s restart window.
+    #[tokio::test]
+    async fn refused_restart_outcome_is_not_confirmed_and_names_the_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Restart);
+
+        spawn_attribution_watcher(
+            state,
+            record.clone(),
+            AttributionTargets {
+                early_log_path: None,
+                managed: None,
+                panic_log_path: None,
+                runner_id: None,
+            },
+            None,
+        );
+
+        record.record_run_result(ActionRunResult::Refused {
+            reason: "restart_refused_unsafe: runner 'primary' (port 9876) reports it is NOT \
+                     safe to restart"
+                .to_string(),
+        });
+
+        // Well inside RESTART_WINDOW: the refusal closes the window early.
+        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        assert_ne!(
+            outcome.category,
+            D3Category::Confirmed,
+            "the refused restart must not report Confirmed"
+        );
+        assert_eq!(outcome.category, D3Category::Failure);
+        assert!(
+            outcome
+                .evidence_ref
+                .as_deref()
+                .is_some_and(|e| e.contains("restart_refused_unsafe")),
+            "the outcome must name the refusal; got {:?}",
+            outcome.evidence_ref
+        );
+        assert!(outcome.signatures.is_empty());
+    }
+
+    /// Plan §6 Phase 5 test 4 — pins Phase 2, the framing fix. A build whose
+    /// terminal result lands AFTER the old flat window would have elapsed must
+    /// still be judged on that result.
+    ///
+    /// `tail` here plays the role the flat 30s played in production: under the
+    /// old code the window was exactly `window_for(Build, None) == tail` and
+    /// closed `Confirmed` before the failure existed. The failure is recorded
+    /// at ~4x `tail`, so this fails against the old sleep-the-window watcher
+    /// and passes against the hold-open one.
+    #[tokio::test]
+    async fn build_failing_after_the_flat_window_does_not_report_confirmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Build);
+
+        let timing = WindowTiming {
+            tail: Duration::from_millis(50),
+            backstop: Duration::from_secs(20),
+        };
+        assert_eq!(
+            window_for(ActionKind::Build, None),
+            BUILD_TAIL_WINDOW,
+            "the pre-fix window for a build with no known duration was the flat tail"
+        );
+
+        spawn_attribution_watcher_with_timing(
+            state,
+            record.clone(),
+            AttributionTargets {
+                early_log_path: None,
+                managed: None,
+                panic_log_path: None,
+                runner_id: None,
+            },
+            None,
+            timing,
+        );
+
+        // Long past the old flat window — and the outcome must still be open.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            record.outcome.read().unwrap().is_none(),
+            "the window must stay OPEN until the build reports a terminal result"
+        );
+
+        record.record_run_result(ActionRunResult::Errored {
+            reason: "cargo build failed: could not compile qontinui-runner".to_string(),
+        });
+
+        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        assert_ne!(outcome.category, D3Category::Confirmed);
+        assert_eq!(outcome.category, D3Category::Failure);
+        assert!(outcome
+            .evidence_ref
+            .as_deref()
+            .is_some_and(|e| e.contains("cargo build failed")));
+        // `duration_ms` must now be a MEASUREMENT of the action, not the flat
+        // window plus overhead (the plan's §2 finding: `duration_ms: 30342`).
+        assert!(
+            outcome.duration_ms >= 200,
+            "window closed before the action ended: {}ms",
+            outcome.duration_ms
+        );
+    }
+
+    /// A build that never records a terminal result still closes — on the
+    /// backstop. Without this the watcher (and the coord ingest behind it)
+    /// would park forever on any path that forgets to report.
+    #[tokio::test]
+    async fn build_with_no_terminal_result_closes_on_the_backstop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Build);
+
+        spawn_attribution_watcher_with_timing(
+            state,
+            record.clone(),
+            AttributionTargets {
+                early_log_path: None,
+                managed: None,
+                panic_log_path: None,
+                runner_id: None,
+            },
+            None,
+            WindowTiming {
+                tail: Duration::from_millis(10),
+                backstop: Duration::from_millis(150),
+            },
+        );
+
+        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        // No terminal result and no signatures: the pre-existing meaning of a
+        // clean window is unchanged for an action that reported nothing.
+        assert_eq!(outcome.category, D3Category::Confirmed);
+    }
+
     #[test]
     fn asset_missing_log_yields_contradiction() {
         // The exact 2026-06-07 incident line.
@@ -380,7 +839,7 @@ mod tests {
                    INFO window created\n";
         let (sigs, evidence) = scan_log_content(log);
         assert!(sigs.contains(&DevSignature::DevTauriAssetMissing));
-        assert_eq!(classify(&sigs), D3Category::Contradiction);
+        assert_eq!(classify(None, &sigs), D3Category::Contradiction);
         assert!(evidence.unwrap().contains("asset not found"));
     }
 
@@ -389,7 +848,7 @@ mod tests {
         let log = "ERROR webview: net::ERR_CONNECTION_REFUSED at http://localhost:1420\n";
         let (sigs, _) = scan_log_content(log);
         assert!(sigs.contains(&DevSignature::DevWebviewConnRefused));
-        assert_eq!(classify(&sigs), D3Category::Contradiction);
+        assert_eq!(classify(None, &sigs), D3Category::Contradiction);
     }
 
     #[test]
@@ -403,7 +862,7 @@ mod tests {
                 sigs.contains(&DevSignature::DevPortBindFail),
                 "line: {line}"
             );
-            assert_eq!(classify(&sigs), D3Category::Failure, "line: {line}");
+            assert_eq!(classify(None, &sigs), D3Category::Failure, "line: {line}");
         }
     }
 
@@ -412,7 +871,7 @@ mod tests {
         let log = "INFO starting up\nINFO bound to port 9876\nINFO ready\n";
         let (sigs, evidence) = scan_log_content(log);
         assert!(sigs.is_empty());
-        assert_eq!(classify(&sigs), D3Category::Confirmed);
+        assert_eq!(classify(None, &sigs), D3Category::Confirmed);
         assert!(evidence.is_none());
     }
 
@@ -422,19 +881,19 @@ mod tests {
             DevSignature::DevPortBindFail,
             DevSignature::DevTauriAssetMissing,
         ];
-        assert_eq!(classify(&sigs), D3Category::Contradiction);
+        assert_eq!(classify(None, &sigs), D3Category::Contradiction);
     }
 
     #[test]
     fn ui_error_boundary_classifies_as_contradiction() {
         let sigs = vec![DevSignature::DevUiErrorBoundary];
-        assert_eq!(classify(&sigs), D3Category::Contradiction);
+        assert_eq!(classify(None, &sigs), D3Category::Contradiction);
     }
 
     #[test]
     fn panic_signature_classifies_as_failure() {
         let sigs = vec![DevSignature::DevPanicStartup];
-        assert_eq!(classify(&sigs), D3Category::Failure);
+        assert_eq!(classify(None, &sigs), D3Category::Failure);
     }
 
     #[test]
@@ -464,7 +923,7 @@ mod tests {
         .unwrap();
         let (sigs, evidence) = scan_early_log(Some(&path));
         assert!(sigs.contains(&DevSignature::DevTauriAssetMissing));
-        assert_eq!(classify(&sigs), D3Category::Contradiction);
+        assert_eq!(classify(None, &sigs), D3Category::Contradiction);
         assert!(evidence.is_some());
     }
 
@@ -486,7 +945,7 @@ mod tests {
     fn late_append_does_not_reopen_verdict() {
         // A clean window closed as Confirmed.
         let mut outcome = ActionOutcome {
-            category: classify(&[]),
+            category: classify(None, &[]),
             signatures: vec![],
             ended_at: Utc::now(),
             duration_ms: 30_000,

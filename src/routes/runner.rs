@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use crate::dev_action::{
     assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
+    SlotResolution,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -65,6 +66,31 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
     })
 }
 
+/// Map an error that ended a primary-runner action to the action's own terminal
+/// result.
+///
+/// [`SupervisorError::RestartUnsafe`] is the readiness gate REFUSING — nothing
+/// ran, so no effect surface was touched and a clean attribution window carries
+/// no information about it. Everything else ran and failed. Both classify to
+/// `D3Category::Failure` (plan §5 rejects a sixth category); the distinction is
+/// carried on the record and surfaces in the outcome's `evidence_ref`.
+///
+/// The refusal's `message` already begins with the gate's own code —
+/// `restart_refused_unsafe: …` when the runner reported live work,
+/// `restart_refused_unknown: …` when no verdict could be obtained — which is
+/// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
+/// verbatim rather than re-worded here.
+fn run_result_for(err: &SupervisorError) -> ActionRunResult {
+    match err {
+        SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
+            reason: detail.message.clone(),
+        },
+        other => ActionRunResult::Errored {
+            reason: other.to_string(),
+        },
+    }
+}
+
 /// Mint a dev-action snapshot for a primary-runner action (restart / build),
 /// evaluate the active dev-state set at execution time, store the record, and
 /// spawn the detached attribution watcher.
@@ -76,8 +102,12 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 /// already in memory, so this stays off the blocking green path (§8 criterion
 /// 6).
 ///
-/// Returns `(action_id, states_active, predicted, risk)` for stamping into the
-/// ACK. Phase 4: `predicted` is coord's state-conditioned expectations for this
+/// Returns `(record, states_active, predicted, risk)`. The `Arc<ActionRecord>`
+/// is returned (rather than just its id) so the executing path can record the
+/// action's **terminal result** on it — the input the attribution watcher was
+/// missing, without which a refused or failed action still closed `Confirmed`
+/// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md`).
+/// Phase 4: `predicted` is coord's state-conditioned expectations for this
 /// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the action completes. An empty vec when
 /// coord is unreachable / has no history (fail-open; never blocks the action).
@@ -95,7 +125,7 @@ async fn mint_primary_action(
     requester_id: Option<String>,
     build_duration: Option<std::time::Duration>,
 ) -> (
-    uuid::Uuid,
+    std::sync::Arc<ActionRecord>,
     Vec<&'static str>,
     Vec<PredictedSignature>,
     ActionRisk,
@@ -150,7 +180,7 @@ async fn mint_primary_action(
     };
     spawn_attribution_watcher(
         state.clone(),
-        arc,
+        arc.clone(),
         AttributionTargets {
             early_log_path,
             managed: None,
@@ -160,7 +190,7 @@ async fn mint_primary_action(
         build_duration,
     );
 
-    (action_id, states_active, predicted, risk)
+    (arc, states_active, predicted, risk)
 }
 
 #[derive(Deserialize)]
@@ -260,7 +290,7 @@ pub async fn restart_runner(
     } else {
         ActionKind::Restart
     };
-    let (action_id, states_active, predicted, risk) = mint_primary_action(
+    let (action_record, states_active, predicted, risk) = mint_primary_action(
         &state,
         action_kind,
         format!("rebuild={};force={}", rebuild, body.force),
@@ -268,6 +298,7 @@ pub async fn restart_runner(
         None,
     )
     .await;
+    let action_id = action_record.action_id;
     let risk_json = risk_ack_json(&risk);
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
@@ -288,6 +319,10 @@ pub async fn restart_runner(
     // `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome.
     if rebuild {
         let exec_state = state.clone();
+        // Phase 3 path 1: the detached body is where the observed refusal
+        // landed. It owns a clone of the record so the terminal result reaches
+        // the watcher BEFORE the window closes.
+        let exec_record = action_record.clone();
         let force = body.force;
         let from_working_tree = body.from_working_tree;
         let do_health_wait = wait_q.wait;
@@ -309,6 +344,10 @@ pub async fn restart_runner(
                 )
                 .await
                 {
+                    // The refusal / error the dev-action outcome used to lose.
+                    // Recorded before the early return so the watcher reads it
+                    // when it composes the verdict.
+                    exec_record.record_run_result(run_result_for(&e));
                     exec_state
                         .logs
                         .emit(
@@ -347,6 +386,15 @@ pub async fn restart_runner(
                                     ),
                                 )
                                 .await;
+                            // Phase 3 path 4: the runner started but never
+                            // bound its port. It RAN, and it failed.
+                            exec_record.record_run_result(ActionRunResult::Errored {
+                                reason: format!(
+                                    "runner_unhealthy_after_start: runner '{}' did not become \
+                                     healthy within {}ms of the detached rebuild-restart",
+                                    runner_id, failure.elapsed_ms
+                                ),
+                            });
                             return (
                                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                                 serde_json::json!({
@@ -429,6 +477,12 @@ pub async fn restart_runner(
                     None => serde_json::Value::Null,
                 };
 
+                // The build + restart completed. `Ran` leaves the effect
+                // surfaces in charge of the verdict (existing precedence) and,
+                // critically, CLOSES the window here rather than at the
+                // backstop — the window is now a measurement of the action.
+                exec_record.record_run_result(ActionRunResult::Ran);
+
                 (
                     StatusCode::OK.as_u16(),
                     serde_json::json!({
@@ -443,7 +497,16 @@ pub async fn restart_runner(
         return Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
-                "status": "rebuilding",
+                // Phase 4: this ACK is emitted BEFORE the readiness gate runs,
+                // so it cannot honestly claim the rebuild is under way — the
+                // observed case is a restart refused 1.4s later that had already
+                // been ACKed as "rebuilding". `submitted` is what is actually
+                // known at this point. The gate deliberately stays BEHIND the
+                // 202 (plan §6 Phase 4): moving it ahead would reverse PR #64's
+                // test-pinned detach, add a 15s readiness probe to the request
+                // path, and turn an always-202 endpoint into 202-or-409 for
+                // existing callers.
+                "status": "submitted",
                 "build_id": submission_id.to_string(),
                 "submission_id": submission_id.to_string(),
                 "poll": "/builds",
@@ -541,6 +604,13 @@ pub async fn restart_runner(
     if let Some(primary) = biased_primary {
         *primary.source_exe_override.write().await = None;
     }
+    // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
+    // minted before the `if rebuild` branch, so a readiness refusal here
+    // returned 409 to the caller while the minted action still closed
+    // `Confirmed` 30s later — and was ingested to coord that way.
+    if let Err(e) = &restart_result {
+        action_record.record_run_result(run_result_for(e));
+    }
     restart_result?;
 
     // Port-bind verification: the manager call above returns the moment the
@@ -554,6 +624,13 @@ pub async fn restart_runner(
         if let Some(primary) = state.get_primary().await {
             let runner_id = primary.config.id.clone();
             if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
+                action_record.record_run_result(ActionRunResult::Errored {
+                    reason: format!(
+                        "runner_unhealthy_after_start: runner '{}' did not become healthy \
+                         within {}ms of the restart",
+                        runner_id, failure.elapsed_ms
+                    ),
+                });
                 state
                     .logs
                     .emit(
@@ -569,6 +646,8 @@ pub async fn restart_runner(
             }
         }
     }
+
+    action_record.record_run_result(ActionRunResult::Ran);
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
@@ -812,7 +891,7 @@ pub async fn fix_and_rebuild(
     // by the build-submissions state machine — Phase 3's coord ingest will
     // thread the precise duration). State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
-    let (action_id, states_active, predicted, risk) = mint_primary_action(
+    let (action_record, states_active, predicted, risk) = mint_primary_action(
         &state,
         ActionKind::Build,
         "fix_and_rebuild".to_string(),
@@ -820,32 +899,45 @@ pub async fn fix_and_rebuild(
         None,
     )
     .await;
+    let action_id = action_record.action_id;
     let risk_json = risk_ack_json(&risk);
 
     // Submit the live-tree rebuild to the build-submissions state machine. The
     // exec future runs in a detached background task — a client disconnect can
     // no longer cancel it, so the post-build provenance/LKG steps always run.
     let exec_state = state.clone();
+    // Phase 3 path 3: `fix-and-rebuild` mints an identical `ActionKind::Build`,
+    // so a failing `run_cargo_build` returned 500 into the submission while the
+    // action closed `Confirmed`.
+    let exec_record = action_record.clone();
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
         state.build_submissions.clone(),
         state.config.project_dir.clone(),
         None,
         async move {
             match crate::build_monitor::run_cargo_build(&exec_state).await {
-                Ok(()) => (
-                    StatusCode::OK.as_u16(),
-                    serde_json::json!({
-                        "status": "ok",
-                        "message": "Runner rebuilt (restart manually to apply)"
-                    }),
-                ),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                    serde_json::json!({
-                        "status": "error",
-                        "error": e.to_string(),
-                    }),
-                ),
+                Ok(()) => {
+                    exec_record.record_run_result(ActionRunResult::Ran);
+                    (
+                        StatusCode::OK.as_u16(),
+                        serde_json::json!({
+                            "status": "ok",
+                            "message": "Runner rebuilt (restart manually to apply)"
+                        }),
+                    )
+                }
+                Err(e) => {
+                    exec_record.record_run_result(ActionRunResult::Errored {
+                        reason: e.to_string(),
+                    });
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        }),
+                    )
+                }
             }
         },
     );
@@ -1029,7 +1121,45 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// A port in the IANA dynamic range that nothing on a dev box or a CI
+    /// runner listens on — see [`test_state_dead_runner_port`].
+    const DEAD_RUNNER_PORT: u16 = 39876;
+
+    /// Serializes the tests that drive a real [`crate::build_monitor::run_cargo_build`].
+    ///
+    /// Both of them close the build-pool semaphore so the build itself fails
+    /// fast — but the PRE-permit guards still run, and `check_ram_guard`'s
+    /// `available_commit_bytes()` is a whole-machine memory/process query.
+    /// Two of those in flight at once cost ~3.3s wall-clock apiece on a loaded
+    /// box, which is enough to trip
+    /// `restart_rebuild_true_detaches_returns_202_and_registers_build`'s 2s
+    /// latency pin — a pin about the HANDLER detaching, not about how busy the
+    /// machine running the suite is. Serializing the two keeps that pin
+    /// measuring what it was written to measure. Measured before/after: 1 in 4
+    /// full-suite runs failed, then 0 in 8.
+    static BUILDING_TESTS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     fn test_state(root: &std::path::Path) -> SharedState {
+        test_state_on_port(root, crate::config::DEFAULT_RUNNER_API_PORT)
+    }
+
+    /// A [`test_state`] whose primary points at [`DEAD_RUNNER_PORT`].
+    ///
+    /// Use this for any test that drives a restart to the point of running
+    /// `restart_readiness::enforce` **synchronously**. Against a dead port the
+    /// gate takes its `every unknown refuses` arm (`CLAUDE.md`: *"No error path
+    /// resolves to 'safe'"*), which is the exact refusal these tests want —
+    /// reached deterministically, and without the test ever being one gate
+    /// verdict away from stopping a live runner that happens to be listening on
+    /// `DEFAULT_RUNNER_API_PORT` on the machine running the suite.
+    fn test_state_dead_runner_port(root: &std::path::Path) -> SharedState {
+        test_state_on_port(root, DEAD_RUNNER_PORT)
+    }
+
+    fn test_state_on_port(root: &std::path::Path, runner_port: u16) -> SharedState {
+        let mut primary = RunnerConfig::default_primary();
+        primary.port = runner_port;
         let config = SupervisorConfig {
             project_dir: root.join("src-tauri"),
             watchdog_enabled_at_start: false,
@@ -1042,7 +1172,7 @@ mod tests {
             cli_args: vec![],
             expo_dir: None,
             expo_port: 8081,
-            runners: vec![RunnerConfig::default_primary()],
+            runners: vec![primary],
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: true,
             no_webview: true,
@@ -1133,6 +1263,7 @@ mod tests {
     /// full submit_detached → terminal-status path.
     #[tokio::test]
     async fn restart_rebuild_true_detaches_returns_202_and_registers_build() {
+        let _building = BUILDING_TESTS.lock().await;
         let tmp = TempDir::new().expect("tempdir");
         let state = test_state(tmp.path());
 
@@ -1160,7 +1291,10 @@ mod tests {
         let (status, body) = body_json(resp).await;
 
         assert_eq!(status, 202, "rebuild:true must return 202 (detached)");
-        assert_eq!(body["status"], "rebuilding");
+        // Phase 4: the ACK is emitted BEFORE the readiness gate runs, so it
+        // says what is actually known — the rebuild was SUBMITTED. It used to
+        // claim "rebuilding" for a restart the gate refused 1.4s later.
+        assert_eq!(body["status"], "submitted");
         assert_eq!(body["poll"], "/builds");
         assert!(
             body["build_id"].is_string(),
@@ -1203,6 +1337,192 @@ mod tests {
         assert!(
             terminal,
             "the detached task must run to a terminal status independently of the handler"
+        );
+
+        // Plan §6 Phase 5 test 5c — Phase 3 path 1, the OBSERVED case, pinned
+        // here rather than in a second test that would drive this same handler
+        // a second time. Whatever the detached body hits (here: a closed build
+        // pool; in the incident: the readiness gate refusing 1.4s after this
+        // 202) must reach the dev-action. It used to reach `/build/{id}/status`
+        // and nothing else, while `/actions/{id}/outcome` closed `Confirmed`
+        // 30s later — two pointers in this very response body, two different
+        // answers to the same question.
+        let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
+            .expect("action_id is a uuid");
+        let run = await_run_result(&state, action_id, std::time::Duration::from_secs(10)).await;
+        assert!(
+            run.is_failure(),
+            "the detached body's failure must reach the action: {run:?}"
+        );
+        assert_ne!(
+            crate::dev_action::attribution::classify(Some(&run), &[]),
+            crate::dev_action::record::D3Category::Confirmed,
+            "a clean window behind a failed detached rebuild must not classify Confirmed"
+        );
+    }
+
+    // ── Regression tests for
+    //    `2026-09-04-supervisor-refused-restart-reports-confirmed` ──────────
+
+    /// Poll the action store for a record's terminal result.
+    async fn await_run_result(
+        state: &SharedState,
+        action_id: uuid::Uuid,
+        budget: std::time::Duration,
+    ) -> crate::dev_action::ActionRunResult {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(rec) = state.dev_actions.read().await.get(&action_id) {
+                if let Some(r) = rec.run_result() {
+                    return r;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no terminal result was ever recorded for action {action_id}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The readiness gate's refusal maps to `Refused`, carrying the
+    /// `restart_refused_unsafe` token verbatim — everything else to `Errored`.
+    /// Both classify to `Failure`; §5 rejects a sixth `D3Category`.
+    #[test]
+    fn run_result_for_maps_the_readiness_refusal_to_refused() {
+        let detail = crate::restart_readiness::RefusalDetail {
+            cause: "sessions_live",
+            message: "restart_refused_unsafe: runner 'primary' (port 9876) reports it is NOT \
+                      safe to restart."
+                .to_string(),
+            payload: serde_json::json!({"error": "restart_refused_unsafe"}),
+        };
+        let refused = run_result_for(&SupervisorError::RestartUnsafe(Box::new(detail)));
+        match &refused {
+            crate::dev_action::ActionRunResult::Refused { reason } => {
+                assert!(
+                    reason.contains("restart_refused_unsafe"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(
+            crate::dev_action::attribution::classify(Some(&refused), &[]),
+            crate::dev_action::record::D3Category::Failure
+        );
+
+        let errored = run_result_for(&SupervisorError::RunnerNotRunning);
+        assert!(matches!(
+            errored,
+            crate::dev_action::ActionRunResult::Errored { .. }
+        ));
+        assert_eq!(
+            crate::dev_action::attribution::classify(Some(&errored), &[]),
+            crate::dev_action::record::D3Category::Failure
+        );
+    }
+
+    /// Plan §6 Phase 5 test 5a — the SYNCHRONOUS `rebuild:false` path. The
+    /// action is minted at the top of the handler, *before* the `if rebuild`
+    /// branch, so a failure here (a readiness refusal returns 409) used to
+    /// leave the minted action closing `Confirmed` 30s later — and being
+    /// ingested to coord that way. It must now carry a terminal result that
+    /// classifies non-`Confirmed`.
+    #[tokio::test]
+    async fn sync_restart_failure_records_a_non_confirmed_terminal_result() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state_dead_runner_port(tmp.path());
+        // Evidence of life on a port nothing answers is the gate's UNKNOWN
+        // signature, and every UNKNOWN refuses. Without `running = true` the
+        // gate's `runner_not_running` exemption short-circuits it and the
+        // restart proceeds to a stop/start — which a unit test must never do.
+        state
+            .get_primary()
+            .await
+            .expect("primary")
+            .runner
+            .write()
+            .await
+            .running = true;
+
+        // The gate therefore refuses — the same 409 `RestartUnsafe` the
+        // observed incident produced, reached deterministically and without a
+        // live runner anywhere in the loop.
+        let result = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: false,
+                force: false,
+                from_working_tree: false,
+                use_lkg: None,
+            }),
+        )
+        .await;
+        let err = result.expect_err("a refused restart must not report success");
+        assert!(
+            matches!(err, SupervisorError::RestartUnsafe(_)),
+            "expected the readiness gate's refusal, got {err:?}"
+        );
+
+        let recent = state.dev_actions.read().await.recent(10);
+        let record = recent
+            .first()
+            .cloned()
+            .expect("the handler mints a dev-action before the restart runs");
+        let run = record
+            .run_result()
+            .expect("the failure must be recorded on the action");
+        match &run {
+            // The gate's refusal family: `restart_refused_unsafe` when the
+            // runner itself reports live work, `restart_refused_unknown` when
+            // no verdict could be obtained (this test's arm — and the arm the
+            // gate's "every unknown refuses" rule exists for). Both are
+            // `RestartUnsafe`; the verbatim carry of the `_unsafe` spelling is
+            // pinned by `run_result_for_maps_the_readiness_refusal_to_refused`.
+            crate::dev_action::ActionRunResult::Refused { reason } => assert!(
+                reason.starts_with("restart_refused_"),
+                "the gate's refusal must be carried verbatim; got {reason}"
+            ),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_ne!(
+            crate::dev_action::attribution::classify(Some(&run), &[]),
+            crate::dev_action::record::D3Category::Confirmed,
+            "a clean window behind a failed restart must not classify Confirmed"
+        );
+    }
+
+    /// Plan §6 Phase 5 test 5b — `POST /runner/fix-and-rebuild`. An identical
+    /// `ActionKind::Build`; a failing `run_cargo_build` returned 500 into the
+    /// submission while the action went `Confirmed`. Closing the build-pool
+    /// semaphore makes the detached build fail fast and deterministically,
+    /// exactly as the PR #64 pin does.
+    #[tokio::test]
+    async fn fix_and_rebuild_failure_records_a_non_confirmed_terminal_result() {
+        let _building = BUILDING_TESTS.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        state.build_pool.permits.close();
+
+        let resp = fix_and_rebuild(State(state.clone()))
+            .await
+            .expect("handler ok")
+            .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202);
+        let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
+            .expect("action_id is a uuid");
+
+        let run = await_run_result(&state, action_id, std::time::Duration::from_secs(10)).await;
+        assert!(
+            run.is_failure(),
+            "a failed fix-and-rebuild must not leave the action's result as Ran: {run:?}"
+        );
+        assert_ne!(
+            crate::dev_action::attribution::classify(Some(&run), &[]),
+            crate::dev_action::record::D3Category::Confirmed
         );
     }
 

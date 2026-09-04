@@ -99,6 +99,63 @@ pub struct ActionOutcome {
     pub late_signatures: Vec<String>,
 }
 
+/// The action's **own terminal result** — what the code path that executes the
+/// action reports about whether it ran at all.
+///
+/// This is the input the attribution watcher was missing. Every effect surface
+/// it scans (early log, panic log, cached health) describes what the *runner*
+/// did; none of them can distinguish "the runner restarted cleanly" from "the
+/// restart was refused at the readiness gate and nothing ever ran". Both leave
+/// a clean window, and a clean window classified to `Confirmed`
+/// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md` §1).
+///
+/// # The never-re-open invariant
+///
+/// The watcher **reads** this; it never writes it. The executing path writes it
+/// (first write wins) *before* the window closes, so folding it into the verdict
+/// happens at composition time rather than as a post-window mutation of a closed
+/// outcome (`attribution.rs` module docs; the ledger plan §3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ActionRunResult {
+    /// A gate refused the action — **nothing ran**, so no effect surface was
+    /// touched and there is nothing for the attribution window to observe.
+    /// The motivating case: `restart_refused_unsafe` from the restart-readiness
+    /// gate (`restart_readiness::decide`).
+    Refused { reason: String },
+    /// The action ran and failed (a build error, an unhealthy runner after
+    /// start, a manager error).
+    Errored { reason: String },
+    /// The action ran to completion without reporting an error of its own.
+    /// The effect surfaces are then the authority on the verdict — this is the
+    /// only variant that leaves the existing signature precedence in charge.
+    Ran,
+}
+
+impl ActionRunResult {
+    /// The operator-facing reason string, if this variant carries one. Used to
+    /// seed [`ActionOutcome::evidence_ref`] when no `DEV-*` signature supplied
+    /// evidence — §5 of the plan: the distinction rides an `ActionRecord` field
+    /// plus `evidence_ref`, NOT a sixth `D3Category` variant.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            ActionRunResult::Refused { reason } | ActionRunResult::Errored { reason } => {
+                Some(reason.as_str())
+            }
+            ActionRunResult::Ran => None,
+        }
+    }
+
+    /// Whether this is a terminal *failure* of the action itself (as opposed to
+    /// `Ran`, which defers to the effect surfaces).
+    pub fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            ActionRunResult::Refused { .. } | ActionRunResult::Errored { .. }
+        )
+    }
+}
+
 /// An Action Snapshot: an action, the active dev-state set at execution time,
 /// and (eventually) its result. The mutable `outcome` lives behind its own
 /// `RwLock` so the detached watcher can fold a verdict in without contending on
@@ -133,6 +190,18 @@ pub struct ActionRecord {
     /// serializer below (a bare `RwLock` is not `Serialize`).
     #[serde(serialize_with = "serialize_outcome_lock")]
     pub outcome: RwLock<Option<ActionOutcome>>,
+    /// The action's own terminal result, written by the executing path (never
+    /// by the watcher) and **read** by the watcher when it composes the
+    /// outcome. `None` means the action has not reported a terminal result yet
+    /// — which, for a `build`, is exactly the state the window must stay open
+    /// through. See [`ActionRunResult`].
+    #[serde(serialize_with = "serialize_run_result_lock")]
+    pub run_result: RwLock<Option<ActionRunResult>>,
+    /// Signalled once when [`Self::record_run_result`] takes the first write, so
+    /// the attribution watcher can wait for the action's real end instead of a
+    /// flat 30-second guess. Not part of the wire form.
+    #[serde(skip)]
+    pub run_signal: tokio::sync::Notify,
 }
 
 /// Serialize the `RwLock<Option<ActionOutcome>>` field by taking a read of the
@@ -152,6 +221,22 @@ where
     match lock.read() {
         Ok(guard) => guard.serialize(serializer),
         Err(_) => None::<ActionOutcome>.serialize(serializer),
+    }
+}
+
+/// Serialize the `RwLock<Option<ActionRunResult>>` field. Same discipline as
+/// [`serialize_outcome_lock`]: a tiny synchronous critical section, and a
+/// poisoned lock degrades to `null` rather than panicking the serializer.
+fn serialize_run_result_lock<S>(
+    lock: &RwLock<Option<ActionRunResult>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match lock.read() {
+        Ok(guard) => guard.serialize(serializer),
+        Err(_) => None::<ActionRunResult>.serialize(serializer),
     }
 }
 
@@ -205,6 +290,42 @@ impl ActionRecord {
             states_unknown,
             started_at: Utc::now(),
             outcome: RwLock::new(None),
+            run_result: RwLock::new(None),
+            run_signal: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Record the action's terminal result. **First write wins**: an action has
+    /// exactly one terminal result, and a later path (e.g. the post-start health
+    /// wait) must not overwrite the refusal or error that already ended it.
+    /// Returns `true` when this call took the write.
+    ///
+    /// Always signals [`Self::run_signal`] — even on a losing write — so a
+    /// waiting watcher is never left parked on a result that is already set.
+    pub fn record_run_result(&self, result: ActionRunResult) -> bool {
+        let took = match self.run_result.write() {
+            Ok(mut guard) => {
+                if guard.is_some() {
+                    false
+                } else {
+                    *guard = Some(result);
+                    true
+                }
+            }
+            // A poisoned lock must not panic the executing path. The window
+            // then closes on its backstop, which is the pre-existing behaviour.
+            Err(_) => false,
+        };
+        self.run_signal.notify_one();
+        took
+    }
+
+    /// Read the recorded terminal result, if any. A poisoned lock reads as
+    /// `None` (unknown), never as a fabricated success.
+    pub fn run_result(&self) -> Option<ActionRunResult> {
+        match self.run_result.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
         }
     }
 }
@@ -304,6 +425,51 @@ mod tests {
             let parsed: D3Category = serde_json::from_str(json).expect("deserialize");
             assert_eq!(parsed, expected, "json {json}");
         }
+    }
+
+    /// An action has exactly ONE terminal result. A later path (the post-start
+    /// health wait, say) must not overwrite the refusal or error that already
+    /// ended it — otherwise the watcher composes its verdict from the wrong
+    /// half of the story.
+    #[test]
+    fn record_run_result_is_first_write_wins() {
+        let record = ActionRecord::new(ActionKind::Restart, None, "p".to_string(), &[]);
+        assert_eq!(record.run_result(), None, "a fresh record has no result");
+
+        assert!(record.record_run_result(ActionRunResult::Refused {
+            reason: "restart_refused_unsafe: sessions live".to_string(),
+        }));
+        assert!(
+            !record.record_run_result(ActionRunResult::Ran),
+            "a second write must be rejected"
+        );
+        match record.run_result().expect("a result is recorded") {
+            ActionRunResult::Refused { reason } => {
+                assert!(reason.contains("restart_refused_unsafe"))
+            }
+            other => panic!("the first write must survive, got {other:?}"),
+        }
+    }
+
+    /// The record's wire form gains `run_result` — `null` while the action has
+    /// not reported, then the internally-tagged variant.
+    #[test]
+    fn record_serializes_its_run_result() {
+        let record = ActionRecord::new(ActionKind::Build, None, "p".to_string(), &[]);
+        let before: serde_json::Value = serde_json::to_value(&record).expect("serialize");
+        assert!(before["run_result"].is_null());
+
+        record.record_run_result(ActionRunResult::Errored {
+            reason: "cargo build failed".to_string(),
+        });
+        let after: serde_json::Value = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(after["run_result"]["result"], "errored");
+        assert_eq!(after["run_result"]["reason"], "cargo build failed");
+
+        let ran = ActionRecord::new(ActionKind::Build, None, "p".to_string(), &[]);
+        ran.record_run_result(ActionRunResult::Ran);
+        let v: serde_json::Value = serde_json::to_value(&ran).expect("serialize");
+        assert_eq!(v["run_result"]["result"], "ran");
     }
 
     #[test]
