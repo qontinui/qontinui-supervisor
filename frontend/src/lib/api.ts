@@ -924,6 +924,18 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rebuild }),
     }),
+  /// Arm a deferred rebuild of the PRIMARY: the supervisor watches its Claude
+  /// session planes and rebuilds from origin/main once they drain. Returns 202
+  /// + build_id immediately, exactly like `runnerRestart(true)`, so the same
+  /// `pollBuild` loop reports it. The wait EXPIRES rather than proceeding if
+  /// the deadline passes first, and an unreadable readiness verdict counts as
+  /// "not drained", never as drained.
+  rebuildPrimaryWhenIdle: () =>
+    fetchJson<DetachedBuildResponse>('/runner/rebuild-when-idle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
   devStartStatus: () =>
     fetchJson<{
       services: { name: string; port: number; available: boolean }[];
@@ -1030,8 +1042,7 @@ export const api = {
 
   // Runner Monitor (proxied to runner at port 9876)
   runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
-  runnerTaskRunsRunning: () =>
-    fetchJson<RunningTaskRunsResponse>('/runner-api/task-runs/running'),
+  runnerTaskRunsRunning: () => fetchJson<RunningTaskRunsResponse>('/runner-api/task-runs/running'),
   runnerWorkflowState: (id: string) =>
     fetchJson<Record<string, unknown>>(
       `/runner-api/task-runs/${encodeURIComponent(id)}/workflow-state`,

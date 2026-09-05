@@ -727,6 +727,8 @@ interface RunnerRowProps {
   onStop: () => void;
   onRestart: () => void;
   onRebuild: () => void;
+  /// Primary only: arm the deferred "rebuild once sessions drain" watcher.
+  onRebuildWhenIdle: () => void;
   onRemove: () => void;
   onProtect?: () => void;
 }
@@ -739,6 +741,7 @@ function RunnerRow({
   onStop,
   onRestart,
   onRebuild,
+  onRebuildWhenIdle,
   onRemove,
   onProtect,
 }: RunnerRowProps) {
@@ -783,6 +786,14 @@ function RunnerRow({
     id: `runner-${r.id}-rebuild`,
     type: 'button',
     label: `Rebuild ${r.name}`,
+    actions: ['click'],
+  });
+  // Registered unconditionally so the id stays stable even on rows that do not
+  // render it (non-primary), matching every other action hook here.
+  const { ref: rebuildWhenIdleBtnRef } = useUIElement({
+    id: `runner-${r.id}-rebuild-when-idle`,
+    type: 'button',
+    label: `Rebuild ${r.name} when idle`,
     actions: ['click'],
   });
   const { ref: removeBtnRef } = useUIElement({
@@ -920,6 +931,18 @@ function RunnerRow({
               'Rebuild'
             )}
           </button>
+          {isPrimary && (
+            <button
+              ref={rebuildWhenIdleBtnRef as React.RefCallback<HTMLButtonElement>}
+              className="btn"
+              style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
+              disabled={actionsDisabled}
+              onClick={onRebuildWhenIdle}
+              title="Watch this runner for active Claude sessions and rebuild it from origin/main once they drain. Nothing is stopped while sessions are live, and a readiness verdict the supervisor cannot read counts as 'still busy' rather than idle. Gives up without rebuilding if the deadline passes."
+            >
+              {busy === `Rebuild ${r.name} when idle` ? 'Arming...' : 'Rebuild when idle'}
+            </button>
+          )}
           {!isPrimary && (
             <button
               ref={protectBtnRef as React.RefCallback<HTMLButtonElement>}
@@ -1270,6 +1293,18 @@ function RunnerInstancesPanel() {
                         if (!ok) return;
                       }
                       await submitRebuild(r.id, r.name, () => doRestart(true));
+                    }}
+                    onRebuildWhenIdle={async () => {
+                      const ok = await confirm(
+                        'Rebuild when idle',
+                        `Watch "${r.name}" and rebuild it from origin/main once its Claude sessions drain?\n\n` +
+                          'Nothing is stopped while sessions are live. The supervisor gives up without ' +
+                          'rebuilding if they have not drained by the deadline.',
+                      );
+                      if (!ok) return;
+                      await submitRebuild(r.id, `${r.name} when idle`, () =>
+                        api.rebuildPrimaryWhenIdle(),
+                      );
                     }}
                     onRemove={() =>
                       doAction(`Remove ${r.name}`, async () => {

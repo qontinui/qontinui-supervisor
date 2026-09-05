@@ -263,6 +263,291 @@ pub async fn stop_runner(
     })))
 }
 
+/// Body for `POST /runner/rebuild-when-idle`. Every field defaults, so the body
+/// as a whole is optional — see [`OptionalJson`] for why that needs a custom
+/// extractor rather than `Option<Json<_>>`.
+#[derive(Deserialize)]
+pub struct RebuildWhenIdleRequest {
+    /// Give up after this long rather than waiting forever. Expiry NEVER
+    /// rebuilds — it reports that it stopped waiting.
+    #[serde(default = "default_idle_deadline_secs")]
+    pub deadline_secs: u64,
+    /// How often to re-probe the primary's session planes.
+    #[serde(default = "default_idle_poll_secs")]
+    pub poll_secs: u64,
+}
+
+fn default_idle_deadline_secs() -> u64 {
+    6 * 60 * 60
+}
+
+fn default_idle_poll_secs() -> u64 {
+    30
+}
+
+impl Default for RebuildWhenIdleRequest {
+    fn default() -> Self {
+        Self {
+            deadline_secs: default_idle_deadline_secs(),
+            poll_secs: default_idle_poll_secs(),
+        }
+    }
+}
+
+/// `POST /runner/rebuild-when-idle` — watch the primary until its Claude
+/// sessions drain, then rebuild it from `origin/main`.
+///
+/// WHY THIS IS NOT "restart the primary on a timer". `CLAUDE.md`'s runner
+/// lifecycle scope says the supervisor never restarts a user-managed runner
+/// that is SERVING, with one carved-out exception (the serving watchdog) whose
+/// terms are: act only on a zero census, refuse on a non-zero count AND on a
+/// census that cannot be taken, never against `stop_requested`/`restart_requested`,
+/// and stay bounded. This endpoint is operator-initiated but FIRES UNATTENDED,
+/// so it is held to those same terms rather than to a plain button's.
+///
+/// Concretely:
+///
+///   * Only [`Readiness::Safe`] with BOTH session planes at zero, or
+///     [`Readiness::CensusSafe`] (zero live `claude` under the runner's pid),
+///     is treated as drained.
+///   * Every `Unsafe`, `CensusUnsafe` and **every `Unknown`** keeps waiting. An
+///     unreachable runner, a 404 from an old build, an unparseable body and a
+///     census that could not be taken are all "not proven idle", never "idle"
+///     [policy: verification-and-evidence silent-empty-is-unknown].
+///   * The deadline EXPIRES the wait; it never converts into a rebuild.
+///   * `force` stays false, so [`restart_readiness::enforce`] — the same gate a
+///     manual restart passes through — re-runs at fire time inside
+///     `manager::restart_runner` and is the AUTHORITATIVE decision. The loop
+///     below is a quiet optimistic poller; it cannot talk the gate into
+///     anything, and if the two ever disagree the gate wins and the refusal is
+///     reported.
+///   * `from_working_tree` stays false, so the rebuild compiles a fresh
+///     `origin/main` worktree — "latest code" as asked, not the contested
+///     working checkout.
+///
+/// Returns 202 + `build_id` immediately; poll `GET /build/{id}/status`.
+pub async fn rebuild_when_idle(
+    State(state): State<SharedState>,
+    body: OptionalJson<RebuildWhenIdleRequest>,
+) -> Result<Response, SupervisorError> {
+    let primary = state
+        .get_primary()
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound("primary".to_string()))?;
+    let port = primary.config.port;
+    let runner_name = primary.config.name.clone();
+
+    // Every field defaults, so an absent body is the all-defaults request.
+    let body = body.into_inner_or_default();
+    let poll_secs = body.poll_secs.clamp(5, 600);
+    let deadline_secs = body.deadline_secs.clamp(60, 24 * 60 * 60);
+
+    state
+        .logs
+        .emit(
+            LogSource::Supervisor,
+            LogLevel::Info,
+            format!(
+                "Rebuild-when-idle armed for '{}' (poll {}s, give up after {}s)",
+                runner_name, poll_secs, deadline_secs
+            ),
+        )
+        .await;
+
+    // A rebuild-restart is a `build`-kind action, exactly as the rebuild arm of
+    // `restart_runner` mints it — the outcome lands after the build, not after
+    // this 202.
+    let (action_record, _states_active, _predicted, risk) = mint_primary_action(
+        &state,
+        ActionKind::Build,
+        format!(
+            "rebuild_when_idle;poll_secs={};deadline_secs={}",
+            poll_secs, deadline_secs
+        ),
+        None,
+        None,
+    )
+    .await;
+    let action_id = action_record.action_id;
+    let risk_json = risk_ack_json(&risk);
+
+    let exec_state = state.clone();
+    let exec_record = action_record.clone();
+    // The detached future outlives this handler, so it gets its own copy of the
+    // name rather than borrowing the one the 202 body still needs.
+    let exec_runner_name = runner_name.clone();
+    let (submission_id, _arc) = crate::build_submissions::submit_detached(
+        state.build_submissions.clone(),
+        state.config.project_dir.clone(),
+        None,
+        async move {
+            let started = std::time::Instant::now();
+            let deadline = std::time::Duration::from_secs(deadline_secs);
+            let poll = std::time::Duration::from_secs(poll_secs);
+            let mut ticks: u64 = 0;
+            // Assigned at the top of every iteration before it is read; no
+            // initial value is meaningful, and giving it one only earns an
+            // unused_assignments warning under clippy -D warnings.
+            let mut last_reason: String;
+
+            loop {
+                // Re-read the primary every tick: it can be replaced, stopped,
+                // or removed while we wait, and a handle captured once would
+                // describe a runner that no longer exists.
+                let Some(managed) = exec_state.get_primary().await else {
+                    exec_record.record_run_result(ActionRunResult::Errored {
+                        reason: "primary_disappeared_while_waiting".to_string(),
+                    });
+                    return (
+                        StatusCode::NOT_FOUND.as_u16(),
+                        serde_json::json!({
+                            "status": "aborted",
+                            "error": "primary_disappeared_while_waiting",
+                            "waited_secs": started.elapsed().as_secs(),
+                        }),
+                    );
+                };
+
+                let (port_open, api_responding) = {
+                    let h = managed.cached_health.read().await;
+                    (h.runner_port_open, h.runner_responding)
+                };
+                let (liveness, root_pid, started_at) = {
+                    let r = managed.runner.read().await;
+                    (r.liveness(port_open, api_responding), r.pid, r.started_at)
+                };
+
+                let readiness = crate::restart_readiness::probe_with_census_fallback(
+                    port, liveness, root_pid, started_at,
+                )
+                .await;
+
+                let verdict = crate::restart_readiness::drained_for_deferred_rebuild(&readiness);
+                let drained = verdict.drained;
+                last_reason = verdict.reason;
+
+                if drained {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Info,
+                            format!(
+                                "Rebuild-when-idle: '{}' drained after {}s ({}); rebuilding from origin/main",
+                                exec_runner_name,
+                                started.elapsed().as_secs(),
+                                last_reason
+                            ),
+                        )
+                        .await;
+                    break;
+                }
+
+                if started.elapsed() >= deadline {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!(
+                                "Rebuild-when-idle: gave up on '{}' after {}s without rebuilding ({})",
+                                exec_runner_name,
+                                started.elapsed().as_secs(),
+                                last_reason
+                            ),
+                        )
+                        .await;
+                    exec_record.record_run_result(ActionRunResult::Errored {
+                        reason: format!("deadline_expired_while_waiting: {last_reason}"),
+                    });
+                    return (
+                        StatusCode::REQUEST_TIMEOUT.as_u16(),
+                        serde_json::json!({
+                            "status": "gave_up_waiting",
+                            "reason": last_reason,
+                            "waited_secs": started.elapsed().as_secs(),
+                            "ticks": ticks,
+                            "note": "The deadline expired. Nothing was rebuilt and nothing was stopped.",
+                        }),
+                    );
+                }
+
+                // Log the first observation and then only occasionally, so a
+                // multi-hour wait does not flood the log pane.
+                if ticks == 0 || ticks.is_multiple_of(20) {
+                    exec_state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Info,
+                            format!(
+                                "Rebuild-when-idle: still waiting on '{}' after {}s — {}",
+                                exec_runner_name,
+                                started.elapsed().as_secs(),
+                                last_reason
+                            ),
+                        )
+                        .await;
+                }
+                ticks += 1;
+                tokio::time::sleep(poll).await;
+            }
+
+            // Drained. Fire the SAME call the Rebuild button makes: rebuild
+            // (origin/main, because `from_working_tree` is false) then restart.
+            // `force: false` keeps the readiness gate armed inside — it is the
+            // authoritative check, and a refusal here is a real refusal.
+            if let Err(e) =
+                manager::restart_runner(&exec_state, true, RestartSource::Manual, false, false)
+                    .await
+            {
+                exec_record.record_run_result(run_result_for(&e));
+                exec_state
+                    .logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Error,
+                        format!("Rebuild-when-idle: rebuild failed after drain: {}", e),
+                    )
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string(),
+                        "waited_secs": started.elapsed().as_secs(),
+                    }),
+                );
+            }
+
+            (
+                StatusCode::OK.as_u16(),
+                serde_json::json!({
+                    "status": "rebuilt",
+                    "waited_secs": started.elapsed().as_secs(),
+                    "ticks": ticks,
+                    "drained_reason": last_reason,
+                }),
+            )
+        },
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "watching",
+            "build_id": submission_id,
+            "action_id": action_id,
+            "runner": runner_name,
+            "poll_secs": poll_secs,
+            "deadline_secs": deadline_secs,
+            "risk": risk_json,
+            "message": "Watching the primary for active sessions. It will rebuild from origin/main once they drain, and give up without rebuilding if the deadline passes first.",
+        })),
+    )
+        .into_response())
+}
+
 pub async fn restart_runner(
     State(state): State<SharedState>,
     Query(wait_q): Query<StartWaitQuery>,

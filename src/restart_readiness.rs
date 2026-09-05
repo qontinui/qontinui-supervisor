@@ -467,6 +467,74 @@ pub async fn probe_with_census_fallback(
     fold_census(probe_result, Some(census))
 }
 
+/// Verdict of [`drained_for_deferred_rebuild`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainedVerdict {
+    /// True ONLY when the primary is positively known to hold no sessions.
+    pub drained: bool,
+    /// Human-readable why, for the log line and the build-status body.
+    pub reason: String,
+}
+
+/// Is the runner positively known to hold no Claude sessions right now?
+///
+/// This is the predicate behind `POST /runner/rebuild-when-idle`, split out
+/// from the polling loop so it can be tested directly — the loop around it is
+/// just a timer.
+///
+/// The asymmetry is the point. `true` requires POSITIVE evidence of emptiness:
+/// either the runner's own verdict with BOTH session planes at zero, or a
+/// census that walked the process subtree and found no live `claude`. Every
+/// other state — a refusal, live processes, and **every `Unknown`** — is
+/// `false`. An unreachable runner, a 404 from a build that predates the
+/// endpoint, an unparseable body, and a census that could not be taken are all
+/// "not proven empty", never "empty"
+/// [policy: verification-and-evidence silent-empty-is-unknown].
+///
+/// Note it does NOT consult `safe_to_restart`. That flag is the runner's own
+/// opinion about restart safety, which can be true for reasons unrelated to
+/// session count; this endpoint promised to wait for the SESSIONS to drain, so
+/// it reads the counts.
+pub fn drained_for_deferred_rebuild(readiness: &Readiness) -> DrainedVerdict {
+    match readiness {
+        Readiness::Safe { report, .. } => {
+            let t = report.terminal_count();
+            let a = report.ai_count();
+            DrainedVerdict {
+                drained: t == 0 && a == 0,
+                reason: format!("runner reports {t} terminal / {a} ai session(s)"),
+            }
+        }
+        Readiness::Unsafe { report, .. } => DrainedVerdict {
+            drained: false,
+            reason: format!(
+                "runner refuses: {} terminal / {} ai session(s)",
+                report.terminal_count(),
+                report.ai_count()
+            ),
+        },
+        Readiness::CensusSafe { census } => DrainedVerdict {
+            drained: true,
+            reason: format!(
+                "census: zero live claude under pid {} ({} process(es) walked)",
+                census.root_pid, census.walked
+            ),
+        },
+        Readiness::CensusUnsafe { census } => DrainedVerdict {
+            drained: false,
+            reason: format!(
+                "census: {} live claude under pid {}",
+                census.live.len(),
+                census.root_pid
+            ),
+        },
+        Readiness::Unknown(u) => DrainedVerdict {
+            drained: false,
+            reason: format!("readiness unknown ({})", u.code()),
+        },
+    }
+}
+
 /// Which destructive operation the gate is guarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateAction {
@@ -2004,5 +2072,91 @@ mod tests {
             .find(|e| e.message.contains("safe_to_restart=true"))
             .expect("the allow path must be auditable too");
         assert!(line.message.contains("verdict="));
+    }
+    // ---- drained_for_deferred_rebuild -------------------------------------
+    // The predicate behind POST /runner/rebuild-when-idle. Its whole contract
+    // is the asymmetry: `true` demands positive evidence of emptiness, and
+    // every other state — including every Unknown — is `false`.
+
+    fn report_json(safe: bool, terminal: u64, ai: u64) -> Readiness {
+        // Built through the REAL deserializer, so these fixtures cannot drift
+        // from the wire shape the runner actually sends.
+        let raw = serde_json::json!({
+            "safe_to_restart": safe,
+            "terminal_sessions": { "count": terminal },
+            "ai_sessions": { "count": ai },
+        });
+        let report: ReadinessReport = serde_json::from_value(raw.clone()).unwrap();
+        if safe {
+            Readiness::Safe { report, raw }
+        } else {
+            Readiness::Unsafe { report, raw }
+        }
+    }
+
+    #[test]
+    fn drained_only_when_both_planes_are_zero() {
+        assert!(drained_for_deferred_rebuild(&report_json(true, 0, 0)).drained);
+        assert!(!drained_for_deferred_rebuild(&report_json(true, 1, 0)).drained);
+        assert!(!drained_for_deferred_rebuild(&report_json(true, 0, 1)).drained);
+        assert!(!drained_for_deferred_rebuild(&report_json(true, 2, 3)).drained);
+    }
+
+    #[test]
+    fn an_unsafe_verdict_is_never_drained_even_with_zero_counts() {
+        // safe_to_restart=false with empty planes is contradictory; the gate
+        // must not resolve that contradiction in favour of acting.
+        assert!(!drained_for_deferred_rebuild(&report_json(false, 0, 0)).drained);
+    }
+
+    #[test]
+    fn census_safe_is_drained_and_census_unsafe_is_not() {
+        assert!(
+            drained_for_deferred_rebuild(&Readiness::CensusSafe {
+                census: census(&[])
+            })
+            .drained
+        );
+        assert!(
+            !drained_for_deferred_rebuild(&Readiness::CensusUnsafe {
+                census: census(&[4321])
+            })
+            .drained
+        );
+    }
+
+    #[test]
+    fn every_unknown_refuses_to_call_it_drained() {
+        // The arm that decides whether the endpoint is safe at all. If a new
+        // ReadinessUnknown variant is added, add it here.
+        let unknowns = vec![
+            ReadinessUnknown::EndpointAbsent,
+            ReadinessUnknown::Unreachable {
+                detail: "connection refused".into(),
+            },
+            ReadinessUnknown::ErrorStatus {
+                status: 500,
+                body_excerpt: "boom".into(),
+            },
+            ReadinessUnknown::Unparseable {
+                detail: "missing field `safe_to_restart`".into(),
+                body_excerpt: "{}".into(),
+            },
+            // Both sources failed. This is the one an operator is most likely
+            // to hit on a wedged runner, and the one it would be most tempting
+            // to read as "quiet, therefore idle".
+            ReadinessUnknown::CensusUnreadable {
+                detail: "census_root_pid_absent".into(),
+            },
+        ];
+        for u in unknowns {
+            let v = drained_for_deferred_rebuild(&Readiness::Unknown(u.clone()));
+            assert!(!v.drained, "Unknown({:?}) must not be drained", u);
+            assert!(
+                v.reason.contains("unknown"),
+                "reason should name the unknown: {}",
+                v.reason
+            );
+        }
     }
 }

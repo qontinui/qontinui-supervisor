@@ -649,6 +649,11 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
         path: "/runner/fix-and-rebuild",
         summary: "Fix errors and rebuild (legacy single-runner endpoint)",
     },
+    EndpointEntry {
+        method: "POST",
+        path: "/runner/rebuild-when-idle",
+        summary: "Watch the primary until its Claude sessions drain, then rebuild from origin/main",
+    },
     // Debug-gated
     EndpointEntry {
         method: "POST",
@@ -753,6 +758,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/runner/fix-and-rebuild",
             post(crate::routes::runner::fix_and_rebuild),
+        )
+        .route(
+            "/runner/rebuild-when-idle",
+            post(crate::routes::runner::rebuild_when_idle),
         )
         // Logs
         .route("/logs/history", get(crate::routes::logs::log_history))
