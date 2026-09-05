@@ -78,6 +78,32 @@ nothing reuses them — the point of the fix — and nothing removes them either
 Bounded and harmless, but it makes permanent the orphaned-file janitor that
 `2026-07-20-runner-port-keyed-state-inheritance` §7 deferred.
 
+**The reconcile sweep kills only runners the supervisor SPAWNED.**
+`manager::reconcile_orphaned_temp_runners` is the safety net for the D7 orphan
+leak — it frees a temp port whose registry record was dropped without a kill.
+Its ownership test used to be *"listening on 9877-9899, **not in my registry**,
+and a `qontinui-runner` image"*, three conditions a **hand-launched** runner
+satisfies by construction, so it reaped runners it had never owned, on a
+five-minute timer, logging only a count. A durable ledger
+(`process::temp_runner_ledger`, `%LOCALAPPDATA%/com.qontinui.supervisor/spawned-temp-runners.json`)
+now records every temp runner this supervisor lineage spawned — pid, port and
+the OS process start time, so a recycled pid cannot be mistaken for the
+original — and the sweep kills only a ledger-matched process. Because the
+ledger is on disk it survives the supervisor restart the registry does not, so
+the D7 case still works; what stops working is reaping strangers. Every
+uncertainty (absent ledger, missing row, pid mismatch, proven pid reuse,
+unreadable file) resolves to **leave it alone and say why**.
+
+**Both outcomes reach the operator-visible log, with the victim named.** The
+sweep used to emit `"killed 1 orphaned temp-runner process(es)"` — the count
+and nothing else — while the pid and port went only to `tracing::warn!`. An
+operator watching a runner vanish had no way to learn whether it was theirs;
+that cost a day of misdiagnosis on 2026-08-19 (plan
+`2026-08-19-session-info-dropdown-mount-gaps-remediation`, D3). The kill line
+now names every victim as `pid <n> on port <p>`, and a **second** line reports
+the listeners the sweep deliberately spared and why — silence there would
+recreate the same defect in mirror image.
+
 **Temp runners have a max age; nothing else does.** Before this, a *healthy*
 temp runner had no terminator at all short of supervisor exit — an unowned
 (`requester_id: None`) temp was found alive with 31 live PTYs two days after it

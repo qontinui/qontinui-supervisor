@@ -2013,10 +2013,21 @@ const TEMP_RUNNER_PORT_RANGE: std::ops::RangeInclusive<u16> = 9877..=9899;
 /// event (the D7 bug, or a record dropped by a prior supervisor binary).
 ///
 /// Safety: only kills a PID that (a) is listening on a temp-range port, (b) is
-/// NOT claimed by any registered runner, AND (c) is confirmed to be a
-/// `qontinui-runner` image via [`proc_kill::is_qontinui_runner_pid`]. An
-/// unrelated process that grabbed a temp-range port is left untouched. The
-/// primary (9876) is outside the swept range and can never be hit.
+/// NOT claimed by any registered runner, (c) is confirmed to be a
+/// `qontinui-runner` image via [`proc_kill::is_qontinui_runner_pid`], AND
+/// (d) **this supervisor lineage actually spawned it**, per the durable
+/// [`crate::process::temp_runner_ledger`]. The primary (9876) is outside the
+/// swept range and can never be hit.
+///
+/// Condition (d) is the one plan
+/// `2026-08-19-session-info-dropdown-mount-gaps-remediation` D3 added, and it
+/// is not a refinement of (b) — it replaces the question. (a)+(b)+(c) are all
+/// satisfied **by construction** by a hand-launched runner, so for as long as
+/// they were the whole test this sweep silently reaped runners it had never
+/// owned, on a five-minute timer, logging only a count. The ledger is on disk
+/// precisely so (d) survives the supervisor restart that (b) exists to
+/// tolerate: a temp runner this supervisor spawned is still recognised as ours
+/// after its registry record is gone, which is the D7 case the net is for.
 async fn reconcile_orphaned_temp_runners(state: &SharedState) {
     // Ports currently claimed by a registered runner — never sweep these.
     let claimed_ports: std::collections::HashSet<u16> = state
@@ -2026,7 +2037,19 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
         .map(|r| r.config.port)
         .collect();
 
+    // Read the spawn ledger ONCE per sweep, not once per port: it is the same
+    // answer for all 23 ports and re-reading it 23 times would let it change
+    // mid-sweep, so two ports could be judged against two different ledgers.
+    let spawned = crate::process::temp_runner_ledger::load();
+
     let mut freed = 0u32;
+    // Defect 2 of the same plan: the operator-visible log used to carry the
+    // COUNT and nothing else, while the victim's PID and port went only to
+    // `tracing::warn!`. An operator watching a runner vanish saw
+    // "killed 1 orphaned temp-runner process(es)" and had no way to learn
+    // whether it was theirs. That is the single line whose absence cost a day.
+    let mut victims: Vec<String> = Vec::new();
+    let mut spared: Vec<String> = Vec::new();
     for port in TEMP_RUNNER_PORT_RANGE {
         if claimed_ports.contains(&port) {
             continue;
@@ -2057,32 +2080,79 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
             continue;
         }
 
+        // (d) — did WE spawn it? Everything unproven resolves to "leave it".
+        let verdict = crate::process::temp_runner_ledger::classify_listener(
+            pid,
+            port,
+            crate::process::temp_runner_ledger::process_start_time_secs(pid),
+            &spawned,
+        );
+        if !verdict.is_kill() {
+            warn!(
+                "reconcile sweep: NOT killing qontinui-runner PID {} on temp port {} — {}",
+                pid,
+                port,
+                verdict.reason()
+            );
+            spared.push(format!("pid {pid} on port {port} ({})", verdict.reason()));
+            continue;
+        }
+
         warn!(
             "reconcile sweep: killing orphaned qontinui-runner PID {} on unclaimed \
-             temp port {} (no registry record)",
-            pid, port
+             temp port {} — {}",
+            pid,
+            port,
+            verdict.reason()
         );
         let _ = crate::process::proc_kill::kill_by_pid_tree(pid).await;
         let _ = crate::process::proc_kill::kill_by_port(port).await;
+        crate::process::temp_runner_ledger::forget_port(port);
         if crate::process::port::wait_for_port_free(port, 5).await {
             freed += 1;
+            victims.push(format!("pid {pid} on port {port}"));
         } else {
             warn!(
                 "reconcile sweep: port {} still in use after killing orphan PID {}",
                 port, pid
             );
+            victims.push(format!(
+                "pid {pid} on port {port} (port still in use after the kill)"
+            ));
         }
     }
 
-    if freed > 0 {
+    if !victims.is_empty() {
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 LogLevel::Info,
                 format!(
-                    "Reconcile sweep: killed {} orphaned temp-runner process(es) and freed their port(s)",
-                    freed
+                    "Reconcile sweep: killed {} orphaned temp-runner process(es), freeing {} \
+                     port(s) — {}",
+                    victims.len(),
+                    freed,
+                    victims.join("; ")
+                ),
+            )
+            .await;
+    }
+
+    // A spared listener is reported too. Silence here would recreate the
+    // original defect in mirror image: a runner that keeps its port for
+    // reasons the operator cannot see.
+    if !spared.is_empty() {
+        state
+            .logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "Reconcile sweep: left {} temp-port listener(s) alone — this supervisor \
+                     did not spawn them — {}",
+                    spared.len(),
+                    spared.join("; ")
                 ),
             )
             .await;
@@ -2188,6 +2258,18 @@ pub async fn start_managed_runner(
         "Runner '{}' started with PID {:?} on port {}",
         runner_name, pid, port
     );
+
+    // Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`, D3. This
+    // is the ONE spawn site, so it is where "I spawned it" becomes a durable
+    // fact the reconcile sweep can consult after the in-memory registry record
+    // is gone. Temp runners only: named and primary runners are outside the
+    // swept port range, and writing them here would put PIDs in a file nothing
+    // ever reads.
+    if let Some(pid_val) = pid {
+        if managed.config.kind().is_temp() {
+            crate::process::temp_runner_ledger::record_spawn(pid_val, port);
+        }
+    }
 
     // Route the spawned process to the supervisor's kill-on-exit JobObject —
     // but ONLY if it is a supervisor-owned ephemeral. When the supervisor

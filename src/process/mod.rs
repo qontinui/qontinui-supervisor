@@ -49,6 +49,11 @@ pub mod stopped_cache;
 /// consumes it and removes this attribute.
 #[allow(dead_code)]
 pub mod subtree_census;
+/// Cross-platform on purpose — the reconcile sweep's ownership decision must be
+/// covered by the Linux-only CI gate that blocks merges. Killing a process the
+/// supervisor never spawned is the failure it exists to prevent, and a
+/// Windows-only test would not gate it.
+pub mod temp_runner_ledger;
 #[cfg(not(target_os = "windows"))]
 pub mod unix_kill;
 #[cfg(target_os = "windows")]
