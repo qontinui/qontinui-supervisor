@@ -24,16 +24,36 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 
 # Repro flags for content-addressed cache compatibility (Row 10 Wave 0).
 #
-# --remap-path-prefix entries (Row 2 Phase 3): collapse the per-worktree
-# absolute prefix so sccache cache keys are path-independent across
-# worktrees on the same machine. Order: longer prefix first (`.wt`
-# before bare). For variable per-agent worktree paths the agent shell
-# additionally sets `RUSTFLAGS=--remap-path-prefix=$WORKTREE_ROOT=...`.
+# --remap-path-prefix entries (Row 2 Phase 3) collapse the per-worktree absolute
+# prefix so sccache cache keys are path-independent across worktrees on one
+# machine. Without them the measured cross-worktree hit rate is 0%.
+#
+# The WINDOWS pair used to be spelled here as an absolute literal
+# (a drive-lettered workspace root). It has moved to each machine's own
+# `$CARGO_HOME/config.toml`, written by
+# qontinui-claude-config/scripts/install-cargo-machine-config.{ps1,sh}, because
+# an absolute per-machine path in a file every machine shares is correct on
+# whichever machine it was written for and inert everywhere else. Cargo JOINS
+# rustflags across config files with the machine-level values FIRST, so the
+# remap still reaches rustc; what stays here is only the machine-NEUTRAL flags.
+# All four fleet machines were confirmed carrying the machine config before this
+# was removed (coord gate a42ce9cd, evidence in finding fa5b6675).
+#
+# The Linux entries below are NOT the same kind of value and stay: they name the
+# CI runner checkout root, which is a constant across runners and which no
+# installer covers.
+#
+# ORDER DOES NOT MATTER, and an earlier version of this comment said it did.
+# rustc takes the LONGEST matching prefix whatever order it is given in;
+# order only breaks ties between IDENTICAL prefixes, where the LAST wins.
+# Measured on two platforms and two toolchains 2026-09-05
+# (qontinui-claude-config#773).
+#
+# For variable per-agent worktree paths the agent shell still additionally sets
+# `RUSTFLAGS=--remap-path-prefix=$WORKTREE_ROOT=...`.
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C", "link-arg=/Brepro",
-    "--remap-path-prefix=D:/qontinui-root.wt=/qontinui",
-    "--remap-path-prefix=D:/qontinui-root=/qontinui",
 ]
 
 [target.x86_64-unknown-linux-gnu]
