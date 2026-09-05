@@ -681,19 +681,27 @@ impl EnvForwarder for RunnerTierEnv {
 // PlanAdapterEnv
 // =============================================================================
 
-/// Forwards the plan→work-unit adapter configuration
-/// (`QONTINUI_PLAN_ADAPTER_DIR`, `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS`) to the
-/// **primary** runner, reading the persisted user environment fresh at each
-/// spawn.
+/// Forwards the plan→work-unit adapter's env knob
+/// (`QONTINUI_PLAN_ADAPTER_INTERVAL_SECS`) to the **primary** runner, reading
+/// the persisted user environment fresh at each spawn.
 ///
-/// The runner's adapter (`plan_workunit_adapter::trigger::spawn_if_configured`)
-/// is gated at boot on `QONTINUI_PLAN_ADAPTER_DIR` in the runner's process
-/// env. A spawned runner inherits the SUPERVISOR's env snapshot, and the
-/// supervisor is long-lived — an operator `setx` after the supervisor started
-/// is invisible to every later runner respawn, so the adapter silently stays
-/// dormant across primary rebuilds (observed 2026-07-03). Reading
-/// `HKCU\Environment` at spawn time makes `setx` + runner restart sufficient;
-/// no supervisor restart required.
+/// The plans dir itself is NOT forwarded. It is a runner setting —
+/// `paths.plans_dir` in the runner's `settings.json`, editable in the runner's
+/// Settings → Paths section and read every scan cycle — and the runner reads
+/// the old `QONTINUI_PLAN_ADAPTER_DIR` env var only in its one-time migration
+/// that persists an env value into settings at first boot. Sequencing note:
+/// this forwarder stopped carrying that variable only after the runner release
+/// with the migration had booted once on every fleet primary. A Windows primary
+/// saw the env var solely through this forwarder, so dropping the entry before
+/// the migration ran would have left `paths.plans_dir` unset and the plan tier
+/// silently OFF on that machine.
+///
+/// The interval knob is still read from the runner's process env by the
+/// reconcile loop. A spawned runner inherits the SUPERVISOR's env snapshot, and
+/// the supervisor is long-lived — an operator `setx` after the supervisor
+/// started is invisible to every later runner respawn (observed 2026-07-03).
+/// Reading `HKCU\Environment` at spawn time makes `setx` + runner restart
+/// sufficient; no supervisor restart required.
 ///
 /// Resolution per variable (first non-blank wins):
 /// 1. `HKCU\Environment` (Windows) — the persisted store `setx` writes;
@@ -708,10 +716,7 @@ impl EnvForwarder for RunnerTierEnv {
 /// overrides anything set here).
 pub struct PlanAdapterEnv;
 
-const PLAN_ADAPTER_VARS: [&str; 2] = [
-    "QONTINUI_PLAN_ADAPTER_DIR",
-    "QONTINUI_PLAN_ADAPTER_INTERVAL_SECS",
-];
+const PLAN_ADAPTER_VARS: [&str; 1] = ["QONTINUI_PLAN_ADAPTER_INTERVAL_SECS"];
 
 impl EnvForwarder for PlanAdapterEnv {
     fn name(&self) -> &'static str {
@@ -923,7 +928,7 @@ fn instance_dir_override_warning(
 mod tests {
     use super::{
         resolve_plan_adapter_value, resolve_test_auto_login, resolve_worktree_mode,
-        TestAutoLoginSource,
+        TestAutoLoginSource, PLAN_ADAPTER_VARS,
     };
     use std::path::{Path, PathBuf};
 
@@ -1083,15 +1088,20 @@ mod tests {
     }
 
     #[test]
+    fn plan_adapter_forwards_only_the_interval_knob() {
+        // The plans dir is a runner setting (`paths.plans_dir`), not an env
+        // var this forwarder carries; the reconcile interval is the one
+        // remaining env knob the runner's loop still reads.
+        assert_eq!(PLAN_ADAPTER_VARS, ["QONTINUI_PLAN_ADAPTER_INTERVAL_SECS"]);
+    }
+
+    #[test]
     fn plan_adapter_persisted_beats_process_snapshot() {
         // The freshly-read persisted value wins over the (possibly stale)
         // process-env snapshot — the whole point of reading at spawn time.
         assert_eq!(
-            resolve_plan_adapter_value(
-                Some("D:/plans-new".to_string()),
-                Some("D:/plans-old".to_string())
-            ),
-            Some("D:/plans-new".to_string())
+            resolve_plan_adapter_value(Some("120".to_string()), Some("60".to_string())),
+            Some("120".to_string())
         );
     }
 
@@ -1100,8 +1110,8 @@ mod tests {
         // No persisted value (non-Windows, or never setx'd) → the supervisor's
         // process env still works, so explicit launches keep functioning.
         assert_eq!(
-            resolve_plan_adapter_value(None, Some("D:/plans".to_string())),
-            Some("D:/plans".to_string())
+            resolve_plan_adapter_value(None, Some("60".to_string())),
+            Some("60".to_string())
         );
         assert_eq!(resolve_plan_adapter_value(None, None), None);
     }
@@ -1111,8 +1121,8 @@ mod tests {
         // A blank registry entry must not mask a real process-env value, and
         // blank-everywhere resolves to no injection at all.
         assert_eq!(
-            resolve_plan_adapter_value(Some("  ".to_string()), Some("D:/plans".to_string())),
-            Some("D:/plans".to_string())
+            resolve_plan_adapter_value(Some("  ".to_string()), Some("60".to_string())),
+            Some("60".to_string())
         );
         assert_eq!(
             resolve_plan_adapter_value(Some(String::new()), Some(String::new())),
