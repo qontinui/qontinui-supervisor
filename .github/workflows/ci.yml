@@ -70,6 +70,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # tests/machine_local_artifacts.rs cross-checks its hard-coded copy of
+      # qontinui-runner's MANAGED_REPO_EXCLUDES against the runner's own
+      # declaration. Without this step that check has no source in CI, so it
+      # ran only on developer boxes — each against whatever ITS sibling
+      # checkout happened to have fetched. On 2026-09-05, against one and the
+      # same qontinui-runner origin/main, that produced three answers: PASS on
+      # a box 337 commits behind (certifying a drift that had already
+      # happened), FAIL on a current one (which produced ca98051, reconciling
+      # the roster), and SKIP here. Every CI run on main between #168 and
+      # ca98051 was green while this check was skipping — which is why
+      # ca98051 describes a failure "on main" that no CI run ever saw.
+      #
+      # Sparse + depth 1: what is wanted is the MANAGED_REPO_EXCLUDES
+      # declaration, not the runner tree. actions/checkout takes the repo's
+      # default branch, which is the origin/main the test wants.
+      #
+      # qontinui-runner is PUBLIC, so this needs no secret — the same
+      # constraint that pushed the cross-repo half of compose-parity into
+      # coord's CI (see that job's comment). If it ever goes private this step
+      # fails and roster_matches_the_runner_definition then hard-fails on a
+      # missing source. That direction is deliberate: red, never silently green.
+      - name: Check out qontinui-runner's roster declaration
+        uses: actions/checkout@v5
+        with:
+          repository: qontinui/qontinui-runner
+          path: .runner-roster
+          sparse-checkout: src-tauri/src/fleet.rs
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -78,6 +108,19 @@ jobs:
 
       - name: Run tests
         run: cargo test
+        env:
+          QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+
+      # `cargo test` swallows stdout for tests that pass, so the roster
+      # cross-check's verdict — which source it read, and at which sha — would
+      # leave no artifact in the CI log, and a control that leaves no artifact
+      # cannot be audited. Re-run just this binary with --nocapture so the
+      # evidence is recorded. It is already compiled by the step above, so this
+      # costs milliseconds.
+      - name: Record the machine-local artifact roster verdict
+        run: cargo test --test machine_local_artifacts -- --nocapture
+        env:
+          QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
 
       - name: Build
         run: cargo build

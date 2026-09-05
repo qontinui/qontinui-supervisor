@@ -3,9 +3,10 @@
 //! # Why this exists
 //!
 //! The runner drops machine-local artifacts into every repo it manages
-//! (`.mcp.json`, the two `agent-worktrees` container spellings, and
-//! `.coord-mcp-status`). None of them is source, and every one of them makes
-//! `git status --porcelain` non-empty while it is untracked-and-unignored.
+//! (`.mcp.json`, the two `agent-worktrees` container spellings,
+//! `.coord-mcp-status`, and `.claude/worktrees/`). None of them is source, and
+//! every one of them makes `git status --porcelain` non-empty while it is
+//! untracked-and-unignored.
 //!
 //! That is not cosmetic. `dev-start.ps1`'s `Resolve-PrimaryTreeStaleness`
 //! treats a non-empty porcelain as uncommitted WIP and *skips* its
@@ -28,7 +29,12 @@
 //! 2. no roster entry has reached the index, the way two `__pycache__` `.pyc`
 //!    files did before that entry existed;
 //! 3. the roster this file hard-codes still matches the roster the runner
-//!    actually enumerates, whenever the runner checkout is reachable.
+//!    actually enumerates **on `origin/main`** — read either from the copy
+//!    `ci.yml` checks out, or from a sibling checkout's `origin/main` ref.
+//!    Never from a working tree, and never only where a checkout happens to
+//!    sit: as #168 shipped it, check 3 read the local sibling's TREE and did
+//!    not run in CI at all, so its verdict was a property of the reader's box
+//!    rather than of the roster.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -37,11 +43,12 @@ use std::process::Command;
 ///
 /// Authoritative definition: qontinui-runner
 /// `src-tauri/src/fleet.rs::MANAGED_REPO_EXCLUDES`. It is duplicated here
-/// because that repo is not a build dependency of this one and CI clones only
-/// `qontinui-schemas` — see the sibling clone step in
-/// `.github/workflows/ci.yml`. `roster_matches_the_runner_definition` closes
-/// the loop wherever the runner checkout IS reachable, so the copy announces
-/// its own drift instead of silently rotting.
+/// because that repo is not a build dependency of this one — the roster is a
+/// handful of string literals, and taking a build dep on the runner to read
+/// them would be absurd. `roster_matches_the_runner_definition` is what stops the copy
+/// rotting, and `ci.yml` supplies it the runner's `origin/main` `fleet.rs` so
+/// it runs on every PR rather than only where a sibling checkout happens to
+/// sit.
 const MACHINE_LOCAL_ARTIFACTS: &[&str] = &[
     ".mcp.json",
     "agent-worktrees/",
@@ -135,6 +142,11 @@ fn every_machine_local_artifact_is_ignored_by_the_tracked_gitignore() {
     }
 
     let mut problems = Vec::new();
+    // The evidence this control produces. A green assertion says only that
+    // nothing was wrong; the per-artifact provenance says what was actually
+    // checked, and an unauditable control is indistinguishable from an absent
+    // one. `ci.yml` re-runs this binary with --nocapture so the log keeps it.
+    let mut verdicts = Vec::new();
 
     for artifact in MACHINE_LOCAL_ARTIFACTS {
         // `--no-index` keeps the answer about the ignore rules alone, so the
@@ -156,19 +168,27 @@ fn every_machine_local_artifact_is_ignored_by_the_tracked_gitignore() {
             ));
             continue;
         }
-
-        // `-v` output is `<source>:<line>:<pattern>\t<path>`.
+        // `-v` output is `<source>:<line>:<pattern>\t<path>`, and the SOURCE is
+        // what distinguishes "promoted" from "still only local". Test it by
+        // prefix rather than by splitting on `:`, because a colon appears on
+        // BOTH sides of the field: an absolute `core.excludesFile` source
+        // starts `C:` on Windows (a left split truncates it to a drive
+        // letter), and a gitignore pattern may contain one (a right split
+        // then swallows a field). A prefix test is exact for the only
+        // question asked — is this the tracked .gitignore at the repo root.
         let line = out.stdout.lines().next().unwrap_or_default();
-        let source = line.split(':').next().unwrap_or_default();
-        if source != ".gitignore" {
+        let before_tab = line.split('\t').next().unwrap_or_default();
+        if !before_tab.starts_with(".gitignore:") {
             problems.push(format!(
-                "{artifact}: ignored by `{source}`, not by the tracked \
-                 .gitignore (matched: {}). `.git/info/exclude` is local-only — \
-                 lost on a fresh clone and in CI — and the runner writes it \
-                 best-effort, swallowing every IO error. Promote the pattern \
-                 into .gitignore.",
+                "{artifact}: not ignored by the tracked .gitignore — git \
+                 check-ignore reports `{}`. `.git/info/exclude` is \
+                 local-only — lost on a fresh clone and in CI — and the \
+                 runner writes it best-effort, swallowing every IO error. \
+                 Promote the pattern into .gitignore.",
                 line.trim()
             ));
+        } else {
+            verdicts.push(format!("{artifact} <- {}", line.trim()));
         }
     }
 
@@ -176,6 +196,11 @@ fn every_machine_local_artifact_is_ignored_by_the_tracked_gitignore() {
         problems.is_empty(),
         "machine-local artifacts are not fully promoted into .gitignore:\n  - {}",
         problems.join("\n  - ")
+    );
+
+    println!(
+        "every_machine_local_artifact_is_ignored_by_the_tracked_gitignore:\n  {}",
+        verdicts.join("\n  ")
     );
 }
 
@@ -209,20 +234,85 @@ fn no_machine_local_artifact_is_tracked() {
     );
 }
 
-/// Locate qontinui-runner's `fleet.rs` relative to this checkout.
+/// Where the runner's roster was read from, so a verdict can name its source.
 ///
-/// Both worktree layouts in use put sibling repos one level up
-/// (`qontinui-worktrees/<uuid>/<repo>` and `.agent-worktrees/<agent_id>/<repo>`),
-/// which is also true of the primary checkout under the workspace root — so a
-/// single `../qontinui-runner` probe covers all three.
-fn runner_fleet_rs() -> Option<PathBuf> {
-    let candidate = repo_root()
-        .parent()?
-        .join("qontinui-runner")
-        .join("src-tauri")
-        .join("src")
-        .join("fleet.rs");
-    candidate.is_file().then_some(candidate)
+/// The distinction is the whole point: a roster read from a checkout's WORKING
+/// TREE is evidence about that checkout and nothing else, and the primary
+/// sibling checkout is routinely the stalest thing in the workspace — nobody's
+/// active worktree, so nobody pulls it.
+struct RosterSource {
+    /// Human-readable provenance, printed in every verdict.
+    label: String,
+    source: String,
+}
+
+/// Resolve the runner's `fleet.rs` **as it stands on `origin/main`**.
+///
+/// Two sources, in order, and neither is a working tree:
+///
+/// 1. `$QONTINUI_RUNNER_FLEET_RS` — a file the caller has already fetched from
+///    the runner's default branch. This is the CI arm: `ci.yml` sparse-checks
+///    out `qontinui-runner` and points this at it, which is what makes the
+///    cross-check load-bearing in the one place a green result is load-bearing.
+/// 2. A sibling `../qontinui-runner` checkout, read with
+///    `git show origin/main:src-tauri/src/fleet.rs` — the checkout's REMOTE-
+///    TRACKING ref, never its working tree. A checkout whose `origin/main` will
+///    not resolve yields UNKNOWN; it does NOT fall back to the tree, because
+///    the tree is exactly what produced the false pass this replaces.
+///
+/// `None` is UNKNOWN — reported, never counted as a pass.
+fn runner_roster_source() -> Option<RosterSource> {
+    if let Some(path) = std::env::var_os("QONTINUI_RUNNER_FLEET_RS") {
+        let path = PathBuf::from(path);
+        let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "QONTINUI_RUNNER_FLEET_RS points at {} which could not be read: \
+                 {e}. It is set explicitly, so an unreadable file is a broken \
+                 configuration, not an absent source.",
+                path.display()
+            )
+        });
+        return Some(RosterSource {
+            label: format!("$QONTINUI_RUNNER_FLEET_RS ({})", path.display()),
+            source,
+        });
+    }
+
+    // Both worktree layouts in use put sibling repos one level up
+    // (`qontinui-worktrees/<uuid>/<repo>` and `.agent-worktrees/<agent_id>/<repo>`),
+    // which is also true of the primary checkout under the workspace root.
+    let runner = repo_root().parent()?.join("qontinui-runner");
+    if !runner.join(".git").exists() {
+        return None;
+    }
+
+    let show = Command::new("git")
+        .arg("-C")
+        .arg(&runner)
+        .args(["show", "origin/main:src-tauri/src/fleet.rs"])
+        .output()
+        .ok()?;
+    if !show.status.success() {
+        return None;
+    }
+
+    // Name the commit, so a verdict is auditable against a specific tree
+    // rather than against "whatever that checkout had fetched".
+    let sha = Command::new("git")
+        .arg("-C")
+        .arg(&runner)
+        .args(["rev-parse", "--short", "origin/main"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(RosterSource {
+        label: format!("{}@origin/main ({sha})", runner.display()),
+        source: String::from_utf8_lossy(&show.stdout).into_owned(),
+    })
 }
 
 /// Extract the string literals of `MANAGED_REPO_EXCLUDES` from runner source.
@@ -255,33 +345,67 @@ fn parse_runner_roster(source: &str) -> Option<Vec<String>> {
     (!entries.is_empty()).then_some(entries)
 }
 
-/// The hard-coded roster above must still match the runner's own enumeration.
+/// The hard-coded roster above must still match the runner's own enumeration
+/// **on `origin/main`**.
 ///
-/// The runner is not a build dependency of this crate and CI clones only
-/// `qontinui-schemas`, so this cross-check runs on developer machines and is
-/// reported as UNKNOWN — never as a pass — everywhere the runner checkout is
-/// out of reach. A duplicated constant that cannot announce its own drift is
-/// how the roster got half-promoted three times.
+/// This is the control that is supposed to stop the roster rotting, and as #168
+/// shipped it its answer depended on the READER'S BOX, because it read the
+/// sibling checkout's WORKING TREE. Both halves of that were observed on
+/// 2026-09-05, on the same day, against the same `origin/main`:
+///
+/// - on a box whose runner checkout was 337 commits behind, it PASSED against
+///   a stale four-entry roster and certified a drift that had already
+///   happened;
+/// - on a box whose checkout was current, it FAILED — correctly — which is
+///   what produced `ca98051`, the commit that reconciled the roster.
+///
+/// A control that answers from a local cache gives a confident wrong answer on
+/// half the fleet, which is worse than an absent one. And CI, where a green is
+/// load-bearing, was the half that never ran it at all: every CI run on `main`
+/// between #168 and `ca98051` was GREEN while this check was skipping, which is
+/// why `ca98051` had to describe a failure "on main" that no CI run ever saw.
+///
+/// In CI an unresolvable source is a HARD FAILURE, exactly as [`require_git`]
+/// treats an unusable git: CI is where a green result is load-bearing, and
+/// `ci.yml` is now what supplies the source, so nothing there can be missing
+/// by accident. Everywhere else it is reported as UNKNOWN — never as a pass.
 #[test]
 fn roster_matches_the_runner_definition() {
-    let Some(fleet_rs) = runner_fleet_rs() else {
+    let Some(runner) = runner_roster_source() else {
+        assert!(
+            !is_ci(),
+            "roster_matches_the_runner_definition: the runner's roster could \
+             not be resolved, so drift against MANAGED_REPO_EXCLUDES was NOT \
+             checked. In CI this is a failure, not a skip — `ci.yml` checks \
+             qontinui-runner out and sets $QONTINUI_RUNNER_FLEET_RS, so an \
+             unresolved source there means that step stopped working and this \
+             control silently stopped running."
+        );
         println!(
-            "SKIP roster_matches_the_runner_definition: no qontinui-runner \
-             checkout beside this one, so drift against \
-             MANAGED_REPO_EXCLUDES is UNKNOWN, not absent."
+            "SKIP roster_matches_the_runner_definition: neither \
+             $QONTINUI_RUNNER_FLEET_RS nor a sibling qontinui-runner checkout \
+             with a resolvable origin/main. Drift is UNKNOWN, not absent. (A \
+             sibling checkout's WORKING TREE is deliberately not a source — \
+             reading one is what let a 337-commit-stale tree certify a roster \
+             that had already drifted.)"
         );
         return;
     };
 
-    let source = std::fs::read_to_string(&fleet_rs)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", fleet_rs.display()));
-
-    let Some(runner_roster) = parse_runner_roster(&source) else {
+    let Some(runner_roster) = parse_runner_roster(&runner.source) else {
+        assert!(
+            !is_ci(),
+            "roster_matches_the_runner_definition: MANAGED_REPO_EXCLUDES could \
+             not be parsed out of {} — it was probably reshaped. In CI that is \
+             a failure: the source was supplied and the parser could not read \
+             it, so the control stopped running rather than passing.",
+            runner.label
+        );
         println!(
             "SKIP roster_matches_the_runner_definition: could not parse \
-             MANAGED_REPO_EXCLUDES out of {} — it was probably reshaped. \
-             Drift is UNKNOWN, not absent; re-check by hand.",
-            fleet_rs.display()
+             MANAGED_REPO_EXCLUDES out of {} — it was probably reshaped. Drift \
+             is UNKNOWN, not absent; re-check by hand.",
+            runner.label
         );
         return;
     };
@@ -295,18 +419,25 @@ fn roster_matches_the_runner_definition() {
     actual.sort();
 
     assert_eq!(
-        actual,
-        expected,
+        actual, expected,
         "MACHINE_LOCAL_ARTIFACTS has drifted from qontinui-runner's \
-         MANAGED_REPO_EXCLUDES ({}). Reconcile the roster here AND add any new \
-         entry to .gitignore — an artifact the runner writes but this repo does \
-         not ignore blocks dev-start's auto-fast-forward.",
-        fleet_rs.display()
+         MANAGED_REPO_EXCLUDES, read from {}. Reconcile the roster here AND \
+         make sure .gitignore covers every entry — an artifact the runner \
+         writes but this repo does not ignore makes `git status --porcelain` \
+         non-empty and blocks dev-start's `merge --ff-only origin/main`.",
+        runner.label
+    );
+
+    println!(
+        "roster_matches_the_runner_definition: {} entries verified against {}.",
+        actual.len(),
+        runner.label
     );
 }
 
-/// The cross-check is only as good as its parser, and its parser runs on
-/// developer machines only — so it is pinned here, where CI does exercise it.
+/// The cross-check is only as good as its parser, so the parser is pinned
+/// against fixed inputs here rather than only against whatever the runner's
+/// declaration happens to look like today.
 ///
 /// The first case is the declaration's real shape. Anchoring on the first `[`
 /// after the name parses the *type* `&[&str]` and silently yields nothing,
@@ -319,6 +450,7 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    ".claude/worktrees/",
 ];
 "#;
     assert_eq!(
@@ -328,6 +460,7 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
             "agent-worktrees/".to_string(),
             ".agent-worktrees/".to_string(),
             ".coord-mcp-status".to_string(),
+            ".claude/worktrees/".to_string(),
         ]),
         "the parser must read the declaration's actual shape, type sigil included"
     );

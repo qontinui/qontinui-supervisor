@@ -38,9 +38,14 @@ __pycache__/
 
 # The rest of the runner's machine-local artifact roster. That roster is
 # enumerated in code — qontinui-runner `src-tauri/src/fleet.rs`,
-# MANAGED_REPO_EXCLUDES — and has five entries. `agent-worktrees/`
-# (line 12) and `.mcp.json` (line 17) above are two of them; these are the two
-# the earlier promotions left behind:
+# MANAGED_REPO_EXCLUDES — and it GROWS: it gained `.claude/worktrees/` in
+# `703123d50`, which is why no count is stated here. Prose carrying a count goes
+# stale silently; `tests/machine_local_artifacts.rs` checks the roster against
+# the runner's own declaration on every PR, and that is the durable statement.
+#
+# Three of the roster's entries are already covered above — `agent-worktrees/`
+# (line 12), `.mcp.json` (line 17), and `.claude/worktrees/` by the broader
+# `.claude/` (line 37). These are the two the earlier promotions left behind:
 #
 #   .agent-worktrees/  the dot-prefixed container. `agent-worktrees/` above does
 #                      NOT match it — a gitignore pattern matches a path

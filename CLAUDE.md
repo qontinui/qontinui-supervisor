@@ -1515,9 +1515,12 @@ that does not carry it — a self-restart no longer propagates it.
 
 The runner drops machine-local artifacts into every repo it manages. The roster
 is enumerated in code — qontinui-runner
-`src-tauri/src/fleet.rs::MANAGED_REPO_EXCLUDES` — and has exactly four entries:
-`.mcp.json`, `agent-worktrees/`, `.agent-worktrees/`, `.coord-mcp-status`. None
-of them is source.
+`src-tauri/src/fleet.rs::MANAGED_REPO_EXCLUDES` — and **it grows**: it was
+`.mcp.json`, `agent-worktrees/`, `.agent-worktrees/` and `.coord-mcp-status`
+when this section was written, and gained `.claude/worktrees/` in runner commit
+`703123d50`. None of them is source. Read the count off the runner's constant,
+never off this paragraph — a count in prose is exactly what
+`tests/machine_local_artifacts.rs` exists to stop anybody relying on.
 
 **Why that is not cosmetic.** `dev-start.ps1`'s `Resolve-PrimaryTreeStaleness`
 reads a non-empty `git status --porcelain` as uncommitted WIP and *skips* its
@@ -1532,10 +1535,24 @@ a whole. `tests/machine_local_artifacts.rs` now does, in CI: every entry must be
 ignored **by the tracked `.gitignore`** (not merely by `.git/info/exclude`,
 which is local-only, lost on a fresh clone and in CI, and which the runner
 writes best-effort while swallowing every IO error); none may have reached the
-index; and the roster is cross-checked against the runner's own constant
-whenever a `qontinui-runner` checkout sits beside this one. That cross-check
-reports **UNKNOWN, never a pass**, where the runner is out of reach — which is
-the case in CI, since `ci.yml` clones only `qontinui-schemas`.
+index; and the roster is cross-checked against the runner's own constant.
+
+**That cross-check reads `origin/main`, never a working tree, and it runs in
+CI.** As #168 shipped it, it read a sibling checkout's working tree and skipped
+entirely in CI — so its verdict was a property of the reader's box rather than
+of the roster, and both halves showed on 2026-09-05 against the same
+`origin/main`: on a box 337 commits behind it PASSED against a stale
+four-entry roster (a cache read reported as fleet state, the failure
+[policy: working-tree-is-not-fleet-evidence] names), while on a current box it
+FAILED correctly and produced `ca98051`, which reconciled the roster. CI never
+ran it either way — every run on `main` between #168 and `ca98051` was green
+while the check skipped, which is why `ca98051` describes a failure "on main"
+that no CI run ever saw. Now: `ci.yml` sparse-checks out `qontinui-runner`'s
+`fleet.rs` and points `$QONTINUI_RUNNER_FLEET_RS` at it, so the check runs on
+every PR; a sibling checkout is read via `git show origin/main:…`; and an
+unresolvable source is **UNKNOWN, never a pass** — a hard failure under
+`CI=true`, since CI is where the source is supplied and a green is
+load-bearing.
 
 ### A clean `.gitignore` is NOT sufficient — the tree is still dirty
 
