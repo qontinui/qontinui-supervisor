@@ -46,6 +46,30 @@ async fn wait_until_listening(port: u16) -> bool {
     false
 }
 
+/// Block until the `lsof`-backed probe can SEE the listener, or until it
+/// errors. Returns nothing: each caller keeps its own `Err` handling.
+///
+/// `wait_until_listening` above is CONNECT-based (`is_port_listening` opens a
+/// socket), so it succeeds the moment the listen backlog exists.
+/// `find_pid_on_port` shells out to `lsof`, which reads a different view and
+/// can lag behind that moment. The two probes are therefore unsynchronised,
+/// and `Ok(None)` from the second means "not visible YET", not "nothing is
+/// listening" -- so asserting on ONE observation races them. Observed
+/// 2026-09-05: `find_pid_on_port_locates_listener` failed with `left: None`
+/// on CI and passed on a rerun of the identical commit.
+///
+/// `Err` is UNKNOWN and will not change by retrying (the standing case is a
+/// box with no `lsof`), so it returns straight away rather than burning the
+/// whole budget.
+async fn wait_until_probe_sees(port: u16) {
+    for _ in 0..50 {
+        match proc_kill::find_pid_on_port(port).await {
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            _ => return,
+        }
+    }
+}
+
 /// kill_by_port must terminate the listener and free the port — the primitive
 /// the reaper and reconcile sweep use to close the orphan leak.
 #[tokio::test]
@@ -64,6 +88,14 @@ async fn kill_by_port_frees_a_real_held_port() {
         wait_until_listening(port).await,
         "listener never bound port {port}"
     );
+
+    // Same race as in find_pid_on_port_locates_listener, one layer down:
+    // kill_by_port iterates `find_pids_on_port`, so a probe that has not yet
+    // seen the socket kills nothing and reports `false` — which the assertion
+    // below would read as a defect in the kill logic. Wait for the probe view
+    // first; this test was not observed failing, but it is the same defect and
+    // fixing only the one that happened to fire would be half a fix.
+    wait_until_probe_sees(port).await;
 
     // The actual fix path. `Err` means the `lsof` probe could not RUN at all,
     // which is UNKNOWN, not a defect in the kill logic under test — skip
@@ -137,6 +169,11 @@ async fn find_pid_on_port_locates_listener() {
         wait_until_listening(port).await,
         "listener never bound port {port}"
     );
+
+    // Let the lsof view catch up with the connect view before asserting; see
+    // wait_until_probe_sees. Without this the assertion below races the two
+    // probes and fails with `left: None` on a perfectly good listener.
+    wait_until_probe_sees(port).await;
 
     // Three-state: `Err` means the probe (lsof) could not run at all — that is
     // UNKNOWN, not "nothing was listening", so it must not be asserted against
