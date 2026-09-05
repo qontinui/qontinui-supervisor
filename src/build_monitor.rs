@@ -1961,7 +1961,10 @@ async fn persist_and_render_incomplete_build(
 /// happens to sit next to it — the 2026-07-03 incident where a 3-week-old
 /// stub (predating identity mode) silently exited 0 and broke every pane
 /// claude launch until it was hand-swapped.
+#[cfg(windows)]
 pub const SHIM_EXE_FILENAME: &str = "qontinui-shim.exe";
+#[cfg(not(windows))]
+pub const SHIM_EXE_FILENAME: &str = "qontinui-shim";
 
 /// Wall-clock budget for the fail-open `cargo build --bin qontinui-shim`
 /// sidecar step. It runs right after the main runner build succeeded on the

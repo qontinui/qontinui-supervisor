@@ -189,7 +189,16 @@ pub async fn score_workflow(
             );
             tokio::fs::write(&script_path, &script).await?;
 
-            let mut cmd = tokio::process::Command::new("powershell.exe");
+            // `powershell.exe` is the Windows host only; elsewhere the
+            // executable is `pwsh` (PowerShell 7+). The argument list is
+            // unchanged: `-ExecutionPolicy Bypass` is accepted and inert on
+            // Linux, where the policy is already Unrestricted, so branching the
+            // NAME alone keeps one code path.
+            #[cfg(windows)]
+            let ps_exe = "powershell.exe";
+            #[cfg(not(windows))]
+            let ps_exe = "pwsh";
+            let mut cmd = tokio::process::Command::new(ps_exe);
             cmd.args([
                 "-ExecutionPolicy",
                 "Bypass",
