@@ -347,6 +347,53 @@ pub fn min_free_ram_gb() -> u64 {
         .unwrap_or(DEFAULT_MIN_FREE_RAM_GB)
 }
 
+/// Default minimum free **PHYSICAL** memory (GB) below which the pre-permit
+/// memory guard DEFERS a build. A SECOND, independent floor beside
+/// [`DEFAULT_MIN_FREE_RAM_GB`] — not a replacement for it — because on this
+/// fleet the two pools are exhausted independently and a commit-only gate is
+/// blind to half of it.
+///
+/// Measured on the MSI box 2026-08-29: free commit **30 GB** (six times the
+/// commit floor, so that arm passed instantly) while free physical was
+/// **629 MB**; one `rustc` held 7.4 GB resident and `vmmemWSL` 9.6 GB of a
+/// 32.5 GB box. Two builds died — `os error 1455` (`ERROR_COMMITMENT_LIMIT`),
+/// which cascaded into ~170 **bogus** compile errors in unrelated crates, then
+/// `memory allocation of 1835008 bytes failed` → `rust_oom` → `0xc0000409`.
+///
+/// **3 GiB, not something larger, on purpose: the floor must be REACHABLE.**
+/// The guard sleeps up to [`DEFAULT_MEM_WAIT_MAX_SECS`] and then builds anyway,
+/// so an unreachable floor buys no protection and only delays every build by
+/// the full window. Separately measured on that box: it **idles at 4.9-8.8 GB**
+/// free physical and **died at 0.36-0.63 GB**. 3 clears the death band with
+/// margin and still sits below the idle band, so it is reachable at rest. This
+/// is a "do not ADD load to a thrashing box" gate, not a promise that a 7 GB
+/// `rustc` will fit.
+///
+/// Mirrors `cargo-guard.sh`'s `MIN_FREE_PHYS_GB` (qontinui-claude-config PR
+/// #428, 2026-08-29), which chose the same value for the same measurements —
+/// but nothing in this repo can observe that lane, so this comment states the
+/// shared derivation rather than claiming a pinned invariant.
+pub const DEFAULT_MIN_FREE_PHYS_GB: u64 = 3;
+
+/// Env var overriding the pre-permit memory guard's PHYSICAL threshold, in GB.
+pub const MIN_FREE_PHYS_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB";
+
+/// Minimum free physical memory (in GB) required before a build may acquire a
+/// build-pool permit. Resolved from [`MIN_FREE_PHYS_GB_ENV`], falling back to
+/// [`DEFAULT_MIN_FREE_PHYS_GB`]. Parse-with-default exactly like
+/// [`min_free_ram_gb`].
+///
+/// A `0` disables the **physical arm only**, leaving the commit floor intact —
+/// the two arms are separately disableable because they answer separately
+/// (`cargo-guard.sh` documents the same split for
+/// `CARGO_GUARD_MIN_FREE_PHYS_GB`).
+pub fn min_free_phys_gb() -> u64 {
+    std::env::var(MIN_FREE_PHYS_GB_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_PHYS_GB)
+}
+
 /// Default cap (seconds) on how long the memory guard defers before building
 /// anyway. Mirrors `cargo-guard.sh`'s `MEM_WAIT_MAX=900`.
 pub const DEFAULT_MEM_WAIT_MAX_SECS: u64 = 900;
@@ -1316,6 +1363,75 @@ mod tests {
         // `memory_guard_floor_and_published_sample_read_one_field` below.
         assert_eq!(DEFAULT_MIN_FREE_RAM_GB, 5);
         assert_eq!(DEFAULT_MEM_WAIT_MAX_SECS, 900);
+        // Same honesty applies to the physical floor: this is a literal, and a
+        // literal is all it asserts. It does NOT pin `cargo-guard.sh`'s
+        // `MIN_FREE_PHYS_GB`, which happens to be 3 for the same measurements
+        // and which nothing here can read.
+        assert_eq!(DEFAULT_MIN_FREE_PHYS_GB, 3);
+    }
+
+    #[test]
+    fn the_physical_floor_is_reachable_at_this_boxs_measured_idle() {
+        // A REAL invariant, not a restated literal: an unreachable floor
+        // protects nothing. `check_ram_guard` sleeps up to
+        // `DEFAULT_MEM_WAIT_MAX_SECS` and then builds ANYWAY, so a floor above
+        // the band the box idles in converts every build into a full-window
+        // delay followed by the same build. Measured on the MSI box
+        // 2026-08-29: idles at 4.9-8.8 GB free physical, died at 0.36-0.63 GB.
+        // The floor must sit strictly inside that gap, at both ends.
+        //
+        // Both are `const` assertions on purpose: they are decidable at compile
+        // time, so a future edit to the floor fails the BUILD rather than
+        // waiting for someone to run the suite.
+        const MEASURED_DEATH_BAND_CEILING_GB: u64 = 1; // 0.36-0.63 rounds under 1
+        const MEASURED_IDLE_FLOOR_GB: u64 = 4; // 4.9 at the low end
+        const {
+            assert!(
+                DEFAULT_MIN_FREE_PHYS_GB > MEASURED_DEATH_BAND_CEILING_GB,
+                "the physical floor must clear the band where builds actually died"
+            );
+        }
+        const {
+            assert!(
+                DEFAULT_MIN_FREE_PHYS_GB <= MEASURED_IDLE_FLOOR_GB,
+                "the physical floor must be reachable at this box's measured idle, or \
+                 every build eats the whole mem_wait_max window and then builds anyway"
+            );
+        }
+    }
+
+    #[test]
+    fn the_physical_probe_is_windows_only_and_paired_with_its_total() {
+        // The observable in-repo invariant for the new arm. Two halves:
+        //
+        // 1. Availability and total agree about whether this platform answers
+        //    at all — a reading with no denominator cannot be rendered as
+        //    "0.61 of 31.71 GB", which is the whole point of the pair.
+        // 2. Off Windows the arm is INERT BY DESIGN, not broken: there
+        //    `available_commit_bytes` already reads MemAvailable (physical
+        //    available), so a second probe would apply two floors to one
+        //    quantity. `None` there is the correct answer, and the guard's
+        //    fail-open contract turns it into "this arm contributes nothing".
+        let avail = crate::build_monitor::available_phys_bytes();
+        let total = crate::build_monitor::total_phys_bytes();
+        assert_eq!(
+            avail.is_some(),
+            total.is_some(),
+            "the physical reading and its ceiling must come from the same probe"
+        );
+        if cfg!(windows) {
+            assert!(
+                avail.is_some(),
+                "on Windows the physical probe must answer — a silently-None probe \
+                 disarms this arm on exactly the box it exists to protect"
+            );
+        } else {
+            assert!(
+                avail.is_none(),
+                "off Windows this arm must stay inert; available_commit_bytes already \
+                 reads physical-available there"
+            );
+        }
     }
 
     #[test]
@@ -1360,6 +1476,9 @@ mod tests {
         }
         if std::env::var(MEM_WAIT_MAX_SECS_ENV).is_err() {
             assert_eq!(mem_wait_max_secs(), DEFAULT_MEM_WAIT_MAX_SECS);
+        }
+        if std::env::var(MIN_FREE_PHYS_GB_ENV).is_err() {
+            assert_eq!(min_free_phys_gb(), DEFAULT_MIN_FREE_PHYS_GB);
         }
     }
 

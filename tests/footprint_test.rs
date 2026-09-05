@@ -4,7 +4,8 @@
 use std::sync::{Arc, OnceLock};
 
 use qontinui_supervisor::build_monitor::{
-    available_commit_bytes, check_disk_guard, disk_guard_allows, ram_guard_allows,
+    available_commit_bytes, available_phys_bytes, check_disk_guard, disk_guard_allows,
+    format_pool_reading, ram_guard_allows, total_phys_bytes,
 };
 use qontinui_supervisor::config::{RunnerConfig, SupervisorConfig};
 use qontinui_supervisor::error::SupervisorError;
@@ -60,20 +61,148 @@ fn disk_guard_pure_threshold() {
     assert!(disk_guard_allows(Some(100 * gb), 30));
 }
 
+/// The commit arm alone, with the physical arm disabled (`0`) so it cannot
+/// contribute. This is the pre-2026-08-29 contract, unchanged.
 #[test]
 fn ram_guard_pure_threshold() {
     let gb = 1024u64 * 1024 * 1024;
     // 0 disables the guard regardless of free commit.
-    assert!(ram_guard_allows(Some(0), 0));
+    assert!(ram_guard_allows(Some(0), 0, None, 0));
     // None (probe failed) fails open — a telemetry gap must never brick the
     // build lane, same contract as the disk guard.
-    assert!(ram_guard_allows(None, 5));
+    assert!(ram_guard_allows(None, 5, None, 0));
     // Below the floor → defer. 3 GB free is roughly where the 2026-07-30
     // rustc abort (0xc0000409) happened on the MSI box.
-    assert!(!ram_guard_allows(Some(3 * gb), 5));
+    assert!(!ram_guard_allows(Some(3 * gb), 5, None, 0));
     // At/above the floor → build.
-    assert!(ram_guard_allows(Some(5 * gb), 5));
-    assert!(ram_guard_allows(Some(32 * gb), 5));
+    assert!(ram_guard_allows(Some(5 * gb), 5, None, 0));
+    assert!(ram_guard_allows(Some(32 * gb), 5, None, 0));
+}
+
+/// The two arms are INDEPENDENT: each floor is checked against its own
+/// reading, and the guard allows only when both agree.
+///
+/// The row that matters most is the last one — the 2026-08-29 measurement:
+/// 30 GB free commit (6x the 5 GB floor, so the commit arm passes instantly)
+/// with 629 MB free physical. A commit-only guard let that build through and
+/// it died twice.
+#[test]
+fn ram_guard_checks_commit_and_physical_independently() {
+    let gb = 1024u64 * 1024 * 1024;
+    let mb = 1024u64 * 1024;
+
+    // Both healthy → build.
+    assert!(ram_guard_allows(Some(30 * gb), 5, Some(20 * gb), 3));
+    // Commit short, physical fine → defer.
+    assert!(!ram_guard_allows(Some(2 * gb), 5, Some(20 * gb), 3));
+    // Physical short, commit fine → defer. THE DEFECT: this is the case every
+    // memory floor in this fleet used to pass.
+    assert!(!ram_guard_allows(Some(30 * gb), 5, Some(629 * mb), 3));
+    // Both short → defer.
+    assert!(!ram_guard_allows(Some(2 * gb), 5, Some(629 * mb), 3));
+    // Exactly at each floor → build (>=, not >).
+    assert!(ram_guard_allows(Some(5 * gb), 5, Some(3 * gb), 3));
+    // One byte under the physical floor → defer.
+    assert!(!ram_guard_allows(Some(5 * gb), 5, Some(3 * gb - 1), 3));
+}
+
+/// The full `Option` matrix. **`None` must never read as `0`** — an absent
+/// reading contributes nothing to the verdict, in either direction. If it were
+/// folded into a number, a box whose physical probe went dark would defer
+/// every build for the whole wait window and then build anyway.
+#[test]
+fn ram_guard_fails_open_per_arm_and_never_reads_none_as_zero() {
+    let gb = 1024u64 * 1024 * 1024;
+
+    // Neither sensor readable → allowed. Not "0 bytes free"; no reading.
+    assert!(ram_guard_allows(None, 5, None, 3));
+    // Commit readable and short, physical dark → the commit arm still holds.
+    assert!(!ram_guard_allows(Some(gb), 5, None, 3));
+    // Commit readable and healthy, physical dark → EXACTLY today's behaviour on
+    // a box that can read commit but not physical (every non-Windows host).
+    assert!(ram_guard_allows(Some(30 * gb), 5, None, 3));
+    // Physical readable and short, commit dark → the physical arm alone holds.
+    assert!(!ram_guard_allows(None, 5, Some(gb), 3));
+    // Physical readable and healthy, commit dark → allowed.
+    assert!(ram_guard_allows(None, 5, Some(30 * gb), 3));
+
+    // A genuine Some(0) is NOT the same as None: it is a real extreme-pressure
+    // reading and must defer. This is the pair that proves the distinction is
+    // carried through rather than collapsed.
+    assert!(!ram_guard_allows(Some(0), 5, None, 3));
+    assert!(!ram_guard_allows(None, 5, Some(0), 3));
+    assert!(ram_guard_allows(None, 5, None, 3));
+}
+
+/// Each `0` disables ONLY its own arm; both `0` disables the guard entirely.
+#[test]
+fn ram_guard_zero_floors_disable_one_arm_each() {
+    let gb = 1024u64 * 1024 * 1024;
+
+    // Physical floor 0: a starved physical pool cannot hold the build.
+    assert!(ram_guard_allows(Some(30 * gb), 5, Some(0), 0));
+    // ...but the commit floor is untouched by that 0.
+    assert!(!ram_guard_allows(Some(gb), 5, Some(0), 0));
+
+    // Commit floor 0: a starved commit pool cannot hold the build.
+    assert!(ram_guard_allows(Some(0), 0, Some(30 * gb), 3));
+    // ...but the physical floor is untouched by that 0.
+    assert!(!ram_guard_allows(Some(0), 0, Some(gb), 3));
+
+    // Both 0 → fully disabled, whatever the readings say.
+    assert!(ram_guard_allows(Some(0), 0, Some(0), 0));
+    assert!(ram_guard_allows(None, 0, None, 0));
+}
+
+/// A reading is always rendered against its own total. A bare "1.05 GB" is
+/// unreadable; "1.05 of 31.71 GB" is the whole message.
+#[test]
+fn pool_readings_render_against_their_own_total() {
+    let gb = 1024u64 * 1024 * 1024;
+
+    assert_eq!(
+        format_pool_reading("physical", Some(gb / 2), Some(32 * gb)),
+        "physical 0.50 of 32.00 GB"
+    );
+    // An unknown total is SAID, not defaulted to something that reads as fact.
+    assert_eq!(
+        format_pool_reading("commit", Some(5 * gb), None),
+        "commit 5.00 GB of an unknown total"
+    );
+    // An unknown reading is "unavailable", never a zero.
+    assert_eq!(
+        format_pool_reading("physical", None, Some(32 * gb)),
+        "physical unavailable"
+    );
+    assert_eq!(
+        format_pool_reading("physical", None, None),
+        "physical unavailable"
+    );
+}
+
+/// The physical probe is Windows-only by design; off Windows it is inert
+/// because `available_commit_bytes` already reads physical-available there.
+#[test]
+fn phys_probe_answers_on_windows_and_is_inert_elsewhere() {
+    let avail = available_phys_bytes();
+    assert_eq!(
+        avail.is_some(),
+        total_phys_bytes().is_some(),
+        "the physical reading and its ceiling must come from the same probe"
+    );
+    if cfg!(windows) {
+        assert!(avail.is_some(), "physical probe returned None on Windows");
+        assert!(
+            avail.unwrap() > 64 * 1024 * 1024,
+            "implausible free physical: {:?}",
+            avail
+        );
+    } else {
+        assert!(
+            avail.is_none(),
+            "off Windows the physical arm must stay inert, not double-count MemAvailable"
+        );
+    }
 }
 
 #[test]

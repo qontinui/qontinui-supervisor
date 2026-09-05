@@ -208,24 +208,121 @@ pub fn disk_guard_allows_for(
     }
 }
 
-/// Pure threshold check for the pre-permit memory guard. Same shape and
-/// fail-open contract as [`disk_guard_allows`].
+/// One gigabyte in bytes. Named because the guard's floors are declared in GB
+/// and its probes answer in bytes, and an inline `1024 * 1024 * 1024` at each
+/// conversion is exactly how two lanes come to compare different units.
+pub const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Pure threshold check for **one** memory pool. Same shape and fail-open
+/// contract as [`disk_guard_allows`], applied per pool so that neither arm of
+/// [`ram_guard_allows`] can disarm the other.
 ///
-/// - `min_free_gb == 0` ⇒ guard disabled, always allow.
+/// - `min_free_gb == 0` ⇒ THIS arm disabled, always allow.
 /// - `available_bytes == None` ⇒ the probe could not be read; FAIL OPEN. A
 ///   telemetry gap must never brick the build lane (identical reasoning to the
 ///   disk guard, and to `cargo-guard.sh`'s `free_mem_gb` returning empty).
-pub fn ram_guard_allows(available_bytes: Option<u64>, min_free_gb: u64) -> bool {
+///
+/// **`None` is never folded into a number.** It is not "0 bytes free" (which
+/// would defer every build on a box whose probe went dark) and not "plenty"
+/// (which would be a lie); it is the absence of a reading, and the only honest
+/// response to it is to let the caller's build through.
+fn pool_allows(available_bytes: Option<u64>, min_free_gb: u64) -> bool {
     if min_free_gb == 0 {
         return true;
     }
     match available_bytes {
         None => true,
-        Some(free) => {
-            let required = min_free_gb.saturating_mul(1024 * 1024 * 1024);
-            free >= required
-        }
+        Some(free) => free >= min_free_gb.saturating_mul(GIB),
     }
+}
+
+/// Pure threshold check for the pre-permit memory guard, over the **two
+/// independently-exhausted** memory pools this fleet has measured.
+///
+/// The arms are deliberately kept as two `Option`s with two floors rather than
+/// reduced to one number: free commit and free physical are different
+/// quantities that share a unit, and the whole §A3 rename exists because a lane
+/// that folds them together stops being able to say which one it is enforcing.
+/// Measured on the MSI box 2026-08-29: free commit **30 GB** — six times the
+/// 5 GB commit floor, so the commit arm passed instantly — while free physical
+/// was **629 MB**, with one `rustc` holding 7.4 GB resident and `vmmemWSL`
+/// 9.6 GB of a 32.5 GB box. Two builds died there (`os error 1455`
+/// / `ERROR_COMMITMENT_LIMIT`, cascading into ~170 bogus compile errors in
+/// unrelated crates, then `memory allocation of 1835008 bytes failed` →
+/// `rust_oom` → `0xc0000409`). A commit-only gate is blind to half of it.
+///
+/// Allowed iff **both** arms allow. Each arm is independently disabled by its
+/// own `0` floor and independently fails open on its own `None`:
+///
+/// | commit reading | physical reading | behaviour |
+/// |---|---|---|
+/// | `Some` | `Some` | both floors enforced |
+/// | `Some` | `None` | exactly today's behaviour — commit floor alone |
+/// | `None` | `Some` | physical floor alone |
+/// | `None` | `None` | allowed (no telemetry ⇒ never brick the lane) |
+///
+/// This mirrors `cargo-guard.sh`'s two-arm `ensure_memory_headroom`, which
+/// shipped 2026-08-29 (qontinui-claude-config PR #428) — the two lanes are
+/// meant to agree.
+pub fn ram_guard_allows(
+    available_commit_bytes: Option<u64>,
+    min_free_commit_gb: u64,
+    available_phys_bytes: Option<u64>,
+    min_free_phys_gb: u64,
+) -> bool {
+    pool_allows(available_commit_bytes, min_free_commit_gb)
+        && pool_allows(available_phys_bytes, min_free_phys_gb)
+}
+
+/// Render one pool's reading **against its own total**, for a human.
+///
+/// A bare `1.05 GB` means nothing — 1.05 of 4 is a dying box, 1.05 of 128 is a
+/// different dying box, and neither is legible without the denominator. An
+/// unknown total is said out loud rather than defaulted, and an unknown reading
+/// renders as `unavailable` rather than as a zero.
+pub fn format_pool_reading(label: &str, available: Option<u64>, total: Option<u64>) -> String {
+    let gib = |b: u64| b as f64 / GIB as f64;
+    match (available, total) {
+        (None, _) => format!("{label} unavailable"),
+        (Some(a), Some(t)) => format!("{label} {:.2} of {:.2} GB", gib(a), gib(t)),
+        (Some(a), None) => format!("{label} {:.2} GB of an unknown total", gib(a)),
+    }
+}
+
+/// One `GlobalMemoryStatusEx` reading: the four counters the guard and the
+/// published sample care about, from a **single** syscall.
+///
+/// The call already fills all four — commit and physical, available and total —
+/// so reading physical alongside commit costs nothing extra, and taking them
+/// from one call means the pair can never describe two different instants.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct MemoryStatus {
+    avail_commit: u64,
+    total_commit: u64,
+    avail_phys: u64,
+    total_phys: u64,
+}
+
+/// Sample all four Windows memory counters in one `GlobalMemoryStatusEx` call,
+/// or `None` when the call fails.
+#[cfg(windows)]
+fn memory_status() -> Option<MemoryStatus> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a correctly-sized, zeroed MEMORYSTATUSEX with
+    // `dwLength` set as the API requires; the call only writes into it.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 {
+        return None;
+    }
+    Some(MemoryStatus {
+        avail_commit: status.ullAvailPageFile,
+        total_commit: status.ullTotalPageFile,
+        avail_phys: status.ullAvailPhys,
+        total_phys: status.ullTotalPhys,
+    })
 }
 
 /// Available **commit** in bytes, or `None` when it cannot be determined.
@@ -238,28 +335,75 @@ pub fn ram_guard_allows(available_bytes: Option<u64>, min_free_gb: u64) -> bool 
 /// both lanes on one metric is the point, so the floor means the same thing
 /// wherever it is applied.
 ///
+/// **NOT THE WHOLE STORY, as of 2026-08-29.** Physical is exhausted
+/// independently of commit on this fleet and binds just as hard — free commit
+/// read 30 GB while free physical read 629 MB and the build died. The sentence
+/// above means free-physical is the misleading number *for the commit
+/// question*; do not read it as "physical never matters". The second arm is
+/// [`available_phys_bytes`], and this function's contract is unchanged.
+///
 /// Non-Windows uses sysinfo's `available_memory()` (MemAvailable on Linux).
 /// The supervisor only ships on Windows, but the fallback keeps this compiling
 /// and unit-testable on a Linux CI gate.
 pub fn available_commit_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        // SAFETY: `status` is a correctly-sized, zeroed MEMORYSTATUSEX with
-        // `dwLength` set as the API requires; the call only writes into it.
-        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        if ok == 0 {
-            return None;
-        }
-        Some(status.ullAvailPageFile)
+        memory_status().map(|s| s.avail_commit)
     }
     #[cfg(not(windows))]
     {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         Some(sys.available_memory())
+    }
+}
+
+/// Available **physical** memory in bytes (`ullAvailPhys`), or `None` when it
+/// cannot be determined — the caller fails OPEN on this arm alone, leaving the
+/// commit floor intact.
+///
+/// **WINDOWS ONLY, by design** — the same choice `cargo-guard.sh`'s
+/// `free_phys_mem_gb()` makes. The commit/physical split is a Windows
+/// phenomenon: there [`available_commit_bytes`] reads `ullAvailPageFile`, which
+/// can sit at 30 GB while physical is exhausted. On Linux
+/// [`available_commit_bytes`] already reads sysinfo's `available_memory()`
+/// (MemAvailable) — i.e. physical-available — so that lane is *already*
+/// watching the binding pool, and a second identical probe here would silently
+/// apply two floors to one quantity. Returning `None` off Windows makes this
+/// arm inert rather than wrong.
+///
+/// Free from a telemetry standpoint on Windows: it is the same
+/// `GlobalMemoryStatusEx` call [`available_commit_bytes`] already makes, whose
+/// physical fields were previously discarded.
+pub fn available_phys_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        memory_status().map(|s| s.avail_phys)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Total **physical** memory in bytes (`ullTotalPhys`), the ceiling
+/// [`available_phys_bytes`] is measured against, or `None` when it cannot be
+/// determined.
+///
+/// Windows-only for the same reason as [`available_phys_bytes`]: it exists so
+/// the guard can say *"physical 0.61 of 31.71 GB"* rather than a bare byte
+/// count, and a denominator for a numerator that is always `None` off Windows
+/// would be noise. sysinfo's `total_memory()` is still published under its own
+/// name by `footprint::memory_snapshot`, which is a different surface with a
+/// different contract.
+pub fn total_phys_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        memory_status().map(|s| s.total_phys)
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -278,16 +422,7 @@ pub fn available_commit_bytes() -> Option<u64> {
 pub fn total_commit_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        // SAFETY: identical contract to `available_commit_bytes` — a
-        // correctly-sized, zeroed MEMORYSTATUSEX with `dwLength` set.
-        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        if ok == 0 {
-            return None;
-        }
-        Some(status.ullTotalPageFile)
+        memory_status().map(|s| s.total_commit)
     }
     #[cfg(not(windows))]
     {
@@ -310,9 +445,23 @@ pub fn total_commit_bytes() -> Option<u64> {
 /// Fails open on an unreadable probe and after `mem_wait_max_secs()`, so a
 /// mis-measuring box can never deadlock the build lane — it degrades to exactly
 /// today's behavior (build anyway, accept the OOM risk) rather than wedging.
+///
+/// **Two floors, checked independently** (commit and physical — see
+/// [`ram_guard_allows`]), and every message names WHICH pool is short and
+/// reports its reading against that pool's own total. The remedies differ
+/// (close a peer build vs. shrink WSL), so an operator who cannot tell which
+/// exhaustion mode they are in cannot act on the message at all.
+///
+/// **`mem_wait_max_secs()` is load-bearing for the physical arm specifically.**
+/// Free physical pins low under saturation and may never climb back over a
+/// threshold on its own, so a lane waiting on it alone could wait forever. The
+/// timer is the non-physical release path that makes this arm safe to add.
 pub async fn check_ram_guard(state: &SharedState) {
     let min_free_gb = crate::config::min_free_ram_gb();
-    if min_free_gb == 0 {
+    let min_free_phys_gb = crate::config::min_free_phys_gb();
+    // Both arms off is the documented full disable; one arm off leaves the
+    // other enforcing, so this can only short-circuit when neither is armed.
+    if min_free_gb == 0 && min_free_phys_gb == 0 {
         return;
     }
     let wait_max = crate::config::mem_wait_max_secs();
@@ -322,12 +471,21 @@ pub async fn check_ram_guard(state: &SharedState) {
 
     loop {
         let free = available_commit_bytes();
-        if ram_guard_allows(free, min_free_gb) {
+        // Not probed at all when the arm is disabled: an inert arm must not pay
+        // a syscall, and `None` is what the rest of this function already reads
+        // as "contributes nothing".
+        let free_phys = if min_free_phys_gb > 0 {
+            available_phys_bytes()
+        } else {
+            None
+        };
+
+        if ram_guard_allows(free, min_free_gb, free_phys, min_free_phys_gb) {
             if warned {
-                let gb = free.unwrap_or(0) / (1024 * 1024 * 1024);
                 let msg = format!(
-                    "Pre-permit memory guard: headroom recovered ({} GB free commit) — building",
-                    gb
+                    "Pre-permit memory guard: headroom recovered ({}, {}) — building",
+                    format_pool_reading("commit", free, total_commit_bytes()),
+                    format_pool_reading("physical", free_phys, total_phys_bytes()),
                 );
                 info!("{}", msg);
                 state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
@@ -335,15 +493,31 @@ pub async fn check_ram_guard(state: &SharedState) {
             return;
         }
 
-        let free_gb = free.unwrap_or(0) / (1024 * 1024 * 1024);
+        // Name every pool that is short, not just the first one — being short
+        // on both is a different situation from being short on either.
+        let mut short: Vec<String> = Vec::new();
+        if !pool_allows(free, min_free_gb) {
+            short.push(format!(
+                "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB)",
+                format_pool_reading("commit", free, total_commit_bytes()),
+                min_free_gb,
+            ));
+        }
+        if !pool_allows(free_phys, min_free_phys_gb) {
+            short.push(format!(
+                "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB)",
+                format_pool_reading("physical", free_phys, total_phys_bytes()),
+                min_free_phys_gb,
+            ));
+        }
+        let short = short.join("; ");
 
         if waited >= wait_max {
             let msg = format!(
-                "Pre-permit memory guard: still only {} GB free commit after {}s \
-                 (floor {} GB, QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB) — building anyway; \
+                "Pre-permit memory guard: still short after {}s — {} — building anyway; \
                  expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
                  incremental cache).",
-                free_gb, waited, min_free_gb,
+                waited, short,
             );
             warn!("{}", msg);
             state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
@@ -352,9 +526,9 @@ pub async fn check_ram_guard(state: &SharedState) {
 
         if !warned {
             let msg = format!(
-                "Pre-permit memory guard: low memory — {} GB free commit < {} GB floor; \
-                 deferring build up to {}s for headroom (no build slot is held while waiting).",
-                free_gb, min_free_gb, wait_max,
+                "Pre-permit memory guard: low memory — {}; deferring build up to {}s for \
+                 headroom (no build slot is held while waiting).",
+                short, wait_max,
             );
             warn!("{}", msg);
             state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;

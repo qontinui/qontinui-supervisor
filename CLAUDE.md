@@ -707,6 +707,55 @@ The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, ov
 
 It measures free COMMIT, not free physical RAM, deliberately: the binding constraint for a big rustc is the commit limit, and builds here have died at ~90% commit while free-physical looked healthy. On Windows it reads `GlobalMemoryStatusEx().ullAvailPageFile` — the same counter `cargo-guard.sh` reads via `Win32_OperatingSystem.FreeVirtualMemory`.
 
+**Second floor: free PHYSICAL (2026-08-29).** The paragraph above is
+misleading *for the commit question* only — it is not "physical never
+matters". The two pools are exhausted **independently** on this fleet, and a
+commit-only gate is blind to half of it. Measured on the MSI box 2026-08-29:
+free commit **30 GB** (6x the 5 GB floor, so that arm passed instantly) while
+free physical was **629 MB**, with one `rustc` at 7.4 GB resident and
+`vmmemWSL` at 9.6 GB of a 32.5 GB box. Two builds died — `os error 1455`
+(`ERROR_COMMITMENT_LIMIT`), cascading into ~170 **bogus** compile errors in
+unrelated crates, then `memory allocation of 1835008 bytes failed` →
+`rust_oom` → `0xc0000409`.
+
+So `check_ram_guard` now defers when **either** floor is short:
+
+- `QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB` (default **3**) reads
+  `GlobalMemoryStatusEx().ullAvailPhys` — the *same syscall* the commit probe
+  already made, whose physical fields were being thrown away, so the second arm
+  costs zero extra syscalls.
+- **3 GiB is deliberate: the floor must be REACHABLE.** The guard sleeps up to
+  `MEM_WAIT_MAX_SECS` and then builds anyway, so an unreachable floor protects
+  nothing and only delays every build by the whole window. That box **idles at
+  4.9-8.8 GB** free physical and **died at 0.36-0.63 GB**; 3 clears the death
+  band and stays under the idle band. `config.rs`'s
+  `the_physical_floor_is_reachable_at_this_boxs_measured_idle` pins both ends at
+  compile time.
+- **The arms are independent in every direction.** Each floor's `0` disables
+  **only its own arm**; each probe's `None` fails open on **its own arm** only,
+  so a box that can read commit but not physical behaves exactly as before, and
+  a box that can read neither is allowed. The two readings are never folded into
+  one number — that collapse is the "different quantities sharing a unit" bug
+  the §A3 rename fixed.
+- **Windows-only, by design.** `build_monitor::available_phys_bytes` returns
+  `None` off Windows, where `available_commit_bytes` already reads
+  `MemAvailable` (physical-available) and a second probe would apply two floors
+  to one quantity. Same choice as `cargo-guard.sh`'s `free_phys_mem_gb`.
+- **Every message names WHICH pool is short and reads it against that pool's
+  own total** — `physical 0.61 of 31.71 GB < 3 GB
+  (QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB)`, both pools joined by `; ` when both
+  are short. A bare "0.61 GB" is unreadable; the remedies differ per pool (close
+  a peer build vs. shrink WSL).
+- **`MEM_WAIT_MAX_SECS` is load-bearing for this arm specifically** and must not
+  be removed: free physical pins low under saturation and may never climb back
+  over a threshold, so a lane waiting on it alone could wait forever. The timer
+  is the non-physical release path that makes the physical floor safe to add.
+
+This mirrors `cargo-guard.sh`'s two-arm `ensure_memory_headroom`
+(qontinui-claude-config PR #428) — the lanes are meant to agree — but nothing in
+this repo can observe that lane, so the agreement is a shared derivation from
+one measurement, not an invariant anything here pins.
+
 **sccache S3-backend degrade (2026-08-04, `src/sccache_guard.rs`).** All **four** compiling cargo spawns the supervisor makes in-process are guarded: the pool build, the `qontinui-shim` sidecar build and the slot prewarm go through `sccache_guard::guarded_cargo()`; the build-submission runner (`build_submissions::run_submission` — `POST /build/submit`, `submit_detached`, and the **spawn-test** `submit_spawn`) is a bare `tokio::process::Command`, so it applies the same decision via `sccache_guard::degrade_cargo_env_if_s3()`. Two cargo spawns are excluded deliberately: `process::manager`'s two are inside `#[cfg(test)]`, and `routes::runners`' `cargo clean --target-dir` compiles nothing so `RUSTC_WRAPPER` cannot affect it. If the **live** sccache server reports an S3 backend (the `s3,` marker in `sccache --show-stats`), the spawn gets `RUSTC_WRAPPER=""` and a loud WARN naming the regression and the fix; the build still runs, uncached. This closes the one hole in the two shipped guards: `cargo-guard.sh`'s `maybe_degrade_on_s3_backend` only fires when a **shell** invokes it, and the `sccache-backend-guard.sh` PreToolUse hook only intercepts an **agent's** Bash calls — so the most-built path on this machine had no guard at all.
 
 Three properties are load-bearing, not style: (1) the predicate probes the server's **actual latched backend**, never `SCCACHE_BUCKET` — the env var misses a latched server whose spawning env was since cleaned and false-fires on a set-but-unused value; (2) the probe reads `--show-stats` **stdout only** (a bucket name in an sccache diagnostic on stderr must not read as a latched backend) and runs **only when a listener already holds the pinned sccache port** — resolved env → the nearest repo `.cargo/config.toml` `[env]` → **`$CARGO_HOME/config.toml`** (the user-level tier, which is where this machine's 4230 pin actually comes from) → 4226 — and never starts the daemon, because starting it from a polluted env is the exact mechanism that re-pins the machine to S3. That ordering is a strong mitigation rather than an absolute guarantee (sccache can idle out between the check and the probe), which is why the probe child also has the S3 selectors stripped from its env. The listener check binds the port to test it, so it now runs briefly before every guarded cargo spawn — no `SO_REUSEADDR`, never listened on, so it leaves no TIME_WAIT behind; (3) it **degrades, never fails**, and fails **open** on any inconclusive probe — withholding caching on a question it could not answer would be worse than the regression.
@@ -1342,7 +1391,8 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Expo port | 8081 |
 | Build no-progress watchdog | 20min (1200s) of no output AND no new artifact, override `QONTINUI_SUPERVISOR_BUILD_NO_PROGRESS_SECS` (clamped [60, 7200]) |
 | Build absolute backstop | 6h (21600s), override `QONTINUI_SUPERVISOR_BUILD_TIMEOUT_SECS` (clamped [300, 86400]) |
-| Pre-permit memory floor | 5 GB free **commit**, override `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (0 disables); defers up to `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) then builds anyway |
+| Pre-permit memory floor (commit) | 5 GB free **commit**, override `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (0 disables this arm only); defers up to `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) then builds anyway |
+| Pre-permit memory floor (physical) | 3 GB free **physical**, override `QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB` (0 disables this arm only). Windows-only probe (`ullAvailPhys`); inert elsewhere. Same 900s defer window |
 | Port wait timeout | 120s |
 | Graceful kill timeout | 5s |
 | Log buffer | 500 entries (override: `QONTINUI_SUPERVISOR_LOG_BUFFER_SIZE`, clamped [100, 10000]) |
