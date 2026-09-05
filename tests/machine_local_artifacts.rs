@@ -47,6 +47,11 @@ const MACHINE_LOCAL_ARTIFACTS: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // Added runner-side by `703123d50` ("exclude .claude/worktrees/ so a skill
+    // worktree cannot pin a repo"). Already ignored here by the broader
+    // `.claude/` entry, so only the roster lagged — which is precisely the
+    // drift `roster_matches_the_runner_definition` exists to announce.
+    ".claude/worktrees/",
 ];
 
 fn repo_root() -> PathBuf {

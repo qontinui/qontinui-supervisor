@@ -38,7 +38,7 @@ __pycache__/
 
 # The rest of the runner's machine-local artifact roster. That roster is
 # enumerated in code — qontinui-runner `src-tauri/src/fleet.rs`,
-# MANAGED_REPO_EXCLUDES — and has exactly four entries. `agent-worktrees/`
+# MANAGED_REPO_EXCLUDES — and has five entries. `agent-worktrees/`
 # (line 12) and `.mcp.json` (line 17) above are two of them; these are the two
 # the earlier promotions left behind:
 #
