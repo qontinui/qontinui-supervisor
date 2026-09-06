@@ -162,6 +162,134 @@ jobs:
                  "deleted tests. Do NOT lower the floor to make this pass."
             exit 1
           fi
+
+          # ── THE CROSS-LANGUAGE PIN MUST ITSELF HAVE RUN ──────────────────
+          # tests/orphan_kill_contract.rs is the only thing making the
+          # EXPECTED_PRIMITIVES roster in the orphan-kill step below and the
+          # exercised("…") names in tests/orphan_kill_unix.rs the same set. It
+          # is an ordinary integration test, so it rides in THIS step — and
+          # losing it costs a handful of tests out of a floor of 1200, which
+          # the count above cannot see. Deleting or renaming that target would
+          # therefore be SILENT, leaving the two files free to drift apart
+          # again with nothing left to notice. That is the same
+          # fail-open-on-deletion the exercised census was written to refuse,
+          # one level up: applied to the refusal itself.
+          #
+          # This reads output the step already tee'd rather than adding a
+          # `cargo test --test orphan_kill_contract` step of its own. cargo
+          # recompiles the crate between targets in this job (~44s per re-run
+          # step, measured on run 34045424390), and a pin costing a third of
+          # those is a pin somebody eventually deletes for time.
+          #
+          # MIN_CONTRACT_TESTS is pinned from the RUST side —
+          # `the_workflow_requires_this_pin_to_have_run` asserts it equals the
+          # number of test attributes in that file — so raising it is part of
+          # adding a test there, rather than a number that quietly stops
+          # covering everything written after it.
+          MIN_CONTRACT_TESTS=7
+          CONTRACT=$(awk '
+            {
+              line = $0
+              gsub(/\033\[[0-9;]*[a-zA-Z]/, "", line)
+              sub(/\r$/, "", line)
+              # cargo writes `Running tests/<name>.rs (…/<name>-<hash>)` and
+              # only then hands the pipe to that binary, so the summary that
+              # follows belongs to that target and to no other. Both streams
+              # are merged into this file by the 2>&1 above.
+              #
+              # EVERY target header re-arms or DISARMS, rather than only ours
+              # arming: a binary that dies before its harness prints anything
+              # would otherwise leave the flag set and credit this target with
+              # the NEXT one count — a number attributed to a run that did not
+              # happen, which is the failure this census exists to name.
+              # `Doc-tests <crate>` is a header too and gets the same treatment.
+              if (line ~ /^ *(Running|Doc-tests) /) {
+                armed = 0
+                if (line ~ /orphan_kill_contract/) { found = 1; armed = 1 }
+                next
+              }
+              # The SUMMARY line, not `running N tests`: libtest counts IGNORED
+              # tests in that one, so an #[ignore] sweep over the pin would read
+              # as a full run while asserting nothing — and the error below
+              # promises to catch exactly that. passed+failed is also what the
+              # sibling cargo-vacuity-count.awk sums, so the two censuses in
+              # this step cannot disagree about what "ran" means. The `^` is a
+              # deliberate TIGHTENING over that sibling, which matches
+              # `/test result:/` anywhere: an indented summary inside a
+              # captured-output block must not be credited to this target.
+              if (armed && line ~ /^test result:/) {
+                n = split(line, w, /[ \t]+/)
+                for (i = 1; i < n; i++) {
+                  if (w[i+1] ~ /^passed/) ran += w[i] + 0
+                  if (w[i+1] ~ /^failed/) ran += w[i] + 0
+                }
+                armed = 0
+              }
+            }
+            END { print (found ? 1 : 0), ran+0 }
+          ' /tmp/cargo-test.out)
+          CONTRACT_FOUND=${CONTRACT%% *}
+          CONTRACT_RAN=${CONTRACT##* }
+          # The reading must BE a reading before it is compared. Two failure
+          # modes, and only one of them is already covered:
+          #
+          # * awk exits NON-ZERO (unopenable input; a parse error left by a
+          #   later edit). `set -e` is active and the exit status of a BARE
+          #   `VAR=$(cmd)` assignment is the substitution's, so the step already
+          #   aborts here — measured, exit 2 — before this guard is reached.
+          #   Keep the assignment bare: `export VAR=$(cmd)` and `local VAR=$(cmd)`
+          #   both return 0 and would silently re-open this arm.
+          # * awk exits ZERO without printing a usable pair — its END did not
+          #   run, or its output grammar changed. NOTHING catches that: both
+          #   numeric tests below then run as `[ "" -eq 0 ]`, which fails as a
+          #   CONDITION rather than as a command, so `set -e` does NOT fire and
+          #   the step falls through to `exit ${SUBRC}` reporting green. This
+          #   guard exists for that arm.
+          #
+          # Each field is checked WHOLLY. `[0-9]*` anchors one character and
+          # then `*` swallows the rest, so a digit-prefixed non-number — `1x`,
+          # exactly what a half-broken program emits — passed a combined
+          # `[0-9]*:[0-9]*` and fell through to green.
+          #
+          # An unreadable census is UNKNOWN, never a pass.
+          for reading in "${CONTRACT_FOUND}" "${CONTRACT_RAN}"; do
+            case "${reading}" in
+              ''|*[!0-9]*)
+                echo "::error::The orphan_kill_contract census produced no usable reading" \
+                     "(awk printed '${CONTRACT}'; this field was '${reading}'). That is" \
+                     "UNKNOWN, not a pass. awk exited 0 here — a non-zero exit aborts the" \
+                     "assignment above under set -e and never reaches this — so its END block" \
+                     "did not run, or its output grammar changed. This is a fault in the" \
+                     "census, not a verdict about the pin. Fix the census."
+                exit 1 ;;
+            esac
+          done
+          echo "supervisor orphan_kill_contract: target ran ${CONTRACT_FOUND}, ${CONTRACT_RAN} tests (floor ${MIN_CONTRACT_TESTS})"
+          if [ "${CONTRACT_FOUND}" -eq 0 ]; then
+            echo "::error::This run shows no orphan_kill_contract target. That file is the" \
+                 "ONLY thing keeping EXPECTED_PRIMITIVES below in step with the" \
+                 "exercised(\"…\") names in tests/orphan_kill_unix.rs, and it is small enough" \
+                 "to vanish inside the ${MIN_TESTS}-test floor above without moving it, so" \
+                 "the likely cause is that it was deleted or renamed: restore it. The other" \
+                 "cause is that this step stopped emitting libtest grammar — a switch to" \
+                 "nextest prints neither 'Running <target>' nor 'running N tests', and this" \
+                 "census reads only those. If that is what changed, EXTEND the census to the" \
+                 "new grammar (cargo-vacuity-count.awk reads both); do not delete it, which" \
+                 "would make the next real deletion silent again. Third cause: cargo itself" \
+                 "exited ${SUBRC}, and a non-zero value there means the target failed to" \
+                 "BUILD — cargo own error above is then what to read, not this message."
+            exit 1
+          fi
+          if [ "${CONTRACT_RAN}" -lt "${MIN_CONTRACT_TESTS}" ]; then
+            echo "::error::The orphan_kill_contract target ran ${CONTRACT_RAN} test(s)," \
+                 "floor ${MIN_CONTRACT_TESTS}. The target survived with tests removed or" \
+                 "ignored, so the pin compiled without asserting what it claims to. Restore" \
+                 "them; lowering this floor un-gates the cross-language contract it proves." \
+                 "cargo itself exited ${SUBRC}; a non-zero value there with a count of 0" \
+                 "means the binary DIED before its harness printed anything, and cargo's" \
+                 "own error above is the cause rather than removed tests."
+            exit 1
+          fi
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
