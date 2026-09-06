@@ -174,3 +174,27 @@ describe('api.devStartStatus()', () => {
     expect(result.services[0].available).toBe(true);
   });
 });
+
+describe('api.builds()', () => {
+  it('calls GET /builds with no query string — a request path must never trigger git fetch', async () => {
+    const data = {
+      pool_size: 3,
+      available_permits: 3,
+      lkg: null,
+      origin_main_drift: null,
+      origin_main_drift_probe: {
+        state: 'pending',
+        computed_at: null,
+        age_secs: null,
+        computed_for_sha: null,
+      },
+      pool_behind_local_build: null,
+    };
+    mockFetchOk(data);
+
+    const result = await api.builds();
+
+    expect(globalThis.fetch).toHaveBeenCalledWith('/builds', undefined);
+    expect(result).toEqual(data);
+  });
+});

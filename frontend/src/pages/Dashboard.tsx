@@ -21,6 +21,12 @@ import { ConfirmDialog, confirm } from '../components/ConfirmDialog';
 import { SmallBtn } from '../components/SmallBtn';
 import { StatusDot } from '../components/StatusDot';
 import { RunnerStatusBadge } from '../components/RunnerStatusBadge';
+import {
+  BuildStalenessBadge,
+  BuildsReading,
+  deriveBuildStaleness,
+  formatRelativeAgeSecs,
+} from '../components/BuildStalenessBadge';
 import { useSSE } from '../hooks/useSSE';
 
 // ─── Log Viewer ──────────────────────────────────────────────────────────────
@@ -635,16 +641,6 @@ function PanicModal({
 // threshold — see `STALE_BINARY_THRESHOLD_SECS` in
 // `qontinui-supervisor/src/process/manager.rs`.
 
-/// Format a seconds delta as a short relative-time string ("42s ago", "5m ago",
-/// "2h ago"). Intentionally coarse — the badge is a hint, not a log line.
-function formatRelativeAgeSecs(secs: number): string {
-  const abs = Math.abs(Math.floor(secs));
-  if (abs < 60) return `${abs}s`;
-  if (abs < 3600) return `${Math.floor(abs / 60)}m`;
-  if (abs < 86400) return `${Math.floor(abs / 3600)}h`;
-  return `${Math.floor(abs / 86400)}d`;
-}
-
 function StaleBinaryBadge({
   stale,
   runnerName,
@@ -715,6 +711,20 @@ function StaleBinaryBadge({
 // every row (e.g. Remove only shows when the runner is down + non-primary),
 // but the hook registration runs unconditionally so IDs are stable.
 
+const REBUILD_TITLE =
+  'Rebuild the runner binary, then restart. The build runs detached on the supervisor (~1-30 min); this button shows live build progress and re-enables when the build finishes.';
+/// Prepended to the PRIMARY's Rebuild tooltip while the build-staleness badge
+/// warns. The incident's operator had this button, did not know it applied,
+/// and reached for dev-start.ps1 instead — which cannot promote a binary.
+const REBUILD_RESOLVES_DRIFT_PREFIX =
+  'The pool is behind — this rebuilds origin/main (not your working tree) and restarts, which resolves it.';
+/// Cadence for `GET /builds`. Slower than the 5 s `/runners` poll: the drift
+/// reading it carries is refreshed server-side every 120 s, so anything faster
+/// buys nothing, and the call must never carry a query string (see
+/// `BuildsResponse`). Never triggers a `git fetch` — that runs on the
+/// supervisor's own ticker.
+const BUILDS_POLL_MS = 30_000;
+
 interface RunnerRowProps {
   runner: RunnerInstance;
   busy: string | null;
@@ -727,6 +737,10 @@ interface RunnerRowProps {
   onStop: () => void;
   onRestart: () => void;
   onRebuild: () => void;
+  /// What the panel currently knows about `GET /builds` (polled every
+  /// `BUILDS_POLL_MS`). Rendered as the build-staleness badge on the PRIMARY
+  /// row only: the origin/main pin is a primary-only rebuild policy.
+  buildsReading: BuildsReading;
   /// Primary only: arm the deferred "rebuild once sessions drain" watcher.
   onRebuildWhenIdle: () => void;
   onRemove: () => void;
@@ -741,6 +755,7 @@ function RunnerRow({
   onStop,
   onRestart,
   onRebuild,
+  buildsReading,
   onRebuildWhenIdle,
   onRemove,
   onProtect,
@@ -761,6 +776,14 @@ function RunnerRow({
   // button shows the live phase label instead of freezing on "Rebuilding...".
   const isBuilding = !!buildingLabel;
   const actionsDisabled = busy !== null || isBuilding;
+  // Build staleness (plan 2026-09-05-supervisor-knows-the-runner-is-stale):
+  // only the primary's Rebuild builds origin/main, so only the primary row
+  // carries the badge and the tooltip amendment.
+  const buildStaleness = isPrimary ? deriveBuildStaleness(buildsReading) : null;
+  const rebuildTitle =
+    buildStaleness?.verdict === 'warn'
+      ? `${REBUILD_RESOLVES_DRIFT_PREFIX} ${REBUILD_TITLE}`
+      : REBUILD_TITLE;
 
   // Register per-row action buttons with UI Bridge. Keep IDs stable per
   // runner id (matches the F5 spec: `runner-<id>-<action>`).
@@ -864,6 +887,13 @@ function RunnerRow({
               disabled={actionsDisabled}
             />
           )}
+          {isPrimary && (
+            <BuildStalenessBadge
+              reading={buildsReading}
+              runnerName={r.name}
+              elementId={`runner-${r.id}-build-staleness-badge`}
+            />
+          )}
           <RunnerWatchdogBadge watchdog={r.watchdog} running={r.running} isPrimary={isPrimary} />
         </div>
       </td>
@@ -909,7 +939,7 @@ function RunnerRow({
             style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem' }}
             disabled={actionsDisabled}
             onClick={onRebuild}
-            title="Rebuild the runner binary, then restart. The build runs detached on the supervisor (~1-30 min); this button shows live build progress and re-enables when the build finishes."
+            title={rebuildTitle}
           >
             {isBuilding ? (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
@@ -1000,6 +1030,10 @@ function RunnerInstancesPanel() {
   // build reaches a terminal state. Replaces the old "frozen Rebuilding... button"
   // behavior now that the HTTP call returns in ~1s instead of blocking the build.
   const [building, setBuilding] = useState<Record<string, string>>({});
+  // `GET /builds` reading for the build-staleness badge. `pending` until the
+  // first answer; a failed poll is kept as `error` (the badge reads UNKNOWN
+  // with the reason), never collapsed to "clean".
+  const [buildsReading, setBuildsReading] = useState<BuildsReading>({ kind: 'pending' });
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState('');
   const [newPort, setNewPort] = useState('');
@@ -1029,6 +1063,21 @@ function RunnerInstancesPanel() {
     const interval = setInterval(refresh, 5000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  const refreshBuilds = useCallback(async () => {
+    try {
+      const builds = await api.builds();
+      setBuildsReading({ kind: 'ok', builds });
+    } catch (e) {
+      setBuildsReading({ kind: 'error', message: e instanceof Error ? e.message : 'unknown' });
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshBuilds();
+    const interval = setInterval(refreshBuilds, BUILDS_POLL_MS);
+    return () => clearInterval(interval);
+  }, [refreshBuilds]);
 
   const doAction = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key);
@@ -1281,6 +1330,7 @@ function RunnerInstancesPanel() {
                         await doRestart(false);
                       })
                     }
+                    buildsReading={buildsReading}
                     onRebuild={async () => {
                       // Confirm BEFORE submitting the detached build. The build
                       // itself now runs async (202 in ~1s), with live progress

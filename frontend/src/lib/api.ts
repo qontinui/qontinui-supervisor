@@ -184,6 +184,82 @@ export interface StaleBinarySummary {
   age_delta_secs: number;
 }
 
+/// `origin_main_drift` on `GET /builds` — the pool's LKG sha versus
+/// `origin/main`. Non-null ONLY when the cached probe is `fresh` AND the LKG
+/// is behind or diverged; `null` when up to date, pending, superseded or not
+/// computable — which is why `OriginMainDriftProbe` must be read beside it.
+/// Producer: `qontinui-supervisor/src/routes/runners.rs` (`list_builds`).
+export interface OriginMainDrift {
+  built_sha: string;
+  origin_main_sha: string;
+  behind_count: number;
+  is_ancestor: boolean;
+  diverged: boolean;
+  fetched: boolean;
+}
+
+/// Provenance for `origin_main_drift`. The reading is a timer-refreshed cache
+/// (the supervisor's `origin_drift` ticker, 120 s by default) because
+/// computing it runs `git fetch`; `state` says whether the cached answer is a
+/// current one, and `age_secs` how old it is. `pending` = never computed
+/// (every other field `null`); `superseded_lkg_moved` = computed for a
+/// previous LKG sha; `not_computable` = no remote / not a repo.
+export type OriginMainDriftProbeState =
+  | 'fresh'
+  | 'not_computable'
+  | 'superseded_lkg_moved'
+  | 'pending';
+
+export interface OriginMainDriftProbe {
+  state: OriginMainDriftProbeState;
+  computed_at: string | null;
+  age_secs: number | null;
+  computed_for_sha: string | null;
+}
+
+/// `pool_behind_local_build` on `GET /builds`: the picked pool slot's exe is
+/// OLDER than a local `target/debug` build. `adopted` says whether resolution
+/// will run the local build (`true`) or the slot exe (`false` — the
+/// operator's build is NOT what runs). `message` is the supervisor's own prose
+/// naming the remedy; render it verbatim. Producer:
+/// `qontinui-supervisor/src/process/manager.rs` (`LocalBuildAdoption::message`).
+export interface PoolBehindLocalBuild {
+  legacy_path: string;
+  legacy_mtime: string;
+  picked_slot_id: number;
+  picked_slot_mtime: string;
+  target_dir_source: string;
+  adopted: boolean;
+  local_build_sha: string | null;
+  local_build_source: string | null;
+  message: string;
+}
+
+/// `lkg` on `GET /builds` — the last-known-good runner binary.
+export interface LkgSummary {
+  /// RFC3339 wall-clock time the LKG build completed.
+  built_at: string;
+  source_slot: number | null;
+  exe_size: number | null;
+  sha: string | null;
+  source: string | null;
+}
+
+/// `GET /builds`. Only the fields the dashboard reads are typed strictly; the
+/// rest of the (large) payload is admitted through the index signature.
+/// **Never send a query string** — `?refresh_footprint=1` forces a synchronous
+/// disk walk on the supervisor, and the drift reading is served from cache by
+/// design (a request path must never trigger `git fetch`).
+export interface BuildsResponse {
+  pool_size: number;
+  available_permits: number;
+  lkg: LkgSummary | null;
+  origin_main_drift: OriginMainDrift | null;
+  origin_main_drift_probe: OriginMainDriftProbe;
+  pool_behind_local_build: PoolBehindLocalBuild | null;
+  [key: string]: unknown;
+}
+
 /// Phase 2b startup-panic telemetry. Parsed from the runner's
 /// `runner-panic.log` when the supervisor observes a non-zero exit AND a
 /// fresh panic file is on disk (see
@@ -918,6 +994,8 @@ export const api = {
 
   // Supervisor
   health: () => fetchJson<HealthResponse>('/health'),
+  /// `GET /builds`, always without a query string — see `BuildsResponse`.
+  builds: () => fetchJson<BuildsResponse>('/builds'),
   runnerRestart: (rebuild: boolean) =>
     fetchJson<DetachedBuildResponse>('/runner/restart', {
       method: 'POST',
