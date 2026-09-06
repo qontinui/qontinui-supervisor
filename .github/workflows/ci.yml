@@ -122,6 +122,23 @@ jobs:
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
 
+      # Same reason, for the orphan-kill suite — and here the silence is not
+      # merely unaudited, it is a green that can mean the suite never ran.
+      # Every one of its three tests SKIPS rather than fails on an environmental
+      # unknown, by design: the port is already in use, `python3` could not be
+      # spawned or exited before binding, or the `lsof` probe could not run at
+      # all (`Err` is UNKNOWN, never "nothing was listening"). Each skip prints
+      # its reason and then returns, so the test passes — and `cargo test`
+      # swallows stdout for a passing test, leaving a green that is
+      # indistinguishable from three real runs against a real listener.
+      #
+      # These are the only tests in this repo that exercise the D7 kill
+      # primitives against a live OS process, so "did they actually run" is the
+      # question the suite exists to answer. --nocapture puts each skip reason
+      # in the log where it can be read. Already compiled by the step above.
+      - name: Record the orphan-kill suite's skip reasons
+        run: cargo test --test orphan_kill_unix -- --nocapture
+
       - name: Build
         run: cargo build
 
