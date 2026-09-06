@@ -14,6 +14,21 @@
 //! probe behaviour around it is UNKNOWN, not covered — CI here is
 //! `ubuntu-latest` only, so a Windows integration test would be gated by
 //! nothing at all.
+//!
+//! **Every test here SKIPS rather than fails on an environmental unknown**, and
+//! that is deliberate: an `lsof` that cannot run, an absent `python3` and an
+//! occupied port are all UNKNOWN *about the kill primitives* rather than
+//! verdicts on them, so a developer on such a box is not handed a red that
+//! blames code it never reached. The cost of that choice is that a skip PASSES,
+//! and three skips are indistinguishable from three real runs.
+//!
+//! So each test prints one machine-readable line saying which it was:
+//! [`EXERCISED_MARKER`] when the primitive really was driven against a live
+//! listener, [`SKIP_MARKER`] with the reason when it was not. CI re-runs this
+//! target with `--nocapture` and requires one exercised line per primitive —
+//! the assertion lives THERE, not here, because `ubuntu-latest` is a controlled
+//! machine where an unrunnable probe is a broken runner rather than a fact to
+//! accept, while a developer's laptop is not.
 #![cfg(not(target_os = "windows"))]
 
 use std::process::Stdio;
@@ -31,6 +46,46 @@ use qontinui_supervisor::process::proc_kill;
 /// coincidence; one constant makes it structural.
 const POLL_ATTEMPTS: usize = 50;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Prefix on the one line a test prints when it DECLINES to run.
+///
+/// Every skip below prints its reason and `return`s, so the test PASSES; CI
+/// re-runs this target with `--nocapture` so those reasons reach the log. A
+/// reason nothing counts is still only evidence to a reader who happens to
+/// look, and the failure this suite exists to catch is precisely the one nobody
+/// looks for. The prefix is what lets the workflow step print the reasons back
+/// when its census comes up short, instead of leaving an operator to scroll.
+const SKIP_MARKER: &str = "ORPHAN_KILL_SKIP";
+
+/// Prefix on the one line a test prints when it DID exercise its primitive
+/// against a live listener, all assertions passed and nothing was skipped.
+///
+/// **This is the countable half, and the one the CI step gates on.** Counting
+/// SKIPS would be an absence check and fails OPEN: delete the skip calls, rename
+/// the prefix, or delete the tests, and a skip census reads zero and reports
+/// green — the same absence-reads-as-coverage shape this file's header refuses.
+/// A census of POSITIVE evidence fails CLOSED on every one of those paths,
+/// because each removes an `ORPHAN_KILL_EXERCISED` line the step requires to be
+/// present.
+///
+/// One line per D7 primitive — `kill_by_port`, `kill_by_pid_tree`,
+/// `find_pid_on_port` — and that count is the workflow's floor.
+const EXERCISED_MARKER: &str = "ORPHAN_KILL_EXERCISED";
+
+/// Announce a skip. The single place the wording lives; the probe-unavailable
+/// message used to be spelled out separately at four call sites.
+fn skip(reason: &str) {
+    eprintln!("{SKIP_MARKER}: {reason}");
+}
+
+/// Announce that `primitive` was exercised against a real, live listener.
+///
+/// Call this ONLY where the fixture was established and every assertion ran. A
+/// marker printed on a skip path would make the census a tautology — which is
+/// the defect it exists to detect.
+fn exercised(primitive: &str) {
+    eprintln!("{EXERCISED_MARKER}: {primitive}");
+}
 
 /// A spawned listener child, OWNED so it cannot outlive the test.
 ///
@@ -105,7 +160,9 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("python3 could not be spawned ({e}); skipping (fixture unavailable)");
+            skip(&format!(
+                "python3 could not be spawned ({e}) (fixture unavailable)"
+            ));
             return None;
         }
     };
@@ -116,10 +173,10 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
             return Some(listener);
         }
         if let Ok(Some(status)) = listener.child.try_wait() {
-            eprintln!(
-                "python3 listener exited with {status} before binding port {port}; \
-                 skipping (fixture unusable)"
-            );
+            skip(&format!(
+                "python3 listener exited with {status} before binding port {port} \
+                 (fixture unusable)"
+            ));
             return None;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -185,7 +242,7 @@ async fn kill_by_port_frees_a_real_held_port() {
     // isolation; pick a high one in-range to reduce collision odds).
     let port: u16 = 9898;
     if is_port_listening(port) {
-        eprintln!("port {port} already in use; skipping (env not clean)");
+        skip(&format!("port {port} already in use (env not clean)"));
         return;
     }
 
@@ -204,7 +261,7 @@ async fn kill_by_port_frees_a_real_held_port() {
         // The `lsof` probe could not RUN at all, which is UNKNOWN, not a defect
         // in the kill logic under test — skip rather than assert against a probe
         // that never answered. The Listener guard kills and reaps on the way out.
-        eprintln!("listener probe unavailable ({e}); skipping");
+        skip(&format!("listener probe unavailable ({e})"));
         return;
     }
 
@@ -214,7 +271,7 @@ async fn kill_by_port_frees_a_real_held_port() {
     let killed = match proc_kill::kill_by_port(port).await {
         Ok(killed) => killed,
         Err(e) => {
-            eprintln!("listener probe unavailable ({e}); skipping");
+            skip(&format!("listener probe unavailable ({e})"));
             return;
         }
     };
@@ -233,6 +290,11 @@ async fn kill_by_port_frees_a_real_held_port() {
         !is_port_listening(port),
         "orphan still holding port {port} after kill"
     );
+
+    // Last statement, after every assertion: reaching it is what the marker
+    // asserts. Printed earlier it would claim coverage a later assertion had not
+    // yet earned.
+    exercised("kill_by_port");
 }
 
 /// kill_by_pid_tree on the tracked PID must terminate the process — the
@@ -242,7 +304,7 @@ async fn kill_by_port_frees_a_real_held_port() {
 async fn kill_by_pid_tree_terminates_tracked_pid() {
     let port: u16 = 9897;
     if is_port_listening(port) {
-        eprintln!("port {port} already in use; skipping (env not clean)");
+        skip(&format!("port {port} already in use (env not clean)"));
         return;
     }
 
@@ -263,6 +325,7 @@ async fn kill_by_pid_tree_terminates_tracked_pid() {
     assert!(freed, "port {port} still held after kill_by_pid_tree(pid)");
 
     // The Listener guard reaps the killed child, so no zombie lingers.
+    exercised("kill_by_pid_tree");
 }
 
 /// find_pid_on_port must locate the real listener so the reconcile sweep can
@@ -271,7 +334,7 @@ async fn kill_by_pid_tree_terminates_tracked_pid() {
 async fn find_pid_on_port_locates_listener() {
     let port: u16 = 9896;
     if is_port_listening(port) {
-        eprintln!("port {port} already in use; skipping (env not clean)");
+        skip(&format!("port {port} already in use (env not clean)"));
         return;
     }
 
@@ -288,21 +351,27 @@ async fn find_pid_on_port_locates_listener() {
         // Three-state: the probe (lsof) could not run at all — that is UNKNOWN,
         // not "nothing was listening", so it must not be asserted against as a
         // wrong PID. Skip rather than fail a box with no lsof.
-        eprintln!("listener probe unavailable ({e}); skipping");
+        skip(&format!("listener probe unavailable ({e})"));
         return;
     }
 
     match proc_kill::find_pid_on_port(port).await {
-        Ok(found) => assert_eq!(
-            found,
-            Some(expected_pid),
-            "find_pid_on_port did not return the listener PID \
-             (lsof view while waiting: {view:?} — `NeverSaw` means the probe ran for the \
-             whole {POLL_ATTEMPTS}-attempt budget and never saw a listener the bind probe \
-             says is up, i.e. the probe is blind or still lagging, NOT find_pid_on_port \
-             returning a wrong PID)"
-        ),
-        Err(e) => eprintln!("listener probe unavailable ({e}); skipping"),
+        Ok(found) => {
+            assert_eq!(
+                found,
+                Some(expected_pid),
+                "find_pid_on_port did not return the listener PID \
+                 (lsof view while waiting: {view:?} — `NeverSaw` means the probe ran for the \
+                 whole {POLL_ATTEMPTS}-attempt budget and never saw a listener the bind probe \
+                 says is up, i.e. the probe is blind or still lagging, NOT find_pid_on_port \
+                 returning a wrong PID)"
+            );
+            // Only inside the `Ok` arm, and only after the assertion: the `Err`
+            // arm below is a skip, and a marker printed outside this match would
+            // claim the probe answered when it had not.
+            exercised("find_pid_on_port");
+        }
+        Err(e) => skip(&format!("listener probe unavailable ({e})")),
     }
 
     // Cleanup is the Listener guard's Drop — it kills and reaps on every exit
