@@ -879,12 +879,18 @@ mod tests {
             other => panic!("expected Exited (clean-exit arm), got {other:?}"),
         }
 
-        // Headline: returns promptly on the direct child's exit, NOT after the
-        // grandchild's 60s sleep and NOT via the 120s wall-clock timeout.
+        // Headline backstop. The two states it exists to separate are "returned
+        // on the direct child's exit" (~1s) and "wedged until the grandchild's
+        // 60s sleep" — so the bound sits between THOSE, not just above a quiet
+        // run. The old 20s was sized to the quiet path and reddened under fleet
+        // load (plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`).
+        let wedge_backstop = crate::test_clock::backstop(Duration::from_secs(30));
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < wedge_backstop,
             "clean-exit-with-inheriting-grandchild must return on the direct child's exit, \
-             not wait out the grandchild's 60s sleep; took {elapsed:?}"
+             not wait out the grandchild's 60s sleep; took {elapsed:?}, backstop \
+             {wedge_backstop:?} (half the 60s sleep it discriminates against)"
         );
     }
 
@@ -924,14 +930,15 @@ mod tests {
             .expect("run() should not error");
         let elapsed = start.elapsed();
 
-        assert!(
-            matches!(outcome, GuardedOutcome::TimedOut { .. }),
-            "expected TimedOut, got {outcome:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "timeout+tree-kill should complete well under the 60s grandchild sleep; took {elapsed:?}"
-        );
+        // WHICH budget fired is a property of the outcome, not of the clock:
+        // the 2s absolute backstop, never the no-progress arm.
+        match &outcome {
+            GuardedOutcome::TimedOut {
+                kind: TimeoutKind::Absolute,
+                ..
+            } => {}
+            other => panic!("expected TimedOut(Absolute), got {other:?}"),
+        }
 
         let grandchild_pid: u32 = std::fs::read_to_string(&marker)
             .ok()
@@ -944,17 +951,36 @@ mod tests {
             });
         let _ = std::fs::remove_file(&marker);
 
-        // Give the kernel a brief moment to finish tearing down the job tree.
-        for _ in 0..30 {
-            if !pid_is_alive(grandchild_pid) {
-                break;
-            }
+        // Give the kernel time to finish tearing down the job tree. This is a
+        // GIVE-UP budget on a poll-until-true loop, not a speed assertion: the
+        // loop exits the instant the pid is gone, so a generous budget costs a
+        // passing run nothing and only delays a genuine failure.
+        let teardown_budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+        let teardown_deadline = std::time::Instant::now() + teardown_budget;
+        while pid_is_alive(grandchild_pid) && std::time::Instant::now() < teardown_deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(
             !pid_is_alive(grandchild_pid),
             "grandchild PID {grandchild_pid} is still alive after the timeout — \
              tree-kill failed (the JobObject did not capture the descendant)"
+        );
+
+        // Backstop, asserted LAST and on purpose: the two assertions above are
+        // the claim (the absolute budget fired; the detached grandchild is
+        // gone), and a clock that reddens before them spends the reader's
+        // attention on the box instead of on the code. The bound separates
+        // "killed on the 2s budget" from "waited out the grandchild's 60s
+        // sleep", so it is derived from that 60s — the old 10s was derived from
+        // a ~2.2s quiet-path measurement and was violated twice on this fleet
+        // (11.46s on 2026-09-04, 13.99s on 2026-09-05) by runs that tree-killed
+        // correctly. Plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+        let wedge_backstop = crate::test_clock::backstop(Duration::from_secs(30));
+        assert!(
+            elapsed < wedge_backstop,
+            "timeout+tree-kill must complete on the 2s budget, not by waiting out the 60s \
+             grandchild sleep; took {elapsed:?}, backstop {wedge_backstop:?} (half that 60s)"
         );
     }
 
@@ -985,24 +1011,38 @@ mod tests {
             .expect("run() should not error even when the child hangs");
         let elapsed = start.elapsed();
 
-        assert!(
-            matches!(outcome, GuardedOutcome::TimedOut { .. }),
-            "cmd-wrapper hang must return TimedOut, got {outcome:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(12),
-            "timeout must fire ~4s in, well under the 60s ping; took {elapsed:?}"
-        );
-        assert!(
-            elapsed >= Duration::from_secs(2),
-            "should have actually waited for the ~4s timeout; took {elapsed:?}"
-        );
+        // The properties: the 4s absolute budget fired (not the no-progress
+        // arm), and the wrapped child really ran — so a live hang was
+        // exercised rather than a spawn failure.
+        match &outcome {
+            GuardedOutcome::TimedOut {
+                kind: TimeoutKind::Absolute,
+                ..
+            } => {}
+            other => panic!("cmd-wrapper hang must return TimedOut(Absolute), got {other:?}"),
+        }
         assert!(
             marker.exists(),
             "wrapped cmd child never ran (marker {marker:?} absent) — \
              the test did not exercise a live hang"
         );
         let _ = std::fs::remove_file(&marker);
+
+        // A LOWER bound is not the flaky shape and is deliberately not scaled:
+        // load can only push `elapsed` up, so this can only become more true.
+        // It guards the opposite failure — a timeout that fires instantly.
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "should have actually waited for the ~4s timeout; took {elapsed:?}"
+        );
+        // Backstop, derived from the 60s ping it discriminates against rather
+        // than from the ~4s quiet path (the old 12s was the latter).
+        let ping_backstop = crate::test_clock::backstop(Duration::from_secs(30));
+        assert!(
+            elapsed < ping_backstop,
+            "timeout must fire on the 4s budget, not by waiting out the 60s ping; \
+             took {elapsed:?}, backstop {ping_backstop:?} (half that 60s)"
+        );
     }
 
     /// A spawn failure (nonexistent program) must surface as a terminal `Err`
@@ -1044,13 +1084,21 @@ mod tests {
             .expect("run() should not error");
         let elapsed = start.elapsed();
 
+        // The property: the run ended by CANCELLATION, not by running to
+        // completion and not by the 60s absolute timeout. `Cancelled` is a
+        // distinct variant from `Exited` and `TimedOut`, so this alone
+        // separates the three states — the clock below only bounds the wedge.
         assert!(
             matches!(outcome, GuardedOutcome::Cancelled { .. }),
             "expected Cancelled, got {outcome:?}"
         );
+        // Backstop derived from the 60s ping/timeout it discriminates against,
+        // not from the ~0.2s quiet path (the old 8s was the latter).
+        let cancel_backstop = crate::test_clock::backstop(Duration::from_secs(30));
         assert!(
-            elapsed < Duration::from_secs(8),
-            "cancel should fire promptly, well under the 60s sleep/timeout; took {elapsed:?}"
+            elapsed < cancel_backstop,
+            "cancel must end the run on the token, not by waiting out the 60s sleep/timeout; \
+             took {elapsed:?}, backstop {cancel_backstop:?} (half that 60s)"
         );
     }
 
@@ -1116,16 +1164,41 @@ mod tests {
             .await
             .expect("run() should not error");
 
-        match &outcome {
-            GuardedOutcome::Exited(out) => assert!(
-                out.status.success(),
-                "progressing process should exit cleanly, got {:?}",
-                out.status
-            ),
+        let out = match &outcome {
+            GuardedOutcome::Exited(out) => out,
             other => panic!(
                 "a progressing process must NOT be killed by the no-progress watchdog; got {other:?}"
             ),
-        }
+        };
+        assert!(
+            out.status.success(),
+            "progressing process should exit cleanly, got {:?}",
+            out.status
+        );
+
+        // THE property, and it is a count rather than a clock: every one of the
+        // ticks reached us, so the process ran to the end of its loop instead
+        // of being killed part-way through. `EXPECTED_TICKS * 400ms` is 8s of
+        // steady output by construction, which is how this also proves the run
+        // outlived the 6s no-progress budget — without asking how busy the box
+        // was. Plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+        const EXPECTED_TICKS: usize = 20;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let ticks = stderr.matches("tick").count();
+        assert_eq!(
+            ticks, EXPECTED_TICKS,
+            "the watchdog must spare EVERY tick of a progressing process: saw {ticks} of \
+             {EXPECTED_TICKS} in {stderr:?}"
+        );
+
+        // Fixture self-check, kept as a LOWER bound and deliberately unscaled:
+        // load can only push elapsed up, so this cannot flake the way an upper
+        // bound does. It catches the one thing the tick count cannot — an
+        // interpreter whose sub-second `sleep` is a no-op, which would emit all
+        // 20 ticks in milliseconds and never reach the 6s budget at all
+        // (qontinui-supervisor #134, 2026-08-05, was the 12-iteration version
+        // of exactly this).
         assert!(
             start.elapsed() >= Duration::from_secs(7),
             "test did not actually outlive the 6s budget, so it proved nothing; elapsed {:?}",
@@ -1139,7 +1212,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn no_progress_watchdog_kills_a_silent_process() {
-        let start = std::time::Instant::now();
         let outcome = GuardedCommand::new("cmd", Duration::from_secs(120))
             .args(["/C", "ping -n 60 127.0.0.1 >nul"])
             .no_progress_timeout(Duration::from_secs(2))
@@ -1157,11 +1229,15 @@ mod tests {
             ),
             other => panic!("expected TimedOut(NoProgress), got {other:?}"),
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "the no-progress kill must fire on the 2s budget, not the 120s backstop; took {:?}",
-            start.elapsed()
-        );
+        // The wall-clock assertion that used to close this test ("fired on the
+        // 2s budget, not the 120s backstop") carried no information the match
+        // above does not: `TimeoutKind` names WHICH budget fired, and the
+        // `other =>` arm rejects `Absolute` outright. The outcome is the
+        // property; the stopwatch was a proxy for it, and a proxy that reddens
+        // under load. Plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+        // (The run is still bounded — by the guard's own 120s absolute
+        // backstop above, which is production code under test.)
     }
 
     /// A silent process whose EXTERNAL probe keeps changing (the cargo case: a

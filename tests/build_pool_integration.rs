@@ -118,15 +118,20 @@ async fn test_concurrent_slot_acquisition() {
     // last_successful_slot is set
     assert!(state.build_pool.last_successful_slot.read().await.is_some());
 
-    // 4th acquire should succeed immediately (all free)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(10),
-        state.build_pool.permits.clone().acquire_owned(),
-    )
-    .await;
-    assert!(result.is_ok(), "4th permit should be immediately available");
+    // A 4th acquire finds a free permit. This asks the semaphore whether a
+    // permit is available RIGHT NOW rather than racing a stopwatch against it:
+    // the previous spelling gave `acquire_owned()` a 10ms wall-clock window,
+    // which measures how busy the box is, not whether the pool released its
+    // permits. Plan
+    // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+    let permit = state
+        .build_pool
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .expect("a 4th permit must be available with every build finished");
     // Drop so we don't leak
-    drop(result.unwrap());
+    drop(permit);
 }
 
 /// When all permits are held, try_acquire should fail. After release all

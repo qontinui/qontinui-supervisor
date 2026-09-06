@@ -58,6 +58,8 @@ mod server;
 mod settings;
 mod spawn_worktree;
 mod state;
+#[cfg(test)]
+mod test_clock;
 mod trace_propagation;
 mod velocity;
 mod velocity_improvement;

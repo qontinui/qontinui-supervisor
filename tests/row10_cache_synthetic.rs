@@ -20,7 +20,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use qontinui_supervisor::bazel_remote::BazelRemoteClient;
 use qontinui_supervisor::build_submissions::BuildKind;
@@ -192,13 +192,22 @@ async fn item6_7_cache_hit_roundtrip_under_2s() {
         &artifact[..],
         "worker B fetched a non-byte-identical artifact"
     );
+    // IRREDUCIBLE, and deliberately so: this bound is not a proxy for a
+    // property, it IS the deliverable — Row 10's done-criterion is that a
+    // cache hit materializes in under 2s, which is what makes the cache worth
+    // having. There is nothing else to assert instead. Per Phase 3 of plan
+    // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`
+    // it therefore gets an environment override rather than a re-derivation;
+    // the 2s default stays the stated criterion (the test is `#[ignore]`d and
+    // needs a live bazel-remote, so it never runs in a pre-PR suite anyway).
+    let budget = qontinui_supervisor::test_clock::backstop(Duration::from_secs_f64(2.0));
     println!(
-        "Item 6/7: cache-hit path (AC get + CAS get) = {:.3}s (budget 2s)",
-        elapsed.as_secs_f64()
+        "Item 6/7: cache-hit path (AC get + CAS get) = {:.3}s (budget {:.3}s)",
+        elapsed.as_secs_f64(),
+        budget.as_secs_f64()
     );
     assert!(
-        elapsed.as_secs_f64() < 2.0,
-        "cache-hit path exceeded the 2s done-criteria budget: {:?}",
-        elapsed
+        elapsed < budget,
+        "cache-hit path exceeded the 2s done-criteria budget (scaled to {budget:?}): {elapsed:?}"
     );
 }

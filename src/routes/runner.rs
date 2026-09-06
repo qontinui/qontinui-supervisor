@@ -1555,24 +1555,54 @@ mod tests {
         // Make the detached build fail fast rather than spawn real cargo.
         state.build_pool.permits.close();
 
-        let started = std::time::Instant::now();
-        let resp = restart_runner(
-            State(state.clone()),
-            Query(StartWaitQuery { wait: false }),
-            Json(RestartRequest {
-                rebuild: true,
-                force: false,
-                // Legacy live-tree path so the closed-semaphore fast-fail is
-                // exercised deterministically without a network fetch /
-                // origin/main worktree materialization in the sandbox.
-                from_working_tree: true,
-                use_lkg: None,
-            }),
+        // DETACHMENT, PROVEN BY ORDERING RATHER THAN BY A STOPWATCH.
+        //
+        // This used to close with `elapsed < 2s`, which was both flaky under
+        // fleet load (measured 2.37s on 2026-09-05) and vacuous: with the pool
+        // semaphore closed the detached body fails fast, so a handler that
+        // AWAITED it would also have returned in milliseconds. The clock could
+        // not distinguish the two states it was there to separate.
+        //
+        // The submission store's write lock can. It is the detached task's
+        // first instruction (`build_submissions::submit_detached` → `spawn` →
+        // `submissions.write()`), and `restart_runner` itself never touches it,
+        // so holding it here pins the detached task at instruction one while
+        // leaving the handler free. A handler that awaited the detached body
+        // could not return; a detached one returns anyway. Plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+        let registration_gate = state.build_submissions.submissions.write().await;
+        // Not a speed budget: it turns "wedged forever" into a red instead of a
+        // hang, so it is sized against forever, not against a measured idle run.
+        let wedge_backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
+        let resp = tokio::time::timeout(
+            wedge_backstop,
+            restart_runner(
+                State(state.clone()),
+                Query(StartWaitQuery { wait: false }),
+                Json(RestartRequest {
+                    rebuild: true,
+                    force: false,
+                    // Legacy live-tree path so the closed-semaphore fast-fail is
+                    // exercised deterministically without a network fetch /
+                    // origin/main worktree materialization in the sandbox.
+                    from_working_tree: true,
+                    use_lkg: None,
+                }),
+            ),
         )
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the handler did not return while the detached task was pinned at its \
+                 registration lock — rebuild:true is AWAITING the build, not detaching \
+                 (waited {wedge_backstop:?})"
+            )
+        })
         .expect("handler ok")
         .into_response();
-        let elapsed = started.elapsed();
+        // Release the detached task now that the handler has demonstrably
+        // returned without it.
+        drop(registration_gate);
         let (status, body) = body_json(resp).await;
 
         assert_eq!(status, 202, "rebuild:true must return 202 (detached)");
@@ -1585,34 +1615,39 @@ mod tests {
             body["build_id"].is_string(),
             "must carry a submission id for /builds correlation"
         );
-        // The handler must NOT block on the build — it returns near-instantly.
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "handler should return fast (detached), took {:?}",
-            elapsed
-        );
-
         // submit_detached registers the submission on a spawned task; give it a
         // beat to insert, then confirm a new build is observable via the store
         // that backs GET /builds / GET /build/{id}/status.
         let build_id = body["build_id"].as_str().unwrap().to_string();
         let target = uuid::Uuid::parse_str(&build_id).expect("build_id is a uuid");
+        // Give-up budgets on poll-until-true loops, not speed assertions: each
+        // exits the instant its property holds, so a generous budget costs a
+        // passing run nothing and only delays a genuine failure. The old fixed
+        // 100 x 20ms was a 2s ceiling sized against a quiet box.
+        let register_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
+        let register_deadline = std::time::Instant::now() + register_budget;
         let mut arc = None;
-        for _ in 0..100 {
+        while std::time::Instant::now() < register_deadline {
             if let Some(a) = state.build_submissions.get(&target).await {
                 arc = Some(a);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let arc = arc.expect("the detached rebuild must register a build submission");
+        let arc = arc.unwrap_or_else(|| {
+            panic!(
+                "the detached rebuild must register a build submission (waited {register_budget:?})"
+            )
+        });
 
         // The detached task runs independently of this (already-returned)
         // handler. With the pool semaphore closed it fails fast and the
         // submission reaches a terminal status — proving the task ran to
         // completion on its own.
+        let terminal_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
+        let terminal_deadline = std::time::Instant::now() + terminal_budget;
         let mut terminal = false;
-        for _ in 0..100 {
+        while std::time::Instant::now() < terminal_deadline {
             if arc.read().await.status.is_terminal() {
                 terminal = true;
                 break;
@@ -1621,7 +1656,8 @@ mod tests {
         }
         assert!(
             terminal,
-            "the detached task must run to a terminal status independently of the handler"
+            "the detached task must run to a terminal status independently of the handler \
+             (waited {terminal_budget:?})"
         );
 
         // Plan §6 Phase 5 test 5c — Phase 3 path 1, the OBSERVED case, pinned
@@ -1634,7 +1670,12 @@ mod tests {
         // answers to the same question.
         let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
             .expect("action_id is a uuid");
-        let run = await_run_result(&state, action_id, std::time::Duration::from_secs(10)).await;
+        let run = await_run_result(
+            &state,
+            action_id,
+            crate::test_clock::poll_budget(std::time::Duration::from_secs(30)),
+        )
+        .await;
         assert!(
             run.is_failure(),
             "the detached body's failure must reach the action: {run:?}"
@@ -1664,7 +1705,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no terminal result was ever recorded for action {action_id}"
+                "no terminal result was ever recorded for action {action_id} within {budget:?}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1800,7 +1841,12 @@ mod tests {
         let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
             .expect("action_id is a uuid");
 
-        let run = await_run_result(&state, action_id, std::time::Duration::from_secs(10)).await;
+        let run = await_run_result(
+            &state,
+            action_id,
+            crate::test_clock::poll_budget(std::time::Duration::from_secs(30)),
+        )
+        .await;
         assert!(
             run.is_failure(),
             "a failed fix-and-rebuild must not leave the action's result as Ran: {run:?}"

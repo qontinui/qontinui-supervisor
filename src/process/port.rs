@@ -170,13 +170,37 @@ mod tests {
     fn test_free_port_reads_as_free() {
         // Grab an ephemeral port, then release it (no connection was ever
         // made, so no TIME_WAIT state exists) — the port must read free.
-        let (listener, port) = ephemeral_listener();
-        drop(listener);
-        assert!(
-            !is_port_listening(port),
-            "a freshly-released port {} with no connections must read as free",
-            port
-        );
+        //
+        // A RELEASED ephemeral port is no longer ours. On a loaded box a peer
+        // process — or another of this suite's own test binaries, several of
+        // which bind ephemeral ports — can take it in the window before the
+        // probe runs, and `is_port_listening` then correctly reports it held.
+        // That is a VOID FIXTURE, not a defect in the probe: measured red once
+        // in six consecutive full-suite runs on this fleet, 2026-09-06, while
+        // the probe was working perfectly. Retry on a fresh port rather than
+        // asserting on a stolen one.
+        //
+        // The assertion is not weakened. A probe that reported every free port
+        // as held would void every attempt and still fail — which is what the
+        // final-attempt message names. (Found while verifying plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`
+        // under concurrent load; it is the same "reds for a reason unrelated to
+        // the diff" defect measured in ports rather than in milliseconds.)
+        const ATTEMPTS: usize = 20;
+        for attempt in 1..=ATTEMPTS {
+            let (listener, port) = ephemeral_listener();
+            drop(listener);
+            if !is_port_listening(port) {
+                return;
+            }
+            assert!(
+                attempt < ATTEMPTS,
+                "a freshly-released port with no connections read as HELD on all {ATTEMPTS} \
+                 attempts (last: {port}) — either is_port_listening reports a free port as \
+                 held, or every ephemeral port this box handed out was taken between the \
+                 release and the probe"
+            );
+        }
     }
 
     /// Regression for the 2026-07-03 17:17Z stop-confirmation wedge: a

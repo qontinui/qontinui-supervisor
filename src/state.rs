@@ -2143,8 +2143,14 @@ mod tests {
         // Fires the same path that `routes/runner.rs::supervisor_shutdown` uses.
         state.signal_shutdown();
 
-        // Generous timeout: anything more than a few millis is a regression.
-        tokio::time::timeout(std::time::Duration::from_secs(1), signal)
+        // A give-up budget, not a speed assertion: the property is that the
+        // signal RESOLVES, and the await returns the instant it does. The
+        // previous 1s was sized against "a few millis on an idle box", which
+        // measures the box (plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`);
+        // widening a give-up budget weakens no assertion.
+        let budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
+        tokio::time::timeout(budget, signal)
             .await
             .expect("shutdown_signal must resolve once signal_shutdown fires")
             .expect("signal task must not panic");
@@ -2163,11 +2169,12 @@ mod tests {
         // Signal first, subscribe second.
         state.signal_shutdown();
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(1), state.shutdown_signal()).await;
+        // Give-up budget, same reasoning as above.
+        let budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
+        let result = tokio::time::timeout(budget, state.shutdown_signal()).await;
         assert!(
             result.is_ok(),
-            "late shutdown_signal subscriber must see the latched flag"
+            "late shutdown_signal subscriber must see the latched flag (waited {budget:?})"
         );
     }
 

@@ -151,7 +151,14 @@ async fn test_health_cache_notify() {
     // Notify should wake the task
     state.health_cache_notify.notify_one();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-    assert!(result.is_ok());
+    // Give-up budget on "the notified task wakes and finishes", not a speed
+    // assertion — the join returns the instant it does. Plan
+    // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+    let budget = qontinui_supervisor::test_clock::poll_budget(std::time::Duration::from_secs(30));
+    let result = tokio::time::timeout(budget, handle).await;
+    assert!(
+        result.is_ok(),
+        "notified task must finish within {budget:?}"
+    );
     assert!(result.unwrap().unwrap());
 }

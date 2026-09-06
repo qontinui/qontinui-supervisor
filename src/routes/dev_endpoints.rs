@@ -271,7 +271,11 @@ mod tests {
         let response = app.oneshot(req).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
 
-        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        // Give-up budget on "the emit reaches the subscriber", not a speed
+        // assertion — it returns the instant the value lands. Plan
+        // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+        let budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
+        let received = tokio::time::timeout(budget, rx.recv())
             .await
             .expect("recv must not time out")
             .expect("recv must yield Ok");

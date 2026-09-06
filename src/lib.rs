@@ -60,6 +60,14 @@ pub mod server;
 pub mod settings;
 pub mod spawn_worktree;
 pub mod state;
+/// Test-only wall-clock policy: the one place a residual deadline's size is
+/// decided, and the env knob that widens them. Plan
+/// `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
+///
+/// Always compiled (rather than `#[cfg(test)]`) so the integration-test
+/// binaries under `tests/` share ONE definition of the env knob's name with
+/// the in-crate unit tests; a second spelling is how the two drift apart.
+pub mod test_clock;
 // Phase 4.1 (`plans/2026-05-21-coordination-improvements.md`): per-machine
 // tree-sitter symbol watcher daemon. Reports `ClaimKind::Symbol` claims to
 // coord via the existing `/claims/{acquire,release}` endpoints. Shipped as

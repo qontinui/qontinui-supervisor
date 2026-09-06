@@ -633,7 +633,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the attribution watcher never folded an outcome in"
+                "the attribution watcher never folded an outcome in within {budget:?}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -717,7 +717,11 @@ mod tests {
         });
 
         // Well inside RESTART_WINDOW: the refusal closes the window early.
-        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        let outcome = await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await;
         assert_ne!(
             outcome.category,
             D3Category::Confirmed,
@@ -784,7 +788,11 @@ mod tests {
             reason: "cargo build failed: could not compile qontinui-runner".to_string(),
         });
 
-        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        let outcome = await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await;
         assert_ne!(outcome.category, D3Category::Confirmed);
         assert_eq!(outcome.category, D3Category::Failure);
         assert!(outcome
@@ -825,7 +833,11 @@ mod tests {
             },
         );
 
-        let outcome = await_outcome(&record, Duration::from_secs(10)).await;
+        let outcome = await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await;
         // No terminal result and no signatures: the pre-existing meaning of a
         // clean window is unchanged for an action that reported nothing.
         assert_eq!(outcome.category, D3Category::Confirmed);

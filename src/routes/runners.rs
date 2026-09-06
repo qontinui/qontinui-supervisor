@@ -7102,8 +7102,10 @@ mod tests {
     #[tokio::test]
     async fn queue_timeout_still_fires_while_actually_queued() {
         let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+        // Give-up budget on "the queue watcher fires at all", not a speed
+        // assertion — it returns the instant the watcher does.
         let phase = tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
             wait_out_queue_timeout(Duration::from_millis(150), marker),
         )
         .await
@@ -7117,8 +7119,9 @@ mod tests {
     #[tokio::test]
     async fn queue_timeout_covers_the_frontend_lock_wait() {
         let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingNpmLock.as_u8()));
+        // Give-up budget, same reasoning as the test above.
         let phase = tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
             wait_out_queue_timeout(Duration::from_millis(150), marker),
         )
         .await
