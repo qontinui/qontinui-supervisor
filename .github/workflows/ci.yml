@@ -106,8 +106,63 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
+      # The vacuity parser below is a COPY. Its source of record is
+      # qontinui-claude-config/scripts/lib/cargo-vacuity.sh, which this runner
+      # cannot reach, so the copy carries the source block's digest in its own
+      # header and this step asserts the file still matches it. That catches
+      # in-repo tampering; drift FROM the source is caught by
+      # qontinui-claude-config's lint-cargo-verification-form.py wherever both
+      # repos are checked out together. Neither half alone is a cross-repo gate,
+      # and saying so is the point — plan
+      # 2026-09-06-cross-repo-transcription-drift-has-no-ci-gate owns the general
+      # mechanism. Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
+      - name: The vacuity parser copy matches its declared digest
+        run: |
+          F=.github/scripts/cargo-vacuity-count.awk
+          WANT=$(sed -n 's/^# source-sha256:[[:space:]]*//p' "$F" | head -1)
+          [ -n "$WANT" ] || { echo "::error::$F carries no source-sha256 header"; exit 1; }
+          GOT=$(awk '/^# >>> CARGO_VACUITY_AWK /{f=1;next} /^# <<< CARGO_VACUITY_AWK /{f=0} f' "$F" | sha256sum | cut -d" " -f1)
+          echo "vacuity parser: declared ${WANT}, computed ${GOT}"
+          [ "$WANT" = "$GOT" ] || { echo "::error::$F has been edited in place. Re-copy the block from qontinui-claude-config/scripts/lib/cargo-vacuity.sh and restamp the digest."; exit 1; }
+
       - name: Run tests
-        run: cargo test
+        run: |
+          set +e
+          cargo test 2>&1 | tee /tmp/cargo-test.out
+          SUBRC=${PIPESTATUS[0]}
+          set -e
+
+          # ── TEST-COUNT FLOOR ────────────────────────────────────────────
+          # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
+          # A target-selection change can collapse this suite to a handful of
+          # tests while the step still exits 0 and prints a plausible summary.
+          # The floor is the only thing that sees that, and it is committed so
+          # that LOWERING it shows up in a diff.
+          #
+          # The parser is `awk -f`, from a file this repo commits, because the
+          # source of record lives in qontinui-claude-config and this runner
+          # never checks it out. `awk` always exits 0 and always prints a
+          # number; a `grep` here would exit non-zero on no match and, under
+          # this shell's `pipefail`, abort the step in exactly the zero-tests
+          # case the guard exists for.
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-test.out)
+          RAN=${VACUITY%% *}
+          SUMMARIES=${VACUITY##* }
+          MIN_TESTS=1200
+          echo "supervisor cargo test: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          if [ "${SUMMARIES}" -eq 0 ]; then
+            echo "::error::No test summary of either format was found in this run's output." \
+                 "The command exited ${SUBRC} but produced no evidence that any test executed." \
+                 "That is UNKNOWN, not a pass."
+            exit 1
+          fi
+          if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
+            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
+                 "suite collapsed — almost certainly a target-selection change rather than" \
+                 "deleted tests. Do NOT lower the floor to make this pass."
+            exit 1
+          fi
+          exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
 
@@ -118,7 +173,51 @@ jobs:
       # evidence is recorded. It is already compiled by the step above, so this
       # costs milliseconds.
       - name: Record the machine-local artifact roster verdict
-        run: cargo test --test machine_local_artifacts -- --nocapture
+        run: |
+          # `--test <target>` is a TARGET selector and cargo errors on an unknown
+          # target, so this step is already fail-closed against the target
+          # disappearing. The residual it is NOT closed against is the target
+          # surviving with every #[test] removed — exit 0, "0 passed", and a step
+          # whose own name claims a verdict was recorded. That is what the count
+          # assertion below covers; the floor is 1 because this target holds a
+          # handful of tests and a number pretending to be tighter would be made
+          # up rather than measured (5 on 2026-09-06).
+          set +e
+          cargo test --test machine_local_artifacts -- --nocapture 2>&1 | tee /tmp/cargo-mla.out
+          SUBRC=${PIPESTATUS[0]}
+          set -e
+
+          # ── TEST-COUNT FLOOR ────────────────────────────────────────────
+          # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
+          # A target-selection change can collapse this suite to a handful of
+          # tests while the step still exits 0 and prints a plausible summary.
+          # The floor is the only thing that sees that, and it is committed so
+          # that LOWERING it shows up in a diff.
+          #
+          # The parser is `awk -f`, from a file this repo commits, because the
+          # source of record lives in qontinui-claude-config and this runner
+          # never checks it out. `awk` always exits 0 and always prints a
+          # number; a `grep` here would exit non-zero on no match and, under
+          # this shell's `pipefail`, abort the step in exactly the zero-tests
+          # case the guard exists for.
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-mla.out)
+          RAN=${VACUITY%% *}
+          SUMMARIES=${VACUITY##* }
+          MIN_TESTS=1
+          echo "supervisor machine_local_artifacts: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          if [ "${SUMMARIES}" -eq 0 ]; then
+            echo "::error::No test summary of either format was found in this run's output." \
+                 "The command exited ${SUBRC} but produced no evidence that any test executed." \
+                 "That is UNKNOWN, not a pass."
+            exit 1
+          fi
+          if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
+            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
+                 "suite collapsed — almost certainly a target-selection change rather than" \
+                 "deleted tests. Do NOT lower the floor to make this pass."
+            exit 1
+          fi
+          exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
 
@@ -195,7 +294,49 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Assert compose() reproduces the local parity fixture
-        run: cargo test compose_parity
+        run: |
+          # A BARE NAME FILTER. Rename `compose_parity`, or cfg-gate it away, and
+          # this step runs 0 tests and exits 0 while its own name asserts a
+          # guarantee — the step would keep passing having asserted nothing.
+          # Measured 2026-09-06: 2 tests match. The floor is 1 rather than 2 so a
+          # legitimate consolidation does not red the step; what it catches is
+          # the filter matching NOTHING, which is the failure that is silent.
+          set +e
+          cargo test compose_parity 2>&1 | tee /tmp/cargo-parity.out
+          SUBRC=${PIPESTATUS[0]}
+          set -e
+
+          # ── TEST-COUNT FLOOR ────────────────────────────────────────────
+          # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
+          # A target-selection change can collapse this suite to a handful of
+          # tests while the step still exits 0 and prints a plausible summary.
+          # The floor is the only thing that sees that, and it is committed so
+          # that LOWERING it shows up in a diff.
+          #
+          # The parser is `awk -f`, from a file this repo commits, because the
+          # source of record lives in qontinui-claude-config and this runner
+          # never checks it out. `awk` always exits 0 and always prints a
+          # number; a `grep` here would exit non-zero on no match and, under
+          # this shell's `pipefail`, abort the step in exactly the zero-tests
+          # case the guard exists for.
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-parity.out)
+          RAN=${VACUITY%% *}
+          SUMMARIES=${VACUITY##* }
+          MIN_TESTS=1
+          echo "supervisor compose_parity: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          if [ "${SUMMARIES}" -eq 0 ]; then
+            echo "::error::No test summary of either format was found in this run's output." \
+                 "The command exited ${SUBRC} but produced no evidence that any test executed." \
+                 "That is UNKNOWN, not a pass."
+            exit 1
+          fi
+          if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
+            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
+                 "suite collapsed — almost certainly a target-selection change rather than" \
+                 "deleted tests. Do NOT lower the floor to make this pass."
+            exit 1
+          fi
+          exit "${SUBRC}"
 
   frontend-check:
     name: Frontend Check
