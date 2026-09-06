@@ -264,6 +264,20 @@ jobs:
           SUBRC=${PIPESTATUS[0]}
           set -e
 
+          # ── THE PRIMITIVE ROSTER ────────────────────────────────────────
+          # One name per D7 kill primitive, and the SINGLE declaration that
+          # drives both assertions below — the floor is derived from its length
+          # rather than written out again, so the two can never disagree.
+          #
+          # It is not free text. Every name here must be announced by an
+          # `exercised("…")` call in tests/orphan_kill_unix.rs and vice versa,
+          # which tests/orphan_kill_contract.rs asserts as an ordinary test in
+          # the `Run tests` step above — so a rename, an addition or a deletion
+          # reds on a developer's own box, naming the drift, instead of arriving
+          # here as a census that reads short and blames the CI runner.
+          EXPECTED_PRIMITIVES="kill_by_port kill_by_pid_tree find_pid_on_port"
+          MIN_TESTS=$(echo ${EXPECTED_PRIMITIVES} | wc -w | tr -d ' ')
+
           # ── TEST-COUNT FLOOR ────────────────────────────────────────────
           # Same parser and same reasoning as the two steps above: `awk` always
           # exits 0 and always prints a number, where a `grep` would exit
@@ -272,7 +286,6 @@ jobs:
           VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-orphan.out)
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
-          MIN_TESTS=3
           echo "supervisor orphan_kill_unix: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
@@ -283,13 +296,14 @@ jobs:
           if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
             echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). Unlike the floors above" \
                  "this one is not a round number below the measurement: the target holds one" \
-                 "test per D7 kill primitive (kill_by_port, kill_by_pid_tree," \
-                 "find_pid_on_port) and losing any of them loses that primitive's only" \
-                 "live-process coverage. Do NOT lower the floor to make this pass."
+                 "test per D7 kill primitive (${EXPECTED_PRIMITIVES}) and losing any of them" \
+                 "loses that primitive's only live-process coverage. Do NOT lower the floor to" \
+                 "make this pass — it is derived from the roster above, so lowering it means" \
+                 "dropping a primitive."
             exit 1
           fi
 
-          # ── EXERCISED CENSUS ────────────────────────────────────────────
+          # ── EXERCISED CENSUS, BY NAME ───────────────────────────────────
           # The floor above sees a target that COLLAPSED. It cannot see the
           # failure this suite is actually exposed to: all three tests present,
           # all three running, all three SKIPPING on an environmental unknown
@@ -302,22 +316,80 @@ jobs:
           #
           # The census counts POSITIVE evidence, never skips. A skip census would
           # fail OPEN — delete the skip calls, rename the marker, or delete the
-          # tests and it reads zero and reports green. Requiring N
-          # ORPHAN_KILL_EXERCISED lines fails CLOSED on every one of those paths.
-          # The markers are defined in tests/orphan_kill_unix.rs, one printed as
-          # the last act of each test after all of its assertions have passed.
-          MIN_EXERCISED=3
-          EXERCISED=$(awk '/ORPHAN_KILL_EXERCISED: /{n++} END{print n+0}' /tmp/cargo-orphan.out)
-          echo "supervisor orphan_kill_unix: ${EXERCISED} primitive(s) exercised against a live listener (floor ${MIN_EXERCISED})"
-          if [ "${EXERCISED}" -lt "${MIN_EXERCISED}" ]; then
-            echo "::error::Only ${EXERCISED} of ${MIN_EXERCISED} D7 kill primitives were exercised" \
-                 "against a live OS process. The suite exited ${SUBRC} and ran ${RAN} tests;" \
-                 "whatever that exit code says, the primitives were NOT tested, which is" \
+          # tests and it reads zero and reports green. Requiring the
+          # ORPHAN_KILL_EXERCISED announcements fails CLOSED on every one of
+          # those paths. The markers are defined in tests/orphan_kill_unix.rs,
+          # one printed as the last act of each test after all of its assertions
+          # have passed.
+          #
+          # BY NAME, not by count, and that distinction is the assertion. Each
+          # announcement carries the primitive it covers; counting the lines
+          # threw that payload away and asserted something weaker than this
+          # step's own contract. Three lines is not three primitives — two
+          # announcements of `kill_by_port` plus one of `kill_by_pid_tree`
+          # totals three while `find_pid_on_port` was never exercised at all,
+          # and a count reports that as green. Requiring each NAME on the roster
+          # is the check the message below has always claimed to be making, and
+          # it says which primitive is missing instead of only how many.
+          EXERCISED=$(awk '
+            {
+              line = $0
+              gsub(/\033\[[0-9;]*[a-zA-Z]/, "", line)
+              sub(/\r$/, "", line)
+              tag = "ORPHAN_KILL_EXERCISED: "
+              at = index(line, tag)
+              if (at > 0) {
+                name = substr(line, at + length(tag))
+                sub(/[^A-Za-z0-9_].*$/, "", name)
+                if (name != "") seen[name] = 1
+              }
+            }
+            END { for (n in seen) print n }
+          ' /tmp/cargo-orphan.out | sort | tr '\n' ' ')
+          EXERCISED=${EXERCISED% }
+          echo "supervisor orphan_kill_unix: exercised [${EXERCISED}] against a live listener (roster: ${EXPECTED_PRIMITIVES})"
+
+          # Both directions are a set-membership test, so pad BOTH haystacks on
+          # both sides and match on " <name> ". Leaning on the separator `tr`
+          # happens to leave behind would work today and is a trap for the next
+          # editor; an empty EXERCISED collapses to "  " and matches nothing,
+          # which is the correct reading of "no primitive was exercised".
+          HAVE=" ${EXERCISED} "
+          WANT=" ${EXPECTED_PRIMITIVES} "
+
+          MISSING=""
+          for p in ${EXPECTED_PRIMITIVES}; do
+            case "${HAVE}" in
+              *" ${p} "*) ;;
+              *) MISSING="${MISSING} ${p}" ;;
+            esac
+          done
+          UNGATED=""
+          for p in ${EXERCISED}; do
+            case "${WANT}" in
+              *" ${p} "*) ;;
+              *) UNGATED="${UNGATED} ${p}" ;;
+            esac
+          done
+
+          if [ -n "${MISSING}" ]; then
+            echo "::error::These D7 kill primitives were NOT exercised against a live OS" \
+                 "process:${MISSING}. The suite exited ${SUBRC} and ran ${RAN} tests;" \
+                 "whatever that exit code says, those primitives were not tested, which is" \
                  "UNKNOWN rather than a pass. Any reason a test gave for declining is listed" \
-                 "below. On ubuntu-latest all three should run: python3, lsof and ports" \
+                 "below. On ubuntu-latest all of them should run: python3, lsof and ports" \
                  "9896-9898 are all expected to be available. Fix the runner (or the test)," \
-                 "never this floor."
+                 "never this roster."
             awk '/ORPHAN_KILL_SKIP: /{print "  " $0}' /tmp/cargo-orphan.out
+            exit 1
+          fi
+          if [ -n "${UNGATED}" ]; then
+            echo "::error::The suite announced primitives this roster does not require:" \
+                 "${UNGATED}. An unlisted primitive is UNGATED — it may skip on every future" \
+                 "run and this census would stay green, because a census asserts the names it" \
+                 "was given. Add it to EXPECTED_PRIMITIVES above; do not delete the" \
+                 "announcement. tests/orphan_kill_contract.rs asserts the two stay in step and" \
+                 "should have failed in the 'Run tests' step before this one ran."
             exit 1
           fi
           exit "${SUBRC}"

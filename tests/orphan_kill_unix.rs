@@ -25,10 +25,15 @@
 //! So each test prints one machine-readable line saying which it was:
 //! [`EXERCISED_MARKER`] when the primitive really was driven against a live
 //! listener, [`SKIP_MARKER`] with the reason when it was not. CI re-runs this
-//! target with `--nocapture` and requires one exercised line per primitive —
-//! the assertion lives THERE, not here, because `ubuntu-latest` is a controlled
-//! machine where an unrunnable probe is a broken runner rather than a fact to
-//! accept, while a developer's laptop is not.
+//! target with `--nocapture` and requires an exercised line naming each
+//! primitive on its roster — the assertion lives THERE, not here, because
+//! `ubuntu-latest` is a controlled machine where an unrunnable probe is a
+//! broken runner rather than a fact to accept, while a developer's laptop is
+//! not.
+//!
+//! That split leaves the two halves agreeing only by string match across a
+//! language boundary, so `tests/orphan_kill_contract.rs` pins them together and
+//! runs everywhere — including on Windows, where this file compiles to nothing.
 #![cfg(not(target_os = "windows"))]
 
 use std::process::Stdio;
@@ -69,7 +74,17 @@ const SKIP_MARKER: &str = "ORPHAN_KILL_SKIP";
 /// present.
 ///
 /// One line per D7 primitive — `kill_by_port`, `kill_by_pid_tree`,
-/// `find_pid_on_port` — and that count is the workflow's floor.
+/// `find_pid_on_port` — and the workflow gates on those NAMES, not on how many
+/// lines appeared. A count is weaker than the contract it was written to
+/// enforce: two announcements of one primitive plus one of another totals three
+/// while a third primitive was never exercised. The `primitive` argument is
+/// therefore load-bearing, not decoration.
+///
+/// `tests/orphan_kill_contract.rs` pins the pair: the names announced here and
+/// the `EXPECTED_PRIMITIVES` roster in `.github/workflows/ci.yml` must be the
+/// same set, so renaming a primitive, or adding a test that announces nothing,
+/// fails on any developer's box rather than arriving in CI as a census that
+/// reads short and blames the runner.
 const EXERCISED_MARKER: &str = "ORPHAN_KILL_EXERCISED";
 
 /// Announce a skip. The single place the wording lives; the probe-unavailable
