@@ -351,8 +351,8 @@ mod tests {
             "https://user@api.qontinui.io",
             "https://api.qontinui.io@evil.example",
         ] {
-            let err = validate_backend_url(input)
-                .expect_err(&format!("must reject userinfo: {input:?}"));
+            let err =
+                validate_backend_url(input).expect_err(&format!("must reject userinfo: {input:?}"));
             assert!(err.contains("credentials"), "input: {input:?}, got: {err}");
         }
     }
