@@ -57,7 +57,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const SUITE: &str = "tests/orphan_kill_unix.rs";
 const WORKFLOW: &str = ".github/workflows/ci.yml";
@@ -65,8 +65,6 @@ const WORKFLOW: &str = ".github/workflows/ci.yml";
 /// how many tests it holds and that number has to come from somewhere that
 /// cannot go stale.
 const SELF: &str = "tests/orphan_kill_contract.rs";
-/// The cargo test target this file compiles to, as the workflow spells it.
-const CONTRACT_TARGET: &str = "orphan_kill_contract";
 /// The shell variable in which the workflow commits this file's test count.
 const CONTRACT_FLOOR: &str = "MIN_CONTRACT_TESTS";
 
@@ -79,6 +77,23 @@ const CONTRACT_FLOOR: &str = "MIN_CONTRACT_TESTS";
 /// there is counted by the workflow's floor, ignored by its census, and was
 /// invisible to this file, which is the addition hole in its third spelling.
 const TEST_ATTRIBUTES: [&str; 2] = ["#[tokio::test", "#[test]"];
+
+/// The cargo test target this file compiles to — the name the workflow's
+/// census must spell.
+///
+/// Derived from [`SELF`] rather than declared beside it, because cargo names an
+/// integration-test target after its file stem and nothing else: a constant
+/// spelling the same name a second time is a copy that a rename of this file
+/// updates or does not, and [`the_workflow_requires_this_pin_to_have_run`]
+/// would go on pinning the OLD name against a workflow that still carried it —
+/// green on the developer's box, red in CI with a message about deletion.
+fn contract_target() -> String {
+    Path::new(SELF)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_else(|| panic!("`SELF` ({SELF}) must name a `tests/<target>.rs` file"))
+        .to_string()
+}
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -174,7 +189,7 @@ fn workflow_int(src: &str, name: &str) -> usize {
         .parse()
         .unwrap_or_else(|_| panic!("`{name}=` in {WORKFLOW} is not followed by a decimal integer"))
 }
-/// How many times `src` DECLARES `needle` (`NAME=`).
+
 /// `src` with every whole-line comment removed, Rust syntax.
 ///
 /// Prose is not code, and every check in this file is about code. A chunk in
@@ -573,6 +588,7 @@ fn the_workflow_requires_this_pin_to_have_run() {
     let workflow = read_workflow_code();
     let me = read(SELF);
     let here = tests_in(&me).len();
+    let target = contract_target();
 
     // The three load-bearing spellings: the awk needle that sets `found`, the
     // comparison that spends the floor, and the guard that refuses an unusable
@@ -584,20 +600,27 @@ fn the_workflow_requires_this_pin_to_have_run() {
     // accumulates while `armed`, and `armed` is only set where `found` is, so
     // `ran > 0` implies `found = 1` and the floor already reds a target that
     // never ran. That guard improves the message; it is not a gate.
+    //
+    // The first spelling carries the target NAME, and that name comes from
+    // [`contract_target`] — this file's own stem — not from a literal. A
+    // literal here would survive a rename of this file unchanged, so the pin
+    // would keep matching the workflow's stale needle and stay green while CI
+    // censused a target that no longer exists.
     for spelling in [
-        "/orphan_kill_contract/) { found = 1",
-        "\"${CONTRACT_RAN}\" -lt \"${CONTRACT_FLOOR_PLACEHOLDER}\"",
-        "''|*[!0-9]*)",
+        format!("/{target}/) {{ found = 1"),
+        format!("\"${{CONTRACT_RAN}}\" -lt \"${{{CONTRACT_FLOOR}}}\""),
+        "''|*[!0-9]*)".to_string(),
     ] {
-        let spelling = spelling.replace("CONTRACT_FLOOR_PLACEHOLDER", CONTRACT_FLOOR);
         assert!(
             workflow.contains(&spelling),
             "{WORKFLOW} no longer contains `{spelling}`, so the census that requires the \
-             `{CONTRACT_TARGET}` target to have run is gone or rewritten. Without it nothing \
-             in CI notices when {SELF} is deleted or renamed: it rides in `cargo test` among \
-             >1200 tests and the floor there cannot see a handful go missing. Restore the \
-             census in the `Run tests` step — and if it was deliberately rewritten, rewrite \
-             this pin with it rather than deleting it."
+             `{target}` target to have run is gone or rewritten. Without it nothing in CI \
+             notices when {SELF} is deleted or renamed: it rides in `cargo test` among >1200 \
+             tests and the floor there cannot see a handful go missing. Restore the census \
+             in the `Run tests` step — and if it was deliberately rewritten, rewrite this \
+             pin with it rather than deleting it. If THIS FILE was renamed, the census still \
+             spells the OLD name: change the workflow's `/<old-name>/` awk needle to \
+             `/{target}/`."
         );
     }
 
