@@ -145,23 +145,27 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
           </div>
         </td>
         <td className="text-mono">
-          {r.hostname ?? '—'}
-          {r.port ? `:${r.port}` : ''}
+          {/*
+            Guard on hostname, not just port: `hostname` is nullable while
+            `port` is not, so a naive `${hostname ?? '—'}:${port}` renders
+            `—:8000`. (`port` needs its own guard too — the backend sends
+            `row.get("port") or 0`, so "absent" arrives as a falsy 0.)
+          */}
+          {r.hostname ? `${r.hostname}${r.port ? `:${r.port}` : ''}` : '—'}
         </td>
         <td>
           <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
             <span className={`badge ${statusBadgeClass(r.derivedStatus)}`}>
               {r.derivedStatus}
             </span>
-            {!r.wsConnected && (
-              <span
-                className="badge badge-warning"
-                style={{ fontSize: '0.7rem' }}
-                title="The backend holds no open WebSocket from this device."
-              >
-                no ws
-              </span>
-            )}
+            {/*
+              No `wsConnected` badge here on purpose. WS presence is the FIRST
+              branch of the backend's status derivation — `ws_session_id is not
+              None` returns `healthy` outright — so `wsConnected` is equivalent
+              to `derivedStatus === 'healthy'`. A badge for it would render on
+              exactly the rows whose status badge already says something other
+              than healthy, duplicating the signal sitting next to it.
+            */}
             {r.uiError && (
               <span
                 ref={uiErrorBadgeRef as React.RefCallback<HTMLSpanElement>}
@@ -472,8 +476,8 @@ export default function Fleet() {
         <h1 className="page-title">Web Fleet</h1>
       </div>
       <p className="page-desc">
-        Read-only view of the qontinui-web runner registry. The supervisor proxies{' '}
-        <span className="text-mono">GET /api/v1/runners</span> at the backend URL below, attaching
+        Read-only view of the qontinui-web device registry. The supervisor proxies{' '}
+        <span className="text-mono">GET /api/v1/devices</span> at the backend URL below, attaching
         the JWT you supply. Credentials live only in your browser's localStorage.
       </p>
 

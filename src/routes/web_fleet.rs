@@ -222,11 +222,35 @@ fn validate_backend_url(raw: &str) -> Result<String, String> {
         return Err("backend_url must not include a fragment".to_string());
     }
 
-    // Build the final target by trimming any trailing slash and appending
-    // the fleet listing path. NOTE: no trailing slash on `/devices` — the web
-    // route is declared `@router.get("")`, and FastAPI would 307-redirect a
-    // `/devices/` form, which reqwest follows but which drops the
-    // `Authorization` header on a cross-origin hop.
+    // Reject userinfo (`user:pass@host`). Two distinct problems, one check:
+    //
+    // 1. CREDENTIAL LEAK. `target_url` is written to the debug log and embedded
+    //    verbatim in every error body this route returns — and the dashboard
+    //    renders that body to the operator. A password in the URL would travel
+    //    into both.
+    // 2. HOST CONFUSION. `https://api.qontinui.io@evil.example` READS as the
+    //    trusted host and RESOLVES to `evil.example`, and the caller's bearer
+    //    token would be forwarded there. Rejecting userinfo removes the
+    //    ambiguity entirely rather than trying to parse around it.
+    //
+    // No legitimate backend URL carries userinfo; the credential travels in the
+    // `Authorization` header the dashboard attaches.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "backend_url must not include credentials (user:pass@host) — the JWT \
+             travels in the Authorization header"
+                .to_string(),
+        );
+    }
+
+    // Build the final target by trimming any trailing slash and appending the
+    // fleet listing path. NOTE: no trailing slash on `/devices` — the web route
+    // is declared `@router.get("")`, so a `/devices/` form would take a
+    // pointless 307 through Starlette's `redirect_slashes`. That redirect is
+    // SAME-ORIGIN and reqwest only strips sensitive headers when the scheme,
+    // host or port changes, so the `Authorization` header would in fact
+    // survive it — the cost is a wasted round-trip, not a dropped credential.
+    // Spell the canonical form anyway and skip the hop.
     let base = trimmed.trim_end_matches('/');
     Ok(format!("{base}/api/v1/devices"))
 }
@@ -295,22 +319,41 @@ mod tests {
     /// the absence of the dead one.
     #[test]
     fn target_is_the_devices_route_never_the_retired_runners_route() {
-        let got = validate_backend_url("https://api.qontinui.io").unwrap();
-        assert!(
-            got.ends_with("/api/v1/devices"),
-            "fleet listing must target the devices route, got: {got}"
-        );
-        assert!(
-            !got.contains("/api/v1/runners"),
-            "/api/v1/runners was deleted from qontinui-web (no alias); got: {got}"
-        );
+        // Whole-string equality across several input shapes. An `ends_with`
+        // against the same constant the function formats with cannot fail for
+        // any input, so it would pin nothing; this catches both a changed
+        // constant and a changed normalization.
+        for input in [
+            "https://api.qontinui.io",
+            "https://api.qontinui.io/",
+            "  https://api.qontinui.io  ",
+        ] {
+            let got = validate_backend_url(input).unwrap();
+            assert_eq!(
+                got, "https://api.qontinui.io/api/v1/devices",
+                "input: {input:?}"
+            );
+            assert!(
+                !got.contains("/api/v1/runners"),
+                "/api/v1/runners was deleted from qontinui-web (no alias); got: {got}"
+            );
+        }
     }
 
-    /// A trailing slash would make FastAPI 307 to the canonical form, and a
-    /// redirect hop is where an `Authorization` header gets dropped.
+    /// Userinfo is rejected: it would put a password in the debug log and in
+    /// every error body the dashboard renders, and
+    /// `https://api.qontinui.io@evil.example` reads as the trusted host while
+    /// resolving to the attacker's.
     #[test]
-    fn target_has_no_trailing_slash() {
-        let got = validate_backend_url("http://127.0.0.1:8000").unwrap();
-        assert!(!got.ends_with('/'), "got: {got}");
+    fn validate_backend_url_rejects_userinfo() {
+        for input in [
+            "https://user:pass@api.qontinui.io",
+            "https://user@api.qontinui.io",
+            "https://api.qontinui.io@evil.example",
+        ] {
+            let err = validate_backend_url(input)
+                .expect_err(&format!("must reject userinfo: {input:?}"));
+            assert!(err.contains("credentials"), "input: {input:?}, got: {err}");
+        }
     }
 }
