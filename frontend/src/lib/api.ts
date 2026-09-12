@@ -793,42 +793,76 @@ export interface VelocityImprovementHistory {
   iterations: VelocityImprovementIteration[];
 }
 
-// Web Fleet types — mirrors the qontinui-web `RunnerResponse` schema at
-// `qontinui-web/backend/app/schemas/runner_fleet.py`. Read-only; the Fleet tab
-// proxies `GET /api/v1/runners` via supervisor's `/web-fleet` endpoint.
-export interface WebFleetRunner {
+// Web Fleet types — the row shape served by qontinui-web's
+// `GET /api/v1/devices`, whose `response_model` is the GENERATED wire entity
+// `Runner` in `qontinui-schemas` (`ts/src/generated/Runner.d.ts`, emitted from
+// the Rust `qontinui-types` crate). Read-only; the Fleet tab reaches it through
+// supervisor's `/web-fleet` proxy.
+//
+// ⚠ THE WIRE IS camelCase. This interface was snake_case until 2026-09-12 and
+// was wrong on two counts at once: it named a route qontinui-web deleted in
+// `1574bd036` (2026-05-19, no alias), and it described a `RunnerResponse`
+// Python schema that was replaced by the generated entity before that. Every
+// field below now matches `Runner.d.ts` exactly — if you change one, change it
+// there first and regenerate; this is a hand-copy of a generated type because
+// the supervisor frontend does not depend on `@qontinui/shared-types`.
+//
+// Fields deliberately ABSENT, because the wire entity does not carry them:
+//   - `status`        -> use `derivedStatus` (a closed enum, not free text)
+//   - `server_mode`   -> the `Runner.server_mode` column was dropped as
+//                        unpopulated when WS became the sole dispatch transport
+//   - `restate_enabled` / `restate_healthy` -> never existed on this entity
+export type WebFleetDeviceStatus =
+  | 'healthy'
+  | 'degraded'
+  | 'offline'
+  | 'starting'
+  | 'errored';
+
+export interface WebFleetDevice {
   id: string;
-  user_id: string;
+  userId: string;
   name: string;
-  hostname: string;
-  port: number;
+  hostname?: string | null;
+  ipAddress?: string | null;
+  port?: number | null;
+  os?: string | null;
+  osVersion?: string | null;
   capabilities: string[];
-  server_mode: boolean;
-  restate_enabled: boolean;
-  restate_healthy: boolean;
-  last_heartbeat: string | null;
-  status: string;
-  // Phase 3J.5 + post-3J follow-up heartbeat extensions. All optional — the
-  // web backend leaves them null until the runner heartbeats in with the
-  // extended shape. Snake-case on the wire (matches the Python schema).
-  derived_status?: string | null;
-  ui_error?: {
+  /** Computed server-side from WS presence + heartbeat freshness. */
+  derivedStatus: WebFleetDeviceStatus;
+  lastHeartbeat?: string | null;
+  /** Whether the backend currently holds an open WebSocket from the device. */
+  wsConnected: boolean;
+  uiError?: {
+    kind: string;
     message: string;
-    stack?: string | null;
-    component_stack?: string | null;
-    digest?: string | null;
-    first_seen: string;
-    reported_at: string;
-    count: number;
+    detail?: string | null;
+    reportedAt: string;
   } | null;
-  recent_crash?: {
-    file_path: string;
-    reported_at: string;
-    panic_location?: string | null;
-    panic_message?: string | null;
-    thread?: string | null;
+  recentCrash?: {
+    filePath: string;
+    panicLocation: string;
+    panicMessage: string;
+    reportedAt: string;
+    thread: string;
   } | null;
-  created_at: string;
+  createdAt: string;
+  // snake_case on purpose — a qontinui-web addition on top of the generated
+  // entity, not part of it.
+  //
+  // TRI-STATE, and the web schema is emphatic that consumers preserve it:
+  //   null      = UNKNOWN (coord did not hydrate the bindings). Never render
+  //               this as "no tenants".
+  //   []        = measured zero.
+  //   non-empty = the tenant set.
+  tenant_bindings?:
+    | {
+        tenant_id: string;
+        tenant_slug: string | null;
+        last_active_at: string | null;
+      }[]
+    | null;
 }
 
 // Commit ↔ session lineage types. Proxied through the supervisor to coord's
@@ -1137,12 +1171,19 @@ export const api = {
       method: 'POST',
     }),
 
-  // Web Fleet — proxies to {backend_url}/api/v1/runners with a user-supplied JWT.
+  // Web Fleet — proxies to {backend_url}/api/v1/devices with a user-supplied
+  // JWT (a Cognito user session bearer; the devices list route authenticates
+  // with `get_current_active_user_async`, which accepts `Authorization: Bearer`).
   // Supervisor does not hold credentials; caller supplies them per-request.
   // On error, surfaces the backend's body so the user sees the real reason
   // (e.g. "401 invalid signature", "404 user not found") rather than just the
   // HTTP status line.
-  webFleet: async (backendUrl: string, jwt: string): Promise<WebFleetRunner[]> => {
+  //
+  // Upstream status codes worth reading precisely: the devices list route
+  // proxies to coord, so 502/504 mean "coord unreachable / timed out", NOT that
+  // the web backend is down, and 503 means the device's `ws_session_id` is
+  // NULL (runner not connected).
+  webFleet: async (backendUrl: string, jwt: string): Promise<WebFleetDevice[]> => {
     const res = await fetch(`/web-fleet?backend_url=${encodeURIComponent(backendUrl)}`, {
       headers: { Authorization: `Bearer ${jwt}` },
     });
@@ -1166,7 +1207,7 @@ export const api = {
       );
     }
     try {
-      return JSON.parse(text) as WebFleetRunner[];
+      return JSON.parse(text) as WebFleetDevice[];
     } catch (e) {
       throw new Error(
         `Failed to parse JSON from /web-fleet: ${

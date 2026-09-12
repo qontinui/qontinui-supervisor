@@ -1,8 +1,37 @@
 //! Web Fleet proxy route.
 //!
-//! Forwards `GET /web-fleet?backend_url=<url>` to `{backend_url}/api/v1/runners`
+//! Forwards `GET /web-fleet?backend_url=<url>` to `{backend_url}/api/v1/devices`
 //! at the user-supplied qontinui-web backend, with the caller's `Authorization`
 //! header attached verbatim.
+//!
+//! ## Why `/api/v1/devices` and not `/api/v1/runners`
+//!
+//! This proxy targeted `/api/v1/runners` until 2026-09-12 and had been dead for
+//! months: qontinui-web deleted the legacy fleet endpoints in `ad3692e6c`
+//! (2026-04-28) and removed the whole `/api/v1/runners` router in `1574bd036`
+//! (2026-05-19, Phase 5 of `2026-05-18-unified-devices-registry`) — a rename
+//! with NO deprecation alias. Every request this route made 404'd, so the Fleet
+//! tab rendered an error for every operator who opened it.
+//!
+//! The replacement list route is `GET /api/v1/devices` (no trailing slash;
+//! declared `@router.get("")` on the web side). Its `response_model` is the same
+//! generated wire entity the retired route served — `qontinui-schemas`' `Runner`
+//! — so the row shape is unchanged apart from an added `tenant_bindings`.
+//!
+//! ## Status codes a caller must NOT misread
+//!
+//! `GET /api/v1/devices` does not read qontinui-web's own database: it proxies
+//! to coord (`GET /coord/devices/by-user`) on a 5s timeout and translates
+//! failures. So on THIS route:
+//!
+//! - `502` means coord is unreachable, or returned a 5xx, NOT that the web
+//!   backend is down.
+//! - `504` means the web backend timed out waiting for coord.
+//! - `503` means exactly one thing: the device row has a NULL `ws_session_id`,
+//!   i.e. the runner is not currently connected.
+//!
+//! The supervisor forwards the upstream status verbatim, so the dashboard sees
+//! these unchanged. Do not translate them into "backend down".
 //!
 //! The supervisor does NOT hold any qontinui-web credentials. The dashboard is
 //! responsible for collecting the backend URL and JWT from the user (persisted
@@ -160,7 +189,7 @@ pub async fn list_web_fleet(
 /// is rejected so the endpoint cannot be turned into a general-purpose proxy.
 ///
 /// Returns the fully-qualified URL to hit on the web backend,
-/// i.e. `{backend_url_trimmed}/api/v1/runners`.
+/// i.e. `{backend_url_trimmed}/api/v1/devices`.
 fn validate_backend_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -194,9 +223,12 @@ fn validate_backend_url(raw: &str) -> Result<String, String> {
     }
 
     // Build the final target by trimming any trailing slash and appending
-    // the fleet listing path.
+    // the fleet listing path. NOTE: no trailing slash on `/devices` — the web
+    // route is declared `@router.get("")`, and FastAPI would 307-redirect a
+    // `/devices/` form, which reqwest follows but which drops the
+    // `Authorization` header on a cross-origin hop.
     let base = trimmed.trim_end_matches('/');
-    Ok(format!("{base}/api/v1/runners"))
+    Ok(format!("{base}/api/v1/devices"))
 }
 
 #[cfg(test)]
@@ -206,19 +238,19 @@ mod tests {
     #[test]
     fn validate_backend_url_accepts_https_origin() {
         let got = validate_backend_url("https://api.qontinui.io").unwrap();
-        assert_eq!(got, "https://api.qontinui.io/api/v1/runners");
+        assert_eq!(got, "https://api.qontinui.io/api/v1/devices");
     }
 
     #[test]
     fn validate_backend_url_accepts_http_localhost_with_port() {
         let got = validate_backend_url("http://127.0.0.1:8000").unwrap();
-        assert_eq!(got, "http://127.0.0.1:8000/api/v1/runners");
+        assert_eq!(got, "http://127.0.0.1:8000/api/v1/devices");
     }
 
     #[test]
     fn validate_backend_url_strips_trailing_slash() {
         let got = validate_backend_url("https://api.qontinui.io/").unwrap();
-        assert_eq!(got, "https://api.qontinui.io/api/v1/runners");
+        assert_eq!(got, "https://api.qontinui.io/api/v1/devices");
     }
 
     #[test]
@@ -254,5 +286,31 @@ mod tests {
     #[test]
     fn validate_backend_url_rejects_garbage() {
         assert!(validate_backend_url("not-a-url").is_err());
+    }
+
+    /// Regression pin for the 2026-09-12 repoint. `/api/v1/runners` was deleted
+    /// from qontinui-web in `1574bd036` with no alias, so a caller that drifts
+    /// back to it 404s on every request with no local error — exactly the
+    /// silent failure this route shipped with for months. Pin the live path and
+    /// the absence of the dead one.
+    #[test]
+    fn target_is_the_devices_route_never_the_retired_runners_route() {
+        let got = validate_backend_url("https://api.qontinui.io").unwrap();
+        assert!(
+            got.ends_with("/api/v1/devices"),
+            "fleet listing must target the devices route, got: {got}"
+        );
+        assert!(
+            !got.contains("/api/v1/runners"),
+            "/api/v1/runners was deleted from qontinui-web (no alias); got: {got}"
+        );
+    }
+
+    /// A trailing slash would make FastAPI 307 to the canonical form, and a
+    /// redirect hop is where an `Authorization` header gets dropped.
+    #[test]
+    fn target_has_no_trailing_slash() {
+        let got = validate_backend_url("http://127.0.0.1:8000").unwrap();
+        assert!(!got.ends_with('/'), "got: {got}");
     }
 }

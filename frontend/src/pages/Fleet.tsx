@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
 import { useUIElement } from '@qontinui/ui-bridge/react';
-import { api, WebFleetRunner } from '../lib/api';
+import { api, WebFleetDevice, WebFleetDeviceStatus } from '../lib/api';
 
 // LocalStorage keys — the supervisor dashboard persists the user's backend URL
 // and JWT here between sessions. The supervisor itself never stores them;
@@ -33,9 +33,13 @@ export function saveToStorage(key: string, value: string) {
 
 /**
  * Format a timestamp as relative time (e.g. "12s ago", "3m ago", "2h ago").
- * Returns `—` if the timestamp is null/empty or unparseable.
+ * Returns `—` if the timestamp is null/undefined/empty or unparseable.
+ *
+ * Accepts `undefined` as well as `null`: the generated wire entity declares
+ * `lastHeartbeat?: string | null`, so an absent key and an explicit null are
+ * both possible and both mean "no heartbeat recorded".
  */
-function relativeTime(isoTs: string | null): string {
+function relativeTime(isoTs: string | null | undefined): string {
   if (!isoTs) return '—';
   const parsed = Date.parse(isoTs);
   if (Number.isNaN(parsed)) return '—';
@@ -47,16 +51,27 @@ function relativeTime(isoTs: string | null): string {
 }
 
 /**
- * Map a fleet status string to a badge variant. Statuses come from
- * qontinui-web's `Runner.status` column; common values are:
- * `healthy`, `unhealthy`, `offline`, `registered`. Anything else falls back
- * to a neutral "warning" badge.
+ * Map a device status to a badge variant. The value is `Runner.derivedStatus`
+ * from the generated wire entity — a CLOSED enum computed server-side from WS
+ * presence and heartbeat freshness, not the free-text `status` column this
+ * function used to read (that column is not on the wire at all).
+ *
+ * The parameter stays widened to `string` so an enum value added upstream
+ * renders as a neutral badge instead of crashing the row.
  */
-function statusBadgeClass(status: string): string {
-  const s = status.toLowerCase();
-  if (s === 'healthy' || s === 'online' || s === 'ready') return 'badge-success';
-  if (s === 'offline' || s === 'unhealthy' || s === 'dead') return 'badge-danger';
-  return 'badge-warning';
+function statusBadgeClass(status: WebFleetDeviceStatus | string): string {
+  switch (status) {
+    case 'healthy':
+      return 'badge-success';
+    case 'offline':
+    case 'errored':
+      return 'badge-danger';
+    case 'degraded':
+    case 'starting':
+      return 'badge-warning';
+    default:
+      return 'badge-warning';
+  }
 }
 
 /**
@@ -76,13 +91,13 @@ function formatTs(iso: string): string {
 // expanded detail panel below the row.
 
 interface FleetRowProps {
-  runner: WebFleetRunner;
+  runner: WebFleetDevice;
   expanded: boolean;
   toggle: () => void;
 }
 
 function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
-  const hasError = r.ui_error != null || r.recent_crash != null;
+  const hasError = r.uiError != null || r.recentCrash != null;
   const rowToggle = () => hasError && toggle();
 
   // Register per-row UI Bridge elements for the two error badges so automation
@@ -130,18 +145,30 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
           </div>
         </td>
         <td className="text-mono">
-          {r.hostname}:{r.port}
+          {r.hostname ?? '—'}
+          {r.port ? `:${r.port}` : ''}
         </td>
         <td>
           <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-            <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status}</span>
-            {r.ui_error && (
+            <span className={`badge ${statusBadgeClass(r.derivedStatus)}`}>
+              {r.derivedStatus}
+            </span>
+            {!r.wsConnected && (
+              <span
+                className="badge badge-warning"
+                style={{ fontSize: '0.7rem' }}
+                title="The backend holds no open WebSocket from this device."
+              >
+                no ws
+              </span>
+            )}
+            {r.uiError && (
               <span
                 ref={uiErrorBadgeRef as React.RefCallback<HTMLSpanElement>}
                 data-ui-bridge-value={String(expanded)}
                 className="badge badge-danger badge-clickable"
                 style={{ fontSize: '0.7rem' }}
-                title={`UI error: ${r.ui_error.message}`}
+                title={`UI error: ${r.uiError.message}`}
                 role="button"
                 tabIndex={0}
                 onClick={rowToggle}
@@ -158,13 +185,13 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                 </span>
               </span>
             )}
-            {r.recent_crash && (
+            {r.recentCrash && (
               <span
                 ref={rustCrashBadgeRef as React.RefCallback<HTMLSpanElement>}
                 data-ui-bridge-value={String(expanded)}
                 className="badge badge-danger badge-clickable"
                 style={{ fontSize: '0.7rem' }}
-                title={`Rust crash: ${r.recent_crash.panic_message ?? 'runner restarted after Rust panic'}${r.recent_crash.panic_location ? ` @ ${r.recent_crash.panic_location}` : ''}`}
+                title={`Rust crash: ${r.recentCrash.panicMessage ?? 'runner restarted after Rust panic'}${r.recentCrash.panicLocation ? ` @ ${r.recentCrash.panicLocation}` : ''}`}
                 role="button"
                 tabIndex={0}
                 onClick={rowToggle}
@@ -183,7 +210,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
             )}
           </div>
         </td>
-        <td>{relativeTime(r.last_heartbeat)}</td>
+        <td>{relativeTime(r.lastHeartbeat)}</td>
         <td>
           <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
             {r.capabilities.length === 0 ? (
@@ -206,22 +233,38 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
           </div>
         </td>
         <td>
+          {/*
+            Was a "Mode" column showing server_mode / restate badges. Neither is
+            on the devices wire entity — the `server_mode` column was dropped as
+            unpopulated, and restate flags never existed there. Showing tenant
+            bindings instead, which IS carried and is what an operator looking at
+            a fleet row actually needs.
+
+            The tri-state matters: `undefined`/`null` means coord did not
+            hydrate the bindings (UNKNOWN), and must not be rendered as "none".
+          */}
           <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-            {r.server_mode && (
-              <span className="badge badge-success" style={{ fontSize: '0.7rem' }}>
-                server
+            {r.tenant_bindings == null ? (
+              <span className="text-muted" title="coord did not report tenant bindings">
+                unknown
               </span>
-            )}
-            {r.restate_enabled && (
-              <span
-                className={`badge ${r.restate_healthy ? 'badge-success' : 'badge-warning'}`}
-                style={{ fontSize: '0.7rem' }}
-              >
-                restate{r.restate_healthy ? '' : ' (unhealthy)'}
-              </span>
-            )}
-            {!r.server_mode && !r.restate_enabled && (
-              <span className="text-muted">—</span>
+            ) : r.tenant_bindings.length === 0 ? (
+              <span className="text-muted">none</span>
+            ) : (
+              r.tenant_bindings.map((b) => (
+                <span
+                  key={b.tenant_id}
+                  className="badge"
+                  style={{
+                    background: 'var(--bg-tertiary)',
+                    color: 'var(--text-secondary)',
+                    fontSize: '0.7rem',
+                  }}
+                  title={b.tenant_id}
+                >
+                  {b.tenant_slug ?? b.tenant_id.slice(0, 8)}
+                </span>
+              ))
             )}
           </div>
         </td>
@@ -239,12 +282,12 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                 fontSize: '0.75rem',
               }}
             >
-              {r.ui_error && (
-                <div style={{ marginBottom: r.recent_crash ? '0.6rem' : 0 }}>
+              {r.uiError && (
+                <div style={{ marginBottom: r.recentCrash ? '0.6rem' : 0 }}>
                   <div style={{ marginBottom: '0.4rem' }}>
                     <strong className="text-danger">UI Error:</strong>{' '}
                     <span style={{ fontFamily: 'var(--font-mono)' }}>
-                      {r.ui_error.message}
+                      {r.uiError.message}
                     </span>
                   </div>
                   <div
@@ -257,32 +300,37 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                     }}
                   >
                     <span>
-                      <strong>First seen:</strong> {formatTs(r.ui_error.first_seen)}
-                    </span>
-                    <span>
-                      <strong>Last reported:</strong>{' '}
-                      {formatTs(r.ui_error.reported_at)}
-                    </span>
-                    <span>
-                      <strong>Count:</strong> {r.ui_error.count}
-                    </span>
-                    {r.ui_error.digest && (
-                      <span>
-                        <strong>Digest:</strong>{' '}
-                        <span style={{ fontFamily: 'var(--font-mono)' }}>
-                          {r.ui_error.digest}
-                        </span>
+                      <strong>Kind:</strong>{' '}
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>
+                        {r.uiError.kind}
                       </span>
-                    )}
+                    </span>
+                    <span>
+                      <strong>Reported:</strong> {formatTs(r.uiError.reportedAt)}
+                    </span>
                   </div>
+                  {r.uiError.detail && (
+                    <pre
+                      className="text-muted"
+                      style={{
+                        fontSize: '0.7rem',
+                        marginTop: '0.4rem',
+                        marginBottom: 0,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {r.uiError.detail}
+                    </pre>
+                  )}
                 </div>
               )}
-              {r.recent_crash && (
+              {r.recentCrash && (
                 <div>
                   <div style={{ marginBottom: '0.4rem' }}>
                     <strong className="text-danger">Rust Crash:</strong>{' '}
                     <span style={{ fontFamily: 'var(--font-mono)' }}>
-                      {r.recent_crash.panic_message ??
+                      {r.recentCrash.panicMessage ??
                         'runner restarted after Rust panic (no message captured)'}
                     </span>
                   </div>
@@ -298,21 +346,21 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                   >
                     <span>
                       <strong>Reported:</strong>{' '}
-                      {formatTs(r.recent_crash.reported_at)}
+                      {formatTs(r.recentCrash.reportedAt)}
                     </span>
-                    {r.recent_crash.panic_location && (
+                    {r.recentCrash.panicLocation && (
                       <span>
                         <strong>Location:</strong>{' '}
                         <span style={{ fontFamily: 'var(--font-mono)' }}>
-                          {r.recent_crash.panic_location}
+                          {r.recentCrash.panicLocation}
                         </span>
                       </span>
                     )}
-                    {r.recent_crash.thread && (
+                    {r.recentCrash.thread && (
                       <span>
                         <strong>Thread:</strong>{' '}
                         <span style={{ fontFamily: 'var(--font-mono)' }}>
-                          {r.recent_crash.thread}
+                          {r.recentCrash.thread}
                         </span>
                       </span>
                     )}
@@ -325,7 +373,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                         wordBreak: 'break-all',
                       }}
                     >
-                      {r.recent_crash.file_path}
+                      {r.recentCrash.filePath}
                     </span>
                   </div>
                 </div>
@@ -341,7 +389,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
 export default function Fleet() {
   const [backendUrl, setBackendUrl] = useState<string>(() => loadFromStorage(LS_BACKEND_URL_KEY));
   const [jwt, setJwt] = useState<string>(() => loadFromStorage(LS_JWT_KEY));
-  const [runners, setRunners] = useState<WebFleetRunner[]>([]);
+  const [runners, setRunners] = useState<WebFleetDevice[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState<string | null>(null);
@@ -572,7 +620,7 @@ export default function Fleet() {
                   <th>Status</th>
                   <th>Last heartbeat</th>
                   <th>Capabilities</th>
-                  <th>Mode</th>
+                  <th>Tenants</th>
                 </tr>
               </thead>
               <tbody>
