@@ -48,7 +48,14 @@ pub struct AddRunnerRequest {
     pub external_restate_ingress_url: Option<String>,
 }
 
+/// `deny_unknown_fields` because `from_working_tree` now decides the PRIMARY's
+/// build provenance and the 202 body does not echo the decision back. Without
+/// it, `{"fromWorkingTree": true}` deserializes to `false` and silently builds
+/// origin/main — the caller asked for the escape hatch, was refused, and has no
+/// way to tell. Same posture as the spawn-test path's `reject_known_provenance_aliases`:
+/// a misspelled provenance selector is a 400, never a silent default.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestartRunnerRequest {
     #[serde(default)]
     pub rebuild: bool,
@@ -65,6 +72,41 @@ pub struct RestartRunnerRequest {
     /// [`crate::restart_readiness`].
     #[serde(default)]
     pub force: bool,
+    /// Compile the live working checkout (provenance `live_tree`) instead of a
+    /// fresh `origin/main` worktree (provenance `origin_main`).
+    ///
+    /// **Only the PRIMARY is affected by this field.** The origin/main build is
+    /// gated on `is_primary()`, so for a named or temp runner the live-tree
+    /// build they have always had is unchanged whatever this carries.
+    ///
+    /// Defaulting to `false` is what keeps this route's primary rebuild
+    /// consistent with `POST /runner/restart` and with the origin/main policy
+    /// this repo's `CLAUDE.md` states for the primary. It used to be hardcoded
+    /// `true` at the call site, on the premise that this route only ever served
+    /// named/temp runners — but `primary` is a registered runner id and reaches
+    /// it, so a primary rebuild through this door silently compiled whatever
+    /// branch the shared checkout was parked on. Measured 2026-09-09: 384
+    /// commits diverged from `origin/main`, served for four days. Plan
+    /// `2026-09-13-supervisor-per-runner-restart-hardcodes-from-working-tree`.
+    ///
+    /// Read it through [`RestartRunnerRequest::build_tree`] rather than
+    /// directly — the wire stays a bool for compatibility, but everything below
+    /// this struct takes [`manager::BuildTree`], where the old defect does not
+    /// typecheck.
+    #[serde(default)]
+    pub from_working_tree: bool,
+}
+
+impl RestartRunnerRequest {
+    /// The build source this request selects, as the typed value every layer
+    /// below the wire takes.
+    pub fn build_tree(&self) -> manager::BuildTree {
+        if self.from_working_tree {
+            manager::BuildTree::LiveWorkingTree
+        } else {
+            manager::BuildTree::OriginMain
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1169,6 +1211,7 @@ pub async fn restart_runner(
     if body.rebuild {
         let exec_state = state.clone();
         let force = body.force;
+        let build_tree = body.build_tree();
         let runner_id = id.clone();
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
@@ -1178,18 +1221,20 @@ pub async fn restart_runner(
                 // The exact stop → build → start sequence the handler used to
                 // await inline. Errors are surfaced in the (status, body)
                 // result so they land in /builds — never silently dropped.
-                // `/runners/{id}/restart` targets named/temp runners; the
-                // origin/main primary policy does not apply — keep the legacy
-                // live-tree build (from_working_tree:true). `restart_runner_by_id`
-                // also no-ops the origin/main path for non-primary runners, but
-                // be explicit.
+                // `primary` IS a registered runner id, so this route reaches
+                // the primary and the origin/main policy DOES apply to it.
+                // The build source is threaded from the request as a typed
+                // `BuildTree`; it used to be a literal `true` here, which is
+                // what put a diverged binary under the primary. Named/temp
+                // runners are unaffected either way - the origin/main path is
+                // gated on `is_primary()`.
                 if let Err(e) = manager::restart_runner_by_id(
                     &exec_state,
                     &runner_id,
                     true,
                     source,
                     force,
-                    true,
+                    build_tree,
                 )
                 .await
                 {
@@ -1237,7 +1282,13 @@ pub async fn restart_runner(
     }
 
     // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
-    manager::restart_runner_by_id(&state, &id, false, source, body.force, true).await?;
+    // The build source is inert here - `restart_runner_by_id` reads it only
+    // inside its `if rebuild` arm, and nothing is compiled on this path. It is
+    // threaded rather than passed as a literal so both call sites say the same
+    // thing, and so a future change that starts building here cannot inherit a
+    // hardcoded provenance.
+    manager::restart_runner_by_id(&state, &id, false, source, body.force, body.build_tree())
+        .await?;
 
     Ok(Json(json!({
         "status": "restarted",
@@ -8009,6 +8060,36 @@ mod tests {
             BuildSource::Override,
             "no resolved sha ⇒ cannot vouch"
         );
+    }
+
+    /// The same contract on `POST /runners/{id}/restart`. This is the whole of
+    /// the 2026-09-09 defect: the wire default decides the PRIMARY's build
+    /// source, and it used to be hardcoded `true` at the call site where no
+    /// body could reach it. A body that omits the flag must get origin/main.
+    ///
+    /// Asserted on the deserialized request rather than on the literal at the
+    /// call site deliberately — the bug was a false premise ("this route only
+    /// serves named/temp runners"), so pinning the spelling would not have
+    /// caught it. Plan
+    /// `2026-09-13-supervisor-per-runner-restart-hardcodes-from-working-tree`.
+    #[test]
+    fn restart_runner_request_defaults_from_working_tree_to_false() {
+        let omitted: super::RestartRunnerRequest =
+            serde_json::from_str(r#"{"rebuild":true}"#).expect("deserialize");
+        assert!(
+            !omitted.from_working_tree,
+            "a primary rebuild that does not ask for the working tree must get origin/main"
+        );
+    }
+
+    /// The escape hatch stays reachable: an operator who deliberately wants the
+    /// primary to run uncommitted local changes can still say so.
+    #[test]
+    fn restart_runner_request_honours_explicit_from_working_tree() {
+        let opted: super::RestartRunnerRequest =
+            serde_json::from_str(r#"{"rebuild":true,"from_working_tree":true}"#)
+                .expect("deserialize");
+        assert!(opted.from_working_tree);
     }
 
     /// `from_working_tree` must round-trip through serde and default to

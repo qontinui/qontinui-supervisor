@@ -3698,7 +3698,9 @@ pub async fn maybe_serving_restart(
                             false,
                             RestartSource::ServingWatchdog,
                             false,
-                            true,
+                            // `rebuild: false` — nothing is compiled, so the
+                            // tree is inert. Name the policy default anyway.
+                            BuildTree::OriginMain,
                         )
                         .await
                     }
@@ -5194,13 +5196,46 @@ pub async fn refuse_if_port_held_by_live_runner(port: u16) -> Result<(), Supervi
 /// reads that flag, so its first failed attempt would have silenced it for
 /// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
 /// finding).
+/// Which tree a rebuild compiles **for the primary runner**.
+///
+/// A two-variant enum rather than a `bool`, deliberately. This was a bare
+/// `bool` in the sixth positional slot of [`restart_runner_by_id`], and a
+/// literal `true` written there — on a comment's false premise about which
+/// runners the caller served — put a binary 384 commits diverged from
+/// `origin/main` under the primary for four days (2026-09-09) with only a
+/// `WARN` to show for it. A bare `true` no longer compiles at these call
+/// sites, so that class of defect is unrepresentable rather than merely
+/// tested-for. Plan
+/// `2026-09-13-supervisor-per-runner-restart-hardcodes-from-working-tree`.
+///
+/// **Inert for named/temp runners.** The origin/main path is gated on
+/// `is_primary()`, so they compile the live tree whichever variant is passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildTree {
+    /// Compile a fresh `origin/main` worktree — provenance `origin_main`, and
+    /// the default everywhere, so the primary runs latest-green-main.
+    OriginMain,
+    /// Compile the live working checkout — provenance `live_tree`. The
+    /// deliberate escape hatch for running uncommitted local changes on the
+    /// primary; the canonical WIP-test path is a temp runner via spawn-test.
+    LiveWorkingTree,
+}
+
+impl BuildTree {
+    /// True when this selects the `origin/main` worktree. Named so the call
+    /// site reads as a question about the tree, not about a flag's polarity.
+    pub fn is_origin_main(self) -> bool {
+        matches!(self, BuildTree::OriginMain)
+    }
+}
+
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
     rebuild: bool,
     source: RestartSource,
     force: bool,
-    from_working_tree: bool,
+    build_tree: BuildTree,
 ) -> Result<(), SupervisorError> {
     if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
@@ -5280,7 +5315,7 @@ pub async fn restart_runner_by_id(
 
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
-    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, from_working_tree).await;
+    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, build_tree).await;
 
     {
         let mut runner = managed.runner.write().await;
@@ -5327,7 +5362,7 @@ async fn restart_after_gate(
     managed: &Arc<ManagedRunner>,
     runner_id: &str,
     rebuild: bool,
-    from_working_tree: bool,
+    build_tree: BuildTree,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -5363,13 +5398,13 @@ async fn restart_after_gate(
     // Phase B: the PRIMARY rebuild defaults to building a fresh `origin/main`
     // worktree (provenance `origin_main`) so the primary always runs
     // latest-green-main and never compiles the contested working checkout.
-    // `from_working_tree: true` is the escape hatch back to the legacy
+    // `BuildTree::LiveWorkingTree` is the escape hatch back to the legacy
     // live-tree build. Non-primary runners (named/temp) keep the legacy
     // live-tree build unconditionally — origin/main pinning is a
     // primary-only policy.
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
-        let build_origin_main = managed.config.kind().is_primary() && !from_working_tree;
+        let build_origin_main = managed.config.kind().is_primary() && build_tree.is_origin_main();
         if build_origin_main {
             primary_rebuild_from_origin_main(state).await?;
         } else {
@@ -5483,17 +5518,18 @@ pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), Supervi
 /// Legacy restart wrapper — targets the primary runner.
 /// Only manual restarts are allowed; automated sources are rejected.
 ///
-/// `from_working_tree` (Phase B): when `false` (default) a `rebuild` materializes
-/// a fresh `origin/main` worktree and compiles THAT (provenance `origin_main`)
-/// so the primary always runs latest-green-main; when `true` it compiles the
-/// live working tree (legacy `live_tree` behavior). Only consulted on the
-/// primary rebuild path inside [`restart_runner_by_id`].
+/// `build_tree` (Phase B): [`BuildTree::OriginMain`] — the default at every
+/// door — materializes a fresh `origin/main` worktree and compiles THAT
+/// (provenance `origin_main`), so the primary always runs latest-green-main;
+/// [`BuildTree::LiveWorkingTree`] compiles the live working tree (legacy
+/// `live_tree` behavior). Only consulted on the primary rebuild path inside
+/// [`restart_runner_by_id`].
 pub async fn restart_runner(
     state: &SharedState,
     rebuild: bool,
     source: RestartSource,
     force: bool,
-    from_working_tree: bool,
+    build_tree: BuildTree,
 ) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
@@ -5506,7 +5542,7 @@ pub async fn restart_runner(
         rebuild,
         source,
         force,
-        from_working_tree,
+        build_tree,
     )
     .await
 }
@@ -8291,7 +8327,7 @@ mod tests {
             false,
             RestartSource::Manual,
             false,
-            true,
+            BuildTree::OriginMain,
         )
         .await
         .expect_err("no exe can be resolved from an empty project dir");
@@ -8329,7 +8365,7 @@ mod tests {
             false,
             RestartSource::Manual,
             false,
-            true,
+            BuildTree::OriginMain,
         )
         .await
         .expect_err("the start still fails at exe resolution");
@@ -8363,7 +8399,7 @@ mod tests {
             false,
             RestartSource::Watchdog,
             false,
-            true,
+            BuildTree::OriginMain,
         )
         .await
         .expect_err("wire watchdog must be blocked");

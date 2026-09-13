@@ -241,6 +241,27 @@ pub struct WatchdogRequest {
     pub reset_attempts: bool,
 }
 
+// NOTE: `RestartRequest` deliberately does NOT carry `#[serde(deny_unknown_fields)]`,
+// while its sibling `routes::runners::RestartRunnerRequest` does. The asymmetry is
+// load-bearing, not an oversight: `qontinui-runner`'s
+// `src-tauri/src/mcp/ai_session.rs` documents POSTing `/runner/restart` with
+// `trigger_auto_continue` and `wait_timeout_seconds`, neither of which exists here.
+// They are ignored today; denying unknown fields would turn a documented caller into
+// a 422. Add the attribute only together with a fix for that caller.
+
+impl RestartRequest {
+    /// The build source this request selects, as the typed value every layer
+    /// below the wire takes. See [`manager::BuildTree`] for why the internal
+    /// representation is an enum and not this bool.
+    pub fn build_tree(&self) -> manager::BuildTree {
+        if self.from_working_tree {
+            manager::BuildTree::LiveWorkingTree
+        } else {
+            manager::BuildTree::OriginMain
+        }
+    }
+}
+
 /// Body for `POST /runner/stop`. Every field defaults, so the body as a whole
 /// is optional — see [`OptionalJson`] for why that needs a custom extractor
 /// rather than `Option<Json<_>>`.
@@ -494,12 +515,17 @@ pub async fn rebuild_when_idle(
             }
 
             // Drained. Fire the SAME call the Rebuild button makes: rebuild
-            // (origin/main, because `from_working_tree` is false) then restart.
+            // from origin/main, then restart.
             // `force: false` keeps the readiness gate armed inside — it is the
             // authoritative check, and a refusal here is a real refusal.
-            if let Err(e) =
-                manager::restart_runner(&exec_state, true, RestartSource::Manual, false, false)
-                    .await
+            if let Err(e) = manager::restart_runner(
+                &exec_state,
+                true,
+                RestartSource::Manual,
+                false,
+                manager::BuildTree::OriginMain,
+            )
+            .await
             {
                 exec_record.record_run_result(run_result_for(&e));
                 exec_state
@@ -610,6 +636,7 @@ pub async fn restart_runner(
         let exec_record = action_record.clone();
         let force = body.force;
         let from_working_tree = body.from_working_tree;
+        let build_tree = body.build_tree();
         let do_health_wait = wait_q.wait;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
@@ -625,7 +652,7 @@ pub async fn restart_runner(
                     true,
                     RestartSource::Manual,
                     force,
-                    from_working_tree,
+                    build_tree,
                 )
                 .await
                 {
@@ -878,7 +905,7 @@ pub async fn restart_runner(
         false,
         RestartSource::Manual,
         body.force,
-        body.from_working_tree,
+        body.build_tree(),
     )
     .await;
 
