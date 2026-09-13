@@ -3,6 +3,10 @@ name = "qontinui-supervisor"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
+# An application, never published. Its qontinui-schemas deps are bare `path =`
+# deps with no `version`, which `cargo publish` would refuse anyway; this says
+# so on purpose rather than by accident.
+publish = false
 
 [[bin]]
 name = "qontinui-supervisor"
