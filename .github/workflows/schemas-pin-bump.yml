@@ -254,6 +254,7 @@ jobs:
           set -euo pipefail
           # GITHUB_TOKEN's push fired no pull_request run; workflow_dispatch is
           # the exception GitHub allows. The check runs land on the head SHA,
-          # which is what coord and the ruleset read (see header).
+          # which is what coord's head-CI read uses (it reads every check run on the SHA,
+          # whatever event produced it; this repo has no ruleset).
           gh workflow run ci.yml -R "$REPO" --ref "$BRANCH"
           echo "Dispatched ci.yml on $BRANCH."
