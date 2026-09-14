@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The ONE reader/writer of coord's qontinui-schemas sibling pin.
+# The ONE reader/writer of qontinui-supervisor's qontinui-schemas sibling pin.
 #
 # Usage:
 #   schemas-pin.sh read     [conf]                # print the pinned 40-hex SHA
@@ -114,10 +114,17 @@ case "$cmd" in
   verify-landed)
     # The pin must be ON schemas main. A pin to an unmerged schemas commit
     # compiles green against a tree nobody else has, and reds main later if
-    # that branch is force-pushed or deleted. Nothing in coord's flow needs an
-    # unlanded pin: schemas' consumer gate does not compile coord, so the
-    # schemas half always lands first (plan §7.2). An unreadable answer is
-    # UNKNOWN and fails too — never "landed".
+    # that branch is force-pushed or deleted. An unreadable answer is UNKNOWN
+    # and fails too — never "landed".
+    #
+    # A schemas change that breaks supervisor is proven BEFORE it lands by
+    # schemas' consumer gate (runner-consumer-check.yml compiles supervisor main,
+    # and a declared `coord:upstream-of=qontinui-supervisor#N` adaptation PR,
+    # against the schemas PR). The supervisor adaptation PR itself stays red
+    # HERE until the schemas PR lands. Then move this pin to the LANDED commit
+    # and refresh Cargo.lock in the same commit. Coord may rebase the schemas PR
+    # before landing, so never pin its head. Expect that PR to conflict with an
+    # open schemas-pin-bump PR on sibling-pins.conf and Cargo.lock.
     conf="${1:-$DEFAULT_CONF}"
     sha="$(read_pin "$conf")"
     api="${SCHEMAS_API_BASE:-https://api.github.com}"

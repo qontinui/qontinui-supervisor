@@ -1,6 +1,6 @@
 name: schemas pin bump
 
-# Keeps `.github/sibling-pins.conf` (the qontinui-schemas commit coord builds
+# Keeps `.github/sibling-pins.conf` (the qontinui-schemas commit supervisor builds
 # against) current, by opening ONE PR that moves the pin AND Cargo.lock in the
 # same commit.
 #
@@ -179,7 +179,7 @@ jobs:
           # more than that — finding b45b88c7 measured unrelated windows-sys /
           # socket2 churn from it in the runner and supervisor locks.
           cargo metadata --format-version 1 > /dev/null
-          # The exact check rust-ci runs on the resulting PR.
+          # The exact check ci.yml's rust-check job runs on the resulting PR.
           cargo metadata --locked --format-version 1 > /dev/null
           changed="$(git status --porcelain | awk '{print $2}' | sort | tr '\n' ' ')"
           case "$changed" in
@@ -232,7 +232,7 @@ jobs:
           $LOCKDIFF
           \`\`\`
 
-          **If this PR goes red, that is the mechanism working, not a failure.** A schemas change does not build or pass with coord. Before the pin, that same break arrived on supervisor \`main\`. Fix supervisor **in this PR**; the workflow does not move an open bump PR's branch.
+          **If this PR goes red, that is the mechanism working, not a failure.** A schemas change does not build or pass with supervisor. Before the pin, that same break arrived on supervisor \`main\`. Fix supervisor **in this PR**; the workflow does not move an open bump PR's branch.
 
           Plan: 2026-08-31-schemas-releases-strand-consumer-cargo-locks
           EOF

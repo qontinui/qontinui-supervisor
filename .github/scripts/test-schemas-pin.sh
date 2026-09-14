@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for `.github/scripts/schemas-pin.sh` — no network.
 #
-# The pin exists so a qontinui-schemas release cannot red coord main (plan
+# The pin exists so a qontinui-schemas release cannot red supervisor main (plan
 # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7). Its one failure
 # mode that would silently undo that is DEGRADING TO MAIN: a missing, duplicated
 # or malformed pin that some site reads as "no pin, fetch the default branch".
