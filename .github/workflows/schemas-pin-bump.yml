@@ -1,0 +1,259 @@
+name: schemas pin bump
+
+# Keeps `.github/sibling-pins.conf` (the qontinui-schemas commit coord builds
+# against) current, by opening ONE PR that moves the pin AND Cargo.lock in the
+# same commit.
+#
+# ---------------------------------------------------------------------------
+# WHY (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3b)
+# ---------------------------------------------------------------------------
+#
+# supervisor path-depends on qontinui-schemas (qontinui-types,
+# qontinui-runner-client), and Cargo.lock records a path crate's version but no
+# commit. While CI cloned schemas MAIN, each qontinui-types release left the
+# committed lock silently stale (supervisor#189 was the hand fix for 2.0.0).
+# Pinning moves the signal: the new schemas commit reaches supervisor only
+# through THIS PR, whose own CI proves pin + lock (and the compile) before
+# anything lands. A red bump PR is the mechanism working — a schemas change broke
+# supervisor; fix it in this PR. (schemas' consumer gate also compiles supervisor
+# main against every schemas PR, so most breaks are caught before they land.)
+#
+# ---------------------------------------------------------------------------
+# CREDENTIAL — none beyond GITHUB_TOKEN
+# ---------------------------------------------------------------------------
+#
+# A GITHUB_TOKEN push fires no `pull_request` workflows. Required-check state is
+# read by (repo, head_sha) whatever event produced the check runs, and
+# GITHUB_TOKEN may create PRs here (`can_approve_pull_request_reviews: true`) and
+# may trigger `workflow_dispatch`. So the job pushes, opens a READY PR, and
+# dispatches ci.yml at the bump branch; its check runs land on the head SHA. If
+# `CLORINDE_AUTOCOMMIT_TOKEN` is ever provisioned to this repo, the job pushes
+# with it instead and skips the dispatch.
+#
+# No credential is persisted into .git/config (`persist-credentials: false`):
+# the write token is handed to the one `git push` that needs it, as an
+# un-persisted header, and no third-party action runs in this job.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT WILL NOT DO
+# ---------------------------------------------------------------------------
+#
+#   - touch an OPEN bump PR. Once proposed, the PR may be an in-flight merge
+#     candidate, and moving a branch tip out from under a proposal is a known
+#     wedge class (the runner's sibling-pin-bump.yml refuses it for the same
+#     reason). It comments ONCE naming the newer schemas head and waits; the
+#     first run after that PR lands bumps against the new main. With a pin,
+#     lagging a run cannot red main.
+#   - move a pin that is not an ancestor of schemas main (a deliberate hand pin):
+#     it warns and leaves it.
+#   - overwrite commits on the branch it did not author (merge commits aside):
+#     it warns and stops. The push is `--force-with-lease` on the sha it read,
+#     so a push that races the check is refused rather than clobbered.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  # Latency hook for plan §7.4 Phase 2 (a schemas release notifying consumers).
+  # With a pin, latency no longer produces a red, so this is optional wiring.
+  repository_dispatch:
+    types: [schemas-released]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schemas-pin-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # gh workflow run ci.yml on the bump branch
+    env:
+      REPO: ${{ github.repository }}
+      BRANCH: chore/schemas-pin-bump
+      SCHEMAS: qontinui/qontinui-schemas
+      BOT_NAME: github-actions[bot]
+      BOT_EMAIL: 41898283+github-actions[bot]@users.noreply.github.com
+      PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Decide whether the pin should move
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "move=false" >> "$GITHUB_OUTPUT"
+          pinned="$(bash .github/scripts/schemas-pin.sh read)"
+          head="$(gh api "repos/$SCHEMAS/commits/main" --jq .sha)"
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve $SCHEMAS main (got '$head')"; exit 1; }
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$head" ]; then
+            echo "Pin is current: $pinned. Nothing to do."
+            exit 0
+          fi
+          # ahead = main has moved past the pin (the normal case). behind /
+          # diverged = the pin is not on main's history: a deliberate hand pin.
+          status="$(gh api "repos/$SCHEMAS/compare/$pinned...$head" --jq .status)"
+          if [ "$status" != "ahead" ]; then
+            echo "::warning::The pin $pinned is '$status' relative to $SCHEMAS main $head — not an ancestor of main (a hand pin?). Leaving it alone."
+            exit 0
+          fi
+          # An open bump PR is never touched (see header). Errors propagate:
+          # an unreadable PR list must not read as "no PR".
+          open_pr="$(gh pr list -R "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$open_pr" ]; then
+            echo "Bump PR #$open_pr is open; not moving its branch."
+            if ! gh pr view "$open_pr" -R "$REPO" --json comments --jq '.comments[].body' | grep -qF "$head"; then
+              gh pr comment "$open_pr" -R "$REPO" --body "qontinui-schemas main has moved to \`$head\` since this bump was opened. The pin-bump workflow does not move an open PR's branch (it may be an in-flight merge candidate); the first run after this PR lands will bump against the new main."
+            fi
+            exit 0
+          fi
+          echo "move=true" >> "$GITHUB_OUTPUT"
+
+      - name: Leave commits this workflow did not author alone
+        if: steps.decide.outputs.move == 'true'
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "blocked=false" >> "$GITHUB_OUTPUT"
+          # 404 = no branch (lease: must not exist). ANY other failure is
+          # UNKNOWN and stops the job — never "no branch, force-push".
+          if out="$(gh api "repos/$REPO/branches/$BRANCH" --jq .commit.sha 2>&1)"; then
+            observed="$out"
+            [[ "$observed" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::unexpected branch read: $observed"; exit 1; }
+          elif printf '%s' "$out" | grep -q 'HTTP 404'; then
+            observed=""
+          else
+            echo "::error::Could not read $BRANCH: $out"
+            exit 1
+          fi
+          echo "lease=$observed" >> "$GITHUB_OUTPUT"
+          [ -z "$observed" ] && { echo "No existing $BRANCH branch."; exit 0; }
+          # Merge commits (e.g. a GitHub update-branch) do not count as authored
+          # work; any other commit not by this workflow is someone's adaptation.
+          foreign="$(gh api "repos/$REPO/compare/main...$observed" --jq "[.commits[] | select((.parents | length) == 1 and .commit.author.email != \"$BOT_EMAIL\")] | length")"
+          if [ "$foreign" != "0" ]; then
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::$BRANCH carries $foreign commit(s) not authored by this workflow and has no open PR. Not overwriting it; open a PR from it or delete the branch to let this job rebuild it."
+          fi
+
+      - name: Install the pinned Rust toolchain
+        if: steps.decide.outputs.move == 'true' && steps.guard.outputs.blocked != 'true'
+        shell: bash
+        # rustup ships on ubuntu-latest; rust-toolchain.toml pins the channel.
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal
+
+      - name: Move the pin and refresh Cargo.lock in one commit
+        if: steps.decide.outputs.move == 'true' && steps.guard.outputs.blocked != 'true'
+        id: commit
+        env:
+          HEAD_SHA: ${{ steps.decide.outputs.head }}
+          OLD_SHA: ${{ steps.decide.outputs.pinned }}
+          LEASE: ${{ steps.guard.outputs.lease }}
+          GH_TOKEN: ${{ github.token }} # schemas-pin.sh checkout authenticates its fetch with it
+          PUSH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/schemas-pin.sh rewrite "$HEAD_SHA"
+          bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+          # Resolve-only, WITHOUT --locked: cargo rewrites only the lock entries
+          # the new sibling tree forces (the path crates' versions, plus any
+          # dependency they newly add). `cargo update -p qontinui-types` unlocks
+          # more than that — finding b45b88c7 measured unrelated windows-sys /
+          # socket2 churn from it in the runner and supervisor locks.
+          cargo metadata --format-version 1 > /dev/null
+          # The exact check rust-ci runs on the resulting PR.
+          cargo metadata --locked --format-version 1 > /dev/null
+          changed="$(git status --porcelain | awk '{print $2}' | sort | tr '\n' ' ')"
+          case "$changed" in
+            ".github/sibling-pins.conf " | ".github/sibling-pins.conf Cargo.lock ") ;;
+            *) echo "::error::Unexpected working-tree changes: '$changed'"; git status --porcelain; exit 1 ;;
+          esac
+          lockdiff="$(git --no-pager diff -U0 -- Cargo.lock | grep -E '^[-+](name|version) = ' || true)"
+          {
+            echo "lockdiff<<LOCKDIFF_EOF"
+            if [ -n "$lockdiff" ]; then printf '%s\n' "$lockdiff"; else echo "(no Cargo.lock change: no path crate version moved)"; fi
+            echo "LOCKDIFF_EOF"
+          } >> "$GITHUB_OUTPUT"
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+          git checkout -B "$BRANCH"
+          git add .github/sibling-pins.conf Cargo.lock
+          git commit -q -m "chore: bump qontinui-schemas pin to ${HEAD_SHA:0:8}" \
+            -m "Moves .github/sibling-pins.conf ${OLD_SHA:0:8} -> ${HEAD_SHA:0:8} and refreshes Cargo.lock in the same commit (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7)."
+          # The token rides one command as an un-persisted header, masked.
+          auth="$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          # Lease on the sha the guard read ("" = the branch must not exist), so
+          # a push that landed after the guard is refused, not overwritten.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --force-with-lease="refs/heads/$BRANCH:$LEASE" \
+            "https://github.com/$REPO.git" "HEAD:refs/heads/$BRANCH"
+
+      - name: Open the bump PR
+        if: steps.decide.outputs.move == 'true' && steps.guard.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || github.token }}
+          HEAD_SHA: ${{ steps.decide.outputs.head }}
+          OLD_SHA: ${{ steps.decide.outputs.pinned }}
+          LOCKDIFF: ${{ steps.commit.outputs.lockdiff }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="chore: bump qontinui-schemas pin to ${HEAD_SHA:0:8}"
+          body="$RUNNER_TEMP/schemas-pin-bump-body.md"
+          cat > "$body" <<EOF
+          Automated by the \`schemas pin bump\` workflow: $RUN_URL
+
+          Moves the qontinui-schemas commit supervisor compiles and tests against, **together with** the Cargo.lock refresh it forces:
+
+          - pin: \`$OLD_SHA\` → \`$HEAD_SHA\` ([compare](https://github.com/$SCHEMAS/compare/$OLD_SHA...$HEAD_SHA))
+          - Cargo.lock:
+
+          \`\`\`
+          $LOCKDIFF
+          \`\`\`
+
+          **If this PR goes red, that is the mechanism working, not a failure.** A schemas change does not build or pass with coord. Before the pin, that same break arrived on supervisor \`main\`. Fix supervisor **in this PR**; the workflow does not move an open bump PR's branch.
+
+          Plan: 2026-08-31-schemas-releases-strand-consumer-cargo-locks
+          EOF
+          # Always a NEW PR. A closed-unmerged bump PR cannot be reopened: the
+          # branch was just rebuilt from main, and GitHub refuses to reopen a PR
+          # whose head no longer descends from its head at close. (An OPEN one
+          # cannot exist here: the decide step stops on it.) Nothing runs after
+          # the create in this step, so no later failure can strand the new PR
+          # without the dispatched checks below.
+          url="$(gh pr create -R "$REPO" --base main --head "$BRANCH" --title "$title" --body-file "$body")"
+          echo "Bump PR: $url"
+
+      - name: Run the required checks on the bump head
+        if: steps.decide.outputs.move == 'true' && steps.guard.outputs.blocked != 'true' && env.PAT_AVAILABLE != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GITHUB_TOKEN's push fired no pull_request run; workflow_dispatch is
+          # the exception GitHub allows. The check runs land on the head SHA,
+          # which is what coord and the ruleset read (see header).
+          gh workflow run ci.yml -R "$REPO" --ref "$BRANCH"
+          echo "Dispatched ci.yml on $BRANCH."
