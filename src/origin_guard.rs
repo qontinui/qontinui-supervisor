@@ -86,7 +86,7 @@
 //! supervisor, so it is shown only to non-browser and same-origin callers.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{MatchedPath, Request, State};
@@ -163,11 +163,19 @@ const SHARED_SPA_SEGMENTS: &[&str] = &[
 
 /// How many recent refusals `/health` carries.
 const RECENT_CAP: usize = 20;
-/// Distinct refusal subjects (class + origin, or the refused `Host`) logged at
-/// WARN before going quiet. The counters keep counting past it. The key never
-/// includes the path: a page chooses its paths freely, so 256 junk paths would
-/// otherwise fill the set and silence every later origin.
-const LOGGED_CAP: usize = 256;
+/// Distinct refusal subjects logged at WARN, per gate. Host keys and origin
+/// keys have SEPARATE sets and separate caps, so saturating one cannot silence
+/// the other — wildcard DNS (`r0..rN.evil.example`, all resolving to loopback)
+/// makes Host keys attacker-multipliable, and N cross-origin iframes on
+/// `i0..iN.evil.example` do the same for origin keys.
+///
+/// So the cap does NOT bound what an attacker can push out of the log. What it
+/// buys is a bounded set: the guard never grows memory per refused subject, and
+/// an ordinary polling page logs once rather than once per request. The refusal
+/// COUNTERS keep counting after saturation, `recent` keeps its last
+/// [`RECENT_CAP`] entries, and `/health` reports `logSaturated` per gate, so a
+/// saturated log is visible rather than silent.
+const LOG_KEYS_CAP: usize = 256;
 /// Longest header value echoed into a log, `/health` or a refusal body.
 const ECHO_MAX: usize = 256;
 
@@ -277,7 +285,10 @@ pub struct OriginGuard {
     refused_host: AtomicU64,
     refused_origin: AtomicU64,
     recent: Mutex<VecDeque<Value>>,
-    logged: Mutex<HashSet<String>>,
+    logged_host: Mutex<HashSet<String>>,
+    logged_origin: Mutex<HashSet<String>>,
+    log_saturated_host: AtomicBool,
+    log_saturated_origin: AtomicBool,
 }
 
 impl OriginGuard {
@@ -308,7 +319,10 @@ impl OriginGuard {
             refused_host: AtomicU64::new(0),
             refused_origin: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
-            logged: Mutex::new(HashSet::new()),
+            logged_host: Mutex::new(HashSet::new()),
+            logged_origin: Mutex::new(HashSet::new()),
+            log_saturated_host: AtomicBool::new(false),
+            log_saturated_origin: AtomicBool::new(false),
         }
     }
 
@@ -383,11 +397,20 @@ impl OriginGuard {
         subject: Option<&str>,
         entry: Value,
     ) -> bool {
-        let (counter, log_key) = if kind == CODE_HOST_NOT_LOOPBACK {
-            (&self.refused_host, format!("host|{subject:?}"))
+        let (counter, keys, saturated, gate, log_key) = if kind == CODE_HOST_NOT_LOOPBACK {
+            (
+                &self.refused_host,
+                &self.logged_host,
+                &self.log_saturated_host,
+                "host",
+                format!("host|{subject:?}"),
+            )
         } else {
             (
                 &self.refused_origin,
+                &self.logged_origin,
+                &self.log_saturated_origin,
+                "origin",
                 format!("origin|{}|{subject:?}", class.as_str()),
             )
         };
@@ -398,10 +421,20 @@ impl OriginGuard {
             }
             recent.push_back(entry);
         }
-        self.logged
-            .lock()
-            .map(|mut set| set.len() < LOGGED_CAP && set.insert(log_key))
-            .unwrap_or(false)
+        let Ok(mut set) = keys.lock() else {
+            return false;
+        };
+        if set.len() >= LOG_KEYS_CAP {
+            if !saturated.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    gate,
+                    distinct_subjects = LOG_KEYS_CAP,
+                    "origin guard: the {gate} refusal log is SATURATED — further {gate} refusals are counted on /health (refusals.{gate}, logSaturated.{gate}) but no longer logged"
+                );
+            }
+            return false;
+        }
+        set.insert(log_key)
     }
 
     /// The `/health` `originGuard` block. `recent` only for non-browser and
@@ -413,6 +446,12 @@ impl OriginGuard {
             "refusals": {
                 "host": self.refused_host.load(Ordering::Relaxed),
                 "origin": self.refused_origin.load(Ordering::Relaxed),
+            },
+            // Per-gate WARN logs stop at LOG_KEYS_CAP distinct subjects; the
+            // counters above do not.
+            "logSaturated": {
+                "host": self.log_saturated_host.load(Ordering::Relaxed),
+                "origin": self.log_saturated_origin.load(Ordering::Relaxed),
             },
             "killSwitchEnv": ENV_GUARD,
             "admitOriginEnv": ENV_ALLOWED_ORIGINS,
@@ -757,25 +796,42 @@ mod unit_tests {
         assert!(!ok("127.0.0.1.evil.example:9875"));
     }
 
-    /// Every route `build_router` registers (in `server.rs` and the merged
-    /// routers) has a first segment in [`API_SEGMENTS`] or
+    /// Every route `build_router` registers (in `server.rs` and the routers it
+    /// merges) has a first segment in [`API_SEGMENTS`] or
     /// [`SHARED_SPA_SEGMENTS`], so a new API prefix cannot silently become
     /// reachable by a cross-site navigation. And no dashboard client route is
     /// an API segment, so deep links keep working.
+    ///
+    /// The scan reads only the sources in [`SCANNED_ROUTERS`], so it also
+    /// checks — in every one of them, not just `server.rs` — that no route
+    /// reaches the router by a path it cannot read: a `.merge(` of anything
+    /// but another scanned module, a non-literal `.route(` path, or one of the
+    /// forbidden service/nest registrations.
     #[test]
     fn api_segments_cover_every_registered_route() {
-        let sources = [
-            include_str!("server.rs"),
-            include_str!("routes/velocity.rs"),
-            include_str!("routes/evaluation.rs"),
-            include_str!("routes/velocity_tests.rs"),
-            include_str!("routes/velocity_improvement.rs"),
-            include_str!("routes/dev_endpoints.rs"),
-            include_str!("routes/dashboard.rs"),
+        /// The router sources, as (module name as `crate::routes::<name>`,
+        /// source). One list, so the scan and the merge allowlist cannot drift.
+        const SCANNED_ROUTERS: &[(&str, &str)] = &[
+            ("server", include_str!("server.rs")),
+            ("velocity", include_str!("routes/velocity.rs")),
+            ("evaluation", include_str!("routes/evaluation.rs")),
+            ("velocity_tests", include_str!("routes/velocity_tests.rs")),
+            (
+                "velocity_improvement",
+                include_str!("routes/velocity_improvement.rs"),
+            ),
+            ("dev_endpoints", include_str!("routes/dev_endpoints.rs")),
+            ("dashboard", include_str!("routes/dashboard.rs")),
         ];
+        let sources: Vec<&str> = SCANNED_ROUTERS.iter().map(|(_, src)| *src).collect();
         let route = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
         let mut seen = 0;
-        for (i, src) in sources.iter().enumerate() {
+        let merge = regex::Regex::new(r"\.merge\(\s*crate::routes::(\w+)::").unwrap();
+        for (name, src) in SCANNED_ROUTERS {
+            // `.fallback(` is fine (dashboard.rs serves the SPA through one);
+            // `.fallback_service(` is not, because a service fallback (a
+            // `ServeDir`, say) serves paths the SPA fallback does not, which
+            // the navigation rule's API_SEGMENTS check would not see.
             for forbidden in [
                 ".nest(",
                 ".nest_service(",
@@ -784,7 +840,22 @@ mod unit_tests {
             ] {
                 assert!(
                     !src.contains(forbidden),
-                    "source {i}: {forbidden} registers routes this scan cannot see"
+                    "{name}.rs: {forbidden} registers routes this scan cannot see"
+                );
+            }
+            // Every merged router must itself be a scanned module — in any
+            // source, not just server.rs.
+            let merges = src.matches(".merge(").count();
+            let merged: Vec<String> = merge.captures_iter(src).map(|c| c[1].to_string()).collect();
+            assert_eq!(
+                merges,
+                merged.len(),
+                "{name}.rs: a `.merge(` is not `crate::routes::<module>::…`"
+            );
+            for module in &merged {
+                assert!(
+                    SCANNED_ROUTERS.iter().any(|(n, _)| n == module),
+                    "{name}.rs merges routes::{module}, which this scan does not read"
                 );
             }
             // Every `.route(` must name its path as a string literal, or the
@@ -793,7 +864,7 @@ mod unit_tests {
             let literal = route.captures_iter(src).count();
             assert_eq!(
                 calls, literal,
-                "source {i}: {calls} `.route(` calls but {literal} with a literal path"
+                "{name}.rs: {calls} `.route(` calls but {literal} with a literal path"
             );
             for cap in route.captures_iter(src) {
                 seen += 1;
@@ -809,35 +880,10 @@ mod unit_tests {
             }
         }
         assert!(seen > 100, "the scan found only {seen} routes");
-
-        // Every router merged into `build_router` must be one of the scanned
-        // modules above.
-        let server = sources[0];
-        let merge = regex::Regex::new(r"\.merge\(\s*crate::routes::(\w+)::").unwrap();
-        let scanned = [
-            "velocity",
-            "evaluation",
-            "velocity_tests",
-            "velocity_improvement",
-            "dev_endpoints",
-            "dashboard",
-        ];
-        let merges = server.matches(".merge(").count();
-        let merged: Vec<String> = merge
-            .captures_iter(server)
-            .map(|c| c[1].to_string())
-            .collect();
-        assert_eq!(
-            merges,
-            merged.len(),
-            "a `.merge(` in server.rs is not `crate::routes::<module>::…`"
+        assert!(
+            sources[0].matches(".merge(").count() >= 6,
+            "server.rs no longer merges the stateless routers this scan expects"
         );
-        for module in &merged {
-            assert!(
-                scanned.contains(&module.as_str()),
-                "server.rs merges routes::{module}, which this scan does not read"
-            );
-        }
 
         let app = include_str!("../frontend/src/App.tsx");
         let client = regex::Regex::new(r#"<Route\s+path="/([^/"]*)"#).unwrap();
@@ -897,6 +943,40 @@ mod unit_tests {
         assert_eq!(
             g.health_json(OriginClass::NonBrowser)["refusals"]["origin"],
             json!(301)
+        );
+    }
+
+    /// The two log-once sets are separate and each is capped: filling the Host
+    /// set (wildcard DNS) silences further HOST logs, marks
+    /// `logSaturated.host`, and leaves origin logging untouched.
+    #[test]
+    fn the_log_once_sets_are_capped_separately() {
+        let g = guard();
+        let host = |h: &str| {
+            g.record_refusal(
+                CODE_HOST_NOT_LOOPBACK,
+                OriginClass::NonBrowser,
+                Some(h),
+                json!({}),
+            )
+        };
+        for i in 0..LOG_KEYS_CAP {
+            assert!(host(&format!("r{i}.evil.example:9875")), "host {i}");
+        }
+        assert!(!host("overflow.evil.example:9875"));
+        assert!(g.record_refusal(
+            CODE_CROSS_ORIGIN_REFUSED,
+            OriginClass::Foreign,
+            Some("https://after-saturation.example"),
+            json!({}),
+        ));
+        let health = g.health_json(OriginClass::NonBrowser);
+        assert_eq!(health["logSaturated"]["host"], json!(true));
+        assert_eq!(health["logSaturated"]["origin"], json!(false));
+        assert_eq!(
+            health["refusals"]["host"],
+            json!(LOG_KEYS_CAP as u64 + 1),
+            "counting continues after saturation"
         );
     }
 

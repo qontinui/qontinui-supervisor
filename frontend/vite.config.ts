@@ -10,7 +10,11 @@ const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'ut
 const SUPERVISOR = 'http://localhost:9875';
 const DEV_PORT = 5174;
 /** This dev server's own origins: the only ones rewritten to the supervisor's. */
-const DEV_ORIGINS = new Set([`http://localhost:${DEV_PORT}`, `http://127.0.0.1:${DEV_PORT}`]);
+const DEV_ORIGINS = new Set([
+  `http://localhost:${DEV_PORT}`,
+  `http://127.0.0.1:${DEV_PORT}`,
+  `http://[::1]:${DEV_PORT}`,
+]);
 
 /**
  * Proxy one path prefix to the supervisor so it passes the supervisor's origin
