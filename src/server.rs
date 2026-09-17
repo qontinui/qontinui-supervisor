@@ -1,7 +1,6 @@
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::state::SharedState;
@@ -702,7 +701,35 @@ pub fn supervisor_panic_handler(
         .into_response()
 }
 
+/// Build the HTTP router. Reads the origin guard's env vars
+/// (`crate::origin_guard::ENV_*`) now, so `main` calling this once at startup
+/// is what makes them "read once at spawn".
 pub fn build_router(state: SharedState) -> Router {
+    let guard = crate::origin_guard::OriginGuardConfig::from_env(state.config.port);
+    build_router_with_origin_guard(state, guard)
+}
+
+/// [`build_router`] with the origin guard's configuration passed in. The bound
+/// port the guard judges `Host` and same-origin against is `guard.bound_port`,
+/// which [`build_router`] takes from `state.config.port` — the port `main`
+/// binds. Tests call this directly so they never touch process env.
+pub fn build_router_with_origin_guard(
+    state: SharedState,
+    guard: crate::origin_guard::OriginGuardConfig,
+) -> Router {
+    let guard = std::sync::Arc::new(crate::origin_guard::OriginGuard::new(guard));
+    if guard.is_enabled() {
+        tracing::info!(
+            "origin guard enabled: browser origins other than this supervisor's own and the runner webview are refused ({} to add one; {}=0 disables)",
+            crate::origin_guard::ENV_ALLOWED_ORIGINS,
+            crate::origin_guard::ENV_GUARD
+        );
+    } else {
+        tracing::warn!(
+            "origin guard DISABLED by {}=0: any web page in this machine's browser can call every supervisor route, including the runner proxies",
+            crate::origin_guard::ENV_GUARD
+        );
+    }
     // Resolve dev_logs directory for velocity routes
     let dev_logs_dir = state
         .config
@@ -712,10 +739,8 @@ pub fn build_router(state: SharedState) -> Router {
         .unwrap_or(&state.config.project_dir)
         .join(".dev-logs");
     let _ = std::fs::create_dir_all(&dev_logs_dir);
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // Echoes only an origin the origin guard admitted; never `*`.
+    let cors = crate::origin_guard::cors_layer();
 
     // Clone state for stateless routes (they need SharedState; main_routes consumes it)
     let eval_state = state.clone();
@@ -1107,6 +1132,14 @@ pub fn build_router(state: SharedState) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+        // Origin + Host guard (plan 2026-09-17-retire-the-runner-origin-guard-dev-grace,
+        // Phase 1). OUTSIDE cors, so a refused request — a preflight included —
+        // never reaches CORS, a handler or a WebSocket upgrade; INSIDE
+        // CatchPanicLayer, so a panic in it is still a 500.
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            crate::origin_guard::middleware,
+        ))
         // CatchPanicLayer wraps everything below it (tower applies layers
         // bottom-up, so this is the OUTERMOST layer). A panic anywhere in
         // a handler — including a deeper layer — is converted into a 500

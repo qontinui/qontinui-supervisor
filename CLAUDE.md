@@ -981,6 +981,52 @@ The supervisor pulls placement config from the primary runner via `GET http://lo
 
 Returns `502 Bad Gateway` with descriptive error if the runner is not responding.
 
+### Origin and Host guard (every route)
+
+Every route, the four runner proxies included, sits behind one middleware
+(`src/origin_guard.rs`; plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`
+Phase 1). The proxies copy only `content-type` to the runner, so the runner sees
+every proxied call as non-browser; before the guard, any web page open on this
+machine could read a coord device JWT through
+`POST /ui-bridge/invoke/get_coord_device_token` here.
+
+- **Agents are unaffected.** A request with no `Origin` (and `Sec-Fetch-Site`
+  absent, `none` or `same-origin`) and a loopback `Host` passes exactly as
+  before. No credential is added.
+- **Host gate:** `127.0.0.1`, `localhost` or `[::1]` on the bound `--port`, or a
+  value in `QONTINUI_SUPERVISOR_ALLOWED_HOSTS`. With no `Host` header the request
+  URI's authority is judged instead; only a request with neither is admitted.
+  Else 403 `HOST_NOT_LOOPBACK` (the DNS-rebinding control).
+- **Origin gate:** the supervisor's own `http://localhost|127.0.0.1|[::1]:<port>`
+  (the dashboard), the runner webview, or an origin in
+  `QONTINUI_SUPERVISOR_ALLOWED_ORIGINS`. Anything else, preflights and WebSocket
+  upgrades included, is 403 `CROSS_ORIGIN_REFUSED` with a body naming the origin,
+  the path and the env var that would admit it. Refusals carry
+  `Vary: Origin, Sec-Fetch-Site` and `Cache-Control: no-store`.
+- **Runner webview origins:** `tauri://localhost` on every OS;
+  `http://tauri.localhost` and `https://tauri.localhost` (WebView2) on Windows
+  only. **Windows residual:** `tauri.localhost` resolves to loopback, so a page
+  served by any local process on port 80 or 443 carries exactly those origins
+  and is admitted there.
+- **Link navigations to the dashboard:** a cross-site or same-site top-level
+  navigation (GET/HEAD, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`,
+  no `Origin`) is admitted only to `/` or to an unmatched path that falls through
+  to the SPA fallback outside `origin_guard::API_SEGMENTS`. Never to an API route,
+  never as an iframe. A tripwire test keeps `API_SEGMENTS` covering every
+  registered route.
+- CORS echoes only an admitted origin (never `*`), with `Vary: Origin`.
+- `QONTINUI_SUPERVISOR_ORIGIN_GUARD=0` turns both gates off. All three env vars
+  are read once when the router is built, so they apply at the supervisor's next
+  start. Never restart a supervisor just to apply one: its JobObject reaps temp
+  runners.
+- `GET /health` → `originGuard { enabled, requesterClass, refusals{host,origin}, recent }`;
+  `recent` (the last 20 refusals) is shown only to non-browser and same-origin callers.
+- The Vite dev server (`frontend`, port 5174) proxies to `:9875` with
+  `changeOrigin` and rewrites an `Origin` in a fixed set built from its
+  `server.port` (`http://localhost:5174`, `http://127.0.0.1:5174`) to the
+  supervisor's. The supervisor deliberately does not admit `:5174`, because any
+  project's page on that port would then reach every route.
+
 ### Supervisor Bridge
 
 UI Bridge relay so the dashboard's own webview can be inspected/controlled by automation agents.

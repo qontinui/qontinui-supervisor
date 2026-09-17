@@ -390,8 +390,29 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
     }
 }
 
-pub async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
-    Json(build_health_response(&state).await)
+/// `GET /health`. Adds the origin guard's `originGuard` block, rendered for the
+/// class of this caller (`recent` only for non-browser and same-origin callers).
+pub async fn health(
+    State(state): State<SharedState>,
+    guard: Option<axum::Extension<crate::origin_guard::OriginGuardContext>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let response = build_health_response(&state).await;
+    // Serialization failure answers 500, as axum's `Json<HealthResponse>` did.
+    let mut value = match serde_json::to_value(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("health serialization failed: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    if let (Some(axum::Extension(ctx)), Some(obj)) = (guard, value.as_object_mut()) {
+        obj.insert("originGuard".to_string(), ctx.health_json());
+    }
+    Json(value).into_response()
 }
 
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {

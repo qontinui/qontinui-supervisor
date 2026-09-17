@@ -33,6 +33,7 @@ mod fs_atomic;
 mod git_provenance;
 mod health_cache;
 mod log_capture;
+mod origin_guard;
 mod otel;
 mod pii_scrub;
 mod process;

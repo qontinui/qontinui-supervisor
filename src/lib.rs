@@ -29,6 +29,7 @@ pub mod fs_atomic;
 pub mod git_provenance;
 pub mod health_cache;
 pub mod log_capture;
+pub mod origin_guard;
 pub mod otel;
 pub mod pii_scrub;
 pub mod process;
