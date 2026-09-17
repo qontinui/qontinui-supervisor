@@ -74,6 +74,9 @@ export default defineConfig({
   },
   server: {
     port: DEV_PORT,
+    // The proxy's Origin rewrite matches only DEV_PORT; a silent fallback to
+    // another port would turn every dashboard POST into a 403.
+    strictPort: true,
     proxy: {
       '/health': toSupervisor(),
       '/runner': toSupervisor(),

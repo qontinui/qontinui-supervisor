@@ -163,8 +163,10 @@ const SHARED_SPA_SEGMENTS: &[&str] = &[
 
 /// How many recent refusals `/health` carries.
 const RECENT_CAP: usize = 20;
-/// Distinct (kind, origin/host, path) keys logged at WARN before going quiet.
-/// The counters keep counting past it.
+/// Distinct refusal subjects (class + origin, or the refused `Host`) logged at
+/// WARN before going quiet. The counters keep counting past it. The key never
+/// includes the path: a page chooses its paths freely, so 256 junk paths would
+/// otherwise fill the set and silence every later origin.
 const LOGGED_CAP: usize = 256;
 /// Longest header value echoed into a log, `/health` or a refusal body.
 const ECHO_MAX: usize = 256;
@@ -370,11 +372,24 @@ impl OriginGuard {
         OriginClass::Foreign
     }
 
-    fn record(&self, kind: &'static str, entry: Value, log_key: String) -> bool {
-        let counter = if kind == CODE_HOST_NOT_LOOPBACK {
-            &self.refused_host
+    /// Count a refusal, keep it in `recent`, and say whether it is the first
+    /// refusal of its subject (and so should be logged). The subject is the
+    /// refused `Host` for a Host refusal and class + `Origin` for an origin
+    /// refusal; the path in `entry` is deliberately not part of it.
+    fn record_refusal(
+        &self,
+        kind: &'static str,
+        class: OriginClass,
+        subject: Option<&str>,
+        entry: Value,
+    ) -> bool {
+        let (counter, log_key) = if kind == CODE_HOST_NOT_LOOPBACK {
+            (&self.refused_host, format!("host|{subject:?}"))
         } else {
-            &self.refused_origin
+            (
+                &self.refused_origin,
+                format!("origin|{}|{subject:?}", class.as_str()),
+            )
         };
         counter.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut recent) = self.recent.lock() {
@@ -463,8 +478,10 @@ pub async fn middleware(
                 .map(|v| truncate(&String::from_utf8_lossy(v.as_bytes()))),
             RequestHost::Absent => None,
         };
-        let first = guard.record(
+        let first = guard.record_refusal(
             CODE_HOST_NOT_LOOPBACK,
+            class,
+            host.as_deref(),
             json!({
                 "code": CODE_HOST_NOT_LOOPBACK,
                 "host": host,
@@ -472,10 +489,9 @@ pub async fn middleware(
                 "path": path,
                 "at": chrono::Utc::now().to_rfc3339(),
             }),
-            format!("host|{host:?}|{path}"),
         );
         if first {
-            tracing::warn!(host = ?host, method = %method, path = %path, "origin guard: refused a non-loopback Host (logged once per host+path; counted on /health)");
+            tracing::warn!(host = ?host, method = %method, path = %path, "origin guard: refused a non-loopback Host (logged once per host; counted on /health)");
         }
         return refusal(json!({
             "error": "Host header does not name this supervisor's loopback address and bound port",
@@ -500,8 +516,10 @@ pub async fn middleware(
             .headers()
             .get(header::ORIGIN)
             .map(|v| truncate(&String::from_utf8_lossy(v.as_bytes())));
-        let first = guard.record(
+        let first = guard.record_refusal(
             CODE_CROSS_ORIGIN_REFUSED,
+            class,
+            origin.as_deref(),
             json!({
                 "code": CODE_CROSS_ORIGIN_REFUSED,
                 "origin": origin,
@@ -509,10 +527,9 @@ pub async fn middleware(
                 "path": path,
                 "at": chrono::Utc::now().to_rfc3339(),
             }),
-            format!("origin|{origin:?}|{path}"),
         );
         if first {
-            tracing::warn!(origin = ?origin, method = %method, path = %path, "origin guard: refused a browser origin (logged once per origin+path; counted on /health)");
+            tracing::warn!(origin = ?origin, method = %method, path = %path, "origin guard: refused a browser origin (logged once per origin; counted on /health)");
         }
         return refusal(json!({
             "error": "This supervisor answers only non-browser callers, its own dashboard origin, the runner webview, and origins listed in the admit env var",
@@ -758,11 +775,25 @@ mod unit_tests {
         ];
         let route = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
         let mut seen = 0;
-        for src in sources {
-            assert!(!src.contains(".nest("), "a nested router escapes this scan");
-            assert!(
-                !src.contains(".route_service("),
-                "route_service escapes this scan"
+        for (i, src) in sources.iter().enumerate() {
+            for forbidden in [
+                ".nest(",
+                ".nest_service(",
+                ".route_service(",
+                ".fallback_service(",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "source {i}: {forbidden} registers routes this scan cannot see"
+                );
+            }
+            // Every `.route(` must name its path as a string literal, or the
+            // capture below silently skips it.
+            let calls = src.matches(".route(").count();
+            let literal = route.captures_iter(src).count();
+            assert_eq!(
+                calls, literal,
+                "source {i}: {calls} `.route(` calls but {literal} with a literal path"
             );
             for cap in route.captures_iter(src) {
                 seen += 1;
@@ -778,6 +809,35 @@ mod unit_tests {
             }
         }
         assert!(seen > 100, "the scan found only {seen} routes");
+
+        // Every router merged into `build_router` must be one of the scanned
+        // modules above.
+        let server = sources[0];
+        let merge = regex::Regex::new(r"\.merge\(\s*crate::routes::(\w+)::").unwrap();
+        let scanned = [
+            "velocity",
+            "evaluation",
+            "velocity_tests",
+            "velocity_improvement",
+            "dev_endpoints",
+            "dashboard",
+        ];
+        let merges = server.matches(".merge(").count();
+        let merged: Vec<String> = merge
+            .captures_iter(server)
+            .map(|c| c[1].to_string())
+            .collect();
+        assert_eq!(
+            merges,
+            merged.len(),
+            "a `.merge(` in server.rs is not `crate::routes::<module>::…`"
+        );
+        for module in &merged {
+            assert!(
+                scanned.contains(&module.as_str()),
+                "server.rs merges routes::{module}, which this scan does not read"
+            );
+        }
 
         let app = include_str!("../frontend/src/App.tsx");
         let client = regex::Regex::new(r#"<Route\s+path="/([^/"]*)"#).unwrap();
@@ -810,17 +870,53 @@ mod unit_tests {
         assert!(!on(Some(" 0 ")));
     }
 
+    /// One origin refused on 300 distinct paths logs once, and cannot fill the
+    /// log-once set: a new origin (and a new Host) afterwards is still logged.
+    #[test]
+    fn junk_paths_cannot_silence_later_refusal_logs() {
+        let g = guard();
+        let refuse = |origin: &str, path: &str| {
+            g.record_refusal(
+                CODE_CROSS_ORIGIN_REFUSED,
+                OriginClass::Foreign,
+                Some(origin),
+                json!({ "origin": origin, "path": path }),
+            )
+        };
+        assert!(refuse("https://evil.example", "/junk/0"));
+        for i in 1..300 {
+            assert!(!refuse("https://evil.example", &format!("/junk/{i}")));
+        }
+        assert!(refuse("https://second.example", "/ui-bridge/x"));
+        assert!(g.record_refusal(
+            CODE_HOST_NOT_LOOPBACK,
+            OriginClass::NonBrowser,
+            Some("rebound.example:9875"),
+            json!({}),
+        ));
+        assert_eq!(
+            g.health_json(OriginClass::NonBrowser)["refusals"]["origin"],
+            json!(301)
+        );
+    }
+
     #[test]
     fn recent_is_withheld_from_browser_classes_and_capped() {
         let g = guard();
         for i in 0..(RECENT_CAP + 5) {
-            g.record(
+            g.record_refusal(
                 CODE_CROSS_ORIGIN_REFUSED,
+                OriginClass::Foreign,
+                Some("https://evil.example"),
                 json!({ "i": i }),
-                format!("k{i}"),
             );
         }
-        g.record(CODE_HOST_NOT_LOOPBACK, json!({}), "h".into());
+        g.record_refusal(
+            CODE_HOST_NOT_LOOPBACK,
+            OriginClass::NonBrowser,
+            Some("evil.example:9875"),
+            json!({}),
+        );
         let nb = g.health_json(OriginClass::NonBrowser);
         assert_eq!(nb["refusals"]["origin"], json!(RECENT_CAP as u64 + 5));
         assert_eq!(nb["refusals"]["host"], json!(1));
