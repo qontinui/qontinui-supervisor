@@ -20,7 +20,10 @@ const PROXY_TIMEOUT_SECS: u64 = 15;
 /// Proxy handler for all runner monitor requests.
 ///
 /// Forwards the request to `http://127.0.0.1:9876/{path}` (stripping the
-/// `/runner-api` prefix), preserving method, query string, headers, and body.
+/// `/runner-api` prefix), preserving method, query string and body — and, of
+/// the headers, ONLY `content-type`. Same consequence as the UI Bridge proxy:
+/// the runner sees no browser provenance and grants full local trust, so
+/// `origin_guard` is the only thing deciding origin here.
 pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
     // Check runner health from cache first
     let cached = state.cached_health.read().await;

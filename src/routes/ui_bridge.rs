@@ -20,7 +20,13 @@ const PROXY_TIMEOUT_SECS: u64 = 15;
 /// Proxy handler for all UI Bridge requests.
 ///
 /// Forwards the request to `http://127.0.0.1:9876/ui-bridge/{path}` preserving
-/// method, query string, headers, and body.
+/// method, query string and body — and, of the headers, ONLY `content-type`.
+///
+/// That omission is load-bearing, not an oversight: with no `Origin` and no
+/// `Sec-Fetch-*` crossing the hop, the runner classifies every proxied call as
+/// non-browser and grants it full local trust. `origin_guard` is therefore the
+/// only thing deciding origin for this route, which is why its allow-list is
+/// strictly more powerful than the runner's own (see that module's doc).
 pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
     // Check runner health from cache first
     let cached = state.cached_health.read().await;

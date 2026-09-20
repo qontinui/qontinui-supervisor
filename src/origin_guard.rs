@@ -72,18 +72,53 @@
 //!    `Access-Control-Allow-Origin`.
 //!
 //! CORS ([`cors_layer`]) echoes only an origin this guard admitted, never `*`,
-//! and tower-http adds `Vary: Origin`.
+//! and tower-http adds `Vary: Origin`. The verdict also reads Fetch Metadata —
+//! `Sec-Fetch-Site` whenever `Origin` is absent, plus `Sec-Fetch-Mode` and
+//! `Sec-Fetch-Dest` for the SPA-shell navigation carve-out below — so
+//! [`middleware`] appends all three to `Vary` on an admitted response. Two
+//! requests differing only in those headers can get opposite verdicts, and a
+//! cache keyed on `Origin` alone would not tell them apart. Nothing is
+//! appended when the guard is off: there is no verdict to vary on.
+//!
+//! # What an admitted origin gets, and why the admit list is not a small dial
+//!
+//! The four runner proxies copy only `content-type` onto the outgoing request
+//! (`routes/ui_bridge.rs`, `routes/graphql_proxy.rs`), so the runner classifies
+//! every proxied call as non-browser and grants it FULL LOCAL TRUST — the
+//! runner's own origin guard, its credential-door list and its route policy all
+//! see a request with no browser provenance at all. That is the design: this
+//! guard decides origin ONCE, here, instead of the runner deciding it again.
+//!
+//! The consequence is worth stating plainly, because nothing downstream can
+//! re-impose it: an origin added to [`ENV_ALLOWED_ORIGINS`] is admitted to
+//! EVERY route, the proxies included, so that page reaches the runner's
+//! credential doors (`POST /ui-bridge/invoke/get_coord_device_token` among
+//! them) whatever the runner's own allow-list says. This admit list is
+//! therefore strictly more powerful than the runner's, and is for a trusted
+//! first-party dev origin only — never a convenience switch for a page that
+//! merely wants to read `/health`. The knowledge-base rule that a server-side
+//! hop either enforces origin itself or forwards the browser's provenance
+//! headers is satisfied here by the first arm
+//! (`knowledge-base/qontinui-specific/runner-origin-guard.md`).
 //!
 //! # Configuration (read once, at startup)
 //!
 //! - [`ENV_GUARD`]`=0` turns both checks off. It is read when the router is
 //!   built, so it takes effect at the supervisor's NEXT start. Never restart a
 //!   supervisor to apply it: its JobObject reaps the temp runners it spawned.
-//! - [`ENV_ALLOWED_ORIGINS`] and [`ENV_ALLOWED_HOSTS`] are comma lists.
+//! - [`ENV_ALLOWED_ORIGINS`] and [`ENV_ALLOWED_HOSTS`] are comma lists. An
+//!   entry that is not a well-formed origin, or not a well-formed
+//!   `name[:port]`, is DROPPED with a WARN naming it — an entry kept but
+//!   unmatchable would leave the operator reading a 403 whose body points at
+//!   the very env var they had already set.
 //!
-//! `/health` reports `originGuard { enabled, refusals{host,origin}, recent }`.
-//! `recent` names other sites the operator's browser pointed at this
-//! supervisor, so it is shown only to non-browser and same-origin callers.
+//! `/health` reports `originGuard { enabled, requesterClass,
+//! refusals{host,origin}, logSaturated{host,origin}, recent[<=20],
+//! killSwitchEnv, admitOriginEnv, admitHostEnv }`. `recent` names other sites
+//! the operator's browser pointed at this supervisor, so it is shown only to
+//! non-browser and same-origin callers. `logSaturated` is how a reader tells a
+//! quiet WARN log from a saturated one — read it before treating an absence of
+//! refusal lines as an absence of refusals.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -314,7 +349,16 @@ impl OriginGuard {
             allowed_hosts: config
                 .allowed_hosts
                 .iter()
-                .map(|h| h.to_ascii_lowercase())
+                .filter_map(|raw| {
+                    let parsed = parse_allowed_host(raw);
+                    if parsed.is_none() {
+                        tracing::warn!(
+                            value = %truncate(raw),
+                            "{ENV_ALLOWED_HOSTS}: ignoring an entry that is not a `name[:port]` Host value (an origin, a URL or a path never matches a Host header)"
+                        );
+                    }
+                    parsed
+                })
                 .collect(),
             refused_host: AtomicU64::new(0),
             refused_origin: AtomicU64::new(0),
@@ -340,16 +384,8 @@ impl OriginGuard {
         if self.allowed_hosts.contains(&host) {
             return true;
         }
-        let (name, port) = if let Some(rest) = host.strip_prefix('[') {
-            match rest.split_once(']') {
-                Some((inner, tail)) => (format!("[{inner}]"), tail.strip_prefix(':')),
-                None => return false,
-            }
-        } else {
-            match host.rsplit_once(':') {
-                Some((n, p)) => (n.to_string(), Some(p)),
-                None => (host.clone(), None),
-            }
+        let Some((name, port)) = split_host_port(&host) else {
+            return false;
         };
         matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]")
             && port.and_then(|p| p.parse::<u16>().ok()) == Some(self.bound_port)
@@ -586,7 +622,25 @@ pub async fn middleware(
         class,
         allow_origin: true,
     });
-    next.run(req).await
+    let mut resp = next.run(req).await;
+    // Name every Fetch Metadata header the verdict above reads, not just the
+    // first. With `Origin` absent the admission turns on `Sec-Fetch-Site`; and
+    // for a Foreign request `is_spa_shell_navigation` additionally reads
+    // `Sec-Fetch-Mode` and `Sec-Fetch-Dest`, so `Mode: navigate` +
+    // `Dest: document` reaches the SPA shell where `Mode: cors` on the same
+    // URL is a 403. Two requests differing only in headers `Vary` does not
+    // name are not interchangeable, and CORS contributes only `Vary: Origin`.
+    //
+    // APPEND rather than insert: a second `Vary` field line is equivalent to
+    // one comma list, and overwriting would drop CORS's.
+    //
+    // Only on this path. With the guard disabled the middleware returned above
+    // without appending — there is no verdict, so there is nothing to vary on.
+    resp.headers_mut().append(
+        header::VARY,
+        HeaderValue::from_static("Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest"),
+    );
+    resp
 }
 
 fn refusal(body: Value) -> Response {
@@ -671,6 +725,85 @@ fn truncate(s: &str) -> String {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),
     }
+}
+
+/// Split a lowercased `Host` value into `(name, port)`, keeping an IPv6
+/// literal's brackets on the name. `None` means the value is not a Host at all
+/// (an unterminated `[`). Shared by [`OriginGuard::host_admitted`] and
+/// [`parse_allowed_host`], so what the gate matches and what the env var
+/// accepts cannot drift apart.
+fn split_host_port(host: &str) -> Option<(String, Option<&str>)> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let (inner, tail) = rest.split_once(']')?;
+        Some((format!("[{inner}]"), tail.strip_prefix(':')))
+    } else {
+        Some(match host.rsplit_once(':') {
+            Some((n, p)) => (n.to_string(), Some(p)),
+            None => (host.to_string(), None),
+        })
+    }
+}
+
+/// Normalize one [`ENV_ALLOWED_HOSTS`] entry, rejecting an origin, a URL, a
+/// path, a query string, userinfo, whitespace, an unbracketed IPv6 address,
+/// bracket junk, and a port that is not a bare `u16`.
+///
+/// [`OriginGuard::host_admitted`] compares the entry to the request's `Host`
+/// by exact string equality, so a malformed entry does not fail loudly — it
+/// simply never matches, and the operator is left reading a 403 whose body
+/// names [`ENV_ALLOWED_HOSTS`] as the fix they had already applied. The
+/// natural mistake is pasting an ORIGIN (`http://host.docker.internal:9875`)
+/// into a variable that wants a Host (`host.docker.internal:9875`).
+///
+/// The list above is what this checks; it is deliberately not stated as
+/// "anything that could never be a Host", because the two are not the same
+/// set and a universal claim here would be the very thing this function
+/// exists to stop — prose asserting more than the code delivers.
+fn parse_allowed_host(raw: &str) -> Option<String> {
+    let host = raw.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | '\\'))
+    {
+        return None;
+    }
+    let (name, port) = split_host_port(&host)?;
+    if host.starts_with('[') {
+        // The bracket branch stops at `]`, so anything between `]` and the
+        // port is silently dropped by the split: `[::1]9875` (a forgotten
+        // colon) would otherwise normalize to a value no `Host` can equal.
+        let tail = &host[name.len()..];
+        if !(tail.is_empty() || tail.starts_with(':')) {
+            return None;
+        }
+    } else if name.contains(':') {
+        // An unbracketed IPv6 address. `rsplit_once(':')` happily reads `::1`
+        // as name ":" port "1"; a real `Host` always brackets the literal, so
+        // `::1` for `[::1]` — the likeliest typo in this variable — could
+        // never match.
+        return None;
+    }
+    if let Some(port) = port {
+        // Round-trip, not merely parse: `u16::from_str` accepts a leading `+`
+        // and leading zeros, so `:+80` and `:0080` parse to 80 while no `Host`
+        // is ever spelled that way.
+        match port.parse::<u16>() {
+            Ok(n) if n.to_string() == port => {}
+            _ => return None,
+        }
+    }
+    let bare = name.trim_start_matches('[').trim_end_matches(']');
+    if bare.is_empty()
+        || !bare
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
+    {
+        return None;
+    }
+    Some(host)
 }
 
 fn split_list(raw: Option<&str>) -> Vec<String> {
@@ -904,6 +1037,140 @@ mod unit_tests {
                 "{seg} is in SHARED_SPA_SEGMENTS but is no longer a dashboard client route"
             );
         }
+    }
+
+    /// Every [`API_SEGMENTS`] entry has a Vite dev-proxy prefix, so a page on
+    /// the dev server (`frontend`, port 5174) can still reach every API route.
+    ///
+    /// This became load-bearing WITH the guard, not before it. A dev page used
+    /// to reach an unproxied route by asking `http://localhost:9875` directly,
+    /// cross-origin, under `Access-Control-Allow-Origin: *`; the Origin gate
+    /// refuses that now, on purpose. So a segment missing from the proxy is
+    /// unreachable in dev and fails SILENTLY — the Vite server answers the SPA
+    /// shell where a JSON route was expected.
+    ///
+    /// Vite matches a string proxy key as a plain prefix, and this test does
+    /// the same, so `/runner` legitimately covers `/runner-api`.
+    /// [`SHARED_SPA_SEGMENTS`] is deliberately NOT required: each of those is
+    /// both an API route and a dashboard client route, so whether the dev
+    /// server should proxy it or serve it is a judgement this test cannot make.
+    #[test]
+    fn every_api_segment_is_reachable_through_the_dev_proxy() {
+        let config = include_str!("../frontend/vite.config.ts");
+        let block = config
+            .split_once("proxy: {")
+            .expect("vite.config.ts no longer has a `proxy: {` block")
+            .1;
+        let block = block
+            .split_once("\n    },")
+            .expect("the `proxy: {` block is no longer closed by `\\n    },`")
+            .0;
+        // Strip whole-line `//` comments FIRST. The block deliberately carries
+        // prose, and a comment containing `'/foo':` would mint a phantom key —
+        // which fails in the vacuous direction, letting a genuinely missing
+        // segment pass. Only leading-`//` lines are dropped, so a `//` inside a
+        // string (a URL) is left alone.
+        let code: String = block
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Both quote styles: a MIXED switch would otherwise hide one key and
+        // send the author to add an entry that is already there.
+        let key = regex::Regex::new(r#"['"](/[^'"]+)['"]\s*:"#).unwrap();
+        let keys: Vec<&str> = key
+            .captures_iter(&code)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        // Anti-vacuity: an extraction that silently matched nothing would make
+        // every assertion below pass. The bar is deliberately far BELOW
+        // `API_SEGMENTS.len()` — a short list means the config is incomplete,
+        // which is the defect the per-segment assertion below reports by name,
+        // and folding the two would hide it behind "the extraction is broken".
+        assert!(
+            keys.len() >= 5 && keys.contains(&"/health"),
+            "read {} proxy keys from vite.config.ts ({keys:?}) — the extraction is broken, not the config",
+            keys.len()
+        );
+        for seg in API_SEGMENTS {
+            let path = format!("/{seg}");
+            assert!(
+                keys.iter().any(|k| path.starts_with(k)),
+                "API segment /{seg} has no Vite dev-proxy entry: add '/{seg}': toSupervisor() to frontend/vite.config.ts, or the dev dashboard gets the SPA shell instead of the route"
+            );
+        }
+        // The rewrite the guard depends on must still be wired to both hooks.
+        for hook in ["proxyReq", "proxyReqWs"] {
+            assert!(
+                config.contains(&format!("proxy.on('{hook}'")),
+                "vite.config.ts no longer rewrites the dev server's own Origin on {hook}"
+            );
+        }
+        assert!(
+            config.contains("strictPort: true"),
+            "strictPort guards the Origin rewrite, which is keyed on DEV_PORT"
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_entries_that_can_never_match_a_host_header_are_dropped() {
+        // A Host header is `name[:port]`. The natural operator mistake is
+        // pasting an ORIGIN into the variable that wants a Host; it would be
+        // stored, never match, and leave a 403 pointing at the env var the
+        // operator had already set.
+        for ok in [
+            "host.docker.internal:9875",
+            "HOST.DOCKER.INTERNAL:9875",
+            "  box.local:80  ",
+            "[::1]:9875",
+            "[::1]",
+            "example.test",
+        ] {
+            assert!(
+                parse_allowed_host(ok).is_some(),
+                "{ok:?} is a valid Host value"
+            );
+        }
+        for bad in [
+            "http://host.docker.internal:9875",
+            "https://box.local",
+            "box.local/path",
+            "box.local:9875/",
+            "box.local?x=1",
+            "user@box.local",
+            "box.local:99999",
+            "box.local:notaport",
+            "box local",
+            "[::1:9875",
+            "",
+            "   ",
+            // Unbracketed IPv6: `rsplit_once(':')` reads `::1` as name ":"
+            // port "1", and a real Host always brackets the literal.
+            "::1",
+            "2001:db8::1",
+            // Bracket junk the `]` split would otherwise discard.
+            "[::1]9875",
+            "[::1]x:80",
+            // Ports that `u16::from_str` accepts but no Host is spelled with.
+            "box.local:+80",
+            "box.local:0080",
+        ] {
+            assert!(
+                parse_allowed_host(bad).is_none(),
+                "{bad:?} can never equal a Host header and must be dropped"
+            );
+        }
+        // Dropped, not merely unmatched: the guard holds only usable entries.
+        let g = OriginGuard::new(OriginGuardConfig::from_values(
+            None,
+            None,
+            Some("http://box.local:9875, box.local:9875"),
+            9875,
+        ));
+        assert_eq!(g.allowed_hosts, vec!["box.local:9875".to_string()]);
+        let root: Uri = "/".parse().unwrap();
+        assert!(g.host_admitted(&headers(&[("host", "box.local:9875")]), &root));
+        assert!(!g.host_admitted(&headers(&[("host", "http://box.local:9875")]), &root));
     }
 
     #[test]
@@ -1221,6 +1488,64 @@ mod router_tests {
             .unwrap();
         let resp = router(dir.path()).await.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// An admitted response says it varies on BOTH headers the verdict reads.
+    ///
+    /// CORS contributes `Vary: Origin`, but with no `Origin` present the
+    /// verdict turns on `Sec-Fetch-Site` alone — `t8`'s agent call is admitted
+    /// and the same request with `Sec-Fetch-Site: cross-site` is refused. A
+    /// cache keyed on `Origin` only would not tell those two apart.
+    #[tokio::test]
+    async fn an_admitted_response_varies_on_sec_fetch_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(dir.path()).await;
+
+        let vary = |resp: &axum::response::Response| -> Vec<String> {
+            resp.headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(|v| v.trim().to_ascii_lowercase())
+                .collect()
+        };
+
+        // No Origin, admitted (the agent path).
+        let resp = app.clone().oneshot(token_request(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            vary(&resp).contains(&"sec-fetch-site".to_string()),
+            "admitted response's Vary was {:?}",
+            vary(&resp)
+        );
+
+        // Same-origin, admitted: Origin is echoed by CORS, and Sec-Fetch-Site
+        // is still part of the verdict for the no-Origin sibling of this URL.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/runner-api/health")
+            .header(header::HOST, loopback_host())
+            .header(header::ORIGIN, format!("http://127.0.0.1:{PORT}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let names = vary(&resp);
+        assert!(names.contains(&"origin".to_string()), "Vary was {names:?}");
+        assert!(
+            names.contains(&"sec-fetch-site".to_string()),
+            "Vary was {names:?}"
+        );
+
+        // And the refusal path keeps its own explicit pair.
+        let resp = app.oneshot(token_request(Some(EVIL))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let names = vary(&resp);
+        assert!(names.contains(&"origin".to_string()), "Vary was {names:?}");
+        assert!(
+            names.contains(&"sec-fetch-site".to_string()),
+            "Vary was {names:?}"
+        );
     }
 
     #[tokio::test]

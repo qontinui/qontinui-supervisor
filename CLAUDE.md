@@ -1014,18 +1014,56 @@ machine could read a coord device JWT through
   to the SPA fallback outside `origin_guard::API_SEGMENTS`. Never to an API route,
   never as an iframe. A tripwire test keeps `API_SEGMENTS` covering every
   registered route.
-- CORS echoes only an admitted origin (never `*`), with `Vary: Origin`.
+- CORS echoes only an admitted origin (never `*`), with `Vary: Origin`. The
+  middleware appends `Vary: Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest` to
+  an **admitted** response as well — every Fetch Metadata header the verdict
+  reads: `Sec-Fetch-Site` decides it outright when no `Origin` is present, and
+  `Mode`/`Dest` decide the SPA-shell navigation carve-out. A cache keyed on
+  `Origin` alone could otherwise serve an admitted non-browser response to a
+  cross-site request. Nothing is appended when the guard is off — there is no
+  verdict to vary on.
 - `QONTINUI_SUPERVISOR_ORIGIN_GUARD=0` turns both gates off. All three env vars
   are read once when the router is built, so they apply at the supervisor's next
   start. Never restart a supervisor just to apply one: its JobObject reaps temp
-  runners.
-- `GET /health` → `originGuard { enabled, requesterClass, refusals{host,origin}, recent }`;
-  `recent` (the last 20 refusals) is shown only to non-browser and same-origin callers.
-- The Vite dev server (`frontend`, port 5174) proxies to `:9875` with
-  `changeOrigin` and rewrites an `Origin` in a fixed set built from its
-  `server.port` (`http://localhost:5174`, `http://127.0.0.1:5174`) to the
-  supervisor's. The supervisor deliberately does not admit `:5174`, because any
-  project's page on that port would then reach every route.
+  runners. An `ALLOWED_ORIGINS` entry that does not parse as an origin is
+  **dropped with a WARN naming it**, and so is an `ALLOWED_HOSTS` entry that is
+  an origin, a URL, a path, a query string, userinfo, an unbracketed IPv6
+  address, bracket junk, or carries a port that is not a bare `u16`. The natural
+  mistake is pasting an origin (`http://box.local:9875`) into the variable that
+  wants a Host (`box.local:9875`); a kept-but-unmatchable entry would leave the
+  operator reading a 403 that points at the env var they had already set. That
+  list is what is checked — it is deliberately not stated as "anything that
+  could never be a Host", which would claim more than the code delivers.
+- `GET /health` → `originGuard { enabled, requesterClass, refusals{host,origin},
+  logSaturated{host,origin}, recent, killSwitchEnv, admitOriginEnv, admitHostEnv }`;
+  `recent` (the last 20 refusals) is shown only to non-browser and same-origin
+  callers. **Read `logSaturated` before reading an absence of refusal WARNs as an
+  absence of refusals** — each gate logs at most `LOG_KEYS_CAP` (256) distinct
+  subjects, and both keys are attacker-multipliable (wildcard DNS for hosts, N
+  cross-origin iframes for origins). The counters keep counting after saturation.
+
+**What an admitted origin actually gets.** The four proxies copy only
+`content-type` to the runner, so the runner classifies every proxied call as
+non-browser and grants it **full local trust** — its own origin guard, its
+credential-door list and its route policy never see any browser provenance. That
+is the design (origin is decided once, here), but it means
+`QONTINUI_SUPERVISOR_ALLOWED_ORIGINS` is **strictly more powerful than the
+runner's own allow-list**: an origin added here reaches the runner's credential
+doors, `POST /ui-bridge/invoke/get_coord_device_token` included, whatever the
+runner admits. Use it for a trusted first-party dev origin only — never as a
+convenience switch for a page that merely wants `/health`.
+
+**The Vite dev proxy is now the only dev path to the supervisor.** The dev server
+(`frontend`, port 5174) proxies to `:9875` with `changeOrigin` and rewrites an
+`Origin` in a fixed set built from its `server.port` (`http://localhost:5174`,
+`http://127.0.0.1:5174`) to the supervisor's. The supervisor deliberately does
+not admit `:5174`, because any project's page on that port would then reach every
+route. A dev page used to be able to route around a missing proxy entry by
+calling `http://localhost:9875` cross-origin under `ACAO: *`; the Origin gate
+closes that. So the proxy list must cover **every** `origin_guard::API_SEGMENTS`
+value or that route is unreachable in dev and fails silently, with Vite answering
+the SPA shell where JSON was expected. The tripwire
+`every_api_segment_is_reachable_through_the_dev_proxy` pins it.
 
 ### Supervisor Bridge
 
