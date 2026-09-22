@@ -227,6 +227,68 @@ describe('Dashboard', () => {
   });
 
   // ------------------------------------------------------------------
+  // Origin guard (PR #194 follow-up): `/health` has reported `originGuard`
+  // since Phase 1, but nothing on the dashboard ever read it.
+  // ------------------------------------------------------------------
+
+  it('does NOT show the origin guard disabled badge when the guard is enabled', async () => {
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'healthy',
+      runner: { running: true, pid: 1234, api_responding: true },
+      ports: { api_port: { port: 9876, in_use: true } },
+      watchdog: { enabled: true, restart_attempts: 0, crash_count: 0, crash_restart_armed: true },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      originGuard: {
+        enabled: true,
+        requesterClass: 'non_browser',
+        refusals: { host: 0, origin: 0 },
+        logSaturated: { host: false, origin: false },
+        killSwitchEnv: 'QONTINUI_SUPERVISOR_ORIGIN_GUARD',
+        admitOriginEnv: 'QONTINUI_SUPERVISOR_ALLOWED_ORIGINS',
+        admitHostEnv: 'QONTINUI_SUPERVISOR_ALLOWED_HOSTS',
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+    expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('origin-guard-disabled-badge')).not.toBeInTheDocument();
+  });
+
+  it('does NOT show the origin guard disabled badge for an older supervisor that omits it', async () => {
+    // Default mock carries no `originGuard` at all (pre-Phase-1 supervisor).
+    // Absent must never read as disabled.
+    renderDashboard();
+    expect(await screen.findByText(/healthy/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('origin-guard-disabled-badge')).not.toBeInTheDocument();
+  });
+
+  it('shows the origin guard disabled badge when QONTINUI_SUPERVISOR_ORIGIN_GUARD=0', async () => {
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'healthy',
+      runner: { running: true, pid: 1234, api_responding: true },
+      ports: { api_port: { port: 9876, in_use: true } },
+      watchdog: { enabled: true, restart_attempts: 0, crash_count: 0, crash_restart_armed: true },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      originGuard: {
+        enabled: false,
+        requesterClass: 'non_browser',
+        refusals: { host: 0, origin: 0 },
+        logSaturated: { host: false, origin: false },
+        killSwitchEnv: 'QONTINUI_SUPERVISOR_ORIGIN_GUARD',
+        admitOriginEnv: 'QONTINUI_SUPERVISOR_ALLOWED_ORIGINS',
+        admitHostEnv: 'QONTINUI_SUPERVISOR_ALLOWED_HOSTS',
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+    expect(await screen.findByTestId('origin-guard-disabled-badge')).toBeInTheDocument();
+  });
+
+  // ------------------------------------------------------------------
   // The wedge: alive, holding the port, answering nothing.
   //
   // The header line read `running` and then `api_responding`, so the primary

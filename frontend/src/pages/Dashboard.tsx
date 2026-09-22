@@ -1624,6 +1624,36 @@ function DashboardInner() {
                 ⚠ crash-loop disarmed
               </span>
             )}
+          {/* Origin guard disabled indicator (PR #194 follow-up). `/health`
+              has reported `originGuard` since
+              2026-09-17-retire-the-runner-origin-guard-dev-grace Phase 1, but
+              nothing on the dashboard ever read it — an operator debugging
+              "why can't this page reach the supervisor" had to curl /health
+              by hand, and an `ORIGIN_GUARD=0` left on past a debugging session
+              (any browser page can then read a coord device JWT through the
+              runner proxies) had no visible trace. `undefined` means an older
+              supervisor with no guard at all, which is not a security
+              regression worth a pill — only an explicit `enabled: false` is. */}
+          {h.originGuard?.enabled === false && (
+            <span
+              title="Origin and Host guard DISABLED (QONTINUI_SUPERVISOR_ORIGIN_GUARD=0). Any web page open in this machine's browser can call every supervisor route, including the runner proxies that grant full local trust to the runner's credential doors. Unset the env var and relaunch the supervisor to re-arm."
+              aria-label="Origin guard disabled: any browser page on this machine can call every supervisor route."
+              data-testid="origin-guard-disabled-badge"
+              style={{
+                fontSize: '0.65rem',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.03em',
+                color: 'var(--danger, #ef4444)',
+                border: '1px solid var(--danger, #ef4444)',
+                borderRadius: '4px',
+                padding: '0.1rem 0.4rem',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              ⚠ origin guard disabled
+            </span>
+          )}
           {lastRefresh && (
             <span className="text-muted" style={{ fontSize: '0.7rem', marginLeft: 'auto' }}>
               updated {lastRefresh.toLocaleTimeString()}
