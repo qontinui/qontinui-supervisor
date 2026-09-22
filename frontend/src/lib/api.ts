@@ -390,6 +390,30 @@ export interface WatchdogHealthWire {
   serving_disabled_reason?: string;
 }
 
+/// `GET /health` → `originGuard` (`src/origin_guard.rs::OriginGuard::health_json`).
+/// Reports the browser-origin and Host guard's live state. Optional on
+/// `HealthResponse` so a supervisor built before
+/// `2026-09-17-retire-the-runner-origin-guard-dev-grace` still type-checks —
+/// absent means "too old to have a guard", not "disabled".
+export interface OriginGuardWire {
+  /// `false` only via `QONTINUI_SUPERVISOR_ORIGIN_GUARD=0`: every route,
+  /// including the runner proxies, then answers ANY browser origin.
+  enabled: boolean;
+  requesterClass: string;
+  refusals: { host: number; origin: number };
+  /// Per-gate WARN log caps out at 256 distinct subjects; the counters above
+  /// do not. `true` means refusals are still being counted but are no longer
+  /// logged, so an absence of WARN lines is not evidence of no refusals.
+  logSaturated: { host: boolean; origin: boolean };
+  /// Last 20 refusals. Present only for a non-browser or same-origin caller
+  /// (the dashboard itself qualifies), since it names other sites the
+  /// operator's browser pointed at this supervisor.
+  recent?: Array<Record<string, unknown>>;
+  killSwitchEnv: string;
+  admitOriginEnv: string;
+  admitHostEnv: string;
+}
+
 export interface HealthResponse {
   status: string;
   runner: {
@@ -438,6 +462,7 @@ export interface HealthResponse {
     built_from_dirty?: boolean | null;
   };
   runners?: RunnerInstanceHealth[];
+  originGuard?: OriginGuardWire;
 }
 
 export interface DevStartResponse {
