@@ -1656,6 +1656,27 @@ async fn run_build_inner(
             // Redirect cargo output to this slot's isolated target dir so
             // concurrent builds on other slots don't contend on the same target/.
             .env("CARGO_TARGET_DIR", &slot.target_dir)
+            // A fresh value every cargo invocation, mirroring
+            // `scripts/build-exe.mjs` in qontinui-runner. `build.rs` declares
+            // `rerun-if-env-changed=QONTINUI_PROVENANCE_NONCE`, so this forces
+            // the build script to re-run and re-stamp gitDirty/treeHash/
+            // rustSrcHash on every supervisor-driven cargo build — including
+            // the path above that proceeds on a PRIOR `dist/` after a failed
+            // `pnpm run build` (`frontend_stale_any`), which would otherwise
+            // embed new Rust code under a stale build script's stamps. Plan
+            // 2026-08-23-build-provenance-assertion, follow-up 1 / coord
+            // finding 34a2c951-6312-4b09-a68f-83e15e779f92.
+            .env(
+                "QONTINUI_PROVENANCE_NONCE",
+                format!(
+                    "{}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0),
+                    std::process::id()
+                ),
+            )
             .job_guarded(true)
             .stream_lines(line_tx)
             .no_progress_timeout(Duration::from_secs(no_progress_secs))
