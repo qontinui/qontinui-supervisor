@@ -358,8 +358,8 @@ pub(crate) fn apply_paired_profile(
 /// `2026-09-23-conductor-e2e-phase1-defects`, S-4).
 ///
 /// Unlike a named profile, the primary may legitimately be unpaired, so a
-/// missing `paired_user.json` is not an error: the snapshot copies whatever
-/// the primary has, and the report says what that was. A spawned runner
+/// missing `paired_user.json` is not an error: nothing is copied (not even a
+/// lone `auth_tokens.enc`), and the report says `primary_unpaired`. A spawned runner
 /// running as the same OS user on the same host derives the same
 /// `SecureStorage` key as the primary (hostname + service name + salt +
 /// username, no path component), so the copied `auth_tokens.enc` decrypts.
@@ -378,6 +378,16 @@ pub(crate) fn apply_primary_paired_snapshot(
                         paired state could not be located; the runner starts unpaired",
         }));
     };
+    // An unpaired primary hands over nothing: a token cache with no pairing
+    // binding beside it is state the temp runner has no use for.
+    if !primary_dir.join("paired_user.json").exists() {
+        return Ok(json!({
+            "source": "primary_snapshot",
+            "status": "primary_unpaired",
+            "source_dir": primary_dir.display().to_string(),
+            "applied": [],
+        }));
+    }
     let applied = copy_paired_state_files(primary_dir, dest_dir).map_err(|message| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -388,10 +398,9 @@ pub(crate) fn apply_primary_paired_snapshot(
             }),
         )
     })?;
-    let paired = applied.iter().any(|f| f == "paired_user.json");
     Ok(json!({
         "source": "primary_snapshot",
-        "status": if paired { "paired" } else { "primary_unpaired" },
+        "status": "paired",
         "source_dir": primary_dir.display().to_string(),
         "applied": applied,
     }))
@@ -920,12 +929,14 @@ pub async fn remove_runner(
                 name, e
             );
         }
-        if let Err(e) = crate::process::windows::remove_instance_config_dir(&id, false).await {
-            warn!(
-                "Failed to remove instance config dir for runner '{}': {}",
-                id, e
-            );
-        }
+    }
+    // Cross-platform: the instance dir holds a copy of the paired state
+    // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4).
+    if let Err(e) = crate::process::remove_instance_config_dir(&id, false).await {
+        warn!(
+            "Failed to remove instance config dir for runner '{}': {}",
+            id, e
+        );
     }
 
     // Clean up the per-runner exe copy (its whole directory, sidecars
@@ -1136,12 +1147,13 @@ pub async fn purge_stale_test_runners_core(
                     name, e
                 );
             }
-            if let Err(e) = crate::process::windows::remove_instance_config_dir(&id, false).await {
-                warn!(
-                    "purge-stale: failed to remove instance config dir for '{}': {}",
-                    id, e
-                );
-            }
+        }
+        // Cross-platform: the instance dir holds a copy of the paired state.
+        if let Err(e) = crate::process::remove_instance_config_dir(&id, false).await {
+            warn!(
+                "purge-stale: failed to remove instance config dir for '{}': {}",
+                id, e
+            );
         }
 
         // Clean up the per-runner exe copy (its whole directory, sidecars
@@ -2760,6 +2772,22 @@ pub async fn spawn_test(
         }
         crate::state::SpawnTicket::Claim(claim) => claim,
     };
+
+    // A Linux temp runner with no display can only end in `no_display` (plan
+    // `2026-09-23-conductor-e2e-phase1-defects`, S-3). Refuse before the
+    // minutes-long build rather than after it; the spawn path's
+    // post-forwarder check stays the final authority. Checked only on a
+    // CLAIM: a request that joins an in-flight build (above) spawns nothing
+    // new. Returning here drops the claim guard, freeing the key.
+    if let Some(refusal) = crate::process::env_forwarders::display_preflight_refusal(
+        cfg!(target_os = "linux"),
+        "spawn-test",
+        &body.extra_env,
+        |k| std::env::var(k).ok(),
+        state.config.temp_runner_display.as_deref(),
+    ) {
+        return Err(SupervisorError::NoDisplay(refusal));
+    }
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner
     // into the registry under a single write lock. Without this, two
@@ -4473,6 +4501,12 @@ async fn execute_spawn_build_inner(
             format!("Test runner spawned on port {}", port)
         }
     });
+    // `coord_credential` is the child's own verdict at the moment it first
+    // answered `/health`. A freshly booted runner commonly reports
+    // `posture: "unknown"` there because its device-JWT refresher has not
+    // completed a pass yet — that is the runner's honest UNKNOWN, not a
+    // failure of the copied pairing; re-read the child's `/health` later.
+    //
     // Which paired state was materialized into the runner's instance dir —
     // a named profile or the primary snapshot — and which files. Callers can
     // verify the pair-state inheritance happened before treating the runner
@@ -7492,6 +7526,29 @@ mod tests {
         );
     }
 
+    /// S-4 at the route: the spawn path hands `paired_profile_id` to the
+    /// paired-state decision UNCONDITIONALLY (so an absent id reaches the
+    /// primary-snapshot arm, which `no_paired_profile_id_applies_the_primary_snapshot`
+    /// pins), and surfaces both new response fields. Re-wrapping the call in
+    /// `if let Some(..)` — the pre-S-4 shape, under which a default spawn came
+    /// up unpaired — fails here.
+    #[test]
+    fn spawn_path_applies_paired_state_even_without_a_profile_id() {
+        let body = fn_source("async fn execute_spawn_build_inner(");
+        assert!(
+            body.contains("apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id)"),
+            "execute_spawn_build_inner must pass the OPTIONAL paired_profile_id straight to \
+             apply_paired_state_for_spawn, so an absent id snapshots the primary"
+        );
+        assert!(
+            !body.contains("if let Some(profile_id) = body.paired_profile_id"),
+            "the paired-state copy is gated on a profile id again — a default spawn-test would \
+             come up unpaired (plan 2026-09-23-conductor-e2e-phase1-defects, S-4)"
+        );
+        assert!(body.contains("resp[\"paired_state\"]"));
+        assert!(body.contains("resp[\"coord_credential\"]"));
+    }
+
     /// Read one function's body out of this source file, bounded at the next
     /// top-level `fn` so a match in a LATER function can never satisfy an
     /// assertion. Same technique as
@@ -7920,8 +7977,9 @@ mod tests {
         );
     }
 
-    /// An unpaired primary is not an error: the snapshot copies what exists
-    /// (here only the token cache), says so, and the spawn proceeds.
+    /// An unpaired primary is not an error: the snapshot copies nothing — not
+    /// even a lone token cache with no pairing beside it — says so, and the
+    /// spawn proceeds.
     #[test]
     fn unpaired_primary_snapshot_reports_primary_unpaired() {
         let profiles = tempfile::tempdir().unwrap();
@@ -7937,8 +7995,9 @@ mod tests {
         )
         .expect("an unpaired primary must not fail the spawn");
         assert_eq!(report["status"], "primary_unpaired");
-        assert_eq!(report["applied"], serde_json::json!(["auth_tokens.enc"]));
+        assert_eq!(report["applied"], serde_json::json!([]));
         assert!(!dest.path().join("paired_user.json").exists());
+        assert!(!dest.path().join("auth_tokens.enc").exists());
 
         let report = super::apply_spawn_paired_state(None, profiles.path(), None, dest.path())
             .expect("an unresolvable primary dir must not fail the spawn");

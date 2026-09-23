@@ -29,7 +29,11 @@ use crate::config::{PORT_CHECK_INTERVAL_MS, PORT_WAIT_TIMEOUT_SECS};
 ///   port it had just released still "read as held"). So on Unix the probe
 ///   sets `SO_REUSEADDR` first. With that flag a Unix `bind(2)` succeeds over
 ///   TIME_WAIT remnants and still fails `EADDRINUSE` when a LISTEN socket
-///   holds the port, which is exactly the question asked here.
+///   holds the port, which is exactly the question asked here. (On Linux the
+///   bind over TIME_WAIT also needs the socket that left the remnant to have
+///   set `SO_REUSEADDR`; std's and tokio's `TcpListener::bind` both do on
+///   Unix, so a runner's listener qualifies. If one did not, the probe errs
+///   toward "held", never toward reporting a live port free.)
 /// * Windows keeps the default bind. There `SO_REUSEADDR` means something
 ///   else entirely — it lets the probe bind *over* a live listener — so
 ///   setting it would make every held port read free.

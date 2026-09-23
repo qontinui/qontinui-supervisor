@@ -77,7 +77,7 @@ use std::path::PathBuf;
 /// 2. **Profile-write side** — `routes::runners::apply_paired_profile_for_spawn`
 ///    copies the requested `paired_profile_id` snapshot INTO it before the
 ///    child process starts.
-/// 3. **Removal side** — [`windows::remove_instance_config_dir`] reaps it when
+/// 3. **Removal side** — [`remove_instance_config_dir`] reaps it when
 ///    the runner is deleted.
 /// 4. **Pair side** — `routes::runners_pair::pair_with_token` (with
 ///    `target_runner_id`) exports it to the `qontinui_profile` child as
@@ -92,10 +92,9 @@ use std::path::PathBuf;
 /// (advisory): runner has NO live coord device JWT` every 15s. Funnelling all
 /// call sites through one function is what makes that divergence impossible.
 ///
-/// Note on placement: this lives here rather than beside the remover in
-/// [`windows`] because that module is `#[cfg(target_os = "windows")]` while the
-/// spawn and profile-write sides are cross-platform (CI builds this crate on
-/// Linux).
+/// Note on placement: this and its remover live here, not in [`windows`],
+/// because that module is `#[cfg(target_os = "windows")]` while all four sides
+/// are cross-platform (CI builds this crate on Linux).
 ///
 /// Returns `None` when the platform has no resolvable config dir, or when
 /// `runner_id` is degenerate (empty, or containing a path separator or `..`).
@@ -106,7 +105,7 @@ use std::path::PathBuf;
 /// `routes::runners::apply_paired_profile`. It matters because
 /// `PathBuf::join("")` does NOT descend: `instance_config_dir("")` would
 /// otherwise return the `instances/` PARENT, and
-/// [`windows::remove_instance_config_dir`] would `remove_dir_all` every
+/// [`remove_instance_config_dir`] would `remove_dir_all` every
 /// runner's instance dir (its `is_primary` flag does not guard that). Ids are
 /// server-generated today, so this is unreachable — but this function is `pub`
 /// and is the documented single source of truth for four call sites, so the
@@ -120,6 +119,53 @@ pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
             .join("instances")
             .join(runner_id)
     })
+}
+
+/// Reap a non-primary runner's [`instance_config_dir`] — its per-instance
+/// config + secure-storage dir, which holds a COPY of a pairing
+/// (`paired_user.json`) and the encrypted token cache (`auth_tokens.enc`) once
+/// spawn-test has applied a paired profile or the primary snapshot.
+///
+/// Cross-platform on purpose. It used to live in the Windows-only module, so on
+/// Linux nothing ever deleted these dirs; once a default spawn-test began
+/// copying the primary's credential store into one (plan
+/// `2026-09-23-conductor-e2e-phase1-defects`, S-4), every temp spawn on Linux
+/// would have left a copy behind for good.
+///
+/// Returns `Ok(true)` when a dir was removed, `Ok(false)` when there was none.
+/// Refuses the primary outright.
+pub async fn remove_instance_config_dir(runner_id: &str, is_primary: bool) -> anyhow::Result<bool> {
+    if is_primary {
+        anyhow::bail!("refusing to remove the primary runner's instance config dir");
+    }
+    // Resolve through the shared helper, never inline: the reaper must delete
+    // exactly the directory the spawn side exported as
+    // `QONTINUI_SECURE_STORAGE_DIR` and the paired-profile writer copied into.
+    let Some(dir) = crate::process::instance_config_dir(runner_id) else {
+        return Ok(false);
+    };
+    if !dir.exists() {
+        return Ok(false);
+    }
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => {
+            tracing::info!(
+                "Removed instance config dir for runner '{}' at {:?}",
+                runner_id,
+                dir
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to remove instance config dir for runner '{}' at {:?}: {}",
+                runner_id,
+                dir,
+                e
+            );
+            Err(e.into())
+        }
+    }
 }
 
 /// The PRIMARY runner's paired-state directory —
@@ -295,5 +341,53 @@ mod tests {
         assert!(dir.ends_with(std::path::Path::new(
             "com.qontinui.runner/instances/test-9877"
         )));
+    }
+
+    /// The write side and the reap side must resolve the SAME directory.
+    ///
+    /// If they diverge, a spawn writes a runner's pairing into a directory the
+    /// reaper never visits — the instance dirs leak, and (worse) whichever side
+    /// is wrong is silently wrong, exactly like the `paired_profile_id` copy
+    /// that landed in `data_local_dir()` while the child read the per-instance
+    /// dir. Asserted behaviourally rather than by re-deriving the path: we
+    /// create the dir at `instance_config_dir(id)`, hand only the id to
+    /// `remove_instance_config_dir`, and require it to report a real removal
+    /// (`Ok(true)` — it returns `Ok(false)` for a dir it does not find).
+    #[tokio::test]
+    async fn instance_config_dir_and_remover_agree_on_path() {
+        let runner_id = format!("test-instance-config-dir-selftest-{}", std::process::id());
+        let Some(dir) = instance_config_dir(&runner_id) else {
+            // No resolvable config dir on this platform — nothing to assert.
+            return;
+        };
+        std::fs::create_dir_all(&dir).expect("create instance dir");
+        // The dir lives under the operator's REAL config dir, so it must not
+        // survive a failing assertion below — the divergence case this test
+        // exists to catch is exactly the one that would leak it permanently.
+        // Same guard the routes-side test uses.
+        let _cleanup = scopeguard::guard(dir.clone(), |d| {
+            let _ = std::fs::remove_dir_all(d);
+        });
+        std::fs::write(dir.join("paired_user.json"), b"{}").expect("write marker");
+
+        let removed = super::remove_instance_config_dir(&runner_id, false)
+            .await
+            .expect("remover must not error");
+
+        assert!(
+            removed,
+            "remove_instance_config_dir did not find the dir instance_config_dir() \
+             created at {dir:?} — the write side and the reap side have diverged"
+        );
+        assert!(!dir.exists(), "instance dir must be gone after removal");
+    }
+
+    /// The reaper refuses primaries outright, so a mis-keyed call can never
+    /// delete the operator's own runner config.
+    #[tokio::test]
+    async fn instance_config_dir_remover_refuses_primary() {
+        assert!(super::remove_instance_config_dir("primary", true)
+            .await
+            .is_err());
     }
 }

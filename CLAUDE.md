@@ -84,7 +84,9 @@ env, and supplies `DISPLAY` from `--temp-runner-display` /
 `DISPLAY` nor `WAYLAND_DISPLAY` resolves after every forwarder (`extra_env`
 included), the spawn is refused `409 {"error": "no_display"}` instead of dying
 in GTK init. Every temp spawn also gets `QONTINUI_SETUP_WIZARD_BYPASS=1`
-(`SetupWizardBypassEnv`), so the first-run wizard never covers the UI.
+(`SetupWizardBypassEnv`) so the first-run wizard does not cover the UI — which
+takes effect only once the runner's `check_setup_completed` honors the variable
+(the runner half of plan `2026-09-23-conductor-e2e-phase1-defects` UI-5).
 
 **Legacy `instance-test-<port>` trees are now permanently orphaned.** Up to 23
 of them (one per port slot, with their stale `terminal-sessions.json`) exist on
@@ -1418,7 +1420,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 1. **Port reservation** — atomically claims a free port (9877-9899) and inserts a placeholder.
 2. **Build** — acquires a build pool permit (blocks if all slots busy), runs `npm run build` (serialized via `npm_lock`), then `cargo build --bin qontinui-runner --features custom-protocol` with `CARGO_TARGET_DIR` set to the slot dir.
-3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read).
+3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read). Expect `posture: "unknown"` from a freshly booted child: its device-JWT refresher has usually not completed a pass by first `/health`, so re-read the child's own `/health` to judge the copied pairing. A Linux spawn-test that can only end in `no_display` is refused before the build starts.
 4. **Optional wait** — if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
 
 **Timeouts:**

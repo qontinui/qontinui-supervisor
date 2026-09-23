@@ -79,8 +79,10 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
 // SetupWizardBypassEnv
 // =============================================================================
 
-/// Env var the runner's `check_setup_completed` honors to skip the first-run
-/// SetupWizard.
+/// Env var the runner's `check_setup_completed` is to honor to skip the
+/// first-run SetupWizard. This is the SUPERVISOR half of UI-5; until the
+/// runner half lands (`commands/setup_wizard.rs`), the runner ignores it and a
+/// temp runner still opens the wizard.
 pub(crate) const SETUP_WIZARD_BYPASS_ENV: &str = "QONTINUI_SETUP_WIZARD_BYPASS";
 
 /// Sets `QONTINUI_SETUP_WIZARD_BYPASS=1` on every **temp** runner spawn.
@@ -90,7 +92,8 @@ pub(crate) const SETUP_WIZARD_BYPASS_ENV: &str = "QONTINUI_SETUP_WIZARD_BYPASS";
 /// that hides every page an agent spawned the runner to drive. The runner used
 /// to infer "test runner" from `QONTINUI_TEST_AUTO_LOGIN_EMAIL`, which the
 /// paired-profile path never sets; this is the explicit flag instead (plan
-/// `2026-09-23-conductor-e2e-phase1-defects`, UI-5). Primary and named runners
+/// `2026-09-23-conductor-e2e-phase1-defects`, UI-5). Inert until the runner
+/// reads it — see [`SETUP_WIZARD_BYPASS_ENV`]. Primary and named runners
 /// are an operator's own and keep the wizard. Registered before [`ExtraEnv`]
 /// so `extra_env: {"QONTINUI_SETUP_WIZARD_BYPASS": "0"}` can still exercise
 /// the wizard on a temp runner.
@@ -259,6 +262,37 @@ pub(crate) fn display_refusal_for_command(
         &runner.name,
         |key| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
         |key| std::env::var(key).ok(),
+    )
+}
+
+/// [`display_refusal`] evaluated BEFORE a temp spawn's build, from what the
+/// spawn request already determines: [`DisplayEnv`]'s resolution over the
+/// supervisor's env and knob, overlaid by the request's `extra_env` (which
+/// [`ExtraEnv`] applies last). A spawn-test build takes minutes, so a request
+/// that can only end in `no_display` is refused up front instead of after the
+/// compile. The post-forwarder check in the spawn path
+/// ([`display_refusal_for_command`]) stays the final authority.
+pub(crate) fn display_preflight_refusal(
+    is_linux: bool,
+    runner_name: &str,
+    extra_env: &std::collections::HashMap<String, String>,
+    supervisor_env: impl Fn(&str) -> Option<String>,
+    knob: Option<&str>,
+) -> Option<String> {
+    let forwarded = resolve_display_env(&supervisor_env, knob);
+    display_refusal(
+        is_linux,
+        true,
+        runner_name,
+        |key| {
+            extra_env.get(key).map(|v| Some(v.clone())).or_else(|| {
+                forwarded
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| Some(v.clone()))
+            })
+        },
+        &supervisor_env,
     )
 }
 
@@ -1434,6 +1468,58 @@ mod tests {
         } else {
             assert_eq!(refusal, None);
         }
+    }
+
+    /// The pre-build check refuses exactly what the post-forwarder check
+    /// would: nothing anywhere refuses; the knob, an inherited value, or an
+    /// `extra_env` value each satisfy it; an `extra_env` blank still refuses.
+    #[test]
+    fn display_preflight_matches_the_final_resolution() {
+        use super::display_preflight_refusal;
+        use std::collections::HashMap;
+        let none: HashMap<String, String> = HashMap::new();
+
+        let msg = display_preflight_refusal(true, "t", &none, |_| None, None)
+            .expect("no display anywhere must refuse before the build");
+        assert!(msg.starts_with("no_display:"), "{msg}");
+
+        assert_eq!(
+            display_preflight_refusal(true, "t", &none, |_| None, Some(":0")),
+            None,
+            "the knob supplies DISPLAY"
+        );
+        assert_eq!(
+            display_preflight_refusal(
+                true,
+                "t",
+                &none,
+                env_of(&[("WAYLAND_DISPLAY", "w-0")]),
+                None
+            ),
+            None,
+            "an inherited WAYLAND_DISPLAY resolves"
+        );
+        let extra: HashMap<String, String> = [("DISPLAY".to_string(), ":5".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            display_preflight_refusal(true, "t", &extra, |_| None, None),
+            None,
+            "extra_env DISPLAY resolves"
+        );
+        let blank: HashMap<String, String> = [("DISPLAY".to_string(), String::new())]
+            .into_iter()
+            .collect();
+        assert!(
+            display_preflight_refusal(true, "t", &blank, env_of(&[("DISPLAY", ":0")]), None)
+                .is_some(),
+            "an extra_env blank overrides the inherited DISPLAY and refuses"
+        );
+        assert_eq!(
+            display_preflight_refusal(false, "t", &none, |_| None, None),
+            None,
+            "never refuses off Linux"
+        );
     }
 
     // --- SetupWizardBypassEnv (UI-5) -----------------------------------------

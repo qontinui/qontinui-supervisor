@@ -12,7 +12,6 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::env_forwarders;
-use crate::process::instance_config_dir;
 use crate::process::port::wait_for_port_free;
 use crate::process::stop_ledger::{
     resolve_stop_target, verify_target_image, PidSource, StopLedger, StopStrategy, StopTarget,
@@ -20,9 +19,9 @@ use crate::process::stop_ledger::{
 };
 #[cfg(target_os = "windows")]
 use crate::process::windows::{
-    remove_instance_config_dir, remove_runner_app_data_dirs, remove_webview2_user_data_folder,
-    webview2_user_data_folder,
+    remove_runner_app_data_dirs, remove_webview2_user_data_folder, webview2_user_data_folder,
 };
+use crate::process::{instance_config_dir, remove_instance_config_dir};
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
@@ -1951,8 +1950,9 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             {
                 let _ = remove_webview2_user_data_folder(&id, false).await;
                 let _ = remove_runner_app_data_dirs(&name, false).await;
-                let _ = remove_instance_config_dir(&id, false).await;
             }
+            // Cross-platform: it holds a copy of the paired state.
+            let _ = remove_instance_config_dir(&id, false).await;
 
             info!(
                 "reaper: removed stale test runner '{}' (port {})",
@@ -5075,12 +5075,14 @@ pub async fn stop_runner_by_id(
                     runner_name, e
                 );
             }
-            if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
-                warn!(
-                    "Failed to remove instance config dir for test runner '{}': {}",
-                    runner_id, e
-                );
-            }
+        }
+        // Cross-platform: the instance dir holds a copy of the paired state
+        // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4).
+        if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
+            warn!(
+                "Failed to remove instance config dir for test runner '{}': {}",
+                runner_id, e
+            );
         }
 
         // Clean up the per-runner exe copy (its whole directory, sidecars

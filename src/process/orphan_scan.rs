@@ -184,12 +184,28 @@ fn exe_table_from_runners(
     state: &SharedState,
     runners: &[Arc<ManagedRunner>],
 ) -> Vec<RegisteredExe> {
+    exe_table_for(&state.config, runners.iter().map(|r| &r.config))
+}
+
+/// Pure core of [`exe_table_from_runners`]. Each runner contributes its
+/// current [`crate::config::SupervisorConfig::runner_exe_copy_path`]; a
+/// `Named` runner also contributes its pre-layout flat path
+/// ([`crate::config::SupervisorConfig::legacy_flat_named_exe_copy_path`]),
+/// so a named runner started by an older supervisor build is still adopted
+/// rather than read as unowned.
+fn exe_table_for<'a>(
+    config: &crate::config::SupervisorConfig,
+    runners: impl Iterator<Item = &'a crate::config::RunnerConfig>,
+) -> Vec<RegisteredExe> {
     runners
-        .iter()
-        .map(|r| RegisteredExe {
-            runner_id: r.config.id.clone(),
-            is_temp: r.config.kind().is_temp(),
-            exe_copy_path: state.config.runner_exe_copy_path(&r.config),
+        .flat_map(|r| {
+            let entry = |exe_copy_path| RegisteredExe {
+                runner_id: r.id.clone(),
+                is_temp: r.kind().is_temp(),
+                exe_copy_path,
+            };
+            std::iter::once(entry(config.runner_exe_copy_path(r)))
+                .chain(config.legacy_flat_named_exe_copy_path(r).map(entry))
         })
         .collect()
 }
@@ -970,6 +986,67 @@ mod tests {
                 is_temp: false
             }
         );
+    }
+
+    /// A named runner still running from the pre-layout flat copy path (it
+    /// survived the supervisor upgrade) is adopted, not read as unowned; a
+    /// temp runner gets no such legacy entry.
+    #[test]
+    fn exe_table_adopts_a_named_runner_on_its_legacy_flat_path() {
+        use clap::Parser;
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let src_tauri = root.path().join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir");
+        let project_dir = src_tauri.to_string_lossy().into_owned();
+        let config =
+            crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
+                "test",
+                "--project-dir",
+                project_dir.as_str(),
+            ]));
+        let mut named = crate::config::RunnerConfig::default_primary();
+        named.id = "named-9880-abc".to_string();
+        named.port = 9880;
+        named.kind = qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: "feat".to_string(),
+        };
+        let mut temp = crate::config::RunnerConfig::default_primary();
+        temp.id = "test-abc".to_string();
+        temp.port = 9877;
+        temp.kind = qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-abc".to_string(),
+        };
+        let table = exe_table_for(&config, [&named, &temp].into_iter());
+        assert_eq!(
+            table.len(),
+            3,
+            "named: current + legacy; temp: current only"
+        );
+
+        let legacy = config
+            .runner_npm_dir()
+            .join("target")
+            .join("debug")
+            .join(format!(
+                "qontinui-runner-named-9880{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        assert_eq!(
+            classify_exe_owner(&legacy, &table),
+            ExeOwner::Registered {
+                runner_id: "named-9880-abc".to_string(),
+                is_temp: false
+            }
+        );
+        let legacy_temp = config
+            .runner_npm_dir()
+            .join("target")
+            .join("debug")
+            .join(format!(
+                "qontinui-runner-test-9877{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        assert_eq!(classify_exe_owner(&legacy_temp, &table), ExeOwner::Unowned);
     }
 
     /// A temp runner's copy path is owned, and flagged temp so it keeps

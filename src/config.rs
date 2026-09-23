@@ -1178,6 +1178,32 @@ impl SupervisorConfig {
         )
     }
 
+    /// The flat `target/debug/qontinui-runner-named-{port}[.exe]` copy path a
+    /// `Named` runner used before the per-runner-directory layout
+    /// ([`Self::runner_exe_copy_dir`]); `None` for every other kind.
+    ///
+    /// Transitional, for identity only: a named runner is user-owned and
+    /// survives a supervisor restart, so one started by a supervisor build
+    /// that predates the layout is still running from this path when the new
+    /// supervisor's orphan scan classifies it. Without this the scan would
+    /// read the operator's runner as unowned. Nothing copies to it any more;
+    /// delete it once no such runner can remain.
+    pub fn legacy_flat_named_exe_copy_path(&self, config: &RunnerConfig) -> Option<PathBuf> {
+        match &config.kind {
+            RunnerKind::Named { .. } => Some(
+                self.runner_npm_dir()
+                    .join("target")
+                    .join("debug")
+                    .join(format!(
+                        "qontinui-runner-named-{}{}",
+                        config.port,
+                        std::env::consts::EXE_SUFFIX
+                    )),
+            ),
+            _ => None,
+        }
+    }
+
     /// Path to a copied runner executable. Every runner runs from a copy so
     /// the build artifact is never locked and dev-mode rebuilds succeed.
     ///
