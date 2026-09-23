@@ -2569,6 +2569,18 @@ pub(crate) fn deploy_sidecar(
     }
 }
 
+/// Whether a temp runner's stop should delete its [`instance_config_dir`].
+///
+/// Not when the stop is the first half of a restart (`restart_requested` is
+/// latched by `restart_runner_by_id` for exactly that window): the same id is
+/// started again at once and must come back with the pairing spawn-test copied
+/// in (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4) and its own
+/// config. Nothing re-applies that snapshot on a restart, so deleting it would
+/// bring the runner back unpaired and first-run.
+pub(crate) fn reap_instance_config_on_stop(restart_requested: bool) -> bool {
+    !restart_requested
+}
+
 /// Remove a runner's exe copy and everything deployed beside it.
 ///
 /// For `Temp`/`Named` runners the copy owns a whole directory
@@ -5077,11 +5089,22 @@ pub async fn stop_runner_by_id(
             }
         }
         // Cross-platform: the instance dir holds a copy of the paired state
-        // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4).
-        if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
-            warn!(
-                "Failed to remove instance config dir for test runner '{}': {}",
-                runner_id, e
+        // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4). Kept when
+        // this stop is the first half of a restart — see
+        // `reap_instance_config_on_stop`.
+        let restarting = managed.runner.read().await.restart_requested;
+        if reap_instance_config_on_stop(restarting) {
+            if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
+                warn!(
+                    "Failed to remove instance config dir for test runner '{}': {}",
+                    runner_id, e
+                );
+            }
+        } else {
+            info!(
+                "Keeping instance config dir for test runner '{}' across its restart \
+                 (it holds the runner's pairing and config)",
+                runner_id
             );
         }
 
@@ -7261,6 +7284,39 @@ mod tests {
                 .join(crate::build_monitor::SHIM_EXE_FILENAME)
                 .exists(),
             "no shim must be fabricated at the destination"
+        );
+    }
+
+    /// A temp restart keeps the instance dir (pairing + config); a plain stop
+    /// reaps it. Pinned at the pure gate and at its one call site, whose input
+    /// must be the `restart_requested` latch `restart_runner_by_id` sets.
+    #[test]
+    fn temp_restart_keeps_the_instance_config_dir() {
+        assert!(reap_instance_config_on_stop(false));
+        assert!(!reap_instance_config_on_stop(true));
+
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("process")
+                .join("manager.rs"),
+        )
+        .expect("read manager.rs")
+        .replace("\r\n", "\n");
+        let stop = src
+            .split_once("pub async fn stop_runner_by_id(")
+            .map(|(_, after)| after)
+            .expect("stop_runner_by_id exists");
+        let stop = &stop[..stop.find("\npub async fn ").unwrap_or(stop.len())];
+        assert!(
+            stop.contains("let restarting = managed.runner.read().await.restart_requested;")
+                && stop.contains("if reap_instance_config_on_stop(restarting)"),
+            "stop_runner_by_id must gate the instance-dir reap on restart_requested"
+        );
+        assert_eq!(
+            stop.matches("remove_instance_config_dir(").count(),
+            1,
+            "exactly one (gated) instance-dir reap in stop_runner_by_id"
         );
     }
 
