@@ -122,6 +122,22 @@ pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
     })
 }
 
+/// The PRIMARY runner's paired-state directory —
+/// `dirs::data_local_dir()/com.qontinui.runner`, where it keeps
+/// `paired_user.json` and `auth_tokens.enc`.
+///
+/// The primary runs with no `QONTINUI_SECURE_STORAGE_DIR` override (only
+/// non-primary spawns get [`instance_config_dir`]), so both files sit at the
+/// runner's own fallback: `SecureStorage::new()` in qontinui-runner
+/// `src-tauri/src/secure_storage.rs` and `paired_user_path` in `pair.rs`.
+/// `spawn-test` without a `paired_profile_id` snapshots this dir into the temp
+/// runner's instance dir (`routes::runners::apply_primary_paired_snapshot`).
+///
+/// Returns `None` only when the platform data-local dir can't be resolved.
+pub fn primary_paired_state_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"))
+}
+
 /// The value a temp runner is given as its `QONTINUI_INSTANCE_NAME` — i.e.
 /// **the runner's own unique id**, never anything derived from its port.
 ///

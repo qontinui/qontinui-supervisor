@@ -3719,8 +3719,8 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
 /// Stop registered runners whose live process is running directly out of a
 /// build-pool slot dir before a cargo build.
 ///
-/// In normal operation every runner launches from a copy at
-/// `target/debug/qontinui-runner-{id}.exe`, so this loop is a no-op. When
+/// In normal operation every runner launches from its copy at
+/// `config::runner_exe_copy_path`, so this loop is a no-op. When
 /// `start_managed_runner`'s copy step has previously fallen back to
 /// `source_exe` (the slot binary), the resulting runner holds a slot exe
 /// open and would block any cargo build that tries to overwrite it. Catch
@@ -5426,6 +5426,7 @@ mod tests {
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: true,
             no_webview: true,
+            temp_runner_display: None,
         };
         Arc::new(SupervisorState::new(config))
     }

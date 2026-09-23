@@ -14,6 +14,10 @@ pub const RUNNER_BIN_NAME: &str = "qontinui-runner.exe";
 #[cfg(not(windows))]
 pub const RUNNER_BIN_NAME: &str = "qontinui-runner";
 
+/// Directory under the runner's `target/debug/` that holds one subdirectory
+/// per `Temp`/`Named` runner copy ([`SupervisorConfig::runner_exe_copy_dir`]).
+pub const RUNNER_COPIES_DIR: &str = "runners";
+
 /// Cargo's own target-dir override env var. Read (never written) by the
 /// supervisor so exe resolution lands on the directory cargo actually wrote to.
 pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
@@ -246,7 +250,21 @@ pub struct CliArgs {
     /// to drive the dashboard from your own browser tab.
     #[arg(long = "no-webview")]
     pub no_webview: bool,
+
+    /// X11 `DISPLAY` value to hand temp runners when the supervisor's own
+    /// environment carries neither `DISPLAY` nor anything to forward — the
+    /// common case for a supervisor started from a non-GUI shell (ssh, a
+    /// systemd user unit, an agent's Bash tool). Linux only; ignored
+    /// elsewhere. Also settable via env `QONTINUI_SUPERVISOR_TEMP_DISPLAY`
+    /// (this flag wins). Without either, a temp spawn on such a box is
+    /// refused with a `no_display:` reason instead of a GTK panic. See
+    /// `process::env_forwarders::DisplayEnv`.
+    #[arg(long = "temp-runner-display")]
+    pub temp_runner_display: Option<String>,
 }
+
+/// Env var equivalent of [`CliArgs::temp_runner_display`].
+pub const TEMP_RUNNER_DISPLAY_ENV: &str = "QONTINUI_SUPERVISOR_TEMP_DISPLAY";
 
 #[allow(dead_code)]
 pub struct SupervisorConfig {
@@ -272,6 +290,10 @@ pub struct SupervisorConfig {
     /// When true, skip the ambient dashboard WebView2 window (item B of the
     /// post-3J UI Bridge improvements plan). See [`CliArgs::no_webview`].
     pub no_webview: bool,
+    /// `DISPLAY` to supply to temp runners when the supervisor's environment
+    /// has none (`--temp-runner-display`, else
+    /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`). Blank counts as unset.
+    pub temp_runner_display: Option<String>,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -491,6 +513,16 @@ impl RunnerConfig {
             extra_env: std::collections::HashMap::new(),
         }
     }
+}
+
+/// `--temp-runner-display` wins over `QONTINUI_SUPERVISOR_TEMP_DISPLAY`;
+/// blank values count as unset at both levels.
+fn resolve_temp_runner_display(flag: Option<String>, env: Option<String>) -> Option<String> {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
 }
 
 fn default_true() -> bool {
@@ -977,6 +1009,11 @@ impl SupervisorConfig {
             .clone()
             .or_else(|| args.log_dir.as_ref().map(|d| d.join("supervisor.log")));
 
+        let temp_runner_display = resolve_temp_runner_display(
+            args.temp_runner_display,
+            std::env::var(TEMP_RUNNER_DISPLAY_ENV).ok(),
+        );
+
         SupervisorConfig {
             project_dir: args.project_dir,
             watchdog_enabled_at_start: args.watchdog,
@@ -994,6 +1031,7 @@ impl SupervisorConfig {
             build_pool: BuildPoolConfig::default(),
             no_prewarm,
             no_webview,
+            temp_runner_display,
         }
     }
 
@@ -1102,41 +1140,63 @@ impl SupervisorConfig {
         self.runner_exe_path_resolved().1
     }
 
-    /// Path to a copied runner executable for non-primary runners.
-    /// This avoids locking the main build artifact so dev-mode rebuilds succeed.
-    /// Lives alongside the source exe under `target/debug/` so it picks up the
-    /// same incremental build outputs (DLLs, PDBs, etc.) as the original.
+    /// Per-runner copy DIRECTORY for `Temp` and `Named` runners:
+    /// `<runner>/target/debug/runners/<pool-name>/`, where `<pool-name>` is
+    /// `qontinui-runner-test-{port}` / `qontinui-runner-named-{port}`.
+    /// `None` for `Primary`, `External` and any future kind, whose copy stays
+    /// flat in `target/debug/`.
     ///
-    /// **Pool naming.** For `Temp` and `Named` runners the filename is keyed
-    /// off the runner's port (`qontinui-runner-test-{port}.exe`,
-    /// `qontinui-runner-named-{port}.exe`) rather than its unique id. This
-    /// gives a stable, bounded set of filenames (23 test slots × the named
-    /// port set) so Windows Firewall rules registered against those paths
-    /// keep matching across spawn-test invocations. Without the pool naming,
-    /// each spawn produced a new binary path (`qontinui-runner-test-{uuid}.exe`),
-    /// every cold spawn triggered a "Allow this app through firewall?" prompt,
-    /// and the install-firewall-rules.ps1 helper had to be re-run after
-    /// every cargo build.
+    /// **Why a directory per runner.** The runner resolves its helper
+    /// binaries (the `qontinui-shim` identity stub, the git credential
+    /// helper) from `current_exe().parent()`, and the supervisor deploys them
+    /// beside the copy ([`crate::process::manager::deploy_shim_sidecar`]).
+    /// With a flat copy that "beside" was the SHARED `target/debug/` of the
+    /// live tree, so every temp spawn overwrote the primary's sidecars. A
+    /// directory per runner keeps each runner's sidecars its own, and lets
+    /// stop-time cleanup remove the whole directory.
     ///
-    /// `Primary` and `External` runners keep id-based names — primary's id is
-    /// already a stable `"primary"`, and external runners are user-managed
-    /// (the supervisor only observes them).
-    pub fn runner_exe_copy_path(&self, config: &RunnerConfig) -> PathBuf {
-        let sfx = std::env::consts::EXE_SUFFIX;
-        let filename = match &config.kind {
-            RunnerKind::Temp { .. } => format!("qontinui-runner-test-{}{}", config.port, sfx),
-            RunnerKind::Named { .. } => format!("qontinui-runner-named-{}{}", config.port, sfx),
-            RunnerKind::Primary => format!("qontinui-runner-{}{}", config.id, sfx),
-            // `External` and any future `RunnerKind` variants (the enum is
-            // `#[non_exhaustive]`) — fall back to the id-based name so
-            // user-managed runners that the supervisor only observes keep
-            // working without supervisor changes.
-            _ => format!("qontinui-runner-{}{}", config.id, sfx),
+    /// **Pool naming.** The directory is keyed off the runner's port rather
+    /// than its unique id, which gives a stable, bounded set of exe paths
+    /// (23 test slots × the named port set) so Windows Firewall rules
+    /// registered against those paths keep matching across spawn-test
+    /// invocations. Without the pool naming, each spawn produced a new binary
+    /// path, every cold spawn triggered an "Allow this app through firewall?"
+    /// prompt, and the firewall-rule helper had to be re-run after every
+    /// cargo build.
+    pub fn runner_exe_copy_dir(&self, config: &RunnerConfig) -> Option<PathBuf> {
+        let pool_name = match &config.kind {
+            RunnerKind::Temp { .. } => format!("qontinui-runner-test-{}", config.port),
+            RunnerKind::Named { .. } => format!("qontinui-runner-named-{}", config.port),
+            _ => return None,
         };
+        Some(
+            self.runner_npm_dir()
+                .join("target")
+                .join("debug")
+                .join(RUNNER_COPIES_DIR)
+                .join(pool_name),
+        )
+    }
+
+    /// Path to a copied runner executable. Every runner runs from a copy so
+    /// the build artifact is never locked and dev-mode rebuilds succeed.
+    ///
+    /// * `Temp` / `Named`: `target/debug/runners/<pool-name>/qontinui-runner[.exe]`
+    ///   — see [`Self::runner_exe_copy_dir`] for why each has its own
+    ///   directory and why it is port-keyed.
+    /// * `Primary` / `External`: flat `target/debug/qontinui-runner-<id>[.exe]`
+    ///   — primary's id is already a stable `"primary"`, and external runners
+    ///   are user-managed (the supervisor only observes them). Any future
+    ///   `RunnerKind` variant (the enum is `#[non_exhaustive]`) takes this arm.
+    pub fn runner_exe_copy_path(&self, config: &RunnerConfig) -> PathBuf {
+        if let Some(dir) = self.runner_exe_copy_dir(config) {
+            return dir.join(RUNNER_BIN_NAME);
+        }
+        let sfx = std::env::consts::EXE_SUFFIX;
         self.runner_npm_dir()
             .join("target")
             .join("debug")
-            .join(filename)
+            .join(format!("qontinui-runner-{}{}", config.id, sfx))
     }
 
     /// Path to the runner npm project root (parent of src-tauri).
@@ -1586,6 +1646,7 @@ mod tests {
             expo_dir: None,
             no_prewarm: false,
             no_webview: false,
+            temp_runner_display: None,
         }
     }
 
@@ -1610,6 +1671,24 @@ mod tests {
     }
 
     #[test]
+    fn temp_runner_display_flag_wins_and_blank_is_unset() {
+        assert_eq!(
+            resolve_temp_runner_display(Some(":1".into()), Some(":0".into())),
+            Some(":1".to_string())
+        );
+        assert_eq!(
+            resolve_temp_runner_display(None, Some(" :0 ".into())),
+            Some(":0".to_string())
+        );
+        assert_eq!(
+            resolve_temp_runner_display(Some("  ".into()), Some(":0".into())),
+            Some(":0".to_string())
+        );
+        assert_eq!(resolve_temp_runner_display(Some(String::new()), None), None);
+        assert_eq!(resolve_temp_runner_display(None, None), None);
+    }
+
+    #[test]
     fn test_from_args_watchdog_implies_auto_start() {
         let args = make_test_args(true, false);
         let config = SupervisorConfig::from_args(args);
@@ -1631,6 +1710,53 @@ mod tests {
         let config = SupervisorConfig::from_args(args);
         let exe_path = config.runner_exe_path();
         assert!(exe_path.ends_with(format!("target/debug/{}", RUNNER_BIN_NAME)));
+    }
+
+    /// S-2: `Temp` and `Named` copies each get their own port-pooled
+    /// directory under `target/debug/runners/`, so the sidecars deployed
+    /// beside them never land in the shared `target/debug/`. `Primary` keeps
+    /// its flat id-named copy.
+    #[test]
+    fn exe_copy_path_is_per_runner_dir_for_temp_and_named_only() {
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        let debug = config.runner_npm_dir().join("target").join("debug");
+
+        let mut temp = RunnerConfig::default_primary();
+        temp.id = "test-abc".to_string();
+        temp.port = 9877;
+        temp.kind = RunnerKind::Temp {
+            id: "test-abc".to_string(),
+        };
+        let temp_dir = debug.join("runners").join("qontinui-runner-test-9877");
+        assert_eq!(config.runner_exe_copy_dir(&temp), Some(temp_dir.clone()));
+        assert_eq!(
+            config.runner_exe_copy_path(&temp),
+            temp_dir.join(RUNNER_BIN_NAME)
+        );
+
+        let mut named = RunnerConfig::default_primary();
+        named.id = "named-9880-x".to_string();
+        named.port = 9880;
+        named.kind = RunnerKind::Named {
+            name: "feat".to_string(),
+        };
+        assert_eq!(
+            config.runner_exe_copy_path(&named),
+            debug
+                .join("runners")
+                .join("qontinui-runner-named-9880")
+                .join(RUNNER_BIN_NAME)
+        );
+
+        let primary = RunnerConfig::default_primary();
+        assert_eq!(config.runner_exe_copy_dir(&primary), None);
+        assert_eq!(
+            config.runner_exe_copy_path(&primary),
+            debug.join(format!(
+                "qontinui-runner-primary{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+        );
     }
 
     // --- Cargo target-dir precedence (the stale-exe defect) ---

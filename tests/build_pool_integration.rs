@@ -30,6 +30,7 @@ fn pool_test_config(pool_size: usize) -> SupervisorConfig {
         build_pool: BuildPoolConfig { pool_size },
         no_prewarm: false,
         no_webview: true,
+        temp_runner_display: None,
     }
 }
 

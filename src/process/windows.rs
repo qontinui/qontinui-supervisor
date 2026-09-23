@@ -358,12 +358,14 @@ pub async fn pid_exe_path(pid: u32) -> Option<PathBuf> {
 /// prior supervisor instance.
 ///
 /// **Why prefix-match, not exact:** `start_managed_runner` copies the
-/// freshly-built slot exe to `target/debug/qontinui-runner-<id>.exe`
-/// before launching, so the *running* process image is `qontinui-runner-
-/// primary.exe`, `qontinui-runner-named-…exe`, etc. — not the bare
-/// `qontinui-runner.exe`. An exact-name match misses every per-runner
-/// copy, which is exactly the orphan we most often need to clean up. The
-/// bare name is still matched (for the failure-mode case where Fix B
+/// freshly-built slot exe to `config::runner_exe_copy_path` before
+/// launching, so the *running* process image of the primary is
+/// `qontinui-runner-primary.exe` — not the bare `qontinui-runner.exe`. An
+/// exact-name match misses that copy. Temp and named runners run from
+/// `target/debug/runners/<pool-name>/qontinui-runner.exe`, whose image name
+/// IS the bare one — ownership is then decided by the full image path
+/// (`orphan_scan::classify_exe_owner`), never by the name. The bare name is
+/// also matched (for the failure-mode case where Fix B
 /// regressed and a runner is running from the slot dir directly).
 ///
 /// Backed by sysinfo. Match is case-insensitive (Windows filesystem

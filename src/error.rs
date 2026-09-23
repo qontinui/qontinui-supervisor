@@ -100,6 +100,16 @@ pub enum SupervisorError {
     #[error("Process error: {0}")]
     Process(String),
 
+    /// A Linux temp-runner spawn was refused because neither `DISPLAY` nor
+    /// `WAYLAND_DISPLAY` would resolve for the child
+    /// (`process::env_forwarders::display_refusal`). The message starts
+    /// `no_display:` and names the `--temp-runner-display` /
+    /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY` knob. Mapped to `409 CONFLICT` with a
+    /// typed body: the request is fine, the supervisor host's environment is
+    /// not.
+    #[error("{0}")]
+    NoDisplay(String),
+
     #[error("Timeout: {0}")]
     Timeout(String),
 
@@ -249,6 +259,18 @@ impl SupervisorError {
             return (StatusCode::CONFLICT, body);
         }
 
+        if let SupervisorError::NoDisplay(message) = self {
+            let body = serde_json::json!({
+                "error": "no_display",
+                "message": message,
+                "knob": {
+                    "flag": "--temp-runner-display",
+                    "env": crate::config::TEMP_RUNNER_DISPLAY_ENV,
+                },
+            });
+            return (StatusCode::CONFLICT, body);
+        }
+
         let status = match self {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
@@ -262,6 +284,7 @@ impl SupervisorError {
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Process(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupervisorError::NoDisplay(_) => StatusCode::CONFLICT,
             SupervisorError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             SupervisorError::Cancelled(_) => StatusCode::CONFLICT,
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -286,6 +309,20 @@ impl IntoResponse for SupervisorError {
 mod tests {
     use super::SupervisorError;
     use axum::http::StatusCode;
+
+    /// `NoDisplay` maps to 409 with a typed body whose message keeps the
+    /// `no_display:` prefix and which names the knob.
+    #[test]
+    fn no_display_maps_to_conflict_with_a_typed_body() {
+        let err = SupervisorError::NoDisplay("no_display: temp runner 't'".to_string());
+        assert_eq!(err.to_string(), "no_display: temp runner 't'");
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "no_display");
+        assert!(body["message"].as_str().unwrap().starts_with("no_display:"));
+        assert_eq!(body["knob"]["flag"], "--temp-runner-display");
+        assert_eq!(body["knob"]["env"], "QONTINUI_SUPERVISOR_TEMP_DISPLAY");
+    }
 
     /// `PortHeldByLiveRunner` maps to 409 with a typed body naming the port
     /// and the holder, so a caller can branch on it rather than scrape prose.

@@ -1904,6 +1904,7 @@ mod tests {
             build_pool: crate::config::BuildPoolConfig { pool_size: 1 },
             no_prewarm: false,
             no_webview: true,
+            temp_runner_display: None,
         }
     }
 

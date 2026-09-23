@@ -22,21 +22,29 @@ use crate::config::{PORT_CHECK_INTERVAL_MS, PORT_WAIT_TIMEOUT_SECS};
 ///   2026-07-03 17:17Z: port 9876 "still in use" after PID-kill + tree-kill
 ///   + kill-by-port while nothing was listening).
 ///
+/// * On Linux (and the other Unixes) a default bind is **not** enough: it
+///   fails `EADDRINUSE` against a server-side TIME_WAIT remnant just as it
+///   does against a live listener (reproduced on a Linux box 2026-09-23 —
+///   a temp runner's `/restart` refused to run its start half because the
+///   port it had just released still "read as held"). So on Unix the probe
+///   sets `SO_REUSEADDR` first. With that flag a Unix `bind(2)` succeeds over
+///   TIME_WAIT remnants and still fails `EADDRINUSE` when a LISTEN socket
+///   holds the port, which is exactly the question asked here.
+/// * Windows keeps the default bind. There `SO_REUSEADDR` means something
+///   else entirely — it lets the probe bind *over* a live listener — so
+///   setting it would make every held port read free.
+///
 /// The probe socket is bound but never listened/connected, so dropping it
 /// creates no TIME_WAIT state of its own.
 ///
-/// **Correct on Unix too, which the connect-based ancestor was not.** The
-/// original probe did a *nonblocking* connect and recognised only the Windows
-/// "in progress" codes (`WSAEWOULDBLOCK` 10035 / `WSAEISCONN` 10056) as
-/// "listening"; on macOS/Linux a nonblocking localhost connect returns
-/// `EINPROGRESS` regardless of whether anything is listening, so the function
-/// **always returned `false` there**. That silently broke every caller that
-/// gates on it: the stop path's port-free confirmation, the reaper's crash
-/// detection, and the reconcile sweep's orphan detection (the D7 orphan-leak
-/// surface). The bind probe has no such asymmetry — a `bind(2)` against a port
-/// a live listener holds fails with `EADDRINUSE` on Unix exactly as it fails
-/// with `WSAEADDRINUSE` on Windows — so it fixes the Unix bug *and* the
-/// TIME_WAIT false positive with one mechanism.
+/// History: the connect-based ancestor of this probe did a *nonblocking*
+/// connect and recognised only the Windows "in progress" codes
+/// (`WSAEWOULDBLOCK` 10035 / `WSAEISCONN` 10056) as "listening"; on
+/// macOS/Linux a nonblocking localhost connect returns `EINPROGRESS` whether
+/// or not anything is listening, so it **always returned `false` there**.
+/// The bind probe fixed that asymmetry, but a doc comment claiming it was
+/// then "correct on Unix too" was wrong for TIME_WAIT until the Unix
+/// `SO_REUSEADDR` arm above was added.
 ///
 /// For "is a runner actually serving HTTP?" use [`is_runner_responding`] —
 /// that is an application-level question, not a port-occupancy one.
@@ -52,11 +60,18 @@ pub fn is_port_listening(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    // Deliberately no SO_REUSEADDR: the default-bind semantics above are
-    // exactly what makes this probe ignore TIME_WAIT but fail against a
-    // live listener. Any bind error (WSAEADDRINUSE / EADDRINUSE, or
-    // WSAEACCES when the holder bound exclusively) means a live socket owns
-    // the port.
+    // Unix only: SO_REUSEADDR makes the bind ignore TIME_WAIT remnants while
+    // still failing EADDRINUSE against a LISTEN socket. Never on Windows,
+    // where the flag would let the bind succeed over a live listener. If the
+    // option cannot be set, fall through to the default bind: that can only
+    // err toward "held", never toward reporting a live port free.
+    #[cfg(unix)]
+    {
+        let _ = socket.set_reuse_address(true);
+    }
+
+    // Any bind error (WSAEADDRINUSE / EADDRINUSE, or WSAEACCES when the
+    // holder bound exclusively) means a live socket owns the port.
     socket.bind(&addr.into()).is_err()
 }
 
@@ -146,7 +161,7 @@ pub async fn wait_for_port_free(port: u16, timeout_secs: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::Read;
     use std::net::{TcpListener, TcpStream};
 
     /// Bind an ephemeral port and return (listener, port).
@@ -203,29 +218,78 @@ mod tests {
         }
     }
 
-    /// Regression for the 2026-07-03 17:17Z stop-confirmation wedge: a
-    /// just-killed process leaves TIME_WAIT remnants on its port. The old
-    /// connect-based probe latched onto them and reported the port in use;
-    /// the bind-based probe must report it free.
+    /// Count the IPv4 sockets in TIME_WAIT whose LOCAL port is `port`, read
+    /// from `/proc/net/tcp` (state `06` is `TCP_TIME_WAIT`). Linux only.
+    #[cfg(target_os = "linux")]
+    fn linux_time_wait_count(port: u16) -> usize {
+        let table = std::fs::read_to_string("/proc/net/tcp").expect("read /proc/net/tcp");
+        table
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                let mut cols = line.split_whitespace();
+                let _sl = cols.next();
+                let local = cols.next().unwrap_or("");
+                let _remote = cols.next();
+                let state = cols.next().unwrap_or("");
+                let local_port = local
+                    .rsplit(':')
+                    .next()
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+                local_port == Some(port) && state == "06"
+            })
+            .count()
+    }
+
+    /// Regression for the 2026-07-03 17:17Z stop-confirmation wedge (Windows)
+    /// and the 2026-09-23 temp-runner `/restart` wedge (Linux): a
+    /// just-stopped process leaves server-side TIME_WAIT remnants on its port,
+    /// and the probe must report that port free.
+    ///
+    /// The fixture must create a GENUINE server-side TIME_WAIT, which an
+    /// earlier version did not: its client wrote after the server had closed,
+    /// which provokes an RST, and an RST'd connection never enters TIME_WAIT —
+    /// so the test passed on Linux while the probe it guarded was wrong there.
+    /// Now the server closes first, the client reads to EOF and closes with no
+    /// write in between (a clean FIN/FIN exchange, the active closer being the
+    /// server), and on Linux the test PROVES the TIME_WAIT exists before it
+    /// probes, so it cannot pass vacuously again.
     #[test]
     fn test_time_wait_remnant_reads_as_free() {
         let (listener, port) = ephemeral_listener();
 
-        // Create a real connection so closing the server side leaves a
-        // TIME_WAIT entry on the server's port (the side that closes first
-        // enters TIME_WAIT).
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let (server_sock, _) = listener.accept().expect("accept");
 
-        // Server closes first: drop the accepted socket and the listener.
+        // Server is the active closer: its FIN goes first.
         drop(server_sock);
-        drop(listener);
 
-        // Nudge the client so the close handshake completes, then close it.
-        let _ = client.write_all(b"x");
+        // Client reads until EOF (the server's FIN), then closes — no write
+        // after the server's close, so no RST.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        let mut sink = Vec::new();
+        client.read_to_end(&mut sink).expect("client reads to EOF");
         drop(client);
 
-        // Give the stack a moment to transition the server side to TIME_WAIT.
+        // Release the LISTEN socket too: only the TIME_WAIT remnant is left.
+        drop(listener);
+
+        // Give the stack a moment to process the client's FIN.
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while linux_time_wait_count(port) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                linux_time_wait_count(port) > 0,
+                "fixture is VOID: no TIME_WAIT socket with local port {port} in /proc/net/tcp, \
+                 so this test would pass without exercising the probe"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         assert!(
@@ -233,5 +297,28 @@ mod tests {
             "TIME_WAIT remnants on port {} must NOT read as listening",
             port
         );
+    }
+
+    /// The Unix `SO_REUSEADDR` arm must not blind the probe to a live
+    /// listener: a LISTEN socket still reads as held, even when the port also
+    /// carries TIME_WAIT remnants from an earlier connection.
+    #[test]
+    fn test_listener_beside_time_wait_still_reads_as_held() {
+        let (listener, port) = ephemeral_listener();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (server_sock, _) = listener.accept().expect("accept");
+        drop(server_sock);
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        let mut sink = Vec::new();
+        client.read_to_end(&mut sink).expect("client reads to EOF");
+        drop(client);
+
+        assert!(
+            is_port_listening(port),
+            "a live listener on port {port} must read as held despite TIME_WAIT remnants"
+        );
+        drop(listener);
     }
 }

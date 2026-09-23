@@ -79,6 +79,7 @@ fn make_config(project_dir: PathBuf, dev_logs_dir: PathBuf) -> SupervisorConfig 
         build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
         no_webview: true,
+        temp_runner_display: None,
     }
 }
 

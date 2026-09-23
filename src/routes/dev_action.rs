@@ -120,6 +120,7 @@ mod tests {
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: true,
             no_webview: true,
+            temp_runner_display: None,
         };
         Arc::new(SupervisorState::new(config))
     }

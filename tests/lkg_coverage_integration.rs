@@ -41,6 +41,7 @@ fn config_with_project_dir(dir: PathBuf) -> SupervisorConfig {
         build_pool: BuildPoolConfig { pool_size: 1 },
         no_prewarm: false,
         no_webview: true,
+        temp_runner_display: None,
     }
 }
 

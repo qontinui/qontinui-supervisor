@@ -269,7 +269,8 @@ pub use imp::RunnerJob;
 ///
 /// The orphan-locks-a-slot-binary rationale the job was built for does not
 /// apply to user-owned runners: every runner start copies its resolved source
-/// exe to `target/debug/qontinui-runner-{id}.exe`, so a surviving primary holds
+/// exe to `target/debug/qontinui-runner-{id}.exe` (the primary's flat copy),
+/// so a surviving primary holds
 /// a lock on its own copy, never on a `target-pool/slot-{k}` binary.
 pub fn should_assign_to_ephemeral_job(kind: &RunnerKind) -> bool {
     kind.is_temp()

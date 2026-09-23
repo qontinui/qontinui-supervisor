@@ -18,6 +18,9 @@
 //! of `POST /runners/spawn-test` with `extra_env: {...}` can override anything
 //! the supervisor set (documented at `config.rs:148-153`). [`PanicLogEnv`]
 //! must run before the spawn so the runner sees `QONTINUI_RUNNER_LOG_DIR`.
+//! [`DisplayEnv`] and [`SetupWizardBypassEnv`] run before [`ExtraEnv`] for the
+//! same override reason; the `no_display` refusal is checked after the whole
+//! list has run ([`display_refusal_for_command`]), so it judges final values.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -66,8 +69,197 @@ pub fn default_env_forwarders() -> Vec<Box<dyn EnvForwarder>> {
         Box::new(RunnerTierEnv),
         Box::new(PlanAdapterEnv),
         Box::new(PanicLogEnv),
+        Box::new(SetupWizardBypassEnv),
+        Box::new(DisplayEnv),
         Box::new(ExtraEnv),
     ]
+}
+
+// =============================================================================
+// SetupWizardBypassEnv
+// =============================================================================
+
+/// Env var the runner's `check_setup_completed` honors to skip the first-run
+/// SetupWizard.
+pub(crate) const SETUP_WIZARD_BYPASS_ENV: &str = "QONTINUI_SETUP_WIZARD_BYPASS";
+
+/// Sets `QONTINUI_SETUP_WIZARD_BYPASS=1` on every **temp** runner spawn.
+///
+/// A temp runner boots with a fresh per-instance config dir, so the runner
+/// treats it as a first run and opens the SetupWizard — a full-viewport cover
+/// that hides every page an agent spawned the runner to drive. The runner used
+/// to infer "test runner" from `QONTINUI_TEST_AUTO_LOGIN_EMAIL`, which the
+/// paired-profile path never sets; this is the explicit flag instead (plan
+/// `2026-09-23-conductor-e2e-phase1-defects`, UI-5). Primary and named runners
+/// are an operator's own and keep the wizard. Registered before [`ExtraEnv`]
+/// so `extra_env: {"QONTINUI_SETUP_WIZARD_BYPASS": "0"}` can still exercise
+/// the wizard on a temp runner.
+pub struct SetupWizardBypassEnv;
+
+/// Pure gate for [`SetupWizardBypassEnv`]: the value to set, or `None`.
+pub(crate) fn setup_wizard_bypass_value(is_temp: bool) -> Option<&'static str> {
+    is_temp.then_some("1")
+}
+
+impl EnvForwarder for SetupWizardBypassEnv {
+    fn name(&self) -> &'static str {
+        "setup_wizard_bypass"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        _state: &'a SharedState,
+        runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(val) = setup_wizard_bypass_value(runner.config.kind().is_temp()) {
+                cmd.env(SETUP_WIZARD_BYPASS_ENV, val);
+            }
+        })
+    }
+}
+
+// =============================================================================
+// DisplayEnv
+// =============================================================================
+
+/// The display-selection variables a GTK/WebKitGTK runner reads on Linux.
+pub(crate) const DISPLAY_ENV_KEYS: [&str; 4] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "GDK_BACKEND",
+    "BROADWAY_DISPLAY",
+];
+
+/// Resolve the display variables to set on a temp runner.
+///
+/// Every key in [`DISPLAY_ENV_KEYS`] the supervisor's own environment carries
+/// (non-blank) is forwarded verbatim. When the supervisor has no `DISPLAY`,
+/// the configured knob (`--temp-runner-display` /
+/// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`) supplies it. Pure over its inputs so
+/// the precedence is testable without mutating the process environment.
+pub(crate) fn resolve_display_env(
+    supervisor_env: impl Fn(&str) -> Option<String>,
+    knob: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = DISPLAY_ENV_KEYS
+        .iter()
+        .filter_map(|k| {
+            supervisor_env(k)
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (*k, v))
+        })
+        .collect();
+    if !out.iter().any(|(k, _)| *k == "DISPLAY") {
+        if let Some(display) = knob.map(str::trim).filter(|v| !v.is_empty()) {
+            out.push(("DISPLAY", display.to_string()));
+        }
+    }
+    out
+}
+
+/// Forwards the display variables to **temp** runners on Linux (plan
+/// `2026-09-23-conductor-e2e-phase1-defects`, S-3).
+///
+/// A supervisor started from a non-GUI shell has no `DISPLAY`, so the temp
+/// runner it spawned used to die in GTK init with a panic that named nothing
+/// the operator could act on. This forwarder carries the supervisor's own
+/// display variables across explicitly, and supplies `DISPLAY` from the
+/// `--temp-runner-display` / `QONTINUI_SUPERVISOR_TEMP_DISPLAY` knob when the
+/// supervisor has none. Registered before [`ExtraEnv`] so `extra_env` still
+/// overrides it. Whether a display then resolves at all is checked after
+/// every forwarder has run, by [`display_refusal_for_command`].
+pub struct DisplayEnv;
+
+impl EnvForwarder for DisplayEnv {
+    fn name(&self) -> &'static str {
+        "display"
+    }
+
+    fn apply<'a>(
+        &'a self,
+        cmd: &'a mut Command,
+        state: &'a SharedState,
+        runner: &'a ManagedRunner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if !cfg!(target_os = "linux") || !runner.config.kind().is_temp() {
+                return;
+            }
+            let resolved = resolve_display_env(
+                |k| std::env::var(k).ok(),
+                state.config.temp_runner_display.as_deref(),
+            );
+            for (key, value) in resolved {
+                cmd.env(key, value);
+            }
+        })
+    }
+}
+
+/// The refusal a temp spawn gets on Linux when neither `DISPLAY` nor
+/// `WAYLAND_DISPLAY` resolves for the child, or `None` when it may proceed.
+///
+/// `explicit(key)` is what the spawn [`Command`] itself says about `key`:
+/// `Some(Some(v))` set, `Some(None)` removed, `None` untouched — in which case
+/// the child inherits `inherited(key)` from the supervisor. This is evaluated
+/// AFTER every forwarder has run, [`ExtraEnv`] included, so it sees the final
+/// values. The message starts `no_display:` and names the knob.
+pub(crate) fn display_refusal(
+    is_linux: bool,
+    is_temp: bool,
+    runner_name: &str,
+    explicit: impl Fn(&str) -> Option<Option<String>>,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if !is_linux || !is_temp {
+        return None;
+    }
+    let resolves = |key: &str| {
+        let value = match explicit(key) {
+            Some(set_or_removed) => set_or_removed,
+            None => inherited(key),
+        };
+        value.is_some_and(|v| !v.trim().is_empty())
+    };
+    if resolves("DISPLAY") || resolves("WAYLAND_DISPLAY") {
+        return None;
+    }
+    Some(format!(
+        "no_display: temp runner '{runner_name}' would start with neither DISPLAY nor \
+         WAYLAND_DISPLAY, and GTK cannot open a window without one. The supervisor's \
+         environment has no display (it was likely started from a non-GUI shell). Start \
+         the supervisor with --temp-runner-display <display> (or env \
+         {knob}=<display>, e.g. :0), start it from a graphical session, or pass \
+         extra_env {{\"DISPLAY\": \"<display>\"}} on the spawn.",
+        knob = crate::config::TEMP_RUNNER_DISPLAY_ENV,
+    ))
+}
+
+/// [`display_refusal`] over a real spawn [`Command`] and the supervisor's
+/// live environment.
+pub(crate) fn display_refusal_for_command(
+    cmd: &Command,
+    runner: &crate::config::RunnerConfig,
+) -> Option<String> {
+    let envs: Vec<(String, Option<String>)> = cmd
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    display_refusal(
+        cfg!(target_os = "linux"),
+        runner.kind().is_temp(),
+        &runner.name,
+        |key| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+        |key| std::env::var(key).ok(),
+    )
 }
 
 // =============================================================================
@@ -927,8 +1119,9 @@ fn instance_dir_override_warning(
 #[cfg(test)]
 mod tests {
     use super::{
+        display_refusal, display_refusal_for_command, resolve_display_env,
         resolve_plan_adapter_value, resolve_test_auto_login, resolve_worktree_mode,
-        TestAutoLoginSource, PLAN_ADAPTER_VARS,
+        setup_wizard_bypass_value, TestAutoLoginSource, PLAN_ADAPTER_VARS,
     };
     use std::path::{Path, PathBuf};
 
@@ -1128,5 +1321,144 @@ mod tests {
             resolve_plan_adapter_value(Some(String::new()), Some(String::new())),
             None
         );
+    }
+
+    // --- DisplayEnv (S-3) ---------------------------------------------------
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn display_forwards_every_present_supervisor_key() {
+        let sup = [
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("GDK_BACKEND", "x11"),
+            ("BROADWAY_DISPLAY", ":5"),
+        ];
+        let got = resolve_display_env(env_of(&sup), Some(":9"));
+        assert_eq!(
+            got,
+            vec![
+                ("DISPLAY", ":0".to_string()),
+                ("WAYLAND_DISPLAY", "wayland-0".to_string()),
+                ("GDK_BACKEND", "x11".to_string()),
+                ("BROADWAY_DISPLAY", ":5".to_string()),
+            ],
+            "the knob must not override a DISPLAY the supervisor already has"
+        );
+    }
+
+    #[test]
+    fn display_knob_supplies_display_only_when_supervisor_has_none() {
+        let sup = [("GDK_BACKEND", "x11"), ("DISPLAY", "  ")];
+        let got = resolve_display_env(env_of(&sup), Some(":1"));
+        assert_eq!(
+            got,
+            vec![
+                ("GDK_BACKEND", "x11".to_string()),
+                ("DISPLAY", ":1".to_string())
+            ]
+        );
+        // Wayland-only supervisor: DISPLAY still comes from the knob.
+        let sup = [("WAYLAND_DISPLAY", "wayland-1")];
+        let got = resolve_display_env(env_of(&sup), Some(":0"));
+        assert!(got.contains(&("DISPLAY", ":0".to_string())));
+        assert!(got.contains(&("WAYLAND_DISPLAY", "wayland-1".to_string())));
+    }
+
+    #[test]
+    fn display_nothing_anywhere_resolves_to_nothing() {
+        assert!(resolve_display_env(env_of(&[]), None).is_empty());
+        assert!(resolve_display_env(env_of(&[]), Some("  ")).is_empty());
+    }
+
+    #[test]
+    fn no_display_refusal_names_the_knob() {
+        let msg = display_refusal(true, true, "test-1", |_| None, |_| None)
+            .expect("no display anywhere must refuse on Linux");
+        assert!(msg.starts_with("no_display:"), "{msg}");
+        assert!(msg.contains("--temp-runner-display"), "{msg}");
+        assert!(msg.contains("QONTINUI_SUPERVISOR_TEMP_DISPLAY"), "{msg}");
+    }
+
+    #[test]
+    fn no_display_refusal_is_linux_temp_only() {
+        assert_eq!(display_refusal(false, true, "t", |_| None, |_| None), None);
+        assert_eq!(display_refusal(true, false, "n", |_| None, |_| None), None);
+    }
+
+    #[test]
+    fn display_resolution_sees_command_inherited_and_removed_values() {
+        // Explicit on the command (knob or extra_env) resolves.
+        let explicit = |k: &str| (k == "DISPLAY").then(|| Some(":7".to_string()));
+        assert_eq!(display_refusal(true, true, "t", explicit, |_| None), None);
+        // Inherited from the supervisor resolves when the command is silent.
+        let inherited = |k: &str| (k == "WAYLAND_DISPLAY").then(|| "wayland-0".to_string());
+        assert_eq!(display_refusal(true, true, "t", |_| None, inherited), None);
+        // An extra_env that REMOVES / blanks the inherited value refuses.
+        let removed = |k: &str| (k == "DISPLAY").then_some(None);
+        let inherited_display = |k: &str| (k == "DISPLAY").then(|| ":0".to_string());
+        assert!(display_refusal(true, true, "t", removed, inherited_display).is_some());
+        let blanked = |k: &str| (k == "DISPLAY").then(|| Some(String::new()));
+        assert!(display_refusal(true, true, "t", blanked, |_| None).is_some());
+    }
+
+    /// The command-reading wrapper judges the FINAL command env: a value set
+    /// on the `Command` (as `extra_env` or the knob would) satisfies it.
+    #[test]
+    fn display_refusal_for_command_reads_the_final_command_env() {
+        let mut temp = crate::config::RunnerConfig::default_primary();
+        temp.id = "test-x".to_string();
+        temp.name = "test-x".to_string();
+        temp.kind = qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-x".to_string(),
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env("DISPLAY", ":3");
+        assert_eq!(display_refusal_for_command(&cmd, &temp), None);
+
+        // Removing both on the command refuses on Linux, whatever the
+        // supervisor's own env holds.
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+        let refusal = display_refusal_for_command(&cmd, &temp);
+        if cfg!(target_os = "linux") {
+            assert!(refusal.expect("must refuse").starts_with("no_display:"));
+        } else {
+            assert_eq!(refusal, None);
+        }
+    }
+
+    // --- SetupWizardBypassEnv (UI-5) -----------------------------------------
+
+    #[test]
+    fn setup_wizard_bypass_is_set_for_temp_runners_only() {
+        assert_eq!(setup_wizard_bypass_value(true), Some("1"));
+        assert_eq!(setup_wizard_bypass_value(false), None);
+        assert_eq!(
+            super::SETUP_WIZARD_BYPASS_ENV,
+            "QONTINUI_SETUP_WIZARD_BYPASS"
+        );
+    }
+
+    /// Registration order: both new forwarders run before `ExtraEnv`, which
+    /// stays last so `extra_env` can override them.
+    #[test]
+    fn display_and_bypass_forwarders_are_registered_before_extra_env() {
+        let names: Vec<&str> = super::default_env_forwarders()
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        let pos = |n: &str| names.iter().position(|x| *x == n).expect(n);
+        assert_eq!(names.last(), Some(&"extra_env"));
+        assert!(pos("display") < pos("extra_env"));
+        assert!(pos("setup_wizard_bypass") < pos("extra_env"));
     }
 }

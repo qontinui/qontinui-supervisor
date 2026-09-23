@@ -1311,6 +1311,7 @@ mod router_tests {
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: false,
             no_webview: true,
+            temp_runner_display: None,
         };
         std::sync::Arc::new(crate::state::SupervisorState::new(config))
     }

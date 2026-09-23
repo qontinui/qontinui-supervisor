@@ -18,7 +18,8 @@
 //! registered runner launches from its own
 //! [`crate::config::Config::runner_exe_copy_path`]
 //! (`target/debug/qontinui-runner-primary.exe`,
-//! `qontinui-runner-test-<port>.exe`, …), so the orphan's `exe_path` alone
+//! `target/debug/runners/qontinui-runner-test-<port>/qontinui-runner.exe`, …),
+//! so the orphan's `exe_path` alone
 //! identifies which registered runner it is — no live process, no netstat, no
 //! listening socket required. The netstat port probe is only a secondary
 //! signal, and a *failed* probe is UNKNOWN rather than "unclaimed"
@@ -921,14 +922,14 @@ mod tests {
                 runner_id: "named-9880-abc".to_string(),
                 is_temp: false,
                 exe_copy_path: PathBuf::from(
-                    r"D:\qontinui-root\qontinui-runner\target\debug\qontinui-runner-named-9880.exe",
+                    r"D:\qontinui-root\qontinui-runner\target\debug\runners\qontinui-runner-named-9880\qontinui-runner.exe",
                 ),
             },
             RegisteredExe {
                 runner_id: "test-abc123".to_string(),
                 is_temp: true,
                 exe_copy_path: PathBuf::from(
-                    r"D:\qontinui-root\qontinui-runner\target\debug\qontinui-runner-test-9877.exe",
+                    r"D:\qontinui-root\qontinui-runner\target\debug\runners\qontinui-runner-test-9877\qontinui-runner.exe",
                 ),
             },
         ]
@@ -958,7 +959,7 @@ mod tests {
     fn named_copy_path_is_owned_and_non_temp() {
         let owner = classify_exe_owner(
             Path::new(
-                r"D:\qontinui-root\qontinui-runner\target\debug\qontinui-runner-named-9880.exe",
+                r"D:\qontinui-root\qontinui-runner\target\debug\runners\qontinui-runner-named-9880\qontinui-runner.exe",
             ),
             &registry_fixture(),
         );
@@ -977,7 +978,7 @@ mod tests {
     fn temp_copy_path_is_owned_and_temp() {
         let owner = classify_exe_owner(
             Path::new(
-                r"D:\qontinui-root\qontinui-runner\target\debug\qontinui-runner-test-9877.exe",
+                r"D:\qontinui-root\qontinui-runner\target\debug\runners\qontinui-runner-test-9877\qontinui-runner.exe",
             ),
             &registry_fixture(),
         );

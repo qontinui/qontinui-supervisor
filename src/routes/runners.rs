@@ -245,12 +245,48 @@ pub struct WatchdogRunnerRequest {
     pub reset_attempts: bool,
 }
 
+/// The two files that make up a runner's paired state, in copy order.
+/// `paired_user.json` is the pairing binding; `auth_tokens.enc` is the
+/// encrypted token cache (device machine key + JWT cache). Both live in the
+/// runner's secure-storage dir.
+const PAIRED_STATE_FILES: [&str; 2] = ["paired_user.json", "auth_tokens.enc"];
+
+/// Copy whichever of [`PAIRED_STATE_FILES`] exist in `source_dir` into
+/// `dest_dir` (created if absent). THE copy both paired-state sources use —
+/// a `paired_profile_id` snapshot dir and the primary's live secure-storage
+/// dir — so the two can never disagree about which files carry a pairing.
+///
+/// Returns the basenames copied, in [`PAIRED_STATE_FILES`] order. A missing
+/// file is skipped, not an error: callers that REQUIRE `paired_user.json`
+/// check for it before calling. `Err` carries a message naming the failed
+/// step; nothing is rolled back (the caller owns `dest_dir`'s cleanup).
+fn copy_paired_state_files(
+    source_dir: &std::path::Path,
+    dest_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("could not create {}: {e}", dest_dir.display()))?;
+    let mut applied = Vec::new();
+    for file in PAIRED_STATE_FILES {
+        let src = source_dir.join(file);
+        if !src.exists() {
+            continue;
+        }
+        let dst = dest_dir.join(file);
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+        applied.push(file.to_string());
+    }
+    Ok(applied)
+}
+
 /// Phase 2b of `plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md` —
 /// resolve and apply a `paired_profile_id` snapshot before runner spawn.
 ///
 /// Looks up a profile snapshot dir under
 /// `<profiles_root>/<paired_profile_id>/` and copies its `paired_user.json`
-/// (required) + `auth_tokens.enc` (optional) into `<dest_dir>/`.
+/// (required) + `auth_tokens.enc` (optional) into `<dest_dir>/`, through
+/// [`copy_paired_state_files`].
 ///
 /// Both root paths are injected (not pulled from `dirs::*`) so unit tests
 /// can drive the helper hermetically against tempdirs. The HTTP handler
@@ -300,69 +336,102 @@ pub(crate) fn apply_paired_profile(
         ));
     }
 
-    if let Err(e) = std::fs::create_dir_all(dest_dir) {
-        return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "error": "profile_apply_failed",
-                "paired_profile_id": profile_id,
-                "message": format!(
-                    "could not create {}: {e}",
-                    dest_dir.display()
-                ),
-            }),
-        ));
-    }
-
-    let paired_dst = dest_dir.join("paired_user.json");
-    if let Err(e) = std::fs::copy(&paired_src, &paired_dst) {
-        return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "error": "profile_apply_failed",
-                "paired_profile_id": profile_id,
-                "message": format!(
-                    "copy {} -> {} failed: {e}",
-                    paired_src.display(),
-                    paired_dst.display(),
-                ),
-            }),
-        ));
-    }
-
-    let mut applied = vec!["paired_user.json".to_string()];
-
     // auth_tokens.enc is optional in the snapshot — older snapshots may
     // only have paired_user.json. Without the encrypted JWT cache the
     // runner will need to refresh on its own, but it can still register
     // because the paired_user.json carries the user_id + tenant_id.
-    let tokens_src = snapshot_dir.join("auth_tokens.enc");
-    if tokens_src.exists() {
-        let tokens_dst = dest_dir.join("auth_tokens.enc");
-        if let Err(e) = std::fs::copy(&tokens_src, &tokens_dst) {
-            return Err((
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "error": "profile_apply_failed",
-                    "paired_profile_id": profile_id,
-                    "message": format!(
-                        "copy {} -> {} failed: {e}",
-                        tokens_src.display(),
-                        tokens_dst.display(),
-                    ),
-                }),
-            ));
-        }
-        applied.push("auth_tokens.enc".to_string());
-    }
-
-    Ok(applied)
+    copy_paired_state_files(&snapshot_dir, dest_dir).map_err(|message| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "profile_apply_failed",
+                "paired_profile_id": profile_id,
+                "message": message,
+            }),
+        )
+    })
 }
 
-/// HTTP-level wrapper around [`apply_paired_profile`] that resolves the
-/// production `profiles_root` from `dirs::home_dir()` and the destination from
-/// [`crate::process::instance_config_dir`], and surfaces failures as
-/// `(StatusCode, Json)`. Returns the list of applied file basenames on success.
+/// Snapshot the PRIMARY's live paired state (`paired_user.json` +
+/// `auth_tokens.enc`, from `primary_dir`) into `dest_dir` — what a spawn-test
+/// with no `paired_profile_id` gets (plan
+/// `2026-09-23-conductor-e2e-phase1-defects`, S-4).
+///
+/// Unlike a named profile, the primary may legitimately be unpaired, so a
+/// missing `paired_user.json` is not an error: the snapshot copies whatever
+/// the primary has, and the report says what that was. A spawned runner
+/// running as the same OS user on the same host derives the same
+/// `SecureStorage` key as the primary (hostname + service name + salt +
+/// username, no path component), so the copied `auth_tokens.enc` decrypts.
+///
+/// Returns the JSON report surfaced as the spawn response's `paired_state`.
+pub(crate) fn apply_primary_paired_snapshot(
+    primary_dir: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
+    let Some(primary_dir) = primary_dir else {
+        return Ok(json!({
+            "source": "primary_snapshot",
+            "status": "primary_dir_unresolved",
+            "applied": [],
+            "message": "the platform data-local dir could not be resolved, so the primary's \
+                        paired state could not be located; the runner starts unpaired",
+        }));
+    };
+    let applied = copy_paired_state_files(primary_dir, dest_dir).map_err(|message| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "primary_snapshot_failed",
+                "source_dir": primary_dir.display().to_string(),
+                "message": message,
+            }),
+        )
+    })?;
+    let paired = applied.iter().any(|f| f == "paired_user.json");
+    Ok(json!({
+        "source": "primary_snapshot",
+        "status": if paired { "paired" } else { "primary_unpaired" },
+        "source_dir": primary_dir.display().to_string(),
+        "applied": applied,
+    }))
+}
+
+/// Apply a spawn's paired state into `dest_dir` — the single decision the
+/// spawn-test route makes, with every root injected so it is testable against
+/// tempdirs.
+///
+/// * `paired_profile_id: Some(id)` → the named snapshot under `profiles_root`
+///   ([`apply_paired_profile`]); a missing profile is a `400`.
+/// * `None` → the primary's live paired state from `primary_dir`
+///   ([`apply_primary_paired_snapshot`]).
+///
+/// Returns the `paired_state` report for the spawn response.
+pub(crate) fn apply_spawn_paired_state(
+    paired_profile_id: Option<&str>,
+    profiles_root: &std::path::Path,
+    primary_dir: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
+    match paired_profile_id {
+        Some(profile_id) => {
+            let applied = apply_paired_profile(profile_id, profiles_root, dest_dir)?;
+            Ok(json!({
+                "source": "paired_profile",
+                "status": "paired",
+                "paired_profile_id": profile_id,
+                "applied": applied,
+            }))
+        }
+        None => apply_primary_paired_snapshot(primary_dir, dest_dir),
+    }
+}
+
+/// HTTP-level wrapper around [`apply_spawn_paired_state`] that resolves the
+/// production roots — `~/.qontinui/profiles`, the primary's secure-storage dir
+/// ([`crate::process::primary_paired_state_dir`]) and the destination from
+/// [`crate::process::instance_config_dir`] — and surfaces failures as
+/// `(StatusCode, Json)`. Returns the `paired_state` report on success.
 ///
 /// The destination is the SPAWNED RUNNER'S per-instance dir, keyed by
 /// `runner_id` — not the shared `dirs::data_local_dir()/com.qontinui.runner`.
@@ -376,10 +445,10 @@ pub(crate) fn apply_paired_profile(
 ///
 /// An unresolvable config dir FAILS the spawn. There is deliberately no
 /// fallback to the shared dir — a silent fallback is the original bug.
-fn apply_paired_profile_for_spawn(
-    profile_id: &str,
+fn apply_paired_state_for_spawn(
+    paired_profile_id: Option<&str>,
     runner_id: &str,
-) -> Result<Vec<String>, (axum::http::StatusCode, serde_json::Value)> {
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
     let home = dirs::home_dir().ok_or_else(|| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -400,7 +469,39 @@ fn apply_paired_profile_for_spawn(
         )
     })?;
     let profiles_root = home.join(".qontinui").join("profiles");
-    apply_paired_profile(profile_id, &profiles_root, &dest_dir)
+    let primary_dir = crate::process::primary_paired_state_dir();
+    apply_spawn_paired_state(
+        paired_profile_id,
+        &profiles_root,
+        primary_dir.as_deref(),
+        &dest_dir,
+    )
+}
+
+/// The spawned child's `coordCredential` block, read from a `/health` body
+/// (`data.coordCredential`, or top-level for a runner that serves it
+/// unwrapped). When the body is absent or carries no such object the result
+/// is a typed UNKNOWN naming why — never an absent field a caller could read
+/// as "fine".
+pub(crate) fn coord_credential_from_health(
+    health_body: Option<&serde_json::Value>,
+    unknown_reason: &str,
+) -> serde_json::Value {
+    health_body
+        .and_then(|v| {
+            v.get("data")
+                .and_then(|d| d.get("coordCredential"))
+                .or_else(|| v.get("coordCredential"))
+        })
+        .filter(|c| c.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "posture": "unknown",
+                "state": "unknown",
+                "reason": unknown_reason,
+            })
+        })
 }
 
 /// GET /runners — list all runners with status.
@@ -827,20 +928,10 @@ pub async fn remove_runner(
         }
     }
 
-    // Clean up the per-runner exe copy for temp runners to prevent disk bloat.
+    // Clean up the per-runner exe copy (its whole directory, sidecars
+    // included) for temp runners to prevent disk bloat.
     if manager::is_temp_runner(&id) {
-        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
-        if exe_copy.exists() {
-            if let Err(e) = std::fs::remove_file(&exe_copy) {
-                warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
-            } else {
-                info!("Removed runner exe copy {:?}", exe_copy);
-            }
-        }
-        let pdb_copy = exe_copy.with_extension("pdb");
-        if pdb_copy.exists() {
-            let _ = std::fs::remove_file(&pdb_copy);
-        }
+        manager::remove_runner_exe_copy(&state.config, &managed.config);
     }
 
     state
@@ -1053,22 +1144,9 @@ pub async fn purge_stale_test_runners_core(
             }
         }
 
-        // Clean up the per-runner exe copy to prevent disk bloat.
-        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
-        if exe_copy.exists() {
-            if let Err(e) = std::fs::remove_file(&exe_copy) {
-                warn!(
-                    "purge-stale: failed to remove exe copy {:?}: {}",
-                    exe_copy, e
-                );
-            } else {
-                info!("purge-stale: removed exe copy {:?}", exe_copy);
-            }
-        }
-        let pdb_copy = exe_copy.with_extension("pdb");
-        if pdb_copy.exists() {
-            let _ = std::fs::remove_file(&pdb_copy);
-        }
+        // Clean up the per-runner exe copy (its whole directory, sidecars
+        // included) to prevent disk bloat.
+        manager::remove_runner_exe_copy(&state.config, &managed.config);
 
         info!(
             "purge-stale: removed test runner '{}' (port {})",
@@ -1817,6 +1895,15 @@ pub struct SpawnTestRequest {
     /// This lets a paired CI machine inherit its operator's pairing without
     /// re-running the headless pair flow on every spawn (Phase 2b of
     /// `plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md`).
+    ///
+    /// **When absent, the PRIMARY's live paired state is snapshotted**
+    /// instead: `paired_user.json` + `auth_tokens.enc` from
+    /// `{data_local_dir}/com.qontinui.runner/`, through the same copy
+    /// (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4). An unpaired
+    /// primary yields an unpaired temp runner, reported as
+    /// `paired_state.status: "primary_unpaired"` rather than refused. The
+    /// response's `paired_state` names which source was used and which files
+    /// were copied; `coord_credential` relays the child's own verdict.
     ///
     /// **Resolution failure is not silent.** If the snapshot dir does not
     /// exist OR contains no `paired_user.json`, the request returns
@@ -3914,51 +4001,45 @@ async fn execute_spawn_build_inner(
     // every spawn path builds its config the same way.
     let name = managed.config.name.clone();
 
-    // Phase 2b — `paired_profile_id`. If the caller asked the spawned runner
-    // to inherit a previously-stashed pairing, copy the snapshot files into
-    // THIS runner's per-instance config dir BEFORE starting the runner — that
-    // is the dir the spawn exports as `QONTINUI_SECURE_STORAGE_DIR`, and the
-    // only one the child reads its pairing from. On failure release the
-    // placeholder port and return the structured error body.
+    // Paired state. With a `paired_profile_id` (Phase 2b) the named snapshot
+    // is copied; without one the PRIMARY's live paired state is snapshotted
+    // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4), so a default
+    // spawn-test comes up with the operator's pairing instead of unpaired.
+    // Either way the files land in THIS runner's per-instance config dir
+    // BEFORE the runner starts — the dir the spawn exports as
+    // `QONTINUI_SECURE_STORAGE_DIR`, and the only one the child reads its
+    // pairing from. On failure release the placeholder port and return the
+    // structured error body.
     //
-    // Tracked under the spawn-test response as `paired_profile_applied`
-    // (the list of basenames actually copied).
-    let mut paired_profile_applied: Option<Vec<String>> = None;
-    if let Some(profile_id) = body.paired_profile_id.as_deref() {
-        match apply_paired_profile_for_spawn(profile_id, id) {
-            Ok(applied) => {
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Info,
-                        format!(
-                            "spawn-test paired_profile_id='{}' applied: {:?}",
-                            profile_id, applied
-                        ),
-                    )
-                    .await;
-                paired_profile_applied = Some(applied);
-            }
-            Err((status, body_json)) => {
-                // `apply_paired_profile` may have already created the
-                // destination instance dir before a `fs::copy` failed. We are
-                // about to drop this runner from the registry, and the
-                // instance-dir reaper only visits REGISTERED runners — so the
-                // dir would leak forever. (It could not before: the old
-                // destination was the shared data dir, which always exists and
-                // is never reaped.) `id` is uuid-unique, so nothing else owns
-                // this path.
-                if let Some(dest) = crate::process::instance_config_dir(id) {
-                    let _ = std::fs::remove_dir_all(&dest);
-                }
-                let mut runners = state.runners.write().await;
-                runners.remove(id);
-                drop(runners);
-                return Ok((status, body_json));
-            }
+    // Reported on the spawn-test response as `paired_state`, plus the legacy
+    // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
+    let paired_state = match apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id) {
+        Ok(report) => {
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!("spawn-test '{}' paired state applied: {}", id, report),
+                )
+                .await;
+            report
         }
-    }
+        Err((status, body_json)) => {
+            // The copy may have already created the destination instance dir
+            // before a `fs::copy` failed. We are about to drop this runner
+            // from the registry, and the instance-dir reaper only visits
+            // REGISTERED runners — so the dir would leak forever. `id` is
+            // uuid-unique, so nothing else owns this path.
+            if let Some(dest) = crate::process::instance_config_dir(id) {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+            let mut runners = state.runners.write().await;
+            runners.remove(id);
+            drop(runners);
+            return Ok((status, body_json));
+        }
+    };
 
     // Start the runner using the Arc captured at insertion time. This avoids
     // the id-based lookup in `start_runner_by_id` which can race with
@@ -3967,7 +4048,13 @@ async fn execute_spawn_build_inner(
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
     if let Err(e) = manager::start_managed_runner(state, managed).await {
-        // Clean up on failure
+        // Clean up on failure — the registry entry AND the instance dir the
+        // paired-state copy just populated (it holds a copy of the
+        // operator's credential store, and the instance-dir reaper only
+        // visits registered runners, so it would otherwise leak forever).
+        if let Some(dest) = crate::process::instance_config_dir(id) {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
         let mut runners = state.runners.write().await;
         runners.remove(id);
         return Err(e);
@@ -4003,14 +4090,19 @@ async fn execute_spawn_build_inner(
     //   and clean up.
     let mut health_probe_ms: Option<u64> = None;
     let mut probed_git_sha: Option<String> = None;
+    // The child's own `coordCredential` block, from the last `/health` body
+    // the supervisor read (the probe, then the `wait` loop's success).
+    let mut child_health_body: Option<serde_json::Value> = None;
     if body.health_probe_timeout_ms > 0 {
         match probe_runner_health(state, id, port, body.health_probe_timeout_ms).await {
             ProbeOutcome::Healthy {
                 elapsed_ms,
                 git_sha,
+                health_body,
             } => {
                 health_probe_ms = Some(elapsed_ms);
                 probed_git_sha = git_sha;
+                child_health_body = health_body;
             }
             ProbeOutcome::Failed {
                 elapsed_ms,
@@ -4159,6 +4251,14 @@ async fn execute_spawn_build_inner(
                 Ok(resp) if resp.status().is_success() => {
                     healthy = true;
                     wait_ms = start.elapsed().as_millis() as u64;
+                    if let Some(v) = resp
+                        .text()
+                        .await
+                        .ok()
+                        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                    {
+                        child_health_body = Some(v);
+                    }
                     state
                         .logs
                         .emit(
@@ -4373,15 +4473,25 @@ async fn execute_spawn_build_inner(
             format!("Test runner spawned on port {}", port)
         }
     });
-    if let Some(applied) = &paired_profile_applied {
-        // Phase 2b — surface which snapshot files were materialized into
-        // the runner data dir. Callers can verify the pair-state inheritance
-        // happened before treating the runner as paired.
-        resp["paired_profile_applied"] = json!(applied);
-        if let Some(pid) = body.paired_profile_id.as_deref() {
-            resp["paired_profile_id"] = json!(pid);
-        }
+    // Which paired state was materialized into the runner's instance dir —
+    // a named profile or the primary snapshot — and which files. Callers can
+    // verify the pair-state inheritance happened before treating the runner
+    // as paired; `coord_credential` below is the child's own verdict on it.
+    if body.paired_profile_id.is_some() {
+        resp["paired_profile_applied"] = paired_state["applied"].clone();
+        resp["paired_profile_id"] = paired_state["paired_profile_id"].clone();
     }
+    resp["paired_state"] = paired_state;
+    resp["coord_credential"] = coord_credential_from_health(
+        child_health_body.as_ref(),
+        if child_health_body.is_some() {
+            "the child's /health carried no coordCredential object (a runner build \
+             predating it) — UNKNOWN, never 'healthy'"
+        } else {
+            "the supervisor did not read a /health body from the child (probe skipped \
+             or the body was unparseable) — UNKNOWN, never 'healthy'"
+        },
+    );
     if let Some(ms) = health_probe_ms {
         resp["health_probe_ms"] = json!(ms);
     }
@@ -4812,6 +4922,9 @@ enum ProbeOutcome {
         /// the runner didn't include it in its /health response (old binary,
         /// or unparseable body).
         git_sha: Option<String>,
+        /// The parsed `/health` body, for fields the spawn response relays
+        /// (`coordCredential`). `None` when the body was unparseable.
+        health_body: Option<serde_json::Value>,
     },
     Failed {
         elapsed_ms: u64,
@@ -4852,20 +4965,21 @@ async fn probe_runner_health(
             if resp.status().is_success() {
                 // Extract gitSha from the /health body while we have it
                 // (best-effort; an old runner won't include the field).
-                let git_sha = resp
+                let health_body = resp
                     .text()
                     .await
                     .ok()
-                    .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                    .and_then(|v| {
-                        v.get("data")
-                            .and_then(|d| d.get("gitSha"))
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string())
-                    });
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok());
+                let git_sha = health_body.as_ref().and_then(|v| {
+                    v.get("data")
+                        .and_then(|d| d.get("gitSha"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                });
                 return ProbeOutcome::Healthy {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     git_sha,
+                    health_body,
                 };
             }
         }
@@ -7695,7 +7809,7 @@ mod tests {
     /// supervisor-spawned runner never consults (its env vars win). The spawn
     /// reported `paired_profile_applied` and the runner came up UNPAIRED.
     ///
-    /// Driven through the real `apply_paired_profile_for_spawn` rather than
+    /// Driven through the real `apply_paired_state_for_spawn` rather than
     /// re-deriving the destination, so re-inlining a different path in the
     /// route fails here even though the helper itself is unchanged. Uses the
     /// production `~/.qontinui/profiles` root under a pid-unique profile id and
@@ -7725,15 +7839,13 @@ mod tests {
         std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02")
             .expect("write auth_tokens.enc");
 
-        let applied =
-            super::apply_paired_profile_for_spawn(&unique, &runner_id).expect("must succeed");
+        let report =
+            super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
 
+        assert_eq!(report["source"], "paired_profile");
         assert_eq!(
-            applied,
-            vec![
-                "paired_user.json".to_string(),
-                "auth_tokens.enc".to_string()
-            ]
+            report["applied"],
+            serde_json::json!(["paired_user.json", "auth_tokens.enc"])
         );
         // The destination is the per-instance dir, spelled out literally so a
         // drift on the ROUTE side trips this assertion. The spawn side (the
@@ -7758,6 +7870,141 @@ mod tests {
         if let Some(shared) = dirs::data_local_dir() {
             assert_ne!(dest, shared.join("com.qontinui.runner"));
         }
+    }
+
+    // -------------------------------------------------------------------
+    // S-4 — spawn-test with no `paired_profile_id` snapshots the PRIMARY.
+    // -------------------------------------------------------------------
+
+    /// The route's paired-state decision with no `paired_profile_id`: the
+    /// primary's live `paired_user.json` + `auth_tokens.enc` are copied into
+    /// the spawned runner's instance dir, and the named-profile root is not
+    /// consulted at all. Every root is injected, as `apply_paired_profile`'s
+    /// tests do.
+    #[test]
+    fn no_paired_profile_id_applies_the_primary_snapshot() {
+        let profiles = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let dest_root = tempfile::tempdir().unwrap();
+        let dest = dest_root.path().join("instances").join("test-abc");
+        std::fs::write(
+            primary.path().join("paired_user.json"),
+            r#"{"user_id":"operator"}"#,
+        )
+        .unwrap();
+        std::fs::write(primary.path().join("auth_tokens.enc"), b"\x09\x08").unwrap();
+        // A profile the route must NOT pick up when no id is given.
+        let decoy = profiles.path().join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("paired_user.json"), r#"{"user_id":"decoy"}"#).unwrap();
+
+        let report =
+            super::apply_spawn_paired_state(None, profiles.path(), Some(primary.path()), &dest)
+                .expect("primary snapshot must succeed");
+
+        assert_eq!(report["source"], "primary_snapshot");
+        assert_eq!(report["status"], "paired");
+        assert_eq!(
+            report["applied"],
+            serde_json::json!(["paired_user.json", "auth_tokens.enc"])
+        );
+        assert!(
+            std::fs::read_to_string(dest.join("paired_user.json"))
+                .unwrap()
+                .contains("operator"),
+            "the PRIMARY's pairing must land in the instance dir, not a profile's"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("auth_tokens.enc")).unwrap(),
+            b"\x09\x08"
+        );
+    }
+
+    /// An unpaired primary is not an error: the snapshot copies what exists
+    /// (here only the token cache), says so, and the spawn proceeds.
+    #[test]
+    fn unpaired_primary_snapshot_reports_primary_unpaired() {
+        let profiles = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("auth_tokens.enc"), b"\x01").unwrap();
+
+        let report = super::apply_spawn_paired_state(
+            None,
+            profiles.path(),
+            Some(primary.path()),
+            dest.path(),
+        )
+        .expect("an unpaired primary must not fail the spawn");
+        assert_eq!(report["status"], "primary_unpaired");
+        assert_eq!(report["applied"], serde_json::json!(["auth_tokens.enc"]));
+        assert!(!dest.path().join("paired_user.json").exists());
+
+        let report = super::apply_spawn_paired_state(None, profiles.path(), None, dest.path())
+            .expect("an unresolvable primary dir must not fail the spawn");
+        assert_eq!(report["status"], "primary_dir_unresolved");
+    }
+
+    /// With a `paired_profile_id` the named snapshot still wins and a missing
+    /// one is still a 400 — the primary is never a silent fallback for it.
+    #[test]
+    fn paired_profile_id_still_selects_the_profile_not_the_primary() {
+        let profiles = tempfile::tempdir().unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(
+            primary.path().join("paired_user.json"),
+            r#"{"user_id":"operator"}"#,
+        )
+        .unwrap();
+        let snap = profiles.path().join("ci");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("paired_user.json"), r#"{"user_id":"ci"}"#).unwrap();
+
+        let report = super::apply_spawn_paired_state(
+            Some("ci"),
+            profiles.path(),
+            Some(primary.path()),
+            dest.path(),
+        )
+        .unwrap();
+        assert_eq!(report["source"], "paired_profile");
+        assert_eq!(report["paired_profile_id"], "ci");
+        assert!(
+            std::fs::read_to_string(dest.path().join("paired_user.json"))
+                .unwrap()
+                .contains("\"ci\"")
+        );
+
+        let (status, body) = super::apply_spawn_paired_state(
+            Some("missing"),
+            profiles.path(),
+            Some(primary.path()),
+            dest.path(),
+        )
+        .expect_err("a missing profile must not fall back to the primary");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "profile_not_found");
+    }
+
+    #[test]
+    fn coord_credential_is_relayed_or_typed_unknown() {
+        let body = serde_json::json!({
+            "data": {"coordCredential": {"posture": "live", "state": "live", "canAnswer": true}}
+        });
+        let got = super::coord_credential_from_health(Some(&body), "unused");
+        assert_eq!(got["posture"], "live");
+        assert_eq!(got["canAnswer"], true);
+
+        let old = serde_json::json!({"data": {"gitSha": "abc"}});
+        let got = super::coord_credential_from_health(Some(&old), "no block");
+        assert_eq!(got["posture"], "unknown");
+        assert_eq!(got["state"], "unknown");
+        assert_eq!(got["reason"], "no block");
+
+        let got = super::coord_credential_from_health(None, "not read");
+        assert_eq!(got["posture"], "unknown");
+        assert_eq!(got["reason"], "not read");
     }
 
     // -------------------------------------------------------------------
@@ -8327,6 +8574,7 @@ mod tests {
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: true,
             no_webview: true,
+            temp_runner_display: None,
         };
         std::sync::Arc::new(crate::state::SupervisorState::new(config))
     }
@@ -8515,6 +8763,7 @@ mod tests {
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: false,
             no_webview: true,
+            temp_runner_display: None,
         };
         std::sync::Arc::new(crate::state::SupervisorState::new(config))
     }

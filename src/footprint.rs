@@ -4,8 +4,9 @@
 //! The supervisor accumulates large build artifacts on disk: per-slot
 //! `target-pool/slot-*/` trees (GBs each), the `target-pool/lkg/` copy,
 //! `.spawn-*` scratch-worktree containers under the workspace root, and one
-//! `qontinui-runner-<id>.exe` copy per started runner under
-//! `<npm_dir>/target/debug/`. Two days before this module landed a build died
+//! runner exe copy per started runner under `<npm_dir>/target/debug/`
+//! (flat `qontinui-runner-<id>.exe` for the primary, one
+//! `runners/<pool-name>/` directory per temp/named runner). Two days before this module landed a build died
 //! with `os error 112` (disk full) at 1.9 GB free while a single slot held
 //! ~369.8 GB.
 //!
@@ -39,7 +40,10 @@ pub struct SpawnContainersFootprint {
     pub oldest_mtime: Option<String>,
 }
 
-/// Per-runner exe copies under `<npm_dir>/target/debug/qontinui-runner-*.exe`.
+/// Per-runner exe copies: the flat `<npm_dir>/target/debug/qontinui-runner-*.exe`
+/// (`Primary`/`External`) plus the per-runner-directory
+/// `<npm_dir>/target/debug/runners/<pool-name>/qontinui-runner[.exe]`
+/// (`Temp`/`Named`, see `SupervisorConfig::runner_exe_copy_dir`).
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ExeCopiesFootprint {
     pub count: usize,
@@ -301,35 +305,45 @@ pub fn disk_free_bytes_for(path: &Path) -> Option<u64> {
     disk_usage_for(path).map(|u| u.free_bytes)
 }
 
-/// Enumerate `<npm_dir>/target/debug/qontinui-runner-*.exe` per-runner exe
-/// copies (NOT the bare `qontinui-runner.exe`, which is the legacy single
-/// build output). Returns count + total bytes.
+/// Enumerate per-runner exe copies: the flat
+/// `<npm_dir>/target/debug/qontinui-runner-*.exe` copies (NOT the bare
+/// `qontinui-runner.exe`, which is the build output) and the
+/// `<npm_dir>/target/debug/runners/*/qontinui-runner[.exe]` per-runner
+/// directories. Returns count + total bytes.
 fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
     let debug_dir = npm_dir.join("target").join("debug");
     let mut out = ExeCopiesFootprint::default();
-    let entries = match std::fs::read_dir(&debug_dir) {
-        Ok(e) => e,
-        Err(_) => return out,
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Match the per-runner copies `qontinui-runner-<id>[.exe]`, excluding the
-        // bare build output (`qontinui-runner[.exe]`, no `-<id>`). Windows copies
-        // carry a `.exe` extension; on macOS/Linux the copy is a bare Mach-O/ELF
-        // with no extension — so require `.exe` on Windows and no extension
-        // elsewhere (a `.json`/`.d`/`.pdb` sidecar is never an exe copy).
-        let is_exe_copy = name.starts_with("qontinui-runner-")
-            && std::path::Path::new(name.as_ref())
-                .extension()
-                .map_or(cfg!(not(windows)), |ext| ext == "exe");
-        if is_exe_copy {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    out.count += 1;
-                    out.bytes = out.bytes.saturating_add(meta.len());
-                }
+    let mut count_file = |path: &Path| {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() {
+                out.count += 1;
+                out.bytes = out.bytes.saturating_add(meta.len());
             }
+        }
+    };
+    if let Ok(entries) = std::fs::read_dir(&debug_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Match the flat per-runner copies `qontinui-runner-<id>[.exe]`,
+            // excluding the bare build output (`qontinui-runner[.exe]`, no
+            // `-<id>`). Windows copies carry a `.exe` extension; on
+            // macOS/Linux the copy is a bare ELF/Mach-O with no extension —
+            // so require `.exe` on Windows and no extension elsewhere (a
+            // `.json`/`.d`/`.pdb` sidecar is never an exe copy).
+            let is_exe_copy = name.starts_with("qontinui-runner-")
+                && std::path::Path::new(name.as_ref())
+                    .extension()
+                    .map_or(cfg!(not(windows)), |ext| ext == "exe");
+            if is_exe_copy {
+                count_file(&entry.path());
+            }
+        }
+    }
+    let copies_root = debug_dir.join(crate::config::RUNNER_COPIES_DIR);
+    if let Ok(entries) = std::fs::read_dir(&copies_root) {
+        for entry in entries.flatten() {
+            count_file(&entry.path().join(crate::config::RUNNER_BIN_NAME));
         }
     }
     out
@@ -671,9 +685,14 @@ mod tests {
         write_file(&debug.join("qontinui-runner.exe"), 9999);
         // Unrelated: NOT counted.
         write_file(&debug.join("other.exe"), 9999);
+        // Per-runner-directory copies (Temp/Named): counted, their sidecars
+        // are not.
+        let pool = debug.join("runners").join("qontinui-runner-test-9877");
+        write_file(&pool.join(crate::config::RUNNER_BIN_NAME), 400);
+        write_file(&pool.join("qontinui-shim"), 9999);
         let fp = exe_copies_footprint(npm);
-        assert_eq!(fp.count, 2);
-        assert_eq!(fp.bytes, 300);
+        assert_eq!(fp.count, 3);
+        assert_eq!(fp.bytes, 700);
     }
 
     #[test]

@@ -70,6 +70,21 @@ runner for age) hand `managed.config.name` to
 (`process::sanitize_instance_name`) mirrors the runner's and maps the id to
 itself. `config::runner_exe_copy_path` stays **deliberately port-keyed** — a
 per-spawn exe path re-triggers a Windows Firewall prompt on every cold spawn.
+Each temp/named copy lives in its **own directory**,
+`target/debug/runners/<pool-name>/qontinui-runner[.exe]` (`<pool-name>` =
+`qontinui-runner-test-<port>` / `qontinui-runner-named-<port>`), so the sidecars
+deployed beside it never land in the live tree's shared `target/debug/`, and a
+stop removes the whole directory (`manager::remove_runner_exe_copy`). The
+primary keeps its flat `target/debug/qontinui-runner-primary[.exe]`.
+
+**Linux temp runners need a display.** `DisplayEnv` forwards `DISPLAY` /
+`WAYLAND_DISPLAY` / `GDK_BACKEND` / `BROADWAY_DISPLAY` from the supervisor's
+env, and supplies `DISPLAY` from `--temp-runner-display` /
+`QONTINUI_SUPERVISOR_TEMP_DISPLAY` when the supervisor has none. When neither
+`DISPLAY` nor `WAYLAND_DISPLAY` resolves after every forwarder (`extra_env`
+included), the spawn is refused `409 {"error": "no_display"}` instead of dying
+in GTK init. Every temp spawn also gets `QONTINUI_SETUP_WIZARD_BYPASS=1`
+(`SetupWizardBypassEnv`), so the first-run wizard never covers the UI.
 
 **Legacy `instance-test-<port>` trees are now permanently orphaned.** Up to 23
 of them (one per port slot, with their stale `terminal-sessions.json`) exist on
@@ -201,6 +216,7 @@ cargo clippy -- -D warnings    # Lint
 | `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. Every file is size+age rotated with a retained-segment cap. |
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
+| `--temp-runner-display` | Linux: `DISPLAY` handed to temp runners when the supervisor's env has none (also `QONTINUI_SUPERVISOR_TEMP_DISPLAY`; the flag wins). Without a display a temp spawn is refused with `no_display`. |
 
 ## Serving-watchdog environment
 
@@ -1329,7 +1345,7 @@ unverified_warning}`. `origin` distinguishes `slot-N` /
 env-override-vs-workspace-default split is visible on the adoption path too. Nothing reported the path before, which is the whole
 reason the stale spawn survived a full manual-test iteration.
 
-Every runner start copies the resolved source exe to `target/debug/qontinui-runner-{id}.exe` so the build artifact is never locked by a running process. The `qontinui-shim.exe` sidecar rides along on every start: the supervisor builds it into the same slot right after the runner build (fail-open), preserves it in the LKG dir, and copies it from next to the source exe to next to the exe copy (`deploy_shim_sidecar` in `src/process/manager.rs`). The runner materializes terminal identity shims from the stub next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed shim build/copy logs a WARN ("identity shims will be stale") but never fails the build or start.
+Every runner start copies the resolved source exe to its `config::runner_exe_copy_path` — `target/debug/qontinui-runner-primary.exe` for the primary, `target/debug/runners/<pool-name>/qontinui-runner.exe` for temp/named runners — so the build artifact is never locked by a running process. The `qontinui-shim.exe` sidecar rides along on every start: the supervisor builds it into the same slot right after the runner build (fail-open), preserves it in the LKG dir, and copies it from next to the source exe to next to the exe copy (`deploy_shim_sidecar` in `src/process/manager.rs`). The `qontinui-git-credential` helper is deployed the same way (from the source exe's dir, else the non-pool `target/debug/`), because the runner also finds it only via `current_exe().parent()`. The runner materializes terminal identity shims from the stub next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed shim build/copy logs a WARN ("identity shims will be stale") but never fails the build or start.
 
 ### Last-known-good (LKG) fallback for agents
 
@@ -1402,7 +1418,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 1. **Port reservation** — atomically claims a free port (9877-9899) and inserts a placeholder.
 2. **Build** — acquires a build pool permit (blocks if all slots busy), runs `npm run build` (serialized via `npm_lock`), then `cargo build --bin qontinui-runner --features custom-protocol` with `CARGO_TARGET_DIR` set to the slot dir.
-3. **Spawn** — copies the built exe to `target/debug/qontinui-runner-{id}.exe` and launches the process.
+3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read).
 4. **Optional wait** — if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
 
 **Timeouts:**

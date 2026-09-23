@@ -80,8 +80,9 @@ pub async fn pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
 ///
 /// Comparison is case-insensitive, matching the Windows helper. On Unix that
 /// is marginally looser than the filesystem, but the path being matched is a
-/// supervisor-generated `qontinui-runner-<id>` under the runner's own
-/// `target/debug` — there is no realistic case-variant collision, and being
+/// supervisor-generated copy path under the runner's own `target/debug`
+/// (`config::runner_exe_copy_path`) — there is no realistic case-variant
+/// collision, and being
 /// loose here can only ever find OUR runner.
 pub async fn find_pids_holding_exe(exe_path: &std::path::Path) -> Vec<u32> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};

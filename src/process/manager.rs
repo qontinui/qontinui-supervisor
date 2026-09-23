@@ -152,26 +152,6 @@ fn resolve_child_api_url(explicit_env: Option<String>, is_primary: bool) -> Opti
     }
 }
 
-/// The primary (user-started) runner's default secure-storage directory —
-/// `dirs::data_local_dir()/com.qontinui.runner`.
-///
-/// This mirrors `SecureStorage::new()`'s fallback in qontinui-runner
-/// (`src-tauri/src/secure_storage.rs`): the primary runs with no
-/// `QONTINUI_SECURE_STORAGE_DIR` override, so its encrypted `auth_tokens.enc`
-/// (holding the device machine key, `dmk_`) lives here. Non-primary spawns are
-/// pointed at this dir via `QONTINUI_PRIMARY_SECURE_STORAGE_DIR` (a *path
-/// pointer*, never the raw credential) so they can seed the primary's `dmk_`
-/// into their own isolated store and reach Tier 2 headlessly (plan
-/// `2026-07-13-runner-web-nav-and-workflows-auth-remediation`, item R4). A
-/// spawned runner running as the same OS user on the same machine derives the
-/// identical `SecureStorage` AES key (hostname + service name + salt + username,
-/// no path/instance component), so it can decrypt the primary's store directly.
-///
-/// Returns `None` only when the platform data-local dir can't be resolved.
-fn primary_secure_storage_dir() -> Option<std::path::PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"))
-}
-
 /// Binary metadata for diagnostics — lets callers detect stale binaries.
 #[derive(Clone, serde::Serialize)]
 pub struct BinaryMeta {
@@ -216,7 +196,7 @@ pub const STALE_BINARY_THRESHOLD_SECS: i64 = 30;
 #[derive(Clone, serde::Serialize)]
 pub struct StaleBinary {
     /// Unix millis of the copy the supervisor made at start time
-    /// (`target/debug/qontinui-runner-<id>.exe`).
+    /// (`config::runner_exe_copy_path`).
     pub running_mtime_ms: i64,
     /// Unix millis of the newest `target-pool/slot-*/debug/qontinui-runner.exe`.
     pub slot_mtime_ms: i64,
@@ -2467,28 +2447,28 @@ pub async fn start_managed_runner(
     Ok(())
 }
 
-/// Outcome of the fail-open `qontinui-shim.exe` sidecar deploy step in
+/// Outcome of a fail-open sidecar deploy step in
 /// [`start_exe_mode_for_runner`]. Pure enough to unit-test with tempdirs —
 /// the caller only maps variants to log lines.
 ///
-/// The runner materializes each terminal's identity shim from the stub
-/// sitting NEXT TO ITS OWN EXE (`current_exe().parent()` — `locate_stub_exe`
-/// in the runner's `shim_materializer.rs`), so the stub must ride along with
-/// every runner-exe deploy. Skipping it re-materializes whatever stale stub
-/// already sits next to the copy (the 2026-07-03 incident). See
-/// [`crate::build_monitor::SHIM_EXE_FILENAME`] for the full placement
-/// contract.
+/// The runner resolves its helper binaries from the directory of ITS OWN
+/// EXE (`current_exe().parent()`): the `qontinui-shim` identity stub
+/// (`locate_stub_exe` in the runner's `shim_materializer.rs`) and the
+/// `qontinui-git-credential` helper (`credential_helper_binary_path`). So
+/// each must ride along with every runner-exe deploy. Skipping the shim
+/// re-materializes whatever stale stub already sits next to the copy (the
+/// 2026-07-03 incident). See [`crate::build_monitor::SHIM_EXE_FILENAME`] for
+/// the full placement contract.
 #[derive(Debug)]
-pub(crate) enum ShimSidecarDeploy {
+pub(crate) enum SidecarDeploy {
     /// Sidecar copied next to the runner exe copy.
     Copied { to: std::path::PathBuf },
-    /// Source and destination exes share a directory (the legacy
-    /// `target/debug/` fallback resolution) — nothing to copy; whatever shim
-    /// sits there is already "next to" the deployed exe.
+    /// Source and destination exes share a directory (the flat `Primary`
+    /// copy beside a `target/debug/` source) — nothing to copy; whatever
+    /// sidecar sits there is already "next to" the deployed exe.
     SameDir,
-    /// No shim next to the source exe (a slot/LKG predating the sidecar
-    /// build, or the fail-open shim build failed). Identity shims will be
-    /// stale for runners started from this source.
+    /// No sidecar next to the source exe (a slot/LKG predating the sidecar
+    /// build, or the fail-open sidecar build failed).
     SourceMissing { expected: std::path::PathBuf },
     /// The copy/replace itself failed.
     CopyFailed {
@@ -2498,52 +2478,76 @@ pub(crate) enum ShimSidecarDeploy {
     },
 }
 
-/// Copy the `qontinui-shim.exe` sidecar from next to `source_exe` to next to
-/// `dest_exe` (the per-runner exe copy). Fail-open by contract: this returns
-/// an outcome for the caller to log — it must never fail the runner start.
-///
-/// The copy goes through a tmp file + atomic rename (keyed by the dest exe's
-/// file stem so concurrent spawns of different runners can't clobber each
-/// other's tmp) because the destination `target/debug/qontinui-shim.exe` is
-/// SHARED by every runner copy in that dir and a concurrently-starting
-/// runner's materializer could otherwise read a torn stub mid-copy.
+/// Copy the `qontinui-shim` sidecar from next to `source_exe` to next to
+/// `dest_exe` (the per-runner exe copy). See [`deploy_sidecar`].
 pub(crate) fn deploy_shim_sidecar(
     source_exe: &std::path::Path,
     dest_exe: &std::path::Path,
-) -> ShimSidecarDeploy {
-    let shim_name = crate::build_monitor::SHIM_EXE_FILENAME;
+) -> SidecarDeploy {
+    deploy_sidecar(
+        source_exe,
+        dest_exe,
+        crate::build_monitor::SHIM_EXE_FILENAME,
+    )
+}
+
+/// File name of the runner's git credential helper, which the runner looks up
+/// beside its own exe (`credential_helper_binary_path`).
+#[cfg(windows)]
+pub(crate) const GIT_CREDENTIAL_EXE_FILENAME: &str = "qontinui-git-credential.exe";
+#[cfg(not(windows))]
+pub(crate) const GIT_CREDENTIAL_EXE_FILENAME: &str = "qontinui-git-credential";
+
+/// Copy the sidecar `sidecar_name` from next to `source_exe` to next to
+/// `dest_exe` (the per-runner exe copy). Fail-open by contract: this returns
+/// an outcome for the caller to log — it must never fail the runner start.
+///
+/// `Temp`/`Named` copies each live in their own directory
+/// ([`crate::config::SupervisorConfig::runner_exe_copy_dir`]), so the
+/// destination is never the shared `target/debug/` of the live tree — a temp
+/// spawn cannot overwrite the primary's sidecars. The copy still goes through
+/// a tmp file + atomic rename (keyed by the dest exe's file stem) because a
+/// runner restarting in place can race its own previous materializer reading
+/// the stub.
+pub(crate) fn deploy_sidecar(
+    source_exe: &std::path::Path,
+    dest_exe: &std::path::Path,
+    sidecar_name: &str,
+) -> SidecarDeploy {
     let (src_dir, dst_dir) = match (source_exe.parent(), dest_exe.parent()) {
         (Some(s), Some(d)) => (s, d),
         // Pathological (no parent dir) — treat as nothing-to-do rather than
         // inventing a failure for a case the exe copy itself already handled.
-        _ => return ShimSidecarDeploy::SameDir,
+        _ => return SidecarDeploy::SameDir,
     };
     if src_dir == dst_dir {
-        return ShimSidecarDeploy::SameDir;
+        return SidecarDeploy::SameDir;
     }
 
-    let shim_src = src_dir.join(shim_name);
-    if !shim_src.exists() {
-        return ShimSidecarDeploy::SourceMissing { expected: shim_src };
+    let sidecar_src = src_dir.join(sidecar_name);
+    if !sidecar_src.exists() {
+        return SidecarDeploy::SourceMissing {
+            expected: sidecar_src,
+        };
     }
-    let shim_dst = dst_dir.join(shim_name);
+    let sidecar_dst = dst_dir.join(sidecar_name);
 
     let stem = dest_exe
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "runner".to_string());
-    let shim_tmp = dst_dir.join(format!("{}.tmp-{}", shim_name, stem));
-    let _ = std::fs::remove_file(&shim_tmp);
+    let sidecar_tmp = dst_dir.join(format!("{}.tmp-{}", sidecar_name, stem));
+    let _ = std::fs::remove_file(&sidecar_tmp);
 
-    let result = std::fs::copy(&shim_src, &shim_tmp)
+    let result = std::fs::copy(&sidecar_src, &sidecar_tmp)
         .map_err(|e| format!("copy to tmp: {}", e))
         .and_then(|_| {
-            std::fs::rename(&shim_tmp, &shim_dst).or_else(|first_err| {
+            std::fs::rename(&sidecar_tmp, &sidecar_dst).or_else(|first_err| {
                 // Windows can refuse the replace while another process holds
                 // the dest open; drop the dest and retry once (mirrors the
                 // exe-copy retry above).
-                let _ = std::fs::remove_file(&shim_dst);
-                std::fs::rename(&shim_tmp, &shim_dst).map_err(|retry_err| {
+                let _ = std::fs::remove_file(&sidecar_dst);
+                std::fs::rename(&sidecar_tmp, &sidecar_dst).map_err(|retry_err| {
                     format!(
                         "rename into place: {}; retry after remove: {}",
                         first_err, retry_err
@@ -2553,15 +2557,49 @@ pub(crate) fn deploy_shim_sidecar(
         });
 
     match result {
-        Ok(()) => ShimSidecarDeploy::Copied { to: shim_dst },
+        Ok(()) => SidecarDeploy::Copied { to: sidecar_dst },
         Err(error) => {
-            let _ = std::fs::remove_file(&shim_tmp);
-            ShimSidecarDeploy::CopyFailed {
-                from: shim_src,
-                to: shim_dst,
+            let _ = std::fs::remove_file(&sidecar_tmp);
+            SidecarDeploy::CopyFailed {
+                from: sidecar_src,
+                to: sidecar_dst,
                 error,
             }
         }
+    }
+}
+
+/// Remove a runner's exe copy and everything deployed beside it.
+///
+/// For `Temp`/`Named` runners the copy owns a whole directory
+/// ([`crate::config::SupervisorConfig::runner_exe_copy_dir`]) — exe, sidecars,
+/// any tmp litter — so the directory goes. For the flat kinds only the exe
+/// and its `.pdb` go; their directory is the shared `target/debug/`.
+/// Best-effort: failures are logged, never propagated (the caller is a stop or
+/// purge path that must not fail on disk cleanup).
+pub(crate) fn remove_runner_exe_copy(
+    supervisor_config: &crate::config::SupervisorConfig,
+    runner_config: &crate::config::RunnerConfig,
+) {
+    if let Some(dir) = supervisor_config.runner_exe_copy_dir(runner_config) {
+        if dir.exists() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => info!("Removed runner exe copy dir {:?}", dir),
+                Err(e) => warn!("Failed to remove runner exe copy dir {:?}: {}", dir, e),
+            }
+        }
+        return;
+    }
+    let exe_copy = supervisor_config.runner_exe_copy_path(runner_config);
+    if exe_copy.exists() {
+        match std::fs::remove_file(&exe_copy) {
+            Ok(()) => info!("Removed runner exe copy {:?}", exe_copy),
+            Err(e) => warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e),
+        }
+    }
+    let pdb_copy = exe_copy.with_extension("pdb");
+    if pdb_copy.exists() {
+        let _ = std::fs::remove_file(&pdb_copy);
     }
 }
 
@@ -2629,7 +2667,6 @@ fn apply_instance_dir_env(
 /// | `QONTINUI_PRIMARY_PORT` | caller-resolved | The runner requires BOTH this and the instance name to classify itself as a secondary; unset makes it silently behave as a primary. |
 /// | `WEBVIEW2_USER_DATA_FOLDER` | `config.id` | Isolated localStorage / IndexedDB / cookies (Windows only). |
 /// | `QONTINUI_CONFIG_DIR` + `QONTINUI_SECURE_STORAGE_DIR` | `config.id` | Per-instance config + pairing store, via [`apply_instance_dir_env`]. |
-/// | `QONTINUI_PRIMARY_SECURE_STORAGE_DIR` | fixed | Path *pointer* (not a credential) so a secondary can seed the primary's device machine key. |
 ///
 /// **`QONTINUI_INSTANCE_NAME` must be unique per SPAWN, not per port.** Temp
 /// ports are recycled inside 9877-9899, so a port-derived name made two
@@ -2687,19 +2724,6 @@ fn apply_non_primary_instance_env(
         "Runner '{}' using per-instance config dir: {:?}",
         config.name, instance_dir
     );
-
-    // Point the non-primary runner at the PRIMARY's secure-storage dir so it
-    // can seed the primary's device machine key (`dmk_`) into its own
-    // isolated store and reach Tier 2 headlessly (plan
-    // `2026-07-13-…-auth-remediation`, R4.1). This is a *computed path
-    // pointer*, NOT the raw credential — the spawned runner decrypts the
-    // primary's `auth_tokens.enc` itself with its own machine-derived
-    // `SecureStorage` key (same OS user + host → same key), keeping the
-    // high-privilege `dmk_` out of process listings, argv, and logs. Inert
-    // until the runner reads it; the runner degrades to Tier 0/1 if absent.
-    if let Some(primary_dir) = primary_secure_storage_dir() {
-        cmd.env("QONTINUI_PRIMARY_SECURE_STORAGE_DIR", &primary_dir);
-    }
 
     Ok(instance_dir)
 }
@@ -2944,14 +2968,14 @@ async fn start_exe_mode_for_runner(
     // (2026-07-03 incident). FAIL-OPEN: a missing/uncopyable stub logs one
     // WARN and never fails the runner start.
     match deploy_shim_sidecar(&source_exe, &exe_path) {
-        ShimSidecarDeploy::Copied { to } => {
+        SidecarDeploy::Copied { to } => {
             info!(
                 "Copied qontinui-shim sidecar for '{}' to {:?}",
                 managed.config.name, to
             );
         }
-        ShimSidecarDeploy::SameDir => {}
-        ShimSidecarDeploy::SourceMissing { expected } => {
+        SidecarDeploy::SameDir => {}
+        SidecarDeploy::SourceMissing { expected } => {
             let msg = format!(
                 "No qontinui-shim.exe next to the source exe for '{}' (expected {:?}) — \
                  identity shims will be stale; rebuild (POST /runner/restart {{rebuild:true}} \
@@ -2964,7 +2988,7 @@ async fn start_exe_mode_for_runner(
                 .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                 .await;
         }
-        ShimSidecarDeploy::CopyFailed { from, to, error } => {
+        SidecarDeploy::CopyFailed { from, to, error } => {
             let msg = format!(
                 "Failed to copy qontinui-shim sidecar for '{}' from {:?} to {:?} ({}) — \
                  identity shims will be stale until a later runner start succeeds in copying it",
@@ -2975,6 +2999,40 @@ async fn start_exe_mode_for_runner(
                 .logs
                 .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                 .await;
+        }
+    }
+
+    // Deploy the git credential helper beside the copy too: the runner finds
+    // it only via `current_exe().parent()`, and a per-runner copy directory
+    // (Temp/Named) holds nothing else. A build slot does not build the helper,
+    // so when the source exe's dir lacks it, fall back to the resolved
+    // non-pool `target/debug/` — the dir the old flat copies lived in, and so
+    // the helper those runners used to see. Optional in the runner (it skips
+    // the install when absent), so a miss is logged at info, not warned.
+    {
+        let local_build_exe = state.config.runner_exe_path();
+        let helper_source = [source_exe.as_path(), local_build_exe.as_path()]
+            .into_iter()
+            .find(|exe| {
+                exe.parent()
+                    .is_some_and(|d| d.join(GIT_CREDENTIAL_EXE_FILENAME).exists())
+            })
+            .unwrap_or(source_exe.as_path());
+        match deploy_sidecar(helper_source, &exe_path, GIT_CREDENTIAL_EXE_FILENAME) {
+            SidecarDeploy::Copied { to } => info!(
+                "Copied {} sidecar for '{}' to {:?}",
+                GIT_CREDENTIAL_EXE_FILENAME, managed.config.name, to
+            ),
+            SidecarDeploy::SameDir => {}
+            SidecarDeploy::SourceMissing { expected } => info!(
+                "No {} beside the source exe for '{}' (looked for {:?}) — the runner \
+                 will skip installing its git credential helper",
+                GIT_CREDENTIAL_EXE_FILENAME, managed.config.name, expected
+            ),
+            SidecarDeploy::CopyFailed { from, to, error } => warn!(
+                "Failed to copy {} sidecar for '{}' from {:?} to {:?} ({})",
+                GIT_CREDENTIAL_EXE_FILENAME, managed.config.name, from, to, error
+            ),
         }
     }
 
@@ -3065,6 +3123,18 @@ async fn start_exe_mode_for_runner(
             managed.config.name
         );
         forwarder.apply(&mut cmd, state, managed).await;
+    }
+
+    // Linux temp runners need a display, and GTK's own failure without one is
+    // a panic that names nothing actionable. Judged AFTER every forwarder
+    // (`ExtraEnv` included), so it sees the final values the child would get.
+    if let Some(refusal) = env_forwarders::display_refusal_for_command(&cmd, &managed.config) {
+        warn!("{}", refusal);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Error, refusal.clone())
+            .await;
+        return Err(SupervisorError::NoDisplay(refusal));
     }
 
     // `PanicLogEnv` stashed the resolved per-runner panic-log path on
@@ -5013,22 +5083,11 @@ pub async fn stop_runner_by_id(
             }
         }
 
-        // Clean up the per-runner exe copy to prevent disk bloat.
-        // Each copy is ~200MB + ~1.3GB PDB; without cleanup, orphaned copies
-        // accumulated to ~200GB in a recent audit.
-        let exe_copy = state.config.runner_exe_copy_path(&managed.config);
-        if exe_copy.exists() {
-            if let Err(e) = std::fs::remove_file(&exe_copy) {
-                warn!("Failed to remove runner exe copy {:?}: {}", exe_copy, e);
-            } else {
-                info!("Removed runner exe copy {:?}", exe_copy);
-            }
-        }
-        // Also try to remove the PDB file (same name but .pdb extension)
-        let pdb_copy = exe_copy.with_extension("pdb");
-        if pdb_copy.exists() {
-            let _ = std::fs::remove_file(&pdb_copy);
-        }
+        // Clean up the per-runner exe copy (its whole directory, sidecars
+        // included) to prevent disk bloat. Each copy is ~200MB + ~1.3GB PDB;
+        // without cleanup, orphaned copies accumulated to ~200GB in a recent
+        // audit.
+        remove_runner_exe_copy(&state.config, &managed.config);
     }
 
     state.notify_health_change();
@@ -5843,30 +5902,6 @@ mod tests {
         let explicit = || Some("https://api.qontinui.io".to_string());
         assert_eq!(resolve_child_api_url(explicit(), true), explicit());
         assert_eq!(resolve_child_api_url(explicit(), false), explicit());
-    }
-
-    // QONTINUI_PRIMARY_SECURE_STORAGE_DIR pointer (plan 2026-07-13, R4.1).
-    // The env var is set only in the non-primary spawn block of
-    // `start_exe_mode_for_runner` (guarded by `!is_primary()`), so a primary
-    // spawn never carries it. Here we assert the *value* the non-primary block
-    // forwards: the primary's default secure-storage dir, which must equal
-    // qontinui-runner's `SecureStorage::new()` fallback
-    // (`dirs::data_local_dir()/com.qontinui.runner`) so the spawned runner's
-    // machine-derived key can decrypt the primary's `auth_tokens.enc`.
-    #[test]
-    fn primary_secure_storage_dir_is_data_local_com_qontinui_runner() {
-        let expected = dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"));
-        assert_eq!(primary_secure_storage_dir(), expected);
-        // On any platform with a resolvable data-local dir, the pointer ends in
-        // the runner's service-name subdir — the exact dir SecureStorage::new()
-        // writes to when unoverridden.
-        if let Some(dir) = primary_secure_storage_dir() {
-            assert!(
-                dir.ends_with("com.qontinui.runner"),
-                "primary secure-storage pointer must target the runner's default \
-                 store dir, got {dir:?}"
-            );
-        }
     }
 
     // Per-instance config/secure-storage dir, asserted at the site that
@@ -7067,10 +7102,12 @@ mod tests {
     // =========================================================================
 
     /// The copy-never-run-from-slot step in `start_exe_mode_for_runner` must
-    /// create `target/debug/` before copying the slot/LKG exe into it.
+    /// create the copy's parent before copying the slot/LKG exe into it — for
+    /// a temp runner `target/debug/runners/<pool-name>/`, which never exists
+    /// before its first spawn, and for the primary `target/debug/`.
     /// Supervisor-managed trees only ever materialize `target-pool/`, so a
     /// tree that has never had a default `cargo build` won't have
-    /// `target/debug/` and the copy would fail with `os error 3`
+    /// `target/debug/` either, and the copy would fail with `os error 3`
     /// (path not found). Mirrors the inline mkdir-then-copy step at the same
     /// abstraction level (the copy itself lives inside the async
     /// process-spawning `start_exe_mode_for_runner`, which isn't unit-testable
@@ -7085,21 +7122,24 @@ mod tests {
         let source_exe = slot_debug.join("qontinui-runner.exe");
         std::fs::write(&source_exe, b"fake-exe-bytes").expect("write source exe");
 
-        // Copy target's parent (`target/debug/`) deliberately does NOT exist.
+        // Copy target's parent (`target/debug/runners/<pool-name>/`)
+        // deliberately does NOT exist, nor does `target/debug/`.
         let copy_path = root
             .path()
             .join("target")
             .join("debug")
-            .join("qontinui-runner-test-9877.exe");
+            .join("runners")
+            .join("qontinui-runner-test-9877")
+            .join("qontinui-runner.exe");
         let parent = copy_path.parent().expect("copy_path has a parent");
         assert!(
             !parent.exists(),
-            "precondition: target/debug must be absent"
+            "precondition: the copy dir must be absent"
         );
 
         // The fix: create_dir_all(parent) before the copy.
         std::fs::create_dir_all(parent).expect("create_dir_all must succeed");
-        assert!(parent.is_dir(), "target/debug should now exist");
+        assert!(parent.is_dir(), "the per-runner copy dir should now exist");
 
         // And the copy then succeeds (previously failed with os error 3).
         std::fs::copy(&source_exe, &copy_path).expect("copy into freshly-created dir");
@@ -7133,16 +7173,21 @@ mod tests {
         )
         .expect("write shim");
 
-        let target_debug = root.path().join("target").join("debug");
-        std::fs::create_dir_all(&target_debug).expect("mkdir target debug");
-        let dest_exe = target_debug.join("qontinui-runner-test-9877.exe");
+        let target_debug = root
+            .path()
+            .join("target")
+            .join("debug")
+            .join("runners")
+            .join("qontinui-runner-test-9877");
+        std::fs::create_dir_all(&target_debug).expect("mkdir per-runner copy dir");
+        let dest_exe = target_debug.join("qontinui-runner.exe");
         std::fs::write(&dest_exe, b"exe-copy").expect("write exe copy");
         // Pre-existing STALE stub — the exact incident artifact.
         let dest_shim = target_debug.join(crate::build_monitor::SHIM_EXE_FILENAME);
         std::fs::write(&dest_shim, b"stale-shim").expect("write stale shim");
 
         match deploy_shim_sidecar(&source_exe, &dest_exe) {
-            ShimSidecarDeploy::Copied { to } => assert_eq!(to, dest_shim),
+            SidecarDeploy::Copied { to } => assert_eq!(to, dest_shim),
             other => panic!("expected Copied, got {:?}", other),
         }
         assert_eq!(
@@ -7175,7 +7220,7 @@ mod tests {
 
         assert!(matches!(
             deploy_shim_sidecar(&source_exe, &dest_exe),
-            ShimSidecarDeploy::SameDir
+            SidecarDeploy::SameDir
         ));
         assert_eq!(
             std::fs::read(&shim).expect("read shim"),
@@ -7201,7 +7246,7 @@ mod tests {
         let dest_exe = target_debug.join("qontinui-runner-primary.exe");
 
         match deploy_shim_sidecar(&source_exe, &dest_exe) {
-            ShimSidecarDeploy::SourceMissing { expected } => {
+            SidecarDeploy::SourceMissing { expected } => {
                 assert_eq!(
                     expected,
                     slot_debug.join(crate::build_monitor::SHIM_EXE_FILENAME)
@@ -7214,6 +7259,94 @@ mod tests {
                 .join(crate::build_monitor::SHIM_EXE_FILENAME)
                 .exists(),
             "no shim must be fabricated at the destination"
+        );
+    }
+
+    /// S-2: a `Temp` runner's copy lives in its own
+    /// `target/debug/runners/<pool-name>/` directory, so its sidecars land
+    /// there and NEVER in the shared `target/debug/` of the live tree (where a
+    /// temp spawn used to overwrite the primary's `qontinui-shim`). Drives the
+    /// real `runner_exe_copy_path` against a tempdir runner tree, then the
+    /// same mkdir → copy → sidecar-deploy sequence `start_exe_mode_for_runner`
+    /// runs, and finally the stop-time cleanup.
+    #[test]
+    fn temp_runner_sidecars_land_in_its_own_dir_not_target_debug() {
+        use clap::Parser;
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let runner = root.path().join("qontinui-runner");
+        let src_tauri = runner.join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
+        let project_dir = src_tauri.to_string_lossy().into_owned();
+        let config =
+            crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
+                "test",
+                "--project-dir",
+                project_dir.as_str(),
+            ]));
+
+        // Source exe + both sidecars in a build slot.
+        let slot_debug = runner.join("target-pool").join("slot-0").join("debug");
+        std::fs::create_dir_all(&slot_debug).expect("mkdir slot debug");
+        let source_exe = slot_debug.join(crate::config::RUNNER_BIN_NAME);
+        std::fs::write(&source_exe, b"exe").expect("write exe");
+        std::fs::write(
+            slot_debug.join(crate::build_monitor::SHIM_EXE_FILENAME),
+            b"fresh-shim",
+        )
+        .expect("write shim");
+        std::fs::write(slot_debug.join(GIT_CREDENTIAL_EXE_FILENAME), b"cred")
+            .expect("write credential helper");
+
+        // The primary's shim already sits in the shared target/debug.
+        let target_debug = runner.join("target").join("debug");
+        std::fs::create_dir_all(&target_debug).expect("mkdir target debug");
+        let shared_shim = target_debug.join(crate::build_monitor::SHIM_EXE_FILENAME);
+        std::fs::write(&shared_shim, b"primary-shim").expect("write primary shim");
+
+        let mut temp = crate::config::RunnerConfig::default_primary();
+        temp.id = "test-1".to_string();
+        temp.port = 9877;
+        temp.kind = qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: "test-1".to_string(),
+        };
+        let dest_exe = config.runner_exe_copy_path(&temp);
+        let own_dir = dest_exe.parent().expect("copy has a parent").to_path_buf();
+        assert_ne!(
+            own_dir.canonicalize().unwrap_or_else(|_| own_dir.clone()),
+            target_debug.canonicalize().expect("canonical target/debug"),
+            "a temp copy must not live directly in target/debug"
+        );
+        assert!(own_dir.ends_with("runners/qontinui-runner-test-9877"));
+
+        std::fs::create_dir_all(&own_dir).expect("mkdir own dir");
+        std::fs::copy(&source_exe, &dest_exe).expect("copy exe");
+        match deploy_shim_sidecar(&source_exe, &dest_exe) {
+            SidecarDeploy::Copied { to } => {
+                assert_eq!(to, own_dir.join(crate::build_monitor::SHIM_EXE_FILENAME))
+            }
+            other => panic!("expected Copied, got {:?}", other),
+        }
+        assert!(matches!(
+            deploy_sidecar(&source_exe, &dest_exe, GIT_CREDENTIAL_EXE_FILENAME),
+            SidecarDeploy::Copied { .. }
+        ));
+        assert_eq!(
+            std::fs::read(own_dir.join(crate::build_monitor::SHIM_EXE_FILENAME)).unwrap(),
+            b"fresh-shim"
+        );
+        assert_eq!(
+            std::fs::read(&shared_shim).expect("read shared shim"),
+            b"primary-shim",
+            "the shared target/debug shim must be untouched by a temp deploy"
+        );
+
+        // Stop-time cleanup removes the whole per-runner directory and leaves
+        // the shared target/debug alone.
+        remove_runner_exe_copy(&config, &temp);
+        assert!(!own_dir.exists(), "per-runner copy dir must be removed");
+        assert!(
+            shared_shim.exists(),
+            "shared target/debug must survive cleanup"
         );
     }
 
