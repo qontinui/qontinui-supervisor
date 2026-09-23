@@ -5421,6 +5421,21 @@ pub async fn restart_runner_by_id(
             Ok(())
         }
         Err(e) => {
+            // The stop half kept the temp runner's instance dir for the start
+            // half (`reap_instance_config_on_stop`). If the restart failed
+            // before the start re-registered the id (e.g. a failed rebuild),
+            // no cleanup path will ever visit that id again — reap the dir,
+            // with its copy of the pairing, here.
+            let still_registered = state.get_runner(runner_id).await.is_some();
+            if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered) {
+                if let Err(re) = remove_instance_config_dir(runner_id, false).await {
+                    warn!(
+                        "Failed to remove instance config dir for temp runner '{}' after \
+                         its failed restart: {}",
+                        runner_id, re
+                    );
+                }
+            }
             state
                 .diagnostics
                 .write()
@@ -5432,6 +5447,13 @@ pub async fn restart_runner_by_id(
             Err(e)
         }
     }
+}
+
+/// Whether a FAILED restart left a temp runner's instance dir with no owner:
+/// the stop half dropped the id from the registry and kept the dir for a start
+/// that never re-registered it.
+pub(crate) fn orphaned_by_failed_restart(is_temp: bool, still_registered: bool) -> bool {
+    is_temp && !still_registered
 }
 
 /// The stop → (build) → start body of [`restart_runner_by_id`], run only
@@ -7295,6 +7317,12 @@ mod tests {
         assert!(reap_instance_config_on_stop(false));
         assert!(!reap_instance_config_on_stop(true));
 
+        // …and a restart that fails before re-registering the temp id reaps
+        // the dir it kept; a registered or non-temp runner is left alone.
+        assert!(orphaned_by_failed_restart(true, false));
+        assert!(!orphaned_by_failed_restart(true, true));
+        assert!(!orphaned_by_failed_restart(false, false));
+
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
@@ -7317,6 +7345,17 @@ mod tests {
             stop.matches("remove_instance_config_dir(").count(),
             1,
             "exactly one (gated) instance-dir reap in stop_runner_by_id"
+        );
+        let restart = src
+            .split_once("pub async fn restart_runner_by_id(")
+            .map(|(_, after)| after)
+            .expect("restart_runner_by_id exists");
+        let restart = &restart[..restart.find("\npub ").unwrap_or(restart.len())];
+        assert!(
+            restart.contains(
+                "if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)"
+            ) && restart.contains("remove_instance_config_dir(runner_id, false)"),
+            "a failed temp restart must reap the instance dir its stop half kept"
         );
     }
 
