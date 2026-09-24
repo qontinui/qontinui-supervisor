@@ -917,18 +917,17 @@ pub async fn remove_runner(
                 id, e
             );
         }
-
-        // Also remove per-instance app data dirs (dev-logs, restate journal,
-        // macros, prompts, playwright, contexts) that the runner writes under
-        // an `instance-<name>` subdirectory. The runner sees the env var
-        // `QONTINUI_INSTANCE_NAME = <managed.config.name>`, so cleanup keys
-        // off the name, not the id.
-        if let Err(e) = crate::process::windows::remove_runner_app_data_dirs(&name, false).await {
-            warn!(
-                "Failed to remove per-instance app data for runner '{}': {}",
-                name, e
-            );
-        }
+    }
+    // Cross-platform: per-instance app data dirs (dev-logs, restate journal,
+    // macros, prompts, playwright, contexts) that the runner writes under an
+    // `instance-<name>` subdirectory. The runner sees the env var
+    // `QONTINUI_INSTANCE_NAME = <managed.config.name>`, so cleanup keys off
+    // the name, not the id.
+    if let Err(e) = crate::process::remove_runner_app_data_dirs(&name, false).await {
+        warn!(
+            "Failed to remove per-instance app data for runner '{}': {}",
+            name, e
+        );
     }
     // Cross-platform: the instance dir holds a copy of the paired state
     // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4).
@@ -1140,13 +1139,13 @@ pub async fn purge_stale_test_runners_core(
                     id, e
                 );
             }
-            if let Err(e) = crate::process::windows::remove_runner_app_data_dirs(&name, false).await
-            {
-                warn!(
-                    "purge-stale: failed to remove app data for '{}': {}",
-                    name, e
-                );
-            }
+        }
+        // Cross-platform.
+        if let Err(e) = crate::process::remove_runner_app_data_dirs(&name, false).await {
+            warn!(
+                "purge-stale: failed to remove app data for '{}': {}",
+                name, e
+            );
         }
         // Cross-platform: the instance dir holds a copy of the paired state.
         if let Err(e) = crate::process::remove_instance_config_dir(&id, false).await {
@@ -5146,6 +5145,22 @@ pub async fn spawn_named(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.eq_ignore_ascii_case("no-wait"))
         .unwrap_or(false);
+
+    // A named runner is the same windowed Tauri binary a temp runner is, so a
+    // Linux spawn with no display can only end in `no_display` too (plan
+    // `2026-09-23-conductor-e2e-phase1-defects`, S-3). Refuse before a
+    // `rebuild: true` build rather than after it; the spawn path's
+    // post-forwarder check stays the final authority. `spawn-named` takes no
+    // `extra_env`, so nothing here can supply DISPLAY that way.
+    if let Some(refusal) = crate::process::env_forwarders::display_preflight_refusal(
+        cfg!(target_os = "linux"),
+        "spawn-named",
+        &std::collections::HashMap::new(),
+        |k| std::env::var(k).ok(),
+        state.config.temp_runner_display.as_deref(),
+    ) {
+        return Err(SupervisorError::NoDisplay(refusal));
+    }
 
     // Atomically reserve a free port AND insert a placeholder ManagedRunner.
     // Keep an Arc to the ManagedRunner so the later start uses it directly,

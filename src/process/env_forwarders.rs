@@ -162,10 +162,10 @@ pub(crate) fn resolve_display_env(
     out
 }
 
-/// Forwards the display variables to **temp** runners on Linux (plan
-/// `2026-09-23-conductor-e2e-phase1-defects`, S-3).
+/// Forwards the display variables to **temp and named** runners on Linux
+/// (plan `2026-09-23-conductor-e2e-phase1-defects`, S-3).
 ///
-/// A supervisor started from a non-GUI shell has no `DISPLAY`, so the temp
+/// A supervisor started from a non-GUI shell has no `DISPLAY`, so a secondary
 /// runner it spawned used to die in GTK init with a panic that named nothing
 /// the operator could act on. This forwarder carries the supervisor's own
 /// display variables across explicitly, and supplies `DISPLAY` from the
@@ -173,6 +173,13 @@ pub(crate) fn resolve_display_env(
 /// supervisor has none. Registered before [`ExtraEnv`] so `extra_env` still
 /// overrides it. Whether a display then resolves at all is checked after
 /// every forwarder has run, by [`display_refusal_for_command`].
+///
+/// Scoped to `Temp` and `Named` — the two kinds the supervisor spawns as the
+/// same windowed Tauri binary. `Primary` and `External` are excluded: an
+/// external runner is never spawned by the supervisor at all, and a
+/// supervisor-started primary is the operator's own runner, started the way
+/// it always was before this forwarder existed (`--auto-start`/`--watchdog`
+/// boot-start is unaffected).
 pub struct DisplayEnv;
 
 impl EnvForwarder for DisplayEnv {
@@ -187,7 +194,8 @@ impl EnvForwarder for DisplayEnv {
         runner: &'a ManagedRunner,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if !cfg!(target_os = "linux") || !runner.config.kind().is_temp() {
+            let kind = runner.config.kind();
+            if !cfg!(target_os = "linux") || !(kind.is_temp() || kind.is_named()) {
                 return;
             }
             let resolved = resolve_display_env(
@@ -201,8 +209,13 @@ impl EnvForwarder for DisplayEnv {
     }
 }
 
-/// The refusal a temp spawn gets on Linux when neither `DISPLAY` nor
+/// The refusal a temp/named spawn gets on Linux when neither `DISPLAY` nor
 /// `WAYLAND_DISPLAY` resolves for the child, or `None` when it may proceed.
+///
+/// `needs_display` is whether this spawn is of a kind [`DisplayEnv`] forwards
+/// for at all (`Temp` or `Named` — see that struct's doc for why `Primary` /
+/// `External` are excluded); callers pass `runner.kind().is_temp() ||
+/// runner.kind().is_named()`.
 ///
 /// `explicit(key)` is what the spawn [`Command`] itself says about `key`:
 /// `Some(Some(v))` set, `Some(None)` removed, `None` untouched — in which case
@@ -211,12 +224,12 @@ impl EnvForwarder for DisplayEnv {
 /// values. The message starts `no_display:` and names the knob.
 pub(crate) fn display_refusal(
     is_linux: bool,
-    is_temp: bool,
+    needs_display: bool,
     runner_name: &str,
     explicit: impl Fn(&str) -> Option<Option<String>>,
     inherited: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    if !is_linux || !is_temp {
+    if !is_linux || !needs_display {
         return None;
     }
     let resolves = |key: &str| {
@@ -230,7 +243,7 @@ pub(crate) fn display_refusal(
         return None;
     }
     Some(format!(
-        "no_display: temp runner '{runner_name}' would start with neither DISPLAY nor \
+        "no_display: runner '{runner_name}' would start with neither DISPLAY nor \
          WAYLAND_DISPLAY, and GTK cannot open a window without one. The supervisor's \
          environment has no display (it was likely started from a non-GUI shell). Start \
          the supervisor with --temp-runner-display <display> (or env \
@@ -241,7 +254,8 @@ pub(crate) fn display_refusal(
 }
 
 /// [`display_refusal`] over a real spawn [`Command`] and the supervisor's
-/// live environment.
+/// live environment. Applies to `Temp` and `Named` runners — see
+/// [`DisplayEnv`]'s doc for why `Primary` / `External` are excluded.
 pub(crate) fn display_refusal_for_command(
     cmd: &Command,
     runner: &crate::config::RunnerConfig,
@@ -256,21 +270,24 @@ pub(crate) fn display_refusal_for_command(
             )
         })
         .collect();
+    let kind = runner.kind();
     display_refusal(
         cfg!(target_os = "linux"),
-        runner.kind().is_temp(),
+        kind.is_temp() || kind.is_named(),
         &runner.name,
         |key| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
         |key| std::env::var(key).ok(),
     )
 }
 
-/// [`display_refusal`] evaluated BEFORE a temp spawn's build, from what the
-/// spawn request already determines: [`DisplayEnv`]'s resolution over the
+/// [`display_refusal`] evaluated BEFORE a temp/named spawn's build, from what
+/// the spawn request already determines: [`DisplayEnv`]'s resolution over the
 /// supervisor's env and knob, overlaid by the request's `extra_env` (which
-/// [`ExtraEnv`] applies last). A spawn-test build takes minutes, so a request
-/// that can only end in `no_display` is refused up front instead of after the
-/// compile. The post-forwarder check in the spawn path
+/// [`ExtraEnv`] applies last). A `rebuild: true` spawn's build takes minutes,
+/// so a request that can only end in `no_display` is refused up front instead
+/// of after the compile. Callers pass a fixed `true` for `needs_display`
+/// because both call sites (`spawn_test`, `spawn_named`) only ever construct a
+/// `Temp`/`Named` runner. The post-forwarder check in the spawn path
 /// ([`display_refusal_for_command`]) stays the final authority.
 pub(crate) fn display_preflight_refusal(
     is_linux: bool,
@@ -1423,9 +1440,48 @@ mod tests {
     }
 
     #[test]
-    fn no_display_refusal_is_linux_temp_only() {
+    fn no_display_refusal_requires_linux_and_needs_display() {
         assert_eq!(display_refusal(false, true, "t", |_| None, |_| None), None);
         assert_eq!(display_refusal(true, false, "n", |_| None, |_| None), None);
+    }
+
+    /// `display_refusal_for_command` (the final-authority check that runs on
+    /// every real spawn) refuses a `Named` runner exactly as it would a
+    /// `Temp` one — both are the same windowed Tauri binary the supervisor
+    /// spawns — and stays a no-op for `Primary`.
+    #[test]
+    fn display_refusal_for_command_covers_named_runners_too() {
+        let mut named = crate::config::RunnerConfig::default_primary();
+        named.id = "named-x".to_string();
+        named.name = "named-x".to_string();
+        named.kind = qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: "named-x".to_string(),
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+        let refusal = display_refusal_for_command(&cmd, &named);
+        if cfg!(target_os = "linux") {
+            assert!(refusal
+                .expect("a named runner with no display must refuse too")
+                .starts_with("no_display:"));
+        } else {
+            assert_eq!(refusal, None);
+        }
+
+        let mut primary = crate::config::RunnerConfig::default_primary();
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+        assert_eq!(
+            display_refusal_for_command(&cmd, &primary),
+            None,
+            "Primary is never gated by the display check"
+        );
+        primary.kind = qontinui_types::wire::runner_kind::RunnerKind::External;
+        assert_eq!(
+            display_refusal_for_command(&cmd, &primary),
+            None,
+            "External is never gated by the display check"
+        );
     }
 
     #[test]

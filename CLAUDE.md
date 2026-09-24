@@ -66,27 +66,46 @@ follows automatically: all **four** removal sites (`remove_runner`,
 `purge_stale_test_runners_core`, `manager::stop_runner_by_id`, and
 `manager::reap_stale_test_runners` — the sweep, which can now kill a *live*
 runner for age) hand `managed.config.name` to
-`windows::remove_runner_app_data_dirs`, whose sanitizer
+`process::remove_runner_app_data_dirs`, whose sanitizer
 (`process::sanitize_instance_name`) mirrors the runner's and maps the id to
-itself. `config::runner_exe_copy_path` stays **deliberately port-keyed** — a
-per-spawn exe path re-triggers a Windows Firewall prompt on every cold spawn.
-Each temp/named copy lives in its **own directory**,
-`target/debug/runners/<pool-name>/qontinui-runner[.exe]` (`<pool-name>` =
-`qontinui-runner-test-<port>` / `qontinui-runner-named-<port>`), so the sidecars
-deployed beside it never land in the live tree's shared `target/debug/`, and a
-stop removes the whole directory (`manager::remove_runner_exe_copy`). The
-primary keeps its flat `target/debug/qontinui-runner-primary[.exe]`.
+itself. **Cross-platform** — it used to be `windows::remove_runner_app_data_dirs`,
+gated `#[cfg(target_os = "windows")]` at every call site, so on Linux, where
+temp runners could not even survive to populate these trees before this same
+plan's S-1..S-3, nothing had ever reaped them. `process::app_data_dir_candidates`
+resolves every base (`dirs::data_local_dir()`/`data_dir()`/`config_dir()`)
+the same way the runner's own `paths.rs`/`prompts.rs`/`restate/config.rs`
+resolve them, rather than reading `LOCALAPPDATA`/`APPDATA` directly, so the
+same candidate list is correct on every platform. `config::runner_exe_copy_path`
+stays **deliberately port-keyed** — a per-spawn exe path re-triggers a Windows
+Firewall prompt on every cold spawn. Each temp/named copy lives in its **own
+directory**, `target/debug/runners/<pool-name>/qontinui-runner[.exe]`
+(`<pool-name>` = `qontinui-runner-test-<port>` / `qontinui-runner-named-<port>`),
+so the sidecars deployed beside it never land in the live tree's shared
+`target/debug/`, and a stop, purge, or DELETE removes the whole directory
+(`manager::remove_runner_exe_copy`). **The periodic max-age sweep
+(`reap_stale_test_runners`) now removes it too** — the other three removal
+sites already did, but the sweep did not, so a temp runner reaped for age
+rather than stopped or purged leaked its whole per-runner directory (runner
+exe + shim + git-credential helper) forever. The primary keeps its flat
+`target/debug/qontinui-runner-primary[.exe]`.
 
-**Linux temp runners need a display.** `DisplayEnv` forwards `DISPLAY` /
-`WAYLAND_DISPLAY` / `GDK_BACKEND` / `BROADWAY_DISPLAY` from the supervisor's
-env, and supplies `DISPLAY` from `--temp-runner-display` /
+**Linux temp AND named runners need a display.** `DisplayEnv` forwards
+`DISPLAY` / `WAYLAND_DISPLAY` / `GDK_BACKEND` / `BROADWAY_DISPLAY` from the
+supervisor's env, and supplies `DISPLAY` from `--temp-runner-display` /
 `QONTINUI_SUPERVISOR_TEMP_DISPLAY` when the supervisor has none. When neither
 `DISPLAY` nor `WAYLAND_DISPLAY` resolves after every forwarder (`extra_env`
 included), the spawn is refused `409 {"error": "no_display"}` instead of dying
-in GTK init. Every temp spawn also gets `QONTINUI_SETUP_WIZARD_BYPASS=1`
-(`SetupWizardBypassEnv`) so the first-run wizard does not cover the UI — which
-takes effect only once the runner's `check_setup_completed` honors the variable
-(the runner half of plan `2026-09-23-conductor-e2e-phase1-defects` UI-5).
+in GTK init — both `spawn-test` and `spawn-named` refuse up front, before a
+`rebuild: true` build, in addition to the post-forwarder check that is the
+final authority for every spawn path. `Primary` and `External` are never
+gated: an external runner is never spawned by the supervisor, and a
+supervisor-started primary boots the way it always did. Every temp spawn also
+gets `QONTINUI_SETUP_WIZARD_BYPASS=1` (`SetupWizardBypassEnv`, temp-only —
+unlike the display forwarder, a named runner is a persistent, production-like
+instance that should see the real first-run wizard) so the first-run wizard
+does not cover the UI — which takes effect only once the runner's
+`check_setup_completed` honors the variable (the runner half of plan
+`2026-09-23-conductor-e2e-phase1-defects` UI-5).
 
 **Legacy `instance-test-<port>` trees are now permanently orphaned.** Up to 23
 of them (one per port slot, with their stale `terminal-sessions.json`) exist on
@@ -218,7 +237,7 @@ cargo clippy -- -D warnings    # Lint
 | `--log-dir` | Directory for persistent log files. Writes `<log-dir>/supervisor.log` plus one `<log-dir>/<runner-id>.log` per managed runner (tees runner stdout/stderr). Directory is created on startup. Every file is size+age rotated with a retained-segment cap. |
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
-| `--temp-runner-display` | Linux: `DISPLAY` handed to temp runners when the supervisor's env has none (also `QONTINUI_SUPERVISOR_TEMP_DISPLAY`; the flag wins). Without a display a temp spawn is refused with `no_display`. |
+| `--temp-runner-display` | Linux: `DISPLAY` handed to temp AND named runners when the supervisor's env has none (also `QONTINUI_SUPERVISOR_TEMP_DISPLAY`; the flag wins). Without a display, a temp or named spawn is refused with `no_display`. |
 
 ## Serving-watchdog environment
 
@@ -1420,7 +1439,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 1. **Port reservation** — atomically claims a free port (9877-9899) and inserts a placeholder.
 2. **Build** — acquires a build pool permit (blocks if all slots busy), runs `npm run build` (serialized via `npm_lock`), then `cargo build --bin qontinui-runner --features custom-protocol` with `CARGO_TARGET_DIR` set to the slot dir.
-3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read). Expect `posture: "unknown"` from a freshly booted child: its device-JWT refresher has usually not completed a pass by first `/health`, so re-read the child's own `/health` to judge the copied pairing. A Linux spawn-test that can only end in `no_display` is refused before the build starts.
+3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read). Expect `posture: "unknown"` from a freshly booted child: its device-JWT refresher has usually not completed a pass by first `/health`, so re-read the child's own `/health` to judge the copied pairing. A Linux spawn-test or spawn-named that can only end in `no_display` is refused before the build starts.
 4. **Optional wait** — if `wait: true`, polls `GET /health` on the spawned runner every 2s until healthy or `wait_timeout_secs` (default 120s) elapses.
 
 **Timeouts:**

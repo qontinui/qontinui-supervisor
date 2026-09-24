@@ -18,10 +18,10 @@ use crate::process::stop_ledger::{
     TargetVerification as StopVerification,
 };
 #[cfg(target_os = "windows")]
-use crate::process::windows::{
-    remove_runner_app_data_dirs, remove_webview2_user_data_folder, webview2_user_data_folder,
+use crate::process::windows::{remove_webview2_user_data_folder, webview2_user_data_folder};
+use crate::process::{
+    instance_config_dir, remove_instance_config_dir, remove_runner_app_data_dirs,
 };
-use crate::process::{instance_config_dir, remove_instance_config_dir};
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
@@ -1949,10 +1949,18 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             #[cfg(windows)]
             {
                 let _ = remove_webview2_user_data_folder(&id, false).await;
-                let _ = remove_runner_app_data_dirs(&name, false).await;
             }
+            // Cross-platform: dev logs, macros, prompts, playwright, contexts,
+            // Restate journal.
+            let _ = remove_runner_app_data_dirs(&name, false).await;
             // Cross-platform: it holds a copy of the paired state.
             let _ = remove_instance_config_dir(&id, false).await;
+            // The per-runner exe-copy directory (S-2): the other three
+            // removal sites already call this; the periodic max-age sweep
+            // did not, so a temp runner reaped for age (rather than stopped
+            // or purged) leaked its whole `runners/<pool-name>/` directory
+            // (runner exe + shim + git-credential) forever.
+            remove_runner_exe_copy(&state.config, &managed.config);
 
             info!(
                 "reaper: removed stale test runner '{}' (port {})",
@@ -5077,16 +5085,16 @@ pub async fn stop_runner_by_id(
                     runner_id, e
                 );
             }
-            // And the per-instance app data dirs (dev-logs, restate journal,
-            // macros, prompts, playwright, contexts) — keyed off the config
-            // name because that's what the runner received as
-            // QONTINUI_INSTANCE_NAME.
-            if let Err(e) = remove_runner_app_data_dirs(&runner_name, false).await {
-                warn!(
-                    "Failed to remove per-instance app data for test runner '{}': {}",
-                    runner_name, e
-                );
-            }
+        }
+        // Cross-platform: the per-instance app data dirs (dev-logs, restate
+        // journal, macros, prompts, playwright, contexts) — keyed off the
+        // config name because that's what the runner received as
+        // QONTINUI_INSTANCE_NAME.
+        if let Err(e) = remove_runner_app_data_dirs(&runner_name, false).await {
+            warn!(
+                "Failed to remove per-instance app data for test runner '{}': {}",
+                runner_name, e
+            );
         }
         // Cross-platform: the instance dir holds a copy of the paired state
         // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4). Kept when

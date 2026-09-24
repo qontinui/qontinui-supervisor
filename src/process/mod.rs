@@ -213,7 +213,7 @@ pub fn primary_paired_state_dir() -> Option<PathBuf> {
 /// 4. `process::manager::reap_stale_test_runners` (the periodic sweep — and the
 ///    one that can now kill a *live* runner for age)
 ///
-/// All four hand that value to `process::windows::remove_runner_app_data_dirs`,
+/// All four hand that value to [`remove_runner_app_data_dirs`],
 /// whose sanitizer ([`sanitize_instance_name`]) mirrors the
 /// runner's. The id's alphabet is `[0-9a-f-]`, so it survives both sanitizers
 /// unchanged (identity mapping) and the dir removed is exactly the dir created
@@ -242,17 +242,10 @@ pub(crate) fn temp_runner_instance_name(id: &str) -> String {
 ///
 /// **Byte-for-byte mirror of `qontinui-runner`
 /// `src-tauri/src/instance.rs:sanitize()`**, which is what `instance::scope_path`
-/// applies when it creates the `instance-<sanitized>` app-data tree. The
-/// supervisor's `windows::remove_runner_app_data_dirs` is the only consumer:
-/// it must reconstruct exactly the directory the runner created, or teardown
-/// deletes nothing while the real tree leaks — silently, and once per spawn.
-///
-/// **Cross-platform on purpose**, like [`netstat_parse`] and [`slot_territory`]:
-/// this is a cross-repo contract, and the test pinning it must run on the
-/// Linux-only CI gate that blocks merges rather than only on a Windows box.
-/// The `allow` is the price of that placement (the sole non-test consumer is
-/// `#[cfg(target_os = "windows")]`).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// applies when it creates the `instance-<sanitized>` app-data tree. This
+/// module's own [`remove_runner_app_data_dirs`] is the consumer: it must
+/// reconstruct exactly the directory the runner created, or teardown deletes
+/// nothing while the real tree leaks — silently, and once per spawn.
 pub(crate) fn sanitize_instance_name(runner_name: &str) -> String {
     runner_name
         .chars()
@@ -264,6 +257,117 @@ pub(crate) fn sanitize_instance_name(runner_name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Every base location under which `qontinui-runner`'s `instance::scope_path()`
+/// helper may have written an `instance-<sanitized_name>` per-instance tree —
+/// dev logs, macros/ai-workflows, prompts/playwright/contexts, and the Restate
+/// journal — mirroring exactly the bases the runner itself resolves:
+///
+/// - dev-logs (`paths.rs::get_default_dev_logs_dir`):
+///   `dirs::data_local_dir()/qontinui-runner/dev-logs`
+/// - macros / ai_workflows (e.g. `macros.rs::get_storage_dir`):
+///   `dirs::data_local_dir()/qontinui-runner`
+/// - prompts / playwright / contexts (e.g. `prompts.rs::get_prompts_path`):
+///   `dirs::config_dir()/com.qontinui.runner`
+/// - Restate journal (`restate/config.rs::resolve_data_dir`, whose
+///   `app_data_dir` argument is `dirs::data_dir().join("qontinui-runner")` —
+///   see `main.rs`'s Restate-injection block):
+///   `dirs::data_dir()/qontinui-runner/restate/data`
+///
+/// `data_local_dir()`, `data_dir()` and `config_dir()` resolve to Windows'
+/// local/roaming AppData the same way the runner's own calls do (`config_dir()`
+/// and `data_dir()` are the SAME roaming folder on Windows), so this is one
+/// cross-platform resolution rather than a Windows-only one plus a guessed
+/// non-Windows arm. A base that fails to resolve on this platform contributes
+/// no candidate rather than erroring — the caller treats a missing candidate
+/// exactly like one that resolved but does not exist on disk.
+fn app_data_dir_candidates(subdir: &str) -> Vec<PathBuf> {
+    let data_local = dirs::data_local_dir();
+    let data = dirs::data_dir();
+    let config = dirs::config_dir();
+    [
+        data_local
+            .as_ref()
+            .map(|p| p.join("qontinui-runner").join("dev-logs").join(subdir)),
+        data_local
+            .as_ref()
+            .map(|p| p.join("qontinui-runner").join(subdir)),
+        config
+            .as_ref()
+            .map(|p| p.join("com.qontinui.runner").join(subdir)),
+        data.as_ref().map(|p| {
+            p.join("qontinui-runner")
+                .join("restate")
+                .join("data")
+                .join(subdir)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Remove per-instance app-data directories for a non-primary runner.
+///
+/// The runner's `crate::instance::scope_path()` helper writes per-runner dev
+/// logs, macros, prompts, playwright tests, contexts, and Restate journals
+/// under an `instance-<sanitized_name>` subdirectory of several base
+/// locations ([`app_data_dir_candidates`]). When a temp runner is deleted we
+/// clean these up so disk usage doesn't grow unbounded.
+///
+/// `runner_name` must be the `managed.config.name` value that the supervisor
+/// passed to the runner as `QONTINUI_INSTANCE_NAME`. For a **temp** runner
+/// that value now IS the runner id ([`temp_runner_instance_name`]) — it used
+/// to be `test-<port>`, which made two spawns on a recycled port share one
+/// `instance-<name>` tree. Keep resolving it from `config.name` rather than
+/// substituting `config.id` at a call site: named runners still carry an
+/// operator-supplied name, and the two keys must not be assumed equal.
+///
+/// Cross-platform on purpose, like [`remove_instance_config_dir`] beside it.
+/// It used to be `windows::remove_runner_app_data_dirs`, gated
+/// `#[cfg(target_os = "windows")]` at every call site — so on Linux, where
+/// `qontinui-supervisor` `#197` (plan `2026-09-23-conductor-e2e-phase1-defects`,
+/// S-1..S-3) just made temp runners actually survive to populate these trees,
+/// nothing ever reaped them. Every candidate is still probed even when several
+/// resolve to the same directory on a given platform (Windows: `config_dir()`
+/// and `data_dir()` coincide) — `path.exists()` makes the duplicate a no-op,
+/// not a double-count.
+///
+/// Refuses to touch anything for primary runners as a safety check.
+pub async fn remove_runner_app_data_dirs(
+    runner_name: &str,
+    is_primary: bool,
+) -> anyhow::Result<u32> {
+    if is_primary {
+        anyhow::bail!("refusing to remove the primary runner's app data dirs");
+    }
+
+    let subdir = format!("instance-{}", sanitize_instance_name(runner_name));
+    let mut removed = 0u32;
+    for path in app_data_dir_candidates(&subdir) {
+        if !path.exists() {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Removed per-instance app data for runner '{}' at {:?}",
+                    runner_name,
+                    path
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to remove per-instance app data at {:?}: {}",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -387,6 +491,83 @@ mod tests {
     #[tokio::test]
     async fn instance_config_dir_remover_refuses_primary() {
         assert!(super::remove_instance_config_dir("primary", true)
+            .await
+            .is_err());
+    }
+
+    // --- remove_runner_app_data_dirs (app-data instance-tree reaper) ------
+
+    /// Every base that resolves on this platform must produce a candidate
+    /// ending in the `instance-<name>` subdir — so a caller that creates
+    /// markers at each and calls the remover can expect them all gone.
+    #[test]
+    fn app_data_dir_candidates_all_end_in_the_subdir() {
+        let candidates = super::app_data_dir_candidates("instance-selftest");
+        assert!(
+            !candidates.is_empty(),
+            "at least one of data_local_dir/data_dir/config_dir must resolve on CI"
+        );
+        for c in &candidates {
+            assert!(
+                c.ends_with("instance-selftest"),
+                "{c:?} does not end with the instance subdir"
+            );
+        }
+    }
+
+    /// The write side (the runner's own `instance::scope_path()`, mirrored
+    /// here as [`super::app_data_dir_candidates`]) and the reap side
+    /// ([`super::remove_runner_app_data_dirs`]) must resolve the SAME
+    /// directories — same shape as `instance_config_dir_and_remover_agree_on_path`
+    /// above, for the sibling leak class this reaper closes: it used to be
+    /// Windows-only (`windows::remove_runner_app_data_dirs`), so on Linux —
+    /// where qontinui-supervisor #197 just made temp runners survive to
+    /// populate these trees at all — nothing ever reaped them.
+    #[tokio::test]
+    async fn remove_runner_app_data_dirs_removes_every_resolved_candidate() {
+        let runner_name = format!("app-data-selftest-{}", std::process::id());
+        let subdir = format!("instance-{}", sanitize_instance_name(&runner_name));
+        let mut candidates = super::app_data_dir_candidates(&subdir);
+        candidates.sort();
+        candidates.dedup();
+        if candidates.is_empty() {
+            // No resolvable base dir on this platform — nothing to assert.
+            return;
+        }
+        let mut cleanups = Vec::new();
+        for dir in &candidates {
+            std::fs::create_dir_all(dir).expect("create candidate dir");
+            std::fs::write(dir.join("marker.json"), b"{}").expect("write marker");
+            // Same belt-and-braces guard as the instance-config-dir test
+            // above: these live under the operator's real data/config dirs.
+            cleanups.push(scopeguard::guard(dir.clone(), |d| {
+                let _ = std::fs::remove_dir_all(d);
+            }));
+        }
+
+        let removed = super::remove_runner_app_data_dirs(&runner_name, false)
+            .await
+            .expect("remover must not error");
+
+        assert_eq!(
+            removed as usize,
+            candidates.len(),
+            "remove_runner_app_data_dirs did not remove every candidate \
+             app_data_dir_candidates resolved — the write side and the reap side \
+             have diverged"
+        );
+        for dir in &candidates {
+            assert!(!dir.exists(), "{dir:?} must be gone after removal");
+        }
+        cleanups.clear();
+    }
+
+    /// Refuses primaries outright, mirroring `remove_instance_config_dir`'s
+    /// guard — a mis-keyed call can never delete the operator's own runner
+    /// data.
+    #[tokio::test]
+    async fn remove_runner_app_data_dirs_refuses_primary() {
+        assert!(super::remove_runner_app_data_dirs("primary", true)
             .await
             .is_err());
     }
