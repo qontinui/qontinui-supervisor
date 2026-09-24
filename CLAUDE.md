@@ -65,8 +65,9 @@ name and id cannot drift apart again. **No second uuid is minted.** Teardown
 follows automatically: all **four** removal sites (`remove_runner`,
 `purge_stale_test_runners_core`, `manager::stop_runner_by_id`, and
 `manager::reap_stale_test_runners` — the sweep, which can now kill a *live*
-runner for age) hand `managed.config.name` to
-`process::remove_runner_app_data_dirs`, whose sanitizer
+runner for age) go through ONE helper, `manager::reap_runner_instance_state`
+(WebView2 profile, app-data trees, instance config dir), which hands
+`managed.config.name` to `process::remove_runner_app_data_dirs`, whose sanitizer
 (`process::sanitize_instance_name`) mirrors the runner's and maps the id to
 itself. **Cross-platform** — it used to be `windows::remove_runner_app_data_dirs`,
 gated `#[cfg(target_os = "windows")]` at every call site, so on Linux, where
@@ -88,6 +89,19 @@ sites already did, but the sweep did not, so a temp runner reaped for age
 rather than stopped or purged leaked its whole per-runner directory (runner
 exe + shim + git-credential helper) forever. The primary keeps its flat
 `target/debug/qontinui-runner-primary[.exe]`.
+
+**A temp runner's RESTART keeps all of that per-instance state** — pairing
+copy, config, dev logs, Restate journal, macros/prompts, WebView2 profile.
+`stop_runner_by_id` gates the helper on the `restart_requested` latch
+(`manager::reap_instance_state_on_stop`), because the same id comes straight
+back under the same `QONTINUI_INSTANCE_NAME`. Only the exe-copy directory is
+removed, and the start redeploys it. A restart that fails before the start
+re-registers the id reaps the whole set instead (`orphaned_by_failed_restart`),
+since no other path would ever visit that id again. The app-data reap briefly
+escaped this gate after #198 made it cross-platform, so every Linux temp
+restart wiped the logs of the run being restarted. The test
+`temp_restart_keeps_the_instance_state` now fails on any teardown site that
+calls a removal directly instead of through the helper.
 
 **Linux temp AND named runners need a display.** `DisplayEnv` forwards
 `DISPLAY` / `WAYLAND_DISPLAY` / `GDK_BACKEND` / `BROADWAY_DISPLAY` from the

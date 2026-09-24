@@ -904,39 +904,12 @@ pub async fn remove_runner(
     let path = settings::settings_path(&state.config);
     settings::remove_runner(&path, &id);
 
-    // Best-effort: remove the runner's isolated WebView2 data folder so its
-    // localStorage, cookies, and caches don't accumulate on disk. Primary
-    // runners are never reached here (the is_primary check above returns
-    // early), so this always targets a non-primary folder.
-    #[cfg(windows)]
-    {
-        if let Err(e) = crate::process::windows::remove_webview2_user_data_folder(&id, false).await
-        {
-            warn!(
-                "Failed to remove WebView2 data folder for runner '{}': {}",
-                id, e
-            );
-        }
-    }
-    // Cross-platform: per-instance app data dirs (dev-logs, restate journal,
-    // macros, prompts, playwright, contexts) that the runner writes under an
-    // `instance-<name>` subdirectory. The runner sees the env var
-    // `QONTINUI_INSTANCE_NAME = <managed.config.name>`, so cleanup keys off
-    // the name, not the id.
-    if let Err(e) = crate::process::remove_runner_app_data_dirs(&name, false).await {
-        warn!(
-            "Failed to remove per-instance app data for runner '{}': {}",
-            name, e
-        );
-    }
-    // Cross-platform: the instance dir holds a copy of the paired state
-    // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4).
-    if let Err(e) = crate::process::remove_instance_config_dir(&id, false).await {
-        warn!(
-            "Failed to remove instance config dir for runner '{}': {}",
-            id, e
-        );
-    }
+    // Best-effort: the runner's per-instance state — isolated WebView2
+    // profile, `instance-<name>` app-data trees (keyed off the name, which is
+    // what the runner received as `QONTINUI_INSTANCE_NAME`), and the instance
+    // config dir with its copy of the pairing. Primary runners are never
+    // reached here (the is_primary check above returns early).
+    manager::reap_runner_instance_state(&id, &name).await;
 
     // Clean up the per-runner exe copy (its whole directory, sidecars
     // included) for temp runners to prevent disk bloat.
@@ -1128,32 +1101,8 @@ pub async fn purge_stale_test_runners_core(
             runners_map.remove(&id);
         }
 
-        // Best-effort cleanup of on-disk data
-        #[cfg(windows)]
-        {
-            if let Err(e) =
-                crate::process::windows::remove_webview2_user_data_folder(&id, false).await
-            {
-                warn!(
-                    "purge-stale: failed to remove WebView2 data for '{}': {}",
-                    id, e
-                );
-            }
-        }
-        // Cross-platform.
-        if let Err(e) = crate::process::remove_runner_app_data_dirs(&name, false).await {
-            warn!(
-                "purge-stale: failed to remove app data for '{}': {}",
-                name, e
-            );
-        }
-        // Cross-platform: the instance dir holds a copy of the paired state.
-        if let Err(e) = crate::process::remove_instance_config_dir(&id, false).await {
-            warn!(
-                "purge-stale: failed to remove instance config dir for '{}': {}",
-                id, e
-            );
-        }
+        // Best-effort cleanup of on-disk per-instance state.
+        manager::reap_runner_instance_state(&id, &name).await;
 
         // Clean up the per-runner exe copy (its whole directory, sidecars
         // included) to prevent disk bloat.

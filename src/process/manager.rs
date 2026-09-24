@@ -1946,15 +1946,8 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                 runners_map.remove(&id);
             }
 
-            #[cfg(windows)]
-            {
-                let _ = remove_webview2_user_data_folder(&id, false).await;
-            }
-            // Cross-platform: dev logs, macros, prompts, playwright, contexts,
-            // Restate journal.
-            let _ = remove_runner_app_data_dirs(&name, false).await;
-            // Cross-platform: it holds a copy of the paired state.
-            let _ = remove_instance_config_dir(&id, false).await;
+            // WebView2 profile, app-data trees, instance config dir.
+            reap_runner_instance_state(&id, &name).await;
             // The per-runner exe-copy directory (S-2): the other three
             // removal sites already call this; the periodic max-age sweep
             // did not, so a temp runner reaped for age (rather than stopped
@@ -2577,16 +2570,60 @@ pub(crate) fn deploy_sidecar(
     }
 }
 
-/// Whether a temp runner's stop should delete its [`instance_config_dir`].
+/// Whether a temp runner's stop should delete its per-instance state (see
+/// [`reap_runner_instance_state`] for what that covers).
 ///
 /// Not when the stop is the first half of a restart (`restart_requested` is
 /// latched by `restart_runner_by_id` for exactly that window): the same id is
-/// started again at once and must come back with the pairing spawn-test copied
-/// in (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4) and its own
-/// config. Nothing re-applies that snapshot on a restart, so deleting it would
-/// bring the runner back unpaired and first-run.
-pub(crate) fn reap_instance_config_on_stop(restart_requested: bool) -> bool {
+/// started again at once, under the same `QONTINUI_INSTANCE_NAME`, and must
+/// come back with the pairing spawn-test copied in (plan
+/// `2026-09-23-conductor-e2e-phase1-defects`, S-4), its own config, and the
+/// dev logs / Restate journal / macros / prompts of the run being restarted.
+/// Nothing re-applies the pairing snapshot on a restart, so deleting it would
+/// bring the runner back unpaired and first-run; deleting the app data would
+/// destroy the very logs that explain why it was restarted.
+pub(crate) fn reap_instance_state_on_stop(restart_requested: bool) -> bool {
     !restart_requested
+}
+
+/// Delete everything a non-primary runner keeps on disk under its identity,
+/// other than its exe copy ([`remove_runner_exe_copy`], which a restart
+/// redeploys): the isolated WebView2 profile (Windows), the `instance-<name>`
+/// app-data trees ([`remove_runner_app_data_dirs`]), and the
+/// [`instance_config_dir`] holding its copy of the pairing. Best-effort; each
+/// failure is logged. `runner_name` is `config.name` — what the runner
+/// received as `QONTINUI_INSTANCE_NAME` — not the id.
+///
+/// The one place that set is spelled out, so the five teardown paths (a plain
+/// stop and the failed-restart path here, the max-age sweep, `DELETE
+/// /runners/{id}` and `purge-stale`) cannot drift apart. They did: the
+/// app-data reap became cross-platform (qontinui-supervisor #198) outside the
+/// restart gate that already protected the config dir, so every temp restart
+/// on Linux wiped the runner's dev logs and Restate journal.
+pub(crate) async fn reap_runner_instance_state(runner_id: &str, runner_name: &str) {
+    #[cfg(windows)]
+    {
+        if let Err(e) = remove_webview2_user_data_folder(runner_id, false).await {
+            warn!(
+                "Failed to remove WebView2 data folder for runner '{}': {}",
+                runner_id, e
+            );
+        }
+    }
+    // Keyed off the config name, because that is what the runner received as
+    // QONTINUI_INSTANCE_NAME.
+    if let Err(e) = remove_runner_app_data_dirs(runner_name, false).await {
+        warn!(
+            "Failed to remove per-instance app data for runner '{}': {}",
+            runner_name, e
+        );
+    }
+    if let Err(e) = remove_instance_config_dir(runner_id, false).await {
+        warn!(
+            "Failed to remove instance config dir for runner '{}': {}",
+            runner_id, e
+        );
+    }
 }
 
 /// Remove a runner's exe copy and everything deployed beside it.
@@ -5075,43 +5112,16 @@ pub async fn stop_runner_by_id(
             );
         }
         drop(runners);
-        // Also remove the test runner's isolated WebView2 data folder so its
-        // localStorage, cookies, and caches don't accumulate on disk.
-        #[cfg(windows)]
-        {
-            if let Err(e) = remove_webview2_user_data_folder(&runner_id, false).await {
-                warn!(
-                    "Failed to remove WebView2 data folder for test runner '{}': {}",
-                    runner_id, e
-                );
-            }
-        }
-        // Cross-platform: the per-instance app data dirs (dev-logs, restate
-        // journal, macros, prompts, playwright, contexts) — keyed off the
-        // config name because that's what the runner received as
-        // QONTINUI_INSTANCE_NAME.
-        if let Err(e) = remove_runner_app_data_dirs(&runner_name, false).await {
-            warn!(
-                "Failed to remove per-instance app data for test runner '{}': {}",
-                runner_name, e
-            );
-        }
-        // Cross-platform: the instance dir holds a copy of the paired state
-        // (plan `2026-09-23-conductor-e2e-phase1-defects`, S-4). Kept when
-        // this stop is the first half of a restart — see
-        // `reap_instance_config_on_stop`.
+        // The runner's per-instance state (WebView2 profile, app-data trees,
+        // instance config dir with its pairing). Kept when this stop is the
+        // first half of a restart — see `reap_instance_state_on_stop`.
         let restarting = managed.runner.read().await.restart_requested;
-        if reap_instance_config_on_stop(restarting) {
-            if let Err(e) = remove_instance_config_dir(&runner_id, false).await {
-                warn!(
-                    "Failed to remove instance config dir for test runner '{}': {}",
-                    runner_id, e
-                );
-            }
+        if reap_instance_state_on_stop(restarting) {
+            reap_runner_instance_state(&runner_id, &runner_name).await;
         } else {
             info!(
-                "Keeping instance config dir for test runner '{}' across its restart \
-                 (it holds the runner's pairing and config)",
+                "Keeping per-instance state for test runner '{}' across its restart \
+                 (pairing, config, dev logs, Restate journal)",
                 runner_id
             );
         }
@@ -5429,20 +5439,19 @@ pub async fn restart_runner_by_id(
             Ok(())
         }
         Err(e) => {
-            // The stop half kept the temp runner's instance dir for the start
-            // half (`reap_instance_config_on_stop`). If the restart failed
+            // The stop half kept the temp runner's per-instance state for the
+            // start half (`reap_instance_state_on_stop`). If the restart failed
             // before the start re-registered the id (e.g. a failed rebuild),
-            // no cleanup path will ever visit that id again — reap the dir,
-            // with its copy of the pairing, here.
+            // no cleanup path will ever visit that id again — reap all of it,
+            // pairing copy included, here.
             let still_registered = state.get_runner(runner_id).await.is_some();
             if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered) {
-                if let Err(re) = remove_instance_config_dir(runner_id, false).await {
-                    warn!(
-                        "Failed to remove instance config dir for temp runner '{}' after \
-                         its failed restart: {}",
-                        runner_id, re
-                    );
-                }
+                warn!(
+                    "Temp runner '{}' was not re-registered by its failed restart; \
+                     reaping the per-instance state its stop kept",
+                    runner_id
+                );
+                reap_runner_instance_state(runner_id, &managed.config.name).await;
             }
             state
                 .diagnostics
@@ -5457,9 +5466,9 @@ pub async fn restart_runner_by_id(
     }
 }
 
-/// Whether a FAILED restart left a temp runner's instance dir with no owner:
-/// the stop half dropped the id from the registry and kept the dir for a start
-/// that never re-registered it.
+/// Whether a FAILED restart left a temp runner's per-instance state with no owner:
+/// the stop half dropped the id from the registry and kept that state for a
+/// start that never re-registered it.
 pub(crate) fn orphaned_by_failed_restart(is_temp: bool, still_registered: bool) -> bool {
     is_temp && !still_registered
 }
@@ -7317,16 +7326,20 @@ mod tests {
         );
     }
 
-    /// A temp restart keeps the instance dir (pairing + config); a plain stop
-    /// reaps it. Pinned at the pure gate and at its one call site, whose input
-    /// must be the `restart_requested` latch `restart_runner_by_id` sets.
+    /// A temp restart keeps the runner's per-instance state (pairing, config,
+    /// app-data trees, WebView2 profile); a plain stop reaps it. Pinned at the
+    /// pure gate and at its call sites, whose input must be the
+    /// `restart_requested` latch `restart_runner_by_id` sets — and every
+    /// per-instance removal in `stop_runner_by_id` must go through the one
+    /// gated helper, so a removal added beside it cannot escape the gate the
+    /// way the app-data reap did after #198.
     #[test]
-    fn temp_restart_keeps_the_instance_config_dir() {
-        assert!(reap_instance_config_on_stop(false));
-        assert!(!reap_instance_config_on_stop(true));
+    fn temp_restart_keeps_the_instance_state() {
+        assert!(reap_instance_state_on_stop(false));
+        assert!(!reap_instance_state_on_stop(true));
 
         // …and a restart that fails before re-registering the temp id reaps
-        // the dir it kept; a registered or non-temp runner is left alone.
+        // the state it kept; a registered or non-temp runner is left alone.
         assert!(orphaned_by_failed_restart(true, false));
         assert!(!orphaned_by_failed_restart(true, true));
         assert!(!orphaned_by_failed_restart(false, false));
@@ -7339,32 +7352,97 @@ mod tests {
         )
         .expect("read manager.rs")
         .replace("\r\n", "\n");
-        let stop = src
-            .split_once("pub async fn stop_runner_by_id(")
-            .map(|(_, after)| after)
-            .expect("stop_runner_by_id exists");
-        let stop = &stop[..stop.find("\npub async fn ").unwrap_or(stop.len())];
+        let body_of = |sig: &str| {
+            let after = src
+                .split_once(sig)
+                .map(|(_, after)| after)
+                .unwrap_or_else(|| panic!("{sig} exists"));
+            // Up to the function's own closing brace (rustfmt puts a
+            // top-level item's `}` alone at column 0), not the next `pub`
+            // item, so a match cannot come from a neighbouring function.
+            after[..after.find("\n}\n").unwrap_or(after.len())].to_string()
+        };
+
+        let stop = body_of("pub async fn stop_runner_by_id(");
         assert!(
             stop.contains("let restarting = managed.runner.read().await.restart_requested;")
-                && stop.contains("if reap_instance_config_on_stop(restarting)"),
-            "stop_runner_by_id must gate the instance-dir reap on restart_requested"
+                && stop
+                    .split_once("if reap_instance_state_on_stop(restarting) {")
+                    .and_then(|(_, gated)| gated.split('}').next())
+                    .is_some_and(|gated| gated
+                        .contains("reap_runner_instance_state(&runner_id, &runner_name)")),
+            "stop_runner_by_id must gate the per-instance reap on restart_requested"
         );
         assert_eq!(
-            stop.matches("remove_instance_config_dir(").count(),
+            stop.matches("reap_runner_instance_state(").count(),
             1,
-            "exactly one (gated) instance-dir reap in stop_runner_by_id"
+            "exactly one (gated) per-instance reap in stop_runner_by_id"
         );
-        let restart = src
-            .split_once("pub async fn restart_runner_by_id(")
-            .map(|(_, after)| after)
-            .expect("restart_runner_by_id exists");
-        let restart = &restart[..restart.find("\npub ").unwrap_or(restart.len())];
+        for direct in [
+            "remove_instance_config_dir(",
+            "remove_runner_app_data_dirs(",
+            "remove_webview2_user_data_folder(",
+        ] {
+            assert!(
+                !stop.contains(direct),
+                "stop_runner_by_id calls {direct} directly, outside the restart gate"
+            );
+        }
+
+        let restart = body_of("pub async fn restart_runner_by_id(");
         assert!(
             restart.contains(
                 "if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)"
-            ) && restart.contains("remove_instance_config_dir(runner_id, false)"),
-            "a failed temp restart must reap the instance dir its stop half kept"
+            ) && restart.contains("reap_runner_instance_state(runner_id, &managed.config.name)"),
+            "a failed temp restart must reap the per-instance state its stop half kept"
         );
+
+        // The other teardown paths must route through the helper too, not
+        // re-spell its set: the max-age sweep here, and `DELETE
+        // /runners/{id}` / `purge-stale` in routes/runners.rs.
+        let sweep = body_of("pub async fn reap_stale_test_runners(");
+        assert!(sweep.contains("reap_runner_instance_state(&id, &name)"));
+        let routes = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners.rs"),
+        )
+        .expect("read routes/runners.rs");
+        assert_eq!(
+            routes
+                .matches("manager::reap_runner_instance_state(&id, &name)")
+                .count(),
+            2,
+            "remove_runner and purge_stale_test_runners_core must use the helper"
+        );
+        for (site, body) in [
+            ("reap_stale_test_runners", sweep.as_str()),
+            ("routes/runners.rs", routes.as_str()),
+        ] {
+            for direct in [
+                "remove_instance_config_dir(",
+                "remove_runner_app_data_dirs(",
+                "remove_webview2_user_data_folder(",
+            ] {
+                assert!(
+                    !body.contains(direct),
+                    "{site} calls {direct} directly instead of reap_runner_instance_state"
+                );
+            }
+        }
+
+        let helper = body_of("pub(crate) async fn reap_runner_instance_state(");
+        for removal in [
+            "remove_webview2_user_data_folder(runner_id, false)",
+            "remove_runner_app_data_dirs(runner_name, false)",
+            "remove_instance_config_dir(runner_id, false)",
+        ] {
+            assert!(
+                helper.contains(removal),
+                "reap_runner_instance_state must include {removal}"
+            );
+        }
     }
 
     /// S-2: a `Temp` runner's copy lives in its own

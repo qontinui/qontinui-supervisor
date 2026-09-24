@@ -251,13 +251,14 @@ pub struct CliArgs {
     #[arg(long = "no-webview")]
     pub no_webview: bool,
 
-    /// X11 `DISPLAY` value to hand temp runners when the supervisor's own
+    /// X11 `DISPLAY` value to hand temp and named runners when the supervisor's own
     /// environment carries neither `DISPLAY` nor anything to forward — the
     /// common case for a supervisor started from a non-GUI shell (ssh, a
     /// systemd user unit, an agent's Bash tool). Linux only; ignored
     /// elsewhere. Also settable via env `QONTINUI_SUPERVISOR_TEMP_DISPLAY`
-    /// (this flag wins). Without either, a temp spawn on such a box is
-    /// refused with a `no_display:` reason instead of a GTK panic. See
+    /// (this flag wins). Without either, a temp or named spawn on such a box
+    /// is refused with a `no_display:` reason instead of a GTK panic. The
+    /// `temp-` in the name predates named runners being covered. See
     /// `process::env_forwarders::DisplayEnv`.
     #[arg(long = "temp-runner-display")]
     pub temp_runner_display: Option<String>,
@@ -290,7 +291,7 @@ pub struct SupervisorConfig {
     /// When true, skip the ambient dashboard WebView2 window (item B of the
     /// post-3J UI Bridge improvements plan). See [`CliArgs::no_webview`].
     pub no_webview: bool,
-    /// `DISPLAY` to supply to temp runners when the supervisor's environment
+    /// `DISPLAY` to supply to temp and named runners when the supervisor's environment
     /// has none (`--temp-runner-display`, else
     /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`). Blank counts as unset.
     pub temp_runner_display: Option<String>,
