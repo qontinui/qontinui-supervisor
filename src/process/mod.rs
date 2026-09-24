@@ -110,8 +110,9 @@ use std::path::PathBuf;
 /// [`remove_instance_config_dir`] would `remove_dir_all` every
 /// runner's instance dir (its `is_primary` flag does not guard that). Ids are
 /// server-generated today, so this is unreachable — but this function is `pub`
-/// and is the documented single source of truth for four call sites, so the
-/// guard is worth its two comparisons.
+/// and is the single source of truth for every call site that resolves the dir
+/// (spawn, pair, paired-state copy, teardown), so the guard is worth its two
+/// comparisons.
 pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
     if runner_id.is_empty() || runner_id.contains(['/', '\\']) || runner_id.contains("..") {
         return None;
