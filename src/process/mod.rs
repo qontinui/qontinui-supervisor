@@ -282,6 +282,15 @@ pub(crate) fn sanitize_instance_name(runner_name: &str) -> String {
 /// non-Windows arm. A base that fails to resolve on this platform contributes
 /// no candidate rather than erroring — the caller treats a missing candidate
 /// exactly like one that resolved but does not exist on disk.
+///
+/// A fifth candidate, `data_local_dir()/com.qontinui.runner`, is included
+/// purely for parity with the Windows-only predecessor this replaces, which
+/// probed BOTH `LOCALAPPDATA\com.qontinui.runner` and
+/// `APPDATA\com.qontinui.runner`. No current runner code path was found that
+/// writes there — every verified `com.qontinui.runner` consumer resolves
+/// through `config_dir()` (roaming) — but dropping it would be a Windows
+/// behavior change this commit does not intend, and probing one extra path
+/// that never exists costs nothing.
 fn app_data_dir_candidates(subdir: &str) -> Vec<PathBuf> {
     let data_local = dirs::data_local_dir();
     let data = dirs::data_dir();
@@ -293,6 +302,9 @@ fn app_data_dir_candidates(subdir: &str) -> Vec<PathBuf> {
         data_local
             .as_ref()
             .map(|p| p.join("qontinui-runner").join(subdir)),
+        data_local
+            .as_ref()
+            .map(|p| p.join("com.qontinui.runner").join(subdir)),
         config
             .as_ref()
             .map(|p| p.join("com.qontinui.runner").join(subdir)),
