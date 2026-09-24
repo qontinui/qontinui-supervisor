@@ -7445,6 +7445,55 @@ mod tests {
         }
     }
 
+    /// The helper keys each removal on the right half of the identity: the
+    /// instance config dir on the runner ID, the `instance-<name>` app-data
+    /// trees on `config.name`. For a temp runner the two are equal
+    /// ([`crate::process::temp_runner_instance_name`]), so the source scan
+    /// above cannot tell a swapped pair from a correct one; a named runner
+    /// carries an operator-supplied name, and a swap there would leak both
+    /// trees silently. Driven with deliberately DIFFERENT id and name.
+    #[tokio::test]
+    async fn reap_runner_instance_state_keys_config_on_id_and_app_data_on_name() {
+        let pid = std::process::id();
+        let runner_id = format!("named-reap-selftest-id-{pid}");
+        let runner_name = format!("reap-selftest-name-{pid}");
+
+        let Some(config_dir) = instance_config_dir(&runner_id) else {
+            // No resolvable config dir on this platform — nothing to assert.
+            return;
+        };
+        let mut app_data = crate::process::app_data_dir_candidates(&format!(
+            "instance-{}",
+            crate::process::sanitize_instance_name(&runner_name)
+        ));
+        app_data.sort();
+        app_data.dedup();
+
+        // These live under the operator's REAL config/data dirs, so they must
+        // not survive a failing assertion (same guard as process::tests).
+        let mut cleanups = Vec::new();
+        for dir in std::iter::once(&config_dir).chain(app_data.iter()) {
+            std::fs::create_dir_all(dir).expect("create dir");
+            cleanups.push(scopeguard::guard(dir.clone(), |d| {
+                let _ = std::fs::remove_dir_all(d);
+            }));
+            std::fs::write(dir.join("marker.json"), b"{}").expect("write marker");
+        }
+
+        reap_runner_instance_state(&runner_id, &runner_name).await;
+
+        assert!(
+            !config_dir.exists(),
+            "instance config dir {config_dir:?} (keyed on the id) survived the reap"
+        );
+        for dir in &app_data {
+            assert!(
+                !dir.exists(),
+                "app-data tree {dir:?} (keyed on the name) survived the reap"
+            );
+        }
+    }
+
     /// S-2: a `Temp` runner's copy lives in its own
     /// `target/debug/runners/<pool-name>/` directory, so its sidecars land
     /// there and NEVER in the shared `target/debug/` of the live tree (where a

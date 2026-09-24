@@ -62,8 +62,9 @@ inheritance was renamed, not removed.
 already-unique per-spawn runner id (`test-<hex-millis>-<hex-seq>`), which also
 keys `instance_config_dir`, the WebView2 profile and `QONTINUI_RUNNER_ID`, so
 name and id cannot drift apart again. **No second uuid is minted.** Teardown
-follows automatically: all **four** removal sites (`remove_runner`,
-`purge_stale_test_runners_core`, `manager::stop_runner_by_id`, and
+follows automatically: all **five** removal sites (`remove_runner`,
+`purge_stale_test_runners_core`, `manager::stop_runner_by_id`, the
+failed-restart arm of `manager::restart_runner_by_id`, and
 `manager::reap_stale_test_runners` — the sweep, which can now kill a *live*
 runner for age) go through ONE helper, `manager::reap_runner_instance_state`
 (WebView2 profile, app-data trees, instance config dir), which hands

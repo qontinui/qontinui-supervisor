@@ -78,7 +78,9 @@ use std::path::PathBuf;
 ///    copies the requested `paired_profile_id` snapshot INTO it before the
 ///    child process starts.
 /// 3. **Removal side** — [`remove_instance_config_dir`] reaps it when
-///    the runner is deleted.
+///    the runner is torn down, always through
+///    [`manager::reap_runner_instance_state`] (and never on the stop half of
+///    a temp runner's restart, which must come back still paired).
 /// 4. **Pair side** — `routes::runners_pair::pair_with_token` (with
 ///    `target_runner_id`) exports it to the `qontinui_profile` child as
 ///    `QONTINUI_SECURE_STORAGE_DIR` and reads `paired_user.json` back from it,
@@ -205,15 +207,19 @@ pub fn primary_paired_state_dir() -> Option<PathBuf> {
 /// minted.
 ///
 /// **Teardown follows automatically** because every removal site reads
-/// `managed.config.name`. There are **four**, not three:
+/// `managed.config.name`. There are **five**:
 ///
 /// 1. `routes::runners::remove_runner` (the `DELETE` handler)
 /// 2. `routes::runners::purge_stale_test_runners_core`
-/// 3. `process::manager::stop_runner_by_id` (auto-remove arm)
-/// 4. `process::manager::reap_stale_test_runners` (the periodic sweep — and the
+/// 3. `process::manager::stop_runner_by_id` (auto-remove arm, skipped on the
+///    stop half of a restart)
+/// 4. `process::manager::restart_runner_by_id` (a failed restart that never
+///    re-registered the id)
+/// 5. `process::manager::reap_stale_test_runners` (the periodic sweep — and the
 ///    one that can now kill a *live* runner for age)
 ///
-/// All four hand that value to [`remove_runner_app_data_dirs`],
+/// All five go through [`manager::reap_runner_instance_state`], which hands
+/// that value to [`remove_runner_app_data_dirs`],
 /// whose sanitizer ([`sanitize_instance_name`]) mirrors the
 /// runner's. The id's alphabet is `[0-9a-f-]`, so it survives both sanitizers
 /// unchanged (identity mapping) and the dir removed is exactly the dir created
