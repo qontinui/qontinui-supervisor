@@ -152,65 +152,15 @@ fn note_failure(reason: &str) {
 
 /// Everything the POST needs that comes from the filesystem, resolved in one
 /// blocking hop. The bearer is NOT here: it is resolved on the async side of
-/// [`publish`] through the shared [`crate::fleet::resolve_device_bearer`].
+/// [`publish`] through the shared, transport-guarded
+/// [`crate::fleet::resolve_device_bearer_for`].
 struct PublishTarget {
     device_id: String,
-    /// Coord HTTP base, kept so [`bearer_for`] can apply its transport guard.
+    /// Coord HTTP base, kept so [`crate::fleet::resolve_device_bearer_for`]
+    /// can apply its transport guard.
     base: String,
     url: String,
     cpu_cores: u32,
-}
-
-/// Source label reported when no credential resolved at all.
-const SOURCE_NONE: &str = "none (no device JWT resolved)";
-
-/// Source label reported when a credential exists but the transport guard
-/// withheld it.
-const SOURCE_WITHHELD: &str = "none (withheld: coord base is neither https nor loopback)";
-
-/// A bearer to send to `base`, or `None`, with the name of the source it
-/// came from (or why none was sent) for the refusal message.
-///
-/// This is one of the supervisor's outbound credentials, and
-/// [`crate::fleet::coord_http_base`] maps `ws://` to plain `http://` — so a
-/// profile pointing at a non-loopback `ws://` host would put a device JWT on
-/// the wire in cleartext. Attach it only over `https://` or to a loopback
-/// host; everything else publishes unauthenticated and lets coord decide,
-/// which degrades exactly like any other non-2xx.
-///
-/// The credential itself comes from the SHARED cascade
-/// ([`crate::fleet::resolve_device_bearer`]: env → file → runner mint,
-/// falling through on validity, not presence) — this module keeps no second
-/// copy of it.
-async fn bearer_for(base: &str) -> (Option<String>, &'static str) {
-    if !transport_may_carry_bearer(base) {
-        return (None, SOURCE_WITHHELD);
-    }
-    match crate::fleet::resolve_device_bearer().await {
-        Some((token, source)) => (Some(token), source),
-        None => (None, SOURCE_NONE),
-    }
-}
-
-/// The transport half of [`bearer_for`]: `true` over `https://` or to a
-/// loopback host.
-fn transport_may_carry_bearer(base: &str) -> bool {
-    // Parse with a real URL parser rather than splitting on ':' and '/': a
-    // hand split reads `http://localhost:x@evil.com` as host `localhost` and
-    // would send the device JWT in cleartext to `evil.com`. `url` resolves
-    // the userinfo, IPv6 brackets and ports the way the HTTP client will.
-    let Ok(url) = url::Url::parse(base) else {
-        return false;
-    };
-    if url.scheme() == "https" {
-        return true;
-    }
-    match url.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 /// The failure text for a non-2xx publish response.
@@ -228,14 +178,10 @@ fn failure_message(
     body: &str,
     source: &str,
 ) -> String {
-    let head = format!(
-        "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: {body}"
-    );
-    match status.as_u16() {
-        401 | 403 => format!("{head} (credential refused — sent: {source})"),
-        404 => format!("{head} (route not served by this coord)"),
-        _ => head,
-    }
+    let hint = crate::fleet::refusal_hint(status, source);
+    format!(
+        "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: {body}{hint}"
+    )
 }
 
 /// Resolve machine identity, coord URL and CPU count.
@@ -303,7 +249,7 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     } = target;
     // The shared resolver is async (file read + runner mint), so the bearer
     // is resolved here rather than inside the blocking identity hop.
-    let (bearer, bearer_source) = bearer_for(&base).await;
+    let (bearer, bearer_source) = crate::fleet::resolve_device_bearer_for(&base).await;
 
     let payload = payload_from_snapshot(snapshot, cpu_cores);
 
@@ -522,9 +468,14 @@ mod tests {
         assert!(msg.contains("~/.qontinui/coord-device-jwt"), "{msg}");
         assert!(msg.contains("auth_required"), "{msg}");
         assert!(!msg.contains("404 is expected"), "{msg}");
-        let unauth = failure_message(reqwest::StatusCode::UNAUTHORIZED, "d", "", SOURCE_NONE);
+        let unauth = failure_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "d",
+            "",
+            crate::fleet::SOURCE_NONE,
+        );
         assert!(unauth.contains("credential refused"), "{unauth}");
-        assert!(unauth.contains(SOURCE_NONE), "{unauth}");
+        assert!(unauth.contains(crate::fleet::SOURCE_NONE), "{unauth}");
     }
 
     #[test]
@@ -539,36 +490,5 @@ mod tests {
             "COORD_DEVICE_JWT",
         );
         assert!(msg.ends_with(": boom"), "{msg}");
-    }
-
-    #[test]
-    fn the_bearer_rides_only_https_or_loopback() {
-        assert!(transport_may_carry_bearer("https://coord.qontinui.io"));
-        assert!(transport_may_carry_bearer("http://127.0.0.1:9870"));
-        assert!(transport_may_carry_bearer("http://localhost:9870/x"));
-        assert!(transport_may_carry_bearer("http://[::1]:9870"));
-        assert!(transport_may_carry_bearer("ws://[::1]"));
-        assert!(transport_may_carry_bearer("http://[::1]/coord"));
-        assert!(!transport_may_carry_bearer("http://[2001:db8::1]:9870"));
-        assert!(!transport_may_carry_bearer("http://coord.example.com"));
-        assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
-        // Userinfo must not smuggle a remote host past the loopback test.
-        assert!(!transport_may_carry_bearer("http://localhost:x@evil.com"));
-        // Inputs the old hand split wrongly read as loopback.
-        assert!(!transport_may_carry_bearer("ws://[::1]:x@evil.com"));
-        assert!(!transport_may_carry_bearer("http://[::1]@evil.com"));
-        // Hosts are compared the way the HTTP client resolves them.
-        assert!(transport_may_carry_bearer("http://LOCALHOST:9870"));
-        assert!(!transport_may_carry_bearer("http://localhost.:9870"));
-        assert!(!transport_may_carry_bearer("not a url"));
-    }
-
-    /// The withheld arm never reaches the resolver (no env, file or mint is
-    /// consulted), and its label says why nothing was sent.
-    #[tokio::test]
-    async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
-        let (bearer, source) = bearer_for("http://coord.example.com").await;
-        assert!(bearer.is_none());
-        assert_eq!(source, SOURCE_WITHHELD);
     }
 }

@@ -493,7 +493,11 @@ pub(crate) const SOURCE_RUNNER_MINT: &str = "runner UI Bridge mint";
 /// **build-only box with no runner** authenticate at all, since rung 3
 /// structurally cannot answer there. On a workstation running a signed-in
 /// primary runner, rung 3 is the one that resolves.
-pub(crate) async fn resolve_device_bearer() -> Option<(String, &'static str)> {
+///
+/// Private on purpose: every caller goes through [`resolve_device_bearer_for`],
+/// which applies the transport guard first, so no publish can put a device
+/// JWT on a cleartext non-loopback wire.
+async fn resolve_device_bearer() -> Option<(String, &'static str)> {
     let env_token = std::env::var(DEVICE_JWT_ENV).ok();
     let file_token = match device_jwt_file_path() {
         Some(p) => tokio::fs::read_to_string(p).await.ok(),
@@ -509,6 +513,72 @@ pub(crate) async fn resolve_device_bearer() -> Option<(String, &'static str)> {
     mint_device_jwt_from_runner()
         .await
         .map(|token| (token, SOURCE_RUNNER_MINT))
+}
+
+/// A resolved device bearer: the token (if any) and the name of its source,
+/// or — when there is no token — why none is sent. The label travels with
+/// the absence so every log and refusal message can name the real cause.
+pub(crate) type ResolvedBearer = (Option<String>, &'static str);
+
+/// Source label reported when no credential resolved at all.
+pub(crate) const SOURCE_NONE: &str = "none (no usable device JWT resolved)";
+
+/// Source label reported when the transport guard withheld the credential.
+pub(crate) const SOURCE_WITHHELD: &str =
+    "none (withheld: coord base is neither https nor loopback)";
+
+/// The device bearer to send to `base`, or `None`, with the name of the
+/// source it came from — or why none was sent — for the caller's log and
+/// refusal message.
+///
+/// [`coord_http_base`] maps `ws://` to plain `http://`, so a profile pointing
+/// at a non-loopback `ws://` host would put a device JWT on the wire in
+/// cleartext. The guard runs BEFORE the cascade: a withheld base consults no
+/// env var, file or runner mint. Every outbound device-authed POST in this
+/// crate (budget publish, resource sample, serving-watchdog notify) resolves
+/// its bearer here, so the guard cannot be forgotten by one of them.
+pub(crate) async fn resolve_device_bearer_for(base: &str) -> ResolvedBearer {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    match resolve_device_bearer().await {
+        Some((token, source)) => (Some(token), source),
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// The transport half of [`resolve_device_bearer_for`]: `true` over
+/// `https://` or to a loopback host.
+pub(crate) fn transport_may_carry_bearer(base: &str) -> bool {
+    // Parse with a real URL parser rather than splitting on ':' and '/': a
+    // hand split reads `http://localhost:x@evil.com` as host `localhost` and
+    // would send the device JWT in cleartext to `evil.com`. `url` resolves
+    // the userinfo, IPv6 brackets and ports the way the HTTP client will.
+    let Ok(url) = url::Url::parse(base) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// The suffix a device-authed POST appends to its non-2xx error so the one
+/// WARN says what to fix: 401/403 → the credential was refused, naming which
+/// source was sent; 404 → this coord does not serve the route; anything else
+/// → nothing (the status and coord's body already say it). Takes the source
+/// NAME, never the token.
+pub(crate) fn refusal_hint(status: reqwest::StatusCode, source: &str) -> String {
+    match status.as_u16() {
+        401 | 403 => format!(" (credential refused — sent: {source})"),
+        404 => " (route not served by this coord)".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The seeded half of [`resolve_device_bearer`], with the clock and both
@@ -667,7 +737,8 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Attach `Authorization: Bearer <device JWT>` when one is resolvable.
+/// Attach `Authorization: Bearer <device JWT>` when one was resolved by
+/// [`resolve_device_bearer_for`].
 ///
 /// Mirrors the runner's `auth::attach_device_auth` posture: attach when
 /// available, **never fail**. Coord still accepts anonymous budget publishes
@@ -684,32 +755,37 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 /// redact `Authorization`, so a single `{req:?}` in a log or an error would
 /// print the device credential. `the_bearer_never_reaches_the_body_but_debug_would_expose_it`
 /// pins that as measured fact rather than leaving it to be rediscovered.
-/// The publish's own error string formats the URL and the `reqwest::Error`
-/// only, neither of which carries headers.
-pub(crate) async fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    attach_resolved_bearer(rb, resolve_device_bearer().await)
-}
-
-/// The decision half of [`attach_device_auth`], split out from the
-/// resolution half so both arms are assertable without a network, a
-/// process-global env mutation, or a running runner.
+/// The publishes' own error strings format the URL, the `reqwest::Error`,
+/// coord's response body and the source NAME — none of which carries
+/// headers.
+///
+/// Resolution is the caller's (so the request path stays assertable without
+/// a network, a process-global env mutation, or a running runner).
 fn attach_resolved_bearer(
     rb: reqwest::RequestBuilder,
-    resolved: Option<(String, &'static str)>,
+    resolved: ResolvedBearer,
 ) -> reqwest::RequestBuilder {
     match resolved {
-        Some((token, source)) => {
-            info!("fleet::publish_budget: attaching coord device JWT (source: {source})");
+        (Some(token), source) => {
+            info!("fleet: attaching coord device JWT (source: {source})");
             rb.header("Authorization", format!("Bearer {token}"))
         }
-        None => {
+        (None, reason) => {
             MISSING_BEARER_WARNED.call_once(|| {
-                warn!(
-                    "fleet::publish_budget: no coord device JWT available (no {DEVICE_JWT_ENV}, \
-                     no ~/.qontinui/coord-device-jwt, and the local runner did not mint one) — \
-                     publishing ANONYMOUSLY. Seed one of the two files/vars to authenticate on a \
-                     box with no runner."
-                );
+                if reason == SOURCE_WITHHELD {
+                    warn!(
+                        "fleet: coord device JWT {reason} — publishing ANONYMOUSLY. Point the \
+                         active profile's coord_url at wss:// / https:// (or a loopback host) \
+                         to authenticate."
+                    );
+                } else {
+                    warn!(
+                        "fleet: no usable coord device JWT (no unexpired {DEVICE_JWT_ENV}, no \
+                         unexpired ~/.qontinui/coord-device-jwt, and the local runner did not \
+                         mint one) — publishing ANONYMOUSLY. Seed one of the two files/vars to \
+                         authenticate on a box with no runner."
+                    );
+                }
             });
             rb
         }
@@ -778,8 +854,9 @@ pub async fn publish_budget(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
-    let resp = attach_device_auth(client.post(&url).json(&payload))
-        .await
+    let bearer = resolve_device_bearer_for(&base).await;
+    let bearer_source = bearer.1;
+    let resp = attach_resolved_bearer(client.post(&url).json(&payload), bearer)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -794,8 +871,9 @@ pub async fn publish_budget(
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
+        let hint = refusal_hint(status, bearer_source);
         Err(format!(
-            "coord returned {status} for POST /coord/devices/{device_id}/budget: {body}"
+            "coord returned {status} for POST /coord/devices/{device_id}/budget: {body}{hint}"
         ))
     }
 }
@@ -825,7 +903,7 @@ pub async fn publish_on_startup() {
 // out. Three occurrences, 12 h to 5 days each, were surfaced only by a
 // session's closeout. The supervisor is the one process on the box that
 // watches the door from outside AND holds a device-authed coord client
-// (`attach_device_auth`), so it is the only honest origin.
+// (`resolve_device_bearer_for`), so it is the only honest origin.
 //
 // Why `POST /coord/agent-notifications` with `action: "other"`: it is the
 // only door on coord `origin/main` that lands in the operator-pull surface
@@ -1020,7 +1098,9 @@ fn build_fallback_finding_body(
 /// Alert coord that the serving watchdog decided something about a runner.
 ///
 /// Resolves the coord base from the active profile (`coord_http_base`) and
-/// the device bearer through the usual cascade, then posts. See the block
+/// the device bearer through the transport-guarded cascade
+/// ([`resolve_device_bearer_for`] — withheld on a cleartext non-loopback
+/// base), then posts. See the block
 /// comment above for why this exists, why it is `action: other`, and why the
 /// caller MUST spawn it rather than await it on the restart path:
 ///
@@ -1059,7 +1139,7 @@ pub async fn notify_serving_watchdog_at(
     base: &str,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    let bearer = resolve_device_bearer().await;
+    let bearer = resolve_device_bearer_for(base).await;
     let device_id = load_machine_file().and_then(|m| m.device_id().map(str::to_string));
     notify_serving_watchdog_with(base, notice, bearer, device_id.as_deref()).await
 }
@@ -1071,7 +1151,7 @@ pub async fn notify_serving_watchdog_at(
 async fn notify_serving_watchdog_with(
     base: &str,
     notice: &ServingWatchdogNotice,
-    bearer: Option<(String, &'static str)>,
+    bearer: ResolvedBearer,
     device_id: Option<&str>,
 ) -> Result<NotifyOutcome, String> {
     let base = base.trim_end_matches('/');
@@ -1120,9 +1200,9 @@ async fn notify_serving_watchdog_with(
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         warn!(
             "fleet::notify_serving_watchdog: coord refused the device bearer at \
-             {AGENT_NOTIFICATIONS_PATH} ({status}) runner={} event={} — falling back to a \
-             `status` finding on topic operator-notify",
-            notice.runner_id, notice.event
+             {AGENT_NOTIFICATIONS_PATH} ({status}, sent: {}) runner={} event={} — falling back \
+             to a `status` finding on topic operator-notify",
+            bearer.1, notice.runner_id, notice.event
         );
         return post_fallback_finding(&client, base, notice, bearer, device_id).await;
     }
@@ -1139,7 +1219,7 @@ async fn post_fallback_finding(
     client: &reqwest::Client,
     base: &str,
     notice: &ServingWatchdogNotice,
-    bearer: Option<(String, &'static str)>,
+    bearer: ResolvedBearer,
     device_id: Option<&str>,
 ) -> Result<NotifyOutcome, String> {
     let url = format!("{base}{AGENT_FINDINGS_PATH}");
@@ -1367,7 +1447,7 @@ mod tests {
         assert_eq!(usable_token(Some("aaa.bbb.cc c"), "test"), None);
     }
 
-    fn built_request(resolved: Option<(String, &'static str)>) -> reqwest::Request {
+    fn built_request(resolved: ResolvedBearer) -> reqwest::Request {
         let client = reqwest::Client::new();
         let rb = client
             .post("http://127.0.0.1:1/coord/devices/00000000-0000-0000-0000-000000000000/budget")
@@ -1379,7 +1459,7 @@ mod tests {
 
     #[test]
     fn device_auth_attaches_the_bearer_when_a_credential_resolves() {
-        let req = built_request(Some(("aaa.bbb.ccc".to_string(), "test source")));
+        let req = built_request((Some("aaa.bbb.ccc".to_string()), "test source"));
         assert_eq!(
             req.headers()
                 .get("Authorization")
@@ -1391,12 +1471,9 @@ mod tests {
     /// Degrade, never fail: coord still accepts anonymous budget publishes,
     /// so a supervisor with no reachable credential must keep publishing
     /// rather than drop off the fleet.
-    /// Degrade, never fail: coord still accepts anonymous budget publishes,
-    /// so a supervisor with no reachable credential must keep publishing
-    /// rather than drop off the fleet.
     #[test]
     fn device_auth_still_produces_a_well_formed_request_when_no_credential_resolves() {
-        let req = built_request(None);
+        let req = built_request((None, SOURCE_NONE));
         assert!(req.headers().get("Authorization").is_none());
         assert_eq!(req.method(), reqwest::Method::POST);
         assert!(req.url().path().ends_with("/budget"));
@@ -1416,7 +1493,7 @@ mod tests {
     #[test]
     fn the_bearer_never_reaches_the_body_but_debug_would_expose_it() {
         let token = "notatoken.notatoken.notatoken";
-        let req = built_request(Some((token.to_string(), "test source")));
+        let req = built_request((Some(token.to_string()), "test source"));
 
         let body = std::str::from_utf8(
             req.body()
@@ -1682,7 +1759,7 @@ mod tests {
         let outcome = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            (Some("aaa.bbb.ccc".to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1706,7 +1783,7 @@ mod tests {
     async fn notify_without_a_credential_still_posts_and_is_notified_on_200() {
         let (base, seen) = spawn_coord_mock(200, None).await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .expect("delivered");
         assert!(
@@ -1724,9 +1801,10 @@ mod tests {
     async fn notify_429_is_rate_limited_and_never_retried() {
         let (base, seen) = spawn_coord_mock(429, Some("30")).await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, Some("dev-1"))
-            .await
-            .expect("a 429 is a delivery outcome, not an error");
+        let outcome =
+            notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), Some("dev-1"))
+                .await
+                .expect("a 429 is a delivery outcome, not an error");
         assert_eq!(
             outcome,
             NotifyOutcome::RateLimited {
@@ -1741,7 +1819,7 @@ mod tests {
 
         // No header → `None`, still no retry.
         let (base, seen) = spawn_coord_mock(429, None).await;
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1763,7 +1841,7 @@ mod tests {
         let outcome = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            (Some("aaa.bbb.ccc".to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1800,7 +1878,7 @@ mod tests {
     async fn notify_401_falls_back_and_omits_an_unresolvable_device_key() {
         let (base, seen) = spawn_coord_mock(401, None).await;
         let notice = sample_notice(ServingEvent::Disarmed);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .unwrap();
         assert!(
@@ -1829,7 +1907,7 @@ mod tests {
         let err = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some((token.to_string(), "test source")),
+            (Some(token.to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1850,7 +1928,7 @@ mod tests {
     async fn notify_network_error_is_an_error_naming_the_url() {
         let base = dead_base().await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let err = notify_serving_watchdog_with(&base, &notice, None, None)
+        let err = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .expect_err("nothing is listening");
         assert!(err.starts_with("POST "), "{err}");
@@ -2222,5 +2300,55 @@ mod tests {
             assert_eq!(*eval.lock().unwrap(), 0, "status {status}");
         }
         assert_eq!(mint_device_jwt_at(&dead_base().await).await, None);
+    }
+
+    #[test]
+    fn the_bearer_rides_only_https_or_loopback() {
+        assert!(transport_may_carry_bearer("https://coord.qontinui.io"));
+        assert!(transport_may_carry_bearer("http://127.0.0.1:9870"));
+        assert!(transport_may_carry_bearer("http://localhost:9870/x"));
+        assert!(transport_may_carry_bearer("http://[::1]:9870"));
+        assert!(transport_may_carry_bearer("ws://[::1]"));
+        assert!(transport_may_carry_bearer("http://[::1]/coord"));
+        assert!(!transport_may_carry_bearer("http://[2001:db8::1]:9870"));
+        assert!(!transport_may_carry_bearer("http://coord.example.com"));
+        assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
+        // Userinfo must not smuggle a remote host past the loopback test.
+        assert!(!transport_may_carry_bearer("http://localhost:x@evil.com"));
+        // Inputs the old hand split wrongly read as loopback.
+        assert!(!transport_may_carry_bearer("ws://[::1]:x@evil.com"));
+        assert!(!transport_may_carry_bearer("http://[::1]@evil.com"));
+        // Hosts are compared the way the HTTP client resolves them.
+        assert!(transport_may_carry_bearer("http://LOCALHOST:9870"));
+        assert!(!transport_may_carry_bearer("http://localhost.:9870"));
+        assert!(!transport_may_carry_bearer("not a url"));
+    }
+
+    /// The withheld arm never reaches the resolver (no env, file or mint is
+    /// consulted), and its label says why nothing was sent.
+    #[tokio::test]
+    async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
+        let (bearer, source) = resolve_device_bearer_for("http://coord.example.com").await;
+        assert!(bearer.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
+    }
+
+    #[test]
+    fn refusal_hint_names_the_source_on_401_403_and_the_route_on_404() {
+        let h = refusal_hint(reqwest::StatusCode::FORBIDDEN, SOURCE_FILE);
+        assert!(
+            h.contains("credential refused") && h.contains(SOURCE_FILE),
+            "{h}"
+        );
+        let h = refusal_hint(reqwest::StatusCode::UNAUTHORIZED, SOURCE_WITHHELD);
+        assert!(h.contains(SOURCE_WITHHELD), "{h}");
+        assert_eq!(
+            refusal_hint(reqwest::StatusCode::NOT_FOUND, SOURCE_FILE),
+            " (route not served by this coord)"
+        );
+        assert_eq!(
+            refusal_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR, SOURCE_FILE),
+            ""
+        );
     }
 }
