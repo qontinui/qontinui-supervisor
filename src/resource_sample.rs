@@ -554,7 +554,12 @@ mod tests {
         assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
         // Userinfo must not smuggle a remote host past the loopback test.
         assert!(!transport_may_carry_bearer("http://localhost:x@evil.com"));
-        assert!(!transport_may_carry_bearer("ws://127.0.0.1@evil.com:9870"));
+        // Inputs the old hand split wrongly read as loopback.
+        assert!(!transport_may_carry_bearer("ws://[::1]:x@evil.com"));
+        assert!(!transport_may_carry_bearer("http://[::1]@evil.com"));
+        // Hosts are compared the way the HTTP client resolves them.
+        assert!(transport_may_carry_bearer("http://LOCALHOST:9870"));
+        assert!(!transport_may_carry_bearer("http://localhost.:9870"));
         assert!(!transport_may_carry_bearer("not a url"));
     }
 
