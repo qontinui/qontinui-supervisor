@@ -199,10 +199,20 @@ fn transport_may_carry_bearer(base: &str) -> bool {
         .split("://")
         .nth(1)
         .map(|rest| rest.split('/').next().unwrap_or(rest))
-        .map(|hostport| hostport.split(':').next().unwrap_or(hostport))
-        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
+        .map(host_of)
+        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
         .unwrap_or(false);
     base.starts_with("https://") || host_is_loopback
+}
+
+/// The host of an authority's `host[:port]`, with IPv6 brackets stripped:
+/// `[::1]:9870` → `::1`. A plain split on ':' would cut a bracketed IPv6
+/// literal at its first colon and yield `[`.
+fn host_of(hostport: &str) -> &str {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    hostport.split(':').next().unwrap_or(hostport)
 }
 
 /// The failure text for a non-2xx publish response.
@@ -538,6 +548,10 @@ mod tests {
         assert!(transport_may_carry_bearer("https://coord.qontinui.io"));
         assert!(transport_may_carry_bearer("http://127.0.0.1:9870"));
         assert!(transport_may_carry_bearer("http://localhost:9870/x"));
+        assert!(transport_may_carry_bearer("http://[::1]:9870"));
+        assert!(transport_may_carry_bearer("ws://[::1]"));
+        assert!(transport_may_carry_bearer("http://[::1]/coord"));
+        assert!(!transport_may_carry_bearer("http://[2001:db8::1]:9870"));
         assert!(!transport_may_carry_bearer("http://coord.example.com"));
         assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
     }

@@ -389,7 +389,7 @@ async fn mint_device_jwt_at(base: &str) -> Option<String> {
         return None;
     }
     let value: serde_json::Value = resp.json().await.ok()?;
-    parse_invoked_token(&value)
+    parse_invoked_token(&value, chrono::Utc::now().timestamp())
 }
 
 /// The WebView fallback: evaluate `get_coord_device_token` in the runner's
@@ -414,15 +414,16 @@ async fn mint_via_page_evaluate(client: &reqwest::Client, base: &str) -> Option<
         return None;
     }
     let value: serde_json::Value = resp.json().await.ok()?;
-    parse_minted_token(&value)
+    parse_minted_token(&value, chrono::Utc::now().timestamp())
 }
 
 /// Pull the minted token out of an invoke-door response body
 /// (`{"success":true,"data":"<token>"}`), returning it only when it is
-/// shaped like a JWT. `data: null` is the runner's "unpaired" answer and
+/// shaped like a JWT and not expired as of `now`. `data: null` is the
+/// runner's "unpaired" answer and
 /// yields `None` quietly; `success: false` (the command rejected — e.g. the
 /// store is unreadable) yields `None` too.
-fn parse_invoked_token(body: &serde_json::Value) -> Option<String> {
+fn parse_invoked_token(body: &serde_json::Value, now: i64) -> Option<String> {
     if body.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
         warn!(
             "fleet: the runner rejected the get_coord_device_token invoke (success=false) — \
@@ -437,7 +438,11 @@ fn parse_invoked_token(body: &serde_json::Value) -> Option<String> {
     }
     let minted = data.as_str()?.trim();
     if looks_like_jwt(minted) {
-        return Some(minted.to_string());
+        // The runner's no-tenant arm does NOT check `exp` ("validate expiry
+        // before use and treat an expired token as no credential" —
+        // qontinui-runner `ui_bridge_invoke.rs`), so a minted token gets the
+        // same expiry gate as a seeded one.
+        return usable_token_at(Some(minted), SOURCE_RUNNER_MINT, now);
     }
     if !minted.is_empty() {
         warn!(
@@ -450,11 +455,15 @@ fn parse_invoked_token(body: &serde_json::Value) -> Option<String> {
 
 /// Pull the minted token out of a UI-Bridge `page/evaluate` response body
 /// (`{data: {result: {value: "<token>"}}}`), returning it only when it is
-/// shaped like a JWT.
-fn parse_minted_token(body: &serde_json::Value) -> Option<String> {
+/// shaped like a JWT and not expired as of `now`.
+fn parse_minted_token(body: &serde_json::Value, now: i64) -> Option<String> {
     let minted = body.pointer("/data/result/value")?.as_str()?.trim();
     if looks_like_jwt(minted) {
-        return Some(minted.to_string());
+        // The runner's no-tenant arm does NOT check `exp` ("validate expiry
+        // before use and treat an expired token as no credential" —
+        // qontinui-runner `ui_bridge_invoke.rs`), so a minted token gets the
+        // same expiry gate as a seeded one.
+        return usable_token_at(Some(minted), SOURCE_RUNNER_MINT, now);
     }
     if !minted.is_empty() {
         warn!(
@@ -558,16 +567,57 @@ fn usable_token_at(raw: Option<&str>, source: &str, now: i64) -> Option<String> 
         return None;
     }
     if let Some(exp) = jwt_exp(token) {
-        if exp <= now + EXPIRY_SKEW_SECS {
-            warn!(
-                "fleet: device bearer: {source} holds an expired device JWT (exp {exp}, \
-                 {}s ago) — skipping it for the next rung.",
-                now - exp
-            );
+        if exp <= now.saturating_add(EXPIRY_SKEW_SECS) {
+            note_expired_source(source, &expired_note(source, exp, now));
             return None;
         }
     }
     Some(token.to_string())
+}
+
+/// The log text for a skipped (expired or about-to-expire) token. Takes the
+/// source NAME and the `exp` claim, never the token. Saturating arithmetic:
+/// `exp` comes from an unverified payload and may be `i64::MIN` (a
+/// `-1e300` saturates to it), and a debug-build overflow panic here would
+/// kill the footprint task that calls the publish.
+fn expired_note(source: &str, exp: i64, now: i64) -> String {
+    let when = if exp <= now {
+        format!("expired {}s ago", now.saturating_sub(exp))
+    } else {
+        format!(
+            "expires in {}s, inside the {EXPIRY_SKEW_SECS}s skew",
+            exp.saturating_sub(now)
+        )
+    };
+    format!(
+        "fleet: device bearer: {source} holds an expired device JWT (exp {exp}, {when}) — \
+         skipping it for the next rung."
+    )
+}
+
+/// Sources that have already had their "expired" WARN this process.
+static EXPIRED_WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Log a skipped expired token: WARN the first time per SOURCE per process,
+/// DEBUG after. On a Linux box an expired `~/.qontinui/coord-device-jwt` is
+/// the normal state (nothing refreshes it), and the resolver runs on every
+/// footprint publish — an unlatched WARN would repeat every cycle even when
+/// the runner mint then succeeds.
+fn note_expired_source(source: &str, note: &str) {
+    let first = match EXPIRED_WARNED.lock() {
+        Ok(mut seen) if !seen.iter().any(|s| s == source) => {
+            seen.push(source.to_string());
+            true
+        }
+        Ok(_) => false,
+        // A poisoned latch must not silence the signal.
+        Err(_) => true,
+    };
+    if first {
+        warn!("{note} Further occurrences for this source log at DEBUG.");
+    } else {
+        debug!("{note}");
+    }
 }
 
 /// Read the `exp` claim of a JWS-compact token WITHOUT verifying it.
@@ -1288,16 +1338,16 @@ mod tests {
     #[test]
     fn parse_minted_token_takes_a_jwt_and_refuses_every_other_answer() {
         let ok = serde_json::json!({"data": {"result": {"value": "aaa.bbb.ccc"}}});
-        assert_eq!(parse_minted_token(&ok).as_deref(), Some("aaa.bbb.ccc"));
+        assert_eq!(parse_minted_token(&ok, NOW).as_deref(), Some("aaa.bbb.ccc"));
 
         let signed_out = serde_json::json!({"data": {"result": {"value": ""}}});
-        assert_eq!(parse_minted_token(&signed_out), None);
+        assert_eq!(parse_minted_token(&signed_out, NOW), None);
 
         let opaque = serde_json::json!({"data": {"result": {"value": "qontinui_runner_x"}}});
-        assert_eq!(parse_minted_token(&opaque), None);
+        assert_eq!(parse_minted_token(&opaque, NOW), None);
 
         let no_runner_shape = serde_json::json!({"error": "not connected"});
-        assert_eq!(parse_minted_token(&no_runner_shape), None);
+        assert_eq!(parse_minted_token(&no_runner_shape, NOW), None);
     }
 
     /// A seeded rung must not be able to break the publish: an operator
@@ -1872,6 +1922,9 @@ mod tests {
         assert_eq!(base64url_decode("YWJjZ"), None);
         // Standard-alphabet bytes are not base64url.
         assert_eq!(base64url_decode("a+b/"), None);
+        // Known answer exercising both url-safe symbols: '-'=62 '_'=63 '8'=60
+        // → 111110 111111 111100 → 0xfb 0xff (4 pad bits dropped).
+        assert_eq!(base64url_decode("-_8").as_deref(), Some(&[0xfb, 0xff][..]));
     }
 
     #[test]
@@ -1899,6 +1952,31 @@ mod tests {
         assert_eq!(usable_token_at(Some(&lapsing), "test", NOW), None);
         let live = jwt_with(serde_json::json!({"exp": NOW + EXPIRY_SKEW_SECS + 1}));
         assert_eq!(usable_token_at(Some(&live), "test", NOW), Some(live));
+    }
+
+    /// `exp` is read from an UNVERIFIED payload, so an adversarial or
+    /// corrupt value must not overflow (a debug-build panic would kill the
+    /// footprint task that runs the publish).
+    #[test]
+    fn an_extreme_negative_exp_is_expired_without_overflowing() {
+        let min = jwt_with(serde_json::json!({"exp": i64::MIN}));
+        assert_eq!(usable_token_at(Some(&min), "test", NOW), None);
+        let huge_neg = jwt_with(serde_json::json!({"exp": -1e300}));
+        assert_eq!(jwt_exp(&huge_neg), Some(i64::MIN));
+        assert_eq!(usable_token_at(Some(&huge_neg), "test", NOW), None);
+        assert!(expired_note("test", i64::MIN, i64::MAX).contains("expired"));
+    }
+
+    #[test]
+    fn the_expired_note_says_ago_or_expires_in_and_names_only_the_source() {
+        let past = expired_note("SRC", NOW - 1400, NOW);
+        assert!(
+            past.contains("SRC") && past.contains("expired 1400s ago"),
+            "{past}"
+        );
+        let lapsing = expired_note("SRC", NOW + 30, NOW);
+        assert!(lapsing.contains("expires in 30s"), "{lapsing}");
+        assert!(!lapsing.contains("-30"), "{lapsing}");
     }
 
     /// Shape-valid with no readable `exp` stays accepted — coord decides.
@@ -1982,7 +2060,7 @@ mod tests {
             assert_eq!(usable_token_at(Some(&expired), "SRC_NAME", NOW), None);
             assert_eq!(usable_token_at(Some(non_jwt), "SRC_NAME", NOW), None);
             let v = serde_json::json!({"success": true, "data": non_jwt});
-            assert_eq!(parse_invoked_token(&v), None);
+            assert_eq!(parse_invoked_token(&v, NOW), None);
         }
         let text = log.text();
         assert!(
@@ -2003,16 +2081,33 @@ mod tests {
         );
     }
 
+    /// The runner's no-tenant arm does not check `exp`, so a minted token
+    /// gets the seeded rungs' expiry gate on both doors.
+    #[test]
+    fn a_minted_expired_token_is_no_credential_on_either_door() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 5}));
+        let live = jwt_with(serde_json::json!({"exp": NOW + 3600}));
+        let inv = |t: &str| serde_json::json!({"success": true, "data": t});
+        let eval = |t: &str| serde_json::json!({"data": {"result": {"value": t}}});
+        assert_eq!(parse_invoked_token(&inv(&expired), NOW), None);
+        assert_eq!(parse_minted_token(&eval(&expired), NOW), None);
+        assert_eq!(parse_invoked_token(&inv(&live), NOW), Some(live.clone()));
+        assert_eq!(parse_minted_token(&eval(&live), NOW), Some(live));
+    }
+
     #[test]
     fn parse_invoked_token_takes_a_jwt_and_refuses_every_other_answer() {
         let ok = serde_json::json!({"success": true, "data": " aaa.bbb.ccc "});
-        assert_eq!(parse_invoked_token(&ok).as_deref(), Some("aaa.bbb.ccc"));
+        assert_eq!(
+            parse_invoked_token(&ok, NOW).as_deref(),
+            Some("aaa.bbb.ccc")
+        );
         let unpaired = serde_json::json!({"success": true, "data": null});
-        assert_eq!(parse_invoked_token(&unpaired), None);
+        assert_eq!(parse_invoked_token(&unpaired, NOW), None);
         let rejected = serde_json::json!({"success": false, "error": "store unreadable"});
-        assert_eq!(parse_invoked_token(&rejected), None);
+        assert_eq!(parse_invoked_token(&rejected, NOW), None);
         let opaque = serde_json::json!({"success": true, "data": "qontinui_runner_x"});
-        assert_eq!(parse_invoked_token(&opaque), None);
+        assert_eq!(parse_invoked_token(&opaque, NOW), None);
     }
 
     #[derive(Clone)]
@@ -2094,6 +2189,17 @@ mod tests {
         }
     }
 
+    /// An expired token from the invoke door is no credential — and not a
+    /// reason to ask the evaluate door, which reads the same store.
+    #[tokio::test]
+    async fn mint_invoke_expired_token_is_no_bearer() {
+        let expired = jwt_with(serde_json::json!({"exp": 1_000}));
+        let (base, _inv, eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": expired})).await;
+        assert_eq!(mint_device_jwt_at(&base).await, None);
+        assert_eq!(*eval.lock().unwrap(), 0);
+    }
+
     /// Unpaired is an ANSWER: evaluate would ask the same store the same
     /// question.
     #[tokio::test]
@@ -2106,9 +2212,15 @@ mod tests {
 
     #[tokio::test]
     async fn mint_invoke_other_failure_is_no_bearer_and_no_evaluate() {
-        let (base, _inv, eval) = spawn_runner_mock(500, serde_json::json!({"error": "x"})).await;
-        assert_eq!(mint_device_jwt_at(&base).await, None);
-        assert_eq!(*eval.lock().unwrap(), 0);
+        // 409 `tenant_required` is the realistic multi-tenant answer.
+        for (status, body) in [
+            (500, serde_json::json!({"error": "x"})),
+            (409, serde_json::json!({"error": "tenant_required"})),
+        ] {
+            let (base, _inv, eval) = spawn_runner_mock(status, body).await;
+            assert_eq!(mint_device_jwt_at(&base).await, None, "status {status}");
+            assert_eq!(*eval.lock().unwrap(), 0, "status {status}");
+        }
         assert_eq!(mint_device_jwt_at(&dead_base().await).await, None);
     }
 }
