@@ -66,7 +66,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::diagnostics::ServingEvent;
 
@@ -328,6 +328,38 @@ fn looks_like_jwt(token: &str) -> bool {
 /// signed-out runner, non-JWT answer). The token is kept in-process: it is
 /// never written to disk, never placed on a command line, and never logged.
 async fn mint_device_jwt_from_runner() -> Option<String> {
+    // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
+    // first and the runner binds the IPv4 loopback only, so the name form
+    // pays a doomed IPv6 connect before the socket that answers.
+    let base = format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT);
+    mint_device_jwt_at(&base).await
+}
+
+/// Path of the runner's in-process command door for the device-token probe.
+const MINT_INVOKE_PATH: &str = "/ui-bridge/invoke/get_coord_device_token";
+
+/// Path of the WebView evaluation door — the pre-invoke fallback.
+const MINT_EVALUATE_PATH: &str = "/ui-bridge/control/page/evaluate";
+
+/// [`mint_device_jwt_from_runner`] against an explicit runner base — the
+/// seam the tests drive against an in-process fake runner.
+///
+/// Two doors, in order:
+///
+/// 1. `POST {base}/ui-bridge/invoke/get_coord_device_token` with `{}` — the
+///    runner's in-process command door, answering
+///    `{"success":true,"data":"<jwt>"}`. It needs no WebView, so it also
+///    answers on a HEADLESS runner, where the evaluate door cannot. It is
+///    the door the fleet's cache renderers already prefer.
+/// 2. `POST {base}/ui-bridge/control/page/evaluate` — today's WebView
+///    evaluation of the same command, used **only** when door 1 answers
+///    HTTP 400 or 404, i.e. a runner build that has no invoke entry for it.
+///
+/// Every other door-1 outcome is final. In particular `data: null` means
+/// the runner is UNPAIRED: the evaluate door would ask the same store the
+/// same question, so falling through would only spend a second round trip
+/// on a known answer.
+async fn mint_device_jwt_at(base: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(MINT_TIMEOUT)
         // The mint targets the loopback. reqwest honours `HTTP_PROXY` /
@@ -337,13 +369,32 @@ async fn mint_device_jwt_from_runner() -> Option<String> {
         .no_proxy()
         .build()
         .ok()?;
-    // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
-    // first and the runner binds the IPv4 loopback only, so the name form
-    // pays a doomed IPv6 connect before the socket that answers.
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/control/page/evaluate",
-        crate::config::RUNNER_API_PORT
-    );
+    let base = base.trim_end_matches('/');
+
+    let resp = client
+        .post(format!("{base}{MINT_INVOKE_PATH}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::NOT_FOUND {
+        debug!(
+            "fleet: runner answered the invoke mint door {status} (build without the invoke \
+             entry) — falling back to page/evaluate"
+        );
+        return mint_via_page_evaluate(&client, base).await;
+    }
+    if !status.is_success() {
+        return None;
+    }
+    let value: serde_json::Value = resp.json().await.ok()?;
+    parse_invoked_token(&value)
+}
+
+/// The WebView fallback: evaluate `get_coord_device_token` in the runner's
+/// page. Only reached when the invoke door says it does not exist.
+async fn mint_via_page_evaluate(client: &reqwest::Client, base: &str) -> Option<String> {
     // `PageEvaluateRequest` is `rename_all = "camelCase"` — `await_promise`
     // would be silently dropped (no `deny_unknown_fields`) and default to
     // false. `timeoutMs` bounds the runner-side evaluation so giving up at
@@ -353,12 +404,48 @@ async fn mint_device_jwt_from_runner() -> Option<String> {
         "awaitPromise": true,
         "timeoutMs": MINT_TIMEOUT.as_millis() as u64,
     });
-    let resp = client.post(&url).json(&body).send().await.ok()?;
+    let resp = client
+        .post(format!("{base}{MINT_EVALUATE_PATH}"))
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let value: serde_json::Value = resp.json().await.ok()?;
     parse_minted_token(&value)
+}
+
+/// Pull the minted token out of an invoke-door response body
+/// (`{"success":true,"data":"<token>"}`), returning it only when it is
+/// shaped like a JWT. `data: null` is the runner's "unpaired" answer and
+/// yields `None` quietly; `success: false` (the command rejected — e.g. the
+/// store is unreadable) yields `None` too.
+fn parse_invoked_token(body: &serde_json::Value) -> Option<String> {
+    if body.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        warn!(
+            "fleet: the runner rejected the get_coord_device_token invoke (success=false) — \
+             no minted device JWT."
+        );
+        return None;
+    }
+    let data = body.get("data")?;
+    if data.is_null() {
+        debug!("fleet: the runner answered get_coord_device_token with null (unpaired)");
+        return None;
+    }
+    let minted = data.as_str()?.trim();
+    if looks_like_jwt(minted) {
+        return Some(minted.to_string());
+    }
+    if !minted.is_empty() {
+        warn!(
+            "fleet: the runner answered the token mint with a non-JWT value (signed out?) — \
+             ignoring it."
+        );
+    }
+    None
 }
 
 /// Pull the minted token out of a UI-Bridge `page/evaluate` response body
@@ -371,17 +458,24 @@ fn parse_minted_token(body: &serde_json::Value) -> Option<String> {
     }
     if !minted.is_empty() {
         warn!(
-            "fleet::publish_budget: the runner answered the token mint with a non-JWT value \
-             (signed out?) — ignoring it and publishing unauthenticated."
+            "fleet: the runner answered the token mint with a non-JWT value (signed out?) — \
+             ignoring it."
         );
     }
     None
 }
 
+/// Source name reported when the bearer came from `~/.qontinui/coord-device-jwt`.
+pub(crate) const SOURCE_FILE: &str = "~/.qontinui/coord-device-jwt";
+
+/// Source name reported when the bearer was minted by the local runner.
+pub(crate) const SOURCE_RUNNER_MINT: &str = "runner UI Bridge mint";
+
 /// Resolve a coord device JWT, returning it with the name of the source
 /// that produced it (for logging — the token itself is never logged).
 ///
-/// Cascade, most-explicit first:
+/// Cascade, most-explicit first, falling through on **validity, not
+/// presence** (an expired seeded token is skipped — see [`usable_token`]):
 /// 1. `$COORD_DEVICE_JWT`;
 /// 2. `~/.qontinui/coord-device-jwt`;
 /// 3. a mint from the local runner's UI Bridge.
@@ -390,41 +484,137 @@ fn parse_minted_token(body: &serde_json::Value) -> Option<String> {
 /// **build-only box with no runner** authenticate at all, since rung 3
 /// structurally cannot answer there. On a workstation running a signed-in
 /// primary runner, rung 3 is the one that resolves.
-async fn resolve_device_bearer() -> Option<(String, &'static str)> {
+pub(crate) async fn resolve_device_bearer() -> Option<(String, &'static str)> {
     let env_token = std::env::var(DEVICE_JWT_ENV).ok();
-    if let Some(token) = usable_token(env_token.as_deref(), DEVICE_JWT_ENV) {
-        return Some((token, DEVICE_JWT_ENV));
-    }
     let file_token = match device_jwt_file_path() {
         Some(p) => tokio::fs::read_to_string(p).await.ok(),
         None => None,
     };
-    if let Some(token) = usable_token(file_token.as_deref(), "~/.qontinui/coord-device-jwt") {
-        return Some((token, "~/.qontinui/coord-device-jwt"));
+    if let Some(seeded) = select_seeded_bearer(
+        env_token.as_deref(),
+        file_token.as_deref(),
+        chrono::Utc::now().timestamp(),
+    ) {
+        return Some(seeded);
     }
     mint_device_jwt_from_runner()
         .await
-        .map(|token| (token, "runner UI Bridge mint"))
+        .map(|token| (token, SOURCE_RUNNER_MINT))
 }
 
-/// Trim a seeded token and accept it only if it is shaped like a JWT.
+/// The seeded half of [`resolve_device_bearer`], with the clock and both
+/// raw values passed in, so the env-over-file order and the expiry
+/// fall-through are assertable without mutating process-global env or the
+/// operator's credential file.
+fn select_seeded_bearer(
+    env_token: Option<&str>,
+    file_token: Option<&str>,
+    now: i64,
+) -> Option<(String, &'static str)> {
+    if let Some(token) = usable_token_at(env_token, DEVICE_JWT_ENV, now) {
+        return Some((token, DEVICE_JWT_ENV));
+    }
+    usable_token_at(file_token, SOURCE_FILE, now).map(|token| (token, SOURCE_FILE))
+}
+
+/// A seeded token whose `exp` falls within this many seconds of now is
+/// treated as already expired: it would lapse in flight, or within the
+/// publish's own retry horizon.
+const EXPIRY_SKEW_SECS: i64 = 60;
+
+/// Trim a seeded token and accept it only if it is shaped like a JWT and
+/// not expired, as of the current clock. See [`usable_token_at`].
+#[cfg(test)]
+fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
+    usable_token_at(raw, source, chrono::Utc::now().timestamp())
+}
+
+/// Trim a seeded token and accept it only if it is shaped like a JWT and
+/// its `exp` is more than [`EXPIRY_SKEW_SECS`] after `now`.
 ///
 /// The seeded rungs are shape-checked for the same reason the mint is, plus
 /// one of their own: an operator-authored file or env var can carry a
 /// trailing newline or an outright wrong value, and a header value built
 /// from that makes `RequestBuilder::build()` fail — turning "bad
-/// credential" into "the budget publish stopped happening". Degrading to
-/// the next rung keeps the publish alive and says why.
-fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
+/// credential" into "the publish stopped happening". Degrading to the next
+/// rung keeps the publish alive and says why.
+///
+/// The **expiry** check exists because both seeded rungs are static while
+/// device JWTs live ~4 h, and nothing on a Linux box refreshes the file on a
+/// schedule. Selecting on presence sent an hours-dead token, coord refused
+/// it 403, and the next rung — a live runner mint — was never tried. The
+/// payload is decoded WITHOUT a signature check (coord verifies); only
+/// `exp` is read. A token with no readable `exp` stays accepted: it is
+/// shape-valid and coord decides.
+///
+/// Logs carry the source NAME only, never the token.
+fn usable_token_at(raw: Option<&str>, source: &str, now: i64) -> Option<String> {
     let token = raw?.trim();
     if token.is_empty() {
         return None;
     }
     if !looks_like_jwt(token) {
-        warn!("fleet::publish_budget: {source} holds a non-JWT value — ignoring it.");
+        warn!("fleet: device bearer: {source} holds a non-JWT value — ignoring it.");
         return None;
     }
+    if let Some(exp) = jwt_exp(token) {
+        if exp <= now + EXPIRY_SKEW_SECS {
+            warn!(
+                "fleet: device bearer: {source} holds an expired device JWT (exp {exp}, \
+                 {}s ago) — skipping it for the next rung.",
+                now - exp
+            );
+            return None;
+        }
+    }
     Some(token.to_string())
+}
+
+/// Read the `exp` claim of a JWS-compact token WITHOUT verifying it.
+///
+/// `None` when the payload segment is not base64url, not JSON, or carries
+/// no numeric `exp` — all of which the caller treats as "no readable exp".
+fn jwt_exp(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64url_decode(payload)?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?;
+    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+}
+
+/// Minimal unpadded base64url decoder (RFC 4648 §5), padding tolerated.
+///
+/// Hand-rolled rather than a `base64` dependency: it is only ever used to
+/// read one claim out of a JWT payload, and this crate declares no base64
+/// crate of its own. `None` on any byte outside the alphabet or an
+/// impossible length (a lone trailing sextet).
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    fn sextet(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some(u32::from(b - b'A')),
+            b'a'..=b'z' => Some(u32::from(b - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(b - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let input = input.trim_end_matches('=').as_bytes();
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.chunks(4) {
+        let mut acc: u32 = 0;
+        for &b in chunk {
+            acc = (acc << 6) | sextet(b)?;
+        }
+        // Left-align the chunk's bits into 24, then emit its whole bytes.
+        acc <<= 6 * (4 - chunk.len() as u32);
+        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&bytes[..chunk.len() - 1]);
+    }
+    Some(out)
 }
 
 /// Attach `Authorization: Bearer <device JWT>` when one is resolvable.
@@ -1635,5 +1825,290 @@ mod tests {
             None
         );
         assert_eq!(id_from_body(&serde_json::Value::Null, "finding_id"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device-bearer validity + the invoke-first mint.
+    // -----------------------------------------------------------------------
+
+    /// Test-only base64url encoder (unpadded), the inverse of
+    /// [`base64url_decode`].
+    fn b64url(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut acc: u32 = 0;
+            for (i, &b) in chunk.iter().enumerate() {
+                acc |= u32::from(b) << (16 - 8 * i);
+            }
+            for i in 0..=chunk.len() {
+                out.push(A[((acc >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// A JWS-compact token whose payload is `claims`. Unsigned — the
+    /// supervisor never verifies a signature, coord does.
+    fn jwt_with(claims: serde_json::Value) -> String {
+        format!(
+            "{}.{}.c2ln",
+            b64url(br#"{"alg":"HS256","typ":"JWT"}"#),
+            b64url(claims.to_string().as_bytes())
+        )
+    }
+
+    const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn base64url_decode_round_trips_every_tail_length_and_refuses_junk() {
+        let inputs: [&[u8]; 6] = [b"", b"a", b"ab", b"abc", b"abcd", b"\xff\xfe\x00?>"];
+        for input in inputs {
+            assert_eq!(base64url_decode(&b64url(input)).as_deref(), Some(input));
+        }
+        // Padding is tolerated.
+        assert_eq!(base64url_decode("YQ==").as_deref(), Some(&b"a"[..]));
+        // A lone trailing sextet cannot encode a byte.
+        assert_eq!(base64url_decode("YWJjZ"), None);
+        // Standard-alphabet bytes are not base64url.
+        assert_eq!(base64url_decode("a+b/"), None);
+    }
+
+    #[test]
+    fn jwt_exp_reads_the_claim_and_is_none_when_unreadable() {
+        assert_eq!(
+            jwt_exp(&jwt_with(serde_json::json!({"exp": 123}))),
+            Some(123)
+        );
+        assert_eq!(
+            jwt_exp(&jwt_with(serde_json::json!({"exp": 123.9}))),
+            Some(123)
+        );
+        assert_eq!(jwt_exp(&jwt_with(serde_json::json!({"sub": "x"}))), None);
+        assert_eq!(jwt_exp(&jwt_with(serde_json::json!({"exp": "soon"}))), None);
+        // `bbb` is not a JSON payload.
+        assert_eq!(jwt_exp("aaa.bbb.ccc"), None);
+    }
+
+    #[test]
+    fn an_expired_seeded_token_is_skipped_and_a_near_expiry_one_too() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 1400}));
+        assert_eq!(usable_token_at(Some(&expired), "test", NOW), None);
+        // Within the 60 s skew: would lapse in flight.
+        let lapsing = jwt_with(serde_json::json!({"exp": NOW + EXPIRY_SKEW_SECS}));
+        assert_eq!(usable_token_at(Some(&lapsing), "test", NOW), None);
+        let live = jwt_with(serde_json::json!({"exp": NOW + EXPIRY_SKEW_SECS + 1}));
+        assert_eq!(usable_token_at(Some(&live), "test", NOW), Some(live));
+    }
+
+    /// Shape-valid with no readable `exp` stays accepted — coord decides.
+    #[test]
+    fn a_token_with_no_readable_exp_is_accepted() {
+        let no_exp = jwt_with(serde_json::json!({"sub": "device"}));
+        assert_eq!(usable_token_at(Some(&no_exp), "test", NOW), Some(no_exp));
+        assert_eq!(
+            usable_token_at(Some("aaa.bbb.ccc"), "test", NOW).as_deref(),
+            Some("aaa.bbb.ccc")
+        );
+    }
+
+    /// The incident shape: an hours-dead `$COORD_DEVICE_JWT` must not shadow
+    /// a live file token.
+    #[test]
+    fn an_expired_env_token_falls_through_to_a_valid_file_token() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 1400}));
+        let live = jwt_with(serde_json::json!({"exp": NOW + 3600}));
+        assert_eq!(
+            select_seeded_bearer(Some(&expired), Some(&live), NOW),
+            Some((live.clone(), SOURCE_FILE))
+        );
+        // Env still wins when it is live.
+        let env_live = jwt_with(serde_json::json!({"exp": NOW + 7200}));
+        assert_eq!(
+            select_seeded_bearer(Some(&env_live), Some(&live), NOW),
+            Some((env_live, DEVICE_JWT_ENV))
+        );
+        // Both expired → nothing seeded, so the caller goes on to the mint.
+        assert_eq!(
+            select_seeded_bearer(Some(&expired), Some(&expired), NOW),
+            None
+        );
+    }
+
+    /// Captures everything logged on this thread while the guard is held.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLog {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let sub = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(sub)
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Every log line the seeded rungs and the mint parsers can emit names
+    /// the source and never the token.
+    #[test]
+    fn no_bearer_log_line_carries_the_token() {
+        let log = CapturedLog::default();
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 10}));
+        let non_jwt = "opaque-secret-value-with-no-dots";
+        {
+            let _g = log.install();
+            assert_eq!(usable_token_at(Some(&expired), "SRC_NAME", NOW), None);
+            assert_eq!(usable_token_at(Some(non_jwt), "SRC_NAME", NOW), None);
+            let v = serde_json::json!({"success": true, "data": non_jwt});
+            assert_eq!(parse_invoked_token(&v), None);
+        }
+        let text = log.text();
+        assert!(
+            text.contains("SRC_NAME") && text.contains("expired"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&expired),
+            "token leaked into a log line: {text}"
+        );
+        // Neither half of the token, either.
+        for segment in expired.split('.') {
+            assert!(!text.contains(segment), "token segment leaked: {text}");
+        }
+        assert!(
+            !text.contains(non_jwt),
+            "value leaked into a log line: {text}"
+        );
+    }
+
+    #[test]
+    fn parse_invoked_token_takes_a_jwt_and_refuses_every_other_answer() {
+        let ok = serde_json::json!({"success": true, "data": " aaa.bbb.ccc "});
+        assert_eq!(parse_invoked_token(&ok).as_deref(), Some("aaa.bbb.ccc"));
+        let unpaired = serde_json::json!({"success": true, "data": null});
+        assert_eq!(parse_invoked_token(&unpaired), None);
+        let rejected = serde_json::json!({"success": false, "error": "store unreadable"});
+        assert_eq!(parse_invoked_token(&rejected), None);
+        let opaque = serde_json::json!({"success": true, "data": "qontinui_runner_x"});
+        assert_eq!(parse_invoked_token(&opaque), None);
+    }
+
+    #[derive(Clone)]
+    struct RunnerMock {
+        invoke_status: u16,
+        invoke_body: serde_json::Value,
+        invoke_hits: Arc<Mutex<u32>>,
+        evaluate_hits: Arc<Mutex<u32>>,
+    }
+
+    const EVALUATE_TOKEN: &str = "eval.minted.token";
+
+    async fn mock_invoke(State(st): State<RunnerMock>) -> axum::response::Response {
+        *st.invoke_hits.lock().unwrap() += 1;
+        (
+            StatusCode::from_u16(st.invoke_status).unwrap(),
+            Json(st.invoke_body.clone()),
+        )
+            .into_response()
+    }
+
+    async fn mock_evaluate(State(st): State<RunnerMock>) -> axum::response::Response {
+        *st.evaluate_hits.lock().unwrap() += 1;
+        Json(serde_json::json!({"data": {"result": {"value": EVALUATE_TOKEN}}})).into_response()
+    }
+
+    /// A runner stand-in on an ephemeral loopback port serving both mint
+    /// doors. Returns the base and the (invoke, evaluate) hit counters.
+    async fn spawn_runner_mock(
+        invoke_status: u16,
+        invoke_body: serde_json::Value,
+    ) -> (String, Arc<Mutex<u32>>, Arc<Mutex<u32>>) {
+        let st = RunnerMock {
+            invoke_status,
+            invoke_body,
+            invoke_hits: Arc::new(Mutex::new(0)),
+            evaluate_hits: Arc::new(Mutex::new(0)),
+        };
+        let (inv, eval) = (Arc::clone(&st.invoke_hits), Arc::clone(&st.evaluate_hits));
+        let app = Router::new()
+            .route(MINT_INVOKE_PATH, post(mock_invoke))
+            .route(MINT_EVALUATE_PATH, post(mock_evaluate))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), inv, eval)
+    }
+
+    #[tokio::test]
+    async fn mint_takes_the_invoke_answer_and_never_calls_evaluate() {
+        let (base, inv, eval) = spawn_runner_mock(
+            200,
+            serde_json::json!({"success": true, "data": "inv.minted.token"}),
+        )
+        .await;
+        assert_eq!(
+            mint_device_jwt_at(&base).await.as_deref(),
+            Some("inv.minted.token")
+        );
+        assert_eq!(*inv.lock().unwrap(), 1);
+        assert_eq!(*eval.lock().unwrap(), 0, "evaluate must not be called");
+    }
+
+    #[tokio::test]
+    async fn mint_falls_back_to_evaluate_on_invoke_400_and_404() {
+        for status in [400, 404] {
+            let (base, inv, eval) =
+                spawn_runner_mock(status, serde_json::json!({"error": "unknown command"})).await;
+            assert_eq!(
+                mint_device_jwt_at(&base).await.as_deref(),
+                Some(EVALUATE_TOKEN),
+                "status {status}"
+            );
+            assert_eq!(*inv.lock().unwrap(), 1);
+            assert_eq!(*eval.lock().unwrap(), 1, "status {status}");
+        }
+    }
+
+    /// Unpaired is an ANSWER: evaluate would ask the same store the same
+    /// question.
+    #[tokio::test]
+    async fn mint_invoke_null_is_no_bearer_and_no_evaluate() {
+        let (base, _inv, eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": null})).await;
+        assert_eq!(mint_device_jwt_at(&base).await, None);
+        assert_eq!(*eval.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mint_invoke_other_failure_is_no_bearer_and_no_evaluate() {
+        let (base, _inv, eval) = spawn_runner_mock(500, serde_json::json!({"error": "x"})).await;
+        assert_eq!(mint_device_jwt_at(&base).await, None);
+        assert_eq!(*eval.lock().unwrap(), 0);
+        assert_eq!(mint_device_jwt_at(&dead_base().await).await, None);
     }
 }

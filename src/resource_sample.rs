@@ -28,9 +28,11 @@
 //! naming the cause; subsequent ones drop to DEBUG so a coord outage cannot
 //! spam the supervisor log. A coord outage must never affect a build.
 //!
-//! **The ingest route lands via a sibling coord PR.** Until it does, this POSTs
-//! into a 404 and degrades silently by design — which is exactly the posture it
-//! must have during any later coord outage, so it is not a temporary shim.
+//! **The ingest route is served** (`qontinui-coord`
+//! `crates/coord/src/device_resource_samples.rs`). A refusal is therefore
+//! reported by status — a 401/403 names the credential source that was sent,
+//! a 404 says this coord does not serve the route — so the one WARN an
+//! episode gets says what to fix.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -51,9 +53,6 @@ const LANE: &str = "host";
 /// Publisher class, per §A1's `source` column (`runner` | `supervisor` |
 /// `ci-step`).
 const SOURCE: &str = "supervisor";
-
-/// Env var carrying a coord device JWT, checked before the on-disk file.
-const DEVICE_JWT_ENV: &str = "COORD_DEVICE_JWT";
 
 /// One-shot latch so a persistent failure warns once and then goes quiet.
 static WARNED_ONCE: AtomicBool = AtomicBool::new(false);
@@ -138,32 +137,6 @@ pub fn payload_from_snapshot(
     }
 }
 
-/// A coord device bearer, if this host has one.
-///
-/// The supervisor holds no credentials of its own (see `routes::web_fleet` and
-/// `routes::ci_runner`, which forward the caller's `Authorization` verbatim and
-/// add nothing), so this reads the machine-wide device JWT: `$COORD_DEVICE_JWT`
-/// first, then `~/.qontinui/coord-device-jwt`. `None` means the POST goes out
-/// unauthenticated exactly like the sibling budget publish — coord decides
-/// whether to accept it, and a refusal degrades silently like any other
-/// non-2xx.
-fn device_bearer() -> Option<String> {
-    if let Ok(v) = std::env::var(DEVICE_JWT_ENV) {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    let path = dirs::home_dir()?.join(".qontinui").join("coord-device-jwt");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 /// Log a publish failure: WARN the first time (naming the cause), DEBUG after.
 fn note_failure(reason: &str) {
     if WARNED_ONCE.swap(true, Ordering::Relaxed) {
@@ -178,25 +151,50 @@ fn note_failure(reason: &str) {
 }
 
 /// Everything the POST needs that comes from the filesystem, resolved in one
-/// blocking hop.
+/// blocking hop. The bearer is NOT here: it is resolved on the async side of
+/// [`publish`] through the shared [`crate::fleet::resolve_device_bearer`].
 struct PublishTarget {
     device_id: String,
+    /// Coord HTTP base, kept so [`bearer_for`] can apply its transport guard.
+    base: String,
     url: String,
-    /// `Some` only when a credential exists AND the transport is safe to carry
-    /// it on — see [`bearer_for`].
-    bearer: Option<String>,
     cpu_cores: u32,
 }
 
-/// A bearer to send to `base`, or `None`.
+/// Source label reported when no credential resolved at all.
+const SOURCE_NONE: &str = "none (no device JWT resolved)";
+
+/// Source label reported when a credential exists but the transport guard
+/// withheld it.
+const SOURCE_WITHHELD: &str = "none (withheld: coord base is neither https nor loopback)";
+
+/// A bearer to send to `base`, or `None`, with the name of the source it
+/// came from (or why none was sent) for the refusal message.
 ///
-/// This is the supervisor's FIRST outbound credential (the sibling budget POST
-/// sends none), and [`crate::fleet::coord_http_base`] maps `ws://` to plain
-/// `http://` — so a profile pointing at a non-loopback `ws://` host would put a
-/// device JWT on the wire in cleartext. Attach it only over `https://` or to a
-/// loopback host; everything else publishes unauthenticated and lets coord
-/// decide, which degrades exactly like any other non-2xx.
-fn bearer_for(base: &str) -> Option<String> {
+/// This is one of the supervisor's outbound credentials, and
+/// [`crate::fleet::coord_http_base`] maps `ws://` to plain `http://` — so a
+/// profile pointing at a non-loopback `ws://` host would put a device JWT on
+/// the wire in cleartext. Attach it only over `https://` or to a loopback
+/// host; everything else publishes unauthenticated and lets coord decide,
+/// which degrades exactly like any other non-2xx.
+///
+/// The credential itself comes from the SHARED cascade
+/// ([`crate::fleet::resolve_device_bearer`]: env → file → runner mint,
+/// falling through on validity, not presence) — this module keeps no second
+/// copy of it.
+async fn bearer_for(base: &str) -> (Option<String>, &'static str) {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    match crate::fleet::resolve_device_bearer().await {
+        Some((token, source)) => (Some(token), source),
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// The transport half of [`bearer_for`]: `true` over `https://` or to a
+/// loopback host.
+fn transport_may_carry_bearer(base: &str) -> bool {
     let host_is_loopback = base
         .split("://")
         .nth(1)
@@ -204,17 +202,38 @@ fn bearer_for(base: &str) -> Option<String> {
         .map(|hostport| hostport.split(':').next().unwrap_or(hostport))
         .map(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
         .unwrap_or(false);
-    if base.starts_with("https://") || host_is_loopback {
-        device_bearer()
-    } else {
-        None
+    base.starts_with("https://") || host_is_loopback
+}
+
+/// The failure text for a non-2xx publish response.
+///
+/// Status-specific, because the one WARN an episode gets is the operator's
+/// only signal that this host fell off fleet telemetry:
+/// - 401/403 → the credential was refused, naming which source was sent;
+/// - 404 → this coord does not serve the route;
+/// - anything else → the status and coord's own body.
+///
+/// Takes the source NAME, never the token.
+fn failure_message(
+    status: reqwest::StatusCode,
+    device_id: &str,
+    body: &str,
+    source: &str,
+) -> String {
+    let head = format!(
+        "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: {body}"
+    );
+    match status.as_u16() {
+        401 | 403 => format!("{head} (credential refused — sent: {source})"),
+        404 => format!("{head} (route not served by this coord)"),
+        _ => head,
     }
 }
 
-/// Resolve machine identity, coord URL, credential and CPU count.
+/// Resolve machine identity, coord URL and CPU count.
 ///
-/// Every step here touches the filesystem (`machine.json`, `profiles.json`, the
-/// device-JWT file), so it runs inside `spawn_blocking` — a stalled volume must
+/// Every step here touches the filesystem (`machine.json`, `profiles.json`),
+/// so it runs inside `spawn_blocking` — a stalled volume must
 /// not park a tokio worker, and the surrounding code already knows this (the
 /// footprint walk is `spawn_blocking`-hosted for the same reason).
 ///
@@ -237,7 +256,6 @@ fn resolve_target() -> Result<PublishTarget, String> {
     let base = crate::fleet::coord_http_base().ok_or_else(|| {
         "~/.qontinui/profiles.json missing or its active profile has no coord_url".to_string()
     })?;
-    let bearer = bearer_for(&base);
     // Same probe `fleet::detect_resources` uses for `cpu_cores`, without its
     // disk enumeration + memory refresh — this module must not re-sample what
     // the footprint snapshot already carries.
@@ -248,7 +266,7 @@ fn resolve_target() -> Result<PublishTarget, String> {
     Ok(PublishTarget {
         url: format!("{base}/coord/devices/{device_id}/resource-sample"),
         device_id,
-        bearer,
+        base,
         cpu_cores,
     })
 }
@@ -271,10 +289,13 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     };
     let PublishTarget {
         device_id,
+        base,
         url,
-        bearer,
         cpu_cores,
     } = target;
+    // The shared resolver is async (file read + runner mint), so the bearer
+    // is resolved here rather than inside the blocking identity hop.
+    let (bearer, bearer_source) = bearer_for(&base).await;
 
     let payload = payload_from_snapshot(snapshot, cpu_cores);
 
@@ -292,11 +313,10 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             // Re-arm the warn-once latch: "once" must mean once per failure
-            // EPISODE, not once per process. Otherwise the expected 404 at boot
-            // (before the coord ingest route lands) consumes the only WARN this
-            // module will ever emit, and a later real failure — an expired JWT,
-            // a coord outage — takes this machine off the fleet dashboard in
-            // total silence.
+            // EPISODE, not once per process. Otherwise one early refusal
+            // consumes the only WARN this module will ever emit, and a later
+            // real failure — an expired JWT, a coord outage — takes this
+            // machine off the fleet dashboard in total silence.
             WARNED_ONCE.store(false, Ordering::Relaxed);
             debug!(
                 "resource_sample: published lane={LANE} device_id={device_id} \
@@ -312,10 +332,7 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
             // failure; bound it so a stray HTML page can't fill the log.
             let mut body = resp.text().await.unwrap_or_default();
             body.truncate(500);
-            note_failure(&format!(
-                "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: \
-                 {body} (a 404 is expected until the coord ingest route lands)"
-            ));
+            note_failure(&failure_message(status, &device_id, &body, bearer_source));
         }
         Err(e) => note_failure(&format!("POST {url}: {e}")),
     }
@@ -483,5 +500,54 @@ mod tests {
         } else {
             assert!(got.is_some());
         }
+    }
+
+    #[test]
+    fn a_403_names_the_credential_source_and_blames_no_route() {
+        let msg = failure_message(
+            reqwest::StatusCode::FORBIDDEN,
+            "00000000-0000-0000-0000-000000000001",
+            r#"{"error":"auth_required"}"#,
+            "~/.qontinui/coord-device-jwt",
+        );
+        assert!(msg.contains("credential refused"), "{msg}");
+        assert!(msg.contains("~/.qontinui/coord-device-jwt"), "{msg}");
+        assert!(msg.contains("auth_required"), "{msg}");
+        assert!(!msg.contains("404 is expected"), "{msg}");
+        let unauth = failure_message(reqwest::StatusCode::UNAUTHORIZED, "d", "", SOURCE_NONE);
+        assert!(unauth.contains("credential refused"), "{unauth}");
+        assert!(unauth.contains(SOURCE_NONE), "{unauth}");
+    }
+
+    #[test]
+    fn a_404_says_the_route_is_not_served_and_other_statuses_stay_plain() {
+        let msg = failure_message(reqwest::StatusCode::NOT_FOUND, "d", "", "COORD_DEVICE_JWT");
+        assert!(msg.contains("route not served by this coord"), "{msg}");
+        assert!(!msg.contains("credential"), "{msg}");
+        let msg = failure_message(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "d",
+            "boom",
+            "COORD_DEVICE_JWT",
+        );
+        assert!(msg.ends_with(": boom"), "{msg}");
+    }
+
+    #[test]
+    fn the_bearer_rides_only_https_or_loopback() {
+        assert!(transport_may_carry_bearer("https://coord.qontinui.io"));
+        assert!(transport_may_carry_bearer("http://127.0.0.1:9870"));
+        assert!(transport_may_carry_bearer("http://localhost:9870/x"));
+        assert!(!transport_may_carry_bearer("http://coord.example.com"));
+        assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
+    }
+
+    /// The withheld arm never reaches the resolver (no env, file or mint is
+    /// consulted), and its label says why nothing was sent.
+    #[tokio::test]
+    async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
+        let (bearer, source) = bearer_for("http://coord.example.com").await;
+        assert!(bearer.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
     }
 }
