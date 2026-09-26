@@ -381,6 +381,30 @@ jobs:
                  "deleted tests. Do NOT lower the floor to make this pass."
             exit 1
           fi
+
+          # ── NO SILENT RECOMPILE ──────────────────────────────────────────
+          # Plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target,
+          # Phase 3. The failure mode here is silent: a recompile costs ~44s and
+          # changes no verdict, so nothing reds when it comes back. This step
+          # existing at all is what re-runs the crate a second time in this job
+          # (see the step's own history above); it must never itself become the
+          # reason the crate rebuilds.
+          # CARGO_TERM_COLOR=always (workflow-level) makes cargo inject an SGR
+          # reset code between "Compiling" and the package name even when
+          # piped, so a plain `grep 'Compiling qontinui-supervisor'` NEVER
+          # matches — proven by the plan's own mutation case: with the bug
+          # reintroduced, this step measured 47.03s (a real recompile) and
+          # the un-stripped grep still read clean. Strip SGR sequences first.
+          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-mla.out | grep -q 'Compiling qontinui-supervisor'; then
+            echo "::error::qontinui-supervisor recompiled during this step — it should" \
+                 "already be built from 'Run tests' above. That is the exact defect" \
+                 "plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target" \
+                 "fixed (build.rs's git_ref_paths() watching an absent packed-refs path made" \
+                 "build-script-build, and everything depending on it, dirty on every cargo" \
+                 "invocation). Do not silence this by deleting the assertion; find what" \
+                 "made the build script dirty again."
+            exit 1
+          fi
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
@@ -547,6 +571,18 @@ jobs:
                  "was given. Add it to EXPECTED_PRIMITIVES above; do not delete the" \
                  "announcement. tests/orphan_kill_contract.rs asserts the two stay in step and" \
                  "should have failed in the 'Run tests' step before this one ran."
+            exit 1
+          fi
+
+          # ── NO SILENT RECOMPILE ──────────────────────────────────────────
+          # Plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target,
+          # Phase 3. Same reasoning as the roster step above — a recompile
+          # here is a ~44s regression that changes no verdict.
+          # See the roster step's identical assertion above for why this
+          # strips SGR sequences before grepping.
+          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-orphan.out | grep -q 'Compiling qontinui-supervisor'; then
+            echo "::error::qontinui-supervisor recompiled during this step — see the" \
+                 "roster step's identical assertion above for what this means and why."
             exit 1
           fi
           exit "${SUBRC}"
