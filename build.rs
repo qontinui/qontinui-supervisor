@@ -141,40 +141,20 @@ fn emit_self_build_provenance() {
 ///
 /// Resolved through `git rev-parse --git-path` rather than assuming `.git/…`:
 /// this repo is routinely built from linked worktrees, where `.git` is a FILE
-/// and the real ref store lives elsewhere.
-///
-/// **Only a path that currently `exists()` is emitted.** `git rev-parse
-/// --git-path <name>` always succeeds and returns *where that file would
-/// live*, whether or not it is there right now — `packed-refs` in particular
-/// is absent on a fresh `actions/checkout@v5` tree, since refs stay loose
-/// until something runs `git gc` / `git pack-refs`. This is NOT harmless to
-/// emit anyway: cargo's `rerun-if-changed` treats a target it cannot find as
-/// perpetually changed, so a missing path here makes `build-script-build`
-/// dirty on *every* cargo invocation, which invalidates every unit depending
-/// on it — i.e. the whole crate, every time. Measured on run
-/// <https://github.com/qontinui/qontinui-supervisor/actions/runs/36232704075>
-/// (plan `2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target`,
-/// Phase 1): `packed-refs` absent → `qontinui-supervisor` recompiled on every
-/// one of five separate cargo invocations in one job. Skipping an absent path
-/// only narrows coverage in the (rare, and self-correcting) window before
-/// something first creates it — a fresh checkout has no commit history to
-/// switch away from yet either — never re-introduces the perpetual-dirty
-/// condition this file used to claim was harmless.
+/// and the real ref store lives elsewhere. Silently emitting a non-existent
+/// path would make cargo re-run the script on every build (harmless) or, worse,
+/// look like coverage that is not there.
 fn git_ref_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for name in ["HEAD", "packed-refs"] {
         if let Some(p) = git(&["rev-parse", "--git-path", name]) {
-            if std::path::Path::new(&p).exists() {
-                paths.push(p);
-            }
+            paths.push(p);
         }
     }
     // Detached HEAD ⇒ no symbolic ref ⇒ nothing more to watch.
     if let Some(sym) = git(&["symbolic-ref", "-q", "HEAD"]) {
         if let Some(p) = git(&["rev-parse", "--git-path", &sym]) {
-            if std::path::Path::new(&p).exists() {
-                paths.push(p);
-            }
+            paths.push(p);
         }
     }
     paths
