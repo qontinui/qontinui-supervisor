@@ -389,7 +389,13 @@ jobs:
           # existing at all is what re-runs the crate a second time in this job
           # (see the step's own history above); it must never itself become the
           # reason the crate rebuilds.
-          if grep -q 'Compiling qontinui-supervisor' /tmp/cargo-mla.out; then
+          # CARGO_TERM_COLOR=always (workflow-level) makes cargo inject an SGR
+          # reset code between "Compiling" and the package name even when
+          # piped, so a plain `grep 'Compiling qontinui-supervisor'` NEVER
+          # matches — proven by the plan's own mutation case: with the bug
+          # reintroduced, this step measured 47.03s (a real recompile) and
+          # the un-stripped grep still read clean. Strip SGR sequences first.
+          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-mla.out | grep -q 'Compiling qontinui-supervisor'; then
             echo "::error::qontinui-supervisor recompiled during this step — it should" \
                  "already be built from 'Run tests' above. That is the exact defect" \
                  "plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target" \
@@ -572,7 +578,9 @@ jobs:
           # Plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target,
           # Phase 3. Same reasoning as the roster step above — a recompile
           # here is a ~44s regression that changes no verdict.
-          if grep -q 'Compiling qontinui-supervisor' /tmp/cargo-orphan.out; then
+          # See the roster step's identical assertion above for why this
+          # strips SGR sequences before grepping.
+          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-orphan.out | grep -q 'Compiling qontinui-supervisor'; then
             echo "::error::qontinui-supervisor recompiled during this step — see the" \
                  "roster step's identical assertion above for what this means and why."
             exit 1
