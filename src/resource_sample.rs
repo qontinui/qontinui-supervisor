@@ -195,24 +195,22 @@ async fn bearer_for(base: &str) -> (Option<String>, &'static str) {
 /// The transport half of [`bearer_for`]: `true` over `https://` or to a
 /// loopback host.
 fn transport_may_carry_bearer(base: &str) -> bool {
-    let host_is_loopback = base
-        .split("://")
-        .nth(1)
-        .map(|rest| rest.split('/').next().unwrap_or(rest))
-        .map(host_of)
-        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
-        .unwrap_or(false);
-    base.starts_with("https://") || host_is_loopback
-}
-
-/// The host of an authority's `host[:port]`, with IPv6 brackets stripped:
-/// `[::1]:9870` → `::1`. A plain split on ':' would cut a bracketed IPv6
-/// literal at its first colon and yield `[`.
-fn host_of(hostport: &str) -> &str {
-    if let Some(rest) = hostport.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+    // Parse with a real URL parser rather than splitting on ':' and '/': a
+    // hand split reads `http://localhost:x@evil.com` as host `localhost` and
+    // would send the device JWT in cleartext to `evil.com`. `url` resolves
+    // the userinfo, IPv6 brackets and ports the way the HTTP client will.
+    let Ok(url) = url::Url::parse(base) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
     }
-    hostport.split(':').next().unwrap_or(hostport)
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The failure text for a non-2xx publish response.
@@ -554,6 +552,10 @@ mod tests {
         assert!(!transport_may_carry_bearer("http://[2001:db8::1]:9870"));
         assert!(!transport_may_carry_bearer("http://coord.example.com"));
         assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
+        // Userinfo must not smuggle a remote host past the loopback test.
+        assert!(!transport_may_carry_bearer("http://localhost:x@evil.com"));
+        assert!(!transport_may_carry_bearer("ws://127.0.0.1@evil.com:9870"));
+        assert!(!transport_may_carry_bearer("not a url"));
     }
 
     /// The withheld arm never reaches the resolver (no env, file or mint is
