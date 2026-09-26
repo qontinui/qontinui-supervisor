@@ -132,8 +132,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: TEMP diagnostic — stat dist/ before clippy
+        run: |
+          echo "::notice::dist stat before clippy step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: |
+          cargo clippy -- -D warnings
+          echo "::notice::dist stat after clippy step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
 
       # The vacuity parser below is a COPY. Its source of record is
       # qontinui-claude-config/scripts/lib/cargo-vacuity.sh, which this runner
@@ -157,9 +166,16 @@ jobs:
       - name: Run tests
         run: |
           set +e
-          cargo test 2>&1 | tee /tmp/cargo-test.out
+          CARGO_LOG=cargo::core::compiler::fingerprint=info cargo test 2>&1 | tee /tmp/cargo-test.out
           SUBRC=${PIPESTATUS[0]}
           set -e
+
+          # TEMPORARY DIAGNOSTIC — plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target Phase 1
+          echo "::notice::dist stat after Run tests step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
+          echo "::notice::fingerprint dirty lines for qontinui-supervisor (Run tests step):"
+          grep -i 'dirty' /tmp/cargo-test.out | grep -i supervisor || echo "::notice::no dirty/supervisor line found in Run tests step output"
 
           # ── TEST-COUNT FLOOR ────────────────────────────────────────────
           # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
@@ -336,6 +352,13 @@ jobs:
       # `Finished ... in 44.01s`. The re-run is still worth ~44s; the number is
       # now measured rather than assumed. The recompile itself is a separate
       # defect (~90s per run across the two re-run steps) and is not fixed here.
+      # TEMPORARY DIAGNOSTIC — plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target
+      # Phase 1. Removed once the fingerprint reason is quoted in the plan.
+      - name: TEMP diagnostic — stat dist/ before roster step
+        run: |
+          echo "::notice::dist stat before roster step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
       - name: Record the machine-local artifact roster verdict
         run: |
           # `--test <target>` is a TARGET selector and cargo errors on an unknown
@@ -350,6 +373,14 @@ jobs:
           cargo test --test machine_local_artifacts -- --nocapture 2>&1 | tee /tmp/cargo-mla.out
           SUBRC=${PIPESTATUS[0]}
           set -e
+
+          # TEMPORARY DIAGNOSTIC — Phase 1: quote cargo's own fingerprint dirty
+          # reason verbatim, and confirm whether dist moved during this step.
+          echo "::notice::dist stat after roster step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
+          echo "::notice::fingerprint dirty lines for qontinui-supervisor (roster step):"
+          grep -i 'dirty' /tmp/cargo-mla.out | grep -i supervisor || echo "::notice::no dirty/supervisor line found in roster step output"
 
           # ── TEST-COUNT FLOOR ────────────────────────────────────────────
           # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
@@ -384,6 +415,8 @@ jobs:
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+          # TEMPORARY DIAGNOSTIC — plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target Phase 1
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
 
       # Same reason, for the orphan-kill suite — and here the silence is not
       # merely unaudited, it is a green that can mean the suite never ran.
@@ -414,12 +447,25 @@ jobs:
       # and the sibling step above at 44.01s for the same reason. The claim that
       # it "costs milliseconds" was inherited, not measured; the steps are still
       # worth their ~44s, but the number is stated rather than guessed.
+      - name: TEMP diagnostic — stat dist/ before orphan step
+        run: |
+          echo "::notice::dist stat before orphan step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
       - name: Record the orphan-kill suite's skip reasons
         run: |
           set +e
           cargo test --test orphan_kill_unix -- --nocapture 2>&1 | tee /tmp/cargo-orphan.out
           SUBRC=${PIPESTATUS[0]}
           set -e
+
+          # TEMPORARY DIAGNOSTIC — Phase 1: quote cargo's own fingerprint dirty
+          # reason verbatim, and confirm whether dist moved during this step.
+          echo "::notice::dist stat after orphan step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
+          echo "::notice::fingerprint dirty lines for qontinui-supervisor (orphan step):"
+          grep -i 'dirty' /tmp/cargo-orphan.out | grep -i supervisor || echo "::notice::no dirty/supervisor line found in orphan step output"
 
           # ── THE PRIMITIVE ROSTER ────────────────────────────────────────
           # One name per D7 kill primitive, and the SINGLE declaration that
@@ -550,9 +596,23 @@ jobs:
             exit 1
           fi
           exit "${SUBRC}"
+        env:
+          # TEMPORARY DIAGNOSTIC — plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target Phase 1
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
 
+      - name: TEMP diagnostic — stat dist/ before Build step
+        run: |
+          echo "::notice::dist stat before Build step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
       - name: Build
-        run: cargo build
+        run: |
+          CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build 2>&1 | tee /tmp/cargo-build.out
+          echo "::notice::dist stat after Build step:"
+          stat dist 2>&1 || echo "dist: absent"
+          stat dist/index.html 2>&1 || echo "dist/index.html: absent"
+          echo "::notice::fingerprint dirty lines for qontinui-supervisor (Build step):"
+          grep -i 'dirty' /tmp/cargo-build.out | grep -i supervisor || echo "::notice::no dirty/supervisor line found in Build step output"
 
   # The pin script's refusals are the whole safety property (a missing or
   # malformed pin must never degrade to "fetch main"), so they are tested here.
