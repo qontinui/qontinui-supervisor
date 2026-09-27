@@ -1148,9 +1148,10 @@ impl SupervisorConfig {
     /// flat in `target/debug/`.
     ///
     /// **Why a directory per runner.** The runner resolves its helper
-    /// binaries (the `qontinui-shim` identity stub, the git credential
-    /// helper) from `current_exe().parent()`, and the supervisor deploys them
-    /// beside the copy ([`crate::process::manager::deploy_shim_sidecar`]).
+    /// binaries (the `qontinui-shim` identity stub, the `qontinui-pr` session
+    /// CLI, the git credential helper) from `current_exe().parent()`, and the
+    /// supervisor deploys them beside the copy
+    /// ([`crate::process::manager::deploy_sidecar`]).
     /// With a flat copy that "beside" was the SHARED `target/debug/` of the
     /// live tree, so every temp spawn overwrote the primary's sidecars. A
     /// directory per runner keeps each runner's sidecars its own, and lets

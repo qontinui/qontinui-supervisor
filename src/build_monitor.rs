@@ -1564,10 +1564,12 @@ async fn run_build_inner(
     // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
     // from devUrl (localhost:1420), which isn't running.
     //
-    // NOTE: after this build succeeds, `build_shim_sidecar` runs a second,
-    // fail-open `cargo build --bin qontinui-shim` on the same warm target dir
-    // so the install-interception stub is produced in lockstep with the runner
-    // exe (see [`SHIM_EXE_FILENAME`] for the placement contract).
+    // NOTE: after this build succeeds, `build_sidecars` runs a second,
+    // fail-open `cargo build --keep-going` over the sidecar roster
+    // (`qontinui-shim`, `qontinui-pr`, `qontinui_profile` — see
+    // [`SIDECAR_BUILD_ARGS`]) on the same warm target dir, so the helper
+    // binaries are produced in lockstep with the runner exe (see
+    // [`SHIM_EXE_FILENAME`] for the placement contract).
     const CARGO_BUILD_ARGS: &[&str] = &[
         "build",
         "--bin",
@@ -1836,11 +1838,12 @@ async fn run_build_inner(
             .await;
         info!("Build completed successfully");
 
-        // Lockstep sidecar: also produce `qontinui-shim.exe` in this slot's
-        // debug dir so the deploy/placement steps can carry it alongside the
-        // runner exe. Fail-open — a shim build failure logs one WARN and never
+        // Lockstep sidecars: also produce the roster (`qontinui-shim`,
+        // `qontinui-pr`, `qontinui_profile`) in this slot's debug dir so the
+        // LKG carry and the deploy steps can take them alongside the runner
+        // exe. Fail-open — a sidecar failure logs a WARN per sidecar and never
         // fails the (already successful) runner build.
-        build_shim_sidecar(state, slot, cargo_cwd).await;
+        build_sidecars(state, slot, cargo_cwd).await;
 
         info!(
             "GCMD: cargo step returned status=success, run_build_inner returning Ok (slot={})",
@@ -1964,19 +1967,30 @@ async fn persist_and_render_incomplete_build(
 
 /// Filename of the install-interception shadow-stub sidecar binary built
 /// alongside the runner (`[[bin]] name = "qontinui-shim"` in the runner's
-/// `src-tauri/Cargo.toml`).
+/// `src-tauri/Cargo.toml`). One entry of the sidecar roster,
+/// [`RUNNER_SIDECARS`].
 ///
-/// PLACEMENT CONTRACT: every runner resolves this stub via
-/// `current_exe().parent()` (`locate_stub_exe` in the runner's
-/// `shim_materializer.rs`) and materializes it into each terminal's identity
-/// shim dir. The stub must therefore be deployed IN LOCKSTEP with the runner
-/// exe:
-///   1. built into the same slot `debug/` dir right after the runner build
-///      ([`build_shim_sidecar`], called from `run_build_inner`);
+/// PLACEMENT CONTRACT — it covers EVERY entry of [`RUNNER_SIDECARS`]
+/// (`qontinui-shim`, `qontinui-pr`, `qontinui_profile`), not just this one.
+/// Each sidecar is produced and carried IN LOCKSTEP with the runner exe:
+///   1. built into the same slot `debug/` dir right after the runner build, in
+///      ONE `cargo build --keep-going` over the whole roster
+///      ([`build_sidecars`], called from `run_build_inner`), and then checked
+///      by name to exist AND be non-empty;
 ///   2. carried into `target-pool/lkg/` by [`update_lkg_after_success`];
-///   3. copied next to the per-runner exe copy in `target/debug/` by
-///      `process::manager::start_exe_mode_for_runner` (the single deploy
-///      funnel for primary, named, and temp runners).
+///   3. copied next to the per-runner exe copy by
+///      `process::manager::start_exe_mode_for_runner` (the single deploy funnel
+///      for primary, named, and temp runners) — for the entries the runner
+///      resolves via `current_exe().parent()`
+///      ([`RunnerSidecar::deployed_beside_runner`]).
+///
+/// A ZERO-LENGTH sidecar is never propagated by any of the three steps. The
+/// runner's `build.rs` writes 0-byte `binaries/<name>-<triple>` placeholders,
+/// and tauri-build copies them over `<target>/<profile>/<name>` on every
+/// build-script run; a supervisor that never built `--bin qontinui-pr` left
+/// that 0-byte copy beside every runner it started, the runner put it on every
+/// terminal's PATH, and `qontinui-pr create` exited 0 having opened no PR
+/// (plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
 ///
 /// A runner deployed without a fresh sidecar materializes whatever stale stub
 /// happens to sit next to it — the 2026-07-03 incident where a 3-week-old
@@ -1987,101 +2001,255 @@ pub const SHIM_EXE_FILENAME: &str = "qontinui-shim.exe";
 #[cfg(not(windows))]
 pub const SHIM_EXE_FILENAME: &str = "qontinui-shim";
 
-/// Wall-clock budget for the fail-open `cargo build --bin qontinui-shim`
-/// sidecar step. It runs right after the main runner build succeeded on the
-/// SAME warm `CARGO_TARGET_DIR` with the SAME feature set, so every shared
-/// dependency is already compiled — the shim itself is a small,
-/// dependency-light bin that compiles + links in seconds. 10 minutes is a
-/// generous ceiling for a heavily contended machine.
-const SHIM_BUILD_TIMEOUT_SECS: u64 = 600;
+/// Filename of the `qontinui-pr` session CLI (`[[bin]] name = "qontinui-pr"`,
+/// `src/bin/qontinui_cli.rs` in the runner). The runner's identity-shim
+/// materializer copies it from `current_exe().parent()` onto every terminal's
+/// PATH, so it is deployed beside every runner exe. See [`SHIM_EXE_FILENAME`]
+/// for the placement contract.
+#[cfg(windows)]
+pub const SESSION_CLI_EXE_FILENAME: &str = "qontinui-pr.exe";
+#[cfg(not(windows))]
+pub const SESSION_CLI_EXE_FILENAME: &str = "qontinui-pr";
 
-/// Build the `qontinui-shim` sidecar into the slot's target dir, right after
-/// a successful runner build (see [`SHIM_EXE_FILENAME`] for the contract).
+/// Filename of the `qontinui_profile` device/profile CLI (auto-discovered
+/// `src/bin/qontinui_profile.rs` in the runner). The supervisor's
+/// `POST /runners/pair-with-token` shells out to it
+/// (`routes::runners_pair::resolve_qontinui_profile_path`), which reads it out
+/// of the build slots and the LKG dir. The runner itself never resolves it
+/// beside its own exe, so it is built and carried but not deployed. See
+/// [`SHIM_EXE_FILENAME`] for the placement contract.
+#[cfg(windows)]
+pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile.exe";
+#[cfg(not(windows))]
+pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile";
+
+/// One helper binary built from the runner workspace alongside the runner exe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerSidecar {
+    /// The cargo `--bin` name.
+    pub bin: &'static str,
+    /// The file cargo writes into `<target>/debug/` on this platform.
+    pub filename: &'static str,
+    /// What is lost while this sidecar is missing or zero-length — the tail of
+    /// every WARN that names it.
+    pub consequence: &'static str,
+    /// Whether the runner resolves this sidecar via `current_exe().parent()`,
+    /// so `start_exe_mode_for_runner` must deploy it beside every runner exe
+    /// copy. Checked against the runner source: `locate_stub_exe` /
+    /// `materialize_session_cli` in `shim_materializer.rs` read `qontinui-shim`
+    /// and `qontinui-pr`; nothing in the runner resolves `qontinui_profile`.
+    pub deployed_beside_runner: bool,
+}
+
+/// The sidecar roster, in build order. [`SIDECAR_BUILD_ARGS`] names exactly
+/// these bins (pinned by a test), and the LKG carry and the per-runner deploy
+/// both iterate this list, so adding a sidecar here reaches every step of the
+/// placement contract.
+pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
+    RunnerSidecar {
+        bin: "qontinui-shim",
+        filename: SHIM_EXE_FILENAME,
+        consequence: "identity shims will be stale",
+        deployed_beside_runner: true,
+    },
+    RunnerSidecar {
+        bin: "qontinui-pr",
+        filename: SESSION_CLI_EXE_FILENAME,
+        consequence: "terminals get no `qontinui-pr` session CLI (command not found; \
+                      open PRs through the runner's loopback door or `gh pr create`)",
+        deployed_beside_runner: true,
+    },
+    RunnerSidecar {
+        bin: "qontinui_profile",
+        filename: PROFILE_CLI_EXE_FILENAME,
+        consequence: "POST /runners/pair-with-token cannot use this build's qontinui_profile",
+        deployed_beside_runner: false,
+    },
+];
+
+/// Args of the fail-open sidecar build. ONE invocation over the whole roster,
+/// with `--keep-going`, so a compile failure in one sidecar cannot cost the
+/// others — above all the shim, whose absence is the 2026-07-03 stale-stub
+/// class. The same feature set as the runner build (`CARGO_BUILD_ARGS` in
+/// `run_build_inner`) so cargo reuses the warm fingerprints instead of
+/// recompiling shared deps under a different feature resolution.
+pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
+    "build",
+    "--keep-going",
+    "--bin",
+    "qontinui-shim",
+    "--bin",
+    "qontinui-pr",
+    "--bin",
+    "qontinui_profile",
+    "--features",
+    "custom-protocol",
+];
+
+/// What sits at a sidecar's path. A zero-length file is NOT a binary: it is a
+/// build placeholder (or a copy of one), and executing it under Git Bash exits
+/// 0 having done nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidecarFile {
+    /// A non-empty regular file of `bytes` bytes.
+    Present { bytes: u64 },
+    /// A zero-length regular file.
+    Empty,
+    /// Nothing there (or something that is not a regular file).
+    Missing,
+}
+
+impl SidecarFile {
+    pub(crate) fn inspect(path: &std::path::Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() && m.len() > 0 => SidecarFile::Present { bytes: m.len() },
+            Ok(m) if m.is_file() => SidecarFile::Empty,
+            _ => SidecarFile::Missing,
+        }
+    }
+
+    pub(crate) fn is_present(&self) -> bool {
+        matches!(self, SidecarFile::Present { .. })
+    }
+}
+
+/// Remove `path` when it is a ZERO-LENGTH regular file, and only then — never
+/// a file with content. Returns whether a file was removed. Used by every step
+/// of the placement contract so a stale 0-byte copy is never left beside a
+/// runner (or in the LKG dir) once a real sidecar could not replace it.
+pub(crate) fn remove_if_zero_length(path: &std::path::Path) -> bool {
+    SidecarFile::inspect(path) == SidecarFile::Empty && std::fs::remove_file(path).is_ok()
+}
+
+/// Wall-clock budget for the fail-open sidecar build. It runs right after the
+/// main runner build succeeded on the SAME warm `CARGO_TARGET_DIR` with the
+/// SAME feature set, so every shared dependency — the runner lib crate
+/// included — is already compiled; what remains is compiling and linking
+/// three small bins. 10 minutes is a generous ceiling for a heavily contended
+/// machine.
+const SIDECAR_BUILD_TIMEOUT_SECS: u64 = 600;
+
+/// The per-sidecar verdict [`build_sidecars`] logs after cargo returns: for
+/// each roster entry, what sits in `debug_dir`. Split out so the "exists AND
+/// non-empty, by name" check is testable without running cargo.
+pub(crate) fn inspect_built_sidecars(
+    debug_dir: &std::path::Path,
+) -> Vec<(RunnerSidecar, std::path::PathBuf, SidecarFile)> {
+    RUNNER_SIDECARS
+        .iter()
+        .map(|sidecar| {
+            let path = debug_dir.join(sidecar.filename);
+            let state = SidecarFile::inspect(&path);
+            (*sidecar, path, state)
+        })
+        .collect()
+}
+
+/// Build every roster sidecar into the slot's target dir, right after a
+/// successful runner build (see [`SHIM_EXE_FILENAME`] for the contract).
 ///
-/// FAIL-OPEN by design: the sidecar is a lockstep rider on the runner deploy,
-/// not a gate on it. Any failure (spawn error, timeout, non-zero exit, exe
-/// missing afterwards) logs a single actionable WARN and returns — it never
-/// fails the runner build/restart. The cost of a missing sidecar is stale
-/// identity shims; the cost of failing the build would be no runner at all.
-async fn build_shim_sidecar(
-    state: &SharedState,
-    slot: &Arc<BuildSlot>,
-    cargo_cwd: &std::path::Path,
-) {
-    // Same feature set as the runner build so cargo reuses the warm
-    // fingerprints instead of recompiling shared deps under a different
-    // feature resolution.
-    const SHIM_BUILD_ARGS: &[&str] = &[
-        "build",
-        "--bin",
-        "qontinui-shim",
-        "--features",
-        "custom-protocol",
-    ];
-
-    let shim_exe = slot.target_dir.join("debug").join(SHIM_EXE_FILENAME);
-    let warn_stale = |detail: String| {
-        format!(
-            "qontinui-shim sidecar build failed on slot {} — identity shims will be stale \
-             until a rebuild produces {:?} (runner build itself succeeded; deploy continues): {}",
-            slot.id, shim_exe, detail
-        )
-    };
-
+/// FAIL-OPEN by design: the sidecars are lockstep riders on the runner deploy,
+/// not a gate on it. Any failure (spawn error, timeout, non-zero exit, a
+/// sidecar missing or zero-length afterwards) logs an actionable WARN — one
+/// per sidecar that is not a real binary, by name — and returns. It never
+/// fails the runner build/restart: the cost of a missing sidecar is a stale
+/// or absent helper, the cost of failing the build would be no runner at all.
+///
+/// The check after cargo returns runs on EVERY outcome, not only on success:
+/// with `--keep-going` a failed invocation can still have produced the other
+/// sidecars, and a successful one can still leave a 0-byte placeholder copy
+/// if cargo did not uplift over it.
+async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &std::path::Path) {
     info!(
-        "Slot {}: building qontinui-shim sidecar (warm target {:?})",
-        slot.id, slot.target_dir
+        "Slot {}: building runner sidecars {:?} (warm target {:?})",
+        slot.id,
+        RUNNER_SIDECARS.iter().map(|s| s.bin).collect::<Vec<_>>(),
+        slot.target_dir
     );
 
     // Same S3-backend degrade as the main pool build — see `sccache_guard`.
     let guarded = crate::sccache_guard::guarded_cargo(
-        Duration::from_secs(SHIM_BUILD_TIMEOUT_SECS),
+        Duration::from_secs(SIDECAR_BUILD_TIMEOUT_SECS),
         cargo_cwd,
     )
     .await
-    .args(SHIM_BUILD_ARGS)
+    .args(SIDECAR_BUILD_ARGS)
     .current_dir(cargo_cwd)
     .env("CARGO_TARGET_DIR", &slot.target_dir)
     .job_guarded(true);
 
-    let failure = match guarded.run().await {
-        Ok(GuardedOutcome::Exited(output)) if output.status.success() => {
-            if shim_exe.exists() {
-                None
-            } else {
-                Some(warn_stale(format!(
-                    "cargo exited 0 but {:?} is missing",
-                    shim_exe
-                )))
-            }
-        }
+    let cargo_failure: Option<String> = match guarded.run().await {
+        Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
         Ok(GuardedOutcome::Exited(output)) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
-            Some(warn_stale(format!(
+            Some(format!(
                 "cargo exit {}: {}",
                 output.status,
                 tail.replace('\n', " | ")
-            )))
+            ))
         }
         Ok(GuardedOutcome::TimedOut { after, .. }) => {
-            Some(warn_stale(format!("timed out after {}s", after.as_secs())))
+            Some(format!("timed out after {}s", after.as_secs()))
         }
-        Ok(GuardedOutcome::Cancelled { .. }) => Some(warn_stale("cancelled".to_string())),
-        Err(e) => Some(warn_stale(format!("failed to spawn cargo: {}", e))),
+        Ok(GuardedOutcome::Cancelled { .. }) => Some("cancelled".to_string()),
+        Err(e) => Some(format!("failed to spawn cargo: {}", e)),
     };
 
-    match failure {
-        None => {
-            info!(
-                "Slot {}: qontinui-shim sidecar built at {:?}",
-                slot.id, shim_exe
-            );
+    let debug_dir = slot.target_dir.join("debug");
+    let mut warnings = Vec::new();
+    let mut built = Vec::new();
+    for (sidecar, path, file) in inspect_built_sidecars(&debug_dir) {
+        let problem = match file {
+            SidecarFile::Present { bytes } => {
+                built.push(format!("{} ({} bytes)", sidecar.bin, bytes));
+                continue;
+            }
+            SidecarFile::Missing => "is missing",
+            SidecarFile::Empty => {
+                "is ZERO-LENGTH (a build placeholder, not a binary — it will not be \
+                 carried to LKG or deployed)"
+            }
+        };
+        warnings.push(format!(
+            "{} sidecar {:?} {} on slot {} after the sidecar build — {} until a rebuild \
+             produces it (runner build itself succeeded; deploy continues){}",
+            sidecar.bin,
+            path,
+            problem,
+            slot.id,
+            sidecar.consequence,
+            cargo_failure
+                .as_deref()
+                .map(|f| format!(": {}", f))
+                .unwrap_or_default()
+        ));
+    }
+    // A failed invocation whose sidecars all look real still gets named: with
+    // `--keep-going` a sidecar that failed to compile keeps the file an EARLIER
+    // build uplifted, which exists and is non-empty but is stale.
+    if warnings.is_empty() {
+        if let Some(failure) = &cargo_failure {
+            warnings.push(format!(
+                "runner sidecar build failed on slot {} ({}) — every sidecar file is present \
+                 and non-empty, but one or more may be left over from an earlier build \
+                 (runner build itself succeeded; deploy continues)",
+                slot.id, failure
+            ));
         }
-        Some(msg) => {
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
-        }
+    }
+
+    if !built.is_empty() {
+        info!(
+            "Slot {}: runner sidecars ready in {:?}: {}",
+            slot.id,
+            debug_dir,
+            built.join(", ")
+        );
+    }
+    for msg in warnings {
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
     }
 }
 
@@ -4149,6 +4317,56 @@ async fn prewarm_single_slot(
 // Last-known-good (LKG) capture
 // =============================================================================
 
+/// Copy the sidecar `filename` from beside the slot exe into `lkg_dir` through
+/// a per-slot tmp file + atomic rename. Returns the bytes carried.
+///
+/// A ZERO-LENGTH source is refused, never carried: it is a build placeholder,
+/// and an LKG-pinned start would otherwise deploy it beside the runner. In that
+/// case a zero-length file already at the LKG destination (carried by a build
+/// predating this check) is removed too, so the LKG dir never holds one; a
+/// non-empty LKG copy from an earlier build is left in place, exactly as it is
+/// when the source is missing.
+fn carry_sidecar_into_lkg(
+    source_exe: &std::path::Path,
+    lkg_dir: &std::path::Path,
+    filename: &str,
+    slot_id: usize,
+) -> Result<u64, String> {
+    let src = source_exe.with_file_name(filename);
+    let dst = lkg_dir.join(filename);
+    match SidecarFile::inspect(&src) {
+        SidecarFile::Present { .. } => {}
+        SidecarFile::Missing => {
+            return Err(format!("{:?} not found next to the slot exe", src));
+        }
+        SidecarFile::Empty => {
+            let removed = remove_if_zero_length(&dst);
+            return Err(format!(
+                "{:?} is ZERO-LENGTH (a build placeholder, not a binary) — refused to carry it{}",
+                src,
+                if removed {
+                    format!("; removed the zero-length copy already at {:?}", dst)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    let tmp = lkg_dir.join(format!("{}.tmp.{}", filename, slot_id));
+    let _ = std::fs::remove_file(&tmp);
+    let result = std::fs::copy(&src, &tmp)
+        .map_err(|e| format!("copy {:?} -> {:?}: {}", src, tmp, e))
+        .and_then(|bytes| {
+            std::fs::rename(&tmp, &dst)
+                .map(|()| bytes)
+                .map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, dst, e))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Copy the freshly-built slot exe to `target-pool/lkg/qontinui-runner.exe`
 /// and write a `lkg.json` sidecar with `{built_at, source_slot, exe_size, sha,
 /// source}`.
@@ -4258,33 +4476,25 @@ async fn update_lkg_after_success(
         ))
     })?;
 
-    // Carry the `qontinui-shim.exe` sidecar into the LKG dir alongside the
-    // exe (same tmp+rename dance) so an LKG-pinned start (spawn-test
-    // {use_lkg: true}) deploys a matching stub, not whatever stale one sits
-    // in `target/debug/`. See [`SHIM_EXE_FILENAME`] for the placement
-    // contract. Fail-open: the exe promotion above already succeeded; a
-    // missing or uncopyable shim logs one WARN and never fails the build.
-    {
-        let shim_src = source_exe.with_file_name(SHIM_EXE_FILENAME);
-        let shim_dst = lkg_dir.join(SHIM_EXE_FILENAME);
-        let shim_tmp = lkg_dir.join(format!("{}.tmp.{}", SHIM_EXE_FILENAME, slot.id));
-        let shim_result: Result<(), String> = if !shim_src.exists() {
-            Err(format!("{:?} not found next to the slot exe", shim_src))
-        } else {
-            let _ = std::fs::remove_file(&shim_tmp);
-            std::fs::copy(&shim_src, &shim_tmp)
-                .map_err(|e| format!("copy {:?} -> {:?}: {}", shim_src, shim_tmp, e))
-                .and_then(|_| {
-                    std::fs::rename(&shim_tmp, &shim_dst)
-                        .map_err(|e| format!("rename {:?} -> {:?}: {}", shim_tmp, shim_dst, e))
-                })
-        };
-        if let Err(detail) = shim_result {
-            let _ = std::fs::remove_file(&shim_tmp);
+    // Carry every roster sidecar into the LKG dir alongside the exe (same
+    // tmp+rename dance) so an LKG-pinned start (spawn-test {use_lkg: true})
+    // deploys helpers that match the LKG exe, not whatever stale ones sit in
+    // `target/debug/`. See [`SHIM_EXE_FILENAME`] for the placement contract.
+    // Fail-open: the exe promotion above already succeeded; a missing,
+    // zero-length or uncopyable sidecar logs one WARN naming it and never
+    // fails the build.
+    for sidecar in RUNNER_SIDECARS.iter() {
+        if let Err(detail) =
+            carry_sidecar_into_lkg(&source_exe, &lkg_dir, sidecar.filename, slot.id)
+        {
             let msg = format!(
-                "LKG shim sidecar capture failed (slot {}) — identity shims will be stale \
-                 on LKG-pinned starts until a rebuild refreshes {:?}: {}",
-                slot.id, shim_dst, detail
+                "LKG {} sidecar capture failed (slot {}) — {} on LKG-pinned starts until a \
+                 rebuild refreshes {:?}: {}",
+                sidecar.bin,
+                slot.id,
+                sidecar.consequence,
+                lkg_dir.join(sidecar.filename),
+                detail
             );
             warn!("{}", msg);
             state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
@@ -4351,6 +4561,10 @@ mod tests {
         stderr_submission_tail, update_lkg_after_success, verify_frontend_built, BuildPhase,
         BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
         LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
+    };
+    use super::{
+        inspect_built_sidecars, remove_if_zero_length, SidecarFile, PROFILE_CLI_EXE_FILENAME,
+        RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME, SHIM_EXE_FILENAME, SIDECAR_BUILD_ARGS,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::error::SupervisorError;
@@ -5628,6 +5842,163 @@ mod tests {
         let lkg = lkg.expect("last_known_good must be populated after origin/main promote");
         assert_eq!(lkg.sha.as_deref(), Some("0a1b2c3d4e5f"));
         assert_eq!(lkg.source, BuildSource::OriginMain);
+    }
+
+    // =====================================================================
+    // Sidecar roster (plan 2026-09-27-qontinui-pr-zero-byte-sidecar-
+    // placeholder-published-as-session-cli, Phase 3): the supervisor builds,
+    // carries to LKG and deploys REAL `qontinui-shim` / `qontinui-pr` /
+    // `qontinui_profile` binaries, and never propagates a zero-length one.
+    // =====================================================================
+
+    /// The sidecar build is ONE `--keep-going` invocation over the whole
+    /// roster, with the runner build's feature set. Pinned literally: dropping
+    /// `--keep-going` lets one sidecar's compile error cost the shim (the
+    /// 2026-07-03 class), dropping a `--bin` leaves that sidecar a 0-byte
+    /// placeholder copy, and changing the features recompiles the warm target.
+    #[test]
+    fn sidecar_build_args_pin_the_roster() {
+        assert_eq!(
+            SIDECAR_BUILD_ARGS,
+            &[
+                "build",
+                "--keep-going",
+                "--bin",
+                "qontinui-shim",
+                "--bin",
+                "qontinui-pr",
+                "--bin",
+                "qontinui_profile",
+                "--features",
+                "custom-protocol",
+            ]
+        );
+        // The `--bin` values are exactly the roster, in order, so the build,
+        // the LKG carry and the deploy can never disagree on what a sidecar is.
+        let built: Vec<&str> = SIDECAR_BUILD_ARGS
+            .windows(2)
+            .filter(|w| w[0] == "--bin")
+            .map(|w| w[1])
+            .collect();
+        let roster: Vec<&str> = RUNNER_SIDECARS.iter().map(|s| s.bin).collect();
+        assert_eq!(built, roster);
+        assert_eq!(
+            RUNNER_SIDECARS.map(|s| s.filename),
+            [
+                SHIM_EXE_FILENAME,
+                SESSION_CLI_EXE_FILENAME,
+                PROFILE_CLI_EXE_FILENAME
+            ]
+        );
+        // The runner resolves the shim and the session CLI beside its own exe
+        // (shim_materializer.rs); nothing in it resolves qontinui_profile.
+        let deployed: Vec<&str> = RUNNER_SIDECARS
+            .iter()
+            .filter(|s| s.deployed_beside_runner)
+            .map(|s| s.bin)
+            .collect();
+        assert_eq!(deployed, ["qontinui-shim", "qontinui-pr"]);
+    }
+
+    /// The post-build check reports EACH sidecar by name, and a zero-length
+    /// file is reported as `Empty`, never as a built binary.
+    #[test]
+    fn inspect_built_sidecars_reports_each_sidecar_and_refuses_zero_length() {
+        let tmp = TempDir::new().expect("tempdir");
+        let debug = tmp.path().join("debug");
+        fs::create_dir_all(&debug).expect("mkdir debug");
+        fs::write(debug.join(SHIM_EXE_FILENAME), b"real-shim").expect("write shim");
+        // The exact incident artifact: tauri-build's copy of the 0-byte
+        // `binaries/qontinui-pr-<triple>` placeholder.
+        fs::write(debug.join(SESSION_CLI_EXE_FILENAME), b"").expect("write empty cli");
+        // qontinui_profile: not produced at all.
+
+        let verdicts: Vec<(&str, SidecarFile)> = inspect_built_sidecars(&debug)
+            .into_iter()
+            .map(|(sidecar, path, file)| {
+                assert_eq!(path, debug.join(sidecar.filename));
+                (sidecar.bin, file)
+            })
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("qontinui-shim", SidecarFile::Present { bytes: 9 }),
+                ("qontinui-pr", SidecarFile::Empty),
+                ("qontinui_profile", SidecarFile::Missing),
+            ]
+        );
+    }
+
+    /// `remove_if_zero_length` removes a 0-byte file and nothing else: a file
+    /// with content, a missing path and a directory are all left alone.
+    #[test]
+    fn remove_if_zero_length_never_touches_content() {
+        let tmp = TempDir::new().expect("tempdir");
+        let empty = tmp.path().join("empty.exe");
+        let real = tmp.path().join("real.exe");
+        let dir = tmp.path().join("a-dir");
+        fs::write(&empty, b"").expect("write empty");
+        fs::write(&real, b"MZ").expect("write real");
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        assert!(remove_if_zero_length(&empty));
+        assert!(!empty.exists(), "the zero-length file must be removed");
+        assert!(!remove_if_zero_length(&real));
+        assert_eq!(fs::read(&real).expect("read real"), b"MZ");
+        assert!(!remove_if_zero_length(&tmp.path().join("absent.exe")));
+        assert!(!remove_if_zero_length(&dir));
+        assert!(dir.is_dir());
+    }
+
+    /// LKG promotion carries EVERY roster sidecar, refuses a zero-length one,
+    /// and removes a zero-length copy an earlier build left in the LKG dir —
+    /// while a sidecar with content keeps being carried byte-for-byte.
+    #[tokio::test]
+    async fn lkg_carries_every_real_sidecar_and_never_a_zero_length_one() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon root");
+        let state = lkg_test_state(&root);
+        let slot_exe = stage_slot0_exe(&state, b"runner-bytes");
+        let slot_debug = slot_exe.parent().expect("slot debug").to_path_buf();
+        fs::write(slot_debug.join(SHIM_EXE_FILENAME), b"real-shim").expect("shim");
+        fs::write(slot_debug.join(SESSION_CLI_EXE_FILENAME), b"").expect("empty cli");
+        fs::write(slot_debug.join(PROFILE_CLI_EXE_FILENAME), b"real-profile").expect("profile");
+
+        // A zero-length session CLI already in the LKG dir, from a build that
+        // predates the zero-length refusal.
+        let lkg_dir = state.config.lkg_dir();
+        fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
+        fs::write(lkg_dir.join(SESSION_CLI_EXE_FILENAME), b"").expect("stale empty cli");
+
+        let slot = state.build_pool.slots[0].clone();
+        let prov = live_provenance(Some("abc123def456"), "/ws/qontinui-runner");
+        update_lkg_after_success(&state, &slot, &prov)
+            .await
+            .expect("a sidecar refusal must never fail the LKG promotion");
+
+        assert_eq!(
+            fs::read(state.config.lkg_exe_path()).unwrap(),
+            b"runner-bytes"
+        );
+        assert_eq!(
+            fs::read(lkg_dir.join(SHIM_EXE_FILENAME)).unwrap(),
+            b"real-shim"
+        );
+        assert_eq!(
+            fs::read(lkg_dir.join(PROFILE_CLI_EXE_FILENAME)).unwrap(),
+            b"real-profile"
+        );
+        assert!(
+            !lkg_dir.join(SESSION_CLI_EXE_FILENAME).exists(),
+            "a zero-length session CLI must never be carried into, or left in, the LKG dir"
+        );
+        let litter: Vec<_> = fs::read_dir(&lkg_dir)
+            .expect("read lkg dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(litter.is_empty(), "tmp files left in lkg: {:?}", litter);
     }
 
     /// The `from_working_tree` flag selects the build's source classification:

@@ -124,56 +124,79 @@ pub struct PairWithTokenRequest {
 /// gets HTTP 504.
 const PAIR_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Locate the `qontinui_profile` binary built alongside `qontinui-runner.exe`.
+/// Locate a REAL `qontinui_profile` binary built from the runner workspace.
 ///
-/// Preference order:
-/// 1. `<runner_npm_dir>/target/debug/qontinui_profile[.exe]` — the canonical
-///    location (matches `runner_exe_path` for the runner binary itself).
-/// 2. Any `<runner_npm_dir>/target-pool/slot-{k}/debug/qontinui_profile[.exe]`
-///    that exists. We pick the first one we find; pair-cli is a thin client
-///    and slot drift here is not load-bearing the way it is for the runner.
+/// Preference order, taking the first candidate that is a NON-EMPTY file:
+/// 1. `<runner_npm_dir>/target/debug/qontinui_profile[.exe]` — the non-pool
+///    local build (matches `runner_exe_path` for the runner binary itself).
+/// 2. Each `<runner_npm_dir>/target-pool/<dir>/debug/qontinui_profile[.exe]`,
+///    in directory-name order (`slot-0`, `slot-1`, …). Pair-cli is a thin
+///    client, so slot drift here is not load-bearing the way it is for the
+///    runner.
+/// 3. `<runner_npm_dir>/target-pool/lkg/qontinui_profile[.exe]` — the copy the
+///    LKG promotion carries (`build_monitor::update_lkg_after_success`).
 ///
-/// Returns an error when no binary exists — the caller should retry after
-/// `POST /runners/spawn-test {rebuild: true}` builds the runner workspace
-/// (cargo build always builds the workspace's bins, so a runner rebuild
-/// produces a fresh `qontinui_profile.exe`).
+/// A ZERO-LENGTH candidate is skipped, never returned. The runner's `build.rs`
+/// writes a 0-byte `binaries/qontinui_profile-<triple>` placeholder and
+/// tauri-build copies it over `<target>/<profile>/qontinui_profile` on every
+/// build-script run, so a 0-byte file is routinely what sits at candidate 1:
+/// executing it spawns nothing useful and the pair would fail with an opaque
+/// error rather than this function's actionable one.
+///
+/// A runner build does NOT produce this binary by itself: the supervisor's
+/// pool build is `cargo build --bin qontinui-runner`, which builds no other
+/// bin. The fail-open sidecar build that follows it
+/// (`build_monitor::SIDECAR_BUILD_ARGS`) is what builds `qontinui_profile`
+/// into the slot. So the remedy the error names is a supervisor rebuild
+/// (`POST /runners/spawn-test {rebuild: true}`), whose sidecar step produces
+/// a fresh one.
 pub fn resolve_qontinui_profile_path(state: &SharedState) -> Result<PathBuf, String> {
-    let exe_name = qontinui_profile_exe_name();
-    let npm_dir = state.config.runner_npm_dir();
+    resolve_qontinui_profile_in(&state.config.runner_npm_dir())
+}
 
-    let canonical = npm_dir.join("target").join("debug").join(&exe_name);
-    if canonical.exists() {
-        return Ok(canonical);
-    }
-
+/// [`resolve_qontinui_profile_path`] against an explicit runner workspace
+/// root (`runner_npm_dir`), so the candidate order and the non-empty rule are
+/// testable against a tempdir.
+fn resolve_qontinui_profile_in(npm_dir: &Path) -> Result<PathBuf, String> {
+    let exe_name = crate::build_monitor::PROFILE_CLI_EXE_FILENAME;
+    let canonical = npm_dir.join("target").join("debug").join(exe_name);
     let pool_root = npm_dir.join("target-pool");
+
+    let mut candidates = vec![canonical.clone()];
     if let Ok(entries) = std::fs::read_dir(&pool_root) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("debug").join(&exe_name);
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+        let mut pool_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        pool_dirs.sort();
+        candidates.extend(pool_dirs.iter().map(|d| d.join("debug").join(exe_name)));
+    }
+    candidates.push(pool_root.join("lkg").join(exe_name));
+
+    let mut zero_length = Vec::new();
+    for candidate in candidates {
+        match crate::build_monitor::SidecarFile::inspect(&candidate) {
+            crate::build_monitor::SidecarFile::Present { .. } => return Ok(candidate),
+            crate::build_monitor::SidecarFile::Empty => zero_length.push(candidate),
+            crate::build_monitor::SidecarFile::Missing => {}
         }
     }
 
+    let skipped = if zero_length.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Skipped {} ZERO-LENGTH candidate(s) — build placeholders, not binaries: {:?}.",
+            zero_length.len(),
+            zero_length
+        )
+    };
     Err(format!(
-        "qontinui_profile binary not found at {:?} or under {:?}. \
-         Run a runner build first (e.g. POST /runners/spawn-test {{\"rebuild\": true}}).",
-        canonical, pool_root
+        "qontinui_profile binary not found at {:?}, under {:?}/*/debug or in {:?}.{} \
+         Run a supervisor runner build first (e.g. POST /runners/spawn-test {{\"rebuild\": true}}); \
+         its sidecar step builds qontinui_profile into the slot.",
+        canonical,
+        pool_root,
+        pool_root.join("lkg"),
+        skipped
     ))
-}
-
-/// Platform-specific binary name. Mirrors `runner_exe_path`'s logic — the
-/// runner workspace builds Windows .exe files; everything else gets the
-/// extension-less name.
-#[cfg(windows)]
-fn qontinui_profile_exe_name() -> String {
-    "qontinui_profile.exe".to_string()
-}
-
-#[cfg(not(windows))]
-fn qontinui_profile_exe_name() -> String {
-    "qontinui_profile".to_string()
 }
 
 /// Path to `~/.qontinui/machine.json` — the persistent device-identity file
@@ -576,6 +599,61 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // `resolve_qontinui_profile_in` — a zero-length `qontinui_profile` (the
+    // runner build.rs placeholder that tauri-build copies into
+    // `target/debug/`) is skipped, never handed to the pair CLI spawn.
+
+    fn write_profile(dir: &Path, bytes: &[u8]) -> PathBuf {
+        fs::create_dir_all(dir).expect("mkdir");
+        let p = dir.join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&p, bytes).expect("write qontinui_profile");
+        p
+    }
+
+    #[test]
+    fn profile_resolution_skips_a_zero_length_canonical_for_a_nonempty_slot() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        write_profile(&npm.join("target").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("slot-0").join("debug"), b"");
+        let real = write_profile(
+            &npm.join("target-pool").join("slot-1").join("debug"),
+            b"real-profile",
+        );
+
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), real);
+    }
+
+    #[test]
+    fn profile_resolution_prefers_a_nonempty_canonical_and_falls_back_to_lkg() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        let lkg = write_profile(&npm.join("target-pool").join("lkg"), b"lkg-profile");
+        assert_eq!(
+            resolve_qontinui_profile_in(npm).unwrap(),
+            lkg,
+            "the LKG copy is the last candidate"
+        );
+
+        let canonical = write_profile(&npm.join("target").join("debug"), b"local-profile");
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), canonical);
+    }
+
+    #[test]
+    fn profile_resolution_errors_when_every_candidate_is_zero_length() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        write_profile(&npm.join("target").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("slot-0").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("lkg"), b"");
+
+        let err = resolve_qontinui_profile_in(npm).expect_err("all candidates are 0-byte");
+        assert!(
+            err.contains("Skipped 3 ZERO-LENGTH candidate(s)"),
+            "the error must say why the files that exist were refused: {err}"
+        );
+    }
 
     #[test]
     fn reads_machine_device_id_canonical() {
