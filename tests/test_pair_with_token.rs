@@ -294,6 +294,127 @@ async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
     assert!(body["stderr"].is_string(), "stderr must be a string");
 }
 
+/// S2 (review round 1): the RESOLVED `qontinui_profile` must never run in
+/// place. A running image locks its file on Windows, and a build that then
+/// lands in that slot panics in tauri-build's `remove_file().unwrap()`. The
+/// handler runs a private copy instead.
+///
+/// The slot's file here is non-empty but not a runnable image, so the spawn
+/// fails on every platform and the `pair_cli_spawn_failed` message names the
+/// path that was actually executed — which must not be the slot's file.
+#[tokio::test]
+async fn resolved_qontinui_profile_is_not_executed_in_place() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runner = tmp.path().join("qontinui-runner");
+    let src_tauri = runner.join("src-tauri");
+    std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
+    let slot_debug = runner.join("target-pool").join("slot-0").join("debug");
+    std::fs::create_dir_all(&slot_debug).expect("mkdir slot debug");
+    let exe_name = if cfg!(windows) {
+        "qontinui_profile.exe"
+    } else {
+        "qontinui_profile"
+    };
+    let slot_binary = slot_debug.join(exe_name);
+    std::fs::write(&slot_binary, b"not-a-runnable-image").expect("write slot binary");
+
+    let mut config = test_config();
+    config.project_dir = src_tauri;
+    let state = Arc::new(SupervisorState::new(config));
+    let app = Router::new()
+        .route("/runners/pair-with-token", post(pair_with_token))
+        .with_state(state);
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], "pair_cli_spawn_failed", "body: {body}");
+    let message = body["message"].as_str().expect("message");
+    let canonical_slot = slot_binary.canonicalize().expect("canonical slot binary");
+    for executed_in_place in [
+        format!("failed to spawn {:?}", slot_binary),
+        format!("failed to spawn {:?}", canonical_slot),
+    ] {
+        assert!(
+            !message.starts_with(&executed_in_place),
+            "the slot's qontinui_profile was executed in place: {message}"
+        );
+    }
+    assert!(
+        slot_binary.exists(),
+        "the slot's file must be left where it was"
+    );
+}
+
+/// S2, behaviourally: the pair CLI that actually RUNS is a private copy, not
+/// the file the route was handed. The stub prints its own full path to stderr
+/// and exits 2, so the 502 body's `stderr` says which file executed —
+/// independent of how any error message is worded. Driven through the
+/// override, which takes the same private-copy path as a resolved binary.
+#[tokio::test]
+async fn the_pair_cli_that_runs_is_a_private_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let build_dir = tmp.path().join("target-pool").join("slot-0").join("debug");
+    std::fs::create_dir_all(&build_dir).expect("mkdir build dir");
+    let stub = write_self_reporting_stub(&build_dir);
+
+    let (app, _state) = build_app();
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "qontinui_profile_path_override": stub.to_string_lossy(),
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    assert_eq!(body["error"], "pair_cli_failed", "body: {body}");
+    let ran = PathBuf::from(body["stderr"].as_str().expect("stderr").trim());
+    assert!(
+        ran.file_name().is_some(),
+        "the stub must have reported its own path: {body}"
+    );
+    assert_eq!(
+        ran.file_name(),
+        stub.file_name(),
+        "the copy keeps the file name"
+    );
+    let canonical_build_dir = build_dir.canonicalize().expect("canonical build dir");
+    assert!(
+        !ran.starts_with(&build_dir) && !ran.starts_with(&canonical_build_dir),
+        "the build directory's file was executed in place: {}",
+        ran.display()
+    );
+    assert!(stub.exists(), "the handed file is left where it was");
+}
+
+/// A stub that prints its own full path to stderr and exits 2.
+#[cfg(windows)]
+fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
+    let stub = dir.join("qontinui_profile_stub.cmd");
+    std::fs::write(&stub, b"@echo %~f0 1>&2\r\n@exit /b 2\r\n").expect("write stub");
+    stub
+}
+
+#[cfg(not(windows))]
+fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = dir.join("qontinui_profile_stub.sh");
+    std::fs::write(&stub, b"#!/bin/sh\necho \"$0\" >&2\nexit 2\n").expect("write stub");
+    let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).expect("set perms");
+    stub
+}
+
 #[cfg(windows)]
 fn pick_failing_stub() -> PathBuf {
     // On Windows there's no `/bin/false`. Use a small .bat file written to

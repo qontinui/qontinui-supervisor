@@ -124,7 +124,107 @@ pub struct PairWithTokenRequest {
 /// gets HTTP 504.
 const PAIR_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Name prefix of the private directories [`stage_private_cli_copy`] creates
+/// under [`private_cli_copy_root`].
+const PRIVATE_CLI_COPY_PREFIX: &str = "qontinui-supervisor-pair-cli-";
+
+/// Where the pair route's private copies live: the supervisor's per-user data
+/// dir (the one the temp-runner ledger uses), not the system temp dir — a
+/// Linux `/tmp` mounted `noexec` would make every copy unrunnable. The system
+/// temp dir is only the fallback for a box with no per-user data dir.
+fn private_cli_copy_root() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("com.qontinui.supervisor").join("pair-cli"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// A leftover private copy older than this is swept by the next pair call.
+/// Far above [`PAIR_CLI_TIMEOUT`], so a copy still in use is never swept.
+const PRIVATE_CLI_COPY_STALE_AFTER: Duration = Duration::from_secs(3600);
+
+/// A private copy of the `qontinui_profile` binary the pair route executes.
+/// Its directory is removed when this is dropped (best effort — a Windows
+/// image still being torn down can keep it a moment longer; the next pair
+/// call's sweep removes it then).
+struct PrivateCliCopy {
+    dir: PathBuf,
+    exe: PathBuf,
+}
+
+impl Drop for PrivateCliCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy `cli` into a fresh private directory under `temp_root` and return the
+/// copy, which is what the pair route executes — never the file it resolved.
+///
+/// Why: the resolved `qontinui_profile` lives in a build slot, the non-pool
+/// `target/debug/` or the LKG dir. A running image locks its file on Windows,
+/// and a build that lands in that directory meanwhile panics in tauri-build's
+/// `remove_file().unwrap()` over it. Running a copy leaves every build
+/// directory unlocked.
+///
+/// The copy keeps the source's file name (so a `.cmd` test stub stays one) and
+/// its bytes are checked: a copy of ZERO bytes — the source rewritten with
+/// tauri-build's placeholder since it was resolved — is refused.
+fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy, String> {
+    sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
+    let file_name = cli
+        .file_name()
+        .ok_or_else(|| format!("{:?} has no file name to copy", cli))?;
+    let dir = temp_root.join(format!(
+        "{}{}",
+        PRIVATE_CLI_COPY_PREFIX,
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create private copy dir {:?}: {e}", dir))?;
+    let copy = PrivateCliCopy {
+        exe: dir.join(file_name),
+        dir,
+    };
+    let bytes = std::fs::copy(cli, &copy.exe)
+        .map_err(|e| format!("copy {:?} -> {:?}: {e}", cli, copy.exe))?;
+    if bytes == 0 {
+        return Err(format!(
+            "{:?} was ZERO-LENGTH when copied (a build placeholder, not a binary) — refused \
+             to run it",
+            cli
+        ));
+    }
+    Ok(copy)
+}
+
+/// Remove private copies older than [`PRIVATE_CLI_COPY_STALE_AFTER`] (as of
+/// `now`) left under `temp_root` by earlier pair calls. Best effort.
+fn sweep_stale_private_cli_copies(temp_root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PRIVATE_CLI_COPY_PREFIX)
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > PRIVATE_CLI_COPY_STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Locate a REAL `qontinui_profile` binary built from the runner workspace.
+/// The pair route never executes the path returned here in place — it runs a
+/// private copy ([`stage_private_cli_copy`]).
 ///
 /// Preference order, taking the first candidate that is a NON-EMPTY file:
 /// 1. `<runner_npm_dir>/target/debug/qontinui_profile[.exe]` — the non-pool
@@ -369,22 +469,38 @@ pub async fn pair_with_token(
         },
     };
 
+    // Run a private copy, never the resolved file: a running image would lock
+    // a build directory's file (see `stage_private_cli_copy`). Held until the
+    // child has been reaped; its directory is removed on drop.
+    let private_copy = match stage_private_cli_copy(&cli_path, &private_cli_copy_root()) {
+        Ok(copy) => copy,
+        Err(message) => {
+            return server_error("qontinui_profile_copy_failed", &message);
+        }
+    };
+    let exec_path = private_copy.exe.clone();
+
     state
         .logs
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
             format!(
-                "pair-with-token: invoking {:?} with tenant_id={} web_base_url={:?} \
-                 target_runner_id={:?} secure_storage_dir={:?}",
-                cli_path, body.tenant_id, body.web_base_url, body.target_runner_id, target_dir
+                "pair-with-token: invoking {:?} (private copy of {:?}) with tenant_id={} \
+                 web_base_url={:?} target_runner_id={:?} secure_storage_dir={:?}",
+                exec_path,
+                cli_path,
+                body.tenant_id,
+                body.web_base_url,
+                body.target_runner_id,
+                target_dir
             ),
         )
         .await;
 
     // Spawn the CLI. Captured stdout/stderr feed the response body on
     // failure; on success we read the on-disk artifacts.
-    let mut cmd = tokio::process::Command::new(&cli_path);
+    let mut cmd = tokio::process::Command::new(&exec_path);
     cmd.arg("device")
         .arg("pair")
         .arg("--auth-token")
@@ -394,6 +510,9 @@ pub async fn pair_with_token(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
+        // A pair call that times out drops the child; without this it would
+        // keep running, unbounded, after the 504 was answered.
+        .kill_on_drop(true)
         // Don't let inherited Claude Code markers leak into the child;
         // mirrors what manager.rs does on runner spawn.
         .strip_inherited_claude_markers();
@@ -419,11 +538,16 @@ pub async fn pair_with_token(
     }
 
     let output_fut = async {
+        // Name the program the Command actually holds, not a variable beside
+        // it, so the message can never claim a different file than the one
+        // that was spawned.
+        let spawned = PathBuf::from(cmd.as_std().get_program());
         let child = cmd.spawn().map_err(|e| {
             format!(
-                "failed to spawn {:?}: {e} (path exists? {})",
+                "failed to spawn {:?}: {e} (private copy of {:?}; path exists? {})",
+                spawned,
                 cli_path,
-                cli_path.exists()
+                spawned.exists()
             )
         })?;
         child
@@ -458,6 +582,8 @@ pub async fn pair_with_token(
                 .into_response();
         }
     };
+
+    drop(private_copy);
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -599,6 +725,78 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // `stage_private_cli_copy` — the pair route runs a private copy of the
+    // resolved binary, never the build directory's file.
+
+    #[test]
+    fn private_cli_copy_is_a_byte_identical_copy_outside_the_source_dir() {
+        let root = tempdir().unwrap();
+        let src_dir = root.path().join("target-pool").join("slot-0").join("debug");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&src, b"real-profile").unwrap();
+        let temp_root = root.path().join("tmp");
+        fs::create_dir_all(&temp_root).unwrap();
+
+        let copy = stage_private_cli_copy(&src, &temp_root).expect("staged");
+        assert!(copy.exe.starts_with(&temp_root));
+        assert_eq!(copy.exe.file_name(), src.file_name());
+        assert_eq!(fs::read(&copy.exe).unwrap(), b"real-profile");
+        let dir = copy.dir.clone();
+        drop(copy);
+        assert!(!dir.exists(), "the private copy is removed on drop");
+        assert!(src.exists(), "the source is never touched");
+    }
+
+    #[test]
+    fn private_cli_copy_refuses_zero_bytes() {
+        let root = tempdir().unwrap();
+        let src = root
+            .path()
+            .join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&src, b"").unwrap();
+        let temp_root = root.path().join("tmp");
+        fs::create_dir_all(&temp_root).unwrap();
+
+        let err = match stage_private_cli_copy(&src, &temp_root) {
+            Ok(_) => panic!("a zero-byte copy must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("ZERO-LENGTH"), "{err}");
+        assert_eq!(
+            fs::read_dir(&temp_root).unwrap().count(),
+            0,
+            "a refused copy leaves no directory behind"
+        );
+    }
+
+    #[test]
+    fn private_cli_copy_sweep_removes_only_its_own_stale_copies() {
+        let root = tempdir().unwrap();
+        let temp_root = root.path();
+        let stale = temp_root.join(format!("{PRIVATE_CLI_COPY_PREFIX}stale"));
+        let fresh = temp_root.join(format!("{PRIVATE_CLI_COPY_PREFIX}fresh"));
+        let foreign = temp_root.join("someone-elses-dir");
+        for d in [&stale, &fresh, &foreign] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // As of now, every copy is fresh: nothing is swept.
+        sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
+        assert!(
+            stale.exists() && fresh.exists(),
+            "a copy that may be in use is kept"
+        );
+
+        // Two stale-windows later, both prefixed copies are stale.
+        let later = std::time::SystemTime::now() + PRIVATE_CLI_COPY_STALE_AFTER * 2;
+        sweep_stale_private_cli_copies(temp_root, later);
+        assert!(
+            !stale.exists() && !fresh.exists(),
+            "stale private copies are swept"
+        );
+        assert!(foreign.exists(), "nothing without the prefix is touched");
+    }
 
     // `resolve_qontinui_profile_in` — a zero-length `qontinui_profile` (the
     // runner build.rs placeholder that tauri-build copies into

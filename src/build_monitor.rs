@@ -1984,12 +1984,24 @@ async fn persist_and_render_incomplete_build(
 ///      resolves via `current_exe().parent()`
 ///      ([`RunnerSidecar::deployed_beside_runner`]).
 ///
-/// A ZERO-LENGTH sidecar is never propagated by any of the three steps. The
-/// runner's `build.rs` writes 0-byte `binaries/<name>-<triple>` placeholders,
-/// and tauri-build copies them over `<target>/<profile>/<name>` on every
-/// build-script run; a supervisor that never built `--bin qontinui-pr` left
-/// that 0-byte copy beside every runner it started, the runner put it on every
-/// terminal's PATH, and `qontinui-pr create` exited 0 having opened no PR
+/// What holds about a ZERO-LENGTH sidecar, precisely: step 1 reports it by
+/// name; step 2 never carries one into the LKG dir (it judges the bytes it
+/// actually copied) and removes one already there; step 3 never deploys one,
+/// and on every deploy outcome removes a zero-length copy already beside the
+/// runner exe. That is a guarantee AT DEPLOY (runner start) TIME, not for the
+/// runner's lifetime: the primary's copy directory is the runner's own cargo
+/// `target/debug/`, and tauri-build refills it with 0-byte placeholder copies
+/// on any non-pool build-script run (a `dev-start.ps1` rebuild, a manual
+/// `cargo build`) until the runner half of the plan (Phase 1a, `build.rs`
+/// hiding `externalBin` from tauri-build) lands. Temp and named runners each
+/// deploy into a directory of their own, which nothing else writes.
+///
+/// Why it matters: the runner's `build.rs` writes 0-byte
+/// `binaries/<name>-<triple>` placeholders, and tauri-build copies them over
+/// `<target>/<profile>/<name>` on every build-script run; a supervisor that
+/// never built `--bin qontinui-pr` left that 0-byte copy beside every runner
+/// it started, the runner put it on every terminal's PATH, and
+/// `qontinui-pr create` exited 0 having opened no PR
 /// (plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
 ///
 /// A runner deployed without a fresh sidecar materializes whatever stale stub
@@ -2055,8 +2067,8 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
     RunnerSidecar {
         bin: "qontinui-pr",
         filename: SESSION_CLI_EXE_FILENAME,
-        consequence: "terminals get no `qontinui-pr` session CLI (command not found; \
-                      open PRs through the runner's loopback door or `gh pr create`)",
+        consequence: "terminals get no working `qontinui-pr` session CLI (open PRs \
+                      through the runner's loopback door or `gh pr create`)",
         deployed_beside_runner: true,
     },
     RunnerSidecar {
@@ -2073,6 +2085,13 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
 /// class. The same feature set as the runner build (`CARGO_BUILD_ARGS` in
 /// `run_build_inner`) so cargo reuses the warm fingerprints instead of
 /// recompiling shared deps under a different feature resolution.
+///
+/// These are the args for a runner tree that declares every roster bin. What
+/// is actually run is [`sidecar_build_args`] over the tree's own manifest:
+/// `--keep-going` does NOT cover an unknown `--bin` — cargo rejects the whole
+/// invocation at target selection, before compiling anything, so a runner ref
+/// predating one sidecar (`qontinui-pr` did not exist 2026-06-08..2026-07-10)
+/// would lose the shim along with it.
 pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
     "build",
     "--keep-going",
@@ -2085,6 +2104,77 @@ pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
     "--features",
     "custom-protocol",
 ];
+
+/// The bin targets the package at `cargo_cwd/Cargo.toml` declares: every
+/// explicit `[[bin]] name`, plus — unless `package.autobins = false` — the
+/// ones cargo discovers itself, `src/bin/<stem>.rs` and `src/bin/<dir>/main.rs`.
+///
+/// `None` is UNKNOWN (no readable manifest, unparseable TOML, or a manifest
+/// with no `[package]`, i.e. a virtual workspace root): the caller then builds
+/// the whole roster and lets cargo say. Over-inclusion is harmless here — the
+/// set is only ever asked whether it contains a roster name — so a discovered
+/// file stem that an explicit `[[bin]]` claims under another name is kept.
+pub(crate) fn declared_bin_targets(
+    cargo_cwd: &std::path::Path,
+) -> Option<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(cargo_cwd.join("Cargo.toml")).ok()?;
+    let manifest: toml::Value = toml::from_str(&text).ok()?;
+    let package = manifest.get("package")?.as_table()?;
+    let mut declared = std::collections::BTreeSet::new();
+    if let Some(bins) = manifest.get("bin").and_then(|b| b.as_array()) {
+        declared.extend(
+            bins.iter()
+                .filter_map(|b| b.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string),
+        );
+    }
+    let autobins = package
+        .get("autobins")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if autobins {
+        if let Ok(entries) = std::fs::read_dir(cargo_cwd.join("src").join("bin")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+                    if let Some(stem) = path.file_stem() {
+                        declared.insert(stem.to_string_lossy().into_owned());
+                    }
+                } else if path.join("main.rs").is_file() {
+                    if let Some(dir) = path.file_name() {
+                        declared.insert(dir.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Some(declared)
+}
+
+/// [`SIDECAR_BUILD_ARGS`] without the `--bin <name>` pairs `declared` lacks.
+/// `None` (the manifest could not be read) keeps every pair. The result names
+/// no `--bin` at all when the tree declares none of the roster — the caller
+/// must then skip cargo, since a bare `cargo build` builds every bin.
+pub(crate) fn sidecar_build_args(
+    declared: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<&'static str> {
+    let mut args = Vec::with_capacity(SIDECAR_BUILD_ARGS.len());
+    let mut i = 0;
+    while i < SIDECAR_BUILD_ARGS.len() {
+        let arg = SIDECAR_BUILD_ARGS[i];
+        if arg == "--bin" {
+            let bin = SIDECAR_BUILD_ARGS[i + 1];
+            if declared.is_none_or(|d| d.contains(bin)) {
+                args.extend([arg, bin]);
+            }
+            i += 2;
+        } else {
+            args.push(arg);
+            i += 1;
+        }
+    }
+    args
+}
 
 /// What sits at a sidecar's path. A zero-length file is NOT a binary: it is a
 /// build placeholder (or a copy of one), and executing it under Git Bash exits
@@ -2114,9 +2204,14 @@ impl SidecarFile {
 }
 
 /// Remove `path` when it is a ZERO-LENGTH regular file, and only then — never
-/// a file with content. Returns whether a file was removed. Used by every step
-/// of the placement contract so a stale 0-byte copy is never left beside a
-/// runner (or in the LKG dir) once a real sidecar could not replace it.
+/// a file with content. Returns whether a file was removed.
+///
+/// The LKG carry and every deploy outcome call it on their destination, so a
+/// stale 0-byte copy does not survive an LKG promotion or a runner start. That
+/// is true AT THAT MOMENT only: the primary's sidecar directory is the runner's
+/// cargo `target/debug/`, which tauri-build refills with 0-byte placeholder
+/// copies on any later non-pool build-script run until the runner's Phase 1a
+/// lands (see [`SHIM_EXE_FILENAME`]).
 pub(crate) fn remove_if_zero_length(path: &std::path::Path) -> bool {
     SidecarFile::inspect(path) == SidecarFile::Empty && std::fs::remove_file(path).is_ok()
 }
@@ -2145,8 +2240,9 @@ pub(crate) fn inspect_built_sidecars(
         .collect()
 }
 
-/// Build every roster sidecar into the slot's target dir, right after a
-/// successful runner build (see [`SHIM_EXE_FILENAME`] for the contract).
+/// Build the roster sidecars the runner tree declares into the slot's target
+/// dir, right after a successful runner build (see [`SHIM_EXE_FILENAME`] for
+/// the contract).
 ///
 /// FAIL-OPEN by design: the sidecars are lockstep riders on the runner deploy,
 /// not a gate on it. Any failure (spawn error, timeout, non-zero exit, a
@@ -2155,51 +2251,89 @@ pub(crate) fn inspect_built_sidecars(
 /// fails the runner build/restart: the cost of a missing sidecar is a stale
 /// or absent helper, the cost of failing the build would be no runner at all.
 ///
+/// Only the roster bins the tree's manifest declares are passed
+/// ([`declared_bin_targets`], [`sidecar_build_args`]): cargo rejects an
+/// unknown `--bin` before compiling anything, `--keep-going` notwithstanding,
+/// so a runner ref that predates one sidecar would otherwise lose them all.
+///
 /// The check after cargo returns runs on EVERY outcome, not only on success:
 /// with `--keep-going` a failed invocation can still have produced the other
 /// sidecars, and a successful one can still leave a 0-byte placeholder copy
 /// if cargo did not uplift over it.
 async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &std::path::Path) {
+    let declared = declared_bin_targets(cargo_cwd);
+    let args = sidecar_build_args(declared.as_ref());
+    let undeclared: Vec<&'static str> = RUNNER_SIDECARS
+        .iter()
+        .filter(|s| declared.as_ref().is_some_and(|d| !d.contains(s.bin)))
+        .map(|s| s.bin)
+        .collect();
+    if declared.is_none() {
+        let msg = format!(
+            "Slot {}: could not read the bin targets {:?} declares — building the whole \
+             sidecar roster; cargo refuses the invocation if the tree lacks one of them",
+            slot.id,
+            cargo_cwd.join("Cargo.toml")
+        );
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+    if !undeclared.is_empty() {
+        let msg = format!(
+            "Slot {}: this runner tree does not declare {:?} (a ref that predates them) — \
+             not building them; a file of that name in the slot is from another build",
+            slot.id, undeclared
+        );
+        info!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+    }
     info!(
-        "Slot {}: building runner sidecars {:?} (warm target {:?})",
+        "Slot {}: building runner sidecars: cargo {} (warm target {:?})",
         slot.id,
-        RUNNER_SIDECARS.iter().map(|s| s.bin).collect::<Vec<_>>(),
+        args.join(" "),
         slot.target_dir
     );
 
-    // Same S3-backend degrade as the main pool build — see `sccache_guard`.
-    let guarded = crate::sccache_guard::guarded_cargo(
-        Duration::from_secs(SIDECAR_BUILD_TIMEOUT_SECS),
-        cargo_cwd,
-    )
-    .await
-    .args(SIDECAR_BUILD_ARGS)
-    .current_dir(cargo_cwd)
-    .env("CARGO_TARGET_DIR", &slot.target_dir)
-    .job_guarded(true);
+    let cargo_failure: Option<String> = if !args.contains(&"--bin") {
+        Some("this runner tree declares none of the sidecar bins — nothing built".to_string())
+    } else {
+        // Same S3-backend degrade as the main pool build — see `sccache_guard`.
+        let guarded = crate::sccache_guard::guarded_cargo(
+            Duration::from_secs(SIDECAR_BUILD_TIMEOUT_SECS),
+            cargo_cwd,
+        )
+        .await
+        .args(&args)
+        .current_dir(cargo_cwd)
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .job_guarded(true);
 
-    let cargo_failure: Option<String> = match guarded.run().await {
-        Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
-        Ok(GuardedOutcome::Exited(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
-            Some(format!(
-                "cargo exit {}: {}",
-                output.status,
-                tail.replace('\n', " | ")
-            ))
+        match guarded.run().await {
+            Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
+            Ok(GuardedOutcome::Exited(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+                Some(format!(
+                    "cargo exit {}: {}",
+                    output.status,
+                    tail.replace('\n', " | ")
+                ))
+            }
+            Ok(GuardedOutcome::TimedOut { after, .. }) => {
+                Some(format!("timed out after {}s", after.as_secs()))
+            }
+            Ok(GuardedOutcome::Cancelled { .. }) => Some("cancelled".to_string()),
+            Err(e) => Some(format!("failed to spawn cargo: {}", e)),
         }
-        Ok(GuardedOutcome::TimedOut { after, .. }) => {
-            Some(format!("timed out after {}s", after.as_secs()))
-        }
-        Ok(GuardedOutcome::Cancelled { .. }) => Some("cancelled".to_string()),
-        Err(e) => Some(format!("failed to spawn cargo: {}", e)),
     };
 
     let debug_dir = slot.target_dir.join("debug");
     let mut warnings = Vec::new();
     let mut built = Vec::new();
     for (sidecar, path, file) in inspect_built_sidecars(&debug_dir) {
+        if undeclared.contains(&sidecar.bin) {
+            continue;
+        }
         let problem = match file {
             SidecarFile::Present { bytes } => {
                 built.push(format!("{} ({} bytes)", sidecar.bin, bytes));
@@ -2226,8 +2360,9 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         ));
     }
     // A failed invocation whose sidecars all look real still gets named: with
-    // `--keep-going` a sidecar that failed to compile keeps the file an EARLIER
-    // build uplifted, which exists and is non-empty but is stale.
+    // `--keep-going` a sidecar that failed to compile may keep an EARLIER
+    // uplift, which can be stale (or the 0-byte placeholder copy, which the
+    // `Empty` arm above already reported).
     if warnings.is_empty() {
         if let Some(failure) = &cargo_failure {
             warnings.push(format!(
@@ -4321,16 +4456,33 @@ async fn prewarm_single_slot(
 /// a per-slot tmp file + atomic rename. Returns the bytes carried.
 ///
 /// A ZERO-LENGTH source is refused, never carried: it is a build placeholder,
-/// and an LKG-pinned start would otherwise deploy it beside the runner. In that
-/// case a zero-length file already at the LKG destination (carried by a build
-/// predating this check) is removed too, so the LKG dir never holds one; a
-/// non-empty LKG copy from an earlier build is left in place, exactly as it is
-/// when the source is missing.
+/// and an LKG-pinned start would otherwise deploy it beside the runner. The
+/// verdict is taken twice — a stat for the message, and the byte count of the
+/// copy itself, because the slot is released before LKG capture and a queued
+/// build can rewrite the sidecar in between. On a refusal a zero-length file
+/// already at the LKG destination (carried by a build predating this check) is
+/// removed too, so the LKG dir never holds one; a non-empty LKG copy from an
+/// earlier build is left in place, exactly as it is when the source is missing.
 fn carry_sidecar_into_lkg(
     source_exe: &std::path::Path,
     lkg_dir: &std::path::Path,
     filename: &str,
     slot_id: usize,
+) -> Result<u64, String> {
+    carry_sidecar_into_lkg_via(source_exe, lkg_dir, filename, slot_id, |from, to| {
+        std::fs::copy(from, to)
+    })
+}
+
+/// [`carry_sidecar_into_lkg`] with the copy injected, so a test can stage the
+/// race in which a concurrent build rewrites the slot's sidecar between the
+/// check and the copy.
+fn carry_sidecar_into_lkg_via(
+    source_exe: &std::path::Path,
+    lkg_dir: &std::path::Path,
+    filename: &str,
+    slot_id: usize,
+    copy: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<u64>,
 ) -> Result<u64, String> {
     let src = source_exe.with_file_name(filename);
     let dst = lkg_dir.join(filename);
@@ -4354,9 +4506,24 @@ fn carry_sidecar_into_lkg(
     }
     let tmp = lkg_dir.join(format!("{}.tmp.{}", filename, slot_id));
     let _ = std::fs::remove_file(&tmp);
-    let result = std::fs::copy(&src, &tmp)
+    let result = copy(&src, &tmp)
         .map_err(|e| format!("copy {:?} -> {:?}: {}", src, tmp, e))
         .and_then(|bytes| {
+            // Judge the bytes actually COPIED, not the stat above: the slot is
+            // released before LKG capture, so a queued build can already have
+            // rewritten this sidecar with tauri-build's 0-byte placeholder copy.
+            if bytes == 0 {
+                let removed = remove_if_zero_length(&dst);
+                return Err(format!(
+                    "{:?} was ZERO-LENGTH when copied (rewritten after the check, likely                      by a build that took the slot) — refused to carry it{}",
+                    src,
+                    if removed {
+                        format!("; removed the zero-length copy already at {:?}", dst)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
             std::fs::rename(&tmp, &dst)
                 .map(|()| bytes)
                 .map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, dst, e))
@@ -4563,7 +4730,8 @@ mod tests {
         LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
     };
     use super::{
-        inspect_built_sidecars, remove_if_zero_length, SidecarFile, PROFILE_CLI_EXE_FILENAME,
+        carry_sidecar_into_lkg_via, declared_bin_targets, inspect_built_sidecars,
+        remove_if_zero_length, sidecar_build_args, SidecarFile, PROFILE_CLI_EXE_FILENAME,
         RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME, SHIM_EXE_FILENAME, SIDECAR_BUILD_ARGS,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
@@ -5900,6 +6068,119 @@ mod tests {
         assert_eq!(deployed, ["qontinui-shim", "qontinui-pr"]);
     }
 
+    /// Write a runner-like `src-tauri` package: `manifest` as `Cargo.toml`,
+    /// plus each of `bin_files` (paths relative to the package root).
+    fn stage_runner_package(root: &std::path::Path, manifest: &str, bin_files: &[&str]) {
+        fs::create_dir_all(root).expect("mkdir package");
+        fs::write(root.join("Cargo.toml"), manifest).expect("write manifest");
+        for rel in bin_files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).expect("mkdir bin dir");
+            fs::write(&path, "fn main() {}\n").expect("write bin");
+        }
+    }
+
+    /// N1 (review round 1): a runner ref that predates `qontinui-pr` (it did
+    /// not exist 2026-06-08..2026-07-10) must not be handed `--bin qontinui-pr`
+    /// — cargo rejects the whole invocation before compiling anything,
+    /// `--keep-going` notwithstanding, and the shim is lost with it.
+    #[test]
+    fn sidecar_build_args_skip_a_bin_the_runner_tree_does_not_declare() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pkg = tmp.path().join("src-tauri");
+        stage_runner_package(
+            &pkg,
+            "[package]\nname = \"qontinui-runner\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"qontinui-shim\"\npath = \"src/bin/qontinui_shim.rs\"\n",
+            &["src/bin/qontinui_shim.rs", "src/bin/qontinui_profile.rs"],
+        );
+
+        let declared = declared_bin_targets(&pkg).expect("a readable package manifest");
+        assert!(
+            declared.contains("qontinui-shim"),
+            "explicit [[bin]]: {declared:?}"
+        );
+        assert!(
+            declared.contains("qontinui_profile"),
+            "discovered bin: {declared:?}"
+        );
+        assert!(!declared.contains("qontinui-pr"), "{declared:?}");
+
+        assert_eq!(
+            sidecar_build_args(Some(&declared)),
+            vec![
+                "build",
+                "--keep-going",
+                "--bin",
+                "qontinui-shim",
+                "--bin",
+                "qontinui_profile",
+                "--features",
+                "custom-protocol",
+            ]
+        );
+    }
+
+    /// A tree declaring the whole roster gets exactly [`SIDECAR_BUILD_ARGS`];
+    /// an unreadable manifest (UNKNOWN) does too; a tree declaring none of the
+    /// roster gets no `--bin` at all, which the caller treats as "skip cargo".
+    #[test]
+    fn sidecar_build_args_full_unknown_and_empty_rosters() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pkg = tmp.path().join("src-tauri");
+        stage_runner_package(
+            &pkg,
+            "[package]\nname = \"qontinui-runner\"\nversion = \"0.1.0\"\n\n\
+             [[bin]]\nname = \"qontinui-shim\"\npath = \"src/bin/qontinui_shim.rs\"\n\n\
+             [[bin]]\nname = \"qontinui-pr\"\npath = \"src/bin/qontinui_cli.rs\"\n",
+            &[
+                "src/bin/qontinui_shim.rs",
+                "src/bin/qontinui_cli.rs",
+                "src/bin/qontinui_profile.rs",
+            ],
+        );
+        let declared = declared_bin_targets(&pkg).expect("readable");
+        assert_eq!(
+            sidecar_build_args(Some(&declared)),
+            SIDECAR_BUILD_ARGS.to_vec()
+        );
+        assert_eq!(sidecar_build_args(None), SIDECAR_BUILD_ARGS.to_vec());
+        let none_declared = std::collections::BTreeSet::new();
+        assert!(!sidecar_build_args(Some(&none_declared)).contains(&"--bin"));
+    }
+
+    /// `autobins = false` turns discovery off; a manifest with no `[package]`
+    /// (a virtual workspace root) or no manifest at all is UNKNOWN (`None`).
+    #[test]
+    fn declared_bin_targets_honours_autobins_and_refuses_what_it_cannot_read() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pkg = tmp.path().join("no-autobins");
+        stage_runner_package(
+            &pkg,
+            "[package]\nname = \"r\"\nversion = \"0.1.0\"\nautobins = false\n\n\
+             [[bin]]\nname = \"qontinui-shim\"\npath = \"src/bin/qontinui_shim.rs\"\n",
+            &["src/bin/qontinui_shim.rs", "src/bin/qontinui_profile.rs"],
+        );
+        let declared = declared_bin_targets(&pkg).expect("readable");
+        assert!(declared.contains("qontinui-shim"));
+        assert!(!declared.contains("qontinui_profile"), "{declared:?}");
+
+        let dir_bin = tmp.path().join("dir-bin");
+        stage_runner_package(
+            &dir_bin,
+            "[package]\nname = \"r\"\nversion = \"0.1.0\"\n",
+            &["src/bin/qontinui_profile/main.rs"],
+        );
+        assert!(declared_bin_targets(&dir_bin)
+            .expect("readable")
+            .contains("qontinui_profile"));
+
+        let virtual_root = tmp.path().join("virtual");
+        stage_runner_package(&virtual_root, "[workspace]\nmembers = []\n", &[]);
+        assert_eq!(declared_bin_targets(&virtual_root), None);
+        assert_eq!(declared_bin_targets(&tmp.path().join("absent")), None);
+    }
+
     /// The post-build check reports EACH sidecar by name, and a zero-length
     /// file is reported as `Empty`, never as a built binary.
     #[test]
@@ -5999,6 +6280,91 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(litter.is_empty(), "tmp files left in lkg: {:?}", litter);
+    }
+
+    /// S1 (review round 1): the slot is released before LKG capture, so a
+    /// queued build can rewrite the slot's sidecar — tauri-build's 0-byte
+    /// placeholder copy — between the check and the copy. The carry must judge
+    /// the bytes it actually COPIED: nothing zero-length may be renamed into
+    /// the LKG dir, and an earlier real LKG copy stays in place.
+    #[test]
+    fn lkg_carry_refuses_a_source_emptied_between_check_and_copy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let slot_debug = tmp.path().join("slot-0").join("debug");
+        let lkg_dir = tmp.path().join("lkg");
+        fs::create_dir_all(&slot_debug).expect("mkdir slot");
+        fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
+        let source_exe = slot_debug.join("qontinui-runner.exe");
+        fs::write(&source_exe, b"runner").expect("runner");
+        let src = slot_debug.join(SESSION_CLI_EXE_FILENAME);
+        fs::write(&src, b"real-cli").expect("real cli at check time");
+        let dst = lkg_dir.join(SESSION_CLI_EXE_FILENAME);
+        fs::write(&dst, b"earlier-real-cli").expect("earlier LKG copy");
+
+        // The concurrent build's placeholder copy lands after the check.
+        let racing_copy = |from: &std::path::Path, to: &std::path::Path| {
+            fs::write(from, b"")?;
+            fs::copy(from, to)
+        };
+        let result = carry_sidecar_into_lkg_via(
+            &source_exe,
+            &lkg_dir,
+            SESSION_CLI_EXE_FILENAME,
+            0,
+            racing_copy,
+        );
+
+        assert!(
+            result.is_err(),
+            "a zero-byte copy must be refused: {result:?}"
+        );
+        assert_eq!(
+            fs::read(&dst).expect("read lkg cli"),
+            b"earlier-real-cli",
+            "the earlier real LKG copy must not be replaced by zero bytes"
+        );
+        let litter: Vec<_> = fs::read_dir(&lkg_dir)
+            .expect("read lkg dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(litter.is_empty(), "tmp files left in lkg: {:?}", litter);
+    }
+
+    /// The same race with a zero-length copy already in the LKG dir: that
+    /// stale copy is removed rather than left in place.
+    #[test]
+    fn lkg_carry_race_removes_a_zero_length_lkg_copy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let slot_debug = tmp.path().join("slot-0").join("debug");
+        let lkg_dir = tmp.path().join("lkg");
+        fs::create_dir_all(&slot_debug).expect("mkdir slot");
+        fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
+        let source_exe = slot_debug.join("qontinui-runner.exe");
+        fs::write(&source_exe, b"runner").expect("runner");
+        fs::write(slot_debug.join(SESSION_CLI_EXE_FILENAME), b"real-cli").expect("cli");
+        let dst = lkg_dir.join(SESSION_CLI_EXE_FILENAME);
+        fs::write(&dst, b"").expect("stale zero-length LKG copy");
+
+        let racing_copy = |from: &std::path::Path, to: &std::path::Path| {
+            fs::write(from, b"")?;
+            fs::copy(from, to)
+        };
+        let result = carry_sidecar_into_lkg_via(
+            &source_exe,
+            &lkg_dir,
+            SESSION_CLI_EXE_FILENAME,
+            0,
+            racing_copy,
+        );
+        assert!(
+            result.is_err(),
+            "a zero-byte copy must be refused: {result:?}"
+        );
+        assert!(
+            !dst.exists(),
+            "a zero-length LKG copy must not survive the refusal"
+        );
     }
 
     /// The `from_working_tree` flag selects the build's source classification:

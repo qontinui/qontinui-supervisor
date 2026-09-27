@@ -2461,6 +2461,14 @@ pub async fn start_managed_runner(
 /// re-materializes whatever stale stub already sits next to the copy (the
 /// 2026-07-03 incident). See [`crate::build_monitor::SHIM_EXE_FILENAME`] for
 /// the full placement contract.
+///
+/// Every arm that did not put a real sidecar at the destination carries
+/// `removed_empty_dest`: the ZERO-LENGTH file [`deploy_sidecar`] found at the
+/// destination and removed, if there was one. So after any deploy, whatever
+/// its outcome, no zero-length copy of the sidecar is left beside the runner
+/// exe — at that moment. The primary's copy directory is the runner's own
+/// cargo `target/debug/`, which a later non-pool build refills (see
+/// [`crate::build_monitor::remove_if_zero_length`]).
 #[derive(Debug)]
 pub(crate) enum SidecarDeploy {
     /// Sidecar copied next to the runner exe copy.
@@ -2471,17 +2479,18 @@ pub(crate) enum SidecarDeploy {
     SameDir,
     /// No sidecar next to the source exe (a slot/LKG predating the sidecar
     /// build, or the fail-open sidecar build failed).
-    SourceMissing { expected: std::path::PathBuf },
+    SourceMissing {
+        expected: std::path::PathBuf,
+        removed_empty_dest: Option<std::path::PathBuf>,
+    },
     /// The sidecar next to the source exe is ZERO-LENGTH — a build
     /// placeholder (the runner's `build.rs` writes 0-byte
     /// `binaries/<name>-<triple>` files, which tauri-build copies over
     /// `<target>/<profile>/<name>`), not a binary. It was NOT deployed: the
     /// runner would put it on every terminal's PATH, where Git Bash runs an
-    /// empty file as a script that exits 0 having done nothing. A zero-length
-    /// file already at the destination was removed too, so the runner finds no
-    /// sidecar (an honest "command not found") rather than a stale 0-byte one;
-    /// `removed_empty_dest` names it. In the [`SidecarDeploy::SameDir`]
-    /// layout the source IS the destination, and it is the file removed.
+    /// empty file as a script that exits 0 having done nothing. In the
+    /// [`SidecarDeploy::SameDir`] layout the source IS the destination, and it
+    /// is the file removed.
     SourceEmpty {
         path: std::path::PathBuf,
         removed_empty_dest: Option<std::path::PathBuf>,
@@ -2491,6 +2500,7 @@ pub(crate) enum SidecarDeploy {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
         error: String,
+        removed_empty_dest: Option<std::path::PathBuf>,
     },
 }
 
@@ -2500,6 +2510,11 @@ pub(crate) enum SidecarDeploy {
 pub(crate) const GIT_CREDENTIAL_EXE_FILENAME: &str = "qontinui-git-credential.exe";
 #[cfg(not(windows))]
 pub(crate) const GIT_CREDENTIAL_EXE_FILENAME: &str = "qontinui-git-credential";
+
+/// Remove `path` when it is a zero-length file, naming it when it was.
+fn remove_empty_dest(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    crate::build_monitor::remove_if_zero_length(path).then(|| path.to_path_buf())
+}
 
 /// Copy the sidecar `sidecar_name` from next to `source_exe` to next to
 /// `dest_exe` (the per-runner exe copy). Fail-open by contract: this returns
@@ -2513,13 +2528,20 @@ pub(crate) const GIT_CREDENTIAL_EXE_FILENAME: &str = "qontinui-git-credential";
 /// runner restarting in place can race its own previous materializer reading
 /// the stub.
 ///
-/// A ZERO-LENGTH source is refused ([`SidecarDeploy::SourceEmpty`]), and a
-/// zero-length file already at the destination is removed with it. The check
+/// A ZERO-LENGTH source is refused ([`SidecarDeploy::SourceEmpty`]). The check
 /// is the byte count of the copy itself rather than a stat taken beforehand,
 /// so a source truncated between a stat and the copy (a concurrent rebuild of
 /// the same slot runs tauri-build's placeholder copy over it) is still caught.
-/// Only zero length is refused: the runner owns the executable-format check
-/// (its materializer validates the image before publishing it).
+/// And on EVERY arm that does not put a real sidecar in place — source empty,
+/// source missing, copy or rename failed — a zero-length file already at the
+/// destination is removed, so a stale 0-byte copy never survives a deploy.
+///
+/// This refusal is load-bearing on its own. The runner's materializer, on
+/// runner `origin/main` today, publishes any `is_file()` it finds beside its
+/// exe, with no size or format check; that check is the runner half of the
+/// same plan (Phase 1b) and has not landed. Only zero length is refused here,
+/// deliberately: it is the failure this plan measured, and a format check
+/// would have to track three executable formats that the runner will own.
 pub(crate) fn deploy_sidecar(
     source_exe: &std::path::Path,
     dest_exe: &std::path::Path,
@@ -2535,21 +2557,22 @@ pub(crate) fn deploy_sidecar(
     if src_dir == dst_dir {
         // Nothing to copy, but the file sitting there IS what the runner will
         // publish — so a zero-length one is removed rather than left in place.
-        if crate::build_monitor::remove_if_zero_length(&sidecar_src) {
+        if let Some(removed) = remove_empty_dest(&sidecar_src) {
             return SidecarDeploy::SourceEmpty {
-                removed_empty_dest: Some(sidecar_src.clone()),
                 path: sidecar_src,
+                removed_empty_dest: Some(removed),
             };
         }
         return SidecarDeploy::SameDir;
     }
+    let sidecar_dst = dst_dir.join(sidecar_name);
 
     if !sidecar_src.exists() {
         return SidecarDeploy::SourceMissing {
             expected: sidecar_src,
+            removed_empty_dest: remove_empty_dest(&sidecar_dst),
         };
     }
-    let sidecar_dst = dst_dir.join(sidecar_name);
 
     let stem = dest_exe
         .file_stem()
@@ -2563,6 +2586,7 @@ pub(crate) fn deploy_sidecar(
         Err(e) => {
             let _ = std::fs::remove_file(&sidecar_tmp);
             return SidecarDeploy::CopyFailed {
+                removed_empty_dest: remove_empty_dest(&sidecar_dst),
                 from: sidecar_src,
                 to: sidecar_dst,
                 error: format!("copy to tmp: {}", e),
@@ -2571,11 +2595,9 @@ pub(crate) fn deploy_sidecar(
     };
     if copied == 0 {
         let _ = std::fs::remove_file(&sidecar_tmp);
-        let removed_empty_dest =
-            crate::build_monitor::remove_if_zero_length(&sidecar_dst).then(|| sidecar_dst.clone());
         return SidecarDeploy::SourceEmpty {
             path: sidecar_src,
-            removed_empty_dest,
+            removed_empty_dest: remove_empty_dest(&sidecar_dst),
         };
     }
 
@@ -2597,6 +2619,7 @@ pub(crate) fn deploy_sidecar(
         Err(error) => {
             let _ = std::fs::remove_file(&sidecar_tmp);
             SidecarDeploy::CopyFailed {
+                removed_empty_dest: remove_empty_dest(&sidecar_dst),
                 from: sidecar_src,
                 to: sidecar_dst,
                 error,
@@ -2618,7 +2641,8 @@ pub(crate) enum SidecarAbsence {
 /// Log one sidecar deploy outcome for runner `runner_name`. Every variant is
 /// logged: a refusal ([`SidecarDeploy::SourceEmpty`]) or a copy failure is a
 /// WARN into both `tracing` and the supervisor log buffer; an absence is a
-/// WARN or an INFO per `absence`.
+/// WARN or an INFO per `absence` — always a WARN when a zero-length copy had
+/// to be removed from beside the runner, since something put it there.
 pub(crate) async fn report_sidecar_deploy(
     state: &SharedState,
     runner_name: &str,
@@ -2627,6 +2651,11 @@ pub(crate) async fn report_sidecar_deploy(
     absence: SidecarAbsence,
     outcome: SidecarDeploy,
 ) {
+    let removal = |removed: Option<std::path::PathBuf>| {
+        removed
+            .map(|d| format!("; removed the zero-length copy at {:?}", d))
+            .unwrap_or_default()
+    };
     let warning = match outcome {
         SidecarDeploy::Copied { to } => {
             info!(
@@ -2636,19 +2665,26 @@ pub(crate) async fn report_sidecar_deploy(
             return;
         }
         SidecarDeploy::SameDir => return,
-        SidecarDeploy::SourceMissing { expected } => match absence {
-            SidecarAbsence::Info => {
+        SidecarDeploy::SourceMissing {
+            expected,
+            removed_empty_dest,
+        } => match (absence, removed_empty_dest) {
+            (SidecarAbsence::Info, None) => {
                 info!(
                     "No {} beside the source exe for '{}' (looked for {:?}) — {}",
                     sidecar, runner_name, expected, consequence
                 );
                 return;
             }
-            SidecarAbsence::Warn => format!(
-                "No {} next to the source exe for '{}' (expected {:?}) — {}; rebuild \
+            (_, removed) => format!(
+                "No {} next to the source exe for '{}' (expected {:?}){} — {}; rebuild \
                  (POST /runner/restart {{rebuild:true}} or spawn-test {{rebuild:true}}) to \
                  produce the sidecar",
-                sidecar, runner_name, expected, consequence
+                sidecar,
+                runner_name,
+                expected,
+                removal(removed),
+                consequence
             ),
         },
         SidecarDeploy::SourceEmpty {
@@ -2661,15 +2697,24 @@ pub(crate) async fn report_sidecar_deploy(
             sidecar,
             runner_name,
             path,
-            removed_empty_dest
-                .map(|d| format!(" and removed the zero-length copy at {:?}", d))
-                .unwrap_or_default(),
+            removal(removed_empty_dest),
             consequence
         ),
-        SidecarDeploy::CopyFailed { from, to, error } => format!(
-            "Failed to copy {} sidecar for '{}' from {:?} to {:?} ({}) — {} until a later \
+        SidecarDeploy::CopyFailed {
+            from,
+            to,
+            error,
+            removed_empty_dest,
+        } => format!(
+            "Failed to copy {} sidecar for '{}' from {:?} to {:?} ({}){} — {} until a later \
              runner start succeeds in copying it",
-            sidecar, runner_name, from, to, error, consequence
+            sidecar,
+            runner_name,
+            from,
+            to,
+            error,
+            removal(removed_empty_dest),
+            consequence
         ),
     };
     warn!("{}", warning);
@@ -7412,7 +7457,7 @@ mod tests {
             &dest_exe,
             crate::build_monitor::SHIM_EXE_FILENAME,
         ) {
-            SidecarDeploy::SourceMissing { expected } => {
+            SidecarDeploy::SourceMissing { expected, .. } => {
                 assert_eq!(
                     expected,
                     slot_debug.join(crate::build_monitor::SHIM_EXE_FILENAME)
@@ -7583,6 +7628,86 @@ mod tests {
             other => panic!("expected SourceEmpty, got {:?}", other),
         }
         assert!(!cli.exists(), "the in-place 0-byte CLI must be removed");
+    }
+
+    /// B1 (review round 1): a MISSING source must still remove a zero-length
+    /// copy at the destination. Reachable: a primary pinned to an LKG that has
+    /// no `qontinui-pr` yet deploys over a `target/debug/` that tauri-build
+    /// refilled with its 0-byte placeholder copy.
+    #[test]
+    fn sidecar_missing_source_removes_a_stale_empty_dest() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (source_exe, dest_exe) = stage_sidecar_deploy_dirs(root.path());
+        let cli = crate::build_monitor::SESSION_CLI_EXE_FILENAME;
+        let dst = dest_exe.with_file_name(cli);
+        std::fs::write(&dst, b"").expect("write stale 0-byte copy");
+
+        match deploy_sidecar(&source_exe, &dest_exe, cli) {
+            SidecarDeploy::SourceMissing {
+                expected,
+                removed_empty_dest,
+            } => {
+                assert_eq!(expected, source_exe.with_file_name(cli));
+                assert_eq!(
+                    removed_empty_dest,
+                    Some(dst.clone()),
+                    "the removal is reported"
+                );
+            }
+            other => panic!("expected SourceMissing, got {:?}", other),
+        }
+        assert!(
+            !dst.exists(),
+            "a 0-byte session CLI must not be left beside the runner when the source is missing"
+        );
+    }
+
+    /// A missing source never deletes a destination sidecar that has content.
+    #[test]
+    fn sidecar_missing_source_leaves_a_dest_with_content_alone() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (source_exe, dest_exe) = stage_sidecar_deploy_dirs(root.path());
+        let cli = crate::build_monitor::SESSION_CLI_EXE_FILENAME;
+        let dst = dest_exe.with_file_name(cli);
+        std::fs::write(&dst, b"earlier-real-cli").expect("write earlier real cli");
+
+        assert!(matches!(
+            deploy_sidecar(&source_exe, &dest_exe, cli),
+            SidecarDeploy::SourceMissing {
+                removed_empty_dest: None,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"earlier-real-cli");
+    }
+
+    /// B1: a copy that FAILS must still remove a zero-length copy at the
+    /// destination. A directory where the sidecar should be makes the copy
+    /// fail deterministically on every platform.
+    #[test]
+    fn sidecar_copy_failure_removes_a_stale_empty_dest() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (source_exe, dest_exe) = stage_sidecar_deploy_dirs(root.path());
+        let cli = crate::build_monitor::SESSION_CLI_EXE_FILENAME;
+        std::fs::create_dir_all(source_exe.with_file_name(cli)).expect("dir as source");
+        let dst = dest_exe.with_file_name(cli);
+        std::fs::write(&dst, b"").expect("write stale 0-byte copy");
+
+        match deploy_sidecar(&source_exe, &dest_exe, cli) {
+            SidecarDeploy::CopyFailed {
+                removed_empty_dest, ..
+            } => assert_eq!(
+                removed_empty_dest,
+                Some(dst.clone()),
+                "the removal is reported"
+            ),
+            other => panic!("expected CopyFailed, got {:?}", other),
+        }
+        assert!(
+            !dst.exists(),
+            "a 0-byte session CLI must not be left beside the runner when the copy fails"
+        );
+        assert!(tmp_litter(dest_exe.parent().unwrap()).is_empty());
     }
 
     /// A temp restart keeps the runner's per-instance state (pairing, config,
