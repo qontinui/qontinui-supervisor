@@ -2287,16 +2287,22 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         info!("{}", msg);
         state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
     }
-    info!(
-        "Slot {}: building runner sidecars: cargo {} (warm target {:?})",
-        slot.id,
-        args.join(" "),
-        slot.target_dir
-    );
-
+    // A tree that declares none of the roster (refs before 2026-04-30) gets
+    // no cargo run at all: a bare `cargo build` would build every bin, and
+    // nothing attempted is nothing failed.
     let cargo_failure: Option<String> = if !args.contains(&"--bin") {
-        Some("this runner tree declares none of the sidecar bins — nothing built".to_string())
+        info!(
+            "Slot {}: this runner tree declares none of the sidecar bins — nothing to build",
+            slot.id
+        );
+        None
     } else {
+        info!(
+            "Slot {}: building runner sidecars: cargo {} (warm target {:?})",
+            slot.id,
+            args.join(" "),
+            slot.target_dir
+        );
         // Same S3-backend degrade as the main pool build — see `sccache_guard`.
         let guarded = crate::sccache_guard::guarded_cargo(
             Duration::from_secs(SIDECAR_BUILD_TIMEOUT_SECS),
@@ -2328,15 +2334,48 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
     };
 
     let debug_dir = slot.target_dir.join("debug");
-    let mut warnings = Vec::new();
-    let mut built = Vec::new();
-    for (sidecar, path, file) in inspect_built_sidecars(&debug_dir) {
+    let verdict = sidecar_build_verdict(slot.id, &debug_dir, &undeclared, cargo_failure.as_deref());
+    if !verdict.built.is_empty() {
+        info!(
+            "Slot {}: runner sidecars ready in {:?}: {}",
+            slot.id,
+            debug_dir,
+            verdict.built.join(", ")
+        );
+    }
+    for msg in verdict.warnings {
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+}
+
+/// What [`build_sidecars`] reports after cargo returns: the sidecars that are
+/// real binaries, and one WARN per declared sidecar that is not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidecarBuildVerdict {
+    pub(crate) built: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The post-build check, kept pure so every arm is testable without cargo.
+/// `undeclared` sidecars were not built for this tree and are not checked;
+/// `cargo_failure` is `None` when cargo succeeded or was never run.
+pub(crate) fn sidecar_build_verdict(
+    slot_id: usize,
+    debug_dir: &std::path::Path,
+    undeclared: &[&str],
+    cargo_failure: Option<&str>,
+) -> SidecarBuildVerdict {
+    let mut verdict = SidecarBuildVerdict::default();
+    for (sidecar, path, file) in inspect_built_sidecars(debug_dir) {
         if undeclared.contains(&sidecar.bin) {
             continue;
         }
         let problem = match file {
             SidecarFile::Present { bytes } => {
-                built.push(format!("{} ({} bytes)", sidecar.bin, bytes));
+                verdict
+                    .built
+                    .push(format!("{} ({} bytes)", sidecar.bin, bytes));
                 continue;
             }
             SidecarFile::Missing => "is missing",
@@ -2345,47 +2384,35 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
                  carried to LKG or deployed)"
             }
         };
-        warnings.push(format!(
+        verdict.warnings.push(format!(
             "{} sidecar {:?} {} on slot {} after the sidecar build — {} until a rebuild \
              produces it (runner build itself succeeded; deploy continues){}",
             sidecar.bin,
             path,
             problem,
-            slot.id,
+            slot_id,
             sidecar.consequence,
             cargo_failure
-                .as_deref()
                 .map(|f| format!(": {}", f))
                 .unwrap_or_default()
         ));
     }
-    // A failed invocation whose sidecars all look real still gets named: with
-    // `--keep-going` a sidecar that failed to compile may keep an EARLIER
-    // uplift, which can be stale (or the 0-byte placeholder copy, which the
-    // `Empty` arm above already reported).
-    if warnings.is_empty() {
-        if let Some(failure) = &cargo_failure {
-            warnings.push(format!(
-                "runner sidecar build failed on slot {} ({}) — every sidecar file is present \
-                 and non-empty, but one or more may be left over from an earlier build \
-                 (runner build itself succeeded; deploy continues)",
-                slot.id, failure
+    // A failed invocation whose declared sidecars all look real still gets
+    // named: with `--keep-going` a sidecar that failed to compile may keep an
+    // EARLIER uplift, which can be stale (or the 0-byte placeholder copy, which
+    // the `Empty` arm above already reported). Only when something was checked
+    // and found present — with nothing declared there is nothing it could say.
+    if verdict.warnings.is_empty() && !verdict.built.is_empty() {
+        if let Some(failure) = cargo_failure {
+            verdict.warnings.push(format!(
+                "runner sidecar build failed on slot {} ({}) — every sidecar this runner \
+                 tree declares is present and non-empty, but one or more may be left over \
+                 from an earlier build (runner build itself succeeded; deploy continues)",
+                slot_id, failure
             ));
         }
     }
-
-    if !built.is_empty() {
-        info!(
-            "Slot {}: runner sidecars ready in {:?}: {}",
-            slot.id,
-            debug_dir,
-            built.join(", ")
-        );
-    }
-    for msg in warnings {
-        warn!("{}", msg);
-        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
-    }
+    verdict
 }
 
 /// Prebuild the frontend inside a fresh spawn worktree before cargo runs.
@@ -4515,7 +4542,8 @@ fn carry_sidecar_into_lkg_via(
             if bytes == 0 {
                 let removed = remove_if_zero_length(&dst);
                 return Err(format!(
-                    "{:?} was ZERO-LENGTH when copied (rewritten after the check, likely                      by a build that took the slot) — refused to carry it{}",
+                    "{:?} was ZERO-LENGTH when copied (rewritten after the check, likely \
+                     by a build that took the slot) — refused to carry it{}",
                     src,
                     if removed {
                         format!("; removed the zero-length copy already at {:?}", dst)
@@ -4731,8 +4759,9 @@ mod tests {
     };
     use super::{
         carry_sidecar_into_lkg_via, declared_bin_targets, inspect_built_sidecars,
-        remove_if_zero_length, sidecar_build_args, SidecarFile, PROFILE_CLI_EXE_FILENAME,
-        RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME, SHIM_EXE_FILENAME, SIDECAR_BUILD_ARGS,
+        remove_if_zero_length, sidecar_build_args, sidecar_build_verdict, SidecarFile,
+        PROFILE_CLI_EXE_FILENAME, RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME, SHIM_EXE_FILENAME,
+        SIDECAR_BUILD_ARGS,
     };
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::error::SupervisorError;
@@ -6179,6 +6208,62 @@ mod tests {
         stage_runner_package(&virtual_root, "[workspace]\nmembers = []\n", &[]);
         assert_eq!(declared_bin_targets(&virtual_root), None);
         assert_eq!(declared_bin_targets(&tmp.path().join("absent")), None);
+    }
+
+    /// R2-2 (review round 2): a runner tree that declares NONE of the roster
+    /// (refs before 2026-04-30) must not be told "every sidecar file is
+    /// present and non-empty" — nothing was checked. The stale files a slot
+    /// may still hold from another build are not this tree's, so they are not
+    /// reported as built either.
+    #[test]
+    fn sidecar_verdict_for_a_tree_declaring_no_sidecar_claims_nothing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let debug = tmp.path().join("debug");
+        fs::create_dir_all(&debug).expect("mkdir debug");
+        // Leftovers from another build in the same slot.
+        fs::write(debug.join(SHIM_EXE_FILENAME), b"other-build-shim").expect("shim");
+        fs::write(debug.join(SESSION_CLI_EXE_FILENAME), b"other-build-cli").expect("cli");
+        let every_bin: Vec<&str> = RUNNER_SIDECARS.iter().map(|s| s.bin).collect();
+
+        for failure in [None, Some("cargo exit 101: error: no bin target named `x`")] {
+            let verdict = sidecar_build_verdict(0, &debug, &every_bin, failure);
+            assert!(verdict.built.is_empty(), "{failure:?}: {verdict:?}");
+            assert!(
+                verdict.warnings.is_empty(),
+                "nothing was declared, so nothing may be claimed ({failure:?}): {verdict:?}"
+            );
+        }
+    }
+
+    /// The fallback WARN still fires where it is true: every DECLARED sidecar
+    /// is present, yet cargo failed — so one may be an earlier build's.
+    #[test]
+    fn sidecar_verdict_names_a_failed_build_whose_declared_sidecars_look_real() {
+        let tmp = TempDir::new().expect("tempdir");
+        let debug = tmp.path().join("debug");
+        fs::create_dir_all(&debug).expect("mkdir debug");
+        fs::write(debug.join(SHIM_EXE_FILENAME), b"shim").expect("shim");
+        fs::write(debug.join(PROFILE_CLI_EXE_FILENAME), b"profile").expect("profile");
+
+        // qontinui-pr undeclared (a ref predating it): not checked, not named.
+        let verdict =
+            sidecar_build_verdict(3, &debug, &["qontinui-pr"], Some("timed out after 600s"));
+        assert_eq!(verdict.built.len(), 2, "{verdict:?}");
+        assert_eq!(verdict.warnings.len(), 1, "{verdict:?}");
+        let warning = &verdict.warnings[0];
+        assert!(
+            warning.contains("every sidecar this runner tree declares is present"),
+            "{warning}"
+        );
+        assert!(warning.contains("timed out after 600s"), "{warning}");
+        assert!(
+            !warning.contains("qontinui-pr"),
+            "an undeclared sidecar is not named: {warning}"
+        );
+
+        // Success: nothing to warn about.
+        let clean = sidecar_build_verdict(3, &debug, &["qontinui-pr"], None);
+        assert!(clean.warnings.is_empty(), "{clean:?}");
     }
 
     /// The post-build check reports EACH sidecar by name, and a zero-length

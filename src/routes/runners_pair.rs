@@ -126,7 +126,7 @@ const PAIR_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Name prefix of the private directories [`stage_private_cli_copy`] creates
 /// under [`private_cli_copy_root`].
-const PRIVATE_CLI_COPY_PREFIX: &str = "qontinui-supervisor-pair-cli-";
+pub const PRIVATE_CLI_COPY_PREFIX: &str = "qontinui-supervisor-pair-cli-";
 
 /// Where the pair route's private copies live: the supervisor's per-user data
 /// dir (the one the temp-runner ledger uses), not the system temp dir — a
@@ -355,6 +355,18 @@ pub async fn pair_with_token(
     State(state): State<SharedState>,
     Json(body): Json<PairWithTokenRequest>,
 ) -> impl IntoResponse {
+    pair_with_token_copying_into(state, body, private_cli_copy_root()).await
+}
+
+/// [`pair_with_token`] with the directory its private CLI copies go under
+/// passed in, so a caller — the integration tests — can keep them out of the
+/// live supervisor's per-user data dir. Deliberately a function parameter and
+/// not a request field: no HTTP caller chooses where the supervisor writes.
+pub async fn pair_with_token_copying_into(
+    state: SharedState,
+    body: PairWithTokenRequest,
+    copy_root: PathBuf,
+) -> axum::response::Response {
     // Body validation. We surface 400 with a structured error body so
     // callers can branch on the `error` discriminator instead of parsing
     // freeform messages.
@@ -472,7 +484,7 @@ pub async fn pair_with_token(
     // Run a private copy, never the resolved file: a running image would lock
     // a build directory's file (see `stage_private_cli_copy`). Held until the
     // child has been reaped; its directory is removed on drop.
-    let private_copy = match stage_private_cli_copy(&cli_path, &private_cli_copy_root()) {
+    let private_copy = match stage_private_cli_copy(&cli_path, &copy_root) {
         Ok(copy) => copy,
         Err(message) => {
             return server_error("qontinui_profile_copy_failed", &message);

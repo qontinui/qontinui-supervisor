@@ -29,13 +29,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
-use axum::Router;
+use axum::{Json, Router};
 use tower::ServiceExt;
 
 use qontinui_supervisor::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-use qontinui_supervisor::routes::runners_pair::pair_with_token;
+use qontinui_supervisor::routes::runners_pair::{
+    pair_with_token, pair_with_token_copying_into, PairWithTokenRequest, PRIVATE_CLI_COPY_PREFIX,
+};
 use qontinui_supervisor::state::{SharedState, SupervisorState};
 
 fn test_config() -> SupervisorConfig {
@@ -73,6 +76,31 @@ fn build_app() -> (Router, SharedState) {
         .route("/runners/pair-with-token", post(pair_with_token))
         .with_state(state.clone());
     (router, state)
+}
+
+/// A router whose pair handler writes its private CLI copies under
+/// `copy_root` instead of the live supervisor's per-user data dir. Every test
+/// that reaches the spawn goes through this, so none writes outside its own
+/// tempdir.
+fn build_app_copying_into(state: SharedState, copy_root: PathBuf) -> Router {
+    Router::new()
+        .route(
+            "/runners/pair-with-token",
+            post(
+                move |State(state): State<SharedState>, Json(body): Json<PairWithTokenRequest>| {
+                    let copy_root = copy_root.clone();
+                    async move { pair_with_token_copying_into(state, body, copy_root).await }
+                },
+            ),
+        )
+        .with_state(state)
+}
+
+/// A fresh private-copy root inside `tmp`.
+fn copy_root_in(tmp: &std::path::Path) -> PathBuf {
+    let root = tmp.join("pair-cli-copies");
+    std::fs::create_dir_all(&root).expect("mkdir copy root");
+    root
 }
 
 async fn post_json(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -268,7 +296,9 @@ async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
     // assert the response carries the discriminator + exit_code + the
     // captured (empty) stderr.
     let stub_path = pick_failing_stub();
-    let (app, _state) = build_app();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = Arc::new(SupervisorState::new(test_config()));
+    let app = build_app_copying_into(state, copy_root_in(tmp.path()));
     let (status, body) = post_json(
         app,
         serde_json::json!({
@@ -321,9 +351,8 @@ async fn resolved_qontinui_profile_is_not_executed_in_place() {
     let mut config = test_config();
     config.project_dir = src_tauri;
     let state = Arc::new(SupervisorState::new(config));
-    let app = Router::new()
-        .route("/runners/pair-with-token", post(pair_with_token))
-        .with_state(state);
+    let copy_root = copy_root_in(tmp.path());
+    let app = build_app_copying_into(state, copy_root.clone());
     let (status, body) = post_json(
         app,
         serde_json::json!({
@@ -346,6 +375,22 @@ async fn resolved_qontinui_profile_is_not_executed_in_place() {
             "the slot's qontinui_profile was executed in place: {message}"
         );
     }
+    // POSITIVE: what was spawned is a private copy under the root the handler
+    // was given. Both sides are Debug renderings of paths built from the same
+    // `copy_root` value, so no canonical/8.3/verbatim form can make this pass
+    // or fail spuriously: the spawned path's rendering begins with the root's
+    // (minus its closing quote), then the private-copy directory prefix.
+    let root_rendered = format!("{:?}", copy_root);
+    let root_rendered = root_rendered.trim_end_matches('"');
+    let expected_prefix = format!("failed to spawn {root_rendered}");
+    assert!(
+        message.starts_with(&expected_prefix),
+        "the spawned file must sit under the private copy root {root_rendered}: {message}"
+    );
+    assert!(
+        message[expected_prefix.len()..].contains(PRIVATE_CLI_COPY_PREFIX),
+        "the spawned file must sit in a `{PRIVATE_CLI_COPY_PREFIX}*` directory: {message}"
+    );
     assert!(
         slot_binary.exists(),
         "the slot's file must be left where it was"
@@ -363,8 +408,10 @@ async fn the_pair_cli_that_runs_is_a_private_copy() {
     let build_dir = tmp.path().join("target-pool").join("slot-0").join("debug");
     std::fs::create_dir_all(&build_dir).expect("mkdir build dir");
     let stub = write_self_reporting_stub(&build_dir);
+    let copy_root = copy_root_in(tmp.path());
 
-    let (app, _state) = build_app();
+    let state = Arc::new(SupervisorState::new(test_config()));
+    let app = build_app_copying_into(state, copy_root.clone());
     let (status, body) = post_json(
         app,
         serde_json::json!({
@@ -391,6 +438,25 @@ async fn the_pair_cli_that_runs_is_a_private_copy() {
     assert!(
         !ran.starts_with(&build_dir) && !ran.starts_with(&canonical_build_dir),
         "the build directory's file was executed in place: {}",
+        ran.display()
+    );
+    // POSITIVE: the stub ran from a `qontinui-supervisor-pair-cli-*` directory
+    // directly under the root the handler was given. Compared by component
+    // NAMES, so an 8.3 or `\\?\` spelling of the tempdir cannot matter.
+    let private_dir = ran.parent().expect("the stub ran from a directory");
+    let private_dir_name = private_dir
+        .file_name()
+        .expect("private dir name")
+        .to_string_lossy();
+    assert!(
+        private_dir_name.starts_with(PRIVATE_CLI_COPY_PREFIX),
+        "the stub must run from a `{PRIVATE_CLI_COPY_PREFIX}*` directory, ran from {}",
+        ran.display()
+    );
+    assert_eq!(
+        private_dir.parent().and_then(|p| p.file_name()),
+        copy_root.file_name(),
+        "the private copy directory must sit directly under the given root: {}",
         ran.display()
     );
     assert!(stub.exists(), "the handed file is left where it was");
