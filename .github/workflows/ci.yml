@@ -178,18 +178,60 @@ jobs:
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
           MIN_TESTS=1200
-          echo "supervisor cargo test: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+
+          # ── CRATE-TARGET FLOOR ──────────────────────────────────────────
+          # SUMMARIES is the number of crate targets that printed a summary,
+          # and the test floor above cannot see it shrink: a fail-fast abort
+          # after the biggest targets, or a selection that keeps them and drops
+          # the rest, still clears 1200 tests. Measured on run 36615898220
+          # (main a1d0889, 2026-09-29): 2476 tests across 21 targets; the floor
+          # is half, the same ratio as the test floor. Plan
+          # 2026-09-20-rust-verification-residuals-cached-green-straddles-the-edit-target-count-unfloored-and-source-pins-scan-themselves,
+          # Phase 3.
+          MIN_TARGETS=10
+
+          # ── A RED RUN IS STILL A READING ────────────────────────────────
+          # Both floors are evaluated whatever cargo exited, and both facts are
+          # printed, so a red run's log says how much of the suite it reached
+          # rather than stopping at cargo's first error. A failing floor exits
+          # with cargo's own status when that was already non-zero, so the
+          # step's exit code is never laundered into a different one; and no
+          # line here calls a red run's reading a pass.
+          FAIL_RC=${SUBRC}
+          [ "${FAIL_RC}" -ne 0 ] || FAIL_RC=1
+          echo "supervisor cargo test: cargo exited ${SUBRC}; ${RAN} tests ran across ${SUMMARIES} summary line(s)" \
+               "(floors: ${MIN_TESTS} tests, ${MIN_TARGETS} crate targets)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
                  "That is UNKNOWN, not a pass."
-            exit 1
+            exit "${FAIL_RC}"
           fi
+          if [ "${SUBRC}" -eq 0 ]; then
+            WHY="cargo exited 0, so this is a collapse, not a crash"
+          else
+            WHY="cargo exited ${SUBRC}, so the run is RED and stopped early; cargo's own error above is the cause, and this line records how much of the suite that run reached"
+          fi
+          FLOOR_MISSED=0
           if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
-            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
-                 "suite collapsed — almost certainly a target-selection change rather than" \
+            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). ${WHY}." \
+                 "On a green exit it is almost certainly a target-selection change rather than" \
                  "deleted tests. Do NOT lower the floor to make this pass."
-            exit 1
+            FLOOR_MISSED=1
+          fi
+          if [ "${SUMMARIES}" -lt "${MIN_TARGETS}" ]; then
+            echo "::error::Only ${SUMMARIES} of the suite's crate targets reported a summary" \
+                 "(floor ${MIN_TARGETS}). ${WHY}. Fewer targets than the floor is a fail-fast" \
+                 "abort or a target-selection collapse. Do NOT lower the floor."
+            FLOOR_MISSED=1
+          fi
+          if [ "${FLOOR_MISSED}" -ne 0 ]; then
+            exit "${FAIL_RC}"
+          fi
+          if [ "${SUBRC}" -ne 0 ]; then
+            echo "::error::cargo test exited ${SUBRC}: this run is RED. It reached ${RAN} tests" \
+                 "across ${SUMMARIES} crate targets, at or above both floors — which says how much" \
+                 "of the suite ran, never that it passed. cargo's own error above is the cause."
           fi
 
           # ── THE CROSS-LANGUAGE PIN MUST ITSELF HAVE RUN ──────────────────
@@ -290,7 +332,7 @@ jobs:
                      "assignment above under set -e and never reaches this — so its END block" \
                      "did not run, or its output grammar changed. This is a fault in the" \
                      "census, not a verdict about the pin. Fix the census."
-                exit 1 ;;
+                exit "${FAIL_RC}" ;;
             esac
           done
           echo "supervisor orphan_kill_contract: target ran ${CONTRACT_FOUND}, ${CONTRACT_RAN} tests (floor ${MIN_CONTRACT_TESTS})"
@@ -307,7 +349,7 @@ jobs:
                  "would make the next real deletion silent again. Third cause: cargo itself" \
                  "exited ${SUBRC}, and a non-zero value there means the target failed to" \
                  "BUILD — cargo own error above is then what to read, not this message."
-            exit 1
+            exit "${FAIL_RC}"
           fi
           if [ "${CONTRACT_RAN}" -lt "${MIN_CONTRACT_TESTS}" ]; then
             echo "::error::The orphan_kill_contract target ran ${CONTRACT_RAN} test(s)," \
@@ -317,7 +359,7 @@ jobs:
                  "cargo itself exited ${SUBRC}; a non-zero value there with a count of 0" \
                  "means the binary DIED before its harness printed anything, and cargo's" \
                  "own error above is the cause rather than removed tests."
-            exit 1
+            exit "${FAIL_RC}"
           fi
           exit "${SUBRC}"
         env:
@@ -368,7 +410,10 @@ jobs:
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
           MIN_TESTS=1
-          echo "supervisor machine_local_artifacts: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          # No crate-target floor above 1, by choice: `--test machine_local_artifacts`
+          # selects ONE target, so there is no suite to collapse (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
+          MIN_TARGETS=1
+          echo "supervisor machine_local_artifacts: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
@@ -443,7 +488,10 @@ jobs:
           VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-orphan.out)
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
-          echo "supervisor orphan_kill_unix: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          # No crate-target floor above 1, by choice: `--test orphan_kill_unix`
+          # selects ONE target, so there is no suite to collapse (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
+          MIN_TARGETS=1
+          echo "supervisor orphan_kill_unix: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
@@ -665,7 +713,12 @@ jobs:
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
           MIN_TESTS=1
-          echo "supervisor compose_parity: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          # No crate-target floor above 1, by choice. The name filter still runs
+          # every target (20 summaries on run 36615898220, 2026-09-29), but this
+          # step guards the NAMED tests; suite coverage is the Rust Check job's
+          # floor, not this one's (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
+          MIN_TARGETS=1
+          echo "supervisor compose_parity: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
