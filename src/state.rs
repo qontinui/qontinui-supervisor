@@ -118,6 +118,18 @@ pub struct ManagedRunner {
     /// caller explicitly asking for "whatever exists". The staleness is still
     /// logged and still reported on the response; only the refusal is waived.
     pub allow_unverified_exe: RwLock<bool>,
+    /// Spawn-in-flight marker. `Some(budget)` while a spawn handler
+    /// (`routes::runners::execute_spawn_build`) owns this runner — building,
+    /// copying the exe, starting it and probing its health. `budget` is the
+    /// startup allowance measured from `RunnerState::started_at`: both
+    /// stale-runner sweeps treat a runner inside that window whose port is not
+    /// listening yet as STARTING, not crashed (see
+    /// [`crate::process::manager::startup_window_protects`]).
+    ///
+    /// A `std` mutex (not tokio) so the handler's RAII guard can clear it from
+    /// `Drop` on every exit path, including a cancelled future. Never held
+    /// across an `.await`.
+    pub spawn_in_flight: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 /// Work-unit → preview correlation for a runner spawned as an attempt's
@@ -203,7 +215,25 @@ impl ManagedRunner {
             build_provenance: RwLock::new(None),
             resolved_exe: RwLock::new(None),
             allow_unverified_exe: RwLock::new(false),
+            spawn_in_flight: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Read the spawn-in-flight marker. A poisoned lock is read through (the
+    /// value is a plain `Option<Duration>`, so it cannot be half-written).
+    pub fn spawn_in_flight(&self) -> Option<std::time::Duration> {
+        *self
+            .spawn_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Set (or clear, with `None`) the spawn-in-flight marker.
+    pub fn set_spawn_in_flight(&self, budget: Option<std::time::Duration>) {
+        *self
+            .spawn_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = budget;
     }
 
     /// Check if this runner is protected.

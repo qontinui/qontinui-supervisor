@@ -1052,6 +1052,25 @@ pub async fn purge_stale_test_runners_core(
         if respect_active_builds && !is_running && any_build_active {
             continue;
         }
+        // Startup-window grace — decided once, here. A runner a spawn handler
+        // still owns (or one started moments ago) whose port is not listening
+        // YET is starting, not crashed; a `running=false` placeholder carrying
+        // the spawn-in-flight marker is in the post-build / pre-start window.
+        // Both are skipped on every caller, the operator path
+        // (`respect_active_builds=false`) included. A listening runner falls
+        // through unchanged.
+        if manager::in_startup_window(managed).await
+            && (!is_running || !crate::process::port::is_port_listening(managed.config.port))
+        {
+            tracing::debug!(
+                "purge-stale: skipping temp runner '{}' (port {}) — inside its startup window \
+                 (running={}, port not listening yet)",
+                managed.config.id,
+                managed.config.port,
+                is_running
+            );
+            continue;
+        }
         if is_running {
             // Try to detect zombie: process is gone but state says running.
             // If nothing is actually listening on the port, treat it as stale.
@@ -3153,6 +3172,12 @@ async fn execute_spawn_build(
     no_wait: bool,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let mut side = SpawnBuildSideChannel::default();
+    // Mark the runner as owned by this spawn for the whole build → copy →
+    // start → probe → wait pipeline, so neither stale-runner sweep reads its
+    // not-yet-bound port as a crash. Computed here because `body` is moved
+    // into the inner fn. The guard clears the marker on EVERY exit — success,
+    // failure, `Err`, and a dropped/cancelled future.
+    let _in_flight = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
     // Merged on BOTH arms, not just `Err`. Several of the inner fn's FAILURE
     // responses (`runner_died_during_startup`, `runner_started_but_unresponsive`,
     // `frontend_stale` / `frontend_dist_missing`, the paired-profile failure) are
@@ -3174,6 +3199,41 @@ async fn execute_spawn_build(
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
+    }
+}
+
+/// Safety margin added on top of the probe + wait allowances.
+const SPAWN_IN_FLIGHT_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Startup allowance a spawn-test request claims, measured from the runner's
+/// `started_at`: the health-probe window, plus the health wait when the caller
+/// asked for one, plus [`SPAWN_IN_FLIGHT_MARGIN`].
+fn spawn_in_flight_budget(body: &SpawnTestRequest) -> std::time::Duration {
+    let wait = if body.wait { body.wait_timeout_secs } else { 0 };
+    std::time::Duration::from_millis(body.health_probe_timeout_ms)
+        + std::time::Duration::from_secs(wait)
+        + SPAWN_IN_FLIGHT_MARGIN
+}
+
+/// RAII owner of [`ManagedRunner::spawn_in_flight`]: sets the marker on
+/// construction, clears it on `Drop` — so every return path of the spawn
+/// handler (and a cancelled future) releases the startup protection.
+struct SpawnInFlightGuard {
+    managed: Arc<ManagedRunner>,
+}
+
+impl SpawnInFlightGuard {
+    fn arm(managed: &Arc<ManagedRunner>, budget: std::time::Duration) -> Self {
+        managed.set_spawn_in_flight(Some(budget));
+        Self {
+            managed: Arc::clone(managed),
+        }
+    }
+}
+
+impl Drop for SpawnInFlightGuard {
+    fn drop(&mut self) {
+        self.managed.set_spawn_in_flight(None);
     }
 }
 
@@ -9270,6 +9330,166 @@ mod tests {
         for id in [&id_a, &id_b, &id_unowned] {
             assert!(purged_ids.contains(id), "unscoped purge reaps {id}");
         }
+    }
+
+    /// A loopback port nothing is listening on: bind an ephemeral port, read
+    /// it, drop the listener. Never hard-code 9877 — a live temp runner on the
+    /// test box may hold it.
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = l.local_addr().expect("local addr").port();
+        drop(l);
+        port
+    }
+
+    /// Mark a registered runner running (or not) with the given start time and
+    /// spawn-in-flight marker.
+    async fn set_runner_phase(
+        state: &crate::state::SharedState,
+        id: &str,
+        running: bool,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        marker: Option<std::time::Duration>,
+    ) {
+        let managed = state.get_runner(id).await.expect("registered");
+        {
+            let mut r = managed.runner.write().await;
+            r.running = running;
+            r.started_at = started_at;
+        }
+        managed.set_spawn_in_flight(marker);
+    }
+
+    /// REGRESSION (plan 2026-09-19-supervisor-reaper-purges-an-in-flight-spawn-test):
+    /// a runner started ~now by an in-flight spawn handler has not bound its
+    /// port yet. The sweep used to read "running=true, port free" as a crash
+    /// and delete the record out from under the starting process.
+    #[tokio::test]
+    async fn purge_spares_a_runner_inside_its_spawn_startup_window() {
+        let state = make_state();
+        let port = free_port();
+        let id = insert_temp_runner_owned(&state, port, None).await;
+        set_runner_phase(
+            &state,
+            &id,
+            true,
+            Some(chrono::Utc::now()),
+            Some(std::time::Duration::from_secs(240)),
+        )
+        .await;
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+        assert!(
+            purged.iter().all(|(pid, _, _)| pid != &id),
+            "a starting runner inside its spawn window must not be purged: {purged:?}"
+        );
+        assert!(
+            state.runners.read().await.contains_key(&id),
+            "the starting runner must still be registered"
+        );
+    }
+
+    /// Companion: the crash arm still works for a runner long past its window.
+    #[tokio::test]
+    async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
+        let state = make_state();
+        let port = free_port();
+        let id = insert_temp_runner_owned(&state, port, None).await;
+        set_runner_phase(
+            &state,
+            &id,
+            true,
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            None,
+        )
+        .await;
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+        assert!(
+            purged.iter().any(|(pid, _, _)| pid == &id),
+            "a runner started an hour ago with a dead port is crashed and must be purged"
+        );
+        assert!(!state.runners.read().await.contains_key(&id));
+    }
+
+    /// Post-build / pre-start window: the placeholder is still running=false,
+    /// no build is active, but the spawn handler owns it. Even the operator
+    /// path (`respect_active_builds=false`) must spare it.
+    #[tokio::test]
+    async fn operator_purge_spares_a_placeholder_whose_spawn_is_in_flight() {
+        let state = make_state();
+        let port = free_port();
+        let id = insert_temp_runner_owned(&state, port, None).await;
+        set_runner_phase(
+            &state,
+            &id,
+            false,
+            None,
+            Some(std::time::Duration::from_secs(240)),
+        )
+        .await;
+
+        let purged = super::purge_stale_test_runners_core(&state, false, None).await;
+
+        assert!(
+            purged.iter().all(|(pid, _, _)| pid != &id),
+            "an in-flight spawn's placeholder must not be purged by the operator path"
+        );
+        assert!(state.runners.read().await.contains_key(&id));
+    }
+
+    /// No marker (restart route / watchdog restart): the generic floor still
+    /// gives a just-started runner time to bind.
+    #[tokio::test]
+    async fn purge_spares_a_just_started_runner_without_a_marker() {
+        let state = make_state();
+        let port = free_port();
+        let id = insert_temp_runner_owned(&state, port, None).await;
+        set_runner_phase(&state, &id, true, Some(chrono::Utc::now()), None).await;
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+        assert!(
+            purged.iter().all(|(pid, _, _)| pid != &id),
+            "a runner started moments ago must get the startup floor"
+        );
+        assert!(state.runners.read().await.contains_key(&id));
+    }
+
+    /// The RAII guard sets the marker and clears it on drop.
+    #[test]
+    fn spawn_in_flight_guard_clears_the_marker_on_drop() {
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = "test-guard".to_string();
+        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+            config, false, None,
+        ));
+        assert_eq!(managed.spawn_in_flight(), None);
+        let guard = super::SpawnInFlightGuard::arm(&managed, std::time::Duration::from_secs(240));
+        assert_eq!(
+            managed.spawn_in_flight(),
+            Some(std::time::Duration::from_secs(240))
+        );
+        drop(guard);
+        assert_eq!(managed.spawn_in_flight(), None);
+    }
+
+    /// Budget = probe window + wait (only when waiting) + margin.
+    #[test]
+    fn spawn_in_flight_budget_sums_probe_wait_and_margin() {
+        let mut body: super::SpawnTestRequest =
+            serde_json::from_value(serde_json::json!({})).expect("defaults");
+        assert_eq!(
+            super::spawn_in_flight_budget(&body),
+            std::time::Duration::from_secs(60 + 60)
+        );
+        body.wait = true;
+        assert_eq!(
+            super::spawn_in_flight_budget(&body),
+            std::time::Duration::from_secs(60 + 120 + 60)
+        );
     }
 
     #[tokio::test]

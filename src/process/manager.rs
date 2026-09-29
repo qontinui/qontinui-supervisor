@@ -129,6 +129,55 @@ pub fn exceeds_temp_runner_max_age(
     }
 }
 
+/// Generic startup floor: how long ANY freshly started temp runner gets to bind
+/// its port before a stale-runner sweep may read "state says running, port is
+/// free" as a crash. Applies with or without a spawn-in-flight marker, so the
+/// restart route, the watchdog restart, and every other start path are covered
+/// too. A Tauri runner started ~1 s before a sweep has not bound its port yet;
+/// without this floor that sweep deleted its record and instance dirs out from
+/// under the starting process.
+pub const STARTUP_GRACE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Is a temp runner inside its startup window, where an unbound port means
+/// "still starting" rather than "crashed"?
+///
+/// - `in_flight` is [`ManagedRunner::spawn_in_flight`]: `Some(budget)` while a
+///   spawn handler owns the runner.
+/// - marker set, never started → protected (the handler is still building or
+///   copying the exe — the post-build / pre-start window included).
+/// - marker set, started → protected while `since_start < max(budget, FLOOR)`.
+///   Bounded: a hung handler cannot protect a started runner forever.
+/// - no marker, started → protected while `since_start < STARTUP_GRACE_FLOOR`.
+/// - no marker, never started → NOT protected.
+/// - a `started_at` in the future (clock step) counts as `since_start = 0`.
+///
+/// Pure — every input injected — so it is unit-testable without a clock.
+pub fn startup_window_protects(
+    in_flight: Option<Duration>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(started_at) = started_at else {
+        return in_flight.is_some();
+    };
+    let since_start = now
+        .signed_duration_since(started_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let window = match in_flight {
+        Some(budget) => budget.max(STARTUP_GRACE_FLOOR),
+        None => STARTUP_GRACE_FLOOR,
+    };
+    since_start < window
+}
+
+/// [`startup_window_protects`] against a live registry entry, at `Utc::now()`.
+pub async fn in_startup_window(managed: &ManagedRunner) -> bool {
+    let in_flight = managed.spawn_in_flight();
+    let started_at = managed.runner.read().await.started_at;
+    startup_window_protects(in_flight, started_at, chrono::Utc::now())
+}
+
 /// Decide the `QONTINUI_API_URL` value to set on a spawned runner child.
 ///
 /// Policy (plan 2026-07-08-runner-relay-honor-persisted-backend-url):
@@ -1780,6 +1829,23 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if !is_running && any_build_active {
                 continue;
             }
+            // Startup-window grace — the ONE place this sweep decides it, read
+            // once per runner. A runner a spawn handler still owns, or one
+            // started moments ago, whose port is not listening YET is starting,
+            // not crashed; and a `running=false` placeholder carrying the
+            // spawn-in-flight marker is in the post-build / pre-start window
+            // (build slot released, exe still being copied). A runner that IS
+            // listening falls through to the max-age logic unchanged.
+            if in_startup_window(managed).await
+                && (!is_running || !crate::process::port::is_port_listening(managed.config.port))
+            {
+                debug!(
+                    "reaper: skipping temp runner '{}' (port {}) — inside its startup window \
+                     (running={}, port not listening yet)",
+                    managed.config.id, managed.config.port, is_running
+                );
+                continue;
+            }
             // True only on the max-age arm — i.e. the one path that reaches the
             // kill ladder with a runner we just observed LISTENING. It makes the
             // ladder's terminal "port still busy → drop the record anyway" rule
@@ -2079,6 +2145,27 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
             continue;
         }
 
+        // Re-check the registry immediately before the kill. `claimed_ports`
+        // was snapshotted at the top of a walk over 23 ports with slow probes;
+        // a spawn that registered this port after the snapshot and has since
+        // bound it is NOT an orphan.
+        if state
+            .get_all_runners()
+            .await
+            .iter()
+            .any(|r| r.config.port == port)
+        {
+            warn!(
+                "reconcile sweep: NOT killing qontinui-runner PID {} on temp port {} — a \
+                 runner registered this port after the sweep's snapshot",
+                pid, port
+            );
+            spared.push(format!(
+                "pid {pid} on port {port} (registered after the sweep snapshot)"
+            ));
+            continue;
+        }
+
         warn!(
             "reconcile sweep: killing orphaned qontinui-runner PID {} on unclaimed \
              temp port {} — {}",
@@ -2130,8 +2217,8 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
                 LogSource::Supervisor,
                 LogLevel::Info,
                 format!(
-                    "Reconcile sweep: left {} temp-port listener(s) alone — this supervisor \
-                     did not spawn them — {}",
+                    "Reconcile sweep: left {} temp-port listener(s) alone — not a proven \
+                     orphan of this supervisor (reason per listener) — {}",
                     spared.len(),
                     spared.join("; ")
                 ),
@@ -5950,6 +6037,71 @@ pub async fn rebuild_and_restart_by_id(
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // Startup-window predicate (plan
+    // 2026-09-19-supervisor-reaper-purges-an-in-flight-spawn-test).
+    #[test]
+    fn startup_window_protects_table() {
+        let now = chrono::Utc::now();
+        let secs = |n: i64| now - chrono::Duration::seconds(n);
+        let budget = Some(Duration::from_secs(240));
+        type Case = (
+            Option<Duration>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            bool,
+            &'static str,
+        );
+        // (in_flight, started_at, expected, label)
+        let cases: Vec<Case> = vec![
+            (budget, None, true, "marker + not started"),
+            (
+                budget,
+                Some(secs(100)),
+                true,
+                "marker + started within budget",
+            ),
+            (
+                budget,
+                Some(secs(300)),
+                false,
+                "marker + started past budget and floor",
+            ),
+            (None, Some(secs(10)), true, "no marker within floor"),
+            (None, Some(secs(61)), false, "no marker past floor"),
+            (
+                budget,
+                Some(now + chrono::Duration::seconds(3600)),
+                true,
+                "future start, marker",
+            ),
+            (
+                None,
+                Some(now + chrono::Duration::seconds(3600)),
+                true,
+                "future start, no marker",
+            ),
+            (None, None, false, "no marker, never started"),
+            (
+                Some(Duration::from_secs(5)),
+                Some(secs(30)),
+                true,
+                "marker budget below floor, started within floor",
+            ),
+            (
+                Some(Duration::from_secs(5)),
+                Some(secs(61)),
+                false,
+                "marker budget below floor, started past floor",
+            ),
+        ];
+        for (in_flight, started_at, expected, label) in cases {
+            assert_eq!(
+                startup_window_protects(in_flight, started_at, now),
+                expected,
+                "{label}"
+            );
+        }
+    }
 
     // Temp-runner max-age bound (plan
     // 2026-08-10-temp-runner-session-restore-isolation, Phase 5).
