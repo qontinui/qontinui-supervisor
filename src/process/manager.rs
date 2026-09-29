@@ -178,6 +178,18 @@ pub async fn in_startup_window(managed: &ManagedRunner) -> bool {
     startup_window_protects(in_flight, started_at, chrono::Utc::now())
 }
 
+/// The per-runner skip decision BOTH stale-runner sweeps make before their
+/// liveness arms (`reap_stale_test_runners` here, and
+/// `routes::runners::purge_stale_test_runners_core`). True when the runner is
+/// inside its startup window AND either it has not started yet (a placeholder
+/// in the build / post-build pre-start window) or it has started but its port
+/// is not listening yet. A runner that IS listening returns false and proceeds
+/// to the sweep's existing logic unchanged.
+pub async fn skip_for_startup_window(managed: &ManagedRunner, is_running: bool) -> bool {
+    in_startup_window(managed).await
+        && (!is_running || !crate::process::port::is_port_listening(managed.config.port))
+}
+
 /// Decide the `QONTINUI_API_URL` value to set on a spawned runner child.
 ///
 /// Policy (plan 2026-07-08-runner-relay-honor-persisted-backend-url):
@@ -1836,12 +1848,11 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             // spawn-in-flight marker is in the post-build / pre-start window
             // (build slot released, exe still being copied). A runner that IS
             // listening falls through to the max-age logic unchanged.
-            if in_startup_window(managed).await
-                && (!is_running || !crate::process::port::is_port_listening(managed.config.port))
-            {
+            if skip_for_startup_window(managed, is_running).await {
                 debug!(
                     "reaper: skipping temp runner '{}' (port {}) — inside its startup window \
-                     (running={}, port not listening yet)",
+                     (running={}: a not-yet-started placeholder, or started with its port not \
+                     listening yet)",
                     managed.config.id, managed.config.port, is_running
                 );
                 continue;
@@ -6040,6 +6051,79 @@ mod tests {
 
     // Startup-window predicate (plan
     // 2026-09-19-supervisor-reaper-purges-an-in-flight-spawn-test).
+    fn startup_test_runner(port: u16) -> ManagedRunner {
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = format!("test-{port}");
+        config.name = config.id.clone();
+        config.port = port;
+        ManagedRunner::new_with_log_dir(config, false, None)
+    }
+
+    /// The per-runner skip decision the manager sweep makes (and purge-core
+    /// shares): exercised directly because the sweep itself is an endless loop.
+    #[tokio::test]
+    async fn skip_for_startup_window_decisions() {
+        // Unbound port: bind ephemeral, read, drop.
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let now = chrono::Utc::now();
+        let budget = Some(Duration::from_secs(240));
+
+        // Started ~now by an in-flight spawn, port not bound → skip.
+        let m = startup_test_runner(dead_port);
+        m.runner.write().await.started_at = Some(now);
+        m.set_spawn_in_flight(budget);
+        assert!(
+            skip_for_startup_window(&m, true).await,
+            "in-window starting runner"
+        );
+
+        // Post-build pre-start placeholder with marker → skip.
+        let m = startup_test_runner(dead_port);
+        m.set_spawn_in_flight(budget);
+        assert!(
+            skip_for_startup_window(&m, false).await,
+            "marked placeholder"
+        );
+
+        // Placeholder with no marker, never started → NOT skipped.
+        let m = startup_test_runner(dead_port);
+        assert!(
+            !skip_for_startup_window(&m, false).await,
+            "unmarked placeholder"
+        );
+
+        // Started an hour ago, no marker, port dead → NOT skipped (crash arm).
+        let m = startup_test_runner(dead_port);
+        m.runner.write().await.started_at = Some(now - chrono::Duration::hours(1));
+        assert!(!skip_for_startup_window(&m, true).await, "crashed runner");
+
+        // Started 120 s ago: past the floor, inside a 240 s marker → skip only
+        // with the marker (isolates the marker from the floor).
+        let m = startup_test_runner(dead_port);
+        m.runner.write().await.started_at = Some(now - chrono::Duration::seconds(120));
+        assert!(
+            !skip_for_startup_window(&m, true).await,
+            "past floor, no marker"
+        );
+        m.set_spawn_in_flight(budget);
+        assert!(
+            skip_for_startup_window(&m, true).await,
+            "past floor, inside budget"
+        );
+
+        // In window but LISTENING → not skipped; proceeds to the sweep's logic.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live");
+        let live_port = live.local_addr().expect("addr").port();
+        let m = startup_test_runner(live_port);
+        m.runner.write().await.started_at = Some(now);
+        m.set_spawn_in_flight(budget);
+        assert!(!skip_for_startup_window(&m, true).await, "listening runner");
+        drop(live);
+    }
+
     #[test]
     fn startup_window_protects_table() {
         let now = chrono::Utc::now();
@@ -7938,6 +8022,15 @@ mod tests {
         // /runners/{id}` / `purge-stale` in routes/runners.rs.
         let sweep = body_of("pub async fn reap_stale_test_runners(");
         assert!(sweep.contains("reap_runner_instance_state(&id, &name)"));
+        // Startup-window grace (plan
+        // 2026-09-19-supervisor-reaper-purges-an-in-flight-spawn-test): the
+        // endless sweep loop cannot be driven from a test, so pin that it
+        // still consults the shared, unit-tested skip decision.
+        assert!(
+            sweep.contains("skip_for_startup_window(managed, is_running)"),
+            "reap_stale_test_runners no longer consults skip_for_startup_window — a starting \
+             temp runner whose port is not bound yet would be reaped as crashed"
+        );
         let routes = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")

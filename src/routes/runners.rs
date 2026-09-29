@@ -1059,12 +1059,11 @@ pub async fn purge_stale_test_runners_core(
         // Both are skipped on every caller, the operator path
         // (`respect_active_builds=false`) included. A listening runner falls
         // through unchanged.
-        if manager::in_startup_window(managed).await
-            && (!is_running || !crate::process::port::is_port_listening(managed.config.port))
-        {
+        if manager::skip_for_startup_window(managed, is_running).await {
             tracing::debug!(
                 "purge-stale: skipping temp runner '{}' (port {}) — inside its startup window \
-                 (running={}, port not listening yet)",
+                 (running={}: a not-yet-started placeholder, or started with its port not \
+                 listening yet)",
                 managed.config.id,
                 managed.config.port,
                 is_running
@@ -2772,7 +2771,7 @@ pub async fn spawn_test(
     // possible when a concurrent path (reaper, stop_all, failed probe on a
     // sibling spawn) removes our id between insertion and start. Smoke tests
     // hit this ~1 in 10 times under load.
-    let (id, port, managed) = {
+    let (id, port, managed, in_flight_guard) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -2825,8 +2824,14 @@ pub async fn spawn_test(
             false,
             state.config.log_dir.as_deref(),
         ));
+        // Arm the spawn-in-flight marker BEFORE the placeholder becomes visible
+        // in the registry, so no sweep can ever observe it unmarked. The guard
+        // is moved into the exec future below and lives until that future ends
+        // (or is dropped); any early `?` return between here and
+        // `submit_spawn` clears the marker through `Drop`.
+        let in_flight_guard = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
         runners.insert(id.clone(), managed.clone());
-        (id, port, managed)
+        (id, port, managed, in_flight_guard)
     };
 
     // friction-1: stamp the owning requester onto the runner so `GET /runners`
@@ -2912,6 +2917,10 @@ pub async fn spawn_test(
         agent_id,
         port,
         async move {
+            // Owns the spawn-in-flight marker for the whole build → start →
+            // probe → wait pipeline; released when this future completes or
+            // is dropped. Both the sync and `async: true` paths run this future.
+            let _in_flight = in_flight_guard;
             let (status, body_json, stderr_tail) =
                 execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
             // The build is over (succeeded or failed): free the key so the next
@@ -3172,12 +3181,9 @@ async fn execute_spawn_build(
     no_wait: bool,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let mut side = SpawnBuildSideChannel::default();
-    // Mark the runner as owned by this spawn for the whole build → copy →
-    // start → probe → wait pipeline, so neither stale-runner sweep reads its
-    // not-yet-bound port as a crash. Computed here because `body` is moved
-    // into the inner fn. The guard clears the marker on EVERY exit — success,
-    // failure, `Err`, and a dropped/cancelled future.
-    let _in_flight = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
+    // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
+    // placeholder insert and moves its guard into the future that awaits this
+    // one, so it also covers the mint/submit gap before this fn runs.
     // Merged on BOTH arms, not just `Err`. Several of the inner fn's FAILURE
     // responses (`runner_died_during_startup`, `runner_started_but_unresponsive`,
     // `frontend_stale` / `frontend_dist_missing`, the paired-profile failure) are
@@ -3209,10 +3215,12 @@ const SPAWN_IN_FLIGHT_MARGIN: std::time::Duration = std::time::Duration::from_se
 /// `started_at`: the health-probe window, plus the health wait when the caller
 /// asked for one, plus [`SPAWN_IN_FLIGHT_MARGIN`].
 fn spawn_in_flight_budget(body: &SpawnTestRequest) -> std::time::Duration {
+    // `wait_timeout_secs` is caller-supplied and unclamped: saturate rather
+    // than let `Duration + Duration` panic on overflow.
     let wait = if body.wait { body.wait_timeout_secs } else { 0 };
     std::time::Duration::from_millis(body.health_probe_timeout_ms)
-        + std::time::Duration::from_secs(wait)
-        + SPAWN_IN_FLIGHT_MARGIN
+        .saturating_add(std::time::Duration::from_secs(wait))
+        .saturating_add(SPAWN_IN_FLIGHT_MARGIN)
 }
 
 /// RAII owner of [`ManagedRunner::spawn_in_flight`]: sets the marker on
@@ -9456,6 +9464,88 @@ mod tests {
             "a runner started moments ago must get the startup floor"
         );
         assert!(state.runners.read().await.contains_key(&id));
+    }
+
+    /// Between the 60 s floor and the marker's budget: the marker alone decides.
+    /// Started 120 s ago with a dead port — spared with a 240 s marker, purged
+    /// without one.
+    #[tokio::test]
+    async fn purge_marker_protects_past_the_floor_but_within_the_budget() {
+        let state = make_state();
+        let started = chrono::Utc::now() - chrono::Duration::seconds(120);
+
+        let marked = insert_temp_runner_owned(&state, free_port(), None).await;
+        set_runner_phase(
+            &state,
+            &marked,
+            true,
+            Some(started),
+            Some(std::time::Duration::from_secs(240)),
+        )
+        .await;
+        let unmarked = loop {
+            // Distinct id: ids are derived from the port.
+            let p = free_port();
+            if format!("test-{p}") != marked {
+                break insert_temp_runner_owned(&state, p, None).await;
+            }
+        };
+        set_runner_phase(&state, &unmarked, true, Some(started), None).await;
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+        let ids: std::collections::HashSet<String> =
+            purged.into_iter().map(|(id, _, _)| id).collect();
+
+        assert!(
+            !ids.contains(&marked),
+            "a runner past the floor but inside its spawn budget must be spared"
+        );
+        assert!(state.runners.read().await.contains_key(&marked));
+        assert!(
+            ids.contains(&unmarked),
+            "the same runner with no marker is past the floor and must be purged"
+        );
+    }
+
+    /// `wait_timeout_secs` is unclamped: the budget must saturate, not panic.
+    #[test]
+    fn spawn_in_flight_budget_saturates_on_huge_wait() {
+        let body: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({
+            "wait": true,
+            "wait_timeout_secs": u64::MAX,
+            "health_probe_timeout_ms": u64::MAX,
+        }))
+        .expect("parse");
+        assert_eq!(
+            super::spawn_in_flight_budget(&body),
+            std::time::Duration::MAX
+        );
+    }
+
+    /// The marker is armed at the placeholder insert in `spawn_test` (so the
+    /// mint/submit gap is covered) and moved into the exec future; the inner
+    /// build fn must not arm a second guard that would clear it early.
+    #[test]
+    fn spawn_in_flight_guard_is_armed_once_at_the_placeholder_insert() {
+        let spawn = fn_source("pub async fn spawn_test(");
+        let arm = spawn
+            .find("SpawnInFlightGuard::arm(")
+            .expect("spawn_test must arm the spawn-in-flight guard");
+        let insert = spawn
+            .find("runners.insert(id.clone(), managed.clone())")
+            .expect("spawn_test placeholder insert");
+        assert!(
+            arm < insert,
+            "the marker must be armed before the placeholder is visible"
+        );
+        assert!(
+            spawn.contains("let _in_flight = in_flight_guard;"),
+            "the guard must be moved into the exec future"
+        );
+        assert!(
+            !fn_source("async fn execute_spawn_build(").contains("SpawnInFlightGuard::arm("),
+            "execute_spawn_build must not arm its own guard"
+        );
     }
 
     /// The RAII guard sets the marker and clears it on drop.
