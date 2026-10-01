@@ -192,11 +192,11 @@ fn production_span_treats_an_extracted_test_file_as_test_code() {
 ///   port-derived helper whose name happens not to match.
 #[test]
 fn no_spawn_site_mints_a_port_derived_instance_name() {
-    // Assembled at runtime so this line does not contain the needle and
-    // self-flag. (It sits inside `mod tests` and is excluded by the
-    // `#[cfg(test)]` split anyway — but only while that split works, and a
-    // guard that depends on its own exclusion to pass is one checkout
-    // setting away from crying wolf. Belt and braces.)
+    // The needle is assembled at runtime (`mints_a_port_derived_name`) so no
+    // line here contains it and self-flags. (This file opens with
+    // `#![cfg(test)]` and is excluded as test-only anyway — but only while
+    // that classification works, and a guard that depends on its own
+    // exclusion to pass is one edit away from crying wolf. Belt and braces.)
     let offenders = scan_production_lines(mints_a_port_derived_name);
 
     assert!(
