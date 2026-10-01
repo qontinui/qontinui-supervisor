@@ -218,19 +218,12 @@ fn no_spawn_site_mints_a_port_derived_instance_name() {
     .replace("\r\n", "\n");
     // Production code only — the same text whether this file's tests are
     // inline or extracted to `routes/runners/tests.rs`.
-    let spawn_test_body = production_span(&this_file)
-        .split_once("pub async fn spawn_test(")
-        .map(|(_, after)| after)
-        .expect("spawn_test must exist — did it get renamed?");
-    // Bound the search to spawn_test itself, not the whole rest of the file:
-    // cut at whichever top-level `fn` comes first, so a match in a LATER
-    // function can never satisfy this assertion.
-    let spawn_test_body = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
-        .iter()
-        .filter_map(|marker| spawn_test_body.find(marker))
-        .min()
-        .map(|end| &spawn_test_body[..end])
-        .unwrap_or(spawn_test_body);
+    // Bounded to spawn_test's own body by brace matching, so a match in a
+    // LATER item — whatever its visibility or qualifiers — can never satisfy
+    // this assertion.
+    let spawn_test_body =
+        crate::source_scan::fn_body(production_span(&this_file), "pub async fn spawn_test(")
+            .expect("spawn_test must exist — did it get renamed?");
     assert!(
         spawn_test_body.contains("temp_runner_instance_name(&id)"),
         "spawn_test no longer mints its instance name via \
@@ -516,9 +509,9 @@ fn spawn_path_applies_paired_state_even_without_a_profile_id() {
     assert!(body.contains("resp[\"coord_credential\"]"));
 }
 
-/// Read one function's body out of this source file, bounded at the next
-/// top-level `fn` so a match in a LATER function can never satisfy an
-/// assertion. Same technique as
+/// Read one function's body out of this source file, bounded at its own
+/// closing brace ([`crate::source_scan::fn_body`]) so a match in a LATER item
+/// can never satisfy an assertion. Same technique as
 /// `no_spawn_site_mints_a_port_derived_instance_name`'s positive half.
 fn fn_source(signature: &str) -> String {
     let this_file = fs::read_to_string(
@@ -531,17 +524,9 @@ fn fn_source(signature: &str) -> String {
     .replace("\r\n", "\n");
     // Production code only, so a body bounded by EOF cannot run on into
     // the test module while it is inline and stop short once extracted.
-    let after = production_span(&this_file)
-        .split_once(signature)
-        .map(|(_, after)| after)
+    crate::source_scan::fn_body(production_span(&this_file), signature)
         .unwrap_or_else(|| panic!("`{signature}` must exist — did it get renamed?"))
-        .to_string();
-    ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
-        .iter()
-        .filter_map(|marker| after.find(marker))
-        .min()
-        .map(|end| after[..end].to_string())
-        .unwrap_or(after)
+        .to_string()
 }
 
 fn write_file(path: &std::path::Path, contents: &[u8]) {

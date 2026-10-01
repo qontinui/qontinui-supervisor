@@ -1928,15 +1928,12 @@ fn temp_restart_keeps_the_instance_state() {
     // `process/manager/tests.rs`. `body_of` panics on a missing signature,
     // so the scan cannot pass on text that no longer holds the functions.
     let src = crate::source_scan::production_span(&src).to_string();
+    // Up to the function's own closing brace, by brace matching, so a match
+    // cannot come from a neighbouring function.
     let body_of = |sig: &str| {
-        let after = src
-            .split_once(sig)
-            .map(|(_, after)| after)
-            .unwrap_or_else(|| panic!("{sig} exists"));
-        // Up to the function's own closing brace (rustfmt puts a
-        // top-level item's `}` alone at column 0), not the next `pub`
-        // item, so a match cannot come from a neighbouring function.
-        after[..after.find("\n}\n").unwrap_or(after.len())].to_string()
+        crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .to_string()
     };
 
     let stop = body_of("pub async fn stop_runner_by_id(");

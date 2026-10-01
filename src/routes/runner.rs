@@ -1910,14 +1910,11 @@ mod tests {
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
 
-        let body = this_file
-            .split_once("pub async fn supervisor_restart(")
-            .map(|(_, after)| after)
+        // Bounded to supervisor_restart's own body (brace matching): before,
+        // this ran to the test module, so the `rfind` below could have landed
+        // on an `exit(0)` in a LATER function.
+        let body = crate::source_scan::fn_body(&this_file, "pub async fn supervisor_restart(")
             .expect("supervisor_restart must exist — did it get renamed?");
-        let body = body
-            .find("\n#[cfg(test)]")
-            .map(|end| &body[..end])
-            .unwrap_or(body);
 
         let latch = body.find("state.signal_shutdown()").unwrap_or_else(|| {
             panic!(

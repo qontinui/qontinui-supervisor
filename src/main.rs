@@ -1020,14 +1020,10 @@ mod tests {
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
 
-        let body = this_file
-            .split_once("async fn shutdown_signal(")
-            .map(|(_, after)| after)
+        // Bounded to shutdown_signal's own body (brace matching), so neither
+        // the needles nor their order can be satisfied by a later function.
+        let body = crate::source_scan::fn_body(&this_file, "async fn shutdown_signal(")
             .expect("shutdown_signal must exist — did it get renamed?");
-        let body = body
-            .find("\n#[cfg(test)]")
-            .map(|end| &body[..end])
-            .unwrap_or(body);
 
         assert!(
             body.contains("SHUTDOWN_DRAIN_DEADLINE_SECS"),
