@@ -80,9 +80,43 @@ fn skip_block_comment(text: &str) -> Option<&str> {
     None
 }
 
+/// The production part of one LF-normalized source file: everything before
+/// its first `#[cfg(test)] mod`, and NOTHING for a file that is test code in
+/// its entirety ([`is_test_only_file`]).
+///
+/// The cut is anchored on the test MODULE, not the bare attribute:
+/// `#[cfg(test)]` also decorates test-only helper items, and cutting at the
+/// first of those hides every production function after it (see
+/// `routes::runners::tests::scan_production_lines`). A module extracted to its
+/// own file leaves `#[cfg(test)]\nmod tests;` in the parent, so the cut lands
+/// in the same place before and after the extraction — which is what lets a
+/// self-scan of the parent read identical production text either way.
+pub(crate) fn production_span(text: &str) -> &str {
+    if is_test_only_file(text) {
+        return "";
+    }
+    text.split_once("\n#[cfg(test)]\nmod ")
+        .map(|(before, _)| before)
+        .unwrap_or(text)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_test_only_file;
+    use super::{is_test_only_file, production_span};
+
+    #[test]
+    fn production_span_is_the_same_for_inline_and_extracted_tests() {
+        let prod = "pub fn f() {}\n";
+        let inline =
+            format!("{prod}\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{}}\n}}\n");
+        let parent = format!("{prod}\n#[cfg(test)]\nmod tests;\n");
+        assert_eq!(production_span(&inline), production_span(&parent));
+        assert_eq!(production_span(&parent), prod);
+        assert_eq!(production_span("#![cfg(test)]\n\n#[test]\nfn t() {}\n"), "");
+        // A test-only helper ITEM does not end production.
+        let helper = "#[cfg(test)]\npub fn helper() {}\npub fn real() {}\n";
+        assert_eq!(production_span(helper), helper);
+    }
 
     #[test]
     fn the_codemod_header_marks_a_file_test_only() {

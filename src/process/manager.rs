@@ -7972,6 +7972,11 @@ mod tests {
         )
         .expect("read manager.rs")
         .replace("\r\n", "\n");
+        // Every body below is PRODUCTION code, so read only that: the same
+        // text whether this module's tests are inline or extracted to
+        // `process/manager/tests.rs`. `body_of` panics on a missing signature,
+        // so the scan cannot pass on text that no longer holds the functions.
+        let src = crate::source_scan::production_span(&src).to_string();
         let body_of = |sig: &str| {
             let after = src
                 .split_once(sig)
@@ -8037,7 +8042,11 @@ mod tests {
                 .join("routes")
                 .join("runners.rs"),
         )
-        .expect("read routes/runners.rs");
+        .expect("read routes/runners.rs")
+        .replace("\r\n", "\n");
+        // Production only — the bans below police teardown call sites, and
+        // that file's tests live in `routes/runners/tests.rs` once extracted.
+        let routes = crate::source_scan::production_span(&routes).to_string();
         assert_eq!(
             routes
                 .matches("manager::reap_runner_instance_state(&id, &name)")

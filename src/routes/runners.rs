@@ -7123,6 +7123,7 @@ mod tests {
         wait_out_queue_timeout, FrontendStaleReason,
     };
     use crate::build_monitor::BuildPhase;
+    use crate::source_scan::production_span;
     use std::fs;
     use std::sync::atomic::AtomicU8;
     use std::sync::Arc;
@@ -7134,7 +7135,7 @@ mod tests {
     ///
     /// "Production" = everything before the file's first `#[cfg(test)] mod`,
     /// nothing at all in a file that opens with `#![cfg(test)]` (an extracted
-    /// test module — [`production_span`]), and never a `//` / `///` line. Test modules legitimately build fixture
+    /// test module — [`crate::source_scan::production_span`]), and never a `//` / `///` line. Test modules legitimately build fixture
     /// ids from ports, and the doc comments deliberately quote the old form to
     /// explain why it is gone — neither reaches a spawn.
     ///
@@ -7189,8 +7190,10 @@ mod tests {
         // file and the one most likely to grow a spawn path; it is also the file
         // the bare-attribute split truncated to 455 lines. If the split ever
         // regresses, its scanned span collapses and this fires — the coverage
-        // loss cannot go silent again. The floor is well under the real span
-        // (~4.4k) so ordinary edits do not trip it.
+        // loss cannot go silent again. The floor is well under the real span —
+        // since its test module moved to `process/manager/tests.rs`, the whole
+        // of `manager.rs` (~6k lines) — so ordinary edits do not trip it. The
+        // extracted file is test-only and is skipped, never counted here.
         const CANARY: &str = "manager.rs";
         const CANARY_MIN_PRODUCTION_LINES: usize = 3000;
         let mut canary_lines = 0usize;
@@ -7229,26 +7232,6 @@ mod tests {
         hits
     }
 
-    /// The production part of one LF-normalized source file: everything before
-    /// its first `#[cfg(test)] mod` (see [`scan_production_lines`] for why the
-    /// cut is anchored on the module), and NOTHING for a file that is test code
-    /// in its entirety.
-    ///
-    /// A test module extracted to its own file (`foo/tests.rs`, opening with
-    /// `#![cfg(test)]`) carries no in-file `#[cfg(test)] mod` — that marker
-    /// stays on the parent's `mod tests;` line — so without the
-    /// [`crate::source_scan::is_test_only_file`] arm the split falls through to
-    /// "whole file" and every fixture in it is policed as production (plan
-    /// `2026-10-01-oversized-source-files-owe-a-decomposition`, Phase 2b).
-    fn production_span(text: &str) -> &str {
-        if crate::source_scan::is_test_only_file(text) {
-            return "";
-        }
-        text.split_once("\n#[cfg(test)]\nmod ")
-            .map(|(before, _)| before)
-            .unwrap_or(text)
-    }
-
     /// The predicate of [`no_spawn_site_mints_a_port_derived_instance_name`]:
     /// a (trimmed) line containing both `"test-{` and `port`. The needle is
     /// assembled at runtime so no line of this file contains it.
@@ -7261,7 +7244,7 @@ mod tests {
     /// predicate rejects is classified as test code and yields no flagged
     /// line, while the same line in a production file (or before an inline
     /// test module) still is. Dropping the `is_test_only_file` arm from
-    /// [`production_span`] reddens the first assertion.
+    /// [`crate::source_scan::production_span`] reddens the first assertion.
     #[test]
     fn production_span_treats_an_extracted_test_file_as_test_code() {
         let flagged = |text: &str| {
@@ -7347,7 +7330,9 @@ mod tests {
         )
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
-        let spawn_test_body = this_file
+        // Production code only — the same text whether this file's tests are
+        // inline or extracted to `routes/runners/tests.rs`.
+        let spawn_test_body = production_span(&this_file)
             .split_once("pub async fn spawn_test(")
             .map(|(_, after)| after)
             .expect("spawn_test must exist — did it get renamed?");
@@ -7658,7 +7643,9 @@ mod tests {
         )
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
-        let after = this_file
+        // Production code only, so a body bounded by EOF cannot run on into
+        // the test module while it is inline and stop short once extracted.
+        let after = production_span(&this_file)
             .split_once(signature)
             .map(|(_, after)| after)
             .unwrap_or_else(|| panic!("`{signature}` must exist — did it get renamed?"))
