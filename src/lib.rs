@@ -59,6 +59,10 @@ pub mod sdk_features;
 pub mod self_provenance;
 pub mod server;
 pub mod settings;
+/// Test-only: classifies a source file the codemod extracted as test code for
+/// the source-scanning guards (plan 2026-10-01-oversized-source-files-owe-a-decomposition).
+#[cfg(test)]
+mod source_scan;
 pub mod spawn_worktree;
 pub mod state;
 /// Test-only wall-clock policy: the one place a residual deadline's size is

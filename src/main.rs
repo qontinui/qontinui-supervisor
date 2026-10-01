@@ -57,6 +57,10 @@ mod sdk_features;
 mod self_provenance;
 mod server;
 mod settings;
+/// Test-only: classifies a source file the codemod extracted as test code for
+/// the source-scanning guards (plan 2026-10-01-oversized-source-files-owe-a-decomposition).
+#[cfg(test)]
+mod source_scan;
 mod spawn_worktree;
 mod state;
 #[cfg(test)]

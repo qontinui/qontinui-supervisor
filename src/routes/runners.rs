@@ -7133,7 +7133,8 @@ mod tests {
     /// each PRODUCTION line matching `pred`.
     ///
     /// "Production" = everything before the file's first `#[cfg(test)] mod`,
-    /// and never a `//` / `///` line. Test modules legitimately build fixture
+    /// nothing at all in a file that opens with `#![cfg(test)]` (an extracted
+    /// test module — [`production_span`]), and never a `//` / `///` line. Test modules legitimately build fixture
     /// ids from ports, and the doc comments deliberately quote the old form to
     /// explain why it is gone — neither reaches a spawn.
     ///
@@ -7201,10 +7202,7 @@ mod tests {
             let text = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("spawn-site guard could not read {path:?}: {e}"))
                 .replace("\r\n", "\n");
-            let prod = text
-                .split_once("\n#[cfg(test)]\nmod ")
-                .map(|(before, _)| before)
-                .unwrap_or(&text);
+            let prod = production_span(&text);
             if path.ends_with(CANARY) {
                 canary_lines = prod.lines().count();
             }
@@ -7229,6 +7227,74 @@ mod tests {
         );
 
         hits
+    }
+
+    /// The production part of one LF-normalized source file: everything before
+    /// its first `#[cfg(test)] mod` (see [`scan_production_lines`] for why the
+    /// cut is anchored on the module), and NOTHING for a file that is test code
+    /// in its entirety.
+    ///
+    /// A test module extracted to its own file (`foo/tests.rs`, opening with
+    /// `#![cfg(test)]`) carries no in-file `#[cfg(test)] mod` — that marker
+    /// stays on the parent's `mod tests;` line — so without the
+    /// [`crate::source_scan::is_test_only_file`] arm the split falls through to
+    /// "whole file" and every fixture in it is policed as production (plan
+    /// `2026-10-01-oversized-source-files-owe-a-decomposition`, Phase 2b).
+    fn production_span(text: &str) -> &str {
+        if crate::source_scan::is_test_only_file(text) {
+            return "";
+        }
+        text.split_once("\n#[cfg(test)]\nmod ")
+            .map(|(before, _)| before)
+            .unwrap_or(text)
+    }
+
+    /// The predicate of [`no_spawn_site_mints_a_port_derived_instance_name`]:
+    /// a (trimmed) line containing both `"test-{` and `port`. The needle is
+    /// assembled at runtime so no line of this file contains it.
+    fn mints_a_port_derived_name(line: &str) -> bool {
+        let needle = format!("{}{}", "\"test-", '{');
+        line.contains(needle.as_str()) && line.contains("port")
+    }
+
+    /// Phase 2b fixture: an extracted test file holding a line the spawn-site
+    /// predicate rejects is classified as test code and yields no flagged
+    /// line, while the same line in a production file (or before an inline
+    /// test module) still is. Dropping the `is_test_only_file` arm from
+    /// [`production_span`] reddens the first assertion.
+    #[test]
+    fn production_span_treats_an_extracted_test_file_as_test_code() {
+        let flagged = |text: &str| {
+            production_span(text)
+                .lines()
+                .filter(|l| mints_a_port_derived_name(l.trim()))
+                .count()
+        };
+        // Assembled at runtime so this source never carries the needle itself.
+        let offending = format!("    let id = format!(\"{}{}port}}\");\n", "test-", '{');
+        // Self-check: the fixture line really is one the guard rejects, so the
+        // assertions below cannot pass on a mis-built fixture.
+        assert!(mints_a_port_derived_name(offending.trim()));
+
+        let extracted =
+            format!("#![cfg(test)]\n\nuse super::*;\n\nfn fixture() {{\n{offending}}}\n");
+        assert_eq!(
+            flagged(&extracted),
+            0,
+            "an extracted `#![cfg(test)]` file must contribute no production lines"
+        );
+
+        let production = format!("pub fn spawn() {{\n{offending}}}\n");
+        assert_eq!(flagged(&production), 1, "a production line is still caught");
+
+        let inline = format!(
+            "pub fn spawn() {{\n{offending}}}\n\n#[cfg(test)]\nmod tests {{\n{offending}}}\n"
+        );
+        assert_eq!(
+            flagged(&inline),
+            1,
+            "only the line before the inline test module is production"
+        );
     }
 
     /// No spawn site anywhere in `src/` may mint a temp runner's instance name
@@ -7262,9 +7328,7 @@ mod tests {
         // `#[cfg(test)]` split anyway — but only while that split works, and a
         // guard that depends on its own exclusion to pass is one checkout
         // setting away from crying wolf. Belt and braces.)
-        let needle = format!("{}{}", "\"test-", '{');
-        let offenders =
-            scan_production_lines(|l| l.contains(needle.as_str()) && l.contains("port"));
+        let offenders = scan_production_lines(mints_a_port_derived_name);
 
         assert!(
             offenders.is_empty(),
