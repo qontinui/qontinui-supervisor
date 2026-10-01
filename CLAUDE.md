@@ -155,6 +155,23 @@ now names every victim as `pid <n> on port <p>`, and a **second** line reports
 the listeners the sweep deliberately spared and why — silence there would
 recreate the same defect in mirror image.
 
+**A temp runner inside its startup window is skipped by both stale-runner sweeps.**
+A Tauri runner started ~1 s before a sweep has not bound its port yet, and
+"state says running, port free" used to read as a crash: the sweep deleted the
+record and instance dirs under the starting process. `manager::skip_for_startup_window`
+(shared by `manager::reap_stale_test_runners` and
+`routes::runners::purge_stale_test_runners_core`, operator `POST /runners/purge-stale`
+included) skips a runner that is in its window AND (not started yet OR port not
+listening). Two inputs: the `ManagedRunner::spawn_in_flight` marker (armed by
+`SpawnInFlightGuard` at the placeholder insert in `execute_spawn_build`, cleared on
+`Drop` on every exit incl. cancellation; budget = probe wait + margin, saturating),
+and a generic `STARTUP_GRACE_FLOOR` (60 s from `started_at`) that covers the restart
+route, the watchdog and every other start path with no marker. The marker is bounded
+(`max(budget, floor)` from `started_at`) so a hung handler cannot protect a started
+runner forever. A **listening** runner is never skipped — it proceeds to the sweep's
+ordinary logic, max-age included. `reconcile_orphaned_temp_runners` additionally
+re-checks the registry for the port immediately before each kill.
+
 **Temp runners have a max age; nothing else does.** Before this, a *healthy*
 temp runner had no terminator at all short of supervisor exit — an unowned
 (`requester_id: None`) temp was found alive with 31 live PTYs two days after it
