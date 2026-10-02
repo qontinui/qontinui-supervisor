@@ -316,7 +316,8 @@ pub struct SupervisorState {
     pub cached_runner_health: RwLock<Vec<CachedRunnerHealth>>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
-    /// Port the legacy `/ui-bridge/*` and `/runner-api/*` proxies forward to.
+    /// Port the legacy `/ui-bridge/*`, `/runner-api/*` and `/graphql` proxies
+    /// forward to.
     /// Always [`crate::config::RUNNER_API_PORT`] in production; a field only so
     /// a test can point those proxies at a stub runner on an ephemeral port.
     pub runner_api_port: u16,

@@ -15,7 +15,6 @@ use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::config::RUNNER_API_PORT;
 use crate::state::SharedState;
 
 /// Default timeout for GraphQL proxy requests (seconds).
@@ -24,7 +23,7 @@ const PROXY_TIMEOUT_SECS: u64 = 30;
 
 /// Proxy handler for GraphQL POST requests.
 ///
-/// Forwards the request to `http://127.0.0.1:9876/graphql` preserving
+/// Forwards the request to the runner's `/graphql` (`state.runner_api_port`) preserving
 /// the JSON body and content-type headers.
 pub async fn graphql_proxy(State(state): State<SharedState>, req: Request) -> Response {
     // Check runner health from cache first
@@ -35,14 +34,14 @@ pub async fn graphql_proxy(State(state): State<SharedState>, req: Request) -> Re
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "error": "Runner is not responding. Is qontinui-runner running?",
-                "runner_port": RUNNER_API_PORT,
+                "runner_port": state.runner_api_port,
             })),
         )
             .into_response();
     }
     drop(cached);
 
-    let target_url = format!("http://127.0.0.1:{}/graphql", RUNNER_API_PORT);
+    let target_url = format!("http://127.0.0.1:{}/graphql", state.runner_api_port);
     debug!("GraphQL proxy: POST /graphql -> {}", target_url);
 
     let client = &state.http_client;

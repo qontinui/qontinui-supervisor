@@ -1828,8 +1828,8 @@ mod router_tests {
         (port, seen)
     }
 
-    /// The production router with all three runner proxies pointed at the
-    /// stub: the legacy `/ui-bridge/*` and `/runner-api/*` proxies through
+    /// The production router with every runner proxy pointed at the stub: the
+    /// legacy `/ui-bridge/*`, `/runner-api/*` and `/graphql` proxies through
     /// `runner_api_port`, `/runners/primary/ui-bridge/*` through the primary
     /// runner's configured port. Both health caches say the runner responds,
     /// so an admitted request really is forwarded.
@@ -1934,5 +1934,50 @@ mod router_tests {
             .map(|(method, _, _, runner_path)| (method.to_string(), runner_path.to_string(), None))
             .collect();
         assert_eq!(*seen.lock().unwrap(), expected);
+    }
+
+    /// `POST /graphql` is the fourth fixed-port runner proxy, and it too
+    /// forwards only `content-type`, so a foreign page's mutation would reach
+    /// the runner with full local trust. Refused with nothing forwarded; the
+    /// same call with no `Origin` is forwarded once, to the runner's
+    /// `/graphql`.
+    #[tokio::test]
+    async fn graphql_proxy_refuses_a_foreign_origin_and_forwards_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stub_port, seen) = stub_runner().await;
+        let app = relay_router(dir.path(), stub_port).await;
+
+        let graphql_request = |origin: Option<&str>| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/graphql")
+                .header(header::HOST, loopback_host())
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(o) = origin {
+                b = b.header(header::ORIGIN, o);
+            }
+            b.body(Body::from(r#"{"query":"{ __typename }"}"#)).unwrap()
+        };
+
+        let resp = app
+            .clone()
+            .oneshot(graphql_request(Some(EVIL)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(acao(&resp), None);
+        assert_eq!(body_json(resp).await["code"], CODE_CROSS_ORIGIN_REFUSED);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused request reached the runner: {:?}",
+            seen.lock().unwrap()
+        );
+
+        let resp = app.oneshot(graphql_request(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("POST".to_string(), "/graphql".to_string(), None)]
+        );
     }
 }
