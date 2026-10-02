@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::config::RUNNER_API_PORT;
 use crate::state::SharedState;
 
 /// Default timeout for UI Bridge proxy requests (seconds).
@@ -36,7 +35,7 @@ pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "error": "Runner is not responding. Is qontinui-runner running?",
-                "runner_port": RUNNER_API_PORT,
+                "runner_port": state.runner_api_port,
             })),
         )
             .into_response();
@@ -48,7 +47,10 @@ pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
 
-    let target_url = format!("http://127.0.0.1:{}{}{}", RUNNER_API_PORT, path, query);
+    let target_url = format!(
+        "http://127.0.0.1:{}{}{}",
+        state.runner_api_port, path, query
+    );
     debug!("UI Bridge proxy: {} {} -> {}", method, path, target_url);
 
     // Reuse the shared HTTP client from state

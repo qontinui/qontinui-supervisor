@@ -1293,9 +1293,9 @@ mod router_tests {
     const PORT: u16 = 9875;
     const EVIL: &str = "https://evil.example";
 
-    fn state(root: &std::path::Path) -> crate::state::SharedState {
+    fn config(root: &std::path::Path) -> crate::config::SupervisorConfig {
         use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-        let config = SupervisorConfig {
+        SupervisorConfig {
             project_dir: root.join("qontinui-runner").join("src-tauri"),
             watchdog_enabled_at_start: false,
             auto_start: false,
@@ -1312,8 +1312,11 @@ mod router_tests {
             no_prewarm: false,
             no_webview: true,
             temp_runner_display: None,
-        };
-        std::sync::Arc::new(crate::state::SupervisorState::new(config))
+        }
+    }
+
+    fn state(root: &std::path::Path) -> crate::state::SharedState {
+        std::sync::Arc::new(crate::state::SupervisorState::new(config(root)))
     }
 
     /// The router as production builds it, with the guard config passed in
@@ -1788,5 +1791,148 @@ mod router_tests {
         .await;
         assert_eq!(webview["originGuard"]["refusals"]["origin"], 1);
         assert!(webview["originGuard"].get("recent").is_none());
+    }
+
+    /// One request as a stub runner saw it: method, path and query, and the
+    /// `Origin` it arrived with.
+    type Seen = (String, String, Option<String>);
+
+    /// A stub runner on `127.0.0.1:0` that records every request it receives
+    /// and answers each with `200 {"ok":true}`.
+    async fn stub_runner() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+        let record = seen.clone();
+        let app = Router::new().fallback(move |req: Request<Body>| {
+            let record = record.clone();
+            async move {
+                let origin = req
+                    .headers()
+                    .get(header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_default();
+                record
+                    .lock()
+                    .unwrap()
+                    .push((req.method().to_string(), path, origin));
+                axum::Json(serde_json::json!({ "ok": true }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, seen)
+    }
+
+    /// The production router with all three runner proxies pointed at the
+    /// stub: the legacy `/ui-bridge/*` and `/runner-api/*` proxies through
+    /// `runner_api_port`, `/runners/primary/ui-bridge/*` through the primary
+    /// runner's configured port. Both health caches say the runner responds,
+    /// so an admitted request really is forwarded.
+    async fn relay_router(root: &std::path::Path, stub_port: u16) -> Router {
+        let mut config = config(root);
+        for rc in &mut config.runners {
+            rc.port = stub_port;
+        }
+        let mut st = crate::state::SupervisorState::new(config);
+        st.runner_api_port = stub_port;
+        let st = std::sync::Arc::new(st);
+        st.cached_health.write().await.runner_responding = true;
+        st.get_runner("primary")
+            .await
+            .unwrap()
+            .cached_health
+            .write()
+            .await
+            .runner_responding = true;
+        crate::server::build_router_with_origin_guard(st, OriginGuardConfig::enabled(PORT))
+    }
+
+    /// Plan 2026-09-17-ui-bridge-relay-registration-is-unauthenticated,
+    /// Phase 4 (supervisor residual). The three proxies strip every header but
+    /// `content-type`, so whatever they forward reaches the runner as a
+    /// non-browser caller with full local trust. A foreign page must therefore
+    /// be stopped HERE, before anything is forwarded: an HTTP registration
+    /// overwrite, a forged relay result, and a relay-tab stream takeover each
+    /// answer 403 and the runner sees nothing. The same calls with no `Origin`
+    /// (agents, scripts) are forwarded exactly once each.
+    #[tokio::test]
+    async fn relay_routes_refuse_a_foreign_origin_and_forward_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stub_port, seen) = stub_runner().await;
+        let app = relay_router(dir.path(), stub_port).await;
+
+        let relay_request = |method: &str, uri: &str, body: &str, origin: Option<&str>| {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, loopback_host());
+            if !body.is_empty() {
+                b = b.header(header::CONTENT_TYPE, "application/json");
+            }
+            if let Some(o) = origin {
+                b = b.header(header::ORIGIN, o);
+            }
+            b.body(Body::from(body.to_string())).unwrap()
+        };
+        // (method, supervisor URI, body, path + query the runner should see)
+        let routes = [
+            (
+                "POST",
+                "/ui-bridge/apps/register",
+                r#"{"appId":"victim","transport":"http","baseUrl":"https://evil.example"}"#,
+                "/ui-bridge/apps/register",
+            ),
+            (
+                "POST",
+                "/runner-api/ui-bridge/commands",
+                r#"{"commandId":"c1","success":true}"#,
+                "/ui-bridge/commands",
+            ),
+            (
+                "GET",
+                "/runners/primary/ui-bridge/commands/stream?tabId=t1",
+                "",
+                "/ui-bridge/commands/stream?tabId=t1",
+            ),
+        ];
+
+        for (method, uri, body, _) in routes {
+            let resp = app
+                .clone()
+                .oneshot(relay_request(method, uri, body, Some(EVIL)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(acao(&resp), None, "{method} {uri}");
+            assert_eq!(
+                body_json(resp).await["code"],
+                CODE_CROSS_ORIGIN_REFUSED,
+                "{method} {uri}"
+            );
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused request reached the runner: {:?}",
+            seen.lock().unwrap()
+        );
+
+        for (method, uri, body, _) in routes {
+            let resp = app
+                .clone()
+                .oneshot(relay_request(method, uri, body, None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
+        }
+        let expected: Vec<Seen> = routes
+            .iter()
+            .map(|(method, _, _, runner_path)| (method.to_string(), runner_path.to_string(), None))
+            .collect();
+        assert_eq!(*seen.lock().unwrap(), expected);
     }
 }
