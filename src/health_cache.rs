@@ -87,7 +87,9 @@ struct RunnerHealthBody {
     #[serde(default)]
     recent_crash: Option<RecentCrashSummary>,
     /// `/health.embeddingService` — one of the inputs that can produce
-    /// `derived_status: "degraded"`.
+    /// `derived_status: "degraded"`. Top-level form; the runner actually
+    /// publishes it under `data` (see [`RunnerHealthData`]) — read through
+    /// [`RunnerHealthBody::embedding_service`].
     #[serde(default, rename = "embeddingService")]
     embedding_service: Option<ReachableFlag>,
     /// `/health.database` — bounded PG liveness, another degraded input.
@@ -117,15 +119,50 @@ struct RunnerHealthBody {
 }
 
 /// The subset of the runner's `/health.data` envelope read here.
+///
+/// The runner publishes every one of these ONLY inside `data` (qontinui-runner
+/// `src-tauri/src/mcp_api.rs`, the `data` object built at :1428 and wrapped at
+/// :1901, as of origin/main b58a81dce); its top level mirrors only
+/// `derived_status` / `ui_error` / `recent_crash`. Reading them at the top level
+/// alone meant `degraded_reason` never named a cause on a real runner.
 #[derive(Debug, Default, Deserialize)]
 struct RunnerHealthData {
     #[serde(default, rename = "frontendReady")]
     frontend_ready: Option<bool>,
     #[serde(default, rename = "frontendState")]
     frontend_state: Option<String>,
+    #[serde(default, rename = "embeddingService")]
+    embedding_service: Option<ReachableFlag>,
+    #[serde(default)]
+    database: Option<ReachableFlag>,
+    #[serde(default, rename = "webIntegration")]
+    web_integration: Option<WebIntegrationSummary>,
 }
 
 impl RunnerHealthBody {
+    /// `embeddingService`, preferring a top-level block over the `data` one.
+    fn embedding_service(&self) -> Option<&ReachableFlag> {
+        self.embedding_service.as_ref().or_else(|| {
+            self.data
+                .as_ref()
+                .and_then(|d| d.embedding_service.as_ref())
+        })
+    }
+
+    /// `database`, preferring a top-level block over the `data` one.
+    fn database(&self) -> Option<&ReachableFlag> {
+        self.database
+            .as_ref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.database.as_ref()))
+    }
+
+    /// `webIntegration`, preferring a top-level block over the `data` one.
+    fn web_integration(&self) -> Option<&WebIntegrationSummary> {
+        self.web_integration
+            .as_ref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.web_integration.as_ref()))
+    }
+
     /// `frontendReady`, preferring a top-level value over the `data` one.
     fn frontend_ready(&self) -> Option<bool> {
         self.frontend_ready
@@ -192,13 +229,13 @@ struct WebIntegrationSummary {
 fn degraded_reason(body: &RunnerHealthBody) -> String {
     let mut causes: Vec<String> = Vec::new();
 
-    if body.embedding_service.as_ref().and_then(|f| f.reachable) == Some(false) {
+    if body.embedding_service().and_then(|f| f.reachable) == Some(false) {
         causes.push("embedding service unreachable".to_string());
     }
-    if body.database.as_ref().and_then(|f| f.reachable) == Some(false) {
+    if body.database().and_then(|f| f.reachable) == Some(false) {
         causes.push("database unreachable".to_string());
     }
-    if let Some(wi) = body.web_integration.as_ref() {
+    if let Some(wi) = body.web_integration() {
         // Only `Some(false)` is a fault. `None` means no relay is expected.
         if wi.connected == Some(false) {
             causes.push(match wi.last_error.as_deref() {
@@ -824,6 +861,34 @@ mod tests {
     /// `lastError`) rather than a hand-built struct that could drift.
     fn body(json: &str) -> RunnerHealthBody {
         serde_json::from_str(json).expect("health body must parse")
+    }
+
+    /// The REAL runner shape (qontinui-runner origin/main b58a81dce,
+    /// `src-tauri/src/mcp_api.rs`): `embeddingService` / `webIntegration` /
+    /// `database` exist only inside `data`; the top level mirrors only
+    /// `derived_status`. The reason must still name every cause.
+    #[test]
+    fn degraded_reason_names_causes_published_only_under_data() {
+        let b = body(
+            r#"{"success":true,
+                "data":{"status":"degraded",
+                        "embeddingService":{"reachable":false,"url":"http://127.0.0.1:8001"},
+                        "webIntegration":{"relayExpected":true,"connected":false,
+                                          "lastError":"401 Unauthorized"},
+                        "database":{"reachable":false,"arm":"external"},
+                        "derived_status":"degraded"},
+                "derived_status":"degraded"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Degraded { reason } => {
+                assert_eq!(
+                    reason,
+                    "runner degraded: embedding service unreachable; database unreachable; \
+                     backend relay down (401 Unauthorized)"
+                );
+            }
+            other => panic!("expected Degraded, got {:?}", other),
+        }
     }
 
     #[test]
