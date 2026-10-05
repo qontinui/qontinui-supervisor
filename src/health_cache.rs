@@ -98,6 +98,67 @@ struct RunnerHealthBody {
     /// web-integration disabled), which is not a fault.
     #[serde(default, rename = "webIntegration")]
     web_integration: Option<WebIntegrationSummary>,
+    /// `/health.frontendReady` — whether the runner's WebView frontend mounted
+    /// and is answering. A runner whose binary embedded the dev PLACEHOLDER
+    /// frontend reports `false` here while its API answers 2xx (plan
+    /// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`).
+    /// Read here AND under `data` (see [`RunnerHealthData`]): the runner
+    /// publishes it only inside its `data` envelope today.
+    #[serde(default, rename = "frontendReady")]
+    frontend_ready: Option<bool>,
+    /// `/health.frontendState` — WHY `frontendReady` is what it is
+    /// (e.g. `window_not_visible`). Same two locations as `frontend_ready`.
+    #[serde(default, rename = "frontendState")]
+    frontend_state: Option<String>,
+    /// The runner's `data` envelope. Only the fields this supervisor reads
+    /// from it are modelled; everything else is ignored.
+    #[serde(default)]
+    data: Option<RunnerHealthData>,
+}
+
+/// The subset of the runner's `/health.data` envelope read here.
+#[derive(Debug, Default, Deserialize)]
+struct RunnerHealthData {
+    #[serde(default, rename = "frontendReady")]
+    frontend_ready: Option<bool>,
+    #[serde(default, rename = "frontendState")]
+    frontend_state: Option<String>,
+}
+
+impl RunnerHealthBody {
+    /// `frontendReady`, preferring a top-level value over the `data` one.
+    fn frontend_ready(&self) -> Option<bool> {
+        self.frontend_ready
+            .or_else(|| self.data.as_ref().and_then(|d| d.frontend_ready))
+    }
+
+    /// `frontendState`, preferring a top-level value over the `data` one.
+    fn frontend_state(&self) -> Option<&str> {
+        self.frontend_state
+            .as_deref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.frontend_state.as_deref()))
+    }
+}
+
+/// The reason text for a runner that self-reported `derived_status: "errored"`.
+///
+/// A bare "derived_status=errored" hid the one fact that mattered on
+/// 2026-10-05: the runner was serving a PLACEHOLDER frontend
+/// (`frontendReady: false`, `frontendState: "window_not_visible"`). When the
+/// body says the frontend is not ready, name it. This changes only the reason,
+/// never which status is derived.
+fn errored_reason(body: &RunnerHealthBody) -> String {
+    let base = "runner reported derived_status=errored";
+    if body.frontend_ready() == Some(false) {
+        return match body.frontend_state() {
+            Some(st) if !st.trim().is_empty() => format!(
+                "{base}; frontend not ready (frontendState={})",
+                truncate_reason(st.trim(), 80)
+            ),
+            _ => format!("{base}; frontend not ready"),
+        };
+    }
+    base.to_string()
 }
 
 /// A `{ "reachable": bool|null }` sub-object on `/health`.
@@ -293,7 +354,7 @@ fn derive_runner_status(
         if let Some(ds) = body.derived_status.as_deref() {
             if ds.eq_ignore_ascii_case("errored") {
                 return RunnerStatus::Errored {
-                    reason: "runner reported derived_status=errored".to_string(),
+                    reason: errored_reason(body),
                 };
             }
             if ds.eq_ignore_ascii_case("degraded") {
@@ -957,6 +1018,76 @@ mod tests {
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Errored { .. }));
+    }
+
+    /// The 2026-10-05 shape: a runner serving the PLACEHOLDER frontend
+    /// answers 2xx with `frontendReady: false` inside its `data` envelope
+    /// (where the runner actually publishes it) and `derived_status: "errored"`
+    /// at the top level. The reason must name the frontend state.
+    #[test]
+    fn test_derive_runner_status_errored_names_frontend_state_from_data_envelope() {
+        let b = body(
+            r#"{"success":true,
+                "data":{"status":"ok","frontendReady":false,
+                        "frontendState":"window_not_visible",
+                        "derived_status":"errored"},
+                "derived_status":"errored"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert!(reason.contains("derived_status=errored"), "{reason}");
+                assert!(reason.contains("frontend not ready"), "{reason}");
+                assert!(reason.contains("window_not_visible"), "{reason}");
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// Same, with the fields at the top level (the camelCase names the brief
+    /// observed) — accepted too, so either placement names the frontend.
+    #[test]
+    fn test_derive_runner_status_errored_names_frontend_state_top_level() {
+        let b = body(
+            r#"{"frontendReady":false,"frontendState":"window_not_visible",
+                "derived_status":"errored"}"#,
+        );
+        assert_eq!(b.frontend_ready(), Some(false));
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert_eq!(
+                    reason,
+                    "runner reported derived_status=errored; frontend not ready \
+                     (frontendState=window_not_visible)"
+                );
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// A ready frontend adds nothing, and the status derived is unchanged.
+    #[test]
+    fn test_derive_runner_status_errored_reason_unchanged_when_frontend_ready() {
+        let b = body(
+            r#"{"data":{"frontendReady":true,"frontendState":"ready"},
+                "derived_status":"errored"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert_eq!(reason, "runner reported derived_status=errored");
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// `frontendReady: false` on a runner that does NOT say errored must not
+    /// change the derived status — only the errored reason gets richer.
+    #[test]
+    fn test_frontend_not_ready_alone_does_not_derive_errored() {
+        let b = body(r#"{"data":{"frontendReady":false,"frontendState":"booting"}}"#);
+        assert!(matches!(
+            derive_runner_status(true, true, Some(&b)),
+            RunnerStatus::Healthy
+        ));
     }
 
     #[test]

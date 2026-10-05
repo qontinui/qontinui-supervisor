@@ -18,6 +18,15 @@ use qontinui_types::wire::runner_kind::RunnerKind;
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
+    /// Why `status` is not the plain process/API verdict, when it is not.
+    ///
+    /// Set today only when the primary runner is running and answering but
+    /// reports ITSELF errored (e.g. a PLACEHOLDER frontend: `frontendReady:
+    /// false`) — the case that used to read `status: "healthy"` beside a
+    /// runner `errored`. Absent otherwise. Plan
+    /// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     pub runner: RunnerHealth,
     pub ports: PortsHealth,
     pub watchdog: WatchdogHealth,
@@ -363,6 +372,62 @@ pub fn determine_overall_status(
     }
 }
 
+/// The top-level `status` plus the reason it was overridden, if it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverallStatus {
+    pub status: &'static str,
+    pub reason: Option<String>,
+}
+
+/// The one rule both `GET /health` and the SSE stream use for the top-level
+/// status, so the two surfaces cannot diverge.
+///
+/// [`determine_overall_status`] answers from process + API liveness only, so a
+/// primary that is running, answering 2xx, and reporting ITSELF errored (the
+/// 2026-10-05 placeholder-frontend runner: `frontendReady: false`,
+/// `derived_status: "errored"`) read `healthy`. Here that case becomes
+/// `degraded` with a reason naming the runner's own errored reason.
+///
+/// Only [`RunnerStatus::Errored`] does this. A runner `Degraded` (a subsystem
+/// outage such as an unreachable embedding service) stays `healthy` at the top
+/// level, unchanged.
+///
+/// `primary_legacy_exe` = the primary was started from the legacy cargo-target
+/// exe ([`crate::process::manager::ExeOrigin::is_legacy_fallback`]); the reason
+/// then says so and names the rebuild that produces a real build-pool slot.
+///
+/// **Display only.** No supervisor code path acts on this top-level string
+/// (the watchdog keys on per-runner liveness, not on it), so a `degraded`
+/// here can never trigger a restart.
+pub fn resolve_overall_status(
+    runner_running: bool,
+    api_responding: bool,
+    build_in_progress: bool,
+    primary_derived: Option<&RunnerStatus>,
+    primary_legacy_exe: bool,
+) -> OverallStatus {
+    let base = determine_overall_status(runner_running, api_responding, build_in_progress);
+    if base == "healthy" {
+        if let Some(RunnerStatus::Errored { reason }) = primary_derived {
+            let mut why = format!("primary runner reports itself errored: {reason}");
+            if primary_legacy_exe {
+                why.push_str(
+                    "; the primary runs the legacy cargo-target exe (no build-pool slot) \
+                     — POST /runner/restart {\"rebuild\":true} builds a real slot",
+                );
+            }
+            return OverallStatus {
+                status: "degraded",
+                reason: Some(why),
+            };
+        }
+    }
+    OverallStatus {
+        status: base,
+        reason: None,
+    }
+}
+
 /// Build runner instance health from the cached snapshot (sync-safe for SSE).
 fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
     match state.cached_runner_health.try_read() {
@@ -453,7 +518,22 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         primary_watchdog,
         primary_liveness,
         primary_last_seen,
+        primary_derived,
+        primary_legacy_exe,
     ) = if let Some(primary) = state.get_primary().await {
+        let derived = state
+            .cached_runner_health
+            .read()
+            .await
+            .iter()
+            .find(|c| c.id == primary.config.id)
+            .map(|c| c.derived_status.clone());
+        let legacy_exe = primary
+            .resolved_exe
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|r| r.origin.is_legacy_fallback());
         let watchdog = {
             let wd = primary.watchdog.read().await;
             WatchdogHealth::from_state_with_arms(
@@ -470,6 +550,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             watchdog,
             pr.liveness(api_in_use, api_responding),
             pr.last_seen_responding_at,
+            derived,
+            legacy_exe,
         )
     } else {
         // Fallback to legacy state.runner if no managed primary exists
@@ -481,11 +563,18 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             WatchdogHealth::unavailable(),
             runner.liveness(api_in_use, api_responding),
             runner.last_seen_responding_at,
+            None,
+            false,
         )
     };
 
-    let overall_status =
-        determine_overall_status(primary_running, api_responding, build.build_in_progress);
+    let overall = resolve_overall_status(
+        primary_running,
+        api_responding,
+        build.build_in_progress,
+        primary_derived.as_ref(),
+        primary_legacy_exe,
+    );
 
     // Build multi-runner status array. The `watchdog_status` field reports
     // the per-runner crash-only watchdog (`WatchdogState`, maintained by
@@ -530,7 +619,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     drop(cached_snapshots);
 
     HealthResponse {
-        status: overall_status.to_string(),
+        status: overall.status.to_string(),
+        status_reason: overall.reason,
         runner: RunnerHealth {
             running: primary_running,
             pid: primary_pid,
@@ -636,8 +726,28 @@ fn try_build_sse_health(
         None => (crate::state::RunnerLiveness::Unknown, None),
     };
 
-    let overall_status =
-        determine_overall_status(primary_running, api_responding, build.build_in_progress);
+    // Sync-safe: a contended `runners` / `resolved_exe` lock omits only the
+    // legacy-exe hint for this tick; the degraded verdict itself comes from
+    // the snapshot already held.
+    let primary_legacy_exe = state
+        .runners
+        .try_read()
+        .ok()
+        .and_then(|rs| rs.values().find(|r| r.config.kind().is_primary()).cloned())
+        .and_then(|m| {
+            m.resolved_exe
+                .try_read()
+                .ok()
+                .map(|g| g.as_ref().is_some_and(|r| r.origin.is_legacy_fallback()))
+        })
+        .unwrap_or(false);
+    let overall = resolve_overall_status(
+        primary_running,
+        api_responding,
+        build.build_in_progress,
+        primary_snapshot.map(|p| &p.derived_status),
+        primary_legacy_exe,
+    );
 
     // Sync-safe scan: use try_read on each slot's frontend_stale flag.
     // If any slot's lock is contended, skip reporting staleness for that
@@ -655,7 +765,8 @@ fn try_build_sse_health(
     };
 
     Ok(HealthResponse {
-        status: overall_status.to_string(),
+        status: overall.status.to_string(),
+        status_reason: overall.reason,
         runner: RunnerHealth {
             running: primary_running,
             pid: primary_pid,
@@ -838,10 +949,109 @@ mod tests {
         assert_eq!(determine_overall_status(false, true, true), "external");
     }
 
+    fn errored(reason: &str) -> RunnerStatus {
+        RunnerStatus::Errored {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// (a) The 2026-10-05 shape: primary running + answering, but reporting
+    /// itself errored. Top-level must NOT read healthy.
+    #[test]
+    fn test_degraded_when_primary_running_responding_but_errored() {
+        let ds = errored("runner reported derived_status=errored; frontend not ready");
+        let o = resolve_overall_status(true, true, false, Some(&ds), false);
+        assert_eq!(o.status, "degraded");
+        let reason = o
+            .reason
+            .expect("an errored primary must carry a status_reason");
+        assert!(reason.contains("derived_status=errored"), "{reason}");
+        assert!(reason.contains("frontend not ready"), "{reason}");
+        assert!(!reason.contains("legacy"), "{reason}");
+    }
+
+    /// (b) The legacy-exe hint appears for the legacy origin only.
+    #[test]
+    fn test_errored_reason_carries_legacy_exe_hint_only_for_legacy_origin() {
+        let ds = errored("boom");
+        let legacy = resolve_overall_status(true, true, false, Some(&ds), true);
+        assert_eq!(legacy.status, "degraded");
+        let r = legacy.reason.unwrap();
+        assert!(r.contains("boom"), "{r}");
+        assert!(r.contains("legacy cargo-target exe"), "{r}");
+        assert!(
+            r.contains(r#"POST /runner/restart {"rebuild":true}"#),
+            "{r}"
+        );
+
+        let slot = resolve_overall_status(true, true, false, Some(&ds), false);
+        assert!(!slot.reason.unwrap().contains("legacy"));
+    }
+
+    /// (b') The legacy origin alone, on a runner that is NOT errored, changes
+    /// nothing — the hint rides on the errored verdict, it is not a verdict.
+    #[test]
+    fn test_legacy_exe_alone_stays_healthy() {
+        let o = resolve_overall_status(true, true, false, Some(&RunnerStatus::Healthy), true);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    /// (c) Degraded / Healthy / unknown primary statuses keep the old verdict.
+    #[test]
+    fn test_primary_degraded_or_healthy_still_healthy_with_no_reason() {
+        let degraded = RunnerStatus::Degraded {
+            reason: "runner degraded: embedding service unreachable".to_string(),
+        };
+        for ds in [Some(&degraded), Some(&RunnerStatus::Healthy), None] {
+            let o = resolve_overall_status(true, true, false, ds, false);
+            assert_eq!(o.status, "healthy", "{ds:?}");
+            assert_eq!(o.reason, None, "{ds:?}");
+        }
+    }
+
+    /// An errored snapshot never upgrades/overrides a non-healthy base verdict
+    /// (stopped / external / building / API-down degraded keep their meaning).
+    #[test]
+    fn test_errored_primary_does_not_override_non_healthy_verdicts() {
+        let ds = errored("boom");
+        assert_eq!(
+            resolve_overall_status(false, false, false, Some(&ds), true).status,
+            "stopped"
+        );
+        assert_eq!(
+            resolve_overall_status(false, true, false, Some(&ds), true).status,
+            "external"
+        );
+        assert_eq!(
+            resolve_overall_status(false, false, true, Some(&ds), true).status,
+            "building"
+        );
+        let api_down = resolve_overall_status(true, false, false, Some(&ds), true);
+        assert_eq!(api_down.status, "degraded");
+        assert_eq!(api_down.reason, None);
+    }
+
+    /// `status_reason` is omitted from the JSON when None, present when Some.
+    #[test]
+    fn test_status_reason_serialization() {
+        let mut r = build_minimal_health_response();
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("status_reason").is_none());
+        r.status = "degraded".to_string();
+        r.status_reason = Some("primary runner reports itself errored: x".to_string());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["status_reason"],
+            "primary runner reports itself errored: x"
+        );
+    }
+
     #[test]
     fn test_health_response_serializes_to_json() {
         let response = HealthResponse {
             status: "healthy".to_string(),
+            status_reason: None,
             runner: RunnerHealth {
                 running: true,
                 pid: Some(1234),
@@ -1050,6 +1260,7 @@ mod tests {
     fn build_minimal_health_response() -> HealthResponse {
         HealthResponse {
             status: "stopped".to_string(),
+            status_reason: None,
             runner: RunnerHealth {
                 running: false,
                 pid: None,

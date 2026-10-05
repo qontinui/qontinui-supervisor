@@ -1808,3 +1808,61 @@ fn stderr_submission_tail_caps_and_keeps_tail() {
         "tail must preserve the END of the stderr where the real error lives"
     );
 }
+
+// -----------------------------------------------------------------------------
+// QONTINUI_ALLOW_PLACEHOLDER_DIST: pre-warm only
+// (plan 2026-10-05-supervisor-first-start-embeds-placeholder-frontend)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn prewarm_cargo_check_carries_allow_placeholder_dist() {
+    let env = super::cargo_invocation_env(super::CargoInvocation::Prewarm);
+    assert!(
+        env.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST", "1")),
+        "the pre-warm `cargo check` must keep working on a fresh tree with no dist/: {env:?}"
+    );
+}
+
+#[test]
+fn real_slot_and_sidecar_builds_never_carry_allow_placeholder_dist() {
+    for kind in [
+        super::CargoInvocation::SlotBuild,
+        super::CargoInvocation::SidecarBuild,
+    ] {
+        let env = super::cargo_invocation_env(kind);
+        assert!(
+            !env.iter()
+                .any(|(k, _)| *k == "QONTINUI_ALLOW_PLACEHOLDER_DIST"),
+            "{kind:?} produces an exe and must let build.rs refuse a placeholder dist: {env:?}"
+        );
+    }
+}
+
+/// The pure function is only half the rule: each call site must ask for its
+/// OWN kind. Read the production source (everything before the test module)
+/// and pin which kind each cargo invocation passes, so wiring the pre-warm
+/// kind into a real build — or dropping it from the pre-warm — goes red.
+#[test]
+fn each_cargo_call_site_applies_its_own_invocation_kind() {
+    let src = include_str!("../build_monitor.rs");
+    let prod = &src[..src
+        .find(&["#[cfg(test)]\nmod ", "tests;"].concat())
+        .expect("build_monitor.rs must still declare its tests module")];
+    let count = |needle: &str| prod.matches(needle).count();
+    // One use each, at the call site (the enum declaration and the match in
+    // `cargo_invocation_env` spell `Prewarm =>` / `SlotBuild |` / `SidecarBuild =>`).
+    assert_eq!(count("CargoInvocation::Prewarm)"), 1);
+    assert_eq!(count("CargoInvocation::SlotBuild)"), 1);
+    assert_eq!(count("CargoInvocation::SidecarBuild)"), 1);
+    // The pre-warm site is the one that runs `cargo check`.
+    let at = prod.find("CargoInvocation::Prewarm)").unwrap();
+    let before = &prod[..at];
+    let fn_start = before
+        .rfind("\nasync fn ")
+        .or_else(|| before.rfind("\npub async fn "))
+        .unwrap();
+    assert!(
+        prod[fn_start..at].contains("\"check\","),
+        "CargoInvocation::Prewarm must be applied inside the pre-warm `cargo check` fn"
+    );
+}

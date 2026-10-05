@@ -1688,6 +1688,9 @@ async fn run_build_inner(
             // target dir is. Without this the watchdog would still kill the exact
             // build that motivated it.
             .progress_probe(artifact_progress_probe(&slot.target_dir));
+    // No QONTINUI_ALLOW_PLACEHOLDER_DIST here: this build produces the exe a
+    // runner starts from, so build.rs must be free to refuse a placeholder dist.
+    let guarded = with_invocation_env(guarded, CargoInvocation::SlotBuild);
 
     let outcome = guarded.run().await;
     // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
@@ -2313,6 +2316,7 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         .current_dir(cargo_cwd)
         .env("CARGO_TARGET_DIR", &slot.target_dir)
         .job_guarded(true);
+        let guarded = with_invocation_env(guarded, CargoInvocation::SidecarBuild);
 
         match guarded.run().await {
             Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
@@ -4140,6 +4144,51 @@ async fn resolve_pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
 /// Timeout per slot's pre-warm `cargo check`.
 const PREWARM_TIMEOUT_SECS: u64 = 60;
 
+/// Env var that lets the runner's `build.rs` accept a `custom-protocol` build
+/// whose `../dist/index.html` is absent or is the dev PLACEHOLDER. Without it
+/// that build script REFUSES, so a binary embedding the placeholder frontend
+/// can no longer be produced by accident.
+pub(crate) const ALLOW_PLACEHOLDER_DIST_ENV: &str = "QONTINUI_ALLOW_PLACEHOLDER_DIST";
+
+/// Which supervisor-driven cargo invocation a command is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CargoInvocation {
+    /// The slot pre-warm: a `cargo check` that never produces an exe.
+    Prewarm,
+    /// The real slot build that produces the runner exe a runner is started from.
+    SlotBuild,
+    /// The fail-open sidecar `cargo build` that follows a slot build.
+    SidecarBuild,
+}
+
+/// Static env vars a supervisor cargo invocation carries, by kind. Pure so the
+/// "only the pre-warm may accept a placeholder dist" rule is testable.
+///
+/// The pre-warm is a `cargo check` on a possibly fresh tree with no `dist/`
+/// yet; it produces no exe, so allowing the placeholder there embeds nothing.
+/// It must NEVER reach a real build. The runner's `build.rs` declares
+/// `cargo:rerun-if-env-changed=QONTINUI_ALLOW_PLACEHOLDER_DIST`, so a later
+/// real build in the same target dir WITHOUT the variable re-runs the build
+/// script and re-applies the refusal rather than reusing the pre-warm's
+/// permissive result. Plan
+/// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
+pub(crate) fn cargo_invocation_env(
+    kind: CargoInvocation,
+) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        CargoInvocation::Prewarm => &[(ALLOW_PLACEHOLDER_DIST_ENV, "1")],
+        CargoInvocation::SlotBuild | CargoInvocation::SidecarBuild => &[],
+    }
+}
+
+/// Apply [`cargo_invocation_env`] for `kind` to a command.
+fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> GuardedCommand {
+    for (k, v) in cargo_invocation_env(kind) {
+        cmd = cmd.env(k, v);
+    }
+    cmd
+}
+
 /// Sweep each slot's target dir for stale `.cargo-lock` advisory files left
 /// behind by a previous supervisor that was killed mid-build.
 ///
@@ -4404,18 +4453,23 @@ async fn prewarm_single_slot(
         slot.id, PREWARM_TIMEOUT_SECS
     );
     // Same S3-backend degrade as the pool build — see `sccache_guard`.
-    let outcome = crate::sccache_guard::guarded_cargo(
+    let cmd = crate::sccache_guard::guarded_cargo(
         Duration::from_secs(PREWARM_TIMEOUT_SECS),
         &state.config.project_dir,
     )
     .await
     .args(args)
     .current_dir(&state.config.project_dir)
-    .env("CARGO_TARGET_DIR", &slot.target_dir)
-    .job_guarded(true)
-    .stream_lines(line_tx)
-    .run()
-    .await;
+    .env("CARGO_TARGET_DIR", &slot.target_dir);
+    // QONTINUI_ALLOW_PLACEHOLDER_DIST=1 — pre-warm ONLY (see
+    // `cargo_invocation_env`): this `cargo check` must keep working on a fresh
+    // tree with no `dist/`, and the runner's build.rs `rerun-if-env-changed`
+    // makes the next real build re-check without it.
+    let outcome = with_invocation_env(cmd, CargoInvocation::Prewarm)
+        .job_guarded(true)
+        .stream_lines(line_tx)
+        .run()
+        .await;
 
     // Map the GuardedOutcome back onto the legacy match shape: `Ok(Ok(status))`
     // for a clean exit, the timeout arm for TimedOut/Cancelled, and a process
