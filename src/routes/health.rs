@@ -379,18 +379,73 @@ pub struct OverallStatus {
     pub reason: Option<String>,
 }
 
+/// How long the primary's own `/health` must report `frontendReady: false`
+/// WITHOUT A BREAK before the top-level status says `degraded`.
+///
+/// Why 120 s, from the runner's own code (qontinui-runner origin/main
+/// b58a81dce) and one measured recovery:
+/// - `frontendReady` is `frontendState == Responsive`
+///   (`mcp_api.rs:1390`), so it is false while the WebView boots and whenever
+///   no pong arrived for `UI_STALE_AFTER_MS` = 30 s (`ui_error.rs:220`). Rust
+///   pings every 3 s; a healthy boot pongs within the runner's own 10 s
+///   UI-Bridge readiness budget (`main.rs:2612`). Boot is far inside 120 s.
+/// - The runner itself calls the UI dead only at `UI_DEAD_AFTER_MS` = 90 s
+///   (`ui_error.rs:237`, "30 consecutive missed pings"). The supervisor must
+///   not call it sooner than the runner does.
+/// - The runner's in-process WebView recovery waits 60 s for a reload to pong
+///   and then recreates the window; on this box (2026-09-30 02:51:03 →
+///   02:52:36, `webview_recovery`) that cycle took 93 s. 120 s lets a
+///   self-healing runner recover without flapping the top level.
+///
+/// The placeholder-frontend runner of 2026-10-05 never pongs at all, so any
+/// grace catches it; the grace only buys freedom from false positives.
+/// The clock starts when the supervisor FIRST OBSERVES `false` (the health
+/// cache refreshes every 2 s and restarts the run on a pid change), so the
+/// runner's API bootstrap time before `/health` answers never counts.
+pub const PRIMARY_FRONTEND_NOT_READY_GRACE_SECS: i64 = 120;
+
+/// The primary runner's frontend, as the health cache last observed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimaryFrontend {
+    /// Start of the current unbroken run of `frontendReady == false`
+    /// observations; `None` when the last observation was not `false`
+    /// (ready, or UNKNOWN — an older runner that publishes no `frontendReady`).
+    pub not_ready_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The runner's `frontendState`, when it published one.
+    pub state: Option<String>,
+}
+
+impl PrimaryFrontend {
+    /// Read from the primary's cached snapshot. No snapshot = UNKNOWN = no
+    /// observation, which never overrides the top-level status.
+    pub fn from_snapshot(snap: Option<&CachedRunnerHealth>) -> Self {
+        match snap {
+            Some(c) => Self {
+                not_ready_since: c.frontend_not_ready_since,
+                state: c.frontend_state.clone(),
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 /// The one rule both `GET /health` and the SSE stream use for the top-level
 /// status, so the two surfaces cannot diverge.
 ///
-/// [`determine_overall_status`] answers from process + API liveness only, so a
-/// primary that is running, answering 2xx, and reporting ITSELF errored (the
-/// 2026-10-05 placeholder-frontend runner: `frontendReady: false`,
-/// `derived_status: "errored"`) read `healthy`. Here that case becomes
-/// `degraded` with a reason naming the runner's own errored reason.
+/// [`determine_overall_status`] answers from process + API liveness only, so
+/// the 2026-10-05 runner with a PLACEHOLDER frontend (`frontendReady: false`,
+/// `frontendState: "window_not_visible"`) read `healthy`. Here a primary whose
+/// frontend has been not-ready for at least
+/// [`PRIMARY_FRONTEND_NOT_READY_GRACE_SECS`] turns a `healthy` base into
+/// `degraded`, with a reason naming the duration and `frontendState`.
 ///
-/// Only [`RunnerStatus::Errored`] does this. A runner `Degraded` (a subsystem
-/// outage such as an unreachable embedding service) stays `healthy` at the top
-/// level, unchanged.
+/// Scoped to the FRONTEND on purpose — not to the runner's `errored` status.
+/// That status folds in `recent_crash`, a startup scan of an unclean PRIOR
+/// shutdown that stays set until a user dismisses it (qontinui-runner
+/// `crash_observability.rs:512`, folded by `ui_error.rs:1501`
+/// `compute_derived_status`), so keying on it would read `degraded` for a
+/// runner's whole life after any power loss. An absent `frontendReady` (older
+/// runner) is UNKNOWN and changes nothing.
 ///
 /// `primary_legacy_exe` = the primary was started from the legacy cargo-target
 /// exe ([`crate::process::manager::ExeOrigin::is_legacy_fallback`]); the reason
@@ -403,23 +458,30 @@ pub fn resolve_overall_status(
     runner_running: bool,
     api_responding: bool,
     build_in_progress: bool,
-    primary_derived: Option<&RunnerStatus>,
+    frontend: &PrimaryFrontend,
     primary_legacy_exe: bool,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> OverallStatus {
     let base = determine_overall_status(runner_running, api_responding, build_in_progress);
     if base == "healthy" {
-        if let Some(RunnerStatus::Errored { reason }) = primary_derived {
-            let mut why = format!("primary runner reports itself errored: {reason}");
-            if primary_legacy_exe {
-                why.push_str(
-                    "; the primary runs the legacy cargo-target exe (no build-pool slot) \
-                     — POST /runner/restart {\"rebuild\":true} builds a real slot",
+        if let Some(since) = frontend.not_ready_since {
+            let secs = (now - since).num_seconds();
+            if secs >= PRIMARY_FRONTEND_NOT_READY_GRACE_SECS {
+                let state = frontend.state.as_deref().unwrap_or("unknown");
+                let mut why = format!(
+                    "primary runner frontend not ready for {secs}s (frontendState={state})"
                 );
+                if primary_legacy_exe {
+                    why.push_str(
+                        "; the primary runs the legacy cargo-target exe (no build-pool slot) \
+                         — POST /runner/restart {\"rebuild\":true} builds a real slot",
+                    );
+                }
+                return OverallStatus {
+                    status: "degraded",
+                    reason: Some(why),
+                };
             }
-            return OverallStatus {
-                status: "degraded",
-                reason: Some(why),
-            };
         }
     }
     OverallStatus {
@@ -518,16 +580,17 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         primary_watchdog,
         primary_liveness,
         primary_last_seen,
-        primary_derived,
+        primary_frontend,
         primary_legacy_exe,
     ) = if let Some(primary) = state.get_primary().await {
-        let derived = state
-            .cached_runner_health
-            .read()
-            .await
-            .iter()
-            .find(|c| c.id == primary.config.id)
-            .map(|c| c.derived_status.clone());
+        let frontend = PrimaryFrontend::from_snapshot(
+            state
+                .cached_runner_health
+                .read()
+                .await
+                .iter()
+                .find(|c| c.id == primary.config.id),
+        );
         let legacy_exe = primary
             .resolved_exe
             .read()
@@ -550,7 +613,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             watchdog,
             pr.liveness(api_in_use, api_responding),
             pr.last_seen_responding_at,
-            derived,
+            frontend,
             legacy_exe,
         )
     } else {
@@ -563,7 +626,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             WatchdogHealth::unavailable(),
             runner.liveness(api_in_use, api_responding),
             runner.last_seen_responding_at,
-            None,
+            PrimaryFrontend::default(),
             false,
         )
     };
@@ -572,8 +635,9 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         primary_running,
         api_responding,
         build.build_in_progress,
-        primary_derived.as_ref(),
+        &primary_frontend,
         primary_legacy_exe,
+        chrono::Utc::now(),
     );
 
     // Build multi-runner status array. The `watchdog_status` field reports
@@ -694,31 +758,30 @@ fn try_build_sse_health(
     let build = state.build.try_read().map_err(|_| ())?;
     let expo = state.expo.try_read().map_err(|_| ())?;
     let cached = state.cached_health.try_read().map_err(|_| ())?;
-    let runner_snapshots = state.cached_runner_health.try_read();
+    // `?`, not `.ok()`: a contended snapshot lock used to yield
+    // `primary_snapshot = None`, so for one tick the SSE path reported a
+    // different status from `GET /health`. Skip the tick instead (keepalive).
+    let runner_snapshots = state.cached_runner_health.try_read().map_err(|_| ())?;
 
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
 
     // Use the primary runner from cached snapshots (not the legacy
     // state.runner which is never updated for user-managed runners).
-    let primary_snapshot = runner_snapshots
-        .as_ref()
-        .ok()
-        .and_then(|snaps| snaps.iter().find(|r| r.kind.is_primary()));
+    let primary_snapshot = runner_snapshots.iter().find(|r| r.kind.is_primary());
     let (primary_running, primary_pid) = match primary_snapshot {
         Some(p) => (p.running, p.pid),
         None => {
-            // Fallback to legacy state.runner
-            match state.runner.try_read() {
-                Ok(r) => (r.running, r.pid),
-                Err(_) => (false, None),
-            }
+            // Fallback to legacy state.runner; contended = skip the tick, for
+            // the same reason as the snapshot lock above.
+            let r = state.runner.try_read().map_err(|_| ())?;
+            (r.running, r.pid)
         }
     };
     let primary_watchdog = primary_snapshot
         .map(|p| p.watchdog.clone())
         .unwrap_or_else(WatchdogHealth::unavailable);
-    // No snapshot yet (first ticks after boot, or a contended lock) is not
+    // No primary snapshot yet (first ticks after boot) is not
     // evidence of health: it is `Unknown`, the same answer every other
     // surface gives for an un-probed runner.
     let (primary_liveness, primary_last_seen) = match primary_snapshot {
@@ -726,27 +789,32 @@ fn try_build_sse_health(
         None => (crate::state::RunnerLiveness::Unknown, None),
     };
 
-    // Sync-safe: a contended `runners` / `resolved_exe` lock omits only the
-    // legacy-exe hint for this tick; the degraded verdict itself comes from
-    // the snapshot already held.
-    let primary_legacy_exe = state
+    // Sync-safe, and contention SKIPS the tick (keepalive) rather than
+    // dropping the legacy-exe hint, so the SSE status line can never differ
+    // from `GET /health`'s for the same state.
+    let primary_managed = state
         .runners
         .try_read()
-        .ok()
-        .and_then(|rs| rs.values().find(|r| r.config.kind().is_primary()).cloned())
-        .and_then(|m| {
-            m.resolved_exe
-                .try_read()
-                .ok()
-                .map(|g| g.as_ref().is_some_and(|r| r.origin.is_legacy_fallback()))
-        })
-        .unwrap_or(false);
+        .map_err(|_| ())?
+        .values()
+        .find(|r| r.config.kind().is_primary())
+        .cloned();
+    let primary_legacy_exe = match primary_managed {
+        Some(m) => m
+            .resolved_exe
+            .try_read()
+            .map_err(|_| ())?
+            .as_ref()
+            .is_some_and(|r| r.origin.is_legacy_fallback()),
+        None => false,
+    };
     let overall = resolve_overall_status(
         primary_running,
         api_responding,
         build.build_in_progress,
-        primary_snapshot.map(|p| &p.derived_status),
+        &PrimaryFrontend::from_snapshot(primary_snapshot),
         primary_legacy_exe,
+        chrono::Utc::now(),
     );
 
     // Sync-safe scan: use try_read on each slot's frontend_stale flag.
@@ -949,87 +1017,230 @@ mod tests {
         assert_eq!(determine_overall_status(false, true, true), "external");
     }
 
-    fn errored(reason: &str) -> RunnerStatus {
-        RunnerStatus::Errored {
-            reason: reason.to_string(),
-        }
+    fn not_ready_for(
+        secs: i64,
+        state: Option<&str>,
+    ) -> (PrimaryFrontend, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::Utc::now();
+        (
+            PrimaryFrontend {
+                not_ready_since: Some(now - chrono::Duration::seconds(secs)),
+                state: state.map(str::to_string),
+            },
+            now,
+        )
     }
 
-    /// (a) The 2026-10-05 shape: primary running + answering, but reporting
-    /// itself errored. Top-level must NOT read healthy.
+    /// (a) The 2026-10-05 shape: primary running + answering, frontend not
+    /// ready past the grace. Top-level must NOT read healthy.
     #[test]
-    fn test_degraded_when_primary_running_responding_but_errored() {
-        let ds = errored("runner reported derived_status=errored; frontend not ready");
-        let o = resolve_overall_status(true, true, false, Some(&ds), false);
+    fn test_degraded_when_primary_frontend_not_ready_past_grace() {
+        let (fe, now) = not_ready_for(125, Some("window_not_visible"));
+        let o = resolve_overall_status(true, true, false, &fe, false, now);
         assert_eq!(o.status, "degraded");
-        let reason = o
-            .reason
-            .expect("an errored primary must carry a status_reason");
-        assert!(reason.contains("derived_status=errored"), "{reason}");
-        assert!(reason.contains("frontend not ready"), "{reason}");
-        assert!(!reason.contains("legacy"), "{reason}");
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("primary runner frontend not ready for 125s (frontendState=window_not_visible)")
+        );
+    }
+
+    /// Inside the grace (boot, an in-process WebView recovery) stays healthy.
+    #[test]
+    fn test_frontend_not_ready_inside_grace_stays_healthy() {
+        let (fe, now) = not_ready_for(119, Some("booting"));
+        let o = resolve_overall_status(true, true, false, &fe, true, now);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
     }
 
     /// (b) The legacy-exe hint appears for the legacy origin only.
     #[test]
-    fn test_errored_reason_carries_legacy_exe_hint_only_for_legacy_origin() {
-        let ds = errored("boom");
-        let legacy = resolve_overall_status(true, true, false, Some(&ds), true);
+    fn test_frontend_reason_carries_legacy_exe_hint_only_for_legacy_origin() {
+        let (fe, now) = not_ready_for(300, Some("window_not_visible"));
+        let legacy = resolve_overall_status(true, true, false, &fe, true, now);
         assert_eq!(legacy.status, "degraded");
         let r = legacy.reason.unwrap();
-        assert!(r.contains("boom"), "{r}");
+        assert!(r.contains("window_not_visible"), "{r}");
         assert!(r.contains("legacy cargo-target exe"), "{r}");
         assert!(
             r.contains(r#"POST /runner/restart {"rebuild":true}"#),
             "{r}"
         );
 
-        let slot = resolve_overall_status(true, true, false, Some(&ds), false);
+        let slot = resolve_overall_status(true, true, false, &fe, false, now);
         assert!(!slot.reason.unwrap().contains("legacy"));
     }
 
-    /// (b') The legacy origin alone, on a runner that is NOT errored, changes
-    /// nothing — the hint rides on the errored verdict, it is not a verdict.
+    /// (c) No not-ready observation — a ready frontend, an older runner with no
+    /// `frontendReady` (UNKNOWN), or a runner the cache calls Errored/Degraded
+    /// for any other reason (e.g. a stale `recent_crash`) — keeps `healthy`
+    /// with no reason, even on the legacy exe.
     #[test]
-    fn test_legacy_exe_alone_stays_healthy() {
-        let o = resolve_overall_status(true, true, false, Some(&RunnerStatus::Healthy), true);
+    fn test_no_frontend_observation_stays_healthy_with_no_reason() {
+        let now = chrono::Utc::now();
+        let o = resolve_overall_status(true, true, false, &PrimaryFrontend::default(), true, now);
         assert_eq!(o.status, "healthy");
         assert_eq!(o.reason, None);
     }
 
-    /// (c) Degraded / Healthy / unknown primary statuses keep the old verdict.
+    /// `frontend_not_ready_since` is what drives it, not the runner's status:
+    /// a snapshot whose `derived_status` is Errored (the `recent_crash` case)
+    /// but whose frontend is ready yields no observation.
     #[test]
-    fn test_primary_degraded_or_healthy_still_healthy_with_no_reason() {
-        let degraded = RunnerStatus::Degraded {
-            reason: "runner degraded: embedding service unreachable".to_string(),
+    fn test_errored_snapshot_with_ready_frontend_is_not_an_observation() {
+        let mut snap = cached_primary_snapshot();
+        snap.derived_status = RunnerStatus::Errored {
+            reason: "runner restarted after Rust panic (no message captured)".to_string(),
         };
-        for ds in [Some(&degraded), Some(&RunnerStatus::Healthy), None] {
-            let o = resolve_overall_status(true, true, false, ds, false);
-            assert_eq!(o.status, "healthy", "{ds:?}");
-            assert_eq!(o.reason, None, "{ds:?}");
-        }
+        snap.frontend_ready = Some(true);
+        snap.frontend_not_ready_since = None;
+        let fe = PrimaryFrontend::from_snapshot(Some(&snap));
+        let o = resolve_overall_status(true, true, false, &fe, true, chrono::Utc::now());
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
     }
 
-    /// An errored snapshot never upgrades/overrides a non-healthy base verdict
+    /// A not-ready frontend never overrides a non-healthy base verdict
     /// (stopped / external / building / API-down degraded keep their meaning).
     #[test]
-    fn test_errored_primary_does_not_override_non_healthy_verdicts() {
-        let ds = errored("boom");
+    fn test_frontend_not_ready_does_not_override_non_healthy_verdicts() {
+        let (fe, now) = not_ready_for(600, Some("window_not_visible"));
         assert_eq!(
-            resolve_overall_status(false, false, false, Some(&ds), true).status,
+            resolve_overall_status(false, false, false, &fe, true, now).status,
             "stopped"
         );
         assert_eq!(
-            resolve_overall_status(false, true, false, Some(&ds), true).status,
+            resolve_overall_status(false, true, false, &fe, true, now).status,
             "external"
         );
         assert_eq!(
-            resolve_overall_status(false, false, true, Some(&ds), true).status,
+            resolve_overall_status(false, false, true, &fe, true, now).status,
             "building"
         );
-        let api_down = resolve_overall_status(true, false, false, Some(&ds), true);
+        let api_down = resolve_overall_status(true, false, false, &fe, true, now);
         assert_eq!(api_down.status, "degraded");
         assert_eq!(api_down.reason, None);
+    }
+
+    /// A primary snapshot with every field at a neutral value.
+    fn cached_primary_snapshot() -> CachedRunnerHealth {
+        CachedRunnerHealth {
+            id: crate::config::RunnerConfig::default_primary().id,
+            name: "Primary".to_string(),
+            port: RUNNER_API_PORT,
+            kind: RunnerKind::Primary,
+            running: true,
+            pid: Some(4242),
+            api_responding: true,
+            ui_error: None,
+            recent_crash: None,
+            derived_status: RunnerStatus::Healthy,
+            watchdog: WatchdogHealth::unavailable(),
+            liveness: crate::state::RunnerLiveness::Responding,
+            last_seen_responding_at: None,
+            port_open: true,
+            frontend_ready: None,
+            frontend_state: None,
+            frontend_not_ready_since: None,
+        }
+    }
+
+    /// A supervisor state with only a primary runner, which this test marks
+    /// running + responding, started from the LEGACY cargo-target exe, and
+    /// whose cached snapshot says the frontend has been not ready for 200 s.
+    async fn state_with_placeholder_primary(root: &std::path::Path) -> SharedState {
+        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+        let config = SupervisorConfig {
+            project_dir: root.join("src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 8081,
+            runners: vec![RunnerConfig::default_primary()],
+            build_pool: BuildPoolConfig { pool_size: 1 },
+            no_prewarm: true,
+            no_webview: true,
+            temp_runner_display: None,
+        };
+        let state: SharedState = std::sync::Arc::new(crate::state::SupervisorState::new(config));
+        let primary = state
+            .get_primary()
+            .await
+            .expect("config declares a primary");
+        primary.runner.write().await.running = true;
+        *primary.resolved_exe.write().await = Some(crate::process::manager::ResolvedRunnerExe {
+            path: root.join("target/debug/qontinui-runner"),
+            origin: crate::process::manager::ExeOrigin::CargoTargetDir(
+                crate::config::TargetDirSource::WorkspaceDefault,
+            ),
+            mtime: None,
+            provenance: None,
+            unverified_warning: None,
+        });
+        state.cached_health.write().await.runner_responding = true;
+        state.cached_health.write().await.runner_port_open = true;
+        let mut snap = cached_primary_snapshot();
+        snap.frontend_ready = Some(false);
+        snap.frontend_state = Some("window_not_visible".to_string());
+        snap.frontend_not_ready_since = Some(chrono::Utc::now() - chrono::Duration::seconds(200));
+        state.cached_runner_health.write().await.push(snap);
+        state
+    }
+
+    /// (d) WIRING: `GET /health`'s builder reads the cached primary frontend
+    /// observation and the resolved exe origin, not just the pure function.
+    #[tokio::test]
+    async fn test_build_health_response_degrades_on_cached_placeholder_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = build_health_response(&state).await;
+        assert_eq!(r.status, "degraded");
+        let reason = r
+            .status_reason
+            .expect("degraded must carry a status_reason");
+        assert!(
+            reason.starts_with("primary runner frontend not ready for "),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("(frontendState=window_not_visible)"),
+            "{reason}"
+        );
+        assert!(reason.contains("legacy cargo-target exe"), "{reason}");
+    }
+
+    /// (d') The same through the SSE builder, which must agree with the plain
+    /// handler for the same state.
+    #[tokio::test]
+    async fn test_sse_health_degrades_on_cached_placeholder_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = try_build_sse_health(&state, None).expect("no lock is contended");
+        assert_eq!(r.status, "degraded");
+        let reason = r
+            .status_reason
+            .expect("degraded must carry a status_reason");
+        assert!(
+            reason.contains("(frontendState=window_not_visible)"),
+            "{reason}"
+        );
+        assert!(reason.contains("legacy cargo-target exe"), "{reason}");
+    }
+
+    /// A contended snapshot lock skips the SSE tick rather than emitting a
+    /// status computed without the primary snapshot.
+    #[tokio::test]
+    async fn test_sse_health_skips_tick_when_snapshot_lock_is_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let _held = state.cached_runner_health.write().await;
+        assert!(try_build_sse_health(&state, None).is_err());
     }
 
     /// `status_reason` is omitted from the JSON when None, present when Some.

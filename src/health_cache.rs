@@ -306,6 +306,47 @@ pub struct CachedRunnerHealth {
     /// sync SSE path can publish the derivation alongside the verdict without
     /// re-probing (it has no access to the per-runner `cached_health` lock).
     pub port_open: bool,
+    /// The runner's own `/health` `frontendReady` on this tick. `None` =
+    /// UNKNOWN (API not answering, body unparseable, or a runner too old to
+    /// publish it) — never read as ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_ready: Option<bool>,
+    /// The runner's own `/health` `frontendState` on this tick (why
+    /// `frontendReady` is what it is, e.g. `window_not_visible`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_state: Option<String>,
+    /// When this supervisor FIRST observed `frontendReady == false` in the
+    /// current unbroken run of such observations for the current pid. `None`
+    /// whenever this tick's `frontend_ready` is not `Some(false)`. See
+    /// [`next_frontend_not_ready_since`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_not_ready_since: Option<DateTime<Utc>>,
+}
+
+/// Advance the "frontend not ready since" observation by one tick.
+///
+/// `prev` is the previous tick's `(since, pid)`. Returns the new `(since, pid)`,
+/// or `None` when this tick is not a `frontendReady == false` observation:
+/// - `Some(false)` with a matching previous run for the SAME pid keeps the
+///   original instant, so the duration measures an unbroken run;
+/// - `Some(false)` with no previous run, or a different pid (the runner was
+///   restarted), starts a new run at `now`;
+/// - `Some(true)` or `None` (UNKNOWN: API silent, older runner) ends the run.
+///   An unknown tick is deliberately NOT carried across, so the duration is
+///   only ever a span of positive `false` observations.
+pub(crate) fn next_frontend_not_ready_since(
+    prev: Option<(DateTime<Utc>, Option<u32>)>,
+    frontend_ready: Option<bool>,
+    pid: Option<u32>,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, Option<u32>)> {
+    if frontend_ready != Some(false) {
+        return None;
+    }
+    match prev {
+        Some((since, prev_pid)) if prev_pid == pid => Some((since, pid)),
+        _ => Some((now, pid)),
+    }
 }
 
 /// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
@@ -439,6 +480,12 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
         // state any consumer should read.
         let mut unresponsive_ticks: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        // Per-runner "frontendReady == false since (instant, pid)" — see
+        // `next_frontend_not_ready_since`.
+        let mut frontend_not_ready: std::collections::HashMap<
+            String,
+            (DateTime<Utc>, Option<u32>),
+        > = std::collections::HashMap::new();
         loop {
             // Wait for either the periodic tick or an immediate refresh notification
             tokio::select! {
@@ -773,6 +820,24 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     runner_responding,
                     health_body.as_ref(),
                 );
+                let frontend_ready = health_body.as_ref().and_then(|b| b.frontend_ready());
+                let frontend_state = health_body
+                    .as_ref()
+                    .and_then(|b| b.frontend_state().map(str::to_string));
+                let frontend_since = next_frontend_not_ready_since(
+                    frontend_not_ready.get(&managed.config.id).copied(),
+                    frontend_ready,
+                    runner_state.pid,
+                    Utc::now(),
+                );
+                match frontend_since {
+                    Some(v) => {
+                        frontend_not_ready.insert(managed.config.id.clone(), v);
+                    }
+                    None => {
+                        frontend_not_ready.remove(&managed.config.id);
+                    }
+                }
                 runner_snapshots.push(CachedRunnerHealth {
                     id: managed.config.id.clone(),
                     name: managed.config.name.clone(),
@@ -790,6 +855,9 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     liveness: runner_state.liveness(runner_port_open, runner_responding),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
                     port_open: runner_port_open,
+                    frontend_ready,
+                    frontend_state,
+                    frontend_not_ready_since: frontend_since.map(|(t, _)| t),
                 });
                 drop(runner_state);
 
@@ -809,6 +877,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
             // box that spawns temp runners all day. Drop whatever is no longer
             // in the registry: this is per-tick bookkeeping, not state.
             unresponsive_ticks.retain(|id, _| runners.iter().any(|m| &m.config.id == id));
+            frontend_not_ready.retain(|id, _| runners.iter().any(|m| &m.config.id == id));
 
             // If no runners exist, check legacy ports
             if runners.is_empty() {
@@ -1153,6 +1222,37 @@ mod tests {
             derive_runner_status(true, true, Some(&b)),
             RunnerStatus::Healthy
         ));
+    }
+
+    #[test]
+    fn frontend_not_ready_since_keeps_the_first_instant_for_the_same_pid() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(2);
+        let first = next_frontend_not_ready_since(None, Some(false), Some(7), t0);
+        assert_eq!(first, Some((t0, Some(7))));
+        let second = next_frontend_not_ready_since(first, Some(false), Some(7), t1);
+        assert_eq!(second, Some((t0, Some(7))), "an unbroken run keeps t0");
+    }
+
+    #[test]
+    fn frontend_not_ready_since_restarts_on_new_pid_and_ends_on_ready_or_unknown() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(2);
+        let run = Some((t0, Some(7)));
+        assert_eq!(
+            next_frontend_not_ready_since(run, Some(false), Some(8), t1),
+            Some((t1, Some(8))),
+            "a restarted runner (new pid) starts a new run"
+        );
+        assert_eq!(
+            next_frontend_not_ready_since(run, Some(true), Some(7), t1),
+            None
+        );
+        assert_eq!(
+            next_frontend_not_ready_since(run, None, Some(7), t1),
+            None,
+            "UNKNOWN (absent frontendReady) is not a false observation"
+        );
     }
 
     #[test]
