@@ -1818,24 +1818,44 @@ fn stderr_submission_tail_caps_and_keeps_tail() {
 fn prewarm_cargo_check_carries_allow_placeholder_dist() {
     let env = super::cargo_invocation_env(super::CargoInvocation::Prewarm);
     assert!(
-        env.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST", "1")),
+        env.set.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST", "1")),
         "the pre-warm `cargo check` must keep working on a fresh tree with no dist/: {env:?}"
     );
+    assert!(!env.remove.contains(&"QONTINUI_ALLOW_PLACEHOLDER_DIST"));
 }
 
 #[test]
-fn real_slot_and_sidecar_builds_never_carry_allow_placeholder_dist() {
+fn real_builds_never_carry_and_actively_remove_allow_placeholder_dist() {
     for kind in [
         super::CargoInvocation::SlotBuild,
         super::CargoInvocation::SidecarBuild,
+        super::CargoInvocation::Submission,
     ] {
         let env = super::cargo_invocation_env(kind);
         assert!(
-            !env.iter()
+            !env.set
+                .iter()
                 .any(|(k, _)| *k == "QONTINUI_ALLOW_PLACEHOLDER_DIST"),
             "{kind:?} produces an exe and must let build.rs refuse a placeholder dist: {env:?}"
         );
+        assert!(
+            env.remove.contains(&"QONTINUI_ALLOW_PLACEHOLDER_DIST"),
+            "{kind:?} must REMOVE an inherited QONTINUI_ALLOW_PLACEHOLDER_DIST: {env:?}"
+        );
     }
+}
+
+/// The `/build/submit` path is a plain tokio `Command`: the removal must land
+/// on it as a removal (`get_envs` reports a removed key as `(key, None)`).
+#[test]
+fn submission_command_removes_allow_placeholder_dist() {
+    let mut cmd = tokio::process::Command::new("cargo");
+    super::apply_invocation_env(&mut cmd, super::CargoInvocation::Submission);
+    let removed = cmd
+        .as_std()
+        .get_envs()
+        .any(|(k, v)| k == "QONTINUI_ALLOW_PLACEHOLDER_DIST" && v.is_none());
+    assert!(removed, "submission build must env_remove the override");
 }
 
 /// The pure function is only half the rule: each call site must ask for its
@@ -1854,6 +1874,12 @@ fn each_cargo_call_site_applies_its_own_invocation_kind() {
     assert_eq!(count("CargoInvocation::Prewarm)"), 1);
     assert_eq!(count("CargoInvocation::SlotBuild)"), 1);
     assert_eq!(count("CargoInvocation::SidecarBuild)"), 1);
+    let subm = include_str!("../build_submissions.rs");
+    assert_eq!(
+        subm.matches("CargoInvocation::Submission,").count(),
+        1,
+        "build_submissions.rs must apply the Submission env rules to its cargo command"
+    );
     // The pre-warm site is the one that runs `cargo check`.
     let at = prod.find("CargoInvocation::Prewarm)").unwrap();
     let before = &prod[..at];

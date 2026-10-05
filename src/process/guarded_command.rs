@@ -133,6 +133,9 @@ pub struct GuardedCommand {
     args: Vec<std::ffi::OsString>,
     cwd: Option<PathBuf>,
     envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Variables REMOVED from the inherited environment. Applied before
+    /// `envs`, so an explicit `env` of the same key still wins.
+    env_removes: Vec<std::ffi::OsString>,
     timeout: Duration,
     cancel: Option<CancellationToken>,
     /// Whether to wrap the spawned child in a tree-kill job (Windows JobObject)
@@ -181,6 +184,7 @@ impl GuardedCommand {
             args: Vec::new(),
             cwd: None,
             envs: Vec::new(),
+            env_removes: Vec::new(),
             timeout,
             cancel: None,
             job_guarded: true,
@@ -249,6 +253,13 @@ impl GuardedCommand {
         self
     }
 
+    /// Remove one variable from the environment the child would otherwise
+    /// inherit from this process.
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_removes.push(key.as_ref().to_os_string());
+        self
+    }
+
     /// Attach a cancellation token. When it fires, [`run`](Self::run) kills the
     /// process tree and returns [`GuardedOutcome::Cancelled`].
     ///
@@ -311,6 +322,9 @@ impl GuardedCommand {
             .stdin(Stdio::null());
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
+        }
+        for k in &self.env_removes {
+            cmd.env_remove(k);
         }
         for (k, v) in &self.envs {
             cmd.env(k, v);
@@ -718,6 +732,38 @@ fn make_output(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `env_remove` reaches the configured child command as a removal, and an
+    /// explicit `env` of the same key still wins over it.
+    #[test]
+    fn env_remove_is_applied_to_the_child_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = |n: &str| std::fs::File::create(dir.path().join(n)).unwrap();
+        let gc = GuardedCommand::new("cargo", Duration::from_secs(1))
+            .env_remove("QONTINUI_ALLOW_PLACEHOLDER_DIST")
+            .env_remove("SOME_OTHER")
+            .env("SOME_OTHER", "kept");
+        let mut cmd = tokio::process::Command::new("cargo");
+        gc.configure_command(&mut cmd, f("o"), f("e"));
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST".to_string(), None)),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&("SOME_OTHER".to_string(), Some("kept".to_string()))),
+            "{envs:?}"
+        );
+    }
 
     /// Windows-only test helper: is `pid` still a live process? Uses
     /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess`;

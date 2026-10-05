@@ -4159,10 +4159,21 @@ pub(crate) enum CargoInvocation {
     SlotBuild,
     /// The fail-open sidecar `cargo build` that follows a slot build.
     SidecarBuild,
+    /// A `/build/submit` build (`build_submissions.rs`, a bare `Command`).
+    Submission,
 }
 
-/// Static env vars a supervisor cargo invocation carries, by kind. Pure so the
-/// "only the pre-warm may accept a placeholder dist" rule is testable.
+/// The env a supervisor cargo invocation SETS and REMOVES, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvocationEnv {
+    /// Variables set on the child.
+    pub set: &'static [(&'static str, &'static str)],
+    /// Variables removed from what the child would inherit from the supervisor.
+    pub remove: &'static [&'static str],
+}
+
+/// Env rules per invocation kind. Pure so the "only the pre-warm may accept a
+/// placeholder dist" rule is testable.
 ///
 /// The pre-warm is a `cargo check` on a possibly fresh tree with no `dist/`
 /// yet; it produces no exe, so allowing the placeholder there embeds nothing.
@@ -4170,23 +4181,49 @@ pub(crate) enum CargoInvocation {
 /// `cargo:rerun-if-env-changed=QONTINUI_ALLOW_PLACEHOLDER_DIST`, so a later
 /// real build in the same target dir WITHOUT the variable re-runs the build
 /// script and re-applies the refusal rather than reusing the pre-warm's
-/// permissive result. Plan
-/// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
-pub(crate) fn cargo_invocation_env(
-    kind: CargoInvocation,
-) -> &'static [(&'static str, &'static str)] {
+/// permissive result.
+///
+/// Every exe-producing kind actively REMOVES the variable: otherwise a value
+/// in the supervisor's OWN environment (an operator shell, a dev script)
+/// would be inherited by every real build and silently bypass the refusal.
+/// Plan `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
+pub(crate) fn cargo_invocation_env(kind: CargoInvocation) -> InvocationEnv {
     match kind {
-        CargoInvocation::Prewarm => &[(ALLOW_PLACEHOLDER_DIST_ENV, "1")],
-        CargoInvocation::SlotBuild | CargoInvocation::SidecarBuild => &[],
+        CargoInvocation::Prewarm => InvocationEnv {
+            set: &[(ALLOW_PLACEHOLDER_DIST_ENV, "1")],
+            remove: &[],
+        },
+        CargoInvocation::SlotBuild
+        | CargoInvocation::SidecarBuild
+        | CargoInvocation::Submission => InvocationEnv {
+            set: &[],
+            remove: &[ALLOW_PLACEHOLDER_DIST_ENV],
+        },
     }
 }
 
-/// Apply [`cargo_invocation_env`] for `kind` to a command.
+/// Apply [`cargo_invocation_env`] for `kind` to a guarded command.
 fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> GuardedCommand {
-    for (k, v) in cargo_invocation_env(kind) {
+    let env = cargo_invocation_env(kind);
+    for k in env.remove {
+        cmd = cmd.env_remove(k);
+    }
+    for (k, v) in env.set {
         cmd = cmd.env(k, v);
     }
     cmd
+}
+
+/// Apply [`cargo_invocation_env`] for `kind` to a plain tokio command (the
+/// `/build/submit` path, which is not a [`GuardedCommand`]).
+pub(crate) fn apply_invocation_env(cmd: &mut tokio::process::Command, kind: CargoInvocation) {
+    let env = cargo_invocation_env(kind);
+    for k in env.remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in env.set {
+        cmd.env(k, v);
+    }
 }
 
 /// Sweep each slot's target dir for stale `.cargo-lock` advisory files left

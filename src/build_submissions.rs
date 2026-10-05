@@ -735,6 +735,12 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
     // unexplained stall. Same predicate, same fail-open, same WARN as the
     // GuardedCommand seam; this one just isn't a GuardedCommand.
     crate::sccache_guard::degrade_cargo_env_if_s3(&mut cmd, &worktree_path).await;
+    // Never inherit QONTINUI_ALLOW_PLACEHOLDER_DIST into a real build: it
+    // would silently bypass the runner build.rs placeholder-dist refusal.
+    crate::build_monitor::apply_invocation_env(
+        &mut cmd,
+        crate::build_monitor::CargoInvocation::Submission,
+    );
 
     let spawn_result = cmd.spawn();
     let mut child = match spawn_result {
