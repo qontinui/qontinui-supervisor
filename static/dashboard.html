@@ -577,7 +577,7 @@
 <!-- Status Bar -->
 <div class="status-bar">
   <div class="left">
-    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span>
+    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span><span id="statusReason" style="color:var(--warning);margin-left:8px;font-size:0.85em"></span></span>
     <span style="color:var(--text-secondary)">Supervisor <span id="supervisorVersion">v?.?.?</span></span>
   </div>
   <div class="right">
@@ -1132,6 +1132,11 @@
     var txt = document.getElementById('statusText');
     dot.className = 'status-dot ' + h.status;
     txt.textContent = h.status.charAt(0).toUpperCase() + h.status.slice(1);
+    // Why the status is not the plain process/API verdict (e.g. the primary's
+    // frontend has been not ready past the grace). Absent = nothing to say.
+    var reasonEl = document.getElementById('statusReason');
+    reasonEl.textContent = h.status_reason ? '— ' + h.status_reason : '';
+    reasonEl.title = h.status_reason || '';
 
     document.getElementById('supervisorVersion').textContent = 'v' + h.supervisor.version;
 

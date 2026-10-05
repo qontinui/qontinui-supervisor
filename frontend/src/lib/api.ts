@@ -416,6 +416,10 @@ export interface OriginGuardWire {
 
 export interface HealthResponse {
   status: string;
+  /// Why `status` is not the plain process/API verdict, when it is not (today:
+  /// the primary's frontend has been not ready past the supervisor's grace).
+  /// Absent when there is nothing to say, and on older supervisors.
+  status_reason?: string;
   runner: {
     running: boolean;
     pid?: number;

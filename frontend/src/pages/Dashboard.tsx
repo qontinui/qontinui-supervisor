@@ -1534,6 +1534,15 @@ function DashboardInner() {
           <span style={{ fontWeight: 600, textTransform: 'capitalize', color: statusColor }}>
             {h.status}
           </span>
+          {h.status_reason && (
+            <span
+              data-testid="status-reason"
+              title={h.status_reason}
+              style={{ fontSize: '0.75rem', color: statusColor }}
+            >
+              {h.status_reason}
+            </span>
+          )}
           <span className="text-muted" style={{ fontSize: '0.75rem' }}>
             {/* The wedge is checked FIRST. This line used to read `running`
                 and then `api_responding`, so the primary that held :9876 for
