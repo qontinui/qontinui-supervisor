@@ -407,24 +407,35 @@ pub const PRIMARY_FRONTEND_NOT_READY_GRACE_SECS: i64 = 120;
 /// The primary runner's frontend, as the health cache last observed it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrimaryFrontend {
-    /// Start of the current unbroken run of `frontendReady == false`
-    /// observations; `None` when the last observation was not `false`
-    /// (ready, or UNKNOWN — an older runner that publishes no `frontendReady`).
+    /// Start of the current run of `frontendReady == false` observations
+    /// (UNKNOWN ticks pause it, see `health_cache::next_frontend_run`); `None`
+    /// when there is no run (ready, or never observed — e.g. an older runner
+    /// that publishes no `frontendReady`).
     pub not_ready_since: Option<chrono::DateTime<chrono::Utc>>,
     /// The runner's `frontendState`, when it published one.
     pub state: Option<String>,
+    /// The primary's config has `server_mode` (`QONTINUI_SERVER_MODE=1`): it
+    /// never creates a window, so `frontendReady` is `false`
+    /// (`frontendState=window_missing`) for its whole life BY DESIGN. Never an
+    /// override for such a runner.
+    pub server_mode: bool,
 }
 
 impl PrimaryFrontend {
-    /// Read from the primary's cached snapshot. No snapshot = UNKNOWN = no
-    /// observation, which never overrides the top-level status.
-    pub fn from_snapshot(snap: Option<&CachedRunnerHealth>) -> Self {
+    /// Read from the primary's cached snapshot plus its config's
+    /// `server_mode`. No snapshot = UNKNOWN = no observation, which never
+    /// overrides the top-level status.
+    pub fn from_snapshot(snap: Option<&CachedRunnerHealth>, server_mode: bool) -> Self {
         match snap {
             Some(c) => Self {
                 not_ready_since: c.frontend_not_ready_since,
                 state: c.frontend_state.clone(),
+                server_mode,
             },
-            None => Self::default(),
+            None => Self {
+                server_mode,
+                ..Self::default()
+            },
         }
     }
 }
@@ -463,7 +474,7 @@ pub fn resolve_overall_status(
     now: chrono::DateTime<chrono::Utc>,
 ) -> OverallStatus {
     let base = determine_overall_status(runner_running, api_responding, build_in_progress);
-    if base == "healthy" {
+    if base == "healthy" && !frontend.server_mode {
         if let Some(since) = frontend.not_ready_since {
             let secs = (now - since).num_seconds();
             if secs >= PRIMARY_FRONTEND_NOT_READY_GRACE_SECS {
@@ -590,6 +601,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
                 .await
                 .iter()
                 .find(|c| c.id == primary.config.id),
+            primary.config.server_mode,
         );
         let legacy_exe = primary
             .resolved_exe
@@ -799,6 +811,9 @@ fn try_build_sse_health(
         .values()
         .find(|r| r.config.kind().is_primary())
         .cloned();
+    let primary_server_mode = primary_managed
+        .as_ref()
+        .is_some_and(|m| m.config.server_mode);
     let primary_legacy_exe = match primary_managed {
         Some(m) => m
             .resolved_exe
@@ -812,7 +827,7 @@ fn try_build_sse_health(
         primary_running,
         api_responding,
         build.build_in_progress,
-        &PrimaryFrontend::from_snapshot(primary_snapshot),
+        &PrimaryFrontend::from_snapshot(primary_snapshot, primary_server_mode),
         primary_legacy_exe,
         chrono::Utc::now(),
     );
@@ -1026,6 +1041,7 @@ mod tests {
             PrimaryFrontend {
                 not_ready_since: Some(now - chrono::Duration::seconds(secs)),
                 state: state.map(str::to_string),
+                server_mode: false,
             },
             now,
         )
@@ -1094,7 +1110,7 @@ mod tests {
         };
         snap.frontend_ready = Some(true);
         snap.frontend_not_ready_since = None;
-        let fe = PrimaryFrontend::from_snapshot(Some(&snap));
+        let fe = PrimaryFrontend::from_snapshot(Some(&snap), false);
         let o = resolve_overall_status(true, true, false, &fe, true, chrono::Utc::now());
         assert_eq!(o.status, "healthy");
         assert_eq!(o.reason, None);
@@ -1149,6 +1165,13 @@ mod tests {
     /// running + responding, started from the LEGACY cargo-target exe, and
     /// whose cached snapshot says the frontend has been not ready for 200 s.
     async fn state_with_placeholder_primary(root: &std::path::Path) -> SharedState {
+        state_with_not_ready_primary(root, false).await
+    }
+
+    async fn state_with_not_ready_primary(
+        root: &std::path::Path,
+        server_mode: bool,
+    ) -> SharedState {
         use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
         let config = SupervisorConfig {
             project_dir: root.join("src-tauri"),
@@ -1162,7 +1185,10 @@ mod tests {
             cli_args: vec![],
             expo_dir: None,
             expo_port: 8081,
-            runners: vec![RunnerConfig::default_primary()],
+            runners: vec![RunnerConfig {
+                server_mode,
+                ..RunnerConfig::default_primary()
+            }],
             build_pool: BuildPoolConfig { pool_size: 1 },
             no_prewarm: true,
             no_webview: true,
@@ -1231,6 +1257,29 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("legacy cargo-target exe"), "{reason}");
+    }
+
+    /// A `server_mode` primary has no window, so `frontendReady` is false
+    /// for life by design: never an override, on either surface.
+    #[test]
+    fn test_server_mode_primary_never_degrades_on_frontend() {
+        let (mut fe, now) = not_ready_for(10_000, Some("window_missing"));
+        fe.server_mode = true;
+        let o = resolve_overall_status(true, true, false, &fe, true, now);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_server_mode_primary_stays_healthy_through_both_builders() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_not_ready_primary(dir.path(), true).await;
+        let plain = build_health_response(&state).await;
+        assert_eq!(plain.status, "healthy");
+        assert_eq!(plain.status_reason, None);
+        let sse = try_build_sse_health(&state, None).expect("no lock is contended");
+        assert_eq!(sse.status, "healthy");
+        assert_eq!(sse.status_reason, None);
     }
 
     /// A contended snapshot lock skips the SSE tick rather than emitting a
