@@ -1169,9 +1169,7 @@ mod tests {
     /// A URL nothing is listening on: bind an ephemeral port to reserve it,
     /// then drop the listener.
     async fn dead_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{}", port)
     }
 
@@ -1688,9 +1686,7 @@ mod tests {
     /// and the census walks this very test process, which hosts no `claude`.
     #[tokio::test]
     async fn phase_one_signature_refused_port_falls_back_to_a_real_census() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::test_ports::reserve_refused_port();
 
         let r = probe_with_census_fallback(
             port,
@@ -1828,9 +1824,7 @@ mod tests {
         protected: bool,
         running: bool,
     ) -> (crate::state::ManagedRunner, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::test_ports::reserve_refused_port();
 
         let config = crate::config::RunnerConfig {
             id: id.to_string(),

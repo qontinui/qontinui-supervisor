@@ -1639,9 +1639,7 @@ mod tests {
 
     /// A URL nothing is listening on.
     async fn dead_base() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{port}")
     }
 
