@@ -1892,3 +1892,227 @@ fn each_cargo_call_site_applies_its_own_invocation_kind() {
         "CargoInvocation::Prewarm must be applied inside the pre-warm `cargo check` fn"
     );
 }
+
+// ---------------------------------------------------------------
+// The supervisor never installs through a linked `node_modules` —
+// plan `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot`,
+// Phase 3 (D2). A worktree whose `node_modules` is a symlink into the
+// shared primary must get the LINK removed before `pnpm install`, so
+// the install lands in a real dir and the primary is byte-identical.
+// ---------------------------------------------------------------
+#[cfg(unix)]
+mod unlink_before_install {
+    use super::super::{
+        prebuild_worktree_frontend_with, unlink_node_modules_link, UNLINKED_NODE_MODULES_LOG,
+    };
+    use super::lkg_test_state;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    /// Every regular file under `root` (not following links) → its bytes.
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("read_dir") {
+                let p = entry.expect("entry").path();
+                let meta = fs::symlink_metadata(&p).expect("meta");
+                if meta.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    let bytes = if meta.file_type().is_symlink() {
+                        fs::read_link(&p)
+                            .expect("read_link")
+                            .to_string_lossy()
+                            .into_owned()
+                            .into_bytes()
+                    } else {
+                        fs::read(&p).expect("read")
+                    };
+                    out.insert(p.strip_prefix(root).unwrap().to_path_buf(), bytes);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A pnpm primary: a real `node_modules` holding a `.modules.yaml`
+    /// sentinel naming itself, plus the install marker.
+    fn seed_primary(prim: &Path) {
+        let nm = prim.join("node_modules");
+        fs::create_dir_all(nm.join(".bin")).unwrap();
+        fs::write(
+            nm.join(".modules.yaml"),
+            "virtualStoreDir: .pnpm\n# owner: prim\n",
+        )
+        .unwrap();
+        fs::write(nm.join(".bin").join("ui-bridge-build-ir"), b"prim-bin").unwrap();
+        fs::write(prim.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+        fs::write(prim.join("package.json"), r#"{"name":"prim"}"#).unwrap();
+    }
+
+    fn ok_output() -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![],
+            stderr: vec![],
+        }
+    }
+
+    #[test]
+    fn unlink_removes_only_the_link_and_never_its_target() {
+        let tmp = TempDir::new().unwrap();
+        let prim = tmp.path().join("prim");
+        let wt = tmp.path().join("wt");
+        seed_primary(&prim);
+        fs::create_dir_all(&wt).unwrap();
+        symlink(prim.join("node_modules"), wt.join("node_modules")).unwrap();
+        let before = snapshot(&prim);
+
+        assert!(
+            unlink_node_modules_link(&wt).expect("unlink"),
+            "a link must be removed"
+        );
+        assert!(
+            fs::symlink_metadata(wt.join("node_modules")).is_err(),
+            "wt/node_modules must be gone after the unlink"
+        );
+        assert_eq!(
+            snapshot(&prim),
+            before,
+            "the link's target must be untouched"
+        );
+    }
+
+    #[test]
+    fn unlink_removes_a_dangling_link() {
+        let tmp = TempDir::new().unwrap();
+        symlink(tmp.path().join("gone"), tmp.path().join("node_modules")).unwrap();
+        assert!(unlink_node_modules_link(tmp.path()).expect("unlink"));
+        assert!(fs::symlink_metadata(tmp.path().join("node_modules")).is_err());
+    }
+
+    /// The post-`npm_lock` re-check calls the helper a second time; on a
+    /// tree the first call already fixed (or a real dir) it must be a no-op.
+    #[test]
+    fn unlink_is_idempotent_and_a_second_call_after_install_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let prim = tmp.path().join("prim");
+        let wt = tmp.path().join("wt");
+        seed_primary(&prim);
+        fs::create_dir_all(&wt).unwrap();
+        symlink(prim.join("node_modules"), wt.join("node_modules")).unwrap();
+
+        assert!(unlink_node_modules_link(&wt).expect("first call"));
+        assert!(!unlink_node_modules_link(&wt).expect("second call, absent"));
+        fs::create_dir_all(wt.join("node_modules")).unwrap();
+        fs::write(wt.join("node_modules/.modules.yaml"), "own").unwrap();
+        assert!(!unlink_node_modules_link(&wt).expect("third call, real dir"));
+        assert_eq!(
+            fs::read_to_string(wt.join("node_modules/.modules.yaml")).unwrap(),
+            "own"
+        );
+    }
+
+    #[test]
+    fn unlink_is_a_noop_on_a_real_dir_and_on_absence() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!unlink_node_modules_link(tmp.path()).expect("absent is fine"));
+
+        seed_primary(tmp.path());
+        let before = snapshot(tmp.path());
+        assert!(
+            !unlink_node_modules_link(tmp.path()).expect("real dir"),
+            "a real node_modules is not a link and must be left alone"
+        );
+        assert_eq!(
+            snapshot(tmp.path()),
+            before,
+            "a real node_modules must be untouched"
+        );
+    }
+
+    /// The whole prebuild, pnpm stubbed: the stub writes what a real
+    /// `pnpm install` / `pnpm run build` would write into `cwd`. Without the
+    /// unlink, those writes go THROUGH the link into `prim` — so the mutant
+    /// that skips the unlink fails both the real-dir and the byte-identical
+    /// assertions.
+    #[tokio::test]
+    async fn prebuild_unlinks_a_linked_node_modules_and_installs_into_a_real_dir() {
+        let tmp = TempDir::new().unwrap();
+        let state = lkg_test_state(&tmp.path().join("live"));
+        let slot = state.build_pool.slots[0].clone();
+
+        let prim = tmp.path().join("prim");
+        let wt = tmp.path().join("wt");
+        seed_primary(&prim);
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+        fs::write(wt.join("package.json"), r#"{"name":"wt"}"#).unwrap();
+        symlink(prim.join("node_modules"), wt.join("node_modules")).unwrap();
+        let prim_before = snapshot(&prim);
+
+        let calls: Arc<Mutex<Vec<(PathBuf, String)>>> = Arc::default();
+        let rec = calls.clone();
+        prebuild_worktree_frontend_with(&state, &slot, &wt, false, move |cwd, args| {
+            rec.lock().unwrap().push((cwd.clone(), args.to_string()));
+            async move {
+                if args.starts_with("install") {
+                    let nm = cwd.join("node_modules");
+                    fs::create_dir_all(nm.join(".bin"))?;
+                    fs::write(
+                        nm.join(".modules.yaml"),
+                        "virtualStoreDir: .pnpm\n# owner: wt\n",
+                    )?;
+                    fs::write(nm.join(".bin").join("ui-bridge-build-ir"), b"wt-bin")?;
+                } else {
+                    let dist = cwd.join("dist");
+                    fs::create_dir_all(&dist)?;
+                    fs::write(dist.join("index.html"), b"<!doctype html>")?;
+                    fs::write(dist.join("build-id.txt"), b"test-build-id")?;
+                }
+                Ok(ok_output())
+            }
+        })
+        .await
+        .expect("prebuild succeeds");
+
+        let wt_nm = fs::symlink_metadata(wt.join("node_modules")).expect("wt/node_modules exists");
+        assert!(
+            wt_nm.is_dir() && !wt_nm.file_type().is_symlink(),
+            "wt/node_modules must be a REAL dir after the prebuild"
+        );
+        assert_eq!(
+            fs::read_to_string(wt.join("node_modules/.modules.yaml")).unwrap(),
+            "virtualStoreDir: .pnpm\n# owner: wt\n"
+        );
+        assert_eq!(
+            snapshot(&prim),
+            prim_before,
+            "the primary must be byte-identical"
+        );
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.first().map(|(c, a)| (c.as_path(), a.as_str())),
+            Some((wt.as_path(), "install --frozen-lockfile")),
+            "the install must run (in wt) — the unlink leaves no marker to call it fresh"
+        );
+
+        let logged = state
+            .logs
+            .build_history()
+            .await
+            .iter()
+            .any(|e| e.message.contains(UNLINKED_NODE_MODULES_LOG));
+        assert!(
+            logged,
+            "the unlink must be logged with the Arming-line text"
+        );
+    }
+}

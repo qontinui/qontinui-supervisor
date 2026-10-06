@@ -1379,6 +1379,14 @@ async fn run_build_inner(
                     ),
                 )
                 .await;
+            // Never install through a link (plan
+            // `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot`,
+            // D2). `npm_dir` here is always the live tree (`runner_npm_dir()`,
+            // since this block is gated on `build_dir_override.is_none()`), whose
+            // `node_modules` is a real dir — so this is a no-op in practice.
+            // It stays so that NO `install` site in this file can run through
+            // a symlink/junction, whichever tree a future caller points it at.
+            unlink_node_modules_link_before_install(state, slot, &npm_dir).await?;
             let install_result = run_pnpm_command(&npm_dir, "install --frozen-lockfile").await;
             match install_result {
                 Ok(output) if output.status.success() => {
@@ -2458,6 +2466,43 @@ async fn prebuild_worktree_frontend(
     wt_root: &std::path::Path,
     force_frontend_build: bool,
 ) -> Result<(), SupervisorError> {
+    prebuild_worktree_frontend_with(
+        state,
+        slot,
+        wt_root,
+        force_frontend_build,
+        |cwd, args| async move { run_pnpm_command(&cwd, args).await },
+    )
+    .await
+}
+
+/// [`prebuild_worktree_frontend`] with the pnpm invocation as a seam, so a
+/// test can drive the whole prebuild (unlink → freshness gate → install →
+/// sidecar → build) with a stub that writes what pnpm would write, without a
+/// real pnpm or network. Production passes [`run_pnpm_command`].
+async fn prebuild_worktree_frontend_with<F, Fut>(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    wt_root: &std::path::Path,
+    force_frontend_build: bool,
+    pnpm: F,
+) -> Result<(), SupervisorError>
+where
+    F: Fn(PathBuf, &'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<std::process::Output, std::io::Error>>,
+{
+    // 0) Never install through a link. A worktree whose `node_modules` is a
+    //    symlink/junction into the shared primary (the allocator's link arm)
+    //    would have `pnpm install` write the PRIMARY's tree and stamp the
+    //    primary's `.modules.yaml` with this worktree's identity — the
+    //    2026-10-02..06 poisoning (plan
+    //    `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot`,
+    //    D2). Remove the LINK (never its target) BEFORE the freshness gate,
+    //    so `dep_install_reason` reads this worktree's own sidecar — not the
+    //    primary's, read through the link — and the install below lands in a
+    //    real dir. Unlink, don't refuse: the build proceeds.
+    unlink_node_modules_link_before_install(state, slot, wt_root).await?;
+
     // Idempotency gate, split for the Phase 3 `frontend_only` fast path:
     //   * `install_reason` — Some(why) when `pnpm install` must run: either the
     //     `node_modules/.bin/ui-bridge-build-ir` marker is absent, or the
@@ -2510,6 +2555,16 @@ async fn prebuild_worktree_frontend(
         )
         .await;
     let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+    // Re-check after the (possibly minutes-long) lock wait: a link re-created
+    // in that window must not be installed through. Idempotent and cheap —
+    // one `symlink_metadata` when `node_modules` is already a real dir. If a
+    // link IS removed here, the freshness gate computed above may have read
+    // through it, so recompute the install reason against the real tree.
+    let install_reason = if unlink_node_modules_link_before_install(state, slot, wt_root).await? {
+        dep_install_reason(wt_root)
+    } else {
+        install_reason
+    };
 
     // 1) pnpm install — produces node_modules/.bin/ui-bridge-build-ir +
     //    everything else `pnpm run build` needs. Use `--frozen-lockfile`
@@ -2546,12 +2601,14 @@ async fn prebuild_worktree_frontend(
             .await;
 
         let install_started = std::time::Instant::now();
-        let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
-            SupervisorError::BuildFailed(format!(
-                "pnpm {} failed to spawn in spawn worktree {:?}: {}",
-                install_args, wt_root, e
-            ))
-        })?;
+        let install_output = pnpm(wt_root.to_path_buf(), install_args)
+            .await
+            .map_err(|e| {
+                SupervisorError::BuildFailed(format!(
+                    "pnpm {} failed to spawn in spawn worktree {:?}: {}",
+                    install_args, wt_root, e
+                ))
+            })?;
         if !install_output.status.success() {
             // S2: pnpm writes resolution/peer-dep diagnostics to BOTH streams —
             // capture the merged blob, not stderr alone.
@@ -2616,12 +2673,14 @@ async fn prebuild_worktree_frontend(
         .await;
 
     let build_started = std::time::Instant::now();
-    let build_output = run_pnpm_command(wt_root, "run build").await.map_err(|e| {
-        SupervisorError::BuildFailed(format!(
-            "pnpm run build failed to spawn in spawn worktree {:?}: {}",
-            wt_root, e
-        ))
-    })?;
+    let build_output = pnpm(wt_root.to_path_buf(), "run build")
+        .await
+        .map_err(|e| {
+            SupervisorError::BuildFailed(format!(
+                "pnpm run build failed to spawn in spawn worktree {:?}: {}",
+                wt_root, e
+            ))
+        })?;
     if !build_output.status.success() {
         // S2 (the P0's second half): `tsc` and `vite` print their compiler
         // diagnostics (`error TS2339: …`) to **stdout**; stderr usually holds
@@ -2661,6 +2720,114 @@ async fn prebuild_worktree_frontend(
     verify_frontend_built(wt_root)?;
 
     Ok(())
+}
+
+/// The log line emitted when [`unlink_node_modules_link_before_install`]
+/// removes a link. Named by the plan's Arming line, so it is a contract:
+/// grep for it to confirm the step fired on a real spawn.
+const UNLINKED_NODE_MODULES_LOG: &str = "unlinked shared node_modules link before install";
+
+/// If `<dir>/node_modules` is a symlink or junction, remove THE LINK (never
+/// its target, never recursively) so the following `pnpm install` creates a
+/// real `node_modules` owned by `dir`. Logs [`UNLINKED_NODE_MODULES_LOG`].
+/// A real dir, or no `node_modules` at all, is left untouched.
+///
+/// Returns `Ok(true)` iff a link was removed (the caller's freshness verdict,
+/// if computed earlier, may have read through it and is stale).
+///
+/// A failed unlink fails the build (logged at ERROR, so `/logs` shows it):
+/// installing anyway would write through the
+/// link into the shared tree, which is the exact harm this step prevents.
+async fn unlink_node_modules_link_before_install(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    dir: &std::path::Path,
+) -> Result<bool, SupervisorError> {
+    let nm = dir.join("node_modules");
+    let target = std::fs::read_link(&nm).ok();
+    match unlink_node_modules_link(dir) {
+        Ok(false) => Ok(false),
+        Ok(true) => {
+            let msg = format!(
+                "Slot {}: {} — {:?} (was -> {:?}); installing into a real dir",
+                slot.id, UNLINKED_NODE_MODULES_LOG, nm, target
+            );
+            info!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+            Ok(true)
+        }
+        Err(e) => {
+            let msg = format!(
+                "Slot {}: {:?} is a symlink/junction and could not be unlinked ({}); refusing \
+                 to run pnpm install through it, which would write the linked (shared) tree",
+                slot.id, nm, e
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Build, LogLevel::Error, msg.clone())
+                .await;
+            Err(SupervisorError::BuildFailed(msg))
+        }
+    }
+}
+
+/// Synchronous core of [`unlink_node_modules_link_before_install`].
+/// `Ok(true)` ⇒ a link was removed; `Ok(false)` ⇒ nothing to do (absent, or a
+/// real dir/file). Inspects with `symlink_metadata`, so the answer is about
+/// the link itself, never about what it points at (a dangling link counts).
+fn unlink_node_modules_link(dir: &std::path::Path) -> std::io::Result<bool> {
+    let nm = dir.join("node_modules");
+    let meta = match std::fs::symlink_metadata(&nm) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !is_link_metadata(&meta) {
+        return Ok(false);
+    }
+    remove_link(&nm)?;
+    Ok(true)
+}
+
+/// True iff `meta` (from `symlink_metadata`) describes a link: a symlink on
+/// unix; any reparse point (junction, `mklink /D`, file symlink) on Windows.
+fn is_link_metadata(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Remove the link at `path` — ONLY the link, never its target, never
+/// recursively (INV-W4; mirrors the runner's `agent_worktree::census::remove_link`).
+/// Windows: a DIRECTORY link (junction or `mklink /D`) takes `remove_dir`, a
+/// file symlink `remove_file` — each refuses the other's shape, and both
+/// remove the reparse point alone. Elsewhere `remove_file` (`unlink(2)`), which
+/// removes a symlink whatever it points at; `remove_dir` would be `rmdir(2)`
+/// and refuse it with `ENOTDIR`.
+fn remove_link(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
+    }
 }
 
 /// True iff `<wt_root>/node_modules/.bin/ui-bridge-build-ir` is ABSENT — i.e.
