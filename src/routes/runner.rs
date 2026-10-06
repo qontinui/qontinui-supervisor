@@ -194,6 +194,7 @@ async fn mint_primary_action(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestartRequest {
     #[serde(default)]
     pub rebuild: bool,
@@ -241,13 +242,13 @@ pub struct WatchdogRequest {
     pub reset_attempts: bool,
 }
 
-// NOTE: `RestartRequest` deliberately does NOT carry `#[serde(deny_unknown_fields)]`,
-// while its sibling `routes::runners::RestartRunnerRequest` does. The asymmetry is
-// load-bearing, not an oversight: `qontinui-runner`'s
-// `src-tauri/src/mcp/ai_session.rs` documents POSTing `/runner/restart` with
-// `trigger_auto_continue` and `wait_timeout_seconds`, neither of which exists here.
-// They are ignored today; denying unknown fields would turn a documented caller into
-// a 422. Add the attribute only together with a fix for that caller.
+// NOTE: `RestartRequest` carries `#[serde(deny_unknown_fields)]`, like its sibling
+// `routes::runners::RestartRunnerRequest`. It used to omit it because
+// `qontinui-runner`'s `ai_session.rs` documented POSTing `/runner/restart` with
+// `trigger_auto_continue` and `wait_timeout_seconds`, neither of which exists here;
+// qontinui-runner#1971 removed that caller (and qontinui-claude-config#1635 the
+// last script one), so an unknown key is now a typo and
+// fails as a 422 instead of being dropped silently.
 
 impl RestartRequest {
     /// The build source this request selects, as the typed value every layer
@@ -1425,6 +1426,18 @@ pub async fn supervisor_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<RestartRequest>(
+            r#"{"rebuild":true,"trigger_auto_continue":true}"#,
+        )
+        .err()
+        .expect("an unknown key must be refused");
+        assert!(err.to_string().contains("trigger_auto_continue"), "{err}");
+        let ok: RestartRequest = serde_json::from_str(r#"{"rebuild":true,"force":true}"#).unwrap();
+        assert!(ok.rebuild && ok.force);
+    }
     use crate::build_submissions::{BuildKind, BuildStatus, BuildSubmission};
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::state::{SharedState, SupervisorState};
