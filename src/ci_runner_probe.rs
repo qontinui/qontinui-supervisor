@@ -59,10 +59,15 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(3600);
 /// every ~10 minutes is enough to keep the fault visible without flooding.
 const DISTRO_DOWN_LOG_EVERY: u64 = 20;
 
-/// Default location of the host-level WSL keepalive script (the thing that is
-/// actually responsible for distro liveness — see the plan's Design principle:
-/// the keepalive owns liveness, the probe owns reporting).
+/// Last-resort location of the host-level WSL keepalive script, used only when
+/// neither the env override nor the scheduled task names one. The script is
+/// installed from the claude-config checkout, so this legacy path is normally
+/// stale — the scheduled task's registered action is the source of truth.
 const DEFAULT_KEEPALIVE_SCRIPT: &str = r"C:\claude\scripts\wsl-keepalive.ps1";
+
+/// Name of the Task Scheduler task that runs the keepalive
+/// (`install-wsl-keepalive.ps1`). Its action carries the script's real path.
+const KEEPALIVE_TASK_NAME: &str = "QontinuiWslKeepalive";
 
 /// Default location of the keepalive's documented disable flag.
 const DEFAULT_KEEPALIVE_DISABLE_FLAG: &str = r"C:\claude\wsl-keepalive.disabled";
@@ -725,6 +730,9 @@ pub enum KeepalivePresence {
     DisabledByFlag,
     /// No keepalive script at all — nothing is holding the distro open.
     Absent,
+    /// The script's location could not be established, so presence is unknown
+    /// rather than absent.
+    Unknown,
 }
 
 impl KeepalivePresence {
@@ -733,6 +741,7 @@ impl KeepalivePresence {
             Self::Present => "keepalive script present (not proof it is running)",
             Self::DisabledByFlag => "keepalive script present but DISABLED by its flag file",
             Self::Absent => "NO keepalive script found",
+            Self::Unknown => "keepalive script location UNKNOWN (scheduled task could not be read)",
         }
     }
 }
@@ -746,28 +755,348 @@ pub fn classify_keepalive(script_present: bool, disable_flag_present: bool) -> K
     }
 }
 
-fn keepalive_script_path() -> PathBuf {
-    std::env::var(KEEPALIVE_SCRIPT_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEEPALIVE_SCRIPT))
+/// Where the resolved keepalive script path came from. Logged so a "missing"
+/// verdict against the legacy default is never mistaken for a real finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveSource {
+    /// `QONTINUI_WSL_KEEPALIVE_SCRIPT`.
+    Env,
+    /// The registered action of the `QontinuiWslKeepalive` scheduled task.
+    Task,
+    /// The task is absent from this account's task list; the legacy default,
+    /// which is normally stale.
+    Default,
 }
 
-fn keepalive_disable_flag_path() -> PathBuf {
-    std::env::var(KEEPALIVE_DISABLE_FLAG_ENV)
-        .ok()
+impl KeepaliveSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Env => "env override",
+            Self::Task => "scheduled task",
+            Self::Default => "legacy default (task not registered, or not visible to this account)",
+        }
+    }
+}
+
+/// What asking Task Scheduler produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLookup {
+    /// The task list was read and holds no task of that name.
+    NotRegistered,
+    /// The task's action names this script, and optionally a `-DisableFlag`.
+    Task {
+        script: PathBuf,
+        disable_flag: Option<PathBuf>,
+    },
+    /// The question could not be answered: `schtasks` would not spawn, failed,
+    /// timed out, or its output named no usable `-File` (an action with
+    /// `-Command`, or a path that is not decodable). The location is UNKNOWN.
+    Unreadable,
+}
+
+/// A resolved keepalive script, or the admission that it cannot be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedScript {
+    Known {
+        script: PathBuf,
+        /// The task's own `-DisableFlag`, when it carries one.
+        task_disable_flag: Option<PathBuf>,
+        source: KeepaliveSource,
+    },
+    Unresolved,
+}
+
+/// Split a command line into tokens. Only `"` quotes: single quotes are literal
+/// under the Windows argv rules, and a path such as `C:\Users\O'Brien\k.ps1`
+/// must not open a quote at its apostrophe.
+fn split_command_line(args: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut in_token = false;
+    for c in args.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                in_token = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Decode the XML entities `schtasks` may emit, `&amp;` last so an escaped
+/// ampersand is never decoded twice.
+fn decode_xml_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Pure: the value following `switch` in a scheduled task's `<Arguments>`.
+/// Only `<Arguments>` elements are read, in order, and the first one carrying a
+/// usable value wins. The switch matches case-insensitively on a whole token,
+/// and a value that is itself a switch (`-File -NoProfile`) is rejected.
+pub fn task_switch_value(xml: &str, switch: &str) -> Option<String> {
+    let mut rest = xml;
+    while let Some(open) = rest.find("<Arguments>") {
+        let body = &rest[open + "<Arguments>".len()..];
+        let close = body.find("</Arguments>")?;
+        let tokens = split_command_line(&decode_xml_entities(&body[..close]));
+        if let Some(i) = tokens.iter().position(|t| t.eq_ignore_ascii_case(switch)) {
+            if let Some(value) = tokens.get(i + 1) {
+                if !value.is_empty() && !value.starts_with('-') {
+                    return Some(value.clone());
+                }
+            }
+        }
+        rest = &body[close + "</Arguments>".len()..];
+    }
+    None
+}
+
+/// Decode `schtasks` output. It is single-byte (the OEM code page) when piped,
+/// but a UTF-16 stream (BOM, or interleaved NULs) is decoded as such rather
+/// than silently failing to match anything.
+pub fn decode_schtasks_output(bytes: &[u8]) -> String {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.contains(&0);
+    if !utf16 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Pure: find the full name (folder included, e.g. `\Fleet\QontinuiWslKeepalive`)
+/// of the task called `name` in `schtasks /Query /FO CSV /NH` output. Matching a
+/// listing rather than trusting a bare `/TN` means a task outside the root
+/// folder is found, and "not registered" never has to be inferred from an exit
+/// code or from locale-dependent error text.
+pub fn find_task_in_listing(listing: &str, name: &str) -> Option<String> {
+    let suffix = format!("\\{name}");
+    let mut nested = None;
+    for line in listing.lines() {
+        let Some(first) = line.trim().trim_start_matches('\u{FEFF}').strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = first.find('"') else { continue };
+        let field = &first[..end];
+        if field == suffix {
+            return Some(field.to_string());
+        }
+        if nested.is_none() && field.ends_with(&suffix) {
+            nested = Some(field.to_string());
+        }
+    }
+    nested
+}
+
+/// Pure: whether `p` is an absolute, literal Windows path (`C:\...`, `C:/...`
+/// or UNC) with no `%VAR%` for Task Scheduler to expand at run time. Spelled out
+/// rather than `Path::is_absolute` so it answers the same on every host.
+fn is_literal_absolute_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    (drive || p.starts_with("\\\\")) && !p.contains('%')
+}
+
+/// Pure: map a task's XML definition to a [`TaskLookup`].
+pub fn lookup_from_task_xml_bytes(bytes: &[u8]) -> TaskLookup {
+    let xml = decode_schtasks_output(bytes);
+    let undecodable = |s: &str| s.contains('\u{FFFD}');
+    let Some(script) = task_switch_value(&xml, "-File") else {
+        return TaskLookup::Unreadable;
+    };
+    let flag = task_switch_value(&xml, "-DisableFlag");
+    // U+FFFD means a non-ASCII byte could not be decoded: location UNKNOWN.
+    if undecodable(&script) || flag.as_deref().is_some_and(undecodable) {
+        return TaskLookup::Unreadable;
+    }
+    // A relative or `%VAR%` path would be tested as written and read as absent.
+    let literal = |p: &str| is_literal_absolute_windows_path(p);
+    if !literal(&script) || flag.as_deref().is_some_and(|f| !literal(f)) {
+        return TaskLookup::Unreadable;
+    }
+    TaskLookup::Task {
+        script: PathBuf::from(script),
+        disable_flag: flag.map(PathBuf::from),
+    }
+}
+
+/// Pure precedence: explicit env override, then the scheduled task, then the
+/// legacy default. The task lookup runs only when no override is set. Only a
+/// task that is genuinely not registered falls back to the default — a lookup
+/// that could not be answered is `Unresolved`, never silently "absent".
+pub fn resolve_keepalive_script(
+    env_override: Option<String>,
+    lookup_task: impl FnOnce() -> TaskLookup,
+) -> ResolvedScript {
+    if let Some(v) = env_override.filter(|v| !v.trim().is_empty()) {
+        return ResolvedScript::Known {
+            script: PathBuf::from(v),
+            task_disable_flag: None,
+            source: KeepaliveSource::Env,
+        };
+    }
+    match lookup_task() {
+        TaskLookup::Task {
+            script,
+            disable_flag,
+        } => ResolvedScript::Known {
+            script,
+            task_disable_flag: disable_flag,
+            source: KeepaliveSource::Task,
+        },
+        TaskLookup::Unreadable => ResolvedScript::Unresolved,
+        TaskLookup::NotRegistered => ResolvedScript::Known {
+            script: PathBuf::from(DEFAULT_KEEPALIVE_SCRIPT),
+            task_disable_flag: None,
+            source: KeepaliveSource::Default,
+        },
+    }
+}
+
+/// Pure: where the disable flag lives. Env override, then the task's own
+/// `-DisableFlag`, then the legacy default.
+pub fn resolve_disable_flag(env_override: Option<String>, task_flag: Option<PathBuf>) -> PathBuf {
+    env_override
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
+        .or(task_flag)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_KEEPALIVE_DISABLE_FLAG))
 }
 
-/// Observe the keepalive from the filesystem. Cheap (two `exists()` calls) and
-/// only done on a `DistroDown` tick.
-fn observe_keepalive() -> (KeepalivePresence, PathBuf) {
-    let script = keepalive_script_path();
-    let flag = keepalive_disable_flag_path();
-    (classify_keepalive(script.exists(), flag.exists()), script)
+/// How long to wait for one `schtasks` call before giving up (a stalled Task
+/// Scheduler service must not hang the probe).
+const SCHTASKS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `cmd` to completion within `timeout`, returning whether it exited
+/// successfully and everything it wrote to stdout. stdout is drained on its own
+/// thread, so output larger than the pipe buffer cannot stall the child into a
+/// false timeout. `None` means it would not spawn or did not finish in time.
+fn run_bounded(cmd: &mut std::process::Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn().ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                // Killing closes the pipe, which ends the reader thread.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?;
+    Some((status.success(), bytes))
+}
+
+/// The two-call lookup, with the process runner injected so every failure arm
+/// is testable: list the tasks and find ours by name (so "not registered" is a
+/// fact about the list, not an inference from an exit code), then read its XML.
+fn lookup_task_via(mut run: impl FnMut(&[&str]) -> Option<(bool, Vec<u8>)>) -> TaskLookup {
+    let Some((true, listing)) = run(&["/Query", "/FO", "CSV", "/NH"]) else {
+        return TaskLookup::Unreadable;
+    };
+    let Some(full_name) =
+        find_task_in_listing(&decode_schtasks_output(&listing), KEEPALIVE_TASK_NAME)
+    else {
+        return TaskLookup::NotRegistered;
+    };
+    match run(&["/Query", "/TN", &full_name, "/XML"]) {
+        Some((true, bytes)) => lookup_from_task_xml_bytes(&bytes),
+        _ => TaskLookup::Unreadable,
+    }
+}
+
+/// `schtasks.exe` from System32, not a bare-name search that includes the
+/// current directory; falls back to the bare name when `SystemRoot` is unset.
+fn schtasks_program() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("schtasks.exe"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("schtasks"))
+}
+
+/// Ask Task Scheduler where the keepalive script really lives.
+fn query_keepalive_task() -> TaskLookup {
+    lookup_task_via(|args| {
+        let mut cmd = std::process::Command::new(schtasks_program());
+        cmd.args(args);
+        run_bounded(&mut cmd, SCHTASKS_TIMEOUT)
+    })
+}
+
+/// Observe the keepalive: resolve the script (bounded `schtasks` calls when no
+/// env override is set), then test it and the disable flag with `exists()`.
+/// Blocking — call through `spawn_blocking`. Only done on a `DistroDown` tick.
+fn observe_keepalive() -> (KeepalivePresence, PathBuf, Option<KeepaliveSource>) {
+    match resolve_keepalive_script(
+        std::env::var(KEEPALIVE_SCRIPT_ENV).ok(),
+        query_keepalive_task,
+    ) {
+        ResolvedScript::Known {
+            script,
+            task_disable_flag,
+            source,
+        } => {
+            let flag = resolve_disable_flag(
+                std::env::var(KEEPALIVE_DISABLE_FLAG_ENV).ok(),
+                task_disable_flag,
+            );
+            (
+                classify_keepalive(script.exists(), flag.exists()),
+                script,
+                Some(source),
+            )
+        }
+        ResolvedScript::Unresolved => (KeepalivePresence::Unknown, PathBuf::new(), None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -825,17 +1154,26 @@ pub async fn ci_runner_probe_loop(state: Arc<SupervisorState>) {
         if new_state.status == CiRunnerStatus::DistroDown {
             distro_down_ticks += 1;
             if distro_down_ticks == 1 || distro_down_ticks.is_multiple_of(DISTRO_DOWN_LOG_EVERY) {
-                let (keepalive, script_path) = observe_keepalive();
+                let (keepalive, script_path, source) =
+                    match tokio::task::spawn_blocking(observe_keepalive).await {
+                        Ok(obs) => obs,
+                        Err(e) => {
+                            warn!("ci_runner_probe: keepalive observation panicked: {e}");
+                            (KeepalivePresence::Unknown, PathBuf::new(), None)
+                        }
+                    };
+                let source = source.map_or("unresolved", |s| s.as_str());
                 warn!(
                     "ci_runner_probe: WSL distro is NOT running ({} consecutive tick(s)). \
                      CI runners cannot be online, and this is a HOST-level fault — no \
                      `systemctl restart` will be attempted and the restart budget is \
                      untouched, because restarting through WSL would merely boot the \
                      distro and mask the cause. Distro liveness is owned by the \
-                     keepalive, not by this probe: {} (looked at {}).",
+                     keepalive, not by this probe: {} (looked at {}, from {}).",
                     distro_down_ticks,
                     keepalive.as_str(),
-                    script_path.display()
+                    script_path.display(),
+                    source
                 );
             }
         } else {
@@ -1573,5 +1911,418 @@ mod tests {
             KeepalivePresence::DisabledByFlag
         );
         assert_eq!(classify_keepalive(true, false), KeepalivePresence::Present);
+    }
+
+    /// The `-File <path>` script out of a task's XML, as production reads it.
+    fn script_path_from_task_xml(xml: &str) -> Option<PathBuf> {
+        task_switch_value(xml, "-File").map(PathBuf::from)
+    }
+
+    fn task_xml(arguments: &str) -> String {
+        format!("<Exec><Command>powershell.exe</Command><Arguments>{arguments}</Arguments></Exec>")
+    }
+
+    const LIVE_SCRIPT: &str = r"C:\qontinui-root\qontinui-claude-config\scripts\wsl-keepalive.ps1";
+    const TASK: &str = "QontinuiWslKeepalive";
+
+    fn live_task() -> TaskLookup {
+        TaskLookup::Task {
+            script: PathBuf::from(LIVE_SCRIPT),
+            disable_flag: None,
+        }
+    }
+
+    #[test]
+    fn script_path_parsed_from_task_xml() {
+        let quoted = task_xml(&format!(
+            "-NoProfile -File \"{LIVE_SCRIPT}\" -Distro \"Ubuntu-24.04\""
+        ));
+        assert_eq!(
+            script_path_from_task_xml(&quoted),
+            Some(PathBuf::from(LIVE_SCRIPT))
+        );
+        // The same definition with the quotes XML-escaped, three ways.
+        for entity in ["&quot;", "&#34;", "&#x22;"] {
+            let escaped = quoted.replace('"', entity);
+            assert_eq!(
+                script_path_from_task_xml(&escaped),
+                Some(PathBuf::from(LIVE_SCRIPT)),
+                "entity {entity}"
+            );
+        }
+        // Bare path, and a path containing a space.
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-File C:\k\wsl-keepalive.ps1")),
+            Some(PathBuf::from(r"C:\k\wsl-keepalive.ps1"))
+        );
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r#"-File "C:\Program Files\k\a.ps1""#)),
+            Some(PathBuf::from(r"C:\Program Files\k\a.ps1"))
+        );
+    }
+
+    #[test]
+    fn apostrophe_in_a_path_is_literal() {
+        // Single quotes are literal under Windows argv rules: this must not
+        // open a quote and swallow `-Distro` into the path.
+        let xml = task_xml(r#"-File "C:\Users\O'Brien\wsl-keepalive.ps1" -Distro "Ubuntu-24.04""#);
+        assert_eq!(
+            script_path_from_task_xml(&xml),
+            Some(PathBuf::from(r"C:\Users\O'Brien\wsl-keepalive.ps1"))
+        );
+        // The same path bare, with the apostrophe XML-escaped.
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-File C:\Users\O&apos;Brien\k.ps1 -X")),
+            Some(PathBuf::from(r"C:\Users\O'Brien\k.ps1"))
+        );
+    }
+
+    #[test]
+    fn script_path_matches_file_switch_only_as_a_whole_token() {
+        // PowerShell switches are case-insensitive.
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-file C:\k\a.ps1")),
+            Some(PathBuf::from(r"C:\k\a.ps1"))
+        );
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-FILE C:\k\a.ps1")),
+            Some(PathBuf::from(r"C:\k\a.ps1"))
+        );
+        // A longer switch that merely starts with -File is not -File.
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-FileLogPath C:\x.log -File C:\k\a.ps1")),
+            Some(PathBuf::from(r"C:\k\a.ps1"))
+        );
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-Filename C:\x.ps1")),
+            None
+        );
+        // First occurrence wins.
+        assert_eq!(
+            script_path_from_task_xml(&task_xml(r"-File C:\first.ps1 -File C:\second.ps1")),
+            Some(PathBuf::from(r"C:\first.ps1"))
+        );
+    }
+
+    #[test]
+    fn script_path_absent_when_task_xml_names_none() {
+        assert_eq!(script_path_from_task_xml(&task_xml("-NoProfile")), None);
+        assert_eq!(script_path_from_task_xml(&task_xml("-File")), None);
+        assert_eq!(
+            script_path_from_task_xml(&task_xml("-File -NoProfile")),
+            None
+        );
+        assert_eq!(script_path_from_task_xml(&task_xml(r#"-File """#)), None);
+        assert_eq!(script_path_from_task_xml(""), None);
+        // A -File outside the <Arguments> element is not an action argument.
+        assert_eq!(
+            script_path_from_task_xml(
+                r"<Description>-File C:\nope.ps1</Description><Arguments>-NoProfile</Arguments>"
+            ),
+            None
+        );
+        // An unterminated <Arguments> element.
+        assert_eq!(
+            script_path_from_task_xml(r"<Arguments>-File C:\k\a.ps1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_later_action_can_carry_the_script() {
+        // The first <Exec> is some other action; the keepalive is the second.
+        let xml = format!(
+            "{}{}",
+            task_xml("-NoProfile -Command Get-Date"),
+            task_xml(&format!("-File \"{LIVE_SCRIPT}\""))
+        );
+        assert_eq!(
+            script_path_from_task_xml(&xml),
+            Some(PathBuf::from(LIVE_SCRIPT))
+        );
+    }
+
+    #[test]
+    fn schtasks_output_decoding() {
+        // Single-byte output is decoded as text.
+        assert_eq!(decode_schtasks_output(b"<a>x</a>"), "<a>x</a>");
+        // UTF-16LE with a BOM, and without one, is decoded rather than missed.
+        let utf16: Vec<u8> = "<a>x</a>"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(decode_schtasks_output(&utf16), "<a>x</a>");
+        let mut bom = vec![0xFF, 0xFE];
+        bom.extend_from_slice(&utf16);
+        assert_eq!(decode_schtasks_output(&bom), "<a>x</a>");
+        // A dangling odd byte is dropped, never a panic.
+        let mut odd = utf16.clone();
+        odd.push(0x41);
+        assert_eq!(decode_schtasks_output(&odd), "<a>x</a>");
+    }
+
+    #[test]
+    fn xml_entities_are_not_decoded_twice() {
+        // `&amp;quot;` is the text `&quot;`, not a quote character.
+        assert_eq!(decode_xml_entities("&amp;quot;"), "&quot;");
+        assert_eq!(decode_xml_entities("&quot;&amp;&lt;"), "\"&<");
+    }
+
+    #[test]
+    fn task_listing_is_matched_by_name_wherever_the_task_lives() {
+        let listing = concat!(
+            "\"\\Qontinui-Subst-D-Drive\",\"N/A\",\"Ready\"\r\n",
+            "\"\\QontinuiWslKeepalive\",\"At log on\",\"Running\"\r\n",
+        );
+        assert_eq!(
+            find_task_in_listing(listing, TASK),
+            Some("\\QontinuiWslKeepalive".to_string())
+        );
+        // A task in a subfolder is found, with its folder.
+        let nested = "\"\\Fleet\\QontinuiWslKeepalive\",\"N/A\",\"Ready\"";
+        assert_eq!(
+            find_task_in_listing(nested, TASK),
+            Some("\\Fleet\\QontinuiWslKeepalive".to_string())
+        );
+        // A different task whose name merely ends the same way is not ours.
+        assert_eq!(
+            find_task_in_listing("\"\\Not-QontinuiWslKeepalive\",\"N/A\",\"Ready\"", TASK),
+            None
+        );
+        // Absent, empty and junk listings find nothing.
+        assert_eq!(find_task_in_listing(listing, "Other"), None);
+        assert_eq!(find_task_in_listing("", TASK), None);
+        assert_eq!(find_task_in_listing("INFO: no tasks\r\n", TASK), None);
+    }
+
+    #[test]
+    fn task_xml_maps_to_a_lookup() {
+        let xml = task_xml(&format!("-File \"{LIVE_SCRIPT}\""));
+        assert_eq!(lookup_from_task_xml_bytes(xml.as_bytes()), live_task());
+        // The task's own -DisableFlag is carried through.
+        let with_flag = task_xml(&format!(
+            "-File \"{LIVE_SCRIPT}\" -DisableFlag \"D:\\off.flag\""
+        ));
+        assert_eq!(
+            lookup_from_task_xml_bytes(with_flag.as_bytes()),
+            TaskLookup::Task {
+                script: PathBuf::from(LIVE_SCRIPT),
+                disable_flag: Some(PathBuf::from(r"D:\off.flag")),
+            }
+        );
+        // An action with no -File (e.g. -Command) is UNKNOWN.
+        assert_eq!(
+            lookup_from_task_xml_bytes(task_xml("-Command Get-Date").as_bytes()),
+            TaskLookup::Unreadable
+        );
+        // So is a path or flag holding an undecodable byte (OEM 0x81 is `u-umlaut`).
+        let bad_script = b"<Arguments>-File C:\\Users\\J\x81rg\\k.ps1</Arguments>";
+        assert_eq!(
+            lookup_from_task_xml_bytes(bad_script),
+            TaskLookup::Unreadable
+        );
+        let bad_flag = b"<Arguments>-File C:\\k.ps1 -DisableFlag C:\\J\x81rg\\f</Arguments>";
+        assert_eq!(lookup_from_task_xml_bytes(bad_flag), TaskLookup::Unreadable);
+    }
+
+    #[test]
+    fn disable_flag_precedence() {
+        let task_flag = Some(PathBuf::from(r"D:\off.flag"));
+        assert_eq!(
+            resolve_disable_flag(Some(r"E:\env.flag".into()), task_flag.clone()),
+            PathBuf::from(r"E:\env.flag")
+        );
+        assert_eq!(
+            resolve_disable_flag(Some("  ".into()), task_flag.clone()),
+            PathBuf::from(r"D:\off.flag")
+        );
+        assert_eq!(
+            resolve_disable_flag(None, task_flag),
+            PathBuf::from(r"D:\off.flag")
+        );
+        assert_eq!(
+            resolve_disable_flag(None, None),
+            PathBuf::from(DEFAULT_KEEPALIVE_DISABLE_FLAG)
+        );
+    }
+
+    #[test]
+    fn keepalive_script_resolution_precedence() {
+        use std::cell::Cell;
+
+        // An env override wins and the task is never asked.
+        let asked = Cell::new(false);
+        let r = resolve_keepalive_script(Some(r"D:\x.ps1".into()), || {
+            asked.set(true);
+            live_task()
+        });
+        assert_eq!(
+            r,
+            ResolvedScript::Known {
+                script: PathBuf::from(r"D:\x.ps1"),
+                task_disable_flag: None,
+                source: KeepaliveSource::Env,
+            }
+        );
+        assert!(!asked.get(), "task lookup must not run under an override");
+
+        // A blank override is no override; the task beats the legacy default.
+        let from_task = ResolvedScript::Known {
+            script: PathBuf::from(LIVE_SCRIPT),
+            task_disable_flag: None,
+            source: KeepaliveSource::Task,
+        };
+        assert_eq!(
+            resolve_keepalive_script(Some("  ".into()), live_task),
+            from_task
+        );
+        assert_eq!(resolve_keepalive_script(None, live_task), from_task);
+        // Only a genuinely unregistered task falls back to the legacy default.
+        assert_eq!(
+            resolve_keepalive_script(None, || TaskLookup::NotRegistered),
+            ResolvedScript::Known {
+                script: PathBuf::from(DEFAULT_KEEPALIVE_SCRIPT),
+                task_disable_flag: None,
+                source: KeepaliveSource::Default,
+            }
+        );
+        // A lookup that could not be answered is UNKNOWN, never the default.
+        assert_eq!(
+            resolve_keepalive_script(None, || TaskLookup::Unreadable),
+            ResolvedScript::Unresolved
+        );
+    }
+
+    #[test]
+    fn run_bounded_reports_a_program_that_will_not_spawn() {
+        let mut cmd = std::process::Command::new("qontinui-no-such-program-0f3a");
+        assert_eq!(run_bounded(&mut cmd, Duration::from_secs(2)), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_bounded_drains_output_larger_than_the_pipe_buffer() {
+        // ~340 KB written before exit. If stdout were read only after exit, the
+        // child would block on a full pipe and this would time out.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "for /L %i in (1,1,20000) do @echo 0123456789abcdef"]);
+        let (ok, bytes) = run_bounded(&mut cmd, Duration::from_secs(30)).expect("finished");
+        assert!(ok);
+        assert!(bytes.len() > 64 * 1024, "got {} bytes", bytes.len());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_bounded_kills_a_child_that_overruns_the_timeout() {
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        let started = Instant::now();
+        assert_eq!(run_bounded(&mut cmd, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_bounded_reports_a_nonzero_exit() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "exit 3"]);
+        let (ok, _) = run_bounded(&mut cmd, Duration::from_secs(10)).expect("finished");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn non_literal_script_paths_are_unknown_not_absent() {
+        for bad in [
+            r"%USERPROFILE%\k\wsl-keepalive.ps1",
+            r"scripts\wsl-keepalive.ps1",
+            r"wsl-keepalive.ps1",
+            r"\rooted\no\drive.ps1",
+        ] {
+            let xml = task_xml(&format!("-File \"{bad}\""));
+            assert_eq!(
+                lookup_from_task_xml_bytes(xml.as_bytes()),
+                TaskLookup::Unreadable,
+                "{bad}"
+            );
+        }
+        // Absolute forms are accepted: drive with either slash, and UNC.
+        for good in [r"C:\k\a.ps1", "D:/k/a.ps1", r"\\host\share\a.ps1"] {
+            let xml = task_xml(&format!("-File \"{good}\""));
+            assert_eq!(
+                lookup_from_task_xml_bytes(xml.as_bytes()),
+                TaskLookup::Task {
+                    script: PathBuf::from(good),
+                    disable_flag: None
+                },
+                "{good}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_match_survives_a_bom_and_prefers_the_root_task() {
+        let bom = "\u{FEFF}\"\\QontinuiWslKeepalive\",\"N/A\",\"Ready\"";
+        assert_eq!(
+            find_task_in_listing(bom, TASK),
+            Some("\\QontinuiWslKeepalive".to_string())
+        );
+        // The same name in two folders: the root task wins whatever the order.
+        let clash = concat!(
+            "\"\\Old\\QontinuiWslKeepalive\",\"N/A\",\"Ready\"\r\n",
+            "\"\\QontinuiWslKeepalive\",\"N/A\",\"Ready\"\r\n",
+        );
+        assert_eq!(
+            find_task_in_listing(clash, TASK),
+            Some("\\QontinuiWslKeepalive".to_string())
+        );
+    }
+
+    #[test]
+    fn task_lookup_flow_maps_every_failure_arm() {
+        let listing = b"\"\\QontinuiWslKeepalive\",\"At log on\",\"Ready\"\r\n".to_vec();
+        let xml = task_xml(&format!("-File \"{LIVE_SCRIPT}\"")).into_bytes();
+
+        // Happy path asks for the listing, then the task's XML by its full name.
+        let mut calls: Vec<String> = Vec::new();
+        let got = lookup_task_via(|args| {
+            calls.push(args.join(" "));
+            Some((
+                true,
+                if args.contains(&"CSV") {
+                    listing.clone()
+                } else {
+                    xml.clone()
+                },
+            ))
+        });
+        assert_eq!(got, live_task());
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1].contains("/TN \\QontinuiWslKeepalive /XML"),
+            "{calls:?}"
+        );
+
+        // A task missing from a listing that read fine is NotRegistered.
+        assert_eq!(
+            lookup_task_via(|_| Some((true, b"\"\\Other\",\"N/A\",\"Ready\"\r\n".to_vec()))),
+            TaskLookup::NotRegistered
+        );
+        // A listing that cannot be read is UNKNOWN, never NotRegistered.
+        assert_eq!(lookup_task_via(|_| None), TaskLookup::Unreadable);
+        assert_eq!(
+            lookup_task_via(|_| Some((false, Vec::new()))),
+            TaskLookup::Unreadable
+        );
+        // A task that is listed but whose XML cannot be read is UNKNOWN.
+        for xml_call in [None, Some((false, Vec::new()))] {
+            let got = lookup_task_via(|args| {
+                if args.contains(&"CSV") {
+                    Some((true, listing.clone()))
+                } else {
+                    xml_call.clone()
+                }
+            });
+            assert_eq!(got, TaskLookup::Unreadable);
+        }
     }
 }
