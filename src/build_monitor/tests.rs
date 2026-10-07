@@ -1899,8 +1899,13 @@ fn each_cargo_call_site_applies_its_own_invocation_kind() {
 // Phase 3 (D2). A worktree whose `node_modules` is a symlink into the
 // shared primary must get the LINK removed before `pnpm install`, so
 // the install lands in a real dir and the primary is byte-identical.
+//
+// Runs on unix (a symlink) AND Windows (a junction, `mklink /J` — the
+// shape the allocator's link arm actually produces on MSYS). CI is
+// ubuntu-only, so the Windows half runs on a Windows dev box; it is the
+// only coverage `remove_link`'s `remove_dir`-on-a-reparse-point branch has.
 // ---------------------------------------------------------------
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod unlink_before_install {
     use super::super::{
         prebuild_worktree_frontend_with, unlink_node_modules_link, UNLINKED_NODE_MODULES_LOG,
@@ -1908,11 +1913,40 @@ mod unlink_before_install {
     use super::lkg_test_state;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    /// Make `link` a directory link to `target`: a symlink on unix, a
+    /// junction on Windows (no privilege needed, unlike `symlink_dir`).
+    #[cfg(unix)]
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link.as_ref())
+            .arg(target.as_ref())
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )))
+        }
+    }
 
     /// Every regular file under `root` (not following links) → its bytes.
     fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -1992,7 +2026,11 @@ mod unlink_before_install {
     #[test]
     fn unlink_removes_a_dangling_link() {
         let tmp = TempDir::new().unwrap();
+        // Link to a real dir, then delete the target: the dangling shape a
+        // reaped worktree's primary is left with, on either platform.
+        fs::create_dir_all(tmp.path().join("gone")).unwrap();
         symlink(tmp.path().join("gone"), tmp.path().join("node_modules")).unwrap();
+        fs::remove_dir(tmp.path().join("gone")).unwrap();
         assert!(unlink_node_modules_link(tmp.path()).expect("unlink"));
         assert!(fs::symlink_metadata(tmp.path().join("node_modules")).is_err());
     }
