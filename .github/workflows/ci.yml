@@ -612,6 +612,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Schemas sibling pin tests
         run: bash .github/scripts/test-schemas-pin.sh
+      - name: Pre-commit cargo target-dir tests
+        run: bash .github/scripts/test-pre-commit-cargo.sh
 
   compose-parity:
     name: Compose Parity (cross-repo fixture drift)
