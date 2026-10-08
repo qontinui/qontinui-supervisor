@@ -46,4 +46,20 @@ check "primary checkout leaves CARGO_TARGET_DIR unset" "TARGET=<unset> ARGS=clip
 out="$(cd "$tmp/wt" && CARGO_TARGET_DIR="$tmp/chosen" bash "$SCRIPT" clippy 2>/dev/null)"
 check "a preset CARGO_TARGET_DIR wins" "TARGET=chosen-target ARGS=clippy" "$out"
 
+# A primary whose git dir lives elsewhere (`--separate-git-dir`): there is no
+# checkout-owned `.git` to take the parent of, so nothing is guessed - neither
+# for the primary itself nor for its linked worktree.
+mkdir -p "$tmp/store"
+git init -q --separate-git-dir "$tmp/store/sep.git" "$tmp/sep"
+git -C "$tmp/sep" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$tmp/sep" worktree add -q "$tmp/sepwt" -b sepwt
+mkdir -p "$tmp/store/target"
+echo store-target > "$tmp/store/target/MARKER"   # the guessed dir it must NOT pick
+
+out="$(cd "$tmp/sep" && bash "$SCRIPT" clippy 2>/dev/null)"
+check "separate-git-dir primary leaves CARGO_TARGET_DIR unset" "TARGET=<unset> ARGS=clippy" "$out"
+
+out="$(cd "$tmp/sepwt" && bash "$SCRIPT" clippy 2>/dev/null)"
+check "worktree of a separate-git-dir primary leaves it unset" "TARGET=<unset> ARGS=clippy" "$out"
+
 exit "$fail"

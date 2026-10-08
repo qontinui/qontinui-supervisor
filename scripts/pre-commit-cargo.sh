@@ -14,14 +14,24 @@
 # In the primary checkout itself nothing is set, so cargo's default applies.
 set -euo pipefail
 
+#
+# The primary is the parent of the common git dir ONLY when that dir is a
+# checkout's own `.git` directory. Any other layout (a separate git dir, a
+# submodule's `.git/modules/<name>`, a bare repo) has no checkout we can name,
+# so leave cargo's default alone rather than guess - the same rule
+# qontinui-claude-config's cargo-verify.sh applies.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   top="$(git rev-parse --show-toplevel)"
   common="$(git rev-parse --path-format=absolute --git-common-dir)"
-  primary="$(dirname "$common")"
-  if [ "$(cd "$primary" && pwd -P)" != "$(cd "$top" && pwd -P)" ]; then
-    export CARGO_TARGET_DIR="$primary/target"
-    echo "pre-commit-cargo: linked worktree; building into the primary's shared target: $CARGO_TARGET_DIR" >&2
-  fi
+  case "$common" in
+    */.git)
+      primary="$(dirname "$common")"
+      if [ "$(cd "$primary" && pwd -P)" != "$(cd "$top" && pwd -P)" ]; then
+        export CARGO_TARGET_DIR="$primary/target"
+        echo "pre-commit-cargo: linked worktree; building into the primary's shared target: $CARGO_TARGET_DIR" >&2
+      fi
+      ;;
+  esac
 fi
 
 exec cargo "$@"
