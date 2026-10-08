@@ -2154,3 +2154,157 @@ mod unlink_before_install {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pre-permit memory gate outcome (plan 2026-10-02-cargo-jobs-…, Phase 5).
+// `run_mem_gate` is the decision loop behind `check_ram_guard`, driven here
+// with a scripted probe and a millisecond interval — no real memory reading,
+// no 15 s sleep.
+// ---------------------------------------------------------------------------
+
+mod mem_gate {
+    use super::super::{run_mem_gate, MemGateOutcome, MemGateReading, GIB};
+    use crate::log_capture::LogLevel;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    /// Drive the gate over a scripted sequence of readings (the last one
+    /// repeats once the script runs out) and return the outcome, the number
+    /// of probes taken, and every message emitted.
+    async fn drive(
+        min_commit_gb: u64,
+        min_phys_gb: u64,
+        wait_max: Duration,
+        script: Vec<MemGateReading>,
+    ) -> (MemGateOutcome, usize, Vec<(LogLevel, String)>) {
+        let probes = RefCell::new(0usize);
+        let logs = RefCell::new(Vec::new());
+        let outcome = run_mem_gate(
+            min_commit_gb,
+            min_phys_gb,
+            wait_max,
+            Duration::from_millis(1),
+            || {
+                let mut n = probes.borrow_mut();
+                let r = script[(*n).min(script.len() - 1)];
+                *n += 1;
+                r
+            },
+            || (Some(64 * GIB), Some(32 * GIB)),
+            |level, msg| {
+                logs.borrow_mut().push((level, msg));
+                std::future::ready(())
+            },
+        )
+        .await;
+        (outcome, probes.into_inner(), logs.into_inner())
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_wait_is_recorded_as_proceeded_after_wait() {
+        // Commit stays at 1 GB against a 5 GB floor and the wait ceiling is
+        // zero: the gate must fail open on the FIRST short reading and say so.
+        let (outcome, probes, logs) = drive(5, 0, Duration::ZERO, vec![(Some(GIB), None)]).await;
+        assert_eq!(outcome, MemGateOutcome::ProceededAfterWait);
+        assert_eq!(probes, 1, "a zero wait ceiling must not sleep or re-probe");
+        let (level, msg) = logs.last().expect("the fail-open must be logged");
+        assert!(matches!(level, LogLevel::Warn));
+        assert!(msg.contains("building anyway"), "{msg}");
+        assert!(msg.contains("mem_gate: proceeded_after_wait"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_outlasts_the_ceiling_proceeds_after_waiting() {
+        // A non-zero ceiling that the shortage outlasts: deferral is logged
+        // once, then the fail-open after the ceiling elapses.
+        let (outcome, probes, logs) =
+            drive(5, 0, Duration::from_millis(3), vec![(Some(GIB), None)]).await;
+        assert_eq!(outcome, MemGateOutcome::ProceededAfterWait);
+        assert!(probes >= 2, "the gate must have re-probed while waiting");
+        assert!(logs.iter().any(|(_, m)| m.contains("deferring build")));
+        assert!(logs
+            .last()
+            .is_some_and(|(_, m)| m.contains("mem_gate: proceeded_after_wait")));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_first_probe_is_passed_and_silent() {
+        let (outcome, probes, logs) =
+            drive(5, 0, Duration::from_secs(900), vec![(Some(64 * GIB), None)]).await;
+        assert_eq!(outcome, MemGateOutcome::Passed);
+        assert_eq!(probes, 1);
+        assert!(logs.is_empty(), "a pass must not log: {logs:?}");
+    }
+
+    #[tokio::test]
+    async fn headroom_recovering_inside_the_wait_is_passed_after_wait() {
+        let (outcome, _, logs) = drive(
+            5,
+            0,
+            Duration::from_secs(900),
+            vec![(Some(GIB), None), (Some(GIB), None), (Some(64 * GIB), None)],
+        )
+        .await;
+        assert_eq!(outcome, MemGateOutcome::PassedAfterWait);
+        assert!(logs
+            .last()
+            .is_some_and(|(_, m)| m.contains("headroom recovered")
+                && m.contains("mem_gate: passed_after_wait")));
+    }
+
+    #[tokio::test]
+    async fn every_armed_probe_unreadable_is_probe_unreadable() {
+        // Both arms armed, both probes dark: allowed (fail-open), but it is
+        // NOT a pass — nothing was measured.
+        let (outcome, probes, logs) =
+            drive(5, 3, Duration::from_secs(900), vec![(None, None)]).await;
+        assert_eq!(outcome, MemGateOutcome::ProbeUnreadable);
+        assert_eq!(probes, 1);
+        assert!(logs
+            .last()
+            .is_some_and(|(_, m)| m.contains("mem_gate: probe_unreadable")));
+    }
+
+    #[tokio::test]
+    async fn one_armed_arm_measured_is_a_pass_not_probe_unreadable() {
+        // Physical dark but commit read and cleared its floor: one arm
+        // genuinely measured headroom, so this is a pass.
+        let (outcome, _, _) =
+            drive(5, 3, Duration::from_secs(900), vec![(Some(64 * GIB), None)]).await;
+        assert_eq!(outcome, MemGateOutcome::Passed);
+        // A disarmed arm's reading never counts as measurement: commit armed
+        // but dark, physical disarmed (its `Some` is ignored) → unreadable.
+        let (outcome, _, _) =
+            drive(5, 0, Duration::from_secs(900), vec![(None, Some(64 * GIB))]).await;
+        assert_eq!(outcome, MemGateOutcome::ProbeUnreadable);
+    }
+
+    #[tokio::test]
+    async fn both_floors_zero_is_disabled_without_probing() {
+        let (outcome, probes, logs) =
+            drive(0, 0, Duration::ZERO, vec![(Some(GIB), Some(GIB))]).await;
+        assert_eq!(outcome, MemGateOutcome::Disabled);
+        assert_eq!(probes, 0, "a disabled gate must not read a probe");
+        assert!(logs.is_empty());
+    }
+
+    #[test]
+    fn mem_gate_outcome_serializes_snake_case_matching_as_str() {
+        for o in [
+            MemGateOutcome::Disabled,
+            MemGateOutcome::Passed,
+            MemGateOutcome::PassedAfterWait,
+            MemGateOutcome::ProceededAfterWait,
+            MemGateOutcome::ProbeUnreadable,
+        ] {
+            assert_eq!(
+                serde_json::to_value(o).unwrap(),
+                serde_json::Value::String(o.as_str().to_string())
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(MemGateOutcome::ProceededAfterWait).unwrap(),
+            "proceeded_after_wait"
+        );
+    }
+}

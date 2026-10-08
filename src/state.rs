@@ -730,6 +730,13 @@ pub struct BuildState {
     pub last_build_error: Option<String>,
     pub last_build_at: Option<DateTime<Utc>>,
     pub last_build_stderr: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent real (non-prewarm)
+    /// build — set when that build claims its slot, alongside
+    /// `last_build_at`. Surfaced as `GET /health` `build.last_mem_gate` so a
+    /// build that ran because the gate's wait EXPIRED
+    /// (`proceeded_after_wait`) is distinguishable from one that passed.
+    /// `None` until the first build.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 /// Metadata for an active build on a specific slot.
@@ -739,6 +746,9 @@ pub struct BuildInfo {
     pub requester_id: Option<String>,
     /// What kind of rebuild: "dev" or "exe" (custom-protocol/embedded frontend).
     pub rebuild_kind: String,
+    /// What the pre-permit memory gate decided before this build claimed the
+    /// slot. `None` only where no gate ran (test fixtures).
+    pub mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 // State of the frontend (`npm run build`) for a specific slot.
@@ -791,6 +801,12 @@ pub struct SlotHistory {
     /// failures for that slot — the failure is no longer the current state).
     /// Use `GET /builds/{slot_id}/log` for the full untruncated log.
     pub last_error_log: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent build (real or
+    /// prewarm) to claim this slot. Surfaced as `GET /builds`
+    /// `slots[].history.last_mem_gate`; persists after the build finishes so
+    /// a fail-open (`proceeded_after_wait`) stays visible next to the build's
+    /// result. `None` until a gated build claims the slot.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 impl Default for SlotHistory {
@@ -809,6 +825,7 @@ impl SlotHistory {
             last_error: None,
             last_error_detail: None,
             last_error_log: None,
+            last_mem_gate: None,
         }
     }
 
@@ -1835,6 +1852,7 @@ impl BuildState {
             last_build_error: None,
             last_build_at: None,
             last_build_stderr: None,
+            last_mem_gate: None,
         }
     }
 }
@@ -2883,6 +2901,7 @@ mod tests {
                 started_at: Utc::now(),
                 requester_id: Some("test".to_string()),
                 rebuild_kind: "exe".to_string(),
+                mem_gate: None,
             })
             .await;
         pool.queue_depth.fetch_add(2, Ordering::Relaxed);

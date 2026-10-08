@@ -5716,6 +5716,10 @@ pub async fn list_builds(
             // Inline ~1 KiB tail of the most recent FAILED build's stderr.
             // Cleared on subsequent success. Full log: GET /builds/{id}/log.
             "last_error_log": history_snapshot.last_error_log,
+            // Pre-permit memory-gate outcome of the last build to claim this
+            // slot — `proceeded_after_wait` marks a build that ran because the
+            // gate's wait expired (fail-open), not because headroom was there.
+            "last_mem_gate": history_snapshot.last_mem_gate,
         });
 
         let (slot_git_sha, slot_source) = match provenance_by_slot.get(&slot.id) {
@@ -5741,6 +5745,7 @@ pub async fn list_builds(
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "mem_gate": i.mem_gate,
                 }));
                 json!({
                     "id": slot.id,
@@ -5750,6 +5755,7 @@ pub async fn list_builds(
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "mem_gate": i.mem_gate,
                     "frontend_stale": frontend_stale,
                     "git_sha": slot_git_sha,
                     "source": slot_source,
