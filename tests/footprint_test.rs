@@ -346,6 +346,7 @@ async fn clean_slot_refuses_active_build() {
             started_at: chrono::Utc::now(),
             requester_id: Some("test".to_string()),
             rebuild_kind: "exe".to_string(),
+            mem_gate: None,
         });
     }
 

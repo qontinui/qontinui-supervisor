@@ -262,6 +262,12 @@ pub struct BuildHealth {
     pub error_detected: bool,
     pub last_error: Option<String>,
     pub last_build_at: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent real build
+    /// (`passed` | `passed_after_wait` | `proceeded_after_wait` |
+    /// `probe_unreadable` | `disabled`). `proceeded_after_wait` means the gate
+    /// FAILED OPEN — memory stayed short past `mem_wait_max_secs` and the build
+    /// ran anyway. `null` until the first build.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
     /// True when at least one build slot embeds a stale frontend because its
     /// most recent `npm run build` failed but a cargo build proceeded using a
     /// prior `dist/` snapshot. Clears when a subsequent npm build on that
@@ -718,6 +724,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             lkg,
         },
@@ -871,6 +878,7 @@ fn try_build_sse_health(
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             // SSE path: try_read on the LKG lock — if contended, skip the
             // field this tick (the next tick will catch up).
@@ -1344,6 +1352,7 @@ mod tests {
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,
+                last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
             },
@@ -1542,6 +1551,7 @@ mod tests {
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,
+                last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
             },
