@@ -2177,13 +2177,33 @@ mod mem_gate {
         wait_max: Duration,
         script: Vec<MemGateReading>,
     ) -> (MemGateOutcome, usize, Vec<(LogLevel, String)>) {
+        drive_at(
+            min_commit_gb,
+            min_phys_gb,
+            wait_max,
+            Duration::from_millis(1),
+            script,
+        )
+        .await
+    }
+
+    /// [`drive`] with an explicit re-probe interval. Pair a realistic interval
+    /// with `#[tokio::test(start_paused = true)]` so the gate's sleeps advance
+    /// virtual time and the probe count is exact rather than timing-dependent.
+    async fn drive_at(
+        min_commit_gb: u64,
+        min_phys_gb: u64,
+        wait_max: Duration,
+        interval: Duration,
+        script: Vec<MemGateReading>,
+    ) -> (MemGateOutcome, usize, Vec<(LogLevel, String)>) {
         let probes = RefCell::new(0usize);
         let logs = RefCell::new(Vec::new());
         let outcome = run_mem_gate(
             min_commit_gb,
             min_phys_gb,
             wait_max,
-            Duration::from_millis(1),
+            interval,
             || {
                 let mut n = probes.borrow_mut();
                 let r = script[(*n).min(script.len() - 1)];
@@ -2213,18 +2233,70 @@ mod mem_gate {
         assert!(msg.contains("mem_gate: proceeded_after_wait"), "{msg}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_wait_that_outlasts_the_ceiling_proceeds_after_waiting() {
-        // A non-zero ceiling that the shortage outlasts: deferral is logged
-        // once, then the fail-open after the ceiling elapses.
+        // The production cadence (15 s re-probe) against a 900 s ceiling, on
+        // paused virtual time. The loop probes at waited = 0, 15, ..., 900 and
+        // fails open on the probe at which `waited >= wait_max`, so it takes
+        // exactly ceiling / interval + 1 = 61 probes.
+        let interval = Duration::from_secs(15);
+        let wait_max = Duration::from_secs(900);
+        let started = tokio::time::Instant::now();
         let (outcome, probes, logs) =
-            drive(5, 0, Duration::from_millis(3), vec![(Some(GIB), None)]).await;
+            drive_at(5, 0, wait_max, interval, vec![(Some(GIB), None)]).await;
         assert_eq!(outcome, MemGateOutcome::ProceededAfterWait);
-        assert!(probes >= 2, "the gate must have re-probed while waiting");
-        assert!(logs.iter().any(|(_, m)| m.contains("deferring build")));
-        assert!(logs
-            .last()
-            .is_some_and(|(_, m)| m.contains("mem_gate: proceeded_after_wait")));
+        let expected = (wait_max.as_secs() / interval.as_secs()) as usize + 1;
+        assert_eq!(probes, expected);
+        assert_eq!(
+            started.elapsed(),
+            wait_max,
+            "the gate must sleep exactly up to the ceiling, no further"
+        );
+        let deferrals = logs
+            .iter()
+            .filter(|(_, m)| m.contains("deferring build"))
+            .count();
+        assert_eq!(
+            deferrals, 1,
+            "deferral must be logged exactly once: {logs:?}"
+        );
+        assert_eq!(logs.len(), 2, "one deferral, one fail-open: {logs:?}");
+        let (level, msg) = logs.last().unwrap();
+        assert!(matches!(level, LogLevel::Warn));
+        assert!(msg.contains("still short after 900s"), "{msg}");
+        assert!(msg.contains("mem_gate: proceeded_after_wait"), "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_going_dark_mid_wait_is_probe_unreadable() {
+        // Short first (the gate defers and waits), then every armed probe
+        // reads `None`. The release was unmeasured, so `ProbeUnreadable` wins
+        // over `PassedAfterWait` — and the log still says it had deferred.
+        let (outcome, probes, logs) = drive_at(
+            5,
+            0,
+            Duration::from_secs(900),
+            Duration::from_secs(15),
+            vec![(Some(GIB), None), (None, None)],
+        )
+        .await;
+        assert_eq!(outcome, MemGateOutcome::ProbeUnreadable);
+        assert_eq!(probes, 2);
+        assert_eq!(
+            logs.iter()
+                .filter(|(_, m)| m.contains("deferring build"))
+                .count(),
+            1,
+            "{logs:?}"
+        );
+        let (level, msg) = logs.last().unwrap();
+        assert!(matches!(level, LogLevel::Warn));
+        assert!(msg.contains("mem_gate: probe_unreadable"), "{msg}");
+        assert!(msg.contains("after deferring 15s"), "{msg}");
+        assert!(
+            !msg.contains("headroom recovered"),
+            "an unmeasured release must not claim recovery: {msg}"
+        );
     }
 
     #[tokio::test]

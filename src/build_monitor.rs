@@ -466,6 +466,15 @@ pub enum MemGateOutcome {
     /// on the fail-open-on-unreadable-probe contract without measuring
     /// anything. A pass in which at least one armed pool was read is `Passed`
     /// (or `PassedAfterWait`) — that arm genuinely measured headroom.
+    ///
+    /// **Takes precedence over a prior deferral.** If the gate had already
+    /// warned and waited on a short reading and a LATER probe reads `None` on
+    /// every armed arm, the outcome is `ProbeUnreadable`, not
+    /// `PassedAfterWait`: the release itself was unmeasured, which is the more
+    /// important fact — `PassedAfterWait` would claim headroom recovered when
+    /// nothing observed it. The deferral is not lost: the "deferring build"
+    /// warning was already logged, and the `probe_unreadable` log line names
+    /// how long the gate had waited.
     ProbeUnreadable,
 }
 
@@ -584,7 +593,9 @@ where
 
         if ram_guard_allows(free, min_free_gb, free_phys, min_free_phys_gb) {
             // Did any ARMED arm actually measure? If not, the allow came purely
-            // from the fail-open-on-`None` contract.
+            // from the fail-open-on-`None` contract. This check deliberately
+            // precedes `warned`: an unmeasured release after a deferral is
+            // `ProbeUnreadable`, not `PassedAfterWait` (see the variant doc).
             let commit_measured = min_free_gb > 0 && free.is_some();
             let phys_measured = min_free_phys_gb > 0 && free_phys.is_some();
             let outcome = if !commit_measured && !phys_measured {
@@ -599,7 +610,7 @@ where
                     LogLevel::Warn,
                     format!(
                         "Pre-permit memory guard: no armed memory probe could be read \
-                         (commit {}, physical {}) — building without a memory check; \
+                         (commit {}, physical {}){} — building without a memory check; \
                          mem_gate: {}",
                         if min_free_gb > 0 {
                             "unavailable"
@@ -610,6 +621,11 @@ where
                             "unavailable"
                         } else {
                             "disarmed"
+                        },
+                        if warned {
+                            format!(" after deferring {}s on a short reading", waited.as_secs())
+                        } else {
+                            String::new()
                         },
                         outcome.as_str(),
                     ),
@@ -1093,8 +1109,10 @@ pub async fn run_cargo_build_with_dir_detailed(
         rebuild_kind: "exe".to_string(),
         mem_gate: Some(mem_gate),
     };
+    // `claim_idle_slot` records `mem_gate` on the slot's history under the
+    // same busy lock as the claim, so `GET /builds` never pairs this build
+    // with the previous build's `last_mem_gate`.
     let slot = state.build_pool.claim_idle_slot(info).await;
-    slot.history.write().await.last_mem_gate = Some(mem_gate);
     // RAII guard: clears `slot.busy = None` AND reconciles the global
     // `build_in_progress` flag on every exit path (happy path, `?`, panic,
     // task cancellation). Prevents permanently-stuck slots and stale flags.
@@ -4745,14 +4763,19 @@ async fn prewarm_single_slot(
         if busy.is_some() {
             return Ok(());
         }
-        *busy = Some(BuildInfo {
-            started_at: chrono::Utc::now(),
-            requester_id: Some("supervisor-prewarm".to_string()),
-            rebuild_kind: "prewarm".to_string(),
-            mem_gate: Some(mem_gate),
-        });
+        // `occupy` writes `history.last_mem_gate` under this busy lock,
+        // before the claim is visible — see its doc.
+        slot.occupy(
+            &mut busy,
+            BuildInfo {
+                started_at: chrono::Utc::now(),
+                requester_id: Some("supervisor-prewarm".to_string()),
+                rebuild_kind: "prewarm".to_string(),
+                mem_gate: Some(mem_gate),
+            },
+        )
+        .await;
     }
-    slot.history.write().await.last_mem_gate = Some(mem_gate);
     let _slot_guard = SlotGuard {
         slot: slot.clone(),
         state: state.clone(),
