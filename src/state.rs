@@ -995,6 +995,25 @@ pub struct BuildSlot {
     pub log_stream: tokio::sync::broadcast::Sender<String>,
 }
 
+impl BuildSlot {
+    /// Mark this slot busy with `info`. `busy` MUST be this slot's own
+    /// `busy` write guard, which the caller holds across the call.
+    ///
+    /// The slot's `history.last_mem_gate` is written FIRST, while the busy
+    /// lock is still held and before `busy` is set, so a reader that sees the
+    /// new build in `busy` (`GET /builds` reads `busy`, then `history`) can
+    /// never pair it with the previous build's `last_mem_gate`. Lock order is
+    /// `busy` -> `history`; nothing takes them the other way round. A claim
+    /// carrying no gate outcome leaves the history value untouched (`None`
+    /// until a gated build claims the slot).
+    pub async fn occupy(&self, busy: &mut Option<BuildInfo>, info: BuildInfo) {
+        if let Some(gate) = info.mem_gate {
+            self.history.write().await.last_mem_gate = Some(gate);
+        }
+        *busy = Some(info);
+    }
+}
+
 /// Metadata for the last-known-good (LKG) runner binary preserved at
 /// `target-pool/lkg/qontinui-runner.exe`.
 ///
@@ -1185,7 +1204,7 @@ impl BuildPool {
         for slot in &self.slots {
             let mut busy = slot.busy.write().await;
             if busy.is_none() {
-                *busy = Some(info.clone());
+                slot.occupy(&mut busy, info.clone()).await;
                 return slot.clone();
             }
         }
@@ -2925,5 +2944,46 @@ mod tests {
         // ...and it must NOT be read off the semaphore, which releases after
         // `busy` is cleared and so disagrees transiently mid-release.
         assert_eq!(pool.permits.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_claim_records_its_mem_gate_on_history_before_it_is_visible() {
+        use crate::build_monitor::MemGateOutcome;
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut config = make_test_config();
+        config.project_dir = tmp.path().join("qontinui-runner").join("src-tauri");
+        config.build_pool = crate::config::BuildPoolConfig { pool_size: 1 };
+        let pool = BuildPool::new(&config);
+        // A previous build left its outcome on the slot's history.
+        pool.slots[0].history.write().await.last_mem_gate = Some(MemGateOutcome::Passed);
+
+        let slot = pool
+            .claim_idle_slot(BuildInfo {
+                started_at: Utc::now(),
+                requester_id: Some("test".to_string()),
+                rebuild_kind: "exe".to_string(),
+                mem_gate: Some(MemGateOutcome::ProceededAfterWait),
+            })
+            .await;
+        // The claim returns with both already agreeing — no separate history
+        // write is left for the caller to race against `GET /builds`.
+        let busy_gate = slot.busy.read().await.as_ref().and_then(|i| i.mem_gate);
+        assert_eq!(busy_gate, Some(MemGateOutcome::ProceededAfterWait));
+        assert_eq!(slot.history.read().await.last_mem_gate, busy_gate);
+
+        // A claim carrying no gate outcome leaves the history value alone.
+        *slot.busy.write().await = None;
+        let slot = pool
+            .claim_idle_slot(BuildInfo {
+                started_at: Utc::now(),
+                requester_id: None,
+                rebuild_kind: "exe".to_string(),
+                mem_gate: None,
+            })
+            .await;
+        assert_eq!(
+            slot.history.read().await.last_mem_gate,
+            Some(MemGateOutcome::ProceededAfterWait)
+        );
     }
 }
