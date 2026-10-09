@@ -3365,3 +3365,56 @@ async fn wire_watchdog_source_is_still_blocked_for_non_temp_runners() {
     assert!(err.to_string().contains("blocked"), "{err}");
     assert!(!managed.runner.read().await.restart_requested);
 }
+
+/// The restart 202 echo and the build decision share one predicate, so they
+/// cannot disagree. Only the primary asking for `OriginMain` compiles
+/// origin/main; named/temp runners build the live tree whatever is passed.
+#[test]
+fn build_tree_compiles_origin_main_only_for_the_primary() {
+    assert!(BuildTree::OriginMain.compiles_origin_main(true));
+    assert!(!BuildTree::LiveWorkingTree.compiles_origin_main(true));
+    assert!(!BuildTree::OriginMain.compiles_origin_main(false));
+    assert!(!BuildTree::LiveWorkingTree.compiles_origin_main(false));
+
+    assert_eq!(
+        BuildTree::OriginMain.build_source(true),
+        BuildSource::OriginMain
+    );
+    assert_eq!(
+        BuildTree::LiveWorkingTree.build_source(true),
+        BuildSource::LiveTree
+    );
+    assert_eq!(
+        BuildTree::OriginMain.build_source(false),
+        BuildSource::LiveTree
+    );
+    assert_eq!(
+        BuildTree::LiveWorkingTree.build_source(false),
+        BuildSource::LiveTree
+    );
+}
+
+/// The 202 bodies serialize this value directly, so pin the wire spelling
+/// the frontend type (`'origin_main' | 'live_tree'`) declares.
+#[test]
+fn build_tree_build_source_serializes_to_the_documented_labels() {
+    assert_eq!(
+        serde_json::to_value(BuildTree::OriginMain.build_source(true)).unwrap(),
+        serde_json::json!("origin_main")
+    );
+    assert_eq!(
+        serde_json::to_value(BuildTree::LiveWorkingTree.build_source(true)).unwrap(),
+        serde_json::json!("live_tree")
+    );
+}
+
+/// The wire bool maps to the enum in exactly one place, with the polarity
+/// the 2026-09-09 defect got wrong: omitted/`false` is origin/main.
+#[test]
+fn build_tree_from_working_tree_maps_the_wire_bool() {
+    assert_eq!(BuildTree::from_working_tree(false), BuildTree::OriginMain);
+    assert_eq!(
+        BuildTree::from_working_tree(true),
+        BuildTree::LiveWorkingTree
+    );
+}

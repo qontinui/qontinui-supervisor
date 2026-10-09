@@ -101,11 +101,7 @@ impl RestartRunnerRequest {
     /// The build source this request selects, as the typed value every layer
     /// below the wire takes.
     pub fn build_tree(&self) -> manager::BuildTree {
-        if self.from_working_tree {
-            manager::BuildTree::LiveWorkingTree
-        } else {
-            manager::BuildTree::OriginMain
-        }
+        manager::BuildTree::from_working_tree(self.from_working_tree)
     }
 }
 
@@ -1268,6 +1264,14 @@ pub async fn restart_runner(
         let exec_state = state.clone();
         let force = body.force;
         let build_tree = body.build_tree();
+        // Echoed in the 202 so the build decision is visible before the build
+        // runs. `null` when the id names no registered runner: the detached
+        // restart fails on it, and a label would describe a build that never
+        // happens.
+        let build_source = match state.get_runner(&id).await {
+            Some(managed) => json!(build_tree.build_source(managed.config.kind().is_primary())),
+            None => serde_json::Value::Null,
+        };
         let runner_id = id.clone();
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
@@ -1329,6 +1333,7 @@ pub async fn restart_runner(
                 "build_id": submission_id.to_string(),
                 "submission_id": submission_id.to_string(),
                 "poll": "/builds",
+                "build_source": build_source,
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
                             for the terminal outcome",
@@ -4088,7 +4093,7 @@ async fn execute_spawn_build_inner(
     // Start the runner using the Arc captured at insertion time. This avoids
     // the id-based lookup in `start_runner_by_id` which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
-    // spawn's failed health probe, stop_all_temp_runners, the reaper).
+    // spawn's failed health probe, the reaper).
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
     if let Err(e) = manager::start_managed_runner(state, managed).await {

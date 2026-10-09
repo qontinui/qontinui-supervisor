@@ -493,6 +493,10 @@ export interface DetachedBuildResponse {
   build_id?: string;
   submission_id?: string;
   poll?: string;
+  /// Which tree the detached rebuild compiles (`/runner/restart` and
+  /// `/runners/{id}/restart` only). `null` = no runner to build for (unknown id,
+  /// or no configured primary).
+  build_source?: 'origin_main' | 'live_tree' | null;
   message?: string;
 }
 

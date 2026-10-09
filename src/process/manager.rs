@@ -3112,7 +3112,7 @@ async fn start_exe_mode_for_runner(
                 // Provenance gate (Phase 3): refuse to deploy a slot exe whose
                 // provenance positively says it was built from a foreign
                 // override tree, for any NON-temp runner. This is the single
-                // funnel for manual start, restart_all, and the `--watchdog`
+                // funnel for manual start, restart, and the `--watchdog`
                 // boot auto-start — one wire-in covers every path. Temp
                 // runners are permissive (they exist to run foreign refs).
                 //
@@ -5464,7 +5464,7 @@ pub fn port_held_by_live_runner(listening: bool, pid_is_runner: bool) -> bool {
 /// process (finding S2: the double-spawn against a held port).
 ///
 /// Called by [`start_managed_runner`] before it resolves an exe or spawns
-/// anything, so it covers every caller — manual start, `restart_all`, the
+/// anything, so it covers every caller — manual start, restart, the
 /// `--watchdog` boot auto-start, the crash watchdog and the serving watchdog.
 /// Three probes, each honest about its own failure:
 ///
@@ -5515,22 +5515,6 @@ pub async fn refuse_if_port_held_by_live_runner(port: u16) -> Result<(), Supervi
     Ok(())
 }
 
-/// Restart a specific runner by ID.
-///
-/// Automated sources are rejected for non-temp runners — see
-/// [`automated_restart_blocked`] for the one exception (the in-process serving
-/// watchdog) and why the wire `watchdog` value is not it.
-///
-/// `restart_requested` is latched `true` only while a restart is genuinely in
-/// flight: it is set after the readiness gate admits the request and cleared
-/// on EVERY exit of the stop → build → start sequence, success or failure
-/// (`restart_after_gate` is the single body; this wrapper clears the flag
-/// once, before matching its result). Before this shape the flag was cleared
-/// only on the success path, so one failed stop or start left it `true` for
-/// the runner's lifetime — and the serving watchdog's `SkipOperatorIntent`
-/// reads that flag, so its first failed attempt would have silenced it for
-/// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
-/// finding).
 /// Which tree a rebuild compiles **for the primary runner**.
 ///
 /// A two-variant enum rather than a `bool`, deliberately. This was a bare
@@ -5557,13 +5541,59 @@ pub enum BuildTree {
 }
 
 impl BuildTree {
+    /// The typed value for a wire `from_working_tree` flag. The ONE place that
+    /// bool's polarity is interpreted, so the two restart request structs
+    /// cannot disagree about it.
+    pub fn from_working_tree(from_working_tree: bool) -> Self {
+        if from_working_tree {
+            BuildTree::LiveWorkingTree
+        } else {
+            BuildTree::OriginMain
+        }
+    }
+
     /// True when this selects the `origin/main` worktree. Named so the call
     /// site reads as a question about the tree, not about a flag's polarity.
     pub fn is_origin_main(self) -> bool {
         matches!(self, BuildTree::OriginMain)
     }
+
+    /// Whether a rebuild of a runner of this kind compiles `origin/main`.
+    ///
+    /// This is the policy predicate itself: [`restart_after_gate`] decides
+    /// with it and the restart routes echo it in their 202 bodies, so the
+    /// acknowledgement cannot describe a build the restart does not run.
+    pub fn compiles_origin_main(self, is_primary: bool) -> bool {
+        is_primary && self.is_origin_main()
+    }
+
+    /// The [`BuildSource`] a rebuild of a runner of this kind is recorded
+    /// under — the same value `GET /runners` later reports as `build_source`.
+    pub fn build_source(self, is_primary: bool) -> BuildSource {
+        if self.compiles_origin_main(is_primary) {
+            BuildSource::OriginMain
+        } else {
+            BuildSource::LiveTree
+        }
+    }
 }
 
+/// Restart a specific runner by ID.
+///
+/// Automated sources are rejected for non-temp runners — see
+/// [`automated_restart_blocked`] for the one exception (the in-process serving
+/// watchdog) and why the wire `watchdog` value is not it.
+///
+/// `restart_requested` is latched `true` only while a restart is genuinely in
+/// flight: it is set after the readiness gate admits the request and cleared
+/// on EVERY exit of the stop → build → start sequence, success or failure
+/// (`restart_after_gate` is the single body; this wrapper clears the flag
+/// once, before matching its result). Before this shape the flag was cleared
+/// only on the success path, so one failed stop or start left it `true` for
+/// the runner's lifetime — and the serving watchdog's `SkipOperatorIntent`
+/// reads that flag, so its first failed attempt would have silenced it for
+/// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
+/// finding).
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -5760,7 +5790,7 @@ async fn restart_after_gate(
     // primary-only policy.
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
-        let build_origin_main = managed.config.kind().is_primary() && build_tree.is_origin_main();
+        let build_origin_main = build_tree.compiles_origin_main(managed.config.kind().is_primary());
         if build_origin_main {
             primary_rebuild_from_origin_main(state).await?;
         } else {
@@ -5784,78 +5814,6 @@ async fn restart_after_gate(
     start_managed_runner(state, managed).await?;
 
     Ok(build_duration)
-}
-
-/// Stop all runners. Primary is stopped last.
-/// Stop all temp runners. User runners (primary and secondary) are never touched.
-pub async fn stop_all_temp_runners(state: &SharedState) -> Result<(), SupervisorError> {
-    let runners = state.get_all_runners().await;
-    let mut errors = Vec::new();
-
-    for managed in &runners {
-        if !is_temp_runner(&managed.config.id) {
-            continue;
-        }
-        let running = managed.runner.read().await.running;
-        if running {
-            // Temp-only sweep, and the gate exempts temp runners anyway;
-            // `false` keeps the honest value rather than asserting an
-            // override that is never consulted.
-            if let Err(e) = stop_runner_by_id(state, &managed.config.id, false).await {
-                errors.push(format!("'{}': {}", managed.config.name, e));
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(SupervisorError::Other(format!(
-            "Errors stopping temp runners: {}",
-            errors.join("; ")
-        )))
-    }
-}
-
-/// Restart all runners. Stop all, optionally rebuild, start all (primary first).
-#[allow(dead_code)]
-pub async fn restart_all(
-    state: &SharedState,
-    rebuild: bool,
-    _source: RestartSource,
-) -> Result<(), SupervisorError> {
-    // Collect which runners were running before stop
-    let runners = state.get_all_runners().await;
-    let mut was_running = Vec::new();
-    for managed in &runners {
-        let running = managed.runner.read().await.running;
-        if running {
-            was_running.push(managed.config.id.clone());
-        }
-    }
-
-    stop_all_temp_runners(state).await?;
-
-    if rebuild {
-        crate::build_monitor::run_cargo_build(state).await?;
-    }
-
-    // Start primary first
-    for managed in &runners {
-        if managed.config.kind().is_primary() && was_running.contains(&managed.config.id) {
-            start_runner_by_id(state, &managed.config.id).await?;
-        }
-    }
-
-    // Then start non-primary with 2s delay
-    for managed in &runners {
-        if !managed.config.kind().is_primary() && was_running.contains(&managed.config.id) {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            start_runner_by_id(state, &managed.config.id).await?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Stop the runner process (primary). Attempts graceful shutdown, then force kill.
