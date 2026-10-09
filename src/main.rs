@@ -716,14 +716,15 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::timeout(std::time::Duration::from_secs(2), expo::stop_expo(&state)).await;
     }
 
-    // NOTE: We deliberately do NOT call `stop_all_temp_runners` here. The
+    // NOTE: We deliberately do NOT sweep temp runners here. The
     // Win32 `RunnerJob` (held in `state.ephemeral_job`) has
     // `KILL_ON_JOB_CLOSE` set, so every supervisor-spawned *temp* runner is
     // terminated by the kernel the instant the last handle to the Job closes
     // — which happens when `state` drops at the end of `main`. (Temps are the
     // only runners assigned to the job; see
     // `process::job::should_assign_to_ephemeral_job`.) The previous
-    // `stop_all_temp_runners` call here was the dominant source of
+    // temp-runner stop sweep here (the since-deleted `stop_all_temp_runners`)
+    // was the dominant source of
     // `POST /supervisor/shutdown` latency: it iterated every temp runner with
     // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
     // wall-clock with several runners attached. The JobObject makes it

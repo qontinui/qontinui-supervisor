@@ -254,11 +254,7 @@ impl RestartRequest {
     /// below the wire takes. See [`manager::BuildTree`] for why the internal
     /// representation is an enum and not this bool.
     pub fn build_tree(&self) -> manager::BuildTree {
-        if self.from_working_tree {
-            manager::BuildTree::LiveWorkingTree
-        } else {
-            manager::BuildTree::OriginMain
-        }
+        manager::BuildTree::from_working_tree(self.from_working_tree)
     }
 }
 
@@ -637,6 +633,11 @@ pub async fn restart_runner(
         let force = body.force;
         let from_working_tree = body.from_working_tree;
         let build_tree = body.build_tree();
+        let build_source = if state.get_primary().await.is_some() {
+            serde_json::json!(build_tree.build_source(true))
+        } else {
+            serde_json::Value::Null
+        };
         let do_health_wait = wait_q.wait;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
@@ -822,6 +823,14 @@ pub async fn restart_runner(
                 "build_id": submission_id.to_string(),
                 "submission_id": submission_id.to_string(),
                 "poll": "/builds",
+                // Which tree the detached rebuild compiles. This route always
+                // targets the primary, so it is the policy decision itself —
+                // echoed so a misread escape hatch is visible now, not after a
+                // 10-20 min build has put the wrong binary under the primary.
+                // `null` when no primary is configured: the detached restart
+                // fails on it at once, and a label would name a build that
+                // never runs (same contract as `POST /runners/{id}/restart`).
+                "build_source": build_source,
                 "action_id": action_id.to_string(),
                 "states_active": states_active,
                 "predicted": predicted,
@@ -1342,7 +1351,7 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // NOTE: we deliberately do NOT call `stop_all_temp_runners` here — same
+    // NOTE: we deliberately do NOT sweep temp runners here — same
     // reasoning as the shutdown path in `main.rs` ("the dominant source of
     // `POST /supervisor/shutdown` latency: it iterated every temp runner with
     // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
@@ -1638,6 +1647,13 @@ mod tests {
         // claim "rebuilding" for a restart the gate refused 1.4s later.
         assert_eq!(body["status"], "submitted");
         assert_eq!(body["poll"], "/builds");
+        // The fixture registers a primary and the request asks for the escape
+        // hatch, so the ACK must name the live tree: the build decision is
+        // echoed before any build runs, not discovered after one finishes.
+        assert_eq!(
+            body["build_source"], "live_tree",
+            "the 202 must echo the tree the rebuild selects"
+        );
         assert!(
             body["build_id"].is_string(),
             "must carry a submission id for /builds correlation"
