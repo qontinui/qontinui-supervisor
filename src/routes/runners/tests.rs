@@ -2698,3 +2698,89 @@ async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot()
         "joining must not record a second in-flight build"
     );
 }
+
+// ── `build_source` echoed in the `POST /runners/{id}/restart` 202 ──────────
+
+/// Drive the rebuild branch of the per-runner restart route and return its
+/// 202 body. The build pool is closed so the detached task fails fast instead
+/// of spawning cargo.
+async fn restart_202_body(
+    state: &crate::state::SharedState,
+    id: &str,
+    from_working_tree: bool,
+) -> serde_json::Value {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    state.build_pool.permits.close();
+    let request: super::RestartRunnerRequest = serde_json::from_value(serde_json::json!({
+        "rebuild": true,
+        "from_working_tree": from_working_tree,
+    }))
+    .expect("request");
+    let resp = super::restart_runner(
+        State(state.clone()),
+        Path(id.to_string()),
+        axum::Json(request),
+    )
+    .await
+    .expect("handler ok")
+    .into_response();
+    assert_eq!(resp.status().as_u16(), 202);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    serde_json::from_slice(&bytes).expect("JSON body")
+}
+
+#[tokio::test]
+async fn restart_202_names_origin_main_for_the_primary_and_live_tree_with_the_escape_hatch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let primary_id = state
+        .get_primary()
+        .await
+        .expect("primary")
+        .config
+        .id
+        .clone();
+
+    let default_body = restart_202_body(&state, &primary_id, false).await;
+    assert_eq!(default_body["build_source"], "origin_main");
+    let hatch_body = restart_202_body(&state, &primary_id, true).await;
+    assert_eq!(hatch_body["build_source"], "live_tree");
+}
+
+#[tokio::test]
+async fn restart_202_names_live_tree_for_a_non_primary_runner() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let config = crate::config::RunnerConfig {
+        id: "named-9999-test".to_string(),
+        name: "Named test".to_string(),
+        port: 9999,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: "Named test".to_string(),
+        },
+        ..crate::config::RunnerConfig::default_primary()
+    };
+    state.runners.write().await.insert(
+        config.id.clone(),
+        Arc::new(crate::state::ManagedRunner::new(config, false)),
+    );
+
+    // The default asks for origin/main, but that build is gated on
+    // `is_primary()`, so the ACK must say live_tree for a named runner.
+    let body = restart_202_body(&state, "named-9999-test", false).await;
+    assert_eq!(body["build_source"], "live_tree");
+}
+
+#[tokio::test]
+async fn restart_202_build_source_is_null_for_an_unknown_runner() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let body = restart_202_body(&state, "no-such-runner", false).await;
+    assert!(
+        body["build_source"].is_null(),
+        "no runner to build for, so no label: {body}"
+    );
+}

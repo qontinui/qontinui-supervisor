@@ -1536,6 +1536,36 @@ mod tests {
         (status, v)
     }
 
+    /// With no primary registered the ACK names no tree: the detached restart
+    /// fails on the missing primary at once, and a label would describe a
+    /// build that never runs.
+    #[tokio::test]
+    async fn restart_202_build_source_is_null_when_no_primary_is_configured() {
+        let _building = BUILDING_TESTS.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        state.build_pool.permits.close();
+        state.runners.write().await.clear();
+        assert!(state.get_primary().await.is_none());
+
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+                from_working_tree: false,
+                use_lkg: None,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202);
+        assert!(body["build_source"].is_null(), "{body}");
+    }
+
     /// A second fix-and-rebuild while one is still in flight is an idempotent
     /// accept: returns the EXISTING submission id (202, `deduplicated: true`)
     /// without kicking off a duplicate live-tree build. This path never calls

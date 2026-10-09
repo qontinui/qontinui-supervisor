@@ -489,7 +489,7 @@ export interface LogFileResponse {
 /// `/runners/{id}/rebuild-and-restart`). The build+restart runs detached; poll
 /// `build_id` via `GET /build/{id}/status` for the terminal outcome.
 export interface DetachedBuildResponse {
-  status: string; // "rebuilding" for the 202, "restarted" for the sync no-rebuild path
+  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart; "restarted" for the sync no-rebuild path
   build_id?: string;
   submission_id?: string;
   poll?: string;
