@@ -966,6 +966,14 @@ pub async fn purge_stale_test_runners_core(
                 continue;
             }
         }
+        // Startup window: a spawn handler still owns this runner, or it was
+        // started moments ago and has not bound its port yet. That is not
+        // "no longer alive" — neither the periodic sweep nor an operator
+        // `POST /runners/purge-stale` may evict it (the 2026-09-18 race, see
+        // `manager::in_startup_window`).
+        if manager::in_startup_window(managed).await {
+            continue;
+        }
         let is_running = {
             let runner = managed.runner.read().await;
             runner.running
@@ -3089,6 +3097,18 @@ async fn execute_spawn_build(
     managed: Arc<ManagedRunner>,
     no_wait: bool,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
+    // Hold the runner out of both stale-temp sweeps for as long as this
+    // handler owns it: through the build, the exe copy, the start, the
+    // post-spawn probe and the `wait` poll. Cleared on drop, so every exit —
+    // including this future being dropped — releases it.
+    let _in_flight = crate::state::SpawnInFlightGuard::new(
+        managed.clone(),
+        spawn_startup_budget(
+            body.health_probe_timeout_ms,
+            body.wait,
+            body.wait_timeout_secs,
+        ),
+    );
     let mut side = SpawnBuildSideChannel::default();
     // Merged on BOTH arms, not just `Err`. Several of the inner fn's FAILURE
     // responses (`runner_died_during_startup`, `runner_started_but_unresponsive`,
@@ -3112,6 +3132,32 @@ async fn execute_spawn_build(
             (status, body, side.stderr_tail)
         }
     }
+}
+
+/// Margin added to a spawn's declared probe + wait windows when computing its
+/// startup budget, to cover the gaps between them (log emits, the frontend
+/// staleness check) on a loaded box.
+const SPAWN_STARTUP_BUDGET_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long after `started_at` a spawn handler may still be legitimately
+/// waiting for its runner to bind: the post-spawn probe window, plus the
+/// `wait` poll window when the caller asked to wait, plus a margin. The
+/// sweeps never protect a started runner past this (see
+/// `manager::startup_window_protects`), so a wedged handler cannot pin it.
+fn spawn_startup_budget(
+    health_probe_timeout_ms: u64,
+    wait: bool,
+    wait_timeout_secs: u64,
+) -> std::time::Duration {
+    let probe = std::time::Duration::from_millis(health_probe_timeout_ms);
+    let wait = if wait {
+        std::time::Duration::from_secs(wait_timeout_secs)
+    } else {
+        std::time::Duration::ZERO
+    };
+    probe
+        .saturating_add(wait)
+        .saturating_add(SPAWN_STARTUP_BUDGET_MARGIN)
 }
 
 /// Values `execute_spawn_build_inner` produces on its way to a result that the
@@ -8979,6 +9025,130 @@ mod tests {
         assert!(
             registry.contains_key(&id_unowned),
             "unowned survives in registry"
+        );
+    }
+
+    /// A loopback port with nothing listening on it (bind an ephemeral port,
+    /// then drop the listener). Never a fixed 98xx port: a real temp runner
+    /// may be serving one on the box that runs the tests.
+    fn unbound_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = l.local_addr().expect("local addr").port();
+        drop(l);
+        port
+    }
+
+    /// Register a temp runner in the state the reaper saw on 2026-09-18:
+    /// `running=true`, started `started_secs_ago`, port not (yet) listening.
+    async fn insert_started_unbound_temp_runner(
+        state: &crate::state::SharedState,
+        started_secs_ago: i64,
+    ) -> (String, std::sync::Arc<crate::state::ManagedRunner>) {
+        let id = insert_temp_runner_owned(state, unbound_port(), None).await;
+        let managed = state.get_runner(&id).await.expect("just inserted");
+        {
+            let mut r = managed.runner.write().await;
+            r.running = true;
+            r.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(started_secs_ago));
+        }
+        (id, managed)
+    }
+
+    /// REGRESSION (2026-09-18): the sweep purged a spawn-test runner 1.2 s
+    /// after its process started, because "running=true, port not listening"
+    /// read as a crash. A runner its spawn handler still owns must survive the
+    /// sweep until it binds.
+    #[tokio::test]
+    async fn purge_spares_a_started_runner_its_spawn_handler_still_owns() {
+        let state = make_state();
+        let (id, managed) = insert_started_unbound_temp_runner(&state, 1).await;
+        let _guard = crate::state::SpawnInFlightGuard::new(
+            managed.clone(),
+            super::spawn_startup_budget(6000, true, 1100),
+        );
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+        assert!(
+            purged.is_empty(),
+            "a runner inside its spawn/startup window must not be purged: {purged:?}"
+        );
+        assert!(
+            state.runners.read().await.contains_key(&id),
+            "the record must survive so the handler's returned id still resolves"
+        );
+        assert!(
+            managed.runner.read().await.running,
+            "the sweep must not rewrite a starting runner's state to crashed"
+        );
+    }
+
+    /// No handler marker: a runner started moments ago by any path (restart,
+    /// watchdog) still gets the startup floor.
+    #[tokio::test]
+    async fn purge_spares_a_just_started_runner_without_a_handler() {
+        let state = make_state();
+        let (id, _managed) = insert_started_unbound_temp_runner(&state, 1).await;
+        let purged = super::purge_stale_test_runners_core(&state, false, None).await;
+        assert!(purged.is_empty(), "purged {purged:?}");
+        assert!(state.runners.read().await.contains_key(&id));
+    }
+
+    /// The post-build, pre-start window: `running=false`, no build active, but
+    /// the handler still owns the placeholder.
+    #[tokio::test]
+    async fn purge_spares_an_unstarted_placeholder_its_handler_still_owns() {
+        let state = make_state();
+        let id = insert_temp_runner_owned(&state, unbound_port(), None).await;
+        let managed = state.get_runner(&id).await.expect("just inserted");
+        let _guard = crate::state::SpawnInFlightGuard::new(
+            managed,
+            super::spawn_startup_budget(6000, false, 120),
+        );
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+        assert!(purged.is_empty(), "purged {purged:?}");
+        assert!(state.runners.read().await.contains_key(&id));
+    }
+
+    /// The crash arm still works: a runner whose port stayed dead past its
+    /// startup window is purged, and so is one whose handler has let go.
+    #[tokio::test]
+    async fn purge_still_reaps_a_runner_dead_past_its_startup_window() {
+        let state = make_state();
+        let (id_old, managed_old) = insert_started_unbound_temp_runner(&state, 3600).await;
+        // Handler marker present but its budget long spent.
+        let _guard = crate::state::SpawnInFlightGuard::new(
+            managed_old,
+            super::spawn_startup_budget(6000, true, 120),
+        );
+        // Handler finished (guard dropped) and the floor has passed.
+        let (id_released, managed_released) = insert_started_unbound_temp_runner(&state, 120).await;
+        drop(crate::state::SpawnInFlightGuard::new(
+            managed_released.clone(),
+            super::spawn_startup_budget(6000, true, 1100),
+        ));
+        assert!(
+            managed_released.spawn_in_flight.lock().unwrap().is_none(),
+            "dropping the guard must clear the marker"
+        );
+
+        let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+        let purged_ids: std::collections::HashSet<String> =
+            purged.into_iter().map(|(id, _, _)| id).collect();
+        assert!(purged_ids.contains(&id_old), "budget-expired runner reaped");
+        assert!(purged_ids.contains(&id_released), "released runner reaped");
+    }
+
+    #[test]
+    fn spawn_startup_budget_counts_wait_only_when_waiting() {
+        use std::time::Duration;
+        assert_eq!(
+            super::spawn_startup_budget(6000, true, 1100),
+            Duration::from_secs(6 + 1100 + 60)
+        );
+        assert_eq!(
+            super::spawn_startup_budget(6000, false, 1100),
+            Duration::from_secs(6 + 60)
         );
     }
 

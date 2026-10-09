@@ -118,6 +118,47 @@ pub struct ManagedRunner {
     /// caller explicitly asking for "whatever exists". The staleness is still
     /// logged and still reported on the response; only the refusal is waived.
     pub allow_unverified_exe: RwLock<bool>,
+    /// `Some(budget)` while a spawn handler still owns this runner and is
+    /// bringing it up (building, copying the exe, starting it, probing and
+    /// waiting for `/health`). `budget` is the startup allowance measured from
+    /// [`RunnerState::started_at`]. The stale-temp sweeps read it through
+    /// [`crate::process::manager::in_startup_window`] so a runner that has
+    /// been started but has not bound its port yet is never mistaken for a
+    /// crashed one — the 2026-09-18 incident, where the reaper purged a
+    /// spawn-test runner 1.2 s after its process started and the handler then
+    /// returned a "healthy" id that no longer existed.
+    ///
+    /// A std (not tokio) mutex so [`SpawnInFlightGuard`] can clear it from
+    /// `Drop`; it is never held across an `.await`.
+    pub spawn_in_flight: std::sync::Mutex<Option<std::time::Duration>>,
+}
+
+/// RAII owner of [`ManagedRunner::spawn_in_flight`]: sets the marker on
+/// construction and clears it on drop, so every exit from a spawn handler —
+/// success, a failure body, an `Err`, or the future being dropped — releases
+/// the runner to the stale-temp sweeps.
+pub struct SpawnInFlightGuard {
+    managed: Arc<ManagedRunner>,
+}
+
+impl SpawnInFlightGuard {
+    pub fn new(managed: Arc<ManagedRunner>, budget: std::time::Duration) -> Self {
+        *managed
+            .spawn_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(budget);
+        Self { managed }
+    }
+}
+
+impl Drop for SpawnInFlightGuard {
+    fn drop(&mut self) {
+        *self
+            .managed
+            .spawn_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Work-unit → preview correlation for a runner spawned as an attempt's
@@ -203,6 +244,7 @@ impl ManagedRunner {
             build_provenance: RwLock::new(None),
             resolved_exe: RwLock::new(None),
             allow_unverified_exe: RwLock::new(false),
+            spawn_in_flight: std::sync::Mutex::new(None),
         }
     }
 

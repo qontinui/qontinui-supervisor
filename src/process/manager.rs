@@ -114,6 +114,61 @@ pub fn resolve_temp_runner_age(
     }
 }
 
+/// How long after `started_at` ANY freshly started temp runner is presumed to
+/// be still binding its port rather than crashed, when no spawn handler has
+/// declared a longer budget. A Tauri runner takes ~1-15 s to bind; 60 s leaves
+/// headroom on a loaded box while still reaping a genuinely dead record on the
+/// next 5-minute sweep.
+pub const TEMP_RUNNER_STARTUP_GRACE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Is a runner still inside its spawn/startup window — so a port that is not
+/// listening yet means "not bound yet", NOT "crashed"?
+///
+/// - `in_flight = Some(budget)` (a spawn handler owns the runner, see
+///   [`crate::state::ManagedRunner::spawn_in_flight`]):
+///   - not started yet (`started_at == None`) → protected: the handler is
+///     between its build and `start_managed_runner` (copying the exe, etc.);
+///   - started → protected while time-since-start < `max(budget, FLOOR)`.
+///     Bounded, so a wedged handler cannot pin a dead record forever.
+/// - `in_flight = None` (restart route, watchdog restart, …) → protected
+///   while time-since-start < [`TEMP_RUNNER_STARTUP_GRACE_FLOOR`]; never
+///   started → not protected (the placeholder rules decide).
+///
+/// A `started_at` in the future (clock step) counts as "just started".
+///
+/// Pure — every input injected — so the policy is unit-testable.
+pub fn startup_window_protects(
+    in_flight: Option<Duration>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let since_start = started_at.map(|s| {
+        now.signed_duration_since(s)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+    });
+    match (in_flight, since_start) {
+        (Some(_), None) => true,
+        (Some(budget), Some(d)) => d < budget.max(TEMP_RUNNER_STARTUP_GRACE_FLOOR),
+        (None, Some(d)) => d < TEMP_RUNNER_STARTUP_GRACE_FLOOR,
+        (None, None) => false,
+    }
+}
+
+/// [`startup_window_protects`] read off a live registry entry. Both stale-temp
+/// sweeps (`reap_stale_test_runners` here and
+/// `routes::runners::purge_stale_test_runners_core`) consult it before they
+/// conclude a runner is dead, so they cannot race a spawn handler that is
+/// still bringing the runner up.
+pub async fn in_startup_window(managed: &ManagedRunner) -> bool {
+    let in_flight = *managed
+        .spawn_in_flight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let started_at = managed.runner.read().await.started_at;
+    startup_window_protects(in_flight, started_at, chrono::Utc::now())
+}
+
 /// Pure — every input injected — so the policy is unit-testable without a
 /// registry, a clock, or the env.
 pub fn exceeds_temp_runner_max_age(
@@ -1766,6 +1821,19 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if managed.created_at.elapsed() < Duration::from_secs(120) {
                 continue;
             }
+            // Startup window: a spawn handler still owns this runner, or it
+            // was started moments ago and has not bound its port yet. Its
+            // port being silent means "not up yet", not "crashed" — reaping it
+            // here purged a spawn-test runner 1.2 s after its process started
+            // (2026-09-18) and handed the caller an id that no longer existed.
+            // A runner this young cannot be over the max-age bound either.
+            if in_startup_window(managed).await {
+                debug!(
+                    "reaper: skipping temp runner '{}' (port {}) — inside its spawn/startup window",
+                    managed.config.name, managed.config.port
+                );
+                continue;
+            }
             // Max-age bound. Measured from when the runner actually STARTED,
             // not from when `spawn-test` reserved its placeholder — see
             // `resolve_temp_runner_age`. A cold `spawn-test {rebuild:true}`
@@ -2076,6 +2144,23 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
             debug!(
                 "reconcile sweep: port {} held by non-runner PID {}; leaving alone",
                 port, pid
+            );
+            continue;
+        }
+
+        // `claimed_ports` was snapshotted at the top of the sweep, and each
+        // port probe is slow; a spawn that registered this port since then and
+        // has just bound it is ledger-recorded as ours, so it would pass (d)
+        // below. Re-read the registry right before the kill decision.
+        if state
+            .get_all_runners()
+            .await
+            .iter()
+            .any(|r| r.config.port == port)
+        {
+            debug!(
+                "reconcile sweep: port {} was claimed by a registered runner mid-sweep;                  leaving it alone",
+                port
             );
             continue;
         }
@@ -5804,6 +5889,47 @@ mod tests {
         let (age, basis) = resolve_temp_runner_age(Some(started), now, Duration::from_secs(11));
         assert_eq!(age.as_secs(), 11);
         assert!(basis.contains("future"), "basis was {basis:?}");
+    }
+
+    /// The startup-window policy both stale-temp sweeps consult before they
+    /// conclude a runner with a silent port is dead (2026-09-18 race).
+    #[test]
+    fn startup_window_protects_policy_table() {
+        let now = chrono::Utc::now();
+        let ago = |secs: i64| Some(now - chrono::Duration::seconds(secs));
+        let budget = Some(Duration::from_secs(600));
+
+        // A spawn handler owns it and has not started it yet (post-build,
+        // pre-start): protected however old the placeholder is.
+        assert!(startup_window_protects(budget, None, now));
+        // Handler owns it, started 1 s ago (the incident): protected.
+        assert!(startup_window_protects(budget, ago(1), now));
+        // Handler owns it, inside its declared budget: protected.
+        assert!(startup_window_protects(budget, ago(599), now));
+        // Past the budget: the protection is bounded, so a wedged handler
+        // cannot pin a dead record forever.
+        assert!(!startup_window_protects(budget, ago(601), now));
+        // A budget shorter than the floor is raised to the floor.
+        assert!(startup_window_protects(
+            Some(Duration::from_secs(5)),
+            ago(30),
+            now
+        ));
+        // No handler (restart / watchdog): the generic floor applies.
+        assert!(startup_window_protects(None, ago(1), now));
+        assert!(!startup_window_protects(
+            None,
+            ago(TEMP_RUNNER_STARTUP_GRACE_FLOOR.as_secs() as i64 + 1),
+            now
+        ));
+        // Never started and no handler: not this rule's to protect.
+        assert!(!startup_window_protects(None, None, now));
+        // A started_at in the future (clock step) reads as "just started".
+        assert!(startup_window_protects(
+            None,
+            Some(now + chrono::Duration::seconds(600)),
+            now
+        ));
     }
 
     /// `None` is the off-switch: nothing is ever reaped for age, including a
