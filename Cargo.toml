@@ -120,6 +120,9 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Paused virtual time (`#[tokio::test(start_paused = true)]`) for the
+# memory-gate wait tests — `full` does not include `test-util`.
+tokio = { version = "1", features = ["test-util"] }
 # `oneshot` extension trait for driving an axum::Router in unit tests
 # without binding a real socket. tower 0.5 is already pulled in
 # transitively by axum 0.8 / tower-http; declaring it explicitly here just

@@ -432,6 +432,82 @@ pub fn total_commit_bytes() -> Option<u64> {
     }
 }
 
+/// What the pre-permit memory gate decided, recorded on the build so that a
+/// build which proceeded *because the wait expired* is distinguishable
+/// afterwards from one that passed the gate.
+///
+/// Serialized snake_case (`passed`, `passed_after_wait`,
+/// `proceeded_after_wait`, `probe_unreadable`, `disabled`) on `GET /health`
+/// `build.last_mem_gate` and on `GET /builds` (`slots[].history.last_mem_gate`,
+/// and `mem_gate` on a slot/active build while it is building).
+///
+/// Five variants rather than the plan's three, each because collapsing it
+/// would make the record lie:
+/// - `PassedAfterWait` is split from `Passed` because a build that was
+///   deferred and then admitted on recovered headroom did spend time in the
+///   gate — folding it into `Passed` hides the deferral, folding it into
+///   `ProceededAfterWait` would claim a fail-open that never happened.
+/// - `Disabled` is reported when both floors are `0`: no gate ran, and saying
+///   `passed` would assert a check that was never made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemGateOutcome {
+    /// Both floors are `0` — the documented full disable. No probe was read.
+    Disabled,
+    /// Headroom was sufficient at the first probe.
+    Passed,
+    /// Headroom was short, the build was deferred, and headroom recovered
+    /// before `mem_wait_max_secs()` expired.
+    PassedAfterWait,
+    /// Still short when `mem_wait_max_secs()` expired — the gate FAILED OPEN
+    /// and the build ran anyway with OOM risk.
+    ProceededAfterWait,
+    /// Every ARMED pool's probe read `None`, so the gate let the build through
+    /// on the fail-open-on-unreadable-probe contract without measuring
+    /// anything. A pass in which at least one armed pool was read is `Passed`
+    /// (or `PassedAfterWait`) — that arm genuinely measured headroom.
+    ///
+    /// **Takes precedence over a prior deferral.** If the gate had already
+    /// warned and waited on a short reading and a LATER probe reads `None` on
+    /// every armed arm, the outcome is `ProbeUnreadable`, not
+    /// `PassedAfterWait`: the release itself was unmeasured, which is the more
+    /// important fact — `PassedAfterWait` would claim headroom recovered when
+    /// nothing observed it. The deferral is not lost: the "deferring build"
+    /// warning was already logged, and the `probe_unreadable` log line names
+    /// how long the gate had waited.
+    ProbeUnreadable,
+}
+
+impl MemGateOutcome {
+    /// The snake_case wire spelling, for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemGateOutcome::Disabled => "disabled",
+            MemGateOutcome::Passed => "passed",
+            MemGateOutcome::PassedAfterWait => "passed_after_wait",
+            MemGateOutcome::ProceededAfterWait => "proceeded_after_wait",
+            MemGateOutcome::ProbeUnreadable => "probe_unreadable",
+        }
+    }
+}
+
+/// One reading of the two pools the gate checks: free commit and free
+/// physical, in bytes. `None` is an unreadable (or, for physical, disarmed)
+/// probe — see [`pool_allows`].
+pub type MemGateReading = (Option<u64>, Option<u64>);
+
+/// Read the real probes. The physical arm is not probed at all when it is
+/// disabled: an inert arm must not pay a syscall, and `None` is what the gate
+/// reads as "contributes nothing".
+fn read_mem_gate_probe(min_free_phys_gb: u64) -> MemGateReading {
+    let free_phys = if min_free_phys_gb > 0 {
+        available_phys_bytes()
+    } else {
+        None
+    };
+    (available_commit_bytes(), free_phys)
+}
+
 /// Pre-permit memory guard. Called BEFORE acquiring a build-pool permit/slot at
 /// every build-spawning site, so the wait never holds a slot hostage.
 ///
@@ -445,6 +521,9 @@ pub fn total_commit_bytes() -> Option<u64> {
 /// Fails open on an unreadable probe and after `mem_wait_max_secs()`, so a
 /// mis-measuring box can never deadlock the build lane — it degrades to exactly
 /// today's behavior (build anyway, accept the OOM risk) rather than wedging.
+/// WHICH of those happened is returned as a [`MemGateOutcome`], which the
+/// callers record on the build's status — the fail-open is otherwise
+/// indistinguishable afterwards from a pass.
 ///
 /// **Two floors, checked independently** (commit and physical — see
 /// [`ram_guard_allows`]), and every message names WHICH pool is short and
@@ -456,87 +535,172 @@ pub fn total_commit_bytes() -> Option<u64> {
 /// Free physical pins low under saturation and may never climb back over a
 /// threshold on its own, so a lane waiting on it alone could wait forever. The
 /// timer is the non-physical release path that makes this arm safe to add.
-pub async fn check_ram_guard(state: &SharedState) {
+pub async fn check_ram_guard(state: &SharedState) -> MemGateOutcome {
     let min_free_gb = crate::config::min_free_ram_gb();
     let min_free_phys_gb = crate::config::min_free_phys_gb();
+    let wait_max = Duration::from_secs(crate::config::mem_wait_max_secs());
+    run_mem_gate(
+        min_free_gb,
+        min_free_phys_gb,
+        wait_max,
+        Duration::from_secs(15),
+        || read_mem_gate_probe(min_free_phys_gb),
+        || (total_commit_bytes(), total_phys_bytes()),
+        |level, msg| {
+            let state = state.clone();
+            async move {
+                match level {
+                    LogLevel::Warn => warn!("{}", msg),
+                    _ => info!("{}", msg),
+                }
+                state.logs.emit(LogSource::Build, level, msg).await;
+            }
+        },
+    )
+    .await
+}
+
+/// The decision loop behind [`check_ram_guard`], with the probe, the sleep
+/// interval, the wait ceiling and the log sink injected so it can be driven
+/// without real memory readings or a 15 s sleep. `totals` (commit, physical)
+/// is read only when a message is rendered — the happy path pays no extra
+/// probe, exactly as before the loop was extracted.
+pub async fn run_mem_gate<P, T, E, Fut>(
+    min_free_gb: u64,
+    min_free_phys_gb: u64,
+    wait_max: Duration,
+    interval: Duration,
+    mut probe: P,
+    totals: T,
+    mut emit: E,
+) -> MemGateOutcome
+where
+    P: FnMut() -> MemGateReading,
+    T: Fn() -> MemGateReading,
+    E: FnMut(LogLevel, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     // Both arms off is the documented full disable; one arm off leaves the
     // other enforcing, so this can only short-circuit when neither is armed.
     if min_free_gb == 0 && min_free_phys_gb == 0 {
-        return;
+        return MemGateOutcome::Disabled;
     }
-    let wait_max = crate::config::mem_wait_max_secs();
-    let interval = std::time::Duration::from_secs(15);
-    let mut waited: u64 = 0;
+    let mut waited = Duration::ZERO;
     let mut warned = false;
 
     loop {
-        let free = available_commit_bytes();
-        // Not probed at all when the arm is disabled: an inert arm must not pay
-        // a syscall, and `None` is what the rest of this function already reads
-        // as "contributes nothing".
-        let free_phys = if min_free_phys_gb > 0 {
-            available_phys_bytes()
-        } else {
-            None
-        };
+        let (free, free_phys) = probe();
 
         if ram_guard_allows(free, min_free_gb, free_phys, min_free_phys_gb) {
-            if warned {
-                let msg = format!(
-                    "Pre-permit memory guard: headroom recovered ({}, {}) — building",
-                    format_pool_reading("commit", free, total_commit_bytes()),
-                    format_pool_reading("physical", free_phys, total_phys_bytes()),
-                );
-                info!("{}", msg);
-                state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+            // Did any ARMED arm actually measure? If not, the allow came purely
+            // from the fail-open-on-`None` contract. This check deliberately
+            // precedes `warned`: an unmeasured release after a deferral is
+            // `ProbeUnreadable`, not `PassedAfterWait` (see the variant doc).
+            let commit_measured = min_free_gb > 0 && free.is_some();
+            let phys_measured = min_free_phys_gb > 0 && free_phys.is_some();
+            let outcome = if !commit_measured && !phys_measured {
+                MemGateOutcome::ProbeUnreadable
+            } else if warned {
+                MemGateOutcome::PassedAfterWait
+            } else {
+                MemGateOutcome::Passed
+            };
+            if outcome == MemGateOutcome::ProbeUnreadable {
+                emit(
+                    LogLevel::Warn,
+                    format!(
+                        "Pre-permit memory guard: no armed memory probe could be read \
+                         (commit {}, physical {}){} — building without a memory check; \
+                         mem_gate: {}",
+                        if min_free_gb > 0 {
+                            "unavailable"
+                        } else {
+                            "disarmed"
+                        },
+                        if min_free_phys_gb > 0 {
+                            "unavailable"
+                        } else {
+                            "disarmed"
+                        },
+                        if warned {
+                            format!(" after deferring {}s on a short reading", waited.as_secs())
+                        } else {
+                            String::new()
+                        },
+                        outcome.as_str(),
+                    ),
+                )
+                .await;
+            } else if warned {
+                let (total_commit, total_phys) = totals();
+                emit(
+                    LogLevel::Info,
+                    format!(
+                        "Pre-permit memory guard: headroom recovered ({}, {}) — building; \
+                         mem_gate: {}",
+                        format_pool_reading("commit", free, total_commit),
+                        format_pool_reading("physical", free_phys, total_phys),
+                        outcome.as_str(),
+                    ),
+                )
+                .await;
             }
-            return;
+            return outcome;
         }
 
         // Name every pool that is short, not just the first one — being short
         // on both is a different situation from being short on either.
+        let (total_commit, total_phys) = totals();
         let mut short: Vec<String> = Vec::new();
         if !pool_allows(free, min_free_gb) {
             short.push(format!(
                 "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB)",
-                format_pool_reading("commit", free, total_commit_bytes()),
+                format_pool_reading("commit", free, total_commit),
                 min_free_gb,
             ));
         }
         if !pool_allows(free_phys, min_free_phys_gb) {
             short.push(format!(
                 "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB)",
-                format_pool_reading("physical", free_phys, total_phys_bytes()),
+                format_pool_reading("physical", free_phys, total_phys),
                 min_free_phys_gb,
             ));
         }
         let short = short.join("; ");
 
         if waited >= wait_max {
-            let msg = format!(
-                "Pre-permit memory guard: still short after {}s — {} — building anyway; \
-                 expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
-                 incremental cache).",
-                waited, short,
-            );
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
-            return;
+            let outcome = MemGateOutcome::ProceededAfterWait;
+            emit(
+                LogLevel::Warn,
+                format!(
+                    "Pre-permit memory guard: still short after {}s — {} — building anyway; \
+                     expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
+                     incremental cache). mem_gate: {}",
+                    waited.as_secs(),
+                    short,
+                    outcome.as_str(),
+                ),
+            )
+            .await;
+            return outcome;
         }
 
         if !warned {
-            let msg = format!(
-                "Pre-permit memory guard: low memory — {}; deferring build up to {}s for \
-                 headroom (no build slot is held while waiting).",
-                short, wait_max,
-            );
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+            emit(
+                LogLevel::Warn,
+                format!(
+                    "Pre-permit memory guard: low memory — {}; deferring build up to {}s for \
+                     headroom (no build slot is held while waiting).",
+                    short,
+                    wait_max.as_secs(),
+                ),
+            )
+            .await;
             warned = true;
         }
 
         tokio::time::sleep(interval).await;
-        waited = waited.saturating_add(interval.as_secs());
+        waited = waited.saturating_add(interval);
     }
 }
 
@@ -911,8 +1075,10 @@ pub async fn run_cargo_build_with_dir_detailed(
 
     // Pre-permit memory guard: defer (never reject) while the box lacks the
     // commit headroom a single rustc on the runner's bin crate needs. Runs
-    // before permit acquisition so waiting never holds a slot.
-    check_ram_guard(state).await;
+    // before permit acquisition so waiting never holds a slot. The outcome is
+    // recorded on the slot and on `/health` once a slot is claimed, so a build
+    // that ran because the wait expired stays distinguishable from a pass.
+    let mem_gate = check_ram_guard(state).await;
 
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -941,7 +1107,11 @@ pub async fn run_cargo_build_with_dir_detailed(
         started_at: chrono::Utc::now(),
         requester_id,
         rebuild_kind: "exe".to_string(),
+        mem_gate: Some(mem_gate),
     };
+    // `claim_idle_slot` records `mem_gate` on the slot's history under the
+    // same busy lock as the claim, so `GET /builds` never pairs this build
+    // with the previous build's `last_mem_gate`.
     let slot = state.build_pool.claim_idle_slot(info).await;
     // RAII guard: clears `slot.busy = None` AND reconciles the global
     // `build_in_progress` flag on every exit path (happy path, `?`, panic,
@@ -959,6 +1129,7 @@ pub async fn run_cargo_build_with_dir_detailed(
         build.build_error_detected = false;
         build.last_build_error = None;
         build.last_build_at = Some(chrono::Utc::now());
+        build.last_mem_gate = Some(mem_gate);
     }
 
     state.notify_health_change();
@@ -4558,7 +4729,7 @@ async fn prewarm_single_slot(
     // Same memory floor as the real-build path: the prewarm `cargo check` also
     // spawns rustc against this workspace, so gating only the real build would
     // let prewarm be the thing that OOMs and poisons the slot.
-    check_ram_guard(state).await;
+    let mem_gate = check_ram_guard(state).await;
 
     // Acquire a permit so concurrent spawn-test calls see this slot as busy.
     state
@@ -4592,11 +4763,18 @@ async fn prewarm_single_slot(
         if busy.is_some() {
             return Ok(());
         }
-        *busy = Some(BuildInfo {
-            started_at: chrono::Utc::now(),
-            requester_id: Some("supervisor-prewarm".to_string()),
-            rebuild_kind: "prewarm".to_string(),
-        });
+        // `occupy` writes `history.last_mem_gate` under this busy lock,
+        // before the claim is visible — see its doc.
+        slot.occupy(
+            &mut busy,
+            BuildInfo {
+                started_at: chrono::Utc::now(),
+                requester_id: Some("supervisor-prewarm".to_string()),
+                rebuild_kind: "prewarm".to_string(),
+                mem_gate: Some(mem_gate),
+            },
+        )
+        .await;
     }
     let _slot_guard = SlotGuard {
         slot: slot.clone(),

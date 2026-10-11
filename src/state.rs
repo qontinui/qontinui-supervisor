@@ -730,6 +730,13 @@ pub struct BuildState {
     pub last_build_error: Option<String>,
     pub last_build_at: Option<DateTime<Utc>>,
     pub last_build_stderr: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent real (non-prewarm)
+    /// build — set when that build claims its slot, alongside
+    /// `last_build_at`. Surfaced as `GET /health` `build.last_mem_gate` so a
+    /// build that ran because the gate's wait EXPIRED
+    /// (`proceeded_after_wait`) is distinguishable from one that passed.
+    /// `None` until the first build.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 /// Metadata for an active build on a specific slot.
@@ -739,6 +746,9 @@ pub struct BuildInfo {
     pub requester_id: Option<String>,
     /// What kind of rebuild: "dev" or "exe" (custom-protocol/embedded frontend).
     pub rebuild_kind: String,
+    /// What the pre-permit memory gate decided before this build claimed the
+    /// slot. `None` only where no gate ran (test fixtures).
+    pub mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 // State of the frontend (`npm run build`) for a specific slot.
@@ -791,6 +801,12 @@ pub struct SlotHistory {
     /// failures for that slot — the failure is no longer the current state).
     /// Use `GET /builds/{slot_id}/log` for the full untruncated log.
     pub last_error_log: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent build (real or
+    /// prewarm) to claim this slot. Surfaced as `GET /builds`
+    /// `slots[].history.last_mem_gate`; persists after the build finishes so
+    /// a fail-open (`proceeded_after_wait`) stays visible next to the build's
+    /// result. `None` until a gated build claims the slot.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
 }
 
 impl Default for SlotHistory {
@@ -809,6 +825,7 @@ impl SlotHistory {
             last_error: None,
             last_error_detail: None,
             last_error_log: None,
+            last_mem_gate: None,
         }
     }
 
@@ -976,6 +993,25 @@ pub struct BuildSlot {
     /// builds — receivers from a previous build naturally start seeing the
     /// next build's lines, which is the desired "tail -f" semantics.
     pub log_stream: tokio::sync::broadcast::Sender<String>,
+}
+
+impl BuildSlot {
+    /// Mark this slot busy with `info`. `busy` MUST be this slot's own
+    /// `busy` write guard, which the caller holds across the call.
+    ///
+    /// The slot's `history.last_mem_gate` is written FIRST, while the busy
+    /// lock is still held and before `busy` is set, so a reader that sees the
+    /// new build in `busy` (`GET /builds` reads `busy`, then `history`) can
+    /// never pair it with the previous build's `last_mem_gate`. Lock order is
+    /// `busy` -> `history`; nothing takes them the other way round. A claim
+    /// carrying no gate outcome leaves the history value untouched (`None`
+    /// until a gated build claims the slot).
+    pub async fn occupy(&self, busy: &mut Option<BuildInfo>, info: BuildInfo) {
+        if let Some(gate) = info.mem_gate {
+            self.history.write().await.last_mem_gate = Some(gate);
+        }
+        *busy = Some(info);
+    }
 }
 
 /// Metadata for the last-known-good (LKG) runner binary preserved at
@@ -1168,7 +1204,7 @@ impl BuildPool {
         for slot in &self.slots {
             let mut busy = slot.busy.write().await;
             if busy.is_none() {
-                *busy = Some(info.clone());
+                slot.occupy(&mut busy, info.clone()).await;
                 return slot.clone();
             }
         }
@@ -1835,6 +1871,7 @@ impl BuildState {
             last_build_error: None,
             last_build_at: None,
             last_build_stderr: None,
+            last_mem_gate: None,
         }
     }
 }
@@ -2883,6 +2920,7 @@ mod tests {
                 started_at: Utc::now(),
                 requester_id: Some("test".to_string()),
                 rebuild_kind: "exe".to_string(),
+                mem_gate: None,
             })
             .await;
         pool.queue_depth.fetch_add(2, Ordering::Relaxed);
@@ -2906,5 +2944,46 @@ mod tests {
         // ...and it must NOT be read off the semaphore, which releases after
         // `busy` is cleared and so disagrees transiently mid-release.
         assert_eq!(pool.permits.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_claim_records_its_mem_gate_on_history_before_it_is_visible() {
+        use crate::build_monitor::MemGateOutcome;
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut config = make_test_config();
+        config.project_dir = tmp.path().join("qontinui-runner").join("src-tauri");
+        config.build_pool = crate::config::BuildPoolConfig { pool_size: 1 };
+        let pool = BuildPool::new(&config);
+        // A previous build left its outcome on the slot's history.
+        pool.slots[0].history.write().await.last_mem_gate = Some(MemGateOutcome::Passed);
+
+        let slot = pool
+            .claim_idle_slot(BuildInfo {
+                started_at: Utc::now(),
+                requester_id: Some("test".to_string()),
+                rebuild_kind: "exe".to_string(),
+                mem_gate: Some(MemGateOutcome::ProceededAfterWait),
+            })
+            .await;
+        // The claim returns with both already agreeing — no separate history
+        // write is left for the caller to race against `GET /builds`.
+        let busy_gate = slot.busy.read().await.as_ref().and_then(|i| i.mem_gate);
+        assert_eq!(busy_gate, Some(MemGateOutcome::ProceededAfterWait));
+        assert_eq!(slot.history.read().await.last_mem_gate, busy_gate);
+
+        // A claim carrying no gate outcome leaves the history value alone.
+        *slot.busy.write().await = None;
+        let slot = pool
+            .claim_idle_slot(BuildInfo {
+                started_at: Utc::now(),
+                requester_id: None,
+                rebuild_kind: "exe".to_string(),
+                mem_gate: None,
+            })
+            .await;
+        assert_eq!(
+            slot.history.read().await.last_mem_gate,
+            Some(MemGateOutcome::ProceededAfterWait)
+        );
     }
 }

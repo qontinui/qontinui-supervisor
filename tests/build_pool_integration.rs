@@ -39,6 +39,7 @@ fn fake_build_info(tag: &str) -> BuildInfo {
         started_at: Utc::now(),
         requester_id: Some(tag.to_string()),
         rebuild_kind: "dev".to_string(),
+        mem_gate: None,
     }
 }
 
