@@ -1726,7 +1726,7 @@ pub struct SpawnTestRequest {
     ///
     /// After the child process is spawned, the supervisor polls
     /// `GET http://localhost:{port}/health` every 200ms until it succeeds or
-    /// this many milliseconds elapse. Defaults to 6000 (6 seconds).
+    /// this many milliseconds elapse. Defaults to 60000 (60 seconds).
     ///
     /// Set to `0` to skip the probe entirely (legacy behavior — return
     /// immediately after spawn without verifying the child bound its API
