@@ -2929,3 +2929,129 @@ async fn rebuild_and_restart_202_build_source_is_null_when_no_build_can_run() {
     let unknown_body = rebuild_and_restart_202_body(&state, "no-such-runner").await;
     assert!(unknown_body["build_source"].is_null(), "{unknown_body}");
 }
+
+/// The rustdoc on `SpawnTestRequest::health_probe_timeout_ms` is the sentence a
+/// caller actually reads: nobody opens `default_health_probe_timeout()` to learn
+/// the default. It said 6000 after the function moved to 60000 (a 6s probe
+/// killed runners that were still inside their 30s-per-stage PG bootstrap), and
+/// the stale number was copied into the fleet's temp-runner docs. Pin the
+/// sentence to the function, so changing either one alone fails here.
+#[test]
+fn health_probe_timeout_rustdoc_states_the_coded_default() {
+    let src = include_str!("../runners.rs");
+    let lines: Vec<&str> = src.lines().collect();
+    let field = lines
+        .iter()
+        .position(|l| l.trim() == "pub health_probe_timeout_ms: u64,")
+        .expect("SpawnTestRequest must still declare `pub health_probe_timeout_ms: u64,`");
+
+    // The field's doc comment: the contiguous `///` lines above it, stepping
+    // over its `#[serde(...)]` attribute.
+    let mut doc: Vec<&str> = Vec::new();
+    for line in lines[..field].iter().rev() {
+        let t = line.trim();
+        if t.starts_with("#[") {
+            continue;
+        }
+        match t.strip_prefix("///") {
+            Some(text) => doc.push(text.trim()),
+            None => break,
+        }
+    }
+    doc.reverse();
+    let doc = doc.join(" ");
+
+    let coded = super::default_health_probe_timeout();
+    // What a caller who omits the field actually gets is its serde default, not
+    // the helper. `#[serde(default)]` without the helper would make it 0, which
+    // skips the probe, while the helper and the doc still agreed on 60000.
+    let effective = serde_json::from_str::<super::SpawnTestRequest>("{}")
+        .expect("deserialize empty SpawnTestRequest")
+        .health_probe_timeout_ms;
+    assert_eq!(
+        effective, coded,
+        "an omitted health_probe_timeout_ms must take default_health_probe_timeout() \
+         ({coded}), got {effective}: the field's #[serde(default = ...)] no longer names it"
+    );
+
+    let stated = stated_defaults(&doc);
+    assert_eq!(
+        stated.len(),
+        1,
+        "the health_probe_timeout_ms doc must state its default exactly once, as \
+         `Defaults to <ms>`; found {stated:?} in: {doc}"
+    );
+    let (ms, secs) = stated[0];
+    assert_eq!(
+        ms,
+        Some(coded),
+        "the health_probe_timeout_ms doc states a default of {ms:?} ms, but \
+         default_health_probe_timeout() returns {coded}; update the doc with the code: {doc}"
+    );
+    if let Some(secs) = secs {
+        assert_eq!(
+            secs * 1000,
+            coded,
+            "the doc's `({secs} seconds)` disagrees with its own {coded} ms: {doc}"
+        );
+    }
+}
+
+/// Every `Defaults to <ms>` a rustdoc sentence states, each with the
+/// `(<s> seconds)` that may follow it (optionally after a ` ms` unit). A number
+/// may carry `_` separators, the code's own spelling (`60_000`).
+fn stated_defaults(doc: &str) -> Vec<(Option<u64>, Option<u64>)> {
+    // The number at the start of `s` and how many bytes it spans.
+    fn leading_u64(s: &str) -> Option<(u64, usize)> {
+        let len: usize = s
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '_')
+            .map(char::len_utf8)
+            .sum();
+        let digits: String = s[..len].chars().filter(char::is_ascii_digit).collect();
+        digits.parse().ok().map(|value| (value, len))
+    }
+    doc.match_indices("Defaults to ")
+        .map(|(at, marker)| {
+            let tail = &doc[at + marker.len()..];
+            match leading_u64(tail) {
+                None => (None, None),
+                Some((ms, used)) => {
+                    let rest = &tail[used..];
+                    let rest = rest.strip_prefix(" ms").unwrap_or(rest);
+                    let secs = rest
+                        .strip_prefix(" (")
+                        .and_then(leading_u64)
+                        .map(|(secs, _)| secs);
+                    (Some(ms), secs)
+                }
+            }
+        })
+        .collect()
+}
+
+/// The parser above is a bespoke verifier, so it is shown working on the
+/// spellings it must handle and the mismatches it must surface.
+#[test]
+fn stated_defaults_reads_each_doc_spelling() {
+    assert_eq!(
+        stated_defaults("window. Defaults to 60000 (60 seconds)."),
+        vec![(Some(60000), Some(60))]
+    );
+    assert_eq!(
+        stated_defaults("Defaults to 60_000 (60 seconds)."),
+        vec![(Some(60000), Some(60))],
+        "`_` separators are the code's own spelling"
+    );
+    assert_eq!(
+        stated_defaults("Defaults to 60000 ms (6 seconds)."),
+        vec![(Some(60000), Some(6))],
+        "a ` ms` unit must not hide a disagreeing `(6 seconds)`"
+    );
+    assert_eq!(
+        stated_defaults("Defaults to 6000 (6 seconds)."),
+        vec![(Some(6000), Some(6))]
+    );
+    assert_eq!(stated_defaults("Defaults to sixty."), vec![(None, None)]);
+    assert_eq!(stated_defaults("no default stated"), vec![]);
+}
