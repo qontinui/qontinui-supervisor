@@ -871,19 +871,28 @@ impl EnvForwarder for RestateEnv {
 // RunnerTierEnv
 // =============================================================================
 
-/// Force a spawned temp runner to boot at Tier 0 (`Local`) regardless of what
-/// the shared runner settings.json says.
+/// Force a spawned temp runner to boot at Tier 0 (`Local`) regardless of the
+/// tier its own settings and its copied pairing would resolve to.
 ///
-/// **Why this is necessary.** The runner's `settings::get_settings_path()`
-/// resolves to `dirs::config_dir() / "com.qontinui.runner" / "settings.json"`
-/// — a single shared file across the primary runner, every named runner, and
-/// every temp runner. When the primary is signed into Qontinui (Tier 2,
-/// `runner_token` populated), every fresh temp runner reads the same shared
-/// settings, sees `tier == qontinui_account`, has no JWT in its (also-shared)
-/// keychain slot, and parks on `LoginScreen` waiting for credentials. The
-/// supervisor cannot fix this by `POST`ing `set_runner_tier` to the temp
-/// runner because that handler persists, and the persist would clobber the
-/// primary's Tier 2 state on disk.
+/// **Why this is necessary.** A temp runner does not load its settings from
+/// the primary's `settings.json`. Since #56 (2026-05-27)
+/// `manager::apply_instance_dir_env` points every non-primary runner's
+/// `QONTINUI_CONFIG_DIR` at its own instance dir, so it boots on a fresh
+/// settings file. One read of the primary's file does survive, and it does
+/// not touch the tier. When the machine-global `claude-accounts.json` is
+/// absent, qontinui-runner `claude_accounts::load_with_migration` probes the
+/// unscoped `settings.json` for an account roster to seed it with, once per
+/// process. This paragraph used to describe
+/// one shared file; that was true when this forwarder landed (#48, 2026-05-22)
+/// and stopped being true five days later. What still lifts a fresh temp runner
+/// to Tier 2 is the pairing spawn-test copies into that same instance dir
+/// (`routes::runners::PAIRED_STATE_FILES`): the runner's tier inference
+/// (qontinui-runner `profiles::infer_tier`) answers `qontinui_account` for any
+/// install that is paired and never chose a tier. Setting the tier afterwards
+/// through the temp runner's own `set_runner_tier` does not replace this: on a
+/// secondary that handler applies the tier in memory only, after the runner has
+/// already booted at the inferred tier, while this overlay is read by the
+/// runner's first settings load.
 ///
 /// The runner now honors `QONTINUI_RUNNER_TIER` as an in-memory overlay
 /// inside `load_settings()` (parallel to the existing `QONTINUI_RESTATE_*`
