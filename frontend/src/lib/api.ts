@@ -1177,12 +1177,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(opts),
     }),
-  runnerFixAndRebuild: (prompt: string) =>
-    fetchJson<DetachedBuildResponse>('/runner/fix-and-rebuild', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-    }),
 
   // Logs
   logFile: (type: string, tailLines?: number) =>
