@@ -312,6 +312,11 @@ impl Default for RebuildWhenIdleRequest {
     }
 }
 
+/// The tree `POST /runner/rebuild-when-idle` rebuilds the primary from. One
+/// constant so the detached rebuild and the `build_source` its 202 echoes
+/// cannot disagree.
+const REBUILD_WHEN_IDLE_TREE: manager::BuildTree = manager::BuildTree::OriginMain;
+
 /// `POST /runner/rebuild-when-idle` — watch the primary until its Claude
 /// sessions drain, then rebuild it from `origin/main`.
 ///
@@ -520,7 +525,7 @@ pub async fn rebuild_when_idle(
                 true,
                 RestartSource::Manual,
                 false,
-                manager::BuildTree::OriginMain,
+                REBUILD_WHEN_IDLE_TREE,
             )
             .await
             {
@@ -560,6 +565,10 @@ pub async fn rebuild_when_idle(
         Json(serde_json::json!({
             "status": "watching",
             "build_id": submission_id,
+            // Same contract as the two restart 202s: name the tree the
+            // eventual rebuild compiles. This route already 404'd above when
+            // no primary is configured, so it is never `null` here.
+            "build_source": REBUILD_WHEN_IDLE_TREE.build_source(true),
             "action_id": action_id,
             "runner": runner_name,
             "poll_secs": poll_secs,
@@ -1577,6 +1586,24 @@ mod tests {
         let (status, body) = body_json(resp).await;
         assert_eq!(status, 202);
         assert!(body["build_source"].is_null(), "{body}");
+    }
+
+    /// The deferred rebuild names its tree in the 202 like the two restart
+    /// doors do. The dead port keeps the background watcher from ever seeing a
+    /// drained primary, so it waits and never builds.
+    #[tokio::test]
+    async fn rebuild_when_idle_202_echoes_origin_main_build_source() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state_dead_runner_port(tmp.path());
+
+        let resp = rebuild_when_idle(State(state.clone()), OptionalJson(None))
+            .await
+            .expect("handler ok")
+            .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202);
+        assert_eq!(body["status"], "watching");
+        assert_eq!(body["build_source"], "origin_main", "{body}");
     }
 
     /// A second fix-and-rebuild while one is still in flight is an idempotent

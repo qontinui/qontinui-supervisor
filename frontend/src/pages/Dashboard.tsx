@@ -1154,6 +1154,14 @@ function RunnerInstancesPanel() {
     try {
       const resp = await submit();
       const buildId = resp.build_id ?? resp.submission_id;
+      // Say which tree the rebuild selects before the 10-20 min build runs, so
+      // a misread escape hatch is caught now rather than after the wrong
+      // binary is under the runner. "Selects", not "will compile": the
+      // readiness gate can still refuse the restart after this 202.
+      if (resp.build_source) {
+        const tree = resp.build_source === 'origin_main' ? 'origin/main' : 'the live working tree';
+        addToast(`Rebuild ${runnerName} selects ${tree}`, 'info');
+      }
       if (buildId) {
         // Fire-and-forget: the poll loop owns the indicator from here.
         void pollBuild(runnerId, runnerName, buildId);

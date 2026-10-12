@@ -493,9 +493,10 @@ export interface DetachedBuildResponse {
   build_id?: string;
   submission_id?: string;
   poll?: string;
-  /// Which tree the detached rebuild compiles (`/runner/restart` and
-  /// `/runners/{id}/restart` only). `null` = no runner to build for (unknown id,
-  /// or no configured primary).
+  /// Which tree the detached rebuild compiles (`/runner/restart`,
+  /// `/runners/{id}/restart` and `/runner/rebuild-when-idle`). `null` = no
+  /// runner to build for (unknown id, or no configured primary); never `null`
+  /// from rebuild-when-idle, which 404s instead.
   build_source?: 'origin_main' | 'live_tree' | null;
   message?: string;
 }
