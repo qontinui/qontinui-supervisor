@@ -132,8 +132,8 @@ pub struct PurgeStaleRequest {
 ///
 /// The rebuild-and-restart cycle is one round-trip for callers that today
 /// have to combine `POST /runners/{id}/stop` + a build + `POST .../start`
-/// manually. Refuses to operate on the primary or any user-managed runner
-/// (the supervisor never starts/stops those unprompted).
+/// manually. Refuses to operate on the primary; any other registered runner
+/// is accepted.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RebuildAndRestartRequest {
     /// Optional source label, recorded in diagnostic events.
@@ -1358,6 +1358,12 @@ pub async fn restart_runner(
     .into_response())
 }
 
+/// The tree `POST /runners/{id}/rebuild-and-restart` compiles.
+/// `rebuild_and_restart_by_id` builds through `run_cargo_build_with_requester`,
+/// which takes no build-dir override, so this route always builds the live
+/// working checkout.
+const REBUILD_AND_RESTART_SOURCE: manager::BuildSource = manager::BuildSource::LiveTree;
+
 /// POST /runners/{id}/rebuild-and-restart — stop → cargo build → start, in
 /// one round-trip.
 ///
@@ -1374,11 +1380,20 @@ pub async fn restart_runner(
 /// and a `build_id` immediately; callers poll `GET /builds` (or `GET
 /// /build/{id}/status`) for the terminal outcome (which carries the full
 /// `build_result` body the inline path used to return synchronously).
+///
+/// The 202 carries `build_source` like the other detached-rebuild 202s:
+/// `live_tree` (from [`REBUILD_AND_RESTART_SOURCE`]) when the id names a
+/// non-primary runner, `null` when it names no runner or the primary, since
+/// the detached task refuses both and no build runs.
 pub async fn rebuild_and_restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(body): Json<RebuildAndRestartRequest>,
 ) -> Result<axum::response::Response, SupervisorError> {
+    let build_source = match state.get_runner(&id).await {
+        Some(managed) if !managed.config.kind().is_primary() => json!(REBUILD_AND_RESTART_SOURCE),
+        _ => serde_json::Value::Null,
+    };
     let exec_state = state.clone();
     let runner_id = id.clone();
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
@@ -1420,6 +1435,7 @@ pub async fn rebuild_and_restart_runner(
             "build_id": submission_id.to_string(),
             "submission_id": submission_id.to_string(),
             "poll": "/builds",
+            "build_source": build_source,
             "message": "rebuild-and-restart submitted; the build+restart runs detached from \
                         this connection — poll GET /builds (or GET /build/{id}/status) for the \
                         terminal outcome",

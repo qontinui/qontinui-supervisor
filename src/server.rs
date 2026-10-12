@@ -129,7 +129,7 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     EndpointEntry {
         method: "POST",
         path: "/runners/{id}/rebuild-and-restart",
-        summary: "Rebuild then restart a non-primary runner",
+        summary: "Rebuild the live tree then restart a non-primary runner, detached; 202 names build_source",
     },
     EndpointEntry {
         method: "GET",
@@ -646,7 +646,7 @@ pub static ENDPOINT_MANIFEST: &[EndpointEntry] = &[
     EndpointEntry {
         method: "POST",
         path: "/runner/fix-and-rebuild",
-        summary: "Fix errors and rebuild (legacy single-runner endpoint)",
+        summary: "Rebuild the live runner tree, detached (no restart); 202 names build_source",
     },
     EndpointEntry {
         method: "POST",

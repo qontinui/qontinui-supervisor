@@ -2784,3 +2784,75 @@ async fn restart_202_build_source_is_null_for_an_unknown_runner() {
         "no runner to build for, so no label: {body}"
     );
 }
+
+// ── `build_source` echoed in the `POST /runners/{id}/rebuild-and-restart` 202 ─
+
+/// Drive the rebuild-and-restart route and return its 202 body. Nothing here
+/// yields after `submit_detached`, so on the current-thread test runtime the
+/// detached stop → build → start never runs; the closed pool is a second
+/// guard against a cargo spawn should it ever be polled. Do not add an
+/// `.await` after the handler returns: for a named runner the task's first
+/// step is a real stop against that runner's port.
+async fn rebuild_and_restart_202_body(
+    state: &crate::state::SharedState,
+    id: &str,
+) -> serde_json::Value {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    state.build_pool.permits.close();
+    let resp = super::rebuild_and_restart_runner(
+        State(state.clone()),
+        Path(id.to_string()),
+        axum::Json(super::RebuildAndRestartRequest::default()),
+    )
+    .await
+    .expect("handler ok")
+    .into_response();
+    assert_eq!(resp.status().as_u16(), 202);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    serde_json::from_slice(&bytes).expect("JSON body")
+}
+
+#[tokio::test]
+async fn rebuild_and_restart_202_names_live_tree_for_a_non_primary_runner() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let config = crate::config::RunnerConfig {
+        id: "named-9998-test".to_string(),
+        name: "Named test".to_string(),
+        port: 9998,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: "Named test".to_string(),
+        },
+        ..crate::config::RunnerConfig::default_primary()
+    };
+    state.runners.write().await.insert(
+        config.id.clone(),
+        Arc::new(crate::state::ManagedRunner::new(config, false)),
+    );
+
+    let body = rebuild_and_restart_202_body(&state, "named-9998-test").await;
+    assert_eq!(body["build_source"], "live_tree", "{body}");
+}
+
+#[tokio::test]
+async fn rebuild_and_restart_202_build_source_is_null_when_no_build_can_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let primary_id = state
+        .get_primary()
+        .await
+        .expect("primary")
+        .config
+        .id
+        .clone();
+
+    // The detached task refuses the primary and an unknown id, so neither
+    // 202 may name a tree.
+    let primary_body = rebuild_and_restart_202_body(&state, &primary_id).await;
+    assert!(primary_body["build_source"].is_null(), "{primary_body}");
+    let unknown_body = rebuild_and_restart_202_body(&state, "no-such-runner").await;
+    assert!(unknown_body["build_source"].is_null(), "{unknown_body}");
+}

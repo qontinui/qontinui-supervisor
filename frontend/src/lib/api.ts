@@ -490,15 +490,15 @@ export interface LogFileResponse {
 /// `/runner/fix-and-rebuild`). The build (+restart) runs detached; poll
 /// `build_id` via `GET /build/{id}/status` for the terminal outcome.
 export interface DetachedBuildResponse {
-  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart, "watching" from /runner/rebuild-when-idle, "accepted" from /runner/fix-and-rebuild; "restarted" for the sync no-rebuild path
+  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart and /runners/{id}/rebuild-and-restart, "watching" from /runner/rebuild-when-idle, "accepted" from /runner/fix-and-rebuild; "restarted" for the sync no-rebuild path
   build_id?: string;
   submission_id?: string;
   poll?: string;
-  /// Which tree the detached rebuild compiles (`/runner/restart`,
-  /// `/runners/{id}/restart`, `/runner/rebuild-when-idle` and
-  /// `/runner/fix-and-rebuild`). `null` = no runner to build for (unknown id,
-  /// or no configured primary); never `null` from rebuild-when-idle, which 404s
-  /// instead, and always `live_tree` from fix-and-rebuild.
+  /// Which tree the detached rebuild compiles (every route listed above).
+  /// `null` = no runner to build for (unknown id, no configured primary, or the
+  /// primary on `/runners/{id}/rebuild-and-restart`, which refuses it); never
+  /// `null` from rebuild-when-idle, which 404s instead, and always `live_tree`
+  /// from fix-and-rebuild.
   build_source?: 'origin_main' | 'live_tree' | null;
   message?: string;
 }
