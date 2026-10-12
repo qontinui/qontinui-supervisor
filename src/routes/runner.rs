@@ -1146,6 +1146,12 @@ pub async fn reset_build(
     })))
 }
 
+/// The tree `POST /runner/fix-and-rebuild` compiles. `run_cargo_build` takes no
+/// build-dir override, so this route always builds the live working checkout;
+/// both of its 202 arms echo it so the acknowledgement names the tree the same
+/// way the restart and rebuild-when-idle 202s do.
+const FIX_AND_REBUILD_SOURCE: manager::BuildSource = manager::BuildSource::LiveTree;
+
 /// POST /runner/fix-and-rebuild — Rebuild the live runner tree, detached from
 /// the HTTP connection.
 ///
@@ -1196,6 +1202,7 @@ pub async fn fix_and_rebuild(
                             "build_id": existing_id.to_string(),
                             "submission_id": existing_id.to_string(),
                             "poll": format!("/build/{existing_id}/status"),
+                            "build_source": FIX_AND_REBUILD_SOURCE,
                             "deduplicated": true,
                             "message": "fix-and-rebuild already in flight; \
                                         poll GET /build/{id}/status for the terminal outcome",
@@ -1286,6 +1293,7 @@ pub async fn fix_and_rebuild(
             "build_id": submission_id.to_string(),
             "submission_id": submission_id.to_string(),
             "poll": format!("/build/{submission_id}/status"),
+            "build_source": FIX_AND_REBUILD_SOURCE,
             "action_id": action_id.to_string(),
             "states_active": states_active,
             "predicted": predicted,
@@ -1632,6 +1640,7 @@ mod tests {
         assert_eq!(status, 202, "idempotent accept must be 202");
         assert_eq!(body["status"], "accepted");
         assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["build_source"], "live_tree", "{body}");
         assert_eq!(
             body["build_id"],
             existing_id.to_string(),
@@ -1952,6 +1961,7 @@ mod tests {
             .into_response();
         let (status, body) = body_json(resp).await;
         assert_eq!(status, 202);
+        assert_eq!(body["build_source"], "live_tree", "{body}");
         let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
             .expect("action_id is a uuid");
 

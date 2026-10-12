@@ -486,17 +486,19 @@ export interface LogFileResponse {
 
 /// 202 body returned by the detached rebuild paths
 /// (`/runner/restart {rebuild:true}`, `/runners/{id}/restart {rebuild:true}`,
-/// `/runners/{id}/rebuild-and-restart`). The build+restart runs detached; poll
+/// `/runners/{id}/rebuild-and-restart`, `/runner/rebuild-when-idle`,
+/// `/runner/fix-and-rebuild`). The build (+restart) runs detached; poll
 /// `build_id` via `GET /build/{id}/status` for the terminal outcome.
 export interface DetachedBuildResponse {
-  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart; "restarted" for the sync no-rebuild path
+  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart, "watching" from /runner/rebuild-when-idle, "accepted" from /runner/fix-and-rebuild; "restarted" for the sync no-rebuild path
   build_id?: string;
   submission_id?: string;
   poll?: string;
   /// Which tree the detached rebuild compiles (`/runner/restart`,
-  /// `/runners/{id}/restart` and `/runner/rebuild-when-idle`). `null` = no
-  /// runner to build for (unknown id, or no configured primary); never `null`
-  /// from rebuild-when-idle, which 404s instead.
+  /// `/runners/{id}/restart`, `/runner/rebuild-when-idle` and
+  /// `/runner/fix-and-rebuild`). `null` = no runner to build for (unknown id,
+  /// or no configured primary); never `null` from rebuild-when-idle, which 404s
+  /// instead, and always `live_tree` from fix-and-rebuild.
   build_source?: 'origin_main' | 'live_tree' | null;
   message?: string;
 }
@@ -1176,7 +1178,7 @@ export const api = {
       body: JSON.stringify(opts),
     }),
   runnerFixAndRebuild: (prompt: string) =>
-    fetchJson<unknown>('/runner/fix-and-rebuild', {
+    fetchJson<DetachedBuildResponse>('/runner/fix-and-rebuild', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt }),
