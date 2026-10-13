@@ -81,6 +81,11 @@ pub struct ResourceSamplePayload {
     /// NULL on the Windows host lane — Windows has no load average, and a
     /// fabricated 0.0 would read as an idle box.
     pub load_1m: Option<f64>,
+    /// CPU package temperature in degrees Celsius. NULL means unmeasured
+    /// (Windows, WSL, no `x86_pkg_temp`/`coretemp` sensor, or an implausible
+    /// reading) — never `0`. Display only; must not feed any pressure or
+    /// headroom ranking. Serialized as `null`, not skipped.
+    pub cpu_temp_c: Option<f64>,
     #[serde(flatten)]
     pub memory: MemorySnapshot,
     pub disk_total_bytes: Option<u64>,
@@ -111,6 +116,89 @@ fn load_1m() -> Option<f64> {
     }
 }
 
+/// Plausible package-temperature window (Celsius). A reading outside it is a
+/// stuck or garbage sensor and is dropped rather than published.
+#[cfg(any(target_os = "linux", test))]
+const CPU_TEMP_MIN_C: f64 = -20.0;
+#[cfg(any(target_os = "linux", test))]
+const CPU_TEMP_MAX_C: f64 = 150.0;
+
+/// Parse a sysfs millidegree value (`71000`) into Celsius (`71.0`).
+///
+/// Pure over `&str`. Empty, non-numeric, non-finite or out-of-range
+/// (`-20..=150` C) input, or the `-1` sentinel, yields `None`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_millidegrees_c(raw: &str) -> Option<f64> {
+    let milli: f64 = raw.trim().parse().ok()?;
+    // `-1` is the conventional "no reading" sentinel; as millidegrees it would
+    // otherwise pass the range check as -0.001 C.
+    if milli == -1.0 {
+        return None;
+    }
+    let c = milli / 1000.0;
+    (c.is_finite() && (CPU_TEMP_MIN_C..=CPU_TEMP_MAX_C).contains(&c)).then_some(c)
+}
+
+/// Read the package temperature under a `/sys`-shaped `root`.
+///
+/// First choice: the thermal zone whose `type` is `x86_pkg_temp`. Fallback:
+/// the hottest `temp*_input` of the hwmon device named `coretemp`.
+#[cfg(target_os = "linux")]
+fn read_cpu_package_temp_c(root: &std::path::Path) -> Option<f64> {
+    use std::fs;
+
+    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok();
+
+    if let Ok(zones) = fs::read_dir(root.join("class/thermal")) {
+        for zone in zones.flatten() {
+            let dir = zone.path();
+            let is_zone = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("thermal_zone"));
+            if !is_zone {
+                continue;
+            }
+            if read(dir.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp") {
+                if let Some(c) = read(dir.join("temp")).and_then(|r| parse_millidegrees_c(&r)) {
+                    return Some(c);
+                }
+            }
+        }
+    }
+
+    let mut hottest: Option<f64> = None;
+    for hw in fs::read_dir(root.join("class/hwmon")).ok()?.flatten() {
+        let dir = hw.path();
+        if read(dir.join("name")).is_none_or(|n| n.trim() != "coretemp") {
+            continue;
+        }
+        for entry in fs::read_dir(&dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("temp") && name.ends_with("_input") {
+                if let Some(c) = read(entry.path()).and_then(|r| parse_millidegrees_c(&r)) {
+                    hottest = Some(hottest.map_or(c, |h| h.max(c)));
+                }
+            }
+        }
+    }
+    hottest
+}
+
+/// CPU package temperature in Celsius, or `None` where unmeasured. Linux only
+/// (`/sys`); every other target reports `None` rather than a guess.
+fn cpu_package_temp_c() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        read_cpu_package_temp_c(std::path::Path::new("/sys"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Build the §A1 payload from a footprint snapshot.
 ///
 /// Pure: every field is projected from the snapshot the timer already
@@ -127,6 +215,7 @@ pub fn payload_from_snapshot(
         lane_instance: None,
         cpu_cores: Some(cpu_cores),
         load_1m: load_1m(),
+        cpu_temp_c: cpu_package_temp_c(),
         memory: snapshot.memory,
         disk_total_bytes: snapshot.disk_total_bytes,
         disk_free_bytes: snapshot.disk_free_bytes,
@@ -353,6 +442,7 @@ mod tests {
             "lane_instance",
             "cpu_cores",
             "load_1m",
+            "cpu_temp_c",
             "mem_total_bytes",
             "mem_available_bytes",
             "commit_total_bytes",
@@ -454,6 +544,102 @@ mod tests {
         } else {
             assert!(got.is_some());
         }
+    }
+
+    #[test]
+    fn millidegrees_parse_to_celsius_and_reject_garbage() {
+        assert_eq!(parse_millidegrees_c("71000"), Some(71.0));
+        assert_eq!(
+            parse_millidegrees_c(
+                "71000
+"
+            ),
+            Some(71.0)
+        );
+        for bad in ["", "abc", "-1", "255000", "NaN"] {
+            assert_eq!(parse_millidegrees_c(bad), None, "{bad:?} must be None");
+        }
+    }
+
+    #[test]
+    fn unmeasured_cpu_temp_serializes_as_null_not_skipped() {
+        let mut p = payload_from_snapshot(&snapshot_fixture(), 8);
+        p.cpu_temp_c = None;
+        let v = serde_json::to_value(p).unwrap();
+        assert!(v.get("cpu_temp_c").is_some_and(|x| x.is_null()));
+    }
+
+    #[test]
+    fn cpu_temp_is_null_off_linux() {
+        if !cfg!(target_os = "linux") {
+            assert!(cpu_package_temp_c().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reader_prefers_pkg_zone_then_hottest_coretemp() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sup-cputemp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let w = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        // No sensors at all.
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&root), None);
+        // coretemp fallback: hottest input wins.
+        w(
+            "class/hwmon/hwmon3/name",
+            "coretemp
+",
+        );
+        w(
+            "class/hwmon/hwmon3/temp1_input",
+            "50000
+",
+        );
+        w(
+            "class/hwmon/hwmon3/temp2_input",
+            "64000
+",
+        );
+        w(
+            "class/hwmon/hwmon4/name",
+            "nvme
+",
+        );
+        w(
+            "class/hwmon/hwmon4/temp1_input",
+            "99000
+",
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(64.0));
+        // x86_pkg_temp zone takes precedence.
+        w(
+            "class/thermal/thermal_zone0/type",
+            "acpitz
+",
+        );
+        w(
+            "class/thermal/thermal_zone0/temp",
+            "30000
+",
+        );
+        w(
+            "class/thermal/thermal_zone1/type",
+            "x86_pkg_temp
+",
+        );
+        w(
+            "class/thermal/thermal_zone1/temp",
+            "71000
+",
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(71.0));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
