@@ -116,39 +116,39 @@ fn load_1m() -> Option<f64> {
     }
 }
 
-/// Plausible package-temperature window (Celsius). A reading outside it is a
-/// stuck or garbage sensor and is dropped rather than published.
+/// Accepted raw sysfs range, in millidegrees: `1..=150000` (0.001..=150 C).
+/// `0` and every negative value (`-1` and friends are "no reading" sentinels)
+/// are rejected, as is anything above 150 C (a stuck or garbage sensor).
 #[cfg(any(target_os = "linux", test))]
-const CPU_TEMP_MIN_C: f64 = -20.0;
+const CPU_TEMP_RAW_MIN: f64 = 1.0;
 #[cfg(any(target_os = "linux", test))]
-const CPU_TEMP_MAX_C: f64 = 150.0;
+const CPU_TEMP_RAW_MAX: f64 = 150_000.0;
 
 /// Parse a sysfs millidegree value (`71000`) into Celsius (`71.0`).
 ///
-/// Pure over `&str`. Empty, non-numeric, non-finite or out-of-range
-/// (`-20..=150` C) input, or the `-1` sentinel, yields `None`.
+/// Pure over `&str`. Empty, non-numeric, non-finite or out-of-range input
+/// (raw outside `1..=150000`, so `0` and negatives included) yields `None`.
 #[cfg(any(target_os = "linux", test))]
 fn parse_millidegrees_c(raw: &str) -> Option<f64> {
     let milli: f64 = raw.trim().parse().ok()?;
-    // `-1` is the conventional "no reading" sentinel; as millidegrees it would
-    // otherwise pass the range check as -0.001 C.
-    if milli == -1.0 {
-        return None;
-    }
-    let c = milli / 1000.0;
-    (c.is_finite() && (CPU_TEMP_MIN_C..=CPU_TEMP_MAX_C).contains(&c)).then_some(c)
+    (milli.is_finite() && (CPU_TEMP_RAW_MIN..=CPU_TEMP_RAW_MAX).contains(&milli))
+        .then(|| milli / 1000.0)
 }
 
 /// Read the package temperature under a `/sys`-shaped `root`.
 ///
-/// First choice: the thermal zone whose `type` is `x86_pkg_temp`. Fallback:
-/// the hottest `temp*_input` of the hwmon device named `coretemp`.
+/// First choice: the MAX over every thermal zone whose `type` is
+/// `x86_pkg_temp` (order independent). If none yields a valid value, the MAX
+/// over every `temp*_input` of every hwmon device named exactly `coretemp`.
+/// A directory that cannot be read is skipped, never fatal.
 #[cfg(target_os = "linux")]
 fn read_cpu_package_temp_c(root: &std::path::Path) -> Option<f64> {
     use std::fs;
 
     let read = |p: std::path::PathBuf| fs::read_to_string(p).ok();
+    let max = |acc: Option<f64>, c: f64| Some(acc.map_or(c, |h| h.max(c)));
 
+    let mut pkg: Option<f64> = None;
     if let Ok(zones) = fs::read_dir(root.join("class/thermal")) {
         for zone in zones.flatten() {
             let dir = zone.path();
@@ -161,24 +161,33 @@ fn read_cpu_package_temp_c(root: &std::path::Path) -> Option<f64> {
             }
             if read(dir.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp") {
                 if let Some(c) = read(dir.join("temp")).and_then(|r| parse_millidegrees_c(&r)) {
-                    return Some(c);
+                    pkg = max(pkg, c);
                 }
             }
         }
     }
+    if pkg.is_some() {
+        return pkg;
+    }
 
     let mut hottest: Option<f64> = None;
-    for hw in fs::read_dir(root.join("class/hwmon")).ok()?.flatten() {
+    let Ok(hwmons) = fs::read_dir(root.join("class/hwmon")) else {
+        return None;
+    };
+    for hw in hwmons.flatten() {
         let dir = hw.path();
         if read(dir.join("name")).is_none_or(|n| n.trim() != "coretemp") {
             continue;
         }
-        for entry in fs::read_dir(&dir).ok()?.flatten() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("temp") && name.ends_with("_input") {
                 if let Some(c) = read(entry.path()).and_then(|r| parse_millidegrees_c(&r)) {
-                    hottest = Some(hottest.map_or(c, |h| h.max(c)));
+                    hottest = max(hottest, c);
                 }
             }
         }
@@ -201,13 +210,15 @@ fn cpu_package_temp_c() -> Option<f64> {
 
 /// Build the §A1 payload from a footprint snapshot.
 ///
-/// Pure: every field is projected from the snapshot the timer already
-/// refreshed, plus the CPU count from the existing
-/// [`crate::fleet::detect_resources`] probe. Nothing here re-samples memory,
+/// Pure over its arguments: every field is projected from the snapshot the
+/// timer already refreshed, plus the CPU count from the existing
+/// [`crate::fleet::detect_resources`] probe and the already-read
+/// `cpu_temp_c` (the caller reads sysfs off the async worker). Nothing here re-samples memory,
 /// disk or pool state — a second sampler is exactly what the plan forbids.
 pub fn payload_from_snapshot(
     snapshot: &FootprintSnapshot,
     cpu_cores: u32,
+    cpu_temp_c: Option<f64>,
 ) -> ResourceSamplePayload {
     ResourceSamplePayload {
         sampled_at: snapshot.computed_at.clone(),
@@ -215,7 +226,7 @@ pub fn payload_from_snapshot(
         lane_instance: None,
         cpu_cores: Some(cpu_cores),
         load_1m: load_1m(),
-        cpu_temp_c: cpu_package_temp_c(),
+        cpu_temp_c,
         memory: snapshot.memory,
         disk_total_bytes: snapshot.disk_total_bytes,
         disk_free_bytes: snapshot.disk_free_bytes,
@@ -340,7 +351,12 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     // is resolved here rather than inside the blocking identity hop.
     let (bearer, bearer_source) = crate::fleet::resolve_device_bearer_for(&base).await;
 
-    let payload = payload_from_snapshot(snapshot, cpu_cores);
+    // sysfs reads are blocking I/O: keep them off the async worker.
+    let cpu_temp_c = tokio::task::spawn_blocking(cpu_package_temp_c)
+        .await
+        .unwrap_or(None);
+
+    let payload = payload_from_snapshot(snapshot, cpu_cores, cpu_temp_c);
 
     let client = match reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
         Ok(c) => c,
@@ -415,7 +431,7 @@ mod tests {
     #[test]
     fn payload_projects_the_snapshot_without_resampling() {
         let snap = snapshot_fixture();
-        let p = payload_from_snapshot(&snap, 24);
+        let p = payload_from_snapshot(&snap, 24, None);
         assert_eq!(p.lane, "host");
         assert_eq!(p.source, "supervisor");
         // The supervisor is the sole publisher for its lane, so NULL is the
@@ -435,7 +451,7 @@ mod tests {
 
     #[test]
     fn payload_serializes_every_a1_column_name() {
-        let v = serde_json::to_value(payload_from_snapshot(&snapshot_fixture(), 8)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snapshot_fixture(), 8, None)).unwrap();
         for key in [
             "sampled_at",
             "lane",
@@ -480,7 +496,7 @@ mod tests {
         snap.disk_free_bytes = None;
         snap.disk_total_bytes = None;
         snap.disk_mount = None;
-        let v = serde_json::to_value(payload_from_snapshot(&snap, 1)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snap, 1, None)).unwrap();
         for key in [
             "mem_total_bytes",
             "commit_available_bytes",
@@ -504,7 +520,7 @@ mod tests {
         // box, and §C3 forbids absence of signal being read as anything else.
         let mut snap = snapshot_fixture();
         snap.memory = crate::footprint::memory_snapshot();
-        let v = serde_json::to_value(payload_from_snapshot(&snap, 1)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snap, 1, None)).unwrap();
         if crate::footprint::SWAP_IS_DERIVED_FROM_COMMIT {
             assert!(
                 v["swap_total_bytes"].is_null(),
@@ -563,7 +579,7 @@ mod tests {
 
     #[test]
     fn unmeasured_cpu_temp_serializes_as_null_not_skipped() {
-        let mut p = payload_from_snapshot(&snapshot_fixture(), 8);
+        let mut p = payload_from_snapshot(&snapshot_fixture(), 8, None);
         p.cpu_temp_c = None;
         let v = serde_json::to_value(p).unwrap();
         assert!(v.get("cpu_temp_c").is_some_and(|x| x.is_null()));
@@ -640,6 +656,102 @@ mod tests {
         );
         assert_eq!(read_cpu_package_temp_c(&root), Some(71.0));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_root(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sup-cputemp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (rel, body) in files {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_pkg_zones_take_max_and_ignore_invalid() {
+        let root = fake_root(
+            "zones",
+            &[
+                ("class/thermal/thermal_zone0/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone0/temp", "55000\n"),
+                ("class/thermal/thermal_zone1/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone1/temp", "72000\n"),
+                ("class/thermal/thermal_zone2/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone2/temp", "0\n"),
+                ("class/thermal/thermal_zone3/type", "acpitz\n"),
+                ("class/thermal/thermal_zone3/temp", "99000\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(72.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_coretemp_hwmons_take_max_across() {
+        let root = fake_root(
+            "hwmons",
+            &[
+                ("class/hwmon/hwmon0/name", "coretemp\n"),
+                ("class/hwmon/hwmon0/temp1_input", "48000\n"),
+                ("class/hwmon/hwmon1/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/temp1_input", "66000\n"),
+                ("class/hwmon/hwmon2/name", "coretemp_x\n"),
+                ("class/hwmon/hwmon2/temp1_input", "99000\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(66.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_zero_and_negatives_are_rejected() {
+        assert_eq!(parse_millidegrees_c("0"), None);
+        assert_eq!(parse_millidegrees_c("-1"), None);
+        assert_eq!(parse_millidegrees_c("-5000"), None);
+        assert_eq!(parse_millidegrees_c("150001"), None);
+        assert_eq!(parse_millidegrees_c("1"), Some(0.001));
+        assert_eq!(parse_millidegrees_c("150000"), Some(150.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_zero_zone_yields_none() {
+        let root = fake_root(
+            "zero",
+            &[
+                ("class/thermal/thermal_zone0/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone0/temp", "0\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_hwmon_entry_is_skipped() {
+        let root = fake_root(
+            "unreadable",
+            &[
+                ("class/hwmon/hwmon0/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/temp1_input", "61000\n"),
+            ],
+        );
+        // hwmon0 has a name but a temp dir entry that is not a readable
+        // file; hwmon9 is a plain file so read_dir on it errors. Neither
+        // may discard hwmon1's valid reading.
+        std::fs::create_dir(root.join("class/hwmon/hwmon0/temp1_input")).unwrap();
+        std::fs::write(root.join("class/hwmon/hwmon9"), "x").unwrap();
+        assert_eq!(read_cpu_package_temp_c(&root), Some(61.0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
