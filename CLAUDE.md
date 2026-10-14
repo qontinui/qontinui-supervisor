@@ -911,6 +911,12 @@ one WSL VM, so the supervisor cannot count jobs — deriving one from
 idle/busy would be a fabricated number in a column an allocator reads). The WSL
 lane is a different pool and is not the supervisor's to report.
 
+`cpu_temp_c` is the CPU package temperature in Celsius, read from `/sys` on Linux
+only (MAX over `x86_pkg_temp` thermal zones, else MAX over `coretemp` hwmons; raw
+sysfs outside `1..=150000` millidegrees is rejected). It is NULL on Windows and
+anywhere no sensor exists — unmeasured, never zero — and is display only: it must
+not feed any pressure or headroom ranking.
+
 Publishing is **best-effort and silent on failure**: machine identity and coord
 URL resolve exactly as `fleet::publish_budget`'s do (`~/.qontinui/machine.json`,
 `~/.qontinui/profiles.json`), a device bearer is attached when
