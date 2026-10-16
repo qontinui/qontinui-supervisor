@@ -876,13 +876,16 @@ impl EnvForwarder for RestateEnv {
 ///
 /// **Why this is necessary.** A temp runner does not load its settings from
 /// the primary's `settings.json`. Since #56 (2026-05-27)
-/// `manager::apply_instance_dir_env` points every non-primary runner's
+/// `manager::apply_instance_root_env` points every non-primary runner's
 /// `QONTINUI_CONFIG_DIR` at its own instance dir, so it boots on a fresh
-/// settings file. One read of the primary's file does survive, and it does
-/// not touch the tier. When the machine-global `claude-accounts.json` is
+/// settings file. One automatic read of the primary's file survives, and it
+/// does not touch the tier. When the machine-global `claude-accounts.json` is
 /// absent, qontinui-runner `claude_accounts::load_with_migration` probes the
 /// unscoped `settings.json` for an account roster to seed it with, once per
-/// process. This paragraph used to describe
+/// process. Backup and restore reach the primary's file too, on request: the
+/// runner's `backup.rs` resolves `settings.json` without the instance dir, so
+/// `GET /backup` on a temp runner reads the primary's file and
+/// `POST /restore` there writes it. This paragraph used to describe
 /// one shared file; that was true when this forwarder landed (#48, 2026-05-22)
 /// and stopped being true five days later. What still lifts a fresh temp runner
 /// to Tier 2 is the pairing spawn-test copies into that same instance dir
