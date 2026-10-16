@@ -44,6 +44,50 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 
 **First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0). Note: on a crash-watchdog-armed runner, the first-healthy kill reads as a crash (non-zero exit, no stop intent) — the crash-only watchdog will retry the start up to its loop-guard budget, then disarm.
 
+## Instance root (every temp and named runner is a subject)
+
+Every non-primary spawn carries `QONTINUI_INSTANCE_ROOT=<config_dir>/com.qontinui.runner/instances/<id>`
+— the same `process::instance_config_dir` the reaper already removes — set by
+`manager::apply_non_primary_instance_env` (plan
+`2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
+Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env.rs`).
+`process::instance_root::InstanceRoot` is the one layout:
+
+| Var | Value |
+|---|---|
+| `QONTINUI_CONFIG_DIR`, `QONTINUI_SECURE_STORAGE_DIR` | the root itself |
+| `QONTINUI_HOME` | `<root>/home` |
+| `QONTINUI_RUNNER_LOG_DIR`, `QONTINUI_PANIC_LOG_DIR` | `<root>/logs` |
+| `QONTINUI_EMBEDDED_PG_DIR` | `<root>/embedded-pg` (a private cluster per runner) |
+| `WEBVIEW2_USER_DATA_FOLDER` | `<root>/webview`, on every OS |
+| `QONTINUI_DISABLE_KEYCHAIN` | `1` |
+
+- **A runner under a root refuses to start (exit 78, `<root>/startup-refusal.log`)
+  when a root-confined variable points outside the root, or when its port is
+  unset, `0` or `9876`.** The env block refuses a non-primary config on `0`,
+  `9876` or the registered primary's port before spawning, and `extra_env`
+  overrides that would trip the refusal are warned about by name.
+- **Every location is exported explicitly, and secure storage and config ARE the
+  root** (not the runner's own `<root>/secure` / `<root>/config` defaults). An
+  LKG or older binary that ignores the root still reads its pairing where the
+  writers put it, and a persistent named runner keeps its existing
+  `settings.json` / `paired_user.json` without a migration. Every pairing writer
+  (the spawn-test paired-state copy, `POST /runners/pair-with-token`) resolves
+  its destination through `instance_root::instance_secure_storage_dir`.
+- **`<root>/home` is provisioned, not inherited.** `machine.json` (the box's
+  device identity) and `profiles.json` (coord/API URL) are copied in from the
+  harness's `~/.qontinui` when absent; no credential the subject can mint for
+  itself (device JWT, agent JWTs, loopback keys) and no ledger is copied. A
+  subject's loopback key, port breadcrumb and session names therefore live under
+  `<root>/home` — the spawn-test and spawn-named responses name it as
+  `instance_root.home`.
+- **Panic logs are read from `<root>/logs`** whatever `--log-dir` says, and
+  `runner-last-panic.txt` is captured into the stopped-runner snapshot before
+  teardown removes the root, so `GET /runners/{id}/crash-summary` still has it.
+- **Cost:** a private embedded-PG cluster means each fresh temp runner pays an
+  initdb and a copy of the bundled PostgreSQL install inside its root; both go
+  with the root at teardown.
+
 ## Temp runner isolation and max age
 
 **`QONTINUI_INSTANCE_NAME` is the runner's unique id, never its port.** The

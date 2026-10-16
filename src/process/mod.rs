@@ -6,6 +6,9 @@ pub mod early_log;
 pub mod env_forwarders;
 pub mod guarded_command;
 pub mod health_probe;
+/// The instance root a non-primary spawn is given (`QONTINUI_INSTANCE_ROOT`) —
+/// plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`.
+pub mod instance_root;
 pub mod job;
 pub mod manager;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
@@ -68,7 +71,9 @@ use std::path::PathBuf;
 /// byte-for-byte:
 ///
 /// 1. **Spawn side** — [`manager::start_exe_mode_for_runner`] exports it to the
-///    child as BOTH `QONTINUI_CONFIG_DIR` and `QONTINUI_SECURE_STORAGE_DIR`.
+///    child as `QONTINUI_INSTANCE_ROOT` (the whole subject lives under it — see
+///    [`instance_root`]) AND as BOTH `QONTINUI_CONFIG_DIR` and
+///    `QONTINUI_SECURE_STORAGE_DIR`.
 ///    The runner prefers those env vars over its
 ///    `dirs::data_local_dir()/com.qontinui.runner` fallback (`auth.rs`,
 ///    `secure_storage.rs`, `pair.rs` all read the env var first), so for a

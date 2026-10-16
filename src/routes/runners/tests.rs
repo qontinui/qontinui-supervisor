@@ -861,7 +861,8 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     // drift on the ROUTE side trips this assertion. The spawn side (the
     // `cmd.env(...)` that tells the child to read this dir) is pinned
     // separately by
-    // `process::manager::tests::apply_instance_dir_env_sets_both_vars_to_instance_config_dir`.
+    // `process::manager::tests::apply_instance_root_env_exports_the_root_and_confines_every_location`
+    // and, end to end, by `paired_state_writer_targets_the_childs_secure_storage_dir`.
     let expected = dirs::config_dir()
         .expect("config_dir resolved above")
         .join("com.qontinui.runner")
@@ -880,6 +881,77 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     if let Some(shared) = dirs::data_local_dir() {
         assert_ne!(dest, shared.join("com.qontinui.runner"));
     }
+}
+
+/// The paired-state writer and the spawn's env block agree END TO END: the dir
+/// `apply_paired_state_for_spawn` copies the pairing into is exactly the
+/// `QONTINUI_SECURE_STORAGE_DIR` the child is handed, and it lies inside the
+/// child's `QONTINUI_INSTANCE_ROOT` (plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+/// Phase 4). Both sides are driven for real — the env block against a real
+/// `Command` — so neither can drift without failing here.
+#[test]
+fn paired_state_writer_targets_the_childs_secure_storage_dir() {
+    let unique = format!("supervisor-selftest-secure-{}", std::process::id());
+    let runner_id = format!("test-{unique}");
+    let (Some(home), Some(root)) = (
+        dirs::home_dir(),
+        crate::process::instance_config_dir(&runner_id),
+    ) else {
+        return;
+    };
+    let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+    std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
+    let _cleanup = scopeguard::guard((snapshot.clone(), root.clone()), |(snap, dst)| {
+        let _ = std::fs::remove_dir_all(snap);
+        let _ = std::fs::remove_dir_all(dst);
+    });
+    std::fs::write(
+        snapshot.join("paired_user.json"),
+        r#"{"user_id":"selftest"}"#,
+    )
+    .expect("write paired_user.json");
+
+    let config = crate::config::RunnerConfig {
+        id: runner_id.clone(),
+        name: crate::process::temp_runner_instance_name(&runner_id),
+        port: 9877,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Temp {
+            id: runner_id.clone(),
+        },
+        protected: true,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: Default::default(),
+    };
+    let mut cmd = tokio::process::Command::new("cargo");
+    crate::process::manager::apply_non_primary_instance_env_with(&mut cmd, &config, 9876, None)
+        .expect("env block must apply");
+    let env = |key: &str| -> Option<std::path::PathBuf> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v)
+            .map(std::path::PathBuf::from)
+    };
+    let child_secure = env("QONTINUI_SECURE_STORAGE_DIR").expect("secure dir exported");
+    let child_root = env("QONTINUI_INSTANCE_ROOT").expect("instance root exported");
+
+    super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
+
+    assert!(
+        child_secure.join("paired_user.json").is_file(),
+        "the pairing must land in the dir the child reads as QONTINUI_SECURE_STORAGE_DIR \
+         ({child_secure:?})"
+    );
+    assert!(
+        crate::process::instance_root::is_inside_root(&child_secure, &child_root),
+        "the child's secure dir {child_secure:?} must lie inside its root {child_root:?}"
+    );
 }
 
 // -------------------------------------------------------------------

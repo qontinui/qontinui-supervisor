@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::process::instance_config_dir;
 use std::time::{Duration, SystemTime};
 
 // Startup-window predicate (plan
@@ -293,24 +294,25 @@ fn child_api_url_explicit_env_forwarded_to_all() {
     assert_eq!(resolve_child_api_url(explicit(), false), explicit());
 }
 
-// Per-instance config/secure-storage dir, asserted at the site that
-// actually decides where the child reads.
+// The instance root, asserted at the site that actually decides where the
+// child reads and writes.
 //
-// `start_exe_mode_for_runner` applies `apply_instance_dir_env` to every
-// non-primary child, and `spawn-test` only ever mints non-primary
-// (`RunnerKind::Temp`) runners — so the dir this function sets IS the
-// directory a spawn-test runner loads its pairing and token cache from.
-// `routes::runners` writes the `paired_profile_id` snapshot into
-// `instance_config_dir`'s output for the same id.
+// `start_exe_mode_for_runner` applies `apply_non_primary_instance_env` (and
+// through it `apply_instance_root_env`) to every non-primary child, and
+// `spawn-test` only ever mints non-primary (`RunnerKind::Temp`) runners — so
+// the vars this sets ARE where a spawn-test runner keeps its state and loads
+// its pairing and token cache from. `routes::runners` writes the
+// `paired_profile_id` snapshot into `instance_secure_storage_dir` for the same
+// id; the cross-check is
+// `routes::runners::tests::paired_state_writer_targets_the_childs_secure_storage_dir`.
 //
 // The assertion is made over a REAL `Command`'s env map rather than over a
 // re-derivation of the helper's body: re-inlining a divergent path at the
 // spawn's `cmd.env(...)` site — the failure this test exists to catch —
-// fails here. (It covers the spawn side only; the route side is pinned by
-// `routes::runners::tests::instance_config_dir_is_where_apply_paired_profile_for_spawn_writes`.)
+// fails here.
 #[test]
-fn apply_instance_dir_env_sets_both_vars_to_instance_config_dir() {
-    let id = format!("test-apply-instance-dir-env-{}", std::process::id());
+fn apply_instance_root_env_exports_the_root_and_confines_every_location() {
+    let id = format!("test-apply-instance-root-env-{}", std::process::id());
     let Some(expected) = instance_config_dir(&id) else {
         // No resolvable config dir on this platform — nothing to assert.
         return;
@@ -320,29 +322,130 @@ fn apply_instance_dir_env_sets_both_vars_to_instance_config_dir() {
     });
 
     let mut cmd = Command::new("cargo");
-    let applied = super::apply_instance_dir_env(&mut cmd, &id).expect("must resolve + create");
-    assert_eq!(applied, expected);
+    let root = super::apply_instance_root_env(&mut cmd, &id, None).expect("must resolve + create");
+    assert_eq!(root.path(), expected.as_path());
 
-    let envs: std::collections::HashMap<String, Option<String>> = cmd
-        .as_std()
-        .get_envs()
-        .map(|(k, v)| {
-            (
-                k.to_string_lossy().into_owned(),
-                v.map(|v| v.to_string_lossy().into_owned()),
-            )
-        })
-        .collect();
-    let want = expected.to_string_lossy().into_owned();
+    let envs = command_envs(&cmd);
+    let want_root = expected.to_string_lossy().into_owned();
+    assert_eq!(
+        envs.get("QONTINUI_INSTANCE_ROOT")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some(want_root.as_str()),
+        "the child must be told its instance root = instance_config_dir({id})"
+    );
+    // Secure storage and config ARE the root, so an older binary that ignores
+    // the root still reads its pairing where the writer put it.
     for key in ["QONTINUI_CONFIG_DIR", "QONTINUI_SECURE_STORAGE_DIR"] {
         assert_eq!(
             envs.get(key).cloned().flatten().as_deref(),
-            Some(want.as_str()),
-            "{key} must be exported to the child as instance_config_dir({id}) = {expected:?}; \
-                 a spawn that inlines a different path leaves the runner unpaired"
+            Some(want_root.as_str()),
+            "{key} must be exported as the instance root {expected:?}; a spawn that inlines a \
+             different path leaves the runner unpaired"
         );
     }
-    assert!(expected.is_dir(), "the instance dir must have been created");
+    assert_confined_to_root(&envs, &expected);
+    assert_eq!(
+        envs.get("QONTINUI_DISABLE_KEYCHAIN")
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some("1"),
+        "the OS keychain is keyed on a service name every runner on the box shares"
+    );
+    for (key, dir) in root.confined_exports() {
+        assert!(dir.is_dir(), "{key}={dir:?} must have been created");
+    }
+}
+
+/// Every root-confined key the command sets lies inside `root` — the contract a
+/// root-honouring runner enforces with exit 78 (qontinui-runner
+/// `instance_env::validate_instance_root`).
+fn assert_confined_to_root(
+    envs: &std::collections::HashMap<String, Option<String>>,
+    root: &std::path::Path,
+) {
+    for key in crate::process::instance_root::ROOT_CONFINED_ENV_KEYS {
+        let Some(Some(value)) = envs.get(key) else {
+            continue;
+        };
+        assert!(
+            crate::process::instance_root::is_inside_root(std::path::Path::new(value), root),
+            "{key}={value:?} lies outside the instance root {root:?} — a runner under the root \
+             refuses to start (exit 78)"
+        );
+    }
+}
+
+/// The whole non-primary block — the root, every confined location, the
+/// provisioned home — and the port refusal.
+#[test]
+fn non_primary_env_block_carries_the_root_and_provisions_the_home() {
+    let pid = std::process::id();
+    let config = temp_config(&format!("test-rootblock-{pid}"), 9877);
+    let Some(expected_root) = instance_config_dir(&config.id) else {
+        return;
+    };
+    let _cleanup = scopeguard::guard(expected_root.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    let harness_home = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        harness_home.path().join("machine.json"),
+        br#"{"device_id":"d"}"#,
+    )
+    .unwrap();
+    std::fs::write(harness_home.path().join("coord-device-jwt"), b"secret").unwrap();
+
+    let mut cmd = Command::new("cargo");
+    let root = super::apply_non_primary_instance_env_with(
+        &mut cmd,
+        &config,
+        9876,
+        Some(harness_home.path()),
+    )
+    .expect("must resolve + create");
+    let envs = command_envs(&cmd);
+    assert_confined_to_root(&envs, &expected_root);
+    for key in [
+        "QONTINUI_HOME",
+        "QONTINUI_RUNNER_LOG_DIR",
+        "QONTINUI_PANIC_LOG_DIR",
+        "QONTINUI_EMBEDDED_PG_DIR",
+        "WEBVIEW2_USER_DATA_FOLDER",
+    ] {
+        assert!(
+            envs.get(key).cloned().flatten().is_some(),
+            "{key} must be exported explicitly so an older binary is isolated too"
+        );
+    }
+    assert!(
+        root.home_dir().join("machine.json").is_file(),
+        "the harness's device identity is provisioned into <root>/home"
+    );
+    assert!(
+        !root.home_dir().join("coord-device-jwt").exists(),
+        "a credential the subject mints for itself is never copied"
+    );
+}
+
+#[test]
+fn non_primary_env_block_refuses_the_primary_port() {
+    for (port, primary) in [(9876u16, 9876u16), (9876, 9990), (9990, 9990), (0, 9876)] {
+        let config = temp_config("test-refuse-port", port);
+        let mut cmd = Command::new("cargo");
+        let err = super::apply_non_primary_instance_env_with(&mut cmd, &config, primary, None)
+            .expect_err("a non-primary runner on a refused port must not spawn");
+        assert!(
+            err.to_string().contains("may not use"),
+            "port {port} (primary {primary}): {err}"
+        );
+        assert!(
+            command_envs(&cmd).is_empty(),
+            "a refused spawn must not have half-applied the block"
+        );
+    }
 }
 
 /// Read a `Command`'s env overrides back as a plain map.
@@ -383,7 +486,7 @@ fn temp_config(id: &str, port: u16) -> crate::config::RunnerConfig {
 /// `WEBVIEW2_USER_DATA_FOLDER` together, because it is the combination
 /// that isolates a secondary's state from the primary's and from other
 /// secondaries'. Sibling of
-/// `apply_instance_dir_env_sets_both_vars_to_instance_config_dir`, which
+/// `apply_instance_root_env_exports_the_root_and_confines_every_location`, which
 /// covers the two config-dir vars.
 ///
 /// **The load-bearing assertion is that `QONTINUI_INSTANCE_NAME` is unique
@@ -412,16 +515,12 @@ fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
     }
     // Both dirs land under the operator's REAL app-data roots (the block
     // creates them), so they must not survive a failing assertion below.
-    // Same guard shape as `apply_instance_dir_env_sets_both_vars_to_…`.
+    // Same guard shape as `apply_instance_root_env_exports_the_root_…`.
     let _cleanup = scopeguard::guard(
         vec![first.id.clone(), second.id.clone()],
         |ids: Vec<String>| {
             for id in ids {
                 if let Some(dir) = instance_config_dir(&id) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-                #[cfg(target_os = "windows")]
-                if let Some(dir) = webview2_user_data_folder(&id, false) {
                     let _ = std::fs::remove_dir_all(dir);
                 }
             }
@@ -430,9 +529,9 @@ fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
 
     let mut cmd_a = Command::new("cargo");
     let mut cmd_b = Command::new("cargo");
-    super::apply_non_primary_instance_env(&mut cmd_a, &first, PRIMARY_PORT)
+    super::apply_non_primary_instance_env_with(&mut cmd_a, &first, PRIMARY_PORT, None)
         .expect("must resolve + create");
-    super::apply_non_primary_instance_env(&mut cmd_b, &second, PRIMARY_PORT)
+    super::apply_non_primary_instance_env_with(&mut cmd_b, &second, PRIMARY_PORT, None)
         .expect("must resolve + create");
     let envs_a = command_envs(&cmd_a);
     let envs_b = command_envs(&cmd_b);
@@ -477,28 +576,28 @@ fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
                  classify itself as secondary; unset makes it behave as a primary"
         );
 
-        #[cfg(target_os = "windows")]
-        {
-            let want = webview2_user_data_folder(&config.id, false)
-                .expect("LOCALAPPDATA resolves on Windows")
-                .to_string_lossy()
-                .into_owned();
-            assert_eq!(
-                envs.get("WEBVIEW2_USER_DATA_FOLDER").cloned().flatten(),
-                Some(want),
-                "the WebView2 profile must be keyed on the per-spawn runner id \
-                     so two temps never share localStorage/IndexedDB/cookies"
-            );
-        }
-        #[cfg(not(target_os = "windows"))]
-        let _ = config;
+        let want = instance_config_dir(&config.id)
+            .expect("resolved above")
+            .join("webview")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            envs.get("WEBVIEW2_USER_DATA_FOLDER").cloned().flatten(),
+            Some(want),
+            "the WebView data dir must live in the per-spawn instance root so two \
+             temps never share localStorage/IndexedDB/cookies"
+        );
     }
 
-    #[cfg(target_os = "windows")]
     assert_ne!(
         envs_a.get("WEBVIEW2_USER_DATA_FOLDER"),
         envs_b.get("WEBVIEW2_USER_DATA_FOLDER"),
-        "same-port spawns must not share a WebView2 profile"
+        "same-port spawns must not share a WebView data dir"
+    );
+    assert_ne!(
+        envs_a.get("QONTINUI_INSTANCE_ROOT"),
+        envs_b.get("QONTINUI_INSTANCE_ROOT"),
+        "same-port spawns must not share an instance root"
     );
 }
 
