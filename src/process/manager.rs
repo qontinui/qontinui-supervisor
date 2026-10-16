@@ -3086,6 +3086,32 @@ fn apply_instance_root_env(
     Ok(root)
 }
 
+/// For a PRIMARY spawn: when this supervisor inherited a subject's instance
+/// root (`inherited_root`), remove that root, `QONTINUI_DISABLE_KEYCHAIN`, and
+/// every root-confined location lying inside it, so the primary resolves its
+/// own stores. Locations outside the inherited root are an operator's own
+/// configuration and are kept. No inherited root: nothing is touched.
+pub(crate) fn drop_inherited_subject_env(
+    cmd: &mut Command,
+    inherited_root: Option<std::ffi::OsString>,
+) {
+    let Some(root) = inherited_root.filter(|r| !r.to_string_lossy().trim().is_empty()) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    cmd.env_remove(instance_root::INSTANCE_ROOT_ENV);
+    cmd.env_remove("QONTINUI_DISABLE_KEYCHAIN");
+    for key in instance_root::ROOT_CONFINED_ENV_KEYS {
+        let inherited = std::env::var_os(key);
+        if inherited
+            .as_deref()
+            .is_some_and(|v| instance_root::is_inside_root(std::path::Path::new(v), &root))
+        {
+            cmd.env_remove(key);
+        }
+    }
+}
+
 /// Apply the whole **non-primary** per-instance env block to a spawn command.
 ///
 /// Everything a secondary (temp / named) runner needs in order to keep its
@@ -3501,10 +3527,12 @@ async fn start_exe_mode_for_runner(
     }
 
     // A supervisor launched from inside a subject's session inherits that
-    // subject's QONTINUI_INSTANCE_ROOT (children of a subject do, by design);
-    // the primary must never run under it — it would exit 78 on port 9876.
+    // subject's QONTINUI_INSTANCE_ROOT and every location under it (children of
+    // a subject do, by design). The primary must run under neither: under the
+    // root it would exit 78 on port 9876, and with the locations it would run
+    // on the SUBJECT's pairing, settings and cluster — deleted at its teardown.
     if managed.config.kind().is_primary() {
-        cmd.env_remove(instance_root::INSTANCE_ROOT_ENV);
+        drop_inherited_subject_env(&mut cmd, std::env::var_os(instance_root::INSTANCE_ROOT_ENV));
     }
 
     // Inline non-forwarder env vars. Test-auto-login credentials are pulled
