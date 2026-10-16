@@ -42,6 +42,10 @@ use std::path::{Path, PathBuf};
 /// The env var naming a subject runner's instance root.
 pub const INSTANCE_ROOT_ENV: &str = "QONTINUI_INSTANCE_ROOT";
 
+/// `<root>/startup-refusal.log` — where a runner-crate binary records why it
+/// refused to start under the root (exit 78).
+pub const STARTUP_REFUSAL_LOG: &str = "startup-refusal.log";
+
 /// Mirror of qontinui-runner `instance_env::ROOT_CONFINED_ENV_KEYS`: under an
 /// instance root, each of these that is set non-blank must lie inside the root,
 /// or the runner refuses to start.
@@ -70,7 +74,13 @@ pub const ROOT_CONFINED_ENV_KEYS: [&str; 10] = [
 /// `QONTINUI_ALLOW_NO_DB` would leave it with no database at all instead of its
 /// private cluster. A caller that really wants one back passes it in
 /// `extra_env`, which is applied after.
-pub const HARNESS_STORE_ENV_KEYS: [&str; 7] = [
+///
+/// `COORD_ADMIN_SECRET` is the operator's coord admin credential, which the
+/// runner forwards as `X-Coord-Admin-Secret`. GitHub tokens are deliberately
+/// NOT on the list: they are the user's own credentials for the repositories a
+/// subject's sessions work on, not a store of the harness's.
+pub const HARNESS_STORE_ENV_KEYS: [&str; 8] = [
+    "COORD_ADMIN_SECRET",
     "RUNNER_DATABASE_URL",
     "DATABASE_URL",
     "REDIS_URL",
@@ -220,14 +230,24 @@ impl InstanceRoot {
     /// - REMOVES every [`HARNESS_STORE_ENV_KEYS`] key, so the child cannot reach
     ///   the harness's database, cache or credentials through inherited env;
     /// - sets `QONTINUI_DISABLE_KEYCHAIN=1` — the OS keychain is keyed on a
-    ///   service name every runner on the box shares (D2 of the plan).
-    pub fn apply_env(&self, cmd: &mut tokio::process::Command) -> Result<(), String> {
+    ///   service name every runner on the box shares (D2 of the plan);
+    /// - clears `<root>/startup-refusal.log`, and provisions `<root>/home` from
+    ///   `home_source` ([`provision_instance_home`]). Returns what it copied.
+    pub fn apply_env(
+        &self,
+        cmd: &mut tokio::process::Command,
+        home_source: Option<&Path>,
+    ) -> Result<Vec<&'static str>, String> {
         let exports = self.confined_exports();
         let mut dirs: Vec<PathBuf> = vec![self.root.clone()];
         dirs.extend(exports.iter().map(|(_, dir)| dir.clone()));
         for dir in &dirs {
             std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {dir:?}: {e}"))?;
         }
+        // The runner APPENDS to this log and never truncates it, and the pair
+        // CLI writes into it too; clear it so a refusal read back after this
+        // launch is this launch's.
+        let _ = std::fs::remove_file(self.root.join(STARTUP_REFUSAL_LOG));
         cmd.env(INSTANCE_ROOT_ENV, &self.root);
         for (key, dir) in &exports {
             cmd.env(key, dir);
@@ -241,7 +261,18 @@ impl InstanceRoot {
             cmd.env_remove(key);
         }
         cmd.env("QONTINUI_DISABLE_KEYCHAIN", "1");
-        Ok(())
+        // A failed provisioning is not a refusal: the child then runs as a box
+        // with no device identity — a degraded subject, not a leak.
+        Ok(
+            provision_instance_home(home_source, &self.home_dir()).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "instance root {:?}: home could not be provisioned ({e}); the child starts \
+                 without the harness's device identity / profile",
+                    self.root
+                );
+                Vec::new()
+            }),
+        )
     }
 
     /// The PID recorded in this root's embedded-PG `postmaster.pid`, if a
@@ -367,8 +398,18 @@ pub(crate) mod tests {
     fn apply_env_sets_removes_and_disables_the_keychain() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = InstanceRoot::at(tmp.path().join("root"));
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(root.path().join(STARTUP_REFUSAL_LOG), "old refusal").unwrap();
+        let harness = tmp.path().join("harness-home");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("machine.json"), "{}").unwrap();
         let mut cmd = tokio::process::Command::new("cargo");
-        root.apply_env(&mut cmd).expect("apply");
+        let copied = root.apply_env(&mut cmd, Some(&harness)).expect("apply");
+        assert_eq!(copied, vec!["machine.json"]);
+        assert!(
+            !root.path().join(STARTUP_REFUSAL_LOG).exists(),
+            "a stale refusal is cleared"
+        );
         let envs: std::collections::HashMap<String, Option<String>> = cmd
             .as_std()
             .get_envs()

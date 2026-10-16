@@ -114,9 +114,13 @@ pub fn tail_on_char_boundary(s: &str, cap: usize) -> &str {
 async fn read_startup_refusal(
     root: Option<crate::process::instance_root::InstanceRoot>,
 ) -> Option<String> {
-    let text = tokio::fs::read_to_string(root?.path().join("startup-refusal.log"))
-        .await
-        .ok()?;
+    let text = tokio::fs::read_to_string(
+        root?
+            .path()
+            .join(crate::process::instance_root::STARTUP_REFUSAL_LOG),
+    )
+    .await
+    .ok()?;
     Some(tail_on_char_boundary(&text, LAST_PANIC_TEXT_CAP).to_string())
 }
 

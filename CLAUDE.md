@@ -76,9 +76,15 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   `settings.json` / `paired_user.json` without a migration. Every pairing writer
   (the spawn-test paired-state copy, `POST /runners/pair-with-token`) resolves
   its destination through `instance_root::instance_secure_storage_dir`, and the
-  pair CLI child gets the same env block as the runner (`InstanceRoot::apply_env`)
-  — so pairing in place writes the target's tier and keeps its tokens out of
-  the shared OS keychain.
+  pair CLI child gets the same env block AND the same provisioned home as the
+  runner (`InstanceRoot::apply_env`) — so pairing in place uses the target's
+  device identity, writes the target's tier, and keeps its tokens out of the
+  shared OS keychain.
+- **Reserved ports are refused at registration** (`POST /runners`,
+  `spawn-named` with an explicit port): `0` and `9876` never reach a persisted
+  non-primary config. The primary spawn drops any inherited
+  `QONTINUI_INSTANCE_ROOT`, so a supervisor started inside a subject's session
+  still starts a primary that can run.
 - **`<root>/home` is provisioned, not inherited.** `machine.json` (the box's
   device identity) is copied in from the harness's `~/.qontinui` when absent,
   and `profiles.json` is PROJECTED down to `active` plus each profile's
@@ -93,8 +99,12 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
 - **Panic logs are read from `<root>/logs`** whatever `--log-dir` says, and
   `runner-last-panic.txt` is captured into the stopped-runner snapshot before
   teardown removes the root, so `GET /runners/{id}/crash-summary` still has it.
-  So is `<root>/startup-refusal.log`, surfaced there as `startup_refusal` — why
-  a child exited 78.
+  So is `<root>/startup-refusal.log` (cleared before every launch, since the
+  runner only appends to it), surfaced there as `startup_refusal` when the exit
+  code was 78.
+- **`profiles.json` projection drops everything but the coord/API URLs**, a
+  profile's proxy settings included: on a box whose proxy is configured only in
+  `profiles.json`, subjects have no proxy.
 - **Cost:** a private embedded-PG cluster means each fresh temp runner pays an
   initdb and a copy of the bundled PostgreSQL install inside its root; both go
   with the root at teardown. Teardown first stops a postmaster a killed runner

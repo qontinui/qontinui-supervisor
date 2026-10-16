@@ -550,7 +550,12 @@ pub async fn pair_with_token_copying_into(
             .as_deref()
             .and_then(crate::process::instance_root::InstanceRoot::for_runner);
         let applied = match &root {
-            Some(root) if root.secure_storage_dir() == *dir => root.apply_env(&mut cmd),
+            Some(root) if root.secure_storage_dir() == *dir => root
+                .apply_env(
+                    &mut cmd,
+                    crate::process::instance_root::harness_qontinui_dir().as_deref(),
+                )
+                .map(|_| ()),
             _ => Err(format!(
                 "the instance root of the target runner does not hold its secure-storage dir {}",
                 dir.display()
@@ -648,7 +653,15 @@ pub async fn pair_with_token_copying_into(
     // artifacts. Anything missing here is a CLI contract violation; we
     // surface it as 500 so the caller knows the pair "succeeded" but the
     // supervisor couldn't read back the expected state.
-    let machine_json = match machine_json_path() {
+    // The device id the CLI paired WITH: the target's provisioned
+    // `<root>/home/machine.json` when a target was given (its `QONTINUI_HOME`),
+    // the harness's otherwise.
+    let target_machine_json = body
+        .target_runner_id
+        .as_deref()
+        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .map(|root| root.home_dir().join("machine.json"));
+    let machine_json = match target_machine_json.or_else(machine_json_path) {
         Some(p) => p,
         None => {
             return server_error(

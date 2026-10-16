@@ -3529,16 +3529,25 @@ fn build_tree_from_working_tree_maps_the_wire_bool() {
 
 /// The orphaned-postmaster stop never kills a process running an executable
 /// outside the instance root — a recycled PID in a stale `postmaster.pid`.
-/// Uses THIS test process's PID, whose exe is the test binary (outside the
-/// tempdir root): the verdict must be a refusal, and we are still alive.
+/// The PID is a `sleep` child this test owns (never the test process itself),
+/// whose image lies outside the tempdir root: the verdict must be a refusal and
+/// the child must still be alive.
+#[cfg(unix)]
 #[tokio::test]
 async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let _reap = scopeguard::guard((), |()| {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
     assert!(
-        crate::process::proc_kill::pid_exe_path(std::process::id())
-            .await
-            .is_some(),
-        "precondition: this process's own image path must be readable, or the identity \
-         check is never reached"
+        crate::process::proc_kill::pid_exe_path(pid).await.is_some(),
+        "precondition: the child's image path must be readable, or the identity check is \
+         never reached"
     );
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let root = crate::process::instance_root::InstanceRoot::at(tmp.path().to_path_buf());
@@ -3546,13 +3555,37 @@ async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
     std::fs::create_dir_all(&data).unwrap();
     std::fs::write(
         data.join("postmaster.pid"),
-        format!("{}\n{}\n", std::process::id(), data.display()),
+        format!("{pid}\n{}\n", data.display()),
     )
     .unwrap();
     assert_eq!(
         super::stop_orphaned_embedded_pg("test-orphan-pg", &root).await,
         super::OrphanPgStop::RefusedOutsideRoot
     );
+    assert!(
+        crate::process::proc_kill::pid_exe_path(pid).await.is_some(),
+        "the refused PID must still be alive"
+    );
+}
+
+#[test]
+fn folded_prefix_is_component_wise() {
+    let base = std::path::Path::new("C").join("instances").join("test-1");
+    assert!(super::starts_with_folded(&base.join("x"), &base));
+    assert!(super::starts_with_folded(
+        &std::path::Path::new("c")
+            .join("INSTANCES")
+            .join("Test-1")
+            .join("x"),
+        &base
+    ));
+    assert!(!super::starts_with_folded(
+        &std::path::Path::new("C")
+            .join("instances")
+            .join("test-10")
+            .join("x"),
+        &base
+    ));
 }
 
 /// The positive arm: an executable that lives INSIDE the root is recognised as
