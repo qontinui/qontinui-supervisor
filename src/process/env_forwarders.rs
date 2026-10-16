@@ -1704,6 +1704,12 @@ mod tests {
         assert!(pos("setup_wizard_bypass") < pos("extra_env"));
     }
 
+    use crate::process::instance_root::tests::abs;
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
     fn cmd_with(envs: &[(&str, &str)]) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("cargo");
         for (k, v) in envs {
@@ -1714,16 +1720,18 @@ mod tests {
 
     #[test]
     fn override_warning_flags_a_confined_key_outside_the_root() {
-        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", "/r/instances/test-1")]);
-        let msg = instance_dir_override_warning(&cmd, "t", "QONTINUI_RUNNER_LOG_DIR", "/tmp/logs")
-            .expect("outside the root must warn");
+        let root = abs("r/instances/test-1");
+        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", &s(&root))]);
+        let msg =
+            instance_dir_override_warning(&cmd, "t", "QONTINUI_RUNNER_LOG_DIR", &s(&abs("x/logs")))
+                .expect("outside the root must warn");
         assert!(msg.contains("exit 78"), "{msg}");
         // Inside the root, or blank, is fine.
         assert!(instance_dir_override_warning(
             &cmd,
             "t",
             "QONTINUI_RUNNER_LOG_DIR",
-            "/r/instances/test-1/other-logs"
+            &s(&root.join("other-logs"))
         )
         .is_none());
         assert!(instance_dir_override_warning(&cmd, "t", "QONTINUI_HOME", " ").is_none());
@@ -1735,17 +1743,19 @@ mod tests {
 
     #[test]
     fn override_warning_flags_moving_the_root_and_redirecting_the_pairing_dir() {
-        let root = "/r/instances/test-1";
+        let root_path = abs("r/instances/test-1");
+        let root_s = s(&root_path);
+        let root = root_s.as_str();
         let cmd = cmd_with(&[
             ("QONTINUI_INSTANCE_ROOT", root),
             ("QONTINUI_SECURE_STORAGE_DIR", root),
         ]);
-        let moved =
-            instance_dir_override_warning(&cmd, "t", "QONTINUI_INSTANCE_ROOT", "/elsewhere")
-                .expect("moving the root must warn");
+        let elsewhere = s(&abs("elsewhere"));
+        let moved = instance_dir_override_warning(&cmd, "t", "QONTINUI_INSTANCE_ROOT", &elsewhere)
+            .expect("moving the root must warn");
         assert!(moved.contains("exit 78"), "{moved}");
         let both =
-            instance_dir_override_warning(&cmd, "t", "QONTINUI_SECURE_STORAGE_DIR", "/elsewhere")
+            instance_dir_override_warning(&cmd, "t", "QONTINUI_SECURE_STORAGE_DIR", &elsewhere)
                 .expect("redirecting the pairing dir outside the root must warn");
         assert!(
             both.contains("UNPAIRED") && both.contains("exit 78"),
@@ -1756,7 +1766,8 @@ mod tests {
 
     #[test]
     fn override_warning_flags_a_refused_port_under_a_root() {
-        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", "/r/instances/test-1")]);
+        let root = abs("r/instances/test-1");
+        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", &s(&root))]);
         for bad in ["9876", "0", "x"] {
             let msg = instance_dir_override_warning(&cmd, "t", "QONTINUI_PORT", bad)
                 .unwrap_or_else(|| panic!("QONTINUI_PORT={bad} must warn"));
@@ -1768,7 +1779,7 @@ mod tests {
             &cmd,
             "t",
             "QONTINUI_INSTANCE_ROOT",
-            "/r/instances/test-1/"
+            &format!("{}{}", s(&root), std::path::MAIN_SEPARATOR)
         )
         .is_none());
     }

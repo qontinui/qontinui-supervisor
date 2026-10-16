@@ -61,6 +61,25 @@ pub const ROOT_CONFINED_ENV_KEYS: [&str; 10] = [
     "WEBVIEW2_USER_DATA_FOLDER",
 ];
 
+/// Inherited variables that would hand a subject the HARNESS's stores or
+/// credentials, so every subject child has them removed
+/// ([`InstanceRoot::apply_env`]): the runner falls back to
+/// `RUNNER_DATABASE_URL` / `REDIS_URL` when its profile names no database
+/// (which a projected `profiles.json` never does), reads a device JWT from
+/// `COORD_DEVICE_JWT`, and `QONTINUI_DISABLE_EMBEDDED_PG` /
+/// `QONTINUI_ALLOW_NO_DB` would leave it with no database at all instead of its
+/// private cluster. A caller that really wants one back passes it in
+/// `extra_env`, which is applied after.
+pub const HARNESS_STORE_ENV_KEYS: [&str; 7] = [
+    "RUNNER_DATABASE_URL",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "COORD_DEVICE_JWT",
+    "QONTINUI_RUNNER_TOKEN",
+    "QONTINUI_DISABLE_EMBEDDED_PG",
+    "QONTINUI_ALLOW_NO_DB",
+];
+
 /// The files copied from the harness's `~/.qontinui` into a subject's
 /// `<root>/home` before it starts — explicit provisioning INTO the root, which
 /// D2 of the plan allows (implicit reads outside it are what it forbids).
@@ -187,6 +206,44 @@ impl InstanceRoot {
         self.root.join("webview")
     }
 
+    /// Point a command at this root — the ONE env block every supervisor child
+    /// that acts as this subject gets: the runner spawn
+    /// (`manager::apply_instance_root_env`) and the `qontinui_profile` pair CLI
+    /// (`routes::runners_pair`). Creates the root and every exported dir, then:
+    ///
+    /// - exports `QONTINUI_INSTANCE_ROOT` and every [`Self::confined_exports`] dir;
+    /// - REMOVES every other [`ROOT_CONFINED_ENV_KEYS`] key, so a value this
+    ///   process carries (a supervisor started from a runner-hosted session
+    ///   inherits `QONTINUI_PROMPTS_DIR`; fleet scripts export
+    ///   `QONTINUI_SESSION_NAMES_DIR` / `QONTINUI_CAPABILITY_STATE_DIR`) is never
+    ///   inherited — outside the root it would make the child refuse (exit 78);
+    /// - REMOVES every [`HARNESS_STORE_ENV_KEYS`] key, so the child cannot reach
+    ///   the harness's database, cache or credentials through inherited env;
+    /// - sets `QONTINUI_DISABLE_KEYCHAIN=1` — the OS keychain is keyed on a
+    ///   service name every runner on the box shares (D2 of the plan).
+    pub fn apply_env(&self, cmd: &mut tokio::process::Command) -> Result<(), String> {
+        let exports = self.confined_exports();
+        let mut dirs: Vec<PathBuf> = vec![self.root.clone()];
+        dirs.extend(exports.iter().map(|(_, dir)| dir.clone()));
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {dir:?}: {e}"))?;
+        }
+        cmd.env(INSTANCE_ROOT_ENV, &self.root);
+        for (key, dir) in &exports {
+            cmd.env(key, dir);
+        }
+        for key in ROOT_CONFINED_ENV_KEYS {
+            if !exports.iter().any(|(exported, _)| *exported == key) {
+                cmd.env_remove(key);
+            }
+        }
+        for key in HARNESS_STORE_ENV_KEYS {
+            cmd.env_remove(key);
+        }
+        cmd.env("QONTINUI_DISABLE_KEYCHAIN", "1");
+        Ok(())
+    }
+
     /// The PID recorded in this root's embedded-PG `postmaster.pid`, if a
     /// cluster is (or was left) running there. PostgreSQL writes the PID on the
     /// first line; the runner's data dir is `<embedded-pg>/pg-data`.
@@ -265,17 +322,19 @@ pub fn provision_instance_home(
         if !src.is_file() || dst.exists() {
             continue;
         }
-        if file == "profiles.json" {
-            let bytes =
-                std::fs::read(&src).map_err(|e| format!("read {} failed: {e}", src.display()))?;
-            let projected =
-                project_profiles_json(&bytes).map_err(|e| format!("{}: {e}", src.display()))?;
-            std::fs::write(&dst, projected)
-                .map_err(|e| format!("write {} failed: {e}", dst.display()))?;
+        let bytes =
+            std::fs::read(&src).map_err(|e| format!("read {} failed: {e}", src.display()))?;
+        let bytes = if file == "profiles.json" {
+            project_profiles_json(&bytes).map_err(|e| format!("{}: {e}", src.display()))?
         } else {
-            std::fs::copy(&src, &dst)
-                .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
-        }
+            bytes
+        };
+        // Temp file + rename, so an interrupted copy never leaves a truncated
+        // file that skip-if-present would then keep forever.
+        let tmp = dest_home.join(format!(".{file}.provisioning"));
+        std::fs::write(&tmp, bytes)
+            .and_then(|()| std::fs::rename(&tmp, &dst))
+            .map_err(|e| format!("write {} failed: {e}", dst.display()))?;
         copied.push(file);
     }
     Ok(copied)
@@ -296,12 +355,53 @@ pub fn is_inside_root(path: &Path, root: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An absolute path on every OS (a bare `/x` is not absolute on Windows).
+    pub(crate) fn abs(rel: &str) -> PathBuf {
+        std::env::temp_dir().join("instance-root-tests").join(rel)
+    }
+
+    #[test]
+    fn apply_env_sets_removes_and_disables_the_keychain() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = InstanceRoot::at(tmp.path().join("root"));
+        let mut cmd = tokio::process::Command::new("cargo");
+        root.apply_env(&mut cmd).expect("apply");
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in ROOT_CONFINED_ENV_KEYS {
+            match envs.get(key) {
+                Some(Some(v)) => assert!(is_inside_root(Path::new(v), root.path()), "{key}={v}"),
+                Some(None) => {}
+                None => panic!("{key} must be set inside the root or removed"),
+            }
+        }
+        for key in HARNESS_STORE_ENV_KEYS {
+            assert_eq!(envs.get(key), Some(&None), "{key} must be removed");
+        }
+        assert_eq!(
+            envs.get("QONTINUI_DISABLE_KEYCHAIN")
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(root.home_dir().is_dir() && root.logs_dir().is_dir());
+    }
 
     #[test]
     fn confined_exports_cover_only_confined_keys_and_lie_inside_the_root() {
-        let root = InstanceRoot::at(PathBuf::from("/r/com.qontinui.runner/instances/test-1"));
+        let root = InstanceRoot::at(abs("com.qontinui.runner/instances/test-1"));
         for (key, value) in root.confined_exports() {
             assert!(
                 ROOT_CONFINED_ENV_KEYS.contains(&key),
@@ -317,7 +417,7 @@ mod tests {
 
     #[test]
     fn secure_storage_and_config_are_the_root_itself() {
-        let root = InstanceRoot::at(PathBuf::from("/r/instances/named-1"));
+        let root = InstanceRoot::at(abs("instances/named-1"));
         assert_eq!(root.secure_storage_dir(), root.path());
         assert_eq!(root.config_dir(), root.path());
     }
@@ -336,12 +436,12 @@ mod tests {
 
     #[test]
     fn is_inside_root_is_lexical_and_refuses_parent_dirs() {
-        let root = Path::new("/a/root");
-        assert!(is_inside_root(Path::new("/a/root"), root));
-        assert!(is_inside_root(Path::new("/a/root/logs"), root));
-        assert!(!is_inside_root(Path::new("/a/rootx"), root));
-        assert!(!is_inside_root(Path::new("/a/root/../elsewhere"), root));
-        assert!(!is_inside_root(Path::new("relative/logs"), root));
+        let root = abs("a/root");
+        assert!(is_inside_root(&root, &root));
+        assert!(is_inside_root(&root.join("logs"), &root));
+        assert!(!is_inside_root(&abs("a/rootx"), &root));
+        assert!(!is_inside_root(&root.join("..").join("elsewhere"), &root));
+        assert!(!is_inside_root(Path::new("relative/logs"), &root));
     }
 
     #[test]

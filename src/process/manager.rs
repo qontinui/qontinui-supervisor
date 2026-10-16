@@ -12,7 +12,7 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::env_forwarders;
-use crate::process::instance_root::{self, InstanceRoot, INSTANCE_ROOT_ENV};
+use crate::process::instance_root::{self, InstanceRoot};
 use crate::process::port::wait_for_port_free;
 use crate::process::stop_ledger::{
     resolve_stop_target, verify_target_image, PidSource, StopLedger, StopStrategy, StopTarget,
@@ -2870,7 +2870,7 @@ pub(crate) async fn reap_runner_instance_state(runner_id: &str, runner_name: &st
         );
     }
     if let Some(root) = InstanceRoot::for_runner(runner_id) {
-        stop_orphaned_embedded_pg(runner_id, &root).await;
+        let _ = stop_orphaned_embedded_pg(runner_id, &root).await;
     }
     if let Err(e) = remove_instance_config_dir(runner_id, false).await {
         warn!(
@@ -2894,18 +2894,21 @@ pub(crate) async fn reap_runner_instance_state(runner_id: &str, runner_name: &st
 /// bundled install lives at `<root>/embedded-pg/pg-install`), so a recycled PID
 /// can never take down an unrelated process. Best-effort; every outcome is
 /// logged and none is propagated.
-pub(crate) async fn stop_orphaned_embedded_pg(runner_id: &str, root: &InstanceRoot) {
+pub(crate) async fn stop_orphaned_embedded_pg(
+    runner_id: &str,
+    root: &InstanceRoot,
+) -> OrphanPgStop {
     let Some(pid) = root.embedded_pg_postmaster_pid() else {
-        return;
+        return OrphanPgStop::NoPidFile;
     };
     let Some(exe) = crate::process::proc_kill::pid_exe_path(pid).await else {
         debug!(
             "Runner '{}': postmaster.pid names PID {} but no such live process — nothing to stop",
             runner_id, pid
         );
-        return;
+        return OrphanPgStop::NotRunning;
     };
-    if !instance_root::is_inside_root(&exe, root.path()) {
+    if !exe_is_inside_root(&exe, root.path()) {
         warn!(
             "Runner '{}': postmaster.pid names PID {} but that process runs {:?}, outside the \
              instance root {:?} — NOT killing it (a recycled PID)",
@@ -2914,20 +2917,62 @@ pub(crate) async fn stop_orphaned_embedded_pg(runner_id: &str, root: &InstanceRo
             exe,
             root.path()
         );
-        return;
+        return OrphanPgStop::RefusedOutsideRoot;
     }
     match crate::process::proc_kill::kill_by_pid_tree(pid).await {
-        Ok(true) => info!(
-            "Runner '{}': stopped its orphaned embedded-PG postmaster (PID {}) before removing \
-             the instance root",
-            runner_id, pid
-        ),
-        Ok(false) | Err(_) => warn!(
-            "Runner '{}': could not stop its orphaned embedded-PG postmaster (PID {}); the \
-             instance root may fail to be removed",
-            runner_id, pid
-        ),
+        Ok(true) => {
+            info!(
+                "Runner '{}': stopped its orphaned embedded-PG postmaster (PID {}) before \
+                 removing the instance root",
+                runner_id, pid
+            );
+            OrphanPgStop::Stopped
+        }
+        Ok(false) | Err(_) => {
+            warn!(
+                "Runner '{}': could not stop its orphaned embedded-PG postmaster (PID {}); the \
+                 instance root may fail to be removed",
+                runner_id, pid
+            );
+            OrphanPgStop::KillFailed
+        }
     }
+}
+
+/// What [`stop_orphaned_embedded_pg`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrphanPgStop {
+    /// No `postmaster.pid` in the root: the runner stopped its cluster itself.
+    NoPidFile,
+    /// The recorded PID is not a live process.
+    NotRunning,
+    /// The recorded PID runs an executable outside the root — not ours.
+    RefusedOutsideRoot,
+    Stopped,
+    KillFailed,
+}
+
+/// Whether a process image lies inside `root`. sysinfo reports a resolved
+/// image path (symlinks followed on Linux, real casing on Windows), while
+/// `root` is built from `dirs::config_dir()`, so the lexical answer is retried
+/// against the canonicalized root, and case-folded on Windows. A false answer
+/// only ever SKIPS a kill.
+fn exe_is_inside_root(exe: &std::path::Path, root: &std::path::Path) -> bool {
+    if instance_root::is_inside_root(exe, root) {
+        return true;
+    }
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if exe.starts_with(&canonical_root) {
+        return true;
+    }
+    cfg!(windows)
+        && exe
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with(&canonical_root.to_string_lossy().to_lowercase())
 }
 
 /// Remove a runner's exe copy and everything deployed beside it.
@@ -3022,34 +3067,13 @@ fn apply_instance_root_env(
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
     })?;
-    let mut dirs_to_create = vec![root.path().to_path_buf()];
-    dirs_to_create.extend(root.confined_exports().into_iter().map(|(_, dir)| dir));
-    for dir in &dirs_to_create {
-        std::fs::create_dir_all(dir).map_err(|e| {
-            SupervisorError::Process(format!(
-                "Failed to create {dir:?} under the instance root of runner '{runner_id}': {e}. \
-                 Refusing to spawn — the child would be told to use a directory that does not \
-                 exist, or fall back to the shared data_local_dir()."
-            ))
-        })?;
-    }
-    cmd.env(INSTANCE_ROOT_ENV, root.path());
-    let exports = root.confined_exports();
-    for (key, dir) in &exports {
-        cmd.env(key, dir);
-    }
-    // Every OTHER root-confined key is removed, never inherited: the supervisor
-    // may itself carry one (a supervisor started from a runner-hosted session
-    // inherits that runner's `QONTINUI_PROMPTS_DIR`; fleet scripts export
-    // `QONTINUI_SESSION_NAMES_DIR` / `QONTINUI_CAPABILITY_STATE_DIR`), and any
-    // of them outside the root makes the child refuse to start (exit 78).
-    // Unset, the child derives each under its own root.
-    for key in instance_root::ROOT_CONFINED_ENV_KEYS {
-        if !exports.iter().any(|(exported, _)| *exported == key) {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("QONTINUI_DISABLE_KEYCHAIN", "1");
+    root.apply_env(cmd).map_err(|e| {
+        SupervisorError::Process(format!(
+            "{e} (instance root of runner '{runner_id}'). Refusing to spawn — the child would be \
+             told to use a directory that does not exist, or fall back to the shared \
+             data_local_dir()."
+        ))
+    })?;
 
     match instance_root::provision_instance_home(home_source, &root.home_dir()) {
         Ok(copied) => debug!(

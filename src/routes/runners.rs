@@ -287,7 +287,7 @@ fn copy_paired_state_files(
 /// Both root paths are injected (not pulled from `dirs::*`) so unit tests
 /// can drive the helper hermetically against tempdirs. The HTTP handler
 /// passes `dirs::home_dir().unwrap().join(".qontinui").join("profiles")`
-/// and `crate::process::instance_config_dir(<runner id>).unwrap()`
+/// and `crate::process::instance_root::instance_secure_storage_dir(<runner id>)`
 /// respectively.
 ///
 /// Returns `Ok(applied_files)` on success — the list of basenames copied,
@@ -6971,6 +6971,7 @@ pub async fn runner_crash_summary(
         "stop_reason": stop_reason,
         "last_phase_log": last_phase_log,
         "panic_excerpt": panic_excerpt,
+        "startup_refusal": snapshot.startup_refusal,
         "early_log_path": snapshot.early_log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
     }))
     .into_response()

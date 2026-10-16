@@ -85,6 +85,12 @@ pub struct StoppedRunnerSnapshot {
     /// serialized: crash-summary renders it as `panic_excerpt`.
     #[serde(skip)]
     pub last_panic_text: Option<String>,
+    /// `<instance root>/startup-refusal.log` of a non-primary runner, read when
+    /// the snapshot was taken (its last [`LAST_PANIC_TEXT_CAP`] bytes): why a
+    /// runner under an instance root refused to start (exit 78). Captured for
+    /// the same reason as `last_panic_text` — teardown removes the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_refusal: Option<String>,
 }
 
 /// How much of `runner-last-panic.txt` a snapshot keeps (the tail).
@@ -102,6 +108,16 @@ pub fn tail_on_char_boundary(s: &str, cap: usize) -> &str {
         .find(|i| *i >= want_start)
         .unwrap_or(s.len());
     &s[start..]
+}
+
+/// Read a root's `startup-refusal.log` for a snapshot; `None` when absent.
+async fn read_startup_refusal(
+    root: Option<crate::process::instance_root::InstanceRoot>,
+) -> Option<String> {
+    let text = tokio::fs::read_to_string(root?.path().join("startup-refusal.log"))
+        .await
+        .ok()?;
+    Some(tail_on_char_boundary(&text, LAST_PANIC_TEXT_CAP).to_string())
 }
 
 /// Read `<dir>/runner-last-panic.txt` for a snapshot; `None` when absent.
@@ -172,6 +188,14 @@ pub async fn snapshot_from_managed(
     let early_log_path = managed.early_log_path.read().await.clone();
     let panic_log_dir = managed.panic_log_dir.read().await.clone();
     let last_panic_text = read_last_panic_text(panic_log_dir.as_deref()).await;
+    let startup_refusal = if managed.config.kind().is_primary() {
+        None
+    } else {
+        read_startup_refusal(crate::process::instance_root::InstanceRoot::for_runner(
+            &managed.config.id,
+        ))
+        .await
+    };
     let started_at = managed.runner.read().await.started_at;
     StoppedRunnerSnapshot {
         id: managed.config.id.clone(),
@@ -187,6 +211,7 @@ pub async fn snapshot_from_managed(
         started_at,
         panic_log_dir,
         last_panic_text,
+        startup_refusal,
     }
 }
 
@@ -211,6 +236,7 @@ mod tests {
             started_at: None,
             panic_log_dir: None,
             last_panic_text: None,
+            startup_refusal: None,
         }
     }
 
@@ -401,5 +427,17 @@ mod tests {
         assert_eq!(text.as_deref(), Some("boom at main.rs:1"));
         assert_eq!(read_last_panic_text(Some(&logs)).await, None);
         assert_eq!(read_last_panic_text(None).await, None);
+    }
+
+    #[tokio::test]
+    async fn startup_refusal_is_read_from_the_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = crate::process::instance_root::InstanceRoot::at(tmp.path().to_path_buf());
+        assert_eq!(read_startup_refusal(Some(root.clone())).await, None);
+        std::fs::write(tmp.path().join("startup-refusal.log"), "refusing: port").unwrap();
+        assert_eq!(
+            read_startup_refusal(Some(root)).await.as_deref(),
+            Some("refusing: port")
+        );
     }
 }

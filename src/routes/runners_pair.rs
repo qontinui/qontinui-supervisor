@@ -534,22 +534,37 @@ pub async fn pair_with_token_copying_into(
     if let Some(web_base) = &body.web_base_url {
         cmd.env("QONTINUI_WEB_BASE", web_base);
     }
-    // Point the child at the target runner's instance dir. The runner lib's
-    // `persist_pairing` (and `SecureStorage::new`) resolve their output dir
-    // from this env var, so both credential halves — `auth_tokens.enc` and
-    // `paired_user.json` — land in the dir the target runner actually reads.
-    // Create it first: the target runner may never have started.
+    // Point the child at the target runner's instance ROOT, through the same
+    // env block the runner spawn gets (`InstanceRoot::apply_env`). The runner
+    // lib's `persist_pairing` (and `SecureStorage::new`) resolve their output
+    // dir from `QONTINUI_SECURE_STORAGE_DIR`, so both credential halves —
+    // `auth_tokens.enc` and `paired_user.json` — land in the dir the target
+    // runner actually reads; `QONTINUI_CONFIG_DIR` makes the CLI's tier
+    // promotion write the TARGET's `settings.json`, not the primary's; and
+    // `QONTINUI_DISABLE_KEYCHAIN` keeps the fresh tokens out of the OS keychain
+    // entry every runner on the box shares. Creates the dirs first: the target
+    // runner may never have started.
     if let Some(dir) = &target_dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        let root = body
+            .target_runner_id
+            .as_deref()
+            .and_then(crate::process::instance_root::InstanceRoot::for_runner);
+        let applied = match &root {
+            Some(root) if root.secure_storage_dir() == *dir => root.apply_env(&mut cmd),
+            _ => Err(format!(
+                "the instance root of the target runner does not hold its secure-storage dir {}",
+                dir.display()
+            )),
+        };
+        if let Err(e) = applied {
             return server_error(
                 "instance_dir_create_failed",
                 &format!(
-                    "failed to create instance secure-storage dir {}: {e}",
+                    "failed to prepare the instance root for secure-storage dir {}: {e}",
                     dir.display()
                 ),
             );
         }
-        cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
     }
 
     let output_fut = async {
