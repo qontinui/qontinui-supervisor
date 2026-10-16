@@ -1011,4 +1011,43 @@ mod tests {
         assert_eq!(user_id, "33333333-3333-4333-8333-333333333333");
         assert!(tenant_id.is_none());
     }
+
+    /// main's handler points the pair CLI at the target's instance root
+    /// through `InstanceRoot::apply_env`, the same env block a runner spawn
+    /// gets, and that is what carries `QONTINUI_CONFIG_DIR` to the CLI (the
+    /// S6 defect: a pair whose CLI promoted the PRIMARY's settings.json).
+    /// `apply_env` is tested on its own; nothing drives the handler in a unit
+    /// test, since it spawns the CLI, so this reads its source. A handler that
+    /// set an instance-dir variable by hand instead would leave every other
+    /// test green while the CLI saw a different env.
+    #[test]
+    fn the_pair_handler_exports_the_instance_root_through_apply_env() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners_pair.rs"),
+        )
+        .expect("read routes/runners_pair.rs")
+        .replace("\r\n", "\n");
+        // Production code only, so this test's own literals cannot satisfy or
+        // trip the scan; `fn_body` stops at the handler's closing brace.
+        let src = crate::source_scan::production_span(&src).to_string();
+        let handler =
+            crate::source_scan::fn_body(&src, "pub async fn pair_with_token_copying_into(")
+                .expect("pair_with_token_copying_into exists");
+        assert_eq!(
+            handler.matches(".apply_env(").count(),
+            1,
+            "pair_with_token_copying_into must hand the pair CLI its instance root through \
+             InstanceRoot::apply_env, exactly once"
+        );
+        for divergent in ["\"QONTINUI_CONFIG_DIR\"", "\"QONTINUI_SECURE_STORAGE_DIR\""] {
+            assert!(
+                !handler.contains(divergent),
+                "pair_with_token_copying_into sets {divergent} by hand: the pair CLI's \
+                 instance env belongs to InstanceRoot::apply_env"
+            );
+        }
+    }
 }
