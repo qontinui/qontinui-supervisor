@@ -82,9 +82,11 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   shared OS keychain.
 - **Reserved ports are refused at registration** (`POST /runners`,
   `spawn-named` with an explicit port): `0` and `9876` never reach a persisted
-  non-primary config. The primary spawn drops any inherited
-  `QONTINUI_INSTANCE_ROOT`, so a supervisor started inside a subject's session
-  still starts a primary that can run.
+  non-primary config. A supervisor started inside a subject's session inherits
+  that subject's root and locations; its primary spawn drops the root,
+  `QONTINUI_DISABLE_KEYCHAIN` and every confined location lying inside that
+  root, so the primary runs on its own stores (locations outside it are the
+  operator's configuration and are kept).
 - **`<root>/home` is provisioned, not inherited.** `machine.json` (the box's
   device identity) is copied in from the harness's `~/.qontinui` when absent,
   and `profiles.json` is PROJECTED down to `active` plus each profile's
@@ -96,7 +98,8 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   subject's loopback key, port breadcrumb and session names therefore live under
   `<root>/home` — the spawn-test and spawn-named responses name it as
   `instance_root.home`.
-- **Panic logs are read from `<root>/logs`** whatever `--log-dir` says, and
+- **Panic logs are read from `<root>/logs`** whatever `--log-dir` says (so
+  `<log-dir>/runner-<id>/runner-panic.log` no longer outlives a temp runner), and
   `runner-last-panic.txt` is captured into the stopped-runner snapshot before
   teardown removes the root, so `GET /runners/{id}/crash-summary` still has it.
   So is `<root>/startup-refusal.log` (cleared before every launch, since the

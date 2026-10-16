@@ -3607,3 +3607,19 @@ fn exe_inside_the_root_is_recognised() {
         &root
     ));
 }
+
+/// A primary spawned by a supervisor that inherited a subject's root drops the
+/// root and the keychain switch; with no inherited root nothing is touched.
+#[test]
+fn primary_drops_an_inherited_subject_root() {
+    let mut cmd = Command::new("cargo");
+    super::drop_inherited_subject_env(&mut cmd, None);
+    assert!(command_envs(&cmd).is_empty());
+
+    let root = crate::process::instance_root::tests::abs("subject-root");
+    let mut cmd = Command::new("cargo");
+    super::drop_inherited_subject_env(&mut cmd, Some(root.into_os_string()));
+    let envs = command_envs(&cmd);
+    assert_eq!(envs.get("QONTINUI_INSTANCE_ROOT"), Some(&None));
+    assert_eq!(envs.get("QONTINUI_DISABLE_KEYCHAIN"), Some(&None));
+}

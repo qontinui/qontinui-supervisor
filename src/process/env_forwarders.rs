@@ -1233,6 +1233,11 @@ fn instance_dir_override_warning(
                     crate::config::DEFAULT_RUNNER_API_PORT
                 ));
             }
+        } else if key == INSTANCE_ROOT_ENV && new_value.trim().is_empty() {
+            problems.push(format!(
+                "it blanks {INSTANCE_ROOT_ENV} — the child runs with NO instance root while \
+                 every location the supervisor exported still points into '{root}'"
+            ));
         } else if key == INSTANCE_ROOT_ENV && std::path::Path::new(new_value) != root_path {
             problems.push(format!(
                 "it moves {INSTANCE_ROOT_ENV} from '{root}' to '{new_value}', but every \
