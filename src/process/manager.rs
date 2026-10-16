@@ -2869,11 +2869,64 @@ pub(crate) async fn reap_runner_instance_state(runner_id: &str, runner_name: &st
             runner_name, e
         );
     }
+    if let Some(root) = InstanceRoot::for_runner(runner_id) {
+        stop_orphaned_embedded_pg(runner_id, &root).await;
+    }
     if let Err(e) = remove_instance_config_dir(runner_id, false).await {
         warn!(
-            "Failed to remove instance config dir for runner '{}': {}",
+            "Failed to remove instance config dir (the instance root, which holds a copy of \
+             the pairing: paired_user.json, auth_tokens.enc) for runner '{}': {}",
             runner_id, e
         );
+    }
+}
+
+/// Stop the private embedded-PG cluster a non-primary runner left running in
+/// its instance root, before the root is removed.
+///
+/// A runner stops its own cluster only on a graceful exit; one the stop ladder
+/// had to kill leaves its postmaster alive (it is a child, and the first kill is
+/// not a tree kill), holding files under `<root>/embedded-pg` — on Windows that
+/// makes the root's removal fail and leaks it, pairing copy included.
+///
+/// Identity is checked before any kill: the PID from `postmaster.pid` is killed
+/// only when that live process runs an executable INSIDE this root (the
+/// bundled install lives at `<root>/embedded-pg/pg-install`), so a recycled PID
+/// can never take down an unrelated process. Best-effort; every outcome is
+/// logged and none is propagated.
+pub(crate) async fn stop_orphaned_embedded_pg(runner_id: &str, root: &InstanceRoot) {
+    let Some(pid) = root.embedded_pg_postmaster_pid() else {
+        return;
+    };
+    let Some(exe) = crate::process::proc_kill::pid_exe_path(pid).await else {
+        debug!(
+            "Runner '{}': postmaster.pid names PID {} but no such live process — nothing to stop",
+            runner_id, pid
+        );
+        return;
+    };
+    if !instance_root::is_inside_root(&exe, root.path()) {
+        warn!(
+            "Runner '{}': postmaster.pid names PID {} but that process runs {:?}, outside the \
+             instance root {:?} — NOT killing it (a recycled PID)",
+            runner_id,
+            pid,
+            exe,
+            root.path()
+        );
+        return;
+    }
+    match crate::process::proc_kill::kill_by_pid_tree(pid).await {
+        Ok(true) => info!(
+            "Runner '{}': stopped its orphaned embedded-PG postmaster (PID {}) before removing \
+             the instance root",
+            runner_id, pid
+        ),
+        Ok(false) | Err(_) => warn!(
+            "Runner '{}': could not stop its orphaned embedded-PG postmaster (PID {}); the \
+             instance root may fail to be removed",
+            runner_id, pid
+        ),
     }
 }
 
@@ -2981,8 +3034,20 @@ fn apply_instance_root_env(
         })?;
     }
     cmd.env(INSTANCE_ROOT_ENV, root.path());
-    for (key, dir) in root.confined_exports() {
+    let exports = root.confined_exports();
+    for (key, dir) in &exports {
         cmd.env(key, dir);
+    }
+    // Every OTHER root-confined key is removed, never inherited: the supervisor
+    // may itself carry one (a supervisor started from a runner-hosted session
+    // inherits that runner's `QONTINUI_PROMPTS_DIR`; fleet scripts export
+    // `QONTINUI_SESSION_NAMES_DIR` / `QONTINUI_CAPABILITY_STATE_DIR`), and any
+    // of them outside the root makes the child refuse to start (exit 78).
+    // Unset, the child derives each under its own root.
+    for key in instance_root::ROOT_CONFINED_ENV_KEYS {
+        if !exports.iter().any(|(exported, _)| *exported == key) {
+            cmd.env_remove(key);
+        }
     }
     cmd.env("QONTINUI_DISABLE_KEYCHAIN", "1");
 

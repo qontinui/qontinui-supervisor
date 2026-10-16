@@ -69,16 +69,60 @@ pub const ROOT_CONFINED_ENV_KEYS: [&str; 10] = [
 ///   tenant). Without it a subject cannot mint a coord device JWT from the
 ///   pairing the spawn copies in, and coord-facing features read as "not
 ///   enrolled". It names the MACHINE, which the subject genuinely shares.
-/// - `profiles.json` — the box's backend profile (coord URL, API URL). Without
-///   it a subject's coord base falls to its tier default instead of the box's
-///   configured coordinator.
+/// - `profiles.json` — PROJECTED, not copied ([`project_profiles_json`]): only
+///   `active` and each profile's `coord_url` / `api_url` survive. Without them a
+///   subject's coord base falls to its tier default instead of the box's
+///   configured coordinator. Everything else in a profile is dropped on
+///   purpose: it can carry secrets (`blob.secret_key`, `auth.token`, a DSN or
+///   proxy URL with a password), and its `database_url` / `redis_url` /
+///   `blob` name the HARNESS's stores, which a subject must not use — without
+///   a `database_url` it boots its own private embedded cluster.
 ///
 /// Deliberately NOT copied: every credential the subject can mint for itself
 /// (`coord-device-jwt`, agent JWTs, loopback handshake keys — those are
 /// per-port and the subject writes its own under `<root>/home`), and every
 /// ledger or registry (session names, capability state, touch ledger) — those
 /// are the harness's history, not the subject's.
+///
+/// Both are skip-if-present, so a persistent named runner keeps the copy it
+/// was first given (and any change it made, e.g. switching its active tenant);
+/// a re-enrolment of the box is not propagated to it.
 pub const PROVISIONED_HOME_FILES: [&str; 2] = ["machine.json", "profiles.json"];
+
+/// The only keys of a profile a subject is given — see [`PROVISIONED_HOME_FILES`].
+const PROJECTED_PROFILE_KEYS: [&str; 2] = ["coord_url", "api_url"];
+
+/// Project the harness's `profiles.json` bytes down to `active` plus each
+/// profile's [`PROJECTED_PROFILE_KEYS`]. `Err` when the bytes are not a JSON
+/// object — the caller then copies nothing rather than the raw file.
+pub fn project_profiles_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("profiles.json is not JSON: {e}"))?;
+    let obj = doc
+        .as_object()
+        .ok_or_else(|| "profiles.json is not a JSON object".to_string())?;
+    let mut out = serde_json::Map::new();
+    if let Some(active) = obj.get("active") {
+        out.insert("active".to_string(), active.clone());
+    }
+    let mut profiles = serde_json::Map::new();
+    if let Some(src) = obj.get("profiles").and_then(|p| p.as_object()) {
+        for (name, profile) in src {
+            let mut kept = serde_json::Map::new();
+            if let Some(profile) = profile.as_object() {
+                for key in PROJECTED_PROFILE_KEYS {
+                    if let Some(v) = profile.get(key) {
+                        kept.insert(key.to_string(), v.clone());
+                    }
+                }
+            }
+            profiles.insert(name.clone(), serde_json::Value::Object(kept));
+        }
+    }
+    out.insert("profiles".to_string(), serde_json::Value::Object(profiles));
+    serde_json::to_vec_pretty(&serde_json::Value::Object(out))
+        .map_err(|e| format!("could not serialize the projected profiles.json: {e}"))
+}
 
 /// One supervisor-spawned runner's instance root and the locations under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,11 +179,25 @@ impl InstanceRoot {
         self.root.join("embedded-pg")
     }
 
-    /// `WEBVIEW2_USER_DATA_FOLDER`: `<root>/webview`. Exported on every OS —
-    /// only WebView2 reads the variable, and a root-honouring runner uses the
-    /// same location for its own WebView data on every platform.
+    /// `WEBVIEW2_USER_DATA_FOLDER`: `<root>/webview`. Exported on every OS for
+    /// one uniform contract, but only the Windows runner (WebView2) reads it:
+    /// on Linux, WebKitGTK still keeps its data in its own default location, so
+    /// two subjects on one Linux box are NOT WebView-isolated by this variable.
     pub fn webview_dir(&self) -> PathBuf {
         self.root.join("webview")
+    }
+
+    /// The PID recorded in this root's embedded-PG `postmaster.pid`, if a
+    /// cluster is (or was left) running there. PostgreSQL writes the PID on the
+    /// first line; the runner's data dir is `<embedded-pg>/pg-data`.
+    pub fn embedded_pg_postmaster_pid(&self) -> Option<u32> {
+        let text = std::fs::read_to_string(
+            self.embedded_pg_dir()
+                .join("pg-data")
+                .join("postmaster.pid"),
+        )
+        .ok()?;
+        text.lines().next()?.trim().parse().ok()
     }
 
     /// Every directory-valued variable the supervisor exports for this root, in
@@ -207,8 +265,17 @@ pub fn provision_instance_home(
         if !src.is_file() || dst.exists() {
             continue;
         }
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+        if file == "profiles.json" {
+            let bytes =
+                std::fs::read(&src).map_err(|e| format!("read {} failed: {e}", src.display()))?;
+            let projected =
+                project_profiles_json(&bytes).map_err(|e| format!("{}: {e}", src.display()))?;
+            std::fs::write(&dst, projected)
+                .map_err(|e| format!("write {} failed: {e}", dst.display()))?;
+        } else {
+            std::fs::copy(&src, &dst)
+                .map_err(|e| format!("copy {} -> {} failed: {e}", src.display(), dst.display()))?;
+        }
         copied.push(file);
     }
     Ok(copied)
@@ -216,7 +283,10 @@ pub fn provision_instance_home(
 
 /// True when `path` lies lexically inside `root` (the root itself counts). A
 /// path carrying `..` is never inside. Lexical on purpose — the runner's check
-/// is lexical too, and this answer only decides whether to WARN.
+/// is lexical too. Unlike the runner's it neither folds case nor strips a
+/// Windows `\\?\` prefix, so it can be stricter than the runner on Windows:
+/// fine for the supervisor's uses (a warning, and tests over paths the
+/// supervisor itself built).
 pub fn is_inside_root(path: &Path, root: &Path) -> bool {
     path.is_absolute()
         && !path
@@ -297,7 +367,11 @@ mod tests {
         let source = tmp.path().join("harness-home");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("machine.json"), b"{\"device_id\":\"d\"}").unwrap();
-        std::fs::write(source.join("profiles.json"), b"{}").unwrap();
+        std::fs::write(
+            source.join("profiles.json"),
+            br#"{"active":"c","profiles":{"c":{"coord_url":"wss://coord","blob":{"secret_key":"S"}}}}"#,
+        )
+        .unwrap();
         // Secrets and ledgers the subject must NOT inherit.
         std::fs::write(source.join("coord-device-jwt"), b"secret").unwrap();
         std::fs::write(source.join("runner-loopback-key-9876"), b"secret").unwrap();
@@ -306,6 +380,12 @@ mod tests {
         let copied = provision_instance_home(Some(&source), &dest).expect("provision");
         assert_eq!(copied, vec!["machine.json", "profiles.json"]);
         assert!(!dest.join("coord-device-jwt").exists());
+        let profiles = std::fs::read_to_string(dest.join("profiles.json")).unwrap();
+        assert!(profiles.contains("wss://coord"), "{profiles}");
+        assert!(
+            !profiles.contains("secret_key"),
+            "secrets must be projected out: {profiles}"
+        );
         assert!(!dest.join("runner-loopback-key-9876").exists());
 
         // A subject that rewrote its copy keeps it on the next spawn.
@@ -324,5 +404,40 @@ mod tests {
         let dest = tmp.path().join("home");
         assert!(provision_instance_home(None, &dest).unwrap().is_empty());
         assert!(dest.is_dir());
+    }
+
+    #[test]
+    fn profiles_projection_keeps_only_urls_and_active() {
+        let raw = br#"{"active":"dev","profiles":{
+            "dev":{"coord_url":"ws://c","api_url":"http://a","database_url":"postgres://u:p@h/db",
+                   "redis_url":"redis://h","auth":{"kind":"static","token":"T"},
+                   "blob":{"access_key":"A","secret_key":"S"}},
+            "odd":"not-an-object"}}"#;
+        let out: serde_json::Value =
+            serde_json::from_slice(&project_profiles_json(raw).unwrap()).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "active": "dev",
+                "profiles": {"dev": {"coord_url": "ws://c", "api_url": "http://a"}, "odd": {}}
+            })
+        );
+        assert!(project_profiles_json(b"[1]").is_err());
+        assert!(project_profiles_json(b"not json").is_err());
+    }
+
+    #[test]
+    fn postmaster_pid_is_read_from_the_roots_pg_data() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = InstanceRoot::at(tmp.path().to_path_buf());
+        assert_eq!(root.embedded_pg_postmaster_pid(), None);
+        let data = root.embedded_pg_dir().join("pg-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("postmaster.pid"),
+            "4242\n/some/data\n1700000000\n",
+        )
+        .unwrap();
+        assert_eq!(root.embedded_pg_postmaster_pid(), Some(4242));
     }
 }

@@ -1220,7 +1220,20 @@ fn instance_dir_override_warning(
 
     if let Some(root) = command_env(cmd, INSTANCE_ROOT_ENV) {
         let root_path = std::path::Path::new(&root);
-        if key == INSTANCE_ROOT_ENV && new_value != root {
+        if key == "QONTINUI_PORT" {
+            let refused = match new_value.parse::<u16>() {
+                Ok(0) | Err(_) => true,
+                Ok(port) => port == crate::config::DEFAULT_RUNNER_API_PORT,
+            };
+            if refused {
+                problems.push(format!(
+                    "it sets QONTINUI_PORT='{new_value}' — a runner under the instance root \
+                     '{root}' refuses to start (exit 78) on an unparseable port, 0 or the \
+                     primary's {}",
+                    crate::config::DEFAULT_RUNNER_API_PORT
+                ));
+            }
+        } else if key == INSTANCE_ROOT_ENV && std::path::Path::new(new_value) != root_path {
             problems.push(format!(
                 "it moves {INSTANCE_ROOT_ENV} from '{root}' to '{new_value}', but every \
                  per-instance location the supervisor exported (config, pairing, home, logs, \
@@ -1742,6 +1755,25 @@ mod tests {
     }
 
     #[test]
+    fn override_warning_flags_a_refused_port_under_a_root() {
+        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", "/r/instances/test-1")]);
+        for bad in ["9876", "0", "x"] {
+            let msg = instance_dir_override_warning(&cmd, "t", "QONTINUI_PORT", bad)
+                .unwrap_or_else(|| panic!("QONTINUI_PORT={bad} must warn"));
+            assert!(msg.contains("exit 78"), "{msg}");
+        }
+        assert!(instance_dir_override_warning(&cmd, "t", "QONTINUI_PORT", "9880").is_none());
+        // A trailing separator is the same root, not a move.
+        assert!(instance_dir_override_warning(
+            &cmd,
+            "t",
+            "QONTINUI_INSTANCE_ROOT",
+            "/r/instances/test-1/"
+        )
+        .is_none());
+    }
+
+    #[test]
     fn panic_log_dir_follows_the_instance_root_for_non_primary_runners() {
         let log_dir = Path::new("/var/log/sup");
         assert_eq!(
@@ -1752,12 +1784,14 @@ mod tests {
             panic_log_dir_for(true, "primary", None),
             PanicLogDir::RunnerDefault
         );
-        if let Some(root) = crate::process::instance_config_dir("test-panic-1") {
-            // Even with --log-dir: a dir outside the root would be refused.
-            assert_eq!(
-                panic_log_dir_for(false, "test-panic-1", Some(log_dir)),
-                PanicLogDir::InstanceRoot(root.join("logs"))
-            );
-        }
+        let Some(root) = crate::process::instance_config_dir("test-panic-1") else {
+            eprintln!("SKIPPED non-primary arm: dirs::config_dir() did not resolve");
+            return;
+        };
+        // Even with --log-dir: a dir outside the root would be refused.
+        assert_eq!(
+            panic_log_dir_for(false, "test-panic-1", Some(log_dir)),
+            PanicLogDir::InstanceRoot(root.join("logs"))
+        );
     }
 }
