@@ -2968,11 +2968,16 @@ fn exe_is_inside_root(exe: &std::path::Path, root: &std::path::Path) -> bool {
     if exe.starts_with(&canonical_root) {
         return true;
     }
-    cfg!(windows)
-        && exe
-            .to_string_lossy()
-            .to_lowercase()
-            .starts_with(&canonical_root.to_string_lossy().to_lowercase())
+    cfg!(windows) && starts_with_folded(&exe, &canonical_root)
+}
+
+/// Component-wise, case-folded `starts_with` — never a string prefix, which
+/// would take `…\instances\test-10` for a child of `…\instances\test-1`.
+fn starts_with_folded(path: &std::path::Path, base: &std::path::Path) -> bool {
+    let fold = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut path = path.components();
+    base.components()
+        .all(|b| path.next().is_some_and(|p| fold(p) == fold(b)))
 }
 
 /// Remove a runner's exe copy and everything deployed beside it.
@@ -3067,25 +3072,17 @@ fn apply_instance_root_env(
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
     })?;
-    root.apply_env(cmd).map_err(|e| {
+    let copied = root.apply_env(cmd, home_source).map_err(|e| {
         SupervisorError::Process(format!(
             "{e} (instance root of runner '{runner_id}'). Refusing to spawn — the child would be \
              told to use a directory that does not exist, or fall back to the shared \
              data_local_dir()."
         ))
     })?;
-
-    match instance_root::provision_instance_home(home_source, &root.home_dir()) {
-        Ok(copied) => debug!(
-            "Runner '{}' instance home provisioned from {:?}: {:?}",
-            runner_id, home_source, copied
-        ),
-        Err(e) => warn!(
-            "Runner '{}' instance home could not be provisioned ({}); the runner starts \
-             without the harness's device identity / profile",
-            runner_id, e
-        ),
-    }
+    debug!(
+        "Runner '{}' instance home provisioned from {:?}: {:?}",
+        runner_id, home_source, copied
+    );
     Ok(root)
 }
 
@@ -3501,6 +3498,13 @@ async fn start_exe_mode_for_runner(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    // A supervisor launched from inside a subject's session inherits that
+    // subject's QONTINUI_INSTANCE_ROOT (children of a subject do, by design);
+    // the primary must never run under it — it would exit 78 on port 9876.
+    if managed.config.kind().is_primary() {
+        cmd.env_remove(instance_root::INSTANCE_ROOT_ENV);
     }
 
     // Inline non-forwarder env vars. Test-auto-login credentials are pulled

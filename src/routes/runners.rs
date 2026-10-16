@@ -489,6 +489,20 @@ fn apply_paired_state_for_spawn(
     )
 }
 
+/// A runner registered here is non-primary, so it runs under an instance root
+/// and refuses to start on `0` or the primary's `9876` — refuse that port at
+/// registration rather than persist a runner that can never start.
+fn refuse_reserved_non_primary_port(port: u16) -> Result<(), SupervisorError> {
+    if port == 0 || port == crate::config::DEFAULT_RUNNER_API_PORT {
+        return Err(SupervisorError::Validation(format!(
+            "Port {port} is reserved: a non-primary runner runs under an instance root and \
+             refuses to start on 0 or the primary's {}",
+            crate::config::DEFAULT_RUNNER_API_PORT
+        )));
+    }
+    Ok(())
+}
+
 /// The spawned runner's instance root and where an external client finds what
 /// it publishes there — `null` only when the root cannot be resolved (the
 /// spawn itself refuses that case, so a live response always carries it).
@@ -794,6 +808,7 @@ pub async fn add_runner(
             "Port must be >= 1024".to_string(),
         ));
     }
+    refuse_reserved_non_primary_port(body.port)?;
 
     // Generate a unique ID
     let id = format!("runner-{}", uuid_simple());
@@ -5237,6 +5252,7 @@ pub async fn spawn_named(
             runners.values().map(|r| r.config.port).collect();
         let port = match body.port {
             Some(p) => {
+                refuse_reserved_non_primary_port(p)?;
                 if used_ports.contains(&p) {
                     return Err(SupervisorError::Validation(format!(
                         "Port {} is already in use",
@@ -6971,7 +6987,13 @@ pub async fn runner_crash_summary(
         "stop_reason": stop_reason,
         "last_phase_log": last_phase_log,
         "panic_excerpt": panic_excerpt,
-        "startup_refusal": snapshot.startup_refusal,
+        // Only an exit-78 refusal is explained by it; any other exit would be
+        // pinned on a stale line from an earlier launch.
+        "startup_refusal": if snapshot.exit_code == Some(78) {
+            snapshot.startup_refusal.clone()
+        } else {
+            None
+        },
         "early_log_path": snapshot.early_log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
     }))
     .into_response()
