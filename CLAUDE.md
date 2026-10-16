@@ -59,8 +59,9 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
 | `QONTINUI_HOME` | `<root>/home` |
 | `QONTINUI_RUNNER_LOG_DIR`, `QONTINUI_PANIC_LOG_DIR` | `<root>/logs` |
 | `QONTINUI_EMBEDDED_PG_DIR` | `<root>/embedded-pg` (a private cluster per runner) |
-| `WEBVIEW2_USER_DATA_FOLDER` | `<root>/webview`, on every OS |
+| `WEBVIEW2_USER_DATA_FOLDER` | `<root>/webview`, exported on every OS but read only by the Windows runner — on Linux, WebKitGTK data is NOT isolated by it |
 | `QONTINUI_DISABLE_KEYCHAIN` | `1` |
+| every other root-confined key (`QONTINUI_PROMPTS_DIR`, `QONTINUI_SESSION_NAMES_DIR`, `QONTINUI_CAPABILITY_STATE_DIR`) | **removed**, so the supervisor's own value is never inherited |
 
 - **A runner under a root refuses to start (exit 78, `<root>/startup-refusal.log`)
   when a root-confined variable points outside the root, or when its port is
@@ -75,9 +76,13 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   (the spawn-test paired-state copy, `POST /runners/pair-with-token`) resolves
   its destination through `instance_root::instance_secure_storage_dir`.
 - **`<root>/home` is provisioned, not inherited.** `machine.json` (the box's
-  device identity) and `profiles.json` (coord/API URL) are copied in from the
-  harness's `~/.qontinui` when absent; no credential the subject can mint for
-  itself (device JWT, agent JWTs, loopback keys) and no ledger is copied. A
+  device identity) is copied in from the harness's `~/.qontinui` when absent,
+  and `profiles.json` is PROJECTED down to `active` plus each profile's
+  `coord_url` / `api_url` — its secrets and its `database_url` / `redis_url` /
+  `blob` (the harness's stores) never reach a subject. No credential the
+  subject can mint for itself (device JWT, agent JWTs, loopback keys) and no
+  ledger is copied. Both are skip-if-present, so a named runner keeps the copy
+  it was first given and a re-enrolment of the box does not reach it. A
   subject's loopback key, port breadcrumb and session names therefore live under
   `<root>/home` — the spawn-test and spawn-named responses name it as
   `instance_root.home`.
@@ -86,7 +91,19 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   teardown removes the root, so `GET /runners/{id}/crash-summary` still has it.
 - **Cost:** a private embedded-PG cluster means each fresh temp runner pays an
   initdb and a copy of the bundled PostgreSQL install inside its root; both go
-  with the root at teardown.
+  with the root at teardown. Teardown first stops a postmaster a killed runner
+  left running in its root (`manager::stop_orphaned_embedded_pg`, which kills
+  only a PID whose executable lies inside that root).
+- **On Windows the root is in the ROAMING profile** (`%APPDATA%`, which is
+  `dirs::config_dir()`), so the cluster and WebView2 caches now live there
+  rather than under `%LOCALAPPDATA%`.
+- **A persistent NAMED runner changes on its first start under this build:**
+  its embedded PG becomes a fresh private cluster (the machine-shared cluster's
+  history is no longer visible to it), its `~/.qontinui` becomes `<root>/home`,
+  and on Windows its WebView2 profile moves into the root (the old
+  `%LOCALAPPDATA%\com.qontinui.runner\EBWebView-<id>` is reaped only at
+  `DELETE`). Its `settings.json` and pairing stay where they were — the root IS
+  its old config/secure dir.
 
 ## Temp runner isolation and max age
 

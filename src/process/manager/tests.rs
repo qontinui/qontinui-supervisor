@@ -314,7 +314,7 @@ fn child_api_url_explicit_env_forwarded_to_all() {
 fn apply_instance_root_env_exports_the_root_and_confines_every_location() {
     let id = format!("test-apply-instance-root-env-{}", std::process::id());
     let Some(expected) = instance_config_dir(&id) else {
-        // No resolvable config dir on this platform — nothing to assert.
+        eprintln!("SKIPPED: dirs::config_dir() did not resolve on this platform");
         return;
     };
     let _cleanup = scopeguard::guard(expected.clone(), |dir| {
@@ -359,22 +359,30 @@ fn apply_instance_root_env_exports_the_root_and_confines_every_location() {
     }
 }
 
-/// Every root-confined key the command sets lies inside `root` — the contract a
-/// root-honouring runner enforces with exit 78 (qontinui-runner
-/// `instance_env::validate_instance_root`).
+/// EVERY root-confined key is decided by the command — set to a path inside
+/// `root`, or explicitly removed — the contract a root-honouring runner
+/// enforces with exit 78 (qontinui-runner `instance_env::validate_instance_root`).
+///
+/// A key the command leaves untouched is a failure even though it is absent
+/// from the overrides: the child would INHERIT the supervisor's value for it,
+/// and nothing then guarantees that value lies inside the root.
 fn assert_confined_to_root(
     envs: &std::collections::HashMap<String, Option<String>>,
     root: &std::path::Path,
 ) {
     for key in crate::process::instance_root::ROOT_CONFINED_ENV_KEYS {
-        let Some(Some(value)) = envs.get(key) else {
-            continue;
-        };
-        assert!(
-            crate::process::instance_root::is_inside_root(std::path::Path::new(value), root),
-            "{key}={value:?} lies outside the instance root {root:?} — a runner under the root \
-             refuses to start (exit 78)"
-        );
+        match envs.get(key) {
+            Some(Some(value)) => assert!(
+                crate::process::instance_root::is_inside_root(std::path::Path::new(value), root),
+                "{key}={value:?} lies outside the instance root {root:?} — a runner under the \
+                 root refuses to start (exit 78)"
+            ),
+            Some(None) => {} // explicitly removed: the child derives it under the root
+            None => panic!(
+                "{key} is neither set inside the root nor removed — the child inherits the \
+                 supervisor's value, which may lie outside {root:?}"
+            ),
+        }
     }
 }
 
@@ -385,6 +393,7 @@ fn non_primary_env_block_carries_the_root_and_provisions_the_home() {
     let pid = std::process::id();
     let config = temp_config(&format!("test-rootblock-{pid}"), 9877);
     let Some(expected_root) = instance_config_dir(&config.id) else {
+        eprintln!("SKIPPED: dirs::config_dir() did not resolve on this platform");
         return;
     };
     let _cleanup = scopeguard::guard(expected_root.clone(), |dir| {
@@ -3516,4 +3525,24 @@ fn build_tree_from_working_tree_maps_the_wire_bool() {
         BuildTree::from_working_tree(true),
         BuildTree::LiveWorkingTree
     );
+}
+
+/// The orphaned-postmaster stop never kills a process running an executable
+/// outside the instance root — a recycled PID in a stale `postmaster.pid`.
+/// Uses THIS test process's PID, whose exe is the test binary (outside the
+/// tempdir root): it must survive, which is the assertion.
+#[tokio::test]
+async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = crate::process::instance_root::InstanceRoot::at(tmp.path().to_path_buf());
+    let data = root.embedded_pg_dir().join("pg-data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("postmaster.pid"),
+        format!("{}\n{}\n", std::process::id(), data.display()),
+    )
+    .unwrap();
+    super::stop_orphaned_embedded_pg("test-orphan-pg", &root).await;
+    // Still alive to run this line: the identity check refused the kill.
+    assert_eq!(root.embedded_pg_postmaster_pid(), Some(std::process::id()));
 }
