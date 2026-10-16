@@ -3530,9 +3530,16 @@ fn build_tree_from_working_tree_maps_the_wire_bool() {
 /// The orphaned-postmaster stop never kills a process running an executable
 /// outside the instance root — a recycled PID in a stale `postmaster.pid`.
 /// Uses THIS test process's PID, whose exe is the test binary (outside the
-/// tempdir root): it must survive, which is the assertion.
+/// tempdir root): the verdict must be a refusal, and we are still alive.
 #[tokio::test]
 async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
+    assert!(
+        crate::process::proc_kill::pid_exe_path(std::process::id())
+            .await
+            .is_some(),
+        "precondition: this process's own image path must be readable, or the identity \
+         check is never reached"
+    );
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let root = crate::process::instance_root::InstanceRoot::at(tmp.path().to_path_buf());
     let data = root.embedded_pg_dir().join("pg-data");
@@ -3542,7 +3549,28 @@ async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
         format!("{}\n{}\n", std::process::id(), data.display()),
     )
     .unwrap();
-    super::stop_orphaned_embedded_pg("test-orphan-pg", &root).await;
-    // Still alive to run this line: the identity check refused the kill.
-    assert_eq!(root.embedded_pg_postmaster_pid(), Some(std::process::id()));
+    assert_eq!(
+        super::stop_orphaned_embedded_pg("test-orphan-pg", &root).await,
+        super::OrphanPgStop::RefusedOutsideRoot
+    );
+}
+
+/// The positive arm: an executable that lives INSIDE the root is recognised as
+/// the subject's own (the identity check that gates the kill).
+#[test]
+fn exe_inside_the_root_is_recognised() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("root");
+    let exe = root
+        .join("embedded-pg")
+        .join("pg-install")
+        .join("bin")
+        .join("postgres");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"").unwrap();
+    assert!(super::exe_is_inside_root(&exe, &root));
+    assert!(!super::exe_is_inside_root(
+        &tmp.path().join("elsewhere"),
+        &root
+    ));
 }

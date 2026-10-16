@@ -898,6 +898,7 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
         dirs::home_dir(),
         crate::process::instance_config_dir(&runner_id),
     ) else {
+        eprintln!("SKIPPED: no resolvable home / config dir on this platform");
         return;
     };
     let snapshot = home.join(".qontinui").join("profiles").join(&unique);
