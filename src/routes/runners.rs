@@ -463,16 +463,22 @@ fn apply_paired_state_for_spawn(
             }),
         )
     })?;
-    let dest_dir = crate::process::instance_config_dir(runner_id).ok_or_else(|| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "error": "config_dir_unresolved",
-                "message": "could not resolve config_dir for the runner's instance dir",
-                "runner_id": runner_id,
-            }),
-        )
-    })?;
+    // The CHILD's secure-storage dir — resolved through the same helper the
+    // spawn's env block exports as `QONTINUI_SECURE_STORAGE_DIR`, so the two
+    // cannot drift (plan
+    // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    // Phase 4: "writes into the subject's own secure dir").
+    let dest_dir = crate::process::instance_root::instance_secure_storage_dir(runner_id)
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "config_dir_unresolved",
+                    "message": "could not resolve config_dir for the runner's instance dir",
+                    "runner_id": runner_id,
+                }),
+            )
+        })?;
     let profiles_root = home.join(".qontinui").join("profiles");
     let primary_dir = crate::process::primary_paired_state_dir();
     apply_spawn_paired_state(
@@ -481,6 +487,26 @@ fn apply_paired_state_for_spawn(
         primary_dir.as_deref(),
         &dest_dir,
     )
+}
+
+/// The spawned runner's instance root and where an external client finds what
+/// it publishes there — `null` only when the root cannot be resolved (the
+/// spawn itself refuses that case, so a live response always carries it).
+///
+/// D5 of plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`:
+/// the launcher owns the root and passes it to any client. A subject keeps its
+/// `~/.qontinui` — the loopback handshake key, its port breadcrumb, session
+/// names — under `home`, NOT under the harness's `~/.qontinui`, so a client that
+/// reads those files must read them from here.
+pub(crate) fn instance_root_json(runner_id: &str) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        Some(root) => json!({
+            "path": root.path().display().to_string(),
+            "home": root.home_dir().display().to_string(),
+            "logs": root.logs_dir().display().to_string(),
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// The spawned child's `coordCredential` block, read from a `/health` body
@@ -4529,6 +4555,7 @@ async fn execute_spawn_build_inner(
         // directory the binary came from, which is the gap that let a
         // 54-day-old exe pass for a branch under test.
         "source_exe": source_exe_json(managed).await,
+        "instance_root": instance_root_json(id),
         "auth_state": auth_state_json,
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
@@ -5584,6 +5611,7 @@ pub async fn spawn_named(
         // Which artifact was launched and which resolution rung produced it —
         // same shape as spawn-test (`source_exe_json`).
         "source_exe": source_exe_json(&managed).await,
+        "instance_root": instance_root_json(&id),
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {
@@ -6901,31 +6929,25 @@ pub async fn runner_crash_summary(
             .join("\n")
     };
 
-    // Compose `panic_excerpt`: read <panic_log_dir>/runner-last-panic.txt if present.
-    let panic_excerpt: Option<String> = match snapshot.panic_log_dir.as_ref() {
-        Some(dir) => {
-            let path = dir.join("runner-last-panic.txt");
-            match tokio::fs::read_to_string(&path).await {
-                Ok(s) => {
-                    if s.len() > CRASH_SUMMARY_PANIC_EXCERPT_CAP {
-                        // Take the last cap bytes, snapping forward to a UTF-8
-                        // boundary so JSON serialization can't fail mid-codepoint.
-                        let want_start = s.len() - CRASH_SUMMARY_PANIC_EXCERPT_CAP;
-                        let snap = s
-                            .char_indices()
-                            .find(|(i, _)| *i >= want_start)
-                            .map(|(i, _)| i)
-                            .unwrap_or(s.len());
-                        Some(s[snap..].to_string())
-                    } else {
-                        Some(s)
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        None => None,
+    // Compose `panic_excerpt`: the `runner-last-panic.txt` text captured when
+    // the snapshot was taken, else a read of <panic_log_dir> now. The capture is
+    // what survives teardown: a non-primary runner's log dir lies inside its
+    // instance root, which is removed right after the snapshot.
+    let panic_text: Option<String> = match snapshot.last_panic_text.clone() {
+        Some(text) => Some(text),
+        None => match snapshot.panic_log_dir.as_ref() {
+            Some(dir) => tokio::fs::read_to_string(dir.join("runner-last-panic.txt"))
+                .await
+                .ok(),
+            None => None,
+        },
     };
+    // Take the last cap bytes, snapping forward to a UTF-8 boundary so JSON
+    // serialization can't fail mid-codepoint.
+    let panic_excerpt: Option<String> = panic_text.map(|s| {
+        crate::process::stopped_cache::tail_on_char_boundary(&s, CRASH_SUMMARY_PANIC_EXCERPT_CAP)
+            .to_string()
+    });
 
     // duration_alive_ms = stopped_at - started_at (when both available).
     let duration_alive_ms: Option<i64> = snapshot.started_at.map(|started| {

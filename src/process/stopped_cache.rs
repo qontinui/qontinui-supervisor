@@ -77,6 +77,39 @@ pub struct StoppedRunnerSnapshot {
     /// runner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panic_log_dir: Option<PathBuf>,
+    /// `<panic_log_dir>/runner-last-panic.txt`, read when the snapshot was
+    /// taken (its last [`LAST_PANIC_TEXT_CAP`] bytes). Captured eagerly because
+    /// a non-primary runner's log dir lies inside its instance root, which every
+    /// teardown removes right after taking this snapshot — a lazy read in
+    /// `GET /runners/{id}/crash-summary` would then find nothing. Not
+    /// serialized: crash-summary renders it as `panic_excerpt`.
+    #[serde(skip)]
+    pub last_panic_text: Option<String>,
+}
+
+/// How much of `runner-last-panic.txt` a snapshot keeps (the tail).
+pub const LAST_PANIC_TEXT_CAP: usize = 64 * 1024;
+
+/// The last `cap` bytes of `s`, snapped forward to a UTF-8 boundary.
+pub fn tail_on_char_boundary(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let want_start = s.len() - cap;
+    let start = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|i| *i >= want_start)
+        .unwrap_or(s.len());
+    &s[start..]
+}
+
+/// Read `<dir>/runner-last-panic.txt` for a snapshot; `None` when absent.
+async fn read_last_panic_text(dir: Option<&std::path::Path>) -> Option<String> {
+    let text = tokio::fs::read_to_string(dir?.join("runner-last-panic.txt"))
+        .await
+        .ok()?;
+    Some(tail_on_char_boundary(&text, LAST_PANIC_TEXT_CAP).to_string())
 }
 
 /// Insert a snapshot, then evict expired entries and trim to the size cap.
@@ -138,6 +171,7 @@ pub async fn snapshot_from_managed(
     let recent_panic = managed.recent_panic.read().await.clone();
     let early_log_path = managed.early_log_path.read().await.clone();
     let panic_log_dir = managed.panic_log_dir.read().await.clone();
+    let last_panic_text = read_last_panic_text(panic_log_dir.as_deref()).await;
     let started_at = managed.runner.read().await.started_at;
     StoppedRunnerSnapshot {
         id: managed.config.id.clone(),
@@ -152,6 +186,7 @@ pub async fn snapshot_from_managed(
         early_log_path,
         started_at,
         panic_log_dir,
+        last_panic_text,
     }
 }
 
@@ -175,6 +210,7 @@ mod tests {
             early_log_path: None,
             started_at: None,
             panic_log_dir: None,
+            last_panic_text: None,
         }
     }
 
@@ -342,5 +378,28 @@ mod tests {
         let got = crate::config::parse_clamped_i64(var, 3600, 60, 86_400);
         std::env::remove_var(var);
         assert_eq!(got, 3600);
+    }
+
+    #[test]
+    fn tail_on_char_boundary_keeps_short_text_and_snaps_long_text() {
+        assert_eq!(tail_on_char_boundary("abc", 10), "abc");
+        assert_eq!(tail_on_char_boundary("abcdef", 3), "def");
+        // 'é' is two bytes; a cut inside it snaps forward.
+        assert_eq!(tail_on_char_boundary("aéb", 2), "b");
+    }
+
+    /// The panic text is captured at snapshot time, so it survives the
+    /// teardown that removes the instance root right after.
+    #[tokio::test]
+    async fn last_panic_text_is_read_eagerly_and_survives_the_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("runner-last-panic.txt"), "boom at main.rs:1").unwrap();
+        let text = read_last_panic_text(Some(&logs)).await;
+        std::fs::remove_dir_all(&logs).unwrap();
+        assert_eq!(text.as_deref(), Some("boom at main.rs:1"));
+        assert_eq!(read_last_panic_text(Some(&logs)).await, None);
+        assert_eq!(read_last_panic_text(None).await, None);
     }
 }

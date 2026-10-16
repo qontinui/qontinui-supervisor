@@ -12,16 +12,15 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::env_forwarders;
+use crate::process::instance_root::{self, InstanceRoot, INSTANCE_ROOT_ENV};
 use crate::process::port::wait_for_port_free;
 use crate::process::stop_ledger::{
     resolve_stop_target, verify_target_image, PidSource, StopLedger, StopStrategy, StopTarget,
     TargetVerification as StopVerification,
 };
 #[cfg(target_os = "windows")]
-use crate::process::windows::{remove_webview2_user_data_folder, webview2_user_data_folder};
-use crate::process::{
-    instance_config_dir, remove_instance_config_dir, remove_runner_app_data_dirs,
-};
+use crate::process::windows::remove_webview2_user_data_folder;
+use crate::process::{remove_instance_config_dir, remove_runner_app_data_dirs};
 use crate::state::{ManagedRunner, SharedState};
 
 // =============================================================================
@@ -2842,7 +2841,7 @@ pub(crate) fn reap_instance_state_on_stop(restart_requested: bool) -> bool {
 /// other than its exe copy ([`remove_runner_exe_copy`], which a restart
 /// redeploys): the isolated WebView2 profile (Windows), the `instance-<name>`
 /// app-data trees ([`remove_runner_app_data_dirs`]), and the
-/// [`instance_config_dir`] holding its copy of the pairing. Best-effort; each
+/// [`crate::process::instance_config_dir`] holding its copy of the pairing. Best-effort; each
 /// failure is logged. `runner_name` is `config.name` — what the runner
 /// received as `QONTINUI_INSTANCE_NAME` — not the id.
 ///
@@ -2921,48 +2920,84 @@ struct SpawnResult {
     panic_log_dir: Option<std::path::PathBuf>,
 }
 
-/// Start exe mode for a specific runner with port/name env vars.
-/// Applies the per-instance config + secure-storage env vars to a spawn command.
+/// Applies a non-primary runner's **instance root** to a spawn command.
 ///
-/// Resolves [`instance_config_dir`] for `runner_id`, creates it, and sets BOTH
-/// `QONTINUI_CONFIG_DIR` and `QONTINUI_SECURE_STORAGE_DIR` to it. Returns the
-/// dir applied.
+/// Resolves [`InstanceRoot::for_runner`] (the per-instance dir
+/// [`crate::process::instance_config_dir`]), creates the root and every location under it, and
+/// exports:
+///
+/// - `QONTINUI_INSTANCE_ROOT` = the root — a runner that honours it is a
+///   SUBJECT: everything it owns resolves under the root, and it refuses to
+///   start (exit 78) when a root-confined override points outside it;
+/// - every directory in [`InstanceRoot::confined_exports`] — `QONTINUI_CONFIG_DIR`
+///   and `QONTINUI_SECURE_STORAGE_DIR` (both the root itself), `QONTINUI_HOME`,
+///   the log dirs, `QONTINUI_EMBEDDED_PG_DIR` and `WEBVIEW2_USER_DATA_FOLDER`,
+///   each inside the root, so an older binary that ignores the root is still
+///   isolated the same way;
+/// - `QONTINUI_DISABLE_KEYCHAIN=1` — the OS keychain entry is keyed on a fixed
+///   service name shared by every runner on the box (D2 of the plan); a
+///   root-honouring runner implies it, an older one needs it said.
+///
+/// It then provisions the harness's `machine.json` / `profiles.json` into
+/// `<root>/home` ([`instance_root::provision_instance_home`]). A provisioning
+/// failure is a WARN, not a refusal: the subject then runs as a box with no
+/// device identity, which is a degraded subject, not a leak.
 ///
 /// **This is the load-bearing site**: whatever this function writes onto the
-/// command is the directory the child loads its pairing and token cache from.
-/// It is a standalone function precisely so a test can drive it against a real
+/// command is where the child keeps its state and loads its pairing from. It is
+/// a standalone function precisely so a test can drive it against a real
 /// [`Command`] and read the vars back — re-inlining a divergent path at the
 /// call site is then a test failure rather than a silently unpaired runner.
 ///
-/// Both failure modes are hard errors, never a skip. Leaving the vars unset
-/// makes the child fall back to the shared
-/// `dirs::data_local_dir()/com.qontinui.runner`, which is the exact
-/// forbidden fallback documented on [`instance_config_dir`]: the spawn-test
-/// paired-profile writer would have copied the snapshot into the instance dir
-/// while the child read somewhere else.
-fn apply_instance_dir_env(
+/// Both resolution failures are hard errors, never a skip. Leaving the vars
+/// unset makes the child fall back to the shared
+/// `dirs::data_local_dir()/com.qontinui.runner`, which is the exact forbidden
+/// fallback documented on [`crate::process::instance_config_dir`]: the spawn-test paired-profile
+/// writer would have copied the snapshot into the instance dir while the child
+/// read somewhere else.
+fn apply_instance_root_env(
     cmd: &mut Command,
     runner_id: &str,
-) -> Result<std::path::PathBuf, SupervisorError> {
-    let dir = instance_config_dir(runner_id).ok_or_else(|| {
+    home_source: Option<&std::path::Path>,
+) -> Result<InstanceRoot, SupervisorError> {
+    let root = InstanceRoot::for_runner(runner_id).ok_or_else(|| {
         SupervisorError::Process(format!(
-            "Could not resolve the per-instance config dir \
+            "Could not resolve the instance root \
              <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
              dirs::config_dir() returned None. Refusing to spawn — without \
-             QONTINUI_CONFIG_DIR/QONTINUI_SECURE_STORAGE_DIR the child falls back to the \
+             QONTINUI_INSTANCE_ROOT and its per-instance dirs the child falls back to the \
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
     })?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        SupervisorError::Process(format!(
-            "Failed to create the per-instance config dir {dir:?} for runner '{runner_id}': {e}. \
-             Refusing to spawn — the child would be told to use a directory that does not exist, \
-             or fall back to the shared data_local_dir()."
-        ))
-    })?;
-    cmd.env("QONTINUI_CONFIG_DIR", &dir);
-    cmd.env("QONTINUI_SECURE_STORAGE_DIR", &dir);
-    Ok(dir)
+    let mut dirs_to_create = vec![root.path().to_path_buf()];
+    dirs_to_create.extend(root.confined_exports().into_iter().map(|(_, dir)| dir));
+    for dir in &dirs_to_create {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            SupervisorError::Process(format!(
+                "Failed to create {dir:?} under the instance root of runner '{runner_id}': {e}. \
+                 Refusing to spawn — the child would be told to use a directory that does not \
+                 exist, or fall back to the shared data_local_dir()."
+            ))
+        })?;
+    }
+    cmd.env(INSTANCE_ROOT_ENV, root.path());
+    for (key, dir) in root.confined_exports() {
+        cmd.env(key, dir);
+    }
+    cmd.env("QONTINUI_DISABLE_KEYCHAIN", "1");
+
+    match instance_root::provision_instance_home(home_source, &root.home_dir()) {
+        Ok(copied) => debug!(
+            "Runner '{}' instance home provisioned from {:?}: {:?}",
+            runner_id, home_source, copied
+        ),
+        Err(e) => warn!(
+            "Runner '{}' instance home could not be provisioned ({}); the runner starts \
+             without the harness's device identity / profile",
+            runner_id, e
+        ),
+    }
+    Ok(root)
 }
 
 /// Apply the whole **non-primary** per-instance env block to a spawn command.
@@ -2974,8 +3009,13 @@ fn apply_instance_dir_env(
 /// |---|---|---|
 /// | `QONTINUI_INSTANCE_NAME` | `config.name` | Roots the runner's `instance-<sanitized>` app-data tree (`instance::scope_path`) — the terminal-session registry, dev logs, macros, prompts, contexts. |
 /// | `QONTINUI_PRIMARY_PORT` | caller-resolved | The runner requires BOTH this and the instance name to classify itself as a secondary; unset makes it silently behave as a primary. |
-/// | `WEBVIEW2_USER_DATA_FOLDER` | `config.id` | Isolated localStorage / IndexedDB / cookies (Windows only). |
-/// | `QONTINUI_CONFIG_DIR` + `QONTINUI_SECURE_STORAGE_DIR` | `config.id` | Per-instance config + pairing store, via [`apply_instance_dir_env`]. |
+/// | `QONTINUI_INSTANCE_ROOT` + every root location | `config.id` | The subject's instance root, via [`apply_instance_root_env`]: config, pairing store, `~/.qontinui`, logs, embedded PG, WebView data. |
+///
+/// The port the child binds (`QONTINUI_PORT`, set by the caller from
+/// `config.port`) must be a fixed port other than the primary's: a runner under
+/// an instance root refuses `0` and `9876`, and this refuses them first — plus
+/// the registered primary's own port — so the failure names the runner config
+/// instead of surfacing as a child that exited 78.
 ///
 /// **`QONTINUI_INSTANCE_NAME` must be unique per SPAWN, not per port.** Temp
 /// ports are recycled inside 9877-9899, so a port-derived name made two
@@ -2985,58 +3025,63 @@ fn apply_instance_dir_env(
 /// `tests::non_primary_env_block_keys_instance_name_per_spawn_not_per_port`.
 ///
 /// Extracted as a standalone function for the same reason
-/// [`apply_instance_dir_env`] is: so a test can drive it against a REAL
+/// [`apply_instance_root_env`] is: so a test can drive it against a REAL
 /// [`Command`] and read the vars back, rather than re-deriving the body.
 /// The primary-port lookup stays in the caller because it is async.
-fn apply_non_primary_instance_env(
+pub(crate) fn apply_non_primary_instance_env(
     cmd: &mut Command,
     config: &crate::config::RunnerConfig,
     primary_port: u16,
-) -> Result<std::path::PathBuf, SupervisorError> {
+) -> Result<InstanceRoot, SupervisorError> {
+    let home_source = instance_root::harness_qontinui_dir();
+    apply_non_primary_instance_env_with(cmd, config, primary_port, home_source.as_deref())
+}
+
+/// [`apply_non_primary_instance_env`] with the provisioning source (the
+/// harness's `~/.qontinui`) injected, so a test never copies the operator's
+/// real files.
+pub(crate) fn apply_non_primary_instance_env_with(
+    cmd: &mut Command,
+    config: &crate::config::RunnerConfig,
+    primary_port: u16,
+    home_source: Option<&std::path::Path>,
+) -> Result<InstanceRoot, SupervisorError> {
+    if config.port == 0
+        || config.port == crate::config::DEFAULT_RUNNER_API_PORT
+        || config.port == primary_port
+    {
+        return Err(SupervisorError::Validation(format!(
+            "Runner '{}' is configured on port {}, which a non-primary runner may not use \
+             (0, the primary's {} and the default {} are refused): it runs under an instance \
+             root, and a runner under a root refuses to start on any of them. Give it another \
+             port.",
+            config.name,
+            config.port,
+            primary_port,
+            crate::config::DEFAULT_RUNNER_API_PORT
+        )));
+    }
     cmd.env("QONTINUI_INSTANCE_NAME", &config.name);
     cmd.env("QONTINUI_PRIMARY_PORT", primary_port.to_string());
 
-    // Per-runner WebView2 data dir — non-primary runners get isolated
-    // localStorage, IndexedDB, cookies, and caches. Primary keeps the
-    // default path so its existing state (auth, terminal layouts, etc.)
-    // is preserved. This prevents state bleed-over when spawning temp
-    // test runners and eliminates the "216 restored terminals" problem
-    // where one runner's persisted UI state floods every other runner.
-    // On non-Windows the variable is ignored by other webview backends,
-    // so this is harmless but keeps behavior consistent.
-    #[cfg(target_os = "windows")]
-    if let Some(webview_dir) = webview2_user_data_folder(&config.id, false) {
-        // Ensure the folder exists so WebView2 doesn't race to create
-        // it against the parent dir's permissions.
-        if let Err(e) = std::fs::create_dir_all(&webview_dir) {
-            warn!(
-                "Failed to pre-create WebView2 data dir {:?} for runner '{}': {}",
-                webview_dir, config.name, e
-            );
-        }
-        info!(
-            "Runner '{}' using isolated WebView2 data dir: {:?}",
-            config.name, webview_dir
-        );
-        cmd.env("WEBVIEW2_USER_DATA_FOLDER", webview_dir);
-    }
-
-    // Per-instance config + secure-storage dir. `instance_config_dir` is
-    // the single source of truth for this path — the spawn-test paired
-    // profile writer and the instance-dir reaper resolve it through the
-    // same helper so a snapshot can never be copied somewhere the child
-    // does not read (see `process::instance_config_dir`). Failures here
-    // abort the spawn rather than letting the child fall back to the
-    // shared data dir.
-    let instance_dir = apply_instance_dir_env(cmd, &config.id)?;
-    debug!(
-        "Runner '{}' using per-instance config dir: {:?}",
-        config.name, instance_dir
+    // The instance root and every location under it. `instance_config_dir` is
+    // the single source of truth for the root — the spawn-test paired-profile
+    // writer, the pair route and the instance-dir reaper resolve it through the
+    // same helper, so a snapshot can never be copied somewhere the child does
+    // not read and the reaper removes everything the child wrote. Failures here
+    // abort the spawn rather than letting the child fall back to the shared
+    // data dir.
+    let root = apply_instance_root_env(cmd, &config.id, home_source)?;
+    info!(
+        "Runner '{}' using instance root {:?}",
+        config.name,
+        root.path()
     );
 
-    Ok(instance_dir)
+    Ok(root)
 }
 
+/// Start exe mode for a specific runner with port/name env vars.
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,

@@ -324,13 +324,16 @@ pub(crate) fn paired_user_json_path(target_dir: Option<&Path>) -> Option<PathBuf
 
 /// Resolve the per-instance secure-storage dir for `target_runner_id`.
 ///
-/// Delegates to [`crate::process::instance_config_dir`] — the documented
+/// Delegates to [`crate::process::instance_root::instance_secure_storage_dir`]
+/// — the one answer the spawn's env block exports as
+/// `QONTINUI_SECURE_STORAGE_DIR` — which resolves through
+/// [`crate::process::instance_config_dir`], the documented
 /// single source of truth for that path (the spawn side, the profile-write
 /// side, and the removal side all funnel through it) — so this route can
 /// never diverge from the dir `start_exe_mode_for_runner` points the runner
 /// itself at.
 pub(crate) fn pair_target_instance_dir(runner_id: &str) -> Result<PathBuf, String> {
-    crate::process::instance_config_dir(runner_id).ok_or_else(|| {
+    crate::process::instance_root::instance_secure_storage_dir(runner_id).ok_or_else(|| {
         format!(
             "could not resolve the per-instance config dir \
              <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
