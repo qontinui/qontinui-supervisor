@@ -1176,6 +1176,14 @@ impl EnvForwarder for ExtraEnv {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             for (k, v) in &runner.config.extra_env {
+                if let Some(msg) = fresh_identity_extra_env_refusal(&runner.config, k) {
+                    tracing::warn!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                        .await;
+                    continue;
+                }
                 if let Some(msg) = instance_dir_override_warning(cmd, &runner.config.name, k, v) {
                     tracing::warn!("{}", msg);
                     state
@@ -1187,6 +1195,28 @@ impl EnvForwarder for ExtraEnv {
             }
         })
     }
+}
+
+/// A `fresh_device_identity` runner's `extra_env` entry that would re-inject
+/// the harness's device id ([`crate::process::instance_root::MACHINE_ID_ENV`]):
+/// the warning to log, and the entry is NOT applied. The spawn routes refuse
+/// this combination up front (400 `fresh_device_identity_conflict`); this is
+/// the backstop for a config that reached the forwarder another way (a
+/// hand-edited settings file). `None` for every other entry and every
+/// unflagged runner — whose `extra_env` stays exactly as honoured as before.
+pub(crate) fn fresh_identity_extra_env_refusal(
+    config: &crate::config::RunnerConfig,
+    key: &str,
+) -> Option<String> {
+    (config.fresh_device_identity && key == crate::process::instance_root::MACHINE_ID_ENV).then(
+        || {
+            format!(
+                "runner '{}' runs under a fresh device identity: its extra_env {key} is NOT \
+                 applied — it would override the device id the runner mints for itself",
+                config.name
+            )
+        },
+    )
 }
 
 /// The value `cmd` currently carries for `key`, if it set one.
@@ -1821,5 +1851,19 @@ mod tests {
             panic_log_dir_for(false, "test-panic-1", Some(log_dir)),
             PanicLogDir::InstanceRoot(root.join("logs"))
         );
+    }
+
+    /// Phase 8b backstop: a fresh-identity runner never has
+    /// `QONTINUI_MACHINE_ID` re-injected through `extra_env`; every other key,
+    /// and every key of an unflagged runner, is applied as before.
+    #[test]
+    fn fresh_identity_extra_env_machine_id_is_not_applied() {
+        let mut cfg = crate::config::RunnerConfig::default_primary();
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_MACHINE_ID").is_none());
+        cfg.fresh_device_identity = true;
+        let msg = super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_MACHINE_ID")
+            .expect("refused for a fresh runner");
+        assert!(msg.contains("NOT applied"), "{msg}");
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_API_URL").is_none());
     }
 }

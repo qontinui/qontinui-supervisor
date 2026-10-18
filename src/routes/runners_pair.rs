@@ -544,6 +544,23 @@ pub async fn pair_with_token_copying_into(
     // `QONTINUI_DISABLE_KEYCHAIN` keeps the fresh tokens out of the OS keychain
     // entry every runner on the box shares. Creates the dirs first: the target
     // runner may never have started.
+    //
+    // A `fresh_device_identity` target (plan
+    // `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b) is
+    // given the same identity treatment its spawn got: no harness
+    // `machine.json`, no inherited `QONTINUI_MACHINE_ID` — otherwise pairing
+    // it before its first start would hand it the harness's device id.
+    let target_identity = match body.target_runner_id.as_deref() {
+        Some(runner_id) => state.get_runner(runner_id).await.map_or(
+            crate::process::instance_root::DeviceIdentity::Harness,
+            |m| {
+                crate::process::instance_root::DeviceIdentity::from_fresh_flag(
+                    m.config.fresh_device_identity,
+                )
+            },
+        ),
+        None => crate::process::instance_root::DeviceIdentity::Harness,
+    };
     if let Some(dir) = &target_dir {
         let root = body
             .target_runner_id
@@ -554,6 +571,7 @@ pub async fn pair_with_token_copying_into(
                 .apply_env(
                     &mut cmd,
                     crate::process::instance_root::harness_qontinui_dir().as_deref(),
+                    target_identity,
                 )
                 .map(|_| ()),
             _ => Err(format!(

@@ -322,7 +322,13 @@ fn apply_instance_root_env_exports_the_root_and_confines_every_location() {
     });
 
     let mut cmd = Command::new("cargo");
-    let root = super::apply_instance_root_env(&mut cmd, &id, None).expect("must resolve + create");
+    let root = super::apply_instance_root_env(
+        &mut cmd,
+        &id,
+        None,
+        crate::process::instance_root::DeviceIdentity::Harness,
+    )
+    .expect("must resolve + create");
     assert_eq!(root.path(), expected.as_path());
 
     let envs = command_envs(&cmd);
@@ -487,6 +493,7 @@ fn temp_config(id: &str, port: u16) -> crate::config::RunnerConfig {
         external_restate_admin_url: None,
         external_restate_ingress_url: None,
         extra_env: Default::default(),
+        fresh_device_identity: false,
     }
 }
 
@@ -3371,6 +3378,7 @@ async fn register_dead_named_runner(state: &SharedState, id: &str) -> Arc<Manage
         external_restate_admin_url: None,
         external_restate_ingress_url: None,
         extra_env: Default::default(),
+        fresh_device_identity: false,
     };
     let managed = Arc::new(ManagedRunner::new(config, false));
     state
@@ -3903,4 +3911,80 @@ fn stop_escalation_only_runs_kills_from_the_table() {
         );
     }
     assert!(stop.contains("graceful_exit_observed("));
+}
+
+/// Phase 8b through the WHOLE non-primary block, against real `Command`s and
+/// real instance roots: two flagged spawns get no harness `machine.json` and
+/// have `QONTINUI_MACHINE_ID` removed; an unflagged spawn still gets the copy.
+#[test]
+fn fresh_device_identity_reaches_the_non_primary_env_block() {
+    const PRIMARY_PORT: u16 = 9876;
+    let pid = std::process::id();
+    let mut fresh_a = temp_config(&format!("test-fresh-id-a-{pid}"), 9877);
+    let mut fresh_b = temp_config(&format!("test-fresh-id-b-{pid}"), 9878);
+    fresh_a.fresh_device_identity = true;
+    fresh_b.fresh_device_identity = true;
+    let plain = temp_config(&format!("test-fresh-id-plain-{pid}"), 9879);
+    if instance_config_dir(&plain.id).is_none() {
+        return;
+    }
+    let _cleanup = scopeguard::guard(
+        vec![fresh_a.id.clone(), fresh_b.id.clone(), plain.id.clone()],
+        |ids: Vec<String>| {
+            for id in ids {
+                if let Some(dir) = instance_config_dir(&id) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        },
+    );
+    let harness = tempfile::tempdir().unwrap();
+    std::fs::write(
+        harness.path().join("machine.json"),
+        br#"{"device_id":"harness-device"}"#,
+    )
+    .unwrap();
+
+    for cfg in [&fresh_a, &fresh_b] {
+        let mut cmd = Command::new("cargo");
+        cmd.env(
+            crate::process::instance_root::MACHINE_ID_ENV,
+            "harness-device",
+        );
+        let root = super::apply_non_primary_instance_env_with(
+            &mut cmd,
+            cfg,
+            PRIMARY_PORT,
+            Some(harness.path()),
+        )
+        .expect("must resolve + create");
+        assert!(
+            !root.home_dir().join("machine.json").exists(),
+            "{}: a fresh subject must hold no harness machine.json",
+            cfg.id
+        );
+        assert_eq!(
+            command_envs(&cmd).get(crate::process::instance_root::MACHINE_ID_ENV),
+            Some(&None),
+            "{}: QONTINUI_MACHINE_ID must be removed",
+            cfg.id
+        );
+    }
+
+    let mut cmd = Command::new("cargo");
+    let root = super::apply_non_primary_instance_env_with(
+        &mut cmd,
+        &plain,
+        PRIMARY_PORT,
+        Some(harness.path()),
+    )
+    .expect("must resolve + create");
+    assert!(
+        root.home_dir().join("machine.json").is_file(),
+        "an unflagged subject still receives the harness machine.json"
+    );
+    assert_eq!(
+        command_envs(&cmd).get(crate::process::instance_root::MACHINE_ID_ENV),
+        None
+    );
 }

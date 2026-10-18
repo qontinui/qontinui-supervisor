@@ -475,7 +475,29 @@ pub(crate) fn apply_spawn_paired_state(
     }
 }
 
-/// HTTP-level wrapper around [`apply_spawn_paired_state`] that resolves the
+/// [`apply_spawn_paired_state`], gated on the subject's device identity (plan
+/// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b): a
+/// [`crate::process::instance_root::DeviceIdentity::Fresh`] subject gets NO
+/// paired state — nothing is read from `profiles_root` or `primary_dir` and
+/// nothing is written to `dest_dir` — and the report says
+/// `status: "fresh_device_identity"`. The `Harness` arm is
+/// [`apply_spawn_paired_state`] unchanged.
+pub(crate) fn apply_spawn_paired_state_for_identity(
+    identity: crate::process::instance_root::DeviceIdentity,
+    paired_profile_id: Option<&str>,
+    profiles_root: &std::path::Path,
+    primary_dir: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
+    match identity {
+        crate::process::instance_root::DeviceIdentity::Fresh => Ok(fresh_identity_paired_state()),
+        crate::process::instance_root::DeviceIdentity::Harness => {
+            apply_spawn_paired_state(paired_profile_id, profiles_root, primary_dir, dest_dir)
+        }
+    }
+}
+
+/// HTTP-level wrapper around [`apply_spawn_paired_state_for_identity`] that resolves the
 /// production roots — `~/.qontinui/profiles`, the primary's secure-storage dir
 /// ([`crate::process::primary_paired_state_dir`]) and the destination from
 /// [`crate::process::instance_config_dir`] — and surfaces failures as
@@ -494,6 +516,7 @@ pub(crate) fn apply_spawn_paired_state(
 /// An unresolvable config dir FAILS the spawn. There is deliberately no
 /// fallback to the shared dir — a silent fallback is the original bug.
 fn apply_paired_state_for_spawn(
+    identity: crate::process::instance_root::DeviceIdentity,
     paired_profile_id: Option<&str>,
     runner_id: &str,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
@@ -524,7 +547,8 @@ fn apply_paired_state_for_spawn(
         })?;
     let profiles_root = home.join(".qontinui").join("profiles");
     let primary_dir = crate::process::primary_paired_state_dir();
-    apply_spawn_paired_state(
+    apply_spawn_paired_state_for_identity(
+        identity,
         paired_profile_id,
         &profiles_root,
         primary_dir.as_deref(),
@@ -691,7 +715,7 @@ pub async fn list_runners(
         // which is the honest answer.
         let liveness = runner.liveness(cached.runner_port_open, cached.runner_responding);
 
-        result.push(json!({
+        let mut entry = json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
@@ -744,7 +768,15 @@ pub async fn list_runners(
                 "last_serving_restart_at": watchdog.last_serving_restart_at.map(|t| t.to_rfc3339()),
                 "serving_disabled_reason": watchdog.serving_disabled_reason.clone(),
             }
-        }));
+        });
+        // Phase 8b: a `fresh_device_identity` runner's own device id, read
+        // lazily from `<root>/home/machine.json` — the observable for an id
+        // minted after the spawn response was sent. Absent for every
+        // unflagged runner, whose entry is unchanged.
+        if managed.config.fresh_device_identity {
+            entry["device_identity"] = device_identity_report(&managed.config.id);
+        }
+        result.push(entry);
     }
     drop(cached_snapshots);
 
@@ -900,6 +932,7 @@ pub async fn add_runner(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
 
         // External runners are never crash-auto-restarted (the supervisor
@@ -2015,6 +2048,26 @@ pub struct SpawnTestRequest {
     #[serde(default)]
     pub paired_profile_id: Option<String>,
 
+    /// Run the subject under its OWN device identity (plan
+    /// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b).
+    /// Default `false`, which leaves the spawn exactly as it was.
+    ///
+    /// When `true` the supervisor projects NO `machine.json` and NO paired
+    /// state into the instance root — neither the primary's
+    /// `paired_user.json` / `auth_tokens.enc` snapshot nor a
+    /// `paired_profile_id` one — and removes `QONTINUI_MACHINE_ID` from the
+    /// child env. The runner then mints a new `device_id` into
+    /// `<root>/home/machine.json` at first start, and the response's
+    /// `device_identity` block reports it (`status: "pending"` until the file
+    /// exists; `GET /runners` re-reads it lazily). The response's
+    /// `paired_state` reads `status: "fresh_device_identity"`.
+    ///
+    /// Refused with `400 fresh_device_identity_conflict` together with a
+    /// `paired_profile_id` (a snapshot IS another device's paired state) or an
+    /// `extra_env` `QONTINUI_MACHINE_ID` (which would override the minted id).
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+
     /// Optional autonomous-dev work-unit id this spawn is a *preview* for
     /// (Track 2 UI-Bridge preview-verification). Pure passthrough correlation:
     /// the supervisor stores it on the spawned `ManagedRunner` and echoes it in
@@ -2091,6 +2144,92 @@ pub struct SpawnNamedRequest {
     /// build failures short-circuit with HTTP 500 and no spawn happens.
     #[serde(default)]
     pub allow_stale_fallback: bool,
+    /// Mirror of `SpawnTestRequest::fresh_device_identity`: the named runner
+    /// runs under its own device identity (no projected `machine.json`, no
+    /// `QONTINUI_MACHINE_ID`). Persisted with the runner's config, so a later
+    /// restart never re-projects the harness's identity. `spawn-named`
+    /// projects no paired state either way.
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+    /// Additional environment variables for the named runner — same contract
+    /// as `SpawnTestRequest::extra_env` (applied last), and persisted with the
+    /// runner's settings entry like every named runner's `extra_env`. A
+    /// `DISPLAY` here satisfies the Linux display preflight.
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
+}
+
+/// Refuse a `fresh_device_identity: true` spawn whose other fields would hand
+/// the subject a device identity anyway — the two contradict, and silently
+/// dropping either side would spawn something other than what was asked for.
+///
+/// - `paired_profile_id` — a snapshot IS another device's paired state;
+/// - `extra_env` naming `QONTINUI_MACHINE_ID` — it would override the id the
+///   runner mints.
+///
+/// Returns the typed `400` body, or `None` when the request is coherent
+/// (always `None` for an unflagged request). Pure, so every arm is tested
+/// without a live `SharedState`.
+pub(crate) fn fresh_device_identity_conflict(
+    fresh_device_identity: bool,
+    paired_profile_id: Option<&str>,
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    if !fresh_device_identity {
+        return None;
+    }
+    let mut conflicts = Vec::new();
+    if paired_profile_id.is_some() {
+        conflicts.push("paired_profile_id".to_string());
+    }
+    let machine_id_env = crate::process::instance_root::MACHINE_ID_ENV;
+    if extra_env.contains_key(machine_id_env) {
+        conflicts.push(format!("extra_env.{machine_id_env}"));
+    }
+    if conflicts.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "error": "fresh_device_identity_conflict",
+        "conflicts_with": conflicts,
+        "message": format!(
+            "fresh_device_identity: true asks for a subject with its OWN device identity, \
+             but {} would give it another one. Send one or the other.",
+            conflicts.join(" and ")
+        ),
+    }))
+}
+
+/// The `paired_state` report of a `fresh_device_identity` spawn: nothing was
+/// projected, by request.
+fn fresh_identity_paired_state() -> serde_json::Value {
+    json!({
+        "source": "none",
+        "status": "fresh_device_identity",
+        "applied": [],
+        "message": "fresh_device_identity: no paired state was projected; the runner \
+                    starts unpaired under the device id it mints",
+    })
+}
+
+/// The `device_identity` block of a `fresh_device_identity` runner — the
+/// `device_id` it minted into `<root>/home/machine.json`, read lazily
+/// ([`crate::process::instance_root::device_identity_json`]). Emitted by the
+/// spawn responses and `GET /runners` for FLAGGED runners only.
+pub(crate) fn device_identity_report(runner_id: &str) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        Some(root) => crate::process::instance_root::device_identity_json(
+            &root.home_dir(),
+            crate::process::instance_root::harness_qontinui_dir().as_deref(),
+        ),
+        None => json!({
+            "fresh": true,
+            "status": "unknown",
+            "device_id": null,
+            "differs_from_harness": null,
+            "message": "the instance root could not be resolved",
+        }),
+    }
 }
 
 /// Paths needed to tear down a prepared spawn container on a downstream
@@ -2769,6 +2908,16 @@ pub async fn spawn_test(
         body.rebuild,
     )?;
 
+    // Phase 8b: a fresh device identity cannot also carry another device's
+    // identity. Before any port, slot or build is claimed.
+    if let Some(conflict) = fresh_device_identity_conflict(
+        body.fresh_device_identity,
+        body.paired_profile_id.as_deref(),
+        &body.extra_env,
+    ) {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
+
     // Single resolution of "which tree does this spawn compile?", threaded
     // through worktree materialization, provenance classification and the
     // response labels so they cannot disagree. Default (no selector +
@@ -2933,6 +3082,7 @@ pub async fn spawn_test(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -4172,7 +4322,17 @@ async fn execute_spawn_build_inner(
     //
     // Reported on the spawn-test response as `paired_state`, plus the legacy
     // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
-    let paired_state = match apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id) {
+    //
+    // A `fresh_device_identity` spawn (Phase 8b) projects NO paired state: the
+    // subject is a different device, and the primary's pairing (or a
+    // snapshot) would bind it to the harness's device.
+    let paired_state = match apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::from_fresh_flag(
+            managed.config.fresh_device_identity,
+        ),
+        body.paired_profile_id.as_deref(),
+        id,
+    ) {
         Ok(report) => {
             state
                 .logs
@@ -4649,6 +4809,9 @@ async fn execute_spawn_build_inner(
         resp["paired_profile_id"] = paired_state["paired_profile_id"].clone();
     }
     resp["paired_state"] = paired_state;
+    if managed.config.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(id);
+    }
     resp["coord_credential"] = coord_credential_from_health(
         child_health_body.as_ref(),
         if child_health_body.is_some() {
@@ -5284,12 +5447,17 @@ pub async fn spawn_named(
     // Linux spawn with no display can only end in `no_display` too (plan
     // `2026-09-23-conductor-e2e-phase1-defects`, S-3). Refuse before a
     // `rebuild: true` build rather than after it; the spawn path's
-    // post-forwarder check stays the final authority. `spawn-named` takes no
-    // `extra_env`, so nothing here can supply DISPLAY that way.
+    // post-forwarder check stays the final authority. A `DISPLAY` in the
+    // request's `extra_env` satisfies it, exactly as for spawn-test.
+    if let Some(conflict) =
+        fresh_device_identity_conflict(body.fresh_device_identity, None, &body.extra_env)
+    {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
     if let Some(refusal) = crate::process::env_forwarders::display_preflight_refusal(
         cfg!(target_os = "linux"),
         "spawn-named",
-        &std::collections::HashMap::new(),
+        &body.extra_env,
         |k| std::env::var(k).ok(),
         state.config.temp_runner_display.as_deref(),
     ) {
@@ -5352,7 +5520,8 @@ pub async fn spawn_named(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
-            extra_env: Default::default(),
+            extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -5693,6 +5862,12 @@ pub async fn spawn_named(
     if let Some(meta) = exe_meta {
         resp["binary_mtime"] = json!(meta.binary_mtime);
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
+    }
+    // Phase 8b: the device id the runner minted (or `pending` before its
+    // first start reaches `ensure_device_initialized` — `GET /runners`
+    // re-reads it). Flagged runners only.
+    if body.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(&id);
     }
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
     resp["action_id"] = json!(action_id.to_string());

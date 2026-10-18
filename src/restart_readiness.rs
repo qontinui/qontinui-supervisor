@@ -2257,6 +2257,7 @@ mod tests {
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
         let managed = crate::state::ManagedRunner::new(config, false);
         managed.runner.write().await.running = running;
@@ -2421,6 +2422,7 @@ mod tests {
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
         let managed = crate::state::ManagedRunner::new(config, false);
         managed.runner.write().await.running = true;
@@ -2482,6 +2484,7 @@ mod tests {
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
         let managed = crate::state::ManagedRunner::new(config, false);
         managed.runner.write().await.running = true;

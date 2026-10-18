@@ -3043,7 +3043,9 @@ struct SpawnResult {
 ///   root-honouring runner implies it, an older one needs it said.
 ///
 /// It then provisions the harness's `machine.json` / `profiles.json` into
-/// `<root>/home` ([`instance_root::provision_instance_home`]). A provisioning
+/// `<root>/home` ([`instance_root::provision_instance_home`]) — only
+/// `profiles.json` for a [`instance_root::DeviceIdentity::Fresh`] subject,
+/// which also has `QONTINUI_MACHINE_ID` removed. A provisioning
 /// failure is a WARN, not a refusal: the subject then runs as a box with no
 /// device identity, which is a degraded subject, not a leak.
 ///
@@ -3063,6 +3065,7 @@ fn apply_instance_root_env(
     cmd: &mut Command,
     runner_id: &str,
     home_source: Option<&std::path::Path>,
+    identity: instance_root::DeviceIdentity,
 ) -> Result<InstanceRoot, SupervisorError> {
     let root = InstanceRoot::for_runner(runner_id).ok_or_else(|| {
         SupervisorError::Process(format!(
@@ -3073,7 +3076,7 @@ fn apply_instance_root_env(
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
     })?;
-    let copied = root.apply_env(cmd, home_source).map_err(|e| {
+    let copied = root.apply_env(cmd, home_source, identity).map_err(|e| {
         SupervisorError::Process(format!(
             "{e} (instance root of runner '{runner_id}'). Refusing to spawn — the child would be \
              told to use a directory that does not exist, or fall back to the shared \
@@ -3081,8 +3084,8 @@ fn apply_instance_root_env(
         ))
     })?;
     debug!(
-        "Runner '{}' instance home provisioned from {:?}: {:?}",
-        runner_id, home_source, copied
+        "Runner '{}' instance home provisioned from {:?} ({:?} device identity): {:?}",
+        runner_id, home_source, identity, copied
     );
     Ok(root)
 }
@@ -3184,7 +3187,14 @@ pub(crate) fn apply_non_primary_instance_env_with(
     // not read and the reaper removes everything the child wrote. Failures here
     // abort the spawn rather than letting the child fall back to the shared
     // data dir.
-    let root = apply_instance_root_env(cmd, &config.id, home_source)?;
+    // `fresh_device_identity` (Phase 8b): no harness `machine.json`, no
+    // inherited `QONTINUI_MACHINE_ID` — the subject mints its own device id.
+    let root = apply_instance_root_env(
+        cmd,
+        &config.id,
+        home_source,
+        instance_root::DeviceIdentity::from_fresh_flag(config.fresh_device_identity),
+    )?;
     info!(
         "Runner '{}' using instance root {:?}",
         config.name,

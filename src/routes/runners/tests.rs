@@ -489,14 +489,16 @@ fn sync_spawn_test_wait_is_shutdown_aware() {
 /// S-4 at the route: the spawn path hands `paired_profile_id` to the
 /// paired-state decision UNCONDITIONALLY (so an absent id reaches the
 /// primary-snapshot arm, which `no_paired_profile_id_applies_the_primary_snapshot`
-/// pins), and surfaces both new response fields. Re-wrapping the call in
+/// pins), and surfaces both new response fields. The identity argument
+/// (Phase 8b) precedes it; only a `fresh_device_identity` runner skips the copy. Re-wrapping the call in
 /// `if let Some(..)` — the pre-S-4 shape, under which a default spawn came
 /// up unpaired — fails here.
 #[test]
 fn spawn_path_applies_paired_state_even_without_a_profile_id() {
     let body = fn_source("async fn execute_spawn_build_inner(");
     assert!(
-        body.contains("apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id)"),
+        body.contains("body.paired_profile_id.as_deref(),\n        id,\n    ) {")
+            && body.contains("let paired_state = match apply_paired_state_for_spawn("),
         "execute_spawn_build_inner must pass the OPTIONAL paired_profile_id straight to \
              apply_paired_state_for_spawn, so an absent id snapshots the primary"
     );
@@ -849,8 +851,12 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02")
         .expect("write auth_tokens.enc");
 
-    let report =
-        super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
+    let report = super::apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::Harness,
+        Some(&unique),
+        &runner_id,
+    )
+    .expect("must succeed");
 
     assert_eq!(report["source"], "paired_profile");
     assert_eq!(
@@ -928,6 +934,7 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
         external_restate_admin_url: None,
         external_restate_ingress_url: None,
         extra_env: Default::default(),
+        fresh_device_identity: false,
     };
     let mut cmd = tokio::process::Command::new("cargo");
     crate::process::manager::apply_non_primary_instance_env_with(&mut cmd, &config, 9876, None)
@@ -942,7 +949,12 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
     let child_secure = env("QONTINUI_SECURE_STORAGE_DIR").expect("secure dir exported");
     let child_root = env("QONTINUI_INSTANCE_ROOT").expect("instance root exported");
 
-    super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
+    super::apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::Harness,
+        Some(&unique),
+        &runner_id,
+    )
+    .expect("must succeed");
 
     assert!(
         child_secure.join("paired_user.json").is_file(),
@@ -3175,6 +3187,7 @@ async fn register_live_named_runner(
         external_restate_admin_url: None,
         external_restate_ingress_url: None,
         extra_env: Default::default(),
+        fresh_device_identity: false,
     };
     let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
     {
@@ -3295,4 +3308,179 @@ async fn handoff_restart_route_refuses_when_the_runner_says_unsafe() {
 
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
     assert!(seen.lock().await.is_empty(), "no close-request may be sent");
+}
+
+// ---- Phase 8b: fresh_device_identity -------------------------------------
+
+/// A fresh-identity spawn projects NO paired state: with a paired primary
+/// AND a matching profile on disk, the destination stays empty and the report
+/// says `fresh_device_identity`. The harness arm still copies.
+#[test]
+fn fresh_identity_spawn_projects_no_paired_state() {
+    use crate::process::instance_root::DeviceIdentity;
+    let profiles = tempfile::tempdir().unwrap();
+    let primary = tempfile::tempdir().unwrap();
+    std::fs::write(
+        primary.path().join("paired_user.json"),
+        r#"{"user_id":"op"}"#,
+    )
+    .unwrap();
+    std::fs::write(primary.path().join("auth_tokens.enc"), b"\x01").unwrap();
+    let snap = profiles.path().join("ci");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::write(snap.join("paired_user.json"), r#"{"user_id":"ci"}"#).unwrap();
+
+    for profile in [None, Some("ci")] {
+        let dest = tempfile::tempdir().unwrap();
+        let report = super::apply_spawn_paired_state_for_identity(
+            DeviceIdentity::Fresh,
+            profile,
+            profiles.path(),
+            Some(primary.path()),
+            dest.path(),
+        )
+        .expect("fresh identity never fails on paired state");
+        assert_eq!(report["status"], "fresh_device_identity", "{profile:?}");
+        assert_eq!(report["applied"], serde_json::json!([]));
+        assert!(
+            !dest.path().join("paired_user.json").exists(),
+            "{profile:?}"
+        );
+        assert!(!dest.path().join("auth_tokens.enc").exists(), "{profile:?}");
+    }
+
+    let dest = tempfile::tempdir().unwrap();
+    let report = super::apply_spawn_paired_state_for_identity(
+        DeviceIdentity::Harness,
+        None,
+        profiles.path(),
+        Some(primary.path()),
+        dest.path(),
+    )
+    .unwrap();
+    assert_eq!(report["status"], "paired");
+    assert!(dest.path().join("paired_user.json").is_file());
+    assert!(dest.path().join("auth_tokens.enc").is_file());
+}
+
+/// Every arm of the contradiction guard: unflagged never refuses; flagged
+/// refuses a `paired_profile_id`, an `extra_env` `QONTINUI_MACHINE_ID`, and
+/// names both when both are present; any other `extra_env` is fine.
+#[test]
+fn fresh_identity_contradictions_are_refused_with_a_typed_body() {
+    use std::collections::HashMap;
+    let none: HashMap<String, String> = HashMap::new();
+    let mut machine = HashMap::new();
+    machine.insert("QONTINUI_MACHINE_ID".to_string(), "x".to_string());
+    let mut other = HashMap::new();
+    other.insert("QONTINUI_API_URL".to_string(), "https://api".to_string());
+
+    assert!(super::fresh_device_identity_conflict(false, Some("ci"), &machine).is_none());
+    assert!(super::fresh_device_identity_conflict(true, None, &none).is_none());
+    assert!(super::fresh_device_identity_conflict(true, None, &other).is_none());
+
+    let body = super::fresh_device_identity_conflict(true, Some("ci"), &none).expect("refused");
+    assert_eq!(body["error"], "fresh_device_identity_conflict");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["paired_profile_id"])
+    );
+
+    let body = super::fresh_device_identity_conflict(true, None, &machine).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["extra_env.QONTINUI_MACHINE_ID"])
+    );
+
+    let body = super::fresh_device_identity_conflict(true, Some("ci"), &machine).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["paired_profile_id", "extra_env.QONTINUI_MACHINE_ID"])
+    );
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("paired_profile_id"));
+}
+
+/// Both spawn bodies default the flag to false (and spawn-named's new
+/// `extra_env` to empty), and accept it set.
+#[test]
+fn spawn_bodies_default_fresh_device_identity_to_false() {
+    let t: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(!t.fresh_device_identity);
+    let t: super::SpawnTestRequest =
+        serde_json::from_value(serde_json::json!({"fresh_device_identity": true})).unwrap();
+    assert!(t.fresh_device_identity);
+
+    let n: super::SpawnNamedRequest =
+        serde_json::from_value(serde_json::json!({"name": "v"})).unwrap();
+    assert!(!n.fresh_device_identity);
+    assert!(n.extra_env.is_empty());
+    let n: super::SpawnNamedRequest = serde_json::from_value(serde_json::json!({
+        "name": "v",
+        "fresh_device_identity": true,
+        "extra_env": {"QONTINUI_API_URL": "https://api.qontinui.io"},
+    }))
+    .unwrap();
+    assert!(n.fresh_device_identity);
+    assert_eq!(n.extra_env["QONTINUI_API_URL"], "https://api.qontinui.io");
+}
+
+/// An unflagged runner config serializes WITHOUT the new key, so a named
+/// runner's settings entry is byte-for-byte what it was; a flagged one keeps
+/// the flag across a settings round-trip (a restart re-projects nothing).
+#[test]
+fn runner_config_persists_the_flag_only_when_set() {
+    let mut cfg = crate::config::RunnerConfig::default_primary();
+    let unflagged = serde_json::to_value(&cfg).unwrap();
+    assert!(
+        unflagged.get("fresh_device_identity").is_none(),
+        "{unflagged}"
+    );
+    let back: crate::config::RunnerConfig = serde_json::from_value(unflagged).unwrap();
+    assert!(!back.fresh_device_identity);
+
+    cfg.fresh_device_identity = true;
+    let flagged = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(flagged["fresh_device_identity"], true);
+    let back: crate::config::RunnerConfig = serde_json::from_value(flagged).unwrap();
+    assert!(back.fresh_device_identity);
+}
+
+/// The handlers themselves need a live `SharedState`, so their wiring is
+/// pinned by source: each spawn route guards the contradiction BEFORE it
+/// reserves anything, threads the request flag into the `RunnerConfig` it
+/// builds (the only thing the env block and the paired-state decision read),
+/// and reports `device_identity`; spawn-named forwards its `extra_env`; and
+/// `GET /runners` re-reads the id for a flagged runner.
+#[test]
+fn spawn_routes_wire_fresh_device_identity_end_to_end() {
+    for sig in ["pub async fn spawn_test(", "pub async fn spawn_named("] {
+        let body = fn_source(sig);
+        let guard = body
+            .find("fresh_device_identity_conflict(")
+            .unwrap_or_else(|| panic!("{sig} must refuse the contradiction"));
+        let reserve = body
+            .find("state.runners.write().await")
+            .unwrap_or_else(|| panic!("{sig} reserves a port under the registry lock"));
+        assert!(
+            guard < reserve,
+            "{sig}: the guard must run before a port is reserved"
+        );
+        assert!(
+            body.contains("fresh_device_identity: body.fresh_device_identity,"),
+            "{sig} must thread the request flag into the RunnerConfig it builds"
+        );
+    }
+    let named = fn_source("pub async fn spawn_named(");
+    assert!(named.contains("extra_env: body.extra_env.clone(),"));
+    assert!(named.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
+    let exec = fn_source("async fn execute_spawn_build_inner(");
+    assert!(exec.contains("resp[\"device_identity\"] = device_identity_report(id)"));
+    assert!(exec.contains("managed.config.fresh_device_identity"));
+    let list = fn_source("pub async fn list_runners(");
+    assert!(
+        list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
+    );
 }

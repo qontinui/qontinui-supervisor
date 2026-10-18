@@ -572,6 +572,22 @@ pub struct RunnerConfig {
     /// settings file.
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b:
+    /// when true this subject runs under its OWN device identity. The spawn
+    /// projects no `machine.json` and no paired state (neither the primary's
+    /// `paired_user.json` / `auth_tokens.enc` nor a `paired_profile_id`
+    /// snapshot) into the instance root, and removes `QONTINUI_MACHINE_ID`
+    /// from the child env, so the runner mints a new `device_id` into
+    /// `<root>/home/machine.json` at first start
+    /// (`pair::ensure_device_initialized`).
+    ///
+    /// Persisted with the config (named runners), so a later restart of the
+    /// same runner never re-projects the harness's identity over the one it
+    /// minted. Omitted from the serialized form when false, so an unflagged
+    /// runner's settings entry is byte-for-byte what it was before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_device_identity: bool,
 }
 
 impl RunnerConfig {
@@ -605,6 +621,7 @@ impl RunnerConfig {
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
             extra_env: std::collections::HashMap::new(),
+            fresh_device_identity: false,
         }
     }
 }
