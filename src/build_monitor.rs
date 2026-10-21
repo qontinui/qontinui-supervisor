@@ -2217,6 +2217,17 @@ pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile.exe";
 #[cfg(not(windows))]
 pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile";
 
+/// Filename of the per-pane PTY holder (`[[bin]] name = "qontinui-pty-holder"`
+/// of the runner workspace's `crates/pty-holder` package, NOT of the runner
+/// package). The runner spawns it from `current_exe().parent()`
+/// (`pty_holder::spawn::resolve_holder_exe`), so it is deployed beside every
+/// runner exe. Without it, `terminal.pty_holder` (default ON on Linux) falls
+/// back to an in-process PTY and the pane dies with the runner.
+#[cfg(windows)]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder.exe";
+#[cfg(not(windows))]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder";
+
 /// One helper binary built from the runner workspace alongside the runner exe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerSidecar {
@@ -2239,7 +2250,7 @@ pub struct RunnerSidecar {
 /// these bins (pinned by a test), and the LKG carry and the per-runner deploy
 /// both iterate this list, so adding a sidecar here reaches every step of the
 /// placement contract.
-pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
+pub const RUNNER_SIDECARS: [RunnerSidecar; 4] = [
     RunnerSidecar {
         bin: "qontinui-shim",
         filename: SHIM_EXE_FILENAME,
@@ -2259,6 +2270,13 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
         consequence: "POST /runners/pair-with-token cannot use this build's qontinui_profile",
         deployed_beside_runner: false,
     },
+    RunnerSidecar {
+        bin: "qontinui-pty-holder",
+        filename: PTY_HOLDER_EXE_FILENAME,
+        consequence: "terminal panes fall back to an in-process PTY and will NOT survive a \
+                      runner exit",
+        deployed_beside_runner: true,
+    },
 ];
 
 /// Args of the fail-open sidecar build. ONE invocation over the whole roster,
@@ -2277,12 +2295,20 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
 pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
     "build",
     "--keep-going",
+    // `qontinui-pty-holder` lives in another workspace package, and from a
+    // member directory cargo selects THAT package only, so both are named.
+    "-p",
+    "qontinui-runner",
+    "-p",
+    "qontinui-pty-holder",
     "--bin",
     "qontinui-shim",
     "--bin",
     "qontinui-pr",
     "--bin",
     "qontinui_profile",
+    "--bin",
+    "qontinui-pty-holder",
     "--features",
     "custom-protocol",
 ];
@@ -2299,6 +2325,34 @@ pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
 pub(crate) fn declared_bin_targets(
     cargo_cwd: &std::path::Path,
 ) -> Option<std::collections::BTreeSet<String>> {
+    let mut declared = package_bin_targets(cargo_cwd)?;
+    // Bins of the other workspace members (the PTY holder is one): the roster
+    // names bins by `--bin`, which cargo resolves across the selected packages.
+    if let Some(root) = cargo_cwd.parent() {
+        let members = std::fs::read_to_string(root.join("Cargo.toml"))
+            .ok()
+            .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+            .and_then(|m| {
+                m.get("workspace")?.get("members")?.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        for member in members.iter().filter(|m| !m.contains('*')) {
+            if let Some(bins) = package_bin_targets(&root.join(member)) {
+                declared.extend(bins);
+            }
+        }
+    }
+    Some(declared)
+}
+
+/// The bin targets of the single package at `dir/Cargo.toml` (see
+/// [`declared_bin_targets`]); `None` when it has no readable `[package]`.
+fn package_bin_targets(dir: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    let cargo_cwd = dir;
     let text = std::fs::read_to_string(cargo_cwd.join("Cargo.toml")).ok()?;
     let manifest: toml::Value = toml::from_str(&text).ok()?;
     let package = manifest.get("package")?.as_table()?;
@@ -2348,6 +2402,14 @@ pub(crate) fn sidecar_build_args(
             let bin = SIDECAR_BUILD_ARGS[i + 1];
             if declared.is_none_or(|d| d.contains(bin)) {
                 args.extend([arg, bin]);
+            }
+            i += 2;
+        } else if arg == "-p" {
+            // `-p <pkg>` for a package the tree lacks is an unknown-package
+            // error that costs the whole invocation, like an unknown `--bin`.
+            let pkg = SIDECAR_BUILD_ARGS[i + 1];
+            if pkg != "qontinui-pty-holder" || declared.is_none_or(|d| d.contains(pkg)) {
+                args.extend([arg, pkg]);
             }
             i += 2;
         } else {

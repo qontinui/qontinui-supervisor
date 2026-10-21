@@ -2227,6 +2227,11 @@ fn temp_runner_sidecars_land_in_its_own_dir_not_target_debug() {
         b"real-cli",
     )
     .expect("write session cli");
+    std::fs::write(
+        slot_debug.join(crate::build_monitor::PTY_HOLDER_EXE_FILENAME),
+        b"real-holder",
+    )
+    .expect("write pty holder");
 
     // The primary's shim already sits in the shared target/debug.
     let target_debug = runner.join("target").join("debug");
