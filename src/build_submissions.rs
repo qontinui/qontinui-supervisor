@@ -737,8 +737,11 @@ async fn run_submission(state: SharedState, sub_arc: Arc<RwLock<BuildSubmission>
     crate::sccache_guard::degrade_cargo_env_if_s3(&mut cmd, &worktree_path).await;
     // Never inherit QONTINUI_ALLOW_PLACEHOLDER_DIST into a real build: it
     // would silently bypass the runner build.rs placeholder-dist refusal.
+    // It also carries the pool's per-slot CARGO_BUILD_JOBS: a submission holds
+    // a pool permit like any slot build.
     crate::build_monitor::apply_invocation_env(
         &mut cmd,
+        state.config.build_pool.jobs.to_set(),
         crate::build_monitor::CargoInvocation::Submission,
     );
 

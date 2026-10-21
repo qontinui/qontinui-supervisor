@@ -302,41 +302,115 @@ pub struct SupervisorConfig {
 /// Each slot gets its own `CARGO_TARGET_DIR` so concurrent `cargo build`s do not
 /// contend on a shared `target/`. Source tree is shared (live working tree);
 /// callers accept the same source-mutation race that single-build today already has.
+///
+/// The pool size and each slot's `CARGO_BUILD_JOBS` are derived from the machine
+/// ([`crate::build_sizing`]); `source` / `derivation` / `jobs` record how, and
+/// `GET /health` `build.pool` serves them.
 #[derive(Debug, Clone)]
 pub struct BuildPoolConfig {
-    /// Number of concurrent cargo builds allowed. Default: 3.
-    /// Override via env var `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`.
+    /// Number of concurrent cargo builds allowed. Derived by
+    /// [`crate::build_sizing::derive_pool_size`] (capped at
+    /// [`crate::build_sizing::DERIVED_POOL_SIZE_CAP`]); override via env var
+    /// `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`.
     pub pool_size: usize,
+    /// Whether `pool_size` was derived or set explicitly.
+    pub source: crate::build_sizing::PoolSizeSource,
+    /// The derivation's inputs and terms (`None` for an explicit size).
+    pub derivation: Option<crate::build_sizing::PoolSizeDerivation>,
+    /// The `CARGO_BUILD_JOBS` every supervisor cargo invocation carries.
+    pub jobs: crate::build_sizing::SlotJobs,
 }
 
-impl Default for BuildPoolConfig {
-    fn default() -> Self {
-        let pool_size = std::env::var("QONTINUI_SUPERVISOR_BUILD_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(3);
-        Self { pool_size }
+impl BuildPoolConfig {
+    /// Resolve from explicit inputs (pure): the pool-size env text, the
+    /// supervisor's own `CARGO_BUILD_JOBS`, the host, and the disk readings for
+    /// the volume holding the pool root. A pool-size override that is not a
+    /// positive integer is ignored (the size is derived), as before.
+    pub fn resolve(
+        pool_size_env: Option<String>,
+        cargo_build_jobs_env: Option<String>,
+        host: qontinui_types::host_sizing::HostCapacity,
+        disk_free_bytes: Option<u64>,
+        disk_total_bytes: Option<u64>,
+        one_target_bytes: Option<u64>,
+    ) -> Self {
+        use crate::build_sizing::{derive_pool_size, PoolSizeSource, SlotJobs};
+        let explicit = pool_size_env
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1);
+        let (pool_size, source, derivation) = match explicit {
+            Some(n) => (n, PoolSizeSource::Override, None),
+            None => {
+                let (n, d) =
+                    derive_pool_size(host, disk_free_bytes, disk_total_bytes, one_target_bytes);
+                (n as usize, PoolSizeSource::Derived, Some(d))
+            }
+        };
+        let jobs = SlotJobs::resolve(
+            host,
+            pool_size.min(u32::MAX as usize) as u32,
+            cargo_build_jobs_env,
+        );
+        Self {
+            pool_size,
+            source,
+            derivation,
+            jobs,
+        }
+    }
+
+    /// Resolve from the live process: env vars, a host probe, the disk holding
+    /// `pool_root` (or its nearest existing ancestor), and the one-target size
+    /// estimate persisted under `pool_root` by the footprint refresh.
+    pub fn for_pool_root(pool_root: &Path) -> Self {
+        let probe_path = pool_root
+            .ancestors()
+            .find(|p| p.exists())
+            .unwrap_or(pool_root);
+        let disk = crate::footprint::disk_usage_for(probe_path);
+        Self::resolve(
+            std::env::var(crate::build_sizing::BUILD_POOL_SIZE_ENV).ok(),
+            std::env::var(crate::build_sizing::CARGO_BUILD_JOBS_ENV).ok(),
+            qontinui_types::host_sizing::probe(),
+            disk.as_ref().map(|d| d.free_bytes),
+            disk.as_ref().map(|d| d.total_bytes),
+            crate::build_sizing::read_one_target_estimate(pool_root).map(|e| e.bytes),
+        )
+    }
+
+    /// An explicitly sized pool (tests and fixtures): `source: override`, jobs
+    /// derived from this host for that size.
+    pub fn fixed(pool_size: usize) -> Self {
+        Self::resolve(
+            Some(pool_size.to_string()),
+            None,
+            qontinui_types::host_sizing::probe(),
+            None,
+            None,
+            None,
+        )
     }
 }
 
 /// Default minimum free disk (GB) below which the pre-permit disk guard
-/// refuses a build. See [`min_free_disk_gb`].
+/// refuses a build, and the floor of the derived floor: the effective value
+/// follows the machine (plan `2026-10-02-cargo-jobs-…` Phase 4,
+/// [`crate::build_sizing::derived_disk_floor_gb`]) and is never below this.
+/// See [`min_free_disk_gb_override`].
 pub const DEFAULT_MIN_FREE_DISK_GB: u64 = 30;
 
 /// Env var overriding the pre-permit disk guard threshold, in GB.
 pub const MIN_FREE_DISK_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB";
 
-/// Minimum free disk (in GB) required before a build may acquire a build-pool
-/// permit. Resolved from [`MIN_FREE_DISK_GB_ENV`], falling back to
-/// [`DEFAULT_MIN_FREE_DISK_GB`]. Parse-with-default exactly like
-/// [`BuildPoolConfig::default`]: a malformed value yields the default. A `0`
-/// disables the guard entirely (treat every disk state as sufficient).
-pub fn min_free_disk_gb() -> u64 {
+/// Explicit override of the pre-permit disk guard threshold, in GB, from
+/// [`MIN_FREE_DISK_GB_ENV`]. `None` (unset or malformed) means the floor is
+/// DERIVED from the machine ([`crate::build_sizing::effective_disk_floor`],
+/// which falls back to [`DEFAULT_MIN_FREE_DISK_GB`] on any UNKNOWN input). A
+/// `0` disables the guard entirely (treat every disk state as sufficient).
+pub fn min_free_disk_gb_override() -> Option<u64> {
     std::env::var(MIN_FREE_DISK_GB_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
 }
 
 /// Default minimum free COMMIT (GB) below which the pre-permit memory guard
@@ -362,7 +436,7 @@ pub const MIN_FREE_RAM_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB";
 /// Minimum free commit (in GB) required before a build may acquire a build-pool
 /// permit. Resolved from [`MIN_FREE_RAM_GB_ENV`], falling back to
 /// [`DEFAULT_MIN_FREE_RAM_GB`]. Parse-with-default exactly like
-/// [`min_free_disk_gb`]. A `0` disables the guard entirely.
+/// [`min_free_disk_gb_override`]. A `0` disables the guard entirely.
 pub fn min_free_ram_gb() -> u64 {
     std::env::var(MIN_FREE_RAM_GB_ENV)
         .ok()
@@ -1015,7 +1089,7 @@ impl SupervisorConfig {
             std::env::var(TEMP_RUNNER_DISPLAY_ENV).ok(),
         );
 
-        SupervisorConfig {
+        let mut config = SupervisorConfig {
             project_dir: args.project_dir,
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
@@ -1029,11 +1103,15 @@ impl SupervisorConfig {
             expo_port: EXPO_PORT,
             // Default: single primary runner; settings may override later
             runners: vec![RunnerConfig::default_primary()],
-            build_pool: BuildPoolConfig::default(),
+            // Placeholder; derived just below once the pool root is known.
+            build_pool: BuildPoolConfig::fixed(1),
             no_prewarm,
             no_webview,
             temp_runner_display,
-        }
+        };
+        config.build_pool =
+            BuildPoolConfig::for_pool_root(&config.runner_npm_dir().join("target-pool"));
+        config
     }
 
     /// Target directory for a given build slot.

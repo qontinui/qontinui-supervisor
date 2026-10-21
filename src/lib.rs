@@ -7,6 +7,7 @@ pub mod bazel_remote;
 /// error that does not name its own cause is a defect the gate must catch.
 pub mod build_diagnostics;
 pub mod build_monitor;
+pub mod build_sizing;
 pub mod build_submissions;
 pub mod cache_key;
 pub mod cache_telemetry;

@@ -200,7 +200,8 @@ pub fn disk_guard_allows_for(
                 let free = other.unwrap_or(0);
                 Err(format!(
                     "Pre-permit disk guard: refusing build — {} GB free, need at least \
-                     {min_free_gb} GB (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
+                     {min_free_gb} GB (derived from this machine — see GET /health \
+                     build.pool.disk_floor; override QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
                     free / (1024 * 1024 * 1024)
                 ))
             }
@@ -809,7 +810,10 @@ impl BuildPhase {
 /// cached (may be `None` if no refresh has run yet — the caller still gets the
 /// numeric free/required bytes and the prune-endpoint hints).
 pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError> {
-    let min_free_gb = crate::config::min_free_disk_gb();
+    // The floor follows the machine (plan `2026-10-02-cargo-jobs-…` Phase 4):
+    // derived from the CACHED footprint's largest built slot and volume size —
+    // never a tree walk on the gate — UNKNOWN → 30, env override wins.
+    let min_free_gb = effective_disk_floor(state).await.gb;
     if min_free_gb == 0 {
         return Ok(());
     }
@@ -855,6 +859,19 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
         required_bytes,
         footprint: Box::new(footprint),
     })
+}
+
+/// The effective pre-permit disk floor for this supervisor: the env override
+/// when set, else [`crate::build_sizing::derived_disk_floor_gb`] over the pool
+/// size and the cached footprint snapshot (UNKNOWN → 30 until the first
+/// footprint walk has measured a built slot).
+pub async fn effective_disk_floor(state: &SharedState) -> crate::build_sizing::DiskFloor {
+    let footprint = state.footprint.read().await;
+    crate::build_sizing::effective_disk_floor(
+        crate::config::min_free_disk_gb_override(),
+        state.config.build_pool.pool_size.min(u32::MAX as usize) as u32,
+        footprint.as_ref(),
+    )
 }
 
 /// RAII guard that clears a `BuildSlot::busy` field on drop AND reconciles
@@ -1869,7 +1886,11 @@ async fn run_build_inner(
             .progress_probe(artifact_progress_probe(&slot.target_dir));
     // No QONTINUI_ALLOW_PLACEHOLDER_DIST here: this build produces the exe a
     // runner starts from, so build.rs must be free to refuse a placeholder dist.
-    let guarded = with_invocation_env(guarded, CargoInvocation::SlotBuild);
+    let guarded = with_invocation_env(
+        guarded,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::SlotBuild,
+    );
 
     let outcome = guarded.run().await;
     // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
@@ -2495,7 +2516,11 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         .current_dir(cargo_cwd)
         .env("CARGO_TARGET_DIR", &slot.target_dir)
         .job_guarded(true);
-        let guarded = with_invocation_env(guarded, CargoInvocation::SidecarBuild);
+        let guarded = with_invocation_env(
+            guarded,
+            state.config.build_pool.jobs.to_set(),
+            CargoInvocation::SidecarBuild,
+        );
 
         match guarded.run().await {
             Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
@@ -4502,10 +4527,11 @@ pub(crate) enum CargoInvocation {
 }
 
 /// The env a supervisor cargo invocation SETS and REMOVES, by kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InvocationEnv {
-    /// Variables set on the child.
-    pub set: &'static [(&'static str, &'static str)],
+    /// Variables set on the child. Owned, because `CARGO_BUILD_JOBS` is
+    /// computed from the machine at runtime.
+    pub set: Vec<(&'static str, String)>,
     /// Variables removed from what the child would inherit from the supervisor.
     pub remove: &'static [&'static str],
 }
@@ -4525,28 +4551,48 @@ pub(crate) struct InvocationEnv {
 /// in the supervisor's OWN environment (an operator shell, a dev script)
 /// would be inherited by every real build and silently bypass the refusal.
 /// Plan `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
-pub(crate) fn cargo_invocation_env(kind: CargoInvocation) -> InvocationEnv {
+///
+/// **`CARGO_BUILD_JOBS` on all four kinds** (plan
+/// `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`,
+/// Phase 2). `jobs` is the pool's per-slot share
+/// ([`crate::build_sizing::SlotJobs::to_set`]): every kind holds a pool permit
+/// (the pre-warm runs once per slot, `/build/submit` shares `build_pool.permits`),
+/// so a full pool's jobs sum to at most the machine's cores instead of
+/// `pool_size × cores`. `None` means the supervisor's own environment already
+/// carries `CARGO_BUILD_JOBS`, which the child then inherits untouched.
+pub(crate) fn cargo_invocation_env(kind: CargoInvocation, jobs: Option<u32>) -> InvocationEnv {
+    let mut set: Vec<(&'static str, String)> = Vec::new();
+    if let Some(j) = jobs {
+        set.push((
+            crate::build_sizing::CARGO_BUILD_JOBS_ENV,
+            j.max(1).to_string(),
+        ));
+    }
     match kind {
-        CargoInvocation::Prewarm => InvocationEnv {
-            set: &[(ALLOW_PLACEHOLDER_DIST_ENV, "1")],
-            remove: &[],
-        },
+        CargoInvocation::Prewarm => {
+            set.push((ALLOW_PLACEHOLDER_DIST_ENV, "1".to_string()));
+            InvocationEnv { set, remove: &[] }
+        }
         CargoInvocation::SlotBuild
         | CargoInvocation::SidecarBuild
         | CargoInvocation::Submission => InvocationEnv {
-            set: &[],
+            set,
             remove: &[ALLOW_PLACEHOLDER_DIST_ENV],
         },
     }
 }
 
 /// Apply [`cargo_invocation_env`] for `kind` to a guarded command.
-fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> GuardedCommand {
-    let env = cargo_invocation_env(kind);
+fn with_invocation_env(
+    mut cmd: GuardedCommand,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) -> GuardedCommand {
+    let env = cargo_invocation_env(kind, jobs);
     for k in env.remove {
         cmd = cmd.env_remove(k);
     }
-    for (k, v) in env.set {
+    for (k, v) in &env.set {
         cmd = cmd.env(k, v);
     }
     cmd
@@ -4554,12 +4600,16 @@ fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> Guarde
 
 /// Apply [`cargo_invocation_env`] for `kind` to a plain tokio command (the
 /// `/build/submit` path, which is not a [`GuardedCommand`]).
-pub(crate) fn apply_invocation_env(cmd: &mut tokio::process::Command, kind: CargoInvocation) {
-    let env = cargo_invocation_env(kind);
+pub(crate) fn apply_invocation_env(
+    cmd: &mut tokio::process::Command,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) {
+    let env = cargo_invocation_env(kind, jobs);
     for k in env.remove {
         cmd.env_remove(k);
     }
-    for (k, v) in env.set {
+    for (k, v) in &env.set {
         cmd.env(k, v);
     }
 }
@@ -4847,11 +4897,15 @@ async fn prewarm_single_slot(
     // `cargo_invocation_env`): this `cargo check` must keep working on a fresh
     // tree with no `dist/`, and the runner's build.rs `rerun-if-env-changed`
     // makes the next real build re-check without it.
-    let outcome = with_invocation_env(cmd, CargoInvocation::Prewarm)
-        .job_guarded(true)
-        .stream_lines(line_tx)
-        .run()
-        .await;
+    let outcome = with_invocation_env(
+        cmd,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::Prewarm,
+    )
+    .job_guarded(true)
+    .stream_lines(line_tx)
+    .run()
+    .await;
 
     // Map the GuardedOutcome back onto the legacy match shape: `Ok(Ok(status))`
     // for a clean exit, the timeout arm for TimedOut/Cancelled, and a process
