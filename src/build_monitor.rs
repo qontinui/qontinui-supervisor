@@ -2464,7 +2464,7 @@ pub(crate) fn remove_if_zero_length(path: &std::path::Path) -> bool {
 /// main runner build succeeded on the SAME warm `CARGO_TARGET_DIR` with the
 /// SAME feature set, so every shared dependency — the runner lib crate
 /// included — is already compiled; what remains is compiling and linking
-/// three small bins. 10 minutes is a generous ceiling for a heavily contended
+/// four small bins. 10 minutes is a generous ceiling for a heavily contended
 /// machine.
 const SIDECAR_BUILD_TIMEOUT_SECS: u64 = 600;
 
