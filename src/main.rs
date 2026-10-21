@@ -176,6 +176,31 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = SupervisorConfig::from_args(args);
 
+    // Build pool sizing (plan 2026-10-02-cargo-jobs-…): say what was derived,
+    // and name slot dirs a smaller pool no longer walks — they still hold disk.
+    {
+        let pool = &config.build_pool;
+        info!(
+            "Build pool: {} slot(s) (source {:?}), CARGO_BUILD_JOBS per slot {} ({:?})",
+            pool.pool_size, pool.source, pool.jobs.per_slot, pool.jobs.source
+        );
+        let beyond = build_sizing::slot_dirs_beyond_pool(
+            &config.runner_npm_dir().join("target-pool"),
+            pool.pool_size,
+        );
+        if !beyond.is_empty() {
+            warn!(
+                "Build pool is {} slot(s) but {} slot target dir(s) beyond it remain on disk \
+                 and are no longer walked by the footprint or reclaimed by slot cleanup: {:?}. \
+                 Delete them to reclaim the space, or raise QONTINUI_SUPERVISOR_BUILD_POOL_SIZE \
+                 to use them.",
+                pool.pool_size,
+                beyond.len(),
+                beyond
+            );
+        }
+    }
+
     // Load persistent settings to check for saved runner configs
     {
         // Per-instance settings path (namespaced under

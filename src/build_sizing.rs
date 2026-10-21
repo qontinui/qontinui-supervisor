@@ -68,6 +68,22 @@ pub enum PoolSizeSource {
     Override,
 }
 
+/// The disk readings the pool derivation uses, for the volume holding the
+/// pool root. Every `None` is UNKNOWN.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskInputs {
+    pub free_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    /// One built slot target dir's size ([`OneTargetEstimate::bytes`]).
+    pub one_target_bytes: Option<u64>,
+    /// Slot target dirs ALREADY built on disk. Their space is already gone
+    /// from `free_bytes`, so they are credited rather than charged again.
+    pub built_slots: u32,
+    /// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` when set: the floor the guard
+    /// will actually enforce, so the derivation subtracts that one.
+    pub floor_override_gb: Option<u64>,
+}
+
 /// The inputs and intermediate terms of a derived pool size, so `/health` can
 /// show WHY the pool is the size it is. `None` on a term means UNKNOWN.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,35 +93,40 @@ pub struct PoolSizeDerivation {
     /// `host_sizing::suggested_concurrent_builds(host)`. Unreadable memory
     /// makes this 1 (the shared rule's conservative fallback).
     pub cpu_memory_term: u32,
-    /// `(free_disk − disk_floor) / one_target_bytes`, or `None` when either
-    /// reading is UNKNOWN — an UNKNOWN disk term is ignored, never a reason
-    /// to shrink the pool.
+    /// `built_slots + (free_disk − disk_floor) / one_target_bytes`, or `None`
+    /// when either reading is UNKNOWN — an UNKNOWN disk term is ignored, never
+    /// a reason to shrink the pool.
     pub disk_term: Option<u32>,
     pub disk_free_bytes: Option<u64>,
     pub one_target_bytes: Option<u64>,
+    pub built_slots: u32,
+    /// The floor (GB) the disk term subtracted.
+    pub disk_floor_gb: Option<u64>,
     /// [`DERIVED_POOL_SIZE_CAP`].
     pub cap: u32,
 }
 
 /// Derive the pool size: `max(1, min(cpu+memory term, disk term, CAP))`.
 ///
-/// The disk term subtracts the floor a pool of the capped candidate size
-/// would demand ([`derived_disk_floor_gb`]) before dividing by one target's
-/// size, so a pool is only as large as the disk can hold ABOVE its floor.
-pub fn derive_pool_size(
-    host: HostCapacity,
-    disk_free_bytes: Option<u64>,
-    disk_total_bytes: Option<u64>,
-    one_target_bytes: Option<u64>,
-) -> (u32, PoolSizeDerivation) {
+/// The disk term is `built_slots + (free − floor) / one_target`: slots already
+/// built on disk are credited (their bytes are already missing from `free`, so
+/// charging them again would shrink a working pool on every restart), and each
+/// further slot must fit ABOVE the floor the guard will enforce — the env
+/// override when set, else [`derived_disk_floor_gb`] for the capped candidate.
+pub fn derive_pool_size(host: HostCapacity, disk: &DiskInputs) -> (u32, PoolSizeDerivation) {
     let cpu_memory_term = host_sizing::suggested_concurrent_builds(host);
     let candidate = cpu_memory_term.clamp(1, DERIVED_POOL_SIZE_CAP);
-    let one_target = one_target_bytes.filter(|b| *b > 0);
-    let disk_term = match (disk_free_bytes, one_target) {
+    let one_target = disk.one_target_bytes.filter(|b| *b > 0);
+    let mut disk_floor_gb = None;
+    let disk_term = match (disk.free_bytes, one_target) {
         (Some(free), Some(target)) => {
-            let floor = derived_disk_floor_gb(candidate, Some(target), disk_total_bytes)
-                .saturating_mul(GIB);
-            Some((free.saturating_sub(floor) / target).min(u32::MAX as u64) as u32)
+            let floor_gb = disk.floor_override_gb.unwrap_or_else(|| {
+                derived_disk_floor_gb(candidate, Some(target), disk.total_bytes)
+            });
+            disk_floor_gb = Some(floor_gb);
+            let more = (free.saturating_sub(floor_gb.saturating_mul(GIB)) / target)
+                .min(u32::MAX as u64) as u32;
+            Some(disk.built_slots.saturating_add(more))
         }
         _ => None,
     };
@@ -117,8 +138,10 @@ pub fn derive_pool_size(
             host_mem_bytes: host.mem_bytes,
             cpu_memory_term,
             disk_term,
-            disk_free_bytes,
+            disk_free_bytes: disk.free_bytes,
             one_target_bytes: one_target,
+            built_slots: disk.built_slots,
+            disk_floor_gb,
             cap: DERIVED_POOL_SIZE_CAP,
         },
     )
@@ -225,15 +248,27 @@ pub enum DiskFloorSource {
     DefaultUnknown,
 }
 
+/// Where the one-target size behind a derived floor came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OneTargetFrom {
+    /// The cached footprint snapshot's largest built slot.
+    Footprint,
+    /// The estimate persisted by a previous footprint walk, read at startup —
+    /// used until this process's first walk has measured a built slot.
+    PersistedEstimate,
+}
+
 /// The effective disk floor and the inputs it was computed from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskFloor {
     pub gb: u64,
     pub source: DiskFloorSource,
     pub pool_size: u32,
-    /// Largest already-built slot target dir (bytes) in the cached footprint.
+    /// Largest already-built slot target dir (bytes).
     pub one_target_bytes: Option<u64>,
     pub one_target_slot: Option<usize>,
+    pub one_target_from: Option<OneTargetFrom>,
     pub disk_total_bytes: Option<u64>,
 }
 
@@ -250,15 +285,30 @@ pub fn largest_slot(slots: &[crate::footprint::SlotFootprint]) -> Option<(usize,
 }
 
 /// Resolve the effective disk floor. `override_gb` is the parsed
-/// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` and always wins; otherwise the floor
-/// is derived from the cached footprint (UNKNOWN → 30).
+/// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` and always wins. Otherwise the floor
+/// is derived from the cached footprint when it has measured a built slot,
+/// else from the estimate persisted by an earlier walk (`persisted`), else
+/// UNKNOWN → 30.
 pub fn effective_disk_floor(
     override_gb: Option<u64>,
     pool_size: u32,
     footprint: Option<&crate::footprint::FootprintSnapshot>,
+    persisted: Option<&OneTargetEstimate>,
 ) -> DiskFloor {
-    let one_target = footprint.and_then(|f| largest_slot(&f.slots));
-    let disk_total_bytes = footprint.and_then(|f| f.disk_total_bytes);
+    let from_footprint = footprint.and_then(|f| {
+        largest_slot(&f.slots).map(|(slot, bytes)| (slot, bytes, f.disk_total_bytes))
+    });
+    let (one_target, disk_total_bytes, one_target_from) = match (from_footprint, persisted) {
+        (Some((slot, bytes, total)), _) => {
+            (Some((slot, bytes)), total, Some(OneTargetFrom::Footprint))
+        }
+        (None, Some(e)) => (
+            Some((e.slot, e.bytes)),
+            e.disk_total_bytes,
+            Some(OneTargetFrom::PersistedEstimate),
+        ),
+        (None, None) => (None, footprint.and_then(|f| f.disk_total_bytes), None),
+    };
     let one_target_bytes = one_target.map(|(_, b)| b);
     let (gb, source) = match override_gb {
         Some(gb) => (gb, DiskFloorSource::Override),
@@ -279,8 +329,31 @@ pub fn effective_disk_floor(
         pool_size,
         one_target_bytes,
         one_target_slot: one_target.map(|(id, _)| id),
+        one_target_from,
         disk_total_bytes,
     }
+}
+
+/// Slot target dirs under `pool_root` whose index is `>= pool_size` — left
+/// behind when the pool shrank (a derived size below an earlier one, or a
+/// lowered override). The footprint walks only `0..pool_size`, so these are
+/// invisible to it and to the prune hints while still holding disk; startup
+/// logs them so an operator can reclaim them.
+pub fn slot_dirs_beyond_pool(pool_root: &Path, pool_size: usize) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(pool_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let idx = name.strip_prefix("slot-")?.parse::<usize>().ok()?;
+            (idx >= pool_size).then(|| e.path())
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The persisted one-target size estimate (see [`ONE_TARGET_ESTIMATE_FILE`]).
@@ -290,6 +363,12 @@ pub struct OneTargetEstimate {
     pub slot: usize,
     /// RFC3339 time of the footprint walk that measured it.
     pub measured_at: String,
+    /// Size of the volume holding the pool root at that walk.
+    #[serde(default)]
+    pub disk_total_bytes: Option<u64>,
+    /// How many slot target dirs that walk found built (non-empty).
+    #[serde(default)]
+    pub built_slots: u32,
 }
 
 /// Read the persisted estimate from `pool_root`. `None` (UNKNOWN) when absent,
@@ -330,11 +409,20 @@ mod tests {
 
     // ---- Phase 2: pool size -------------------------------------------------
 
+    fn disk(free: Option<u64>, total: Option<u64>, target: Option<u64>) -> DiskInputs {
+        DiskInputs {
+            free_bytes: free,
+            total_bytes: total,
+            one_target_bytes: target,
+            ..Default::default()
+        }
+    }
+
     /// merytshost (48c / 368 GiB): the shared rule suggests 12; the cap holds
     /// it at the shipped 3.
     #[test]
     fn big_host_is_capped_at_the_shipped_default() {
-        let (pool, d) = derive_pool_size(host(368, 48), None, None, None);
+        let (pool, d) = derive_pool_size(host(368, 48), &DiskInputs::default());
         assert_eq!(d.cpu_memory_term, 12);
         assert_eq!(pool, DERIVED_POOL_SIZE_CAP);
         assert_eq!(d.disk_term, None);
@@ -343,8 +431,8 @@ mod tests {
     /// A small host derives fewer slots than the cap.
     #[test]
     fn small_host_derives_below_the_cap() {
-        assert_eq!(derive_pool_size(host(31, 8), None, None, None).0, 2);
-        assert_eq!(derive_pool_size(host(15, 8), None, None, None).0, 1);
+        assert_eq!(derive_pool_size(host(31, 8), &DiskInputs::default()).0, 2);
+        assert_eq!(derive_pool_size(host(15, 8), &DiskInputs::default()).0, 1);
     }
 
     /// Unreadable memory → the shared rule's 1, kept.
@@ -354,10 +442,8 @@ mod tests {
             mem_bytes: None,
             cpus: 48,
         };
-        assert_eq!(
-            derive_pool_size(h, Some(500 * GIB), Some(2000 * GIB), Some(14 * GIB)).0,
-            1
-        );
+        let d = disk(Some(500 * GIB), Some(2000 * GIB), Some(14 * GIB));
+        assert_eq!(derive_pool_size(h, &d).0, 1);
     }
 
     /// An UNKNOWN disk term is ignored, never a reason to shrink.
@@ -368,7 +454,7 @@ mod tests {
             (Some(500 * GIB), None),
             (Some(500 * GIB), Some(0)),
         ] {
-            let (pool, d) = derive_pool_size(host(368, 48), free, Some(2000 * GIB), target);
+            let (pool, d) = derive_pool_size(host(368, 48), &disk(free, Some(2000 * GIB), target));
             assert_eq!(pool, 3);
             assert_eq!(d.disk_term, None);
         }
@@ -380,20 +466,53 @@ mod tests {
         // floor for 3 × 14 GiB on a 2000 GiB disk = 42; free 80 → (80-42)/14 = 2.
         let (pool, d) = derive_pool_size(
             host(368, 48),
-            Some(80 * GIB),
-            Some(2000 * GIB),
-            Some(14 * GIB),
+            &disk(Some(80 * GIB), Some(2000 * GIB), Some(14 * GIB)),
         );
         assert_eq!(d.disk_term, Some(2));
+        assert_eq!(d.disk_floor_gb, Some(42));
         assert_eq!(pool, 2);
         // Below the floor entirely → disk term 0 → pool 1, never 0.
         let (pool, d) = derive_pool_size(
             host(368, 48),
-            Some(10 * GIB),
-            Some(2000 * GIB),
-            Some(14 * GIB),
+            &disk(Some(10 * GIB), Some(2000 * GIB), Some(14 * GIB)),
         );
         assert_eq!(d.disk_term, Some(0));
+        assert_eq!(pool, 1);
+    }
+
+    /// Slots already built are credited: their bytes are already gone from
+    /// `free`, so a restart must not shrink the pool that built them.
+    #[test]
+    fn already_built_slots_are_credited() {
+        // 3 slots built at 15 GiB, 60 GiB free, floor 45 → 3 + (60-45)/15 = 4.
+        let d = DiskInputs {
+            built_slots: 3,
+            ..disk(Some(60 * GIB), Some(2000 * GIB), Some(15 * GIB))
+        };
+        let (pool, der) = derive_pool_size(host(368, 48), &d);
+        assert_eq!(der.disk_term, Some(4));
+        assert_eq!(pool, 3);
+    }
+
+    /// The disk term subtracts the floor the guard will enforce: the override
+    /// when set (including 0), not the derived one.
+    #[test]
+    fn disk_term_uses_the_floor_override() {
+        let base = disk(Some(80 * GIB), Some(2000 * GIB), Some(14 * GIB));
+        let d = DiskInputs {
+            floor_override_gb: Some(0),
+            ..base.clone()
+        };
+        let (pool, der) = derive_pool_size(host(368, 48), &d);
+        assert_eq!(der.disk_floor_gb, Some(0));
+        assert_eq!(der.disk_term, Some(5));
+        assert_eq!(pool, 3);
+        let d = DiskInputs {
+            floor_override_gb: Some(70),
+            ..base
+        };
+        let (pool, der) = derive_pool_size(host(368, 48), &d);
+        assert_eq!(der.disk_term, Some(0));
         assert_eq!(pool, 1);
     }
 
@@ -512,19 +631,31 @@ mod tests {
     #[test]
     fn effective_floor_sources() {
         // No footprint yet → UNKNOWN → 30.
-        let f = effective_disk_floor(None, 3, None);
+        let f = effective_disk_floor(None, 3, None, None);
         assert_eq!((f.gb, f.source), (30, DiskFloorSource::DefaultUnknown));
         // Unbuilt slots → UNKNOWN → 30.
         let s = snapshot(&[0, 0, 0], Some(2000 * GIB));
-        let f = effective_disk_floor(None, 3, Some(&s));
+        let f = effective_disk_floor(None, 3, Some(&s), None);
         assert_eq!((f.gb, f.source), (30, DiskFloorSource::DefaultUnknown));
+        // ... unless an earlier walk persisted an estimate.
+        let e = OneTargetEstimate {
+            bytes: 20 * GIB,
+            slot: 1,
+            measured_at: String::new(),
+            disk_total_bytes: Some(2000 * GIB),
+            built_slots: 2,
+        };
+        let f = effective_disk_floor(None, 3, Some(&s), Some(&e));
+        assert_eq!((f.gb, f.source), (60, DiskFloorSource::Derived));
+        assert_eq!(f.one_target_from, Some(OneTargetFrom::PersistedEstimate));
         // Largest built slot is the one-target estimate.
         let s = snapshot(&[15 * GIB, 2 * GIB, 5 * GIB], Some(2000 * GIB));
-        let f = effective_disk_floor(None, 3, Some(&s));
+        let f = effective_disk_floor(None, 3, Some(&s), Some(&e));
         assert_eq!((f.gb, f.source), (45, DiskFloorSource::Derived));
         assert_eq!(f.one_target_slot, Some(0));
+        assert_eq!(f.one_target_from, Some(OneTargetFrom::Footprint));
         // The env override always wins, including 0 (guard disabled).
-        let f = effective_disk_floor(Some(0), 3, Some(&s));
+        let f = effective_disk_floor(Some(0), 3, Some(&s), None);
         assert_eq!((f.gb, f.source), (0, DiskFloorSource::Override));
     }
 
@@ -536,6 +667,8 @@ mod tests {
             bytes: 14 * GIB,
             slot: 0,
             measured_at: "2026-10-22T00:00:00Z".into(),
+            disk_total_bytes: Some(2000 * GIB),
+            built_slots: 3,
         };
         write_one_target_estimate(dir.path(), &e);
         assert_eq!(read_one_target_estimate(dir.path()), Some(e));
@@ -549,8 +682,37 @@ mod tests {
                 bytes: 1,
                 slot: 0,
                 measured_at: String::new(),
+                disk_total_bytes: None,
+                built_slots: 1,
             },
         );
         assert!(!missing.exists());
+        // A file from before `disk_total_bytes` / `built_slots` still reads.
+        std::fs::write(
+            dir.path().join(ONE_TARGET_ESTIMATE_FILE),
+            r#"{"bytes": 5, "slot": 2, "measured_at": "x"}"#,
+        )
+        .unwrap();
+        let old = read_one_target_estimate(dir.path()).unwrap();
+        assert_eq!(
+            (old.bytes, old.built_slots, old.disk_total_bytes),
+            (5, 0, None)
+        );
+    }
+
+    #[test]
+    fn slot_dirs_beyond_the_pool_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["slot-0", "slot-1", "slot-2", "lkg", "slot-x"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        std::fs::write(dir.path().join("slot-9"), "file, not a dir").unwrap();
+        let beyond = slot_dirs_beyond_pool(dir.path(), 1);
+        assert_eq!(
+            beyond,
+            vec![dir.path().join("slot-1"), dir.path().join("slot-2")]
+        );
+        assert!(slot_dirs_beyond_pool(dir.path(), 3).is_empty());
+        assert!(slot_dirs_beyond_pool(&dir.path().join("missing"), 0).is_empty());
     }
 }
