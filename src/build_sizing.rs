@@ -255,7 +255,7 @@ pub enum OneTargetFrom {
     /// The cached footprint snapshot's largest built slot.
     Footprint,
     /// The estimate persisted by a previous footprint walk, read at startup —
-    /// used until this process's first walk has measured a built slot.
+    /// used whenever the cached footprint has measured no built slot.
     PersistedEstimate,
 }
 
@@ -287,8 +287,9 @@ pub fn largest_slot(slots: &[crate::footprint::SlotFootprint]) -> Option<(usize,
 /// Resolve the effective disk floor. `override_gb` is the parsed
 /// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` and always wins. Otherwise the floor
 /// is derived from the cached footprint when it has measured a built slot,
-/// else from the estimate persisted by an earlier walk (`persisted`), else
-/// UNKNOWN → 30.
+/// else (whenever the cached footprint has measured no built slot — before the
+/// first walk, or after one that found every slot empty) from the estimate
+/// persisted by an earlier walk (`persisted`), else UNKNOWN → 30.
 pub fn effective_disk_floor(
     override_gb: Option<u64>,
     pool_size: u32,
@@ -304,7 +305,8 @@ pub fn effective_disk_floor(
         }
         (None, Some(e)) => (
             Some((e.slot, e.bytes)),
-            e.disk_total_bytes,
+            e.disk_total_bytes
+                .or_else(|| footprint.and_then(|f| f.disk_total_bytes)),
             Some(OneTargetFrom::PersistedEstimate),
         ),
         (None, None) => (None, footprint.and_then(|f| f.disk_total_bytes), None),
@@ -354,6 +356,27 @@ pub fn slot_dirs_beyond_pool(pool_root: &Path, pool_size: usize) -> Vec<std::pat
         .collect();
     out.sort();
     out
+}
+
+/// Non-empty `slot-*` target dirs under `pool_root`, at any index — the slots
+/// whose bytes are already out of the volume's free space. A `read_dir` per
+/// slot (is it empty?), never a tree walk, so it is cheap at startup and,
+/// unlike the footprint (which walks only `0..pool_size`), it also sees dirs
+/// left beyond a pool that shrank.
+pub fn count_built_slot_dirs(pool_root: &Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(pool_root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("slot-")
+                .is_some_and(|n| n.parse::<usize>().is_ok())
+                && std::fs::read_dir(e.path()).is_ok_and(|mut d| d.next().is_some())
+        })
+        .count()
+        .min(u32::MAX as usize) as u32
 }
 
 /// The persisted one-target size estimate (see [`ONE_TARGET_ESTIMATE_FILE`]).
@@ -714,5 +737,11 @@ mod tests {
         );
         assert!(slot_dirs_beyond_pool(dir.path(), 3).is_empty());
         assert!(slot_dirs_beyond_pool(&dir.path().join("missing"), 0).is_empty());
+        // Only non-empty numbered slot dirs count as built.
+        assert_eq!(count_built_slot_dirs(dir.path()), 0);
+        std::fs::write(dir.path().join("slot-2").join("f"), "x").unwrap();
+        std::fs::write(dir.path().join("lkg").join("f"), "x").unwrap();
+        assert_eq!(count_built_slot_dirs(dir.path()), 1);
+        assert_eq!(count_built_slot_dirs(&dir.path().join("missing")), 0);
     }
 }

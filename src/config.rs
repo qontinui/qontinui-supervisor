@@ -320,8 +320,8 @@ pub struct BuildPoolConfig {
     /// The `CARGO_BUILD_JOBS` every supervisor cargo invocation carries.
     pub jobs: crate::build_sizing::SlotJobs,
     /// The one-target estimate persisted by a previous footprint walk, read at
-    /// startup. The disk floor uses it until this process's first walk has
-    /// measured a built slot.
+    /// startup. The disk floor uses it whenever the cached footprint has
+    /// measured no built slot.
     pub persisted_estimate: Option<crate::build_sizing::OneTargetEstimate>,
 }
 
@@ -384,7 +384,9 @@ impl BuildPoolConfig {
             free_bytes: usage.as_ref().map(|d| d.free_bytes),
             total_bytes: usage.as_ref().map(|d| d.total_bytes),
             one_target_bytes: estimate.as_ref().map(|e| e.bytes),
-            built_slots: estimate.as_ref().map_or(0, |e| e.built_slots),
+            // Counted on disk now (one read_dir per slot), not taken from the
+            // last walk, which saw only `0..pool_size` of that process.
+            built_slots: crate::build_sizing::count_built_slot_dirs(pool_root),
             floor_override_gb: min_free_disk_gb_override(),
         };
         Self::resolve(

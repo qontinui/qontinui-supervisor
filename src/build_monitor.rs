@@ -864,9 +864,9 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
 
 /// The effective pre-permit disk floor for this supervisor: the env override
 /// when set, else [`crate::build_sizing::derived_disk_floor_gb`] over the pool
-/// size and the cached footprint snapshot — or, before this process's first
-/// walk, the estimate an earlier walk persisted (UNKNOWN → 30 when neither
-/// has measured a built slot).
+/// size and the cached footprint snapshot — or, whenever that snapshot has
+/// measured no built slot, the estimate an earlier walk persisted (UNKNOWN →
+/// 30 when neither has).
 pub async fn effective_disk_floor(state: &SharedState) -> crate::build_sizing::DiskFloor {
     let footprint = state.footprint.read().await;
     crate::build_sizing::effective_disk_floor(
