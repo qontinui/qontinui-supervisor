@@ -319,7 +319,19 @@ pub struct BuildPoolConfig {
     pub derivation: Option<crate::build_sizing::PoolSizeDerivation>,
     /// The `CARGO_BUILD_JOBS` every supervisor cargo invocation carries.
     pub jobs: crate::build_sizing::SlotJobs,
+    /// The one-target estimate persisted by a previous footprint walk, read at
+    /// startup. The disk floor uses it until this process's first walk has
+    /// measured a built slot.
+    pub persisted_estimate: Option<crate::build_sizing::OneTargetEstimate>,
 }
+
+/// Fixed host for [`BuildPoolConfig::fixed`] (fixtures): deterministic, and no
+/// sysinfo probe per fixture.
+const FIXTURE_HOST: qontinui_types::host_sizing::HostCapacity =
+    qontinui_types::host_sizing::HostCapacity {
+        mem_bytes: Some(64 * 1024 * 1024 * 1024),
+        cpus: 16,
+    };
 
 impl BuildPoolConfig {
     /// Resolve from explicit inputs (pure): the pool-size env text, the
@@ -330,9 +342,8 @@ impl BuildPoolConfig {
         pool_size_env: Option<String>,
         cargo_build_jobs_env: Option<String>,
         host: qontinui_types::host_sizing::HostCapacity,
-        disk_free_bytes: Option<u64>,
-        disk_total_bytes: Option<u64>,
-        one_target_bytes: Option<u64>,
+        disk: &crate::build_sizing::DiskInputs,
+        persisted_estimate: Option<crate::build_sizing::OneTargetEstimate>,
     ) -> Self {
         use crate::build_sizing::{derive_pool_size, PoolSizeSource, SlotJobs};
         let explicit = pool_size_env
@@ -341,8 +352,7 @@ impl BuildPoolConfig {
         let (pool_size, source, derivation) = match explicit {
             Some(n) => (n, PoolSizeSource::Override, None),
             None => {
-                let (n, d) =
-                    derive_pool_size(host, disk_free_bytes, disk_total_bytes, one_target_bytes);
+                let (n, d) = derive_pool_size(host, disk);
                 (n as usize, PoolSizeSource::Derived, Some(d))
             }
         };
@@ -356,6 +366,7 @@ impl BuildPoolConfig {
             source,
             derivation,
             jobs,
+            persisted_estimate,
         }
     }
 
@@ -367,26 +378,32 @@ impl BuildPoolConfig {
             .ancestors()
             .find(|p| p.exists())
             .unwrap_or(pool_root);
-        let disk = crate::footprint::disk_usage_for(probe_path);
+        let usage = crate::footprint::disk_usage_for(probe_path);
+        let estimate = crate::build_sizing::read_one_target_estimate(pool_root);
+        let disk = crate::build_sizing::DiskInputs {
+            free_bytes: usage.as_ref().map(|d| d.free_bytes),
+            total_bytes: usage.as_ref().map(|d| d.total_bytes),
+            one_target_bytes: estimate.as_ref().map(|e| e.bytes),
+            built_slots: estimate.as_ref().map_or(0, |e| e.built_slots),
+            floor_override_gb: min_free_disk_gb_override(),
+        };
         Self::resolve(
             std::env::var(crate::build_sizing::BUILD_POOL_SIZE_ENV).ok(),
             std::env::var(crate::build_sizing::CARGO_BUILD_JOBS_ENV).ok(),
             qontinui_types::host_sizing::probe(),
-            disk.as_ref().map(|d| d.free_bytes),
-            disk.as_ref().map(|d| d.total_bytes),
-            crate::build_sizing::read_one_target_estimate(pool_root).map(|e| e.bytes),
+            &disk,
+            estimate,
         )
     }
 
     /// An explicitly sized pool (tests and fixtures): `source: override`, jobs
-    /// derived from this host for that size.
+    /// derived for that size on a fixed 16-cpu / 64 GiB host.
     pub fn fixed(pool_size: usize) -> Self {
         Self::resolve(
             Some(pool_size.to_string()),
             None,
-            qontinui_types::host_sizing::probe(),
-            None,
-            None,
+            FIXTURE_HOST,
+            &crate::build_sizing::DiskInputs::default(),
             None,
         )
     }

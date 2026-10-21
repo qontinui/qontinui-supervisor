@@ -200,8 +200,9 @@ pub fn disk_guard_allows_for(
                 let free = other.unwrap_or(0);
                 Err(format!(
                     "Pre-permit disk guard: refusing build — {} GB free, need at least \
-                     {min_free_gb} GB (derived from this machine — see GET /health \
-                     build.pool.disk_floor; override QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
+                     {min_free_gb} GB (the effective floor — GET /health \
+                     build.pool.disk_floor names its source and inputs; override \
+                     QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
                     free / (1024 * 1024 * 1024)
                 ))
             }
@@ -863,14 +864,16 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
 
 /// The effective pre-permit disk floor for this supervisor: the env override
 /// when set, else [`crate::build_sizing::derived_disk_floor_gb`] over the pool
-/// size and the cached footprint snapshot (UNKNOWN → 30 until the first
-/// footprint walk has measured a built slot).
+/// size and the cached footprint snapshot — or, before this process's first
+/// walk, the estimate an earlier walk persisted (UNKNOWN → 30 when neither
+/// has measured a built slot).
 pub async fn effective_disk_floor(state: &SharedState) -> crate::build_sizing::DiskFloor {
     let footprint = state.footprint.read().await;
     crate::build_sizing::effective_disk_floor(
         crate::config::min_free_disk_gb_override(),
         state.config.build_pool.pool_size.min(u32::MAX as usize) as u32,
         footprint.as_ref(),
+        state.config.build_pool.persisted_estimate.as_ref(),
     )
 }
 

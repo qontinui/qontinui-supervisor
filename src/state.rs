@@ -1973,6 +1973,8 @@ fn persist_one_target_estimate(
                 bytes,
                 slot,
                 measured_at: snapshot.computed_at.clone(),
+                disk_total_bytes: snapshot.disk_total_bytes,
+                built_slots: snapshot.slots.iter().filter(|s| s.bytes > 0).count() as u32,
             },
         );
     }

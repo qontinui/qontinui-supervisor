@@ -306,14 +306,15 @@ pub struct BuildPoolHealth {
     pub slots_busy: Option<u32>,
     /// Callers queued on the permit semaphore.
     pub queue_depth: u32,
-    /// The pre-permit disk guard's effective floor and its inputs.
-    pub disk_floor: crate::build_sizing::DiskFloor,
+    /// The pre-permit disk guard's effective floor and its inputs; `null`
+    /// when the footprint lock was contended on this read (UNKNOWN for this
+    /// tick — not the guard's answer, which waits for the lock).
+    pub disk_floor: Option<crate::build_sizing::DiskFloor>,
 }
 
 /// Build the `build.pool` block without awaiting: every lock is `try_read`,
 /// so both the async `/health` handler and the sync SSE path share it. A
-/// contended footprint lock reads as "no snapshot" (floor UNKNOWN → 30 for
-/// this tick), which is what the guard itself would see before the first walk.
+/// contended lock yields `null` for the field it feeds, never a default.
 pub fn build_pool_health(state: &crate::state::SupervisorState) -> BuildPoolHealth {
     let pool = &state.config.build_pool;
     let mut busy = 0u32;
@@ -324,12 +325,14 @@ pub fn build_pool_health(state: &crate::state::SupervisorState) -> BuildPoolHeal
             Err(_) => contended = true,
         }
     }
-    let footprint = state.footprint.try_read().ok();
-    let disk_floor = crate::build_sizing::effective_disk_floor(
-        crate::config::min_free_disk_gb_override(),
-        pool.pool_size.min(u32::MAX as usize) as u32,
-        footprint.as_ref().and_then(|g| g.as_ref()),
-    );
+    let disk_floor = state.footprint.try_read().ok().map(|g| {
+        crate::build_sizing::effective_disk_floor(
+            crate::config::min_free_disk_gb_override(),
+            pool.pool_size.min(u32::MAX as usize) as u32,
+            g.as_ref(),
+            pool.persisted_estimate.as_ref(),
+        )
+    });
     BuildPoolHealth {
         pool_size: pool.pool_size,
         source: pool.source,
@@ -1070,7 +1073,9 @@ mod tests {
             jobs: cfg.jobs,
             slots_busy: Some(0),
             queue_depth: 0,
-            disk_floor: crate::build_sizing::effective_disk_floor(None, 3, None),
+            disk_floor: Some(crate::build_sizing::effective_disk_floor(
+                None, 3, None, None,
+            )),
         }
     }
 
@@ -1318,21 +1323,29 @@ mod tests {
         assert_eq!(v["slots_busy"], 0);
         assert!(v["jobs"]["per_slot"].as_u64().unwrap() >= 1);
         assert!(v["jobs"]["source"].is_string());
-        if crate::config::min_free_disk_gb_override().is_none() {
-            assert_eq!(v["disk_floor"]["gb"], 30);
-            assert_eq!(v["disk_floor"]["source"], "default_unknown");
-            let mut snap = crate::footprint::compute_snapshot(&state.config);
-            snap.slots = vec![crate::footprint::SlotFootprint {
-                id: 0,
-                bytes: 40 * GIB,
-            }];
-            snap.disk_total_bytes = Some(2000 * GIB);
-            *state.footprint.write().await = Some(snap);
-            let v = serde_json::to_value(build_pool_health(&state)).unwrap();
-            assert_eq!(v["disk_floor"]["gb"], 40);
-            assert_eq!(v["disk_floor"]["source"], "derived");
-            assert_eq!(v["disk_floor"]["one_target_slot"], 0);
-        }
+        // The served floor is the guard's own resolution (the pure rule is
+        // pinned in build_sizing's tests), before and after a footprint walk.
+        let ovr = crate::config::min_free_disk_gb_override();
+        let expect = |snap: Option<&crate::footprint::FootprintSnapshot>| {
+            serde_json::to_value(crate::build_sizing::effective_disk_floor(
+                ovr, 1, snap, None,
+            ))
+            .unwrap()
+        };
+        assert_eq!(v["disk_floor"], expect(None));
+        let mut snap = crate::footprint::compute_snapshot(&state.config);
+        snap.slots = vec![crate::footprint::SlotFootprint {
+            id: 0,
+            bytes: 40 * GIB,
+        }];
+        snap.disk_total_bytes = Some(2000 * GIB);
+        *state.footprint.write().await = Some(snap.clone());
+        let v = serde_json::to_value(build_pool_health(&state)).unwrap();
+        assert_eq!(v["disk_floor"], expect(Some(&snap)));
+        // A contended footprint lock is UNKNOWN (null), never a default.
+        let _held = state.footprint.write().await;
+        let v = serde_json::to_value(build_pool_health(&state)).unwrap();
+        assert!(v["disk_floor"].is_null(), "{v}");
     }
 
     /// (d) WIRING: `GET /health`'s builder reads the cached primary frontend
