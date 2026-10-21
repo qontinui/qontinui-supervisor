@@ -19,7 +19,7 @@ fn test_config() -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,

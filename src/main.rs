@@ -3,6 +3,7 @@ mod bazel_remote;
 /// out of `build_monitor` so the Linux-only merge gate can test it.
 mod build_diagnostics;
 mod build_monitor;
+mod build_sizing;
 mod build_submissions;
 mod cache_key;
 mod cache_telemetry;

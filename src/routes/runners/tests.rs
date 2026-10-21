@@ -1643,7 +1643,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         expo_dir: None,
         expo_port: 19000,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
@@ -1832,7 +1832,7 @@ fn make_state() -> crate::state::SharedState {
         expo_dir: None,
         expo_port: 19000,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
@@ -2141,7 +2141,7 @@ async fn every_runner_row_carries_a_liveness_object_with_a_state_string() {
 async fn list_builds_emits_the_pool_size_the_harness_refuses_to_run_without() {
     use axum::extract::{Query, State};
     use axum::response::IntoResponse;
-    let state = make_state(); // BuildPoolConfig { pool_size: 1 }
+    let state = make_state(); // BuildPoolConfig::fixed(1)
 
     let resp = super::list_builds(State(state.clone()), Query(Default::default()))
         .await

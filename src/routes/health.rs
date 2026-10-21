@@ -283,6 +283,66 @@ pub struct BuildHealth {
     /// predates the changes and would silently run stale code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lkg: Option<LkgHealth>,
+    /// How the build pool is sized for this machine: pool size and its
+    /// source, the per-slot `CARGO_BUILD_JOBS`, slot occupancy, and the
+    /// effective disk floor with its inputs (plan
+    /// `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`).
+    pub pool: BuildPoolHealth,
+}
+
+/// `build.pool` on `GET /health` and the SSE stream.
+#[derive(Serialize)]
+pub struct BuildPoolHealth {
+    pub pool_size: usize,
+    /// `derived` | `override`.
+    pub source: crate::build_sizing::PoolSizeSource,
+    /// The derivation's inputs and terms; `null` for an explicit size.
+    pub derivation: Option<crate::build_sizing::PoolSizeDerivation>,
+    /// Per-slot `CARGO_BUILD_JOBS` (`source: derived` = set by the supervisor,
+    /// `inherited` = the supervisor's own env value reaches the child).
+    pub jobs: crate::build_sizing::SlotJobs,
+    /// Slots executing a build right now; `null` when a slot lock was
+    /// contended on this read (UNKNOWN, never "idle").
+    pub slots_busy: Option<u32>,
+    /// Callers queued on the permit semaphore.
+    pub queue_depth: u32,
+    /// The pre-permit disk guard's effective floor and its inputs.
+    pub disk_floor: crate::build_sizing::DiskFloor,
+}
+
+/// Build the `build.pool` block without awaiting: every lock is `try_read`,
+/// so both the async `/health` handler and the sync SSE path share it. A
+/// contended footprint lock reads as "no snapshot" (floor UNKNOWN → 30 for
+/// this tick), which is what the guard itself would see before the first walk.
+pub fn build_pool_health(state: &crate::state::SupervisorState) -> BuildPoolHealth {
+    let pool = &state.config.build_pool;
+    let mut busy = 0u32;
+    let mut contended = false;
+    for slot in &state.build_pool.slots {
+        match slot.busy.try_read() {
+            Ok(g) => busy += u32::from(g.is_some()),
+            Err(_) => contended = true,
+        }
+    }
+    let footprint = state.footprint.try_read().ok();
+    let disk_floor = crate::build_sizing::effective_disk_floor(
+        crate::config::min_free_disk_gb_override(),
+        pool.pool_size.min(u32::MAX as usize) as u32,
+        footprint.as_ref().and_then(|g| g.as_ref()),
+    );
+    BuildPoolHealth {
+        pool_size: pool.pool_size,
+        source: pool.source,
+        derivation: pool.derivation.clone(),
+        jobs: pool.jobs.clone(),
+        slots_busy: (!contended).then_some(busy),
+        queue_depth: state
+            .build_pool
+            .queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(u32::MAX as usize) as u32,
+        disk_floor,
+    }
 }
 
 #[derive(Serialize)]
@@ -727,6 +787,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             lkg,
+            pool: build_pool_health(state),
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -896,6 +957,7 @@ fn try_build_sse_health(
                         source: info.source,
                     })
                 }),
+            pool: build_pool_health(state),
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -998,6 +1060,20 @@ pub async fn health_stream(
 
 #[cfg(test)]
 mod tests {
+    /// A `build.pool` block for hand-built `HealthResponse` fixtures.
+    fn fixture_pool_health() -> BuildPoolHealth {
+        let cfg = crate::config::BuildPoolConfig::fixed(3);
+        BuildPoolHealth {
+            pool_size: cfg.pool_size,
+            source: cfg.source,
+            derivation: cfg.derivation,
+            jobs: cfg.jobs,
+            slots_busy: Some(0),
+            queue_depth: 0,
+            disk_floor: crate::build_sizing::effective_disk_floor(None, 3, None),
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1197,7 +1273,7 @@ mod tests {
                 server_mode,
                 ..RunnerConfig::default_primary()
             }],
-            build_pool: BuildPoolConfig { pool_size: 1 },
+            build_pool: BuildPoolConfig::fixed(1),
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
@@ -1225,6 +1301,38 @@ mod tests {
         snap.frontend_not_ready_since = Some(chrono::Utc::now() - chrono::Duration::seconds(200));
         state.cached_runner_health.write().await.push(snap);
         state
+    }
+
+    /// `GET /health` `build.pool` serves the pool size, its source, the
+    /// per-slot jobs, occupancy, and the effective disk floor — and the floor
+    /// follows the cached footprint (UNKNOWN → 30, then derived).
+    #[tokio::test]
+    async fn health_build_pool_reports_size_jobs_and_disk_floor() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = build_health_response(&state).await;
+        let v = serde_json::to_value(&r.build.pool).unwrap();
+        assert_eq!(v["pool_size"], 1);
+        assert_eq!(v["source"], "override");
+        assert_eq!(v["slots_busy"], 0);
+        assert!(v["jobs"]["per_slot"].as_u64().unwrap() >= 1);
+        assert!(v["jobs"]["source"].is_string());
+        if crate::config::min_free_disk_gb_override().is_none() {
+            assert_eq!(v["disk_floor"]["gb"], 30);
+            assert_eq!(v["disk_floor"]["source"], "default_unknown");
+            let mut snap = crate::footprint::compute_snapshot(&state.config);
+            snap.slots = vec![crate::footprint::SlotFootprint {
+                id: 0,
+                bytes: 40 * GIB,
+            }];
+            snap.disk_total_bytes = Some(2000 * GIB);
+            *state.footprint.write().await = Some(snap);
+            let v = serde_json::to_value(build_pool_health(&state)).unwrap();
+            assert_eq!(v["disk_floor"]["gb"], 40);
+            assert_eq!(v["disk_floor"]["source"], "derived");
+            assert_eq!(v["disk_floor"]["one_target_slot"], 0);
+        }
     }
 
     /// (d) WIRING: `GET /health`'s builder reads the cached primary frontend
@@ -1355,6 +1463,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
                 running: false,
@@ -1554,6 +1663,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
                 running: false,

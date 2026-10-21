@@ -1650,10 +1650,13 @@ impl SupervisorState {
         self: &std::sync::Arc<Self>,
     ) -> crate::footprint::FootprintSnapshot {
         let this = self.clone();
-        let mut snapshot =
-            tokio::task::spawn_blocking(move || crate::footprint::compute_snapshot(&this.config))
-                .await
-                .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
+        let mut snapshot = tokio::task::spawn_blocking(move || {
+            let snapshot = crate::footprint::compute_snapshot(&this.config);
+            persist_one_target_estimate(&this.config, &snapshot);
+            snapshot
+        })
+        .await
+        .unwrap_or_else(|_| crate::footprint::compute_snapshot(&self.config));
         // Occupancy is read AFTER the walk, deliberately. The walk is
         // minutes-slow on real trees, and `computed_at` is stamped at its end —
         // a slot count taken before it would ship under a timestamp minutes
@@ -1954,6 +1957,27 @@ impl Default for VelocityTestState {
     }
 }
 
+/// Persist the largest built slot target dir from `snapshot` as the
+/// one-target size estimate (plan `2026-10-02-cargo-jobs-…` Phases 2/4), so the
+/// NEXT supervisor start can include the disk term in its pool-size derivation
+/// without walking a slot tree. Nothing is written when no slot is built yet —
+/// an absent estimate stays UNKNOWN rather than becoming a zero.
+fn persist_one_target_estimate(
+    config: &crate::config::SupervisorConfig,
+    snapshot: &crate::footprint::FootprintSnapshot,
+) {
+    if let Some((slot, bytes)) = crate::build_sizing::largest_slot(&snapshot.slots) {
+        crate::build_sizing::write_one_target_estimate(
+            &config.runner_npm_dir().join("target-pool"),
+            &crate::build_sizing::OneTargetEstimate {
+                bytes,
+                slot,
+                measured_at: snapshot.computed_at.clone(),
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1974,7 +1998,7 @@ mod tests {
             expo_dir: None,
             expo_port: EXPO_PORT,
             runners: vec![RunnerConfig::default_primary()],
-            build_pool: crate::config::BuildPoolConfig { pool_size: 1 },
+            build_pool: crate::config::BuildPoolConfig::fixed(1),
             no_prewarm: false,
             no_webview: true,
             temp_runner_display: None,
@@ -2906,7 +2930,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let mut config = make_test_config();
         config.project_dir = tmp.path().join("qontinui-runner").join("src-tauri");
-        config.build_pool = crate::config::BuildPoolConfig { pool_size: 3 };
+        config.build_pool = crate::config::BuildPoolConfig::fixed(3);
         let pool = BuildPool::new(&config);
 
         let idle = pool.occupancy().await;
@@ -2952,7 +2976,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let mut config = make_test_config();
         config.project_dir = tmp.path().join("qontinui-runner").join("src-tauri");
-        config.build_pool = crate::config::BuildPoolConfig { pool_size: 1 };
+        config.build_pool = crate::config::BuildPoolConfig::fixed(1);
         let pool = BuildPool::new(&config);
         // A previous build left its outcome on the slot's history.
         pool.slots[0].history.write().await.last_mem_gate = Some(MemGateOutcome::Passed);

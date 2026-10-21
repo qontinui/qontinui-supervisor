@@ -309,7 +309,7 @@ where `<instance-key>` = `<project-dir-basename>-<8-hex>`, the 8-hex being a sta
 ## Architecture
 
 Standalone Axum HTTP server:
-- **Parallel build pool** (3 concurrent cargo build slots, each with isolated `CARGO_TARGET_DIR`)
+- **Parallel build pool** (machine-derived slot count, capped at 3, each with isolated `CARGO_TARGET_DIR` and a per-slot `CARGO_BUILD_JOBS`)
 - **Temp runner spawning** for testing code changes
 - **Named runner spawning** for persistent runners from the latest build
 - **Runner lifecycle** start/stop/restart/protect for temp and named runners
@@ -879,7 +879,7 @@ the dashboard's own stop/start buttons were never affected either way.
 
 ### Parallel Build Pool
 
-The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, override via env `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is serialized behind a dedicated mutex since Tauri embeds a single `dist/`.
+The supervisor runs a fixed pool of **N concurrent cargo builds**. N is **derived from the machine** at startup (`src/build_sizing.rs`): `max(1, min(host_sizing::suggested_concurrent_builds(host), (free_disk − disk_floor) / one_target, 3))` — the CPU+memory term is the shared `qontinui_types::host_sizing` rule, the disk term uses the one-target size the footprint refresh persists to `target-pool/one-target-estimate.json` (UNKNOWN → ignored), and the **cap of 3 is deliberate** (the shipped default; served policy `production-and-cost` `spawns-outrank-ci-and-builds` puts background builds last, and slot occupancy on `/health` is the evidence for a later raise). `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE` still sets N explicitly. **Every supervisor cargo invocation** (prewarm, slot build, sidecar build, `/build/submit`) carries `CARGO_BUILD_JOBS = host_sizing::build_jobs(host, N − 1)` — the per-slot share, so a full pool's jobs sum to at most the cores — unless the supervisor's own environment already carries `CARGO_BUILD_JOBS`. **The pre-permit disk floor follows the machine too**: `max(30, min(N × largest built slot target dir, 10% of the volume))` GB, from the cached footprint (UNKNOWN → exactly 30; `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` overrides, `0` disables). `GET /health` → `build.pool` shows pool size + `source` (`derived`/`override`) + its derivation, the per-slot jobs + source, `slots_busy`/`queue_depth`, and `disk_floor` with its inputs and source (`derived`/`override`/`default_unknown`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is serialized behind a dedicated mutex since Tauri embeds a single `dist/`.
 
 **Pre-permit memory guard (2026-07-31).** Before acquiring a permit, a build waits while free **commit** is below `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (default 5). This mirrors `cargo-guard.sh`'s `MIN_FREE_GB` and `ci_node`'s `MIN_FREE_RAM_GB` — the supervisor was the only build lane without a memory floor, which is why it was the lane that OOM'd. It **defers, never rejects** (unlike the disk guard, which refuses with 507): memory pressure is transient, so failing the build would turn a recoverable condition into an error. After `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) it builds anyway, and it fails open on an unreadable probe — a mis-measuring box degrades to the old behavior rather than wedging the lane. The wait happens **before** permit acquisition, so it never holds a slot.
 
@@ -1695,7 +1695,8 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Retained rotated segments | 5 per log, live file excluded (override: `QONTINUI_SUPERVISOR_LOG_MAX_RETAINED`, clamped [1, 100]) |
 | Stopped-runners cache cap | 1000 entries (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP`, clamped [100, 100000]) |
 | Stopped-runners cache TTL | 3600s / 60min (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS`, clamped [60, 86400]) |
-| Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
+| Build pool size | derived from the machine, capped at 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`); see `GET /health` `build.pool` |
+| Pre-permit disk floor | `max(30, min(pool × one-target GB, 10% of volume))`, UNKNOWN → 30 (override: `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`, `0` disables) |
 | Temp runner port range | 9877-9899 |
 | Temp runner max age | 24h (86400s) default, override `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` (clamped [3600, 604800]; **0 disables**). `RunnerKind::Temp` only; measured from `started_at`; `protected` does not exempt. |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
