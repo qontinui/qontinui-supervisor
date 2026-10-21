@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{
     TargetDirSource, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
+    RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS,
 };
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
@@ -4227,6 +4228,9 @@ pub async fn maybe_serving_restart(
                             // `rebuild: false` — nothing is compiled, so the
                             // tree is inert. Name the policy default anyway.
                             BuildTree::OriginMain,
+                            // The watchdog never asks for a handoff: it acts
+                            // only on a zero census, so there is nothing to keep.
+                            CloseIntent::Kill,
                         )
                         .await
                     }
@@ -4958,25 +4962,57 @@ async fn request_drain(state: &SharedState, port: u16, runner_name: &str) {
     }
 }
 
-async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str) {
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/control/page/close-request",
-        port
-    );
-    let result = state
-        .http_client
-        .post(&url)
-        .timeout(Duration::from_millis(
-            RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS,
-        ))
-        .send()
-        .await;
+/// Path of the runner's close-request door (`mcp/ui_bridge/page.rs`).
+pub(crate) const CLOSE_REQUEST_PATH: &str = "/ui-bridge/control/page/close-request";
+
+/// POST the close-request to `base_url`, carrying the intent's body.
+///
+/// [`CloseIntent::Kill`] sends no body and no `Content-Type` — the exact
+/// request this supervisor has always sent. [`CloseIntent::HandoffHolders`]
+/// sends `{"handoff":"holders"}` as JSON. Split out from
+/// [`request_graceful_stop`] so the wire shape is testable against a real HTTP
+/// server without a runner or a `SharedState`.
+pub(crate) async fn post_close_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    intent: CloseIntent,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), CLOSE_REQUEST_PATH);
+    let mut req = client.post(&url).timeout(Duration::from_millis(
+        RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS,
+    ));
+    if let Some(body) = intent.close_request_body() {
+        req = req.json(&body);
+    }
+    req.send().await
+}
+
+async fn request_graceful_stop(
+    state: &SharedState,
+    port: u16,
+    runner_name: &str,
+    intent: CloseIntent,
+) {
+    let result = post_close_request(
+        &state.http_client,
+        &format!("http://127.0.0.1:{}", port),
+        intent,
+    )
+    .await;
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let msg = format!(
-                "Requested graceful stop for runner '{}' via close-request (port {})",
-                runner_name, port
-            );
+            let msg = if intent.is_handoff() {
+                format!(
+                    "Requested graceful HANDOFF stop for runner '{}' via close-request \
+                     {{\"handoff\":\"holders\"}} (port {})",
+                    runner_name, port
+                )
+            } else {
+                format!(
+                    "Requested graceful stop for runner '{}' via close-request (port {})",
+                    runner_name, port
+                )
+            };
             info!("{}", msg);
             state
                 .logs
@@ -4990,23 +5026,39 @@ async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str
                 port,
                 resp.status()
             );
-            debug!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
-                .await;
+            emit_close_request_fallthrough(state, intent, msg).await;
         }
         Err(e) => {
             let msg = format!(
                 "Graceful close-request for runner '{}' (port {}) failed: {} — falling through to kill",
                 runner_name, port, e
             );
-            debug!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
-                .await;
+            emit_close_request_fallthrough(state, intent, msg).await;
         }
+    }
+}
+
+/// Log a close-request that did not land. Debug for a normal stop, as it always
+/// was. For a handoff it is a Warn: the runner never received the intent, so
+/// the PID kill that follows takes the holder panes down with it — the outcome
+/// the caller asked to avoid — and that must be readable in the operator log.
+async fn emit_close_request_fallthrough(state: &SharedState, intent: CloseIntent, msg: String) {
+    if intent.is_handoff() {
+        let msg = format!(
+            "{msg} — the runner may NOT have received the HANDOFF intent; if it did not, \
+             holder-backed panes are killed with the runner"
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+            .await;
+    } else {
+        debug!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+            .await;
     }
 }
 
@@ -5080,10 +5132,15 @@ async fn verify_kill_target(
 /// it parsed one and threw it away. See [`crate::restart_readiness`] for the
 /// exemptions (temp runners, explicitly-unprotected runners, and runners the
 /// supervisor has no evidence are alive).
+///
+/// `intent` is forwarded on the close-request and sizes the graceful wait —
+/// see [`CloseIntent`]. Every caller but a handoff restart passes
+/// [`CloseIntent::Kill`], which is byte-for-byte the stop this always was.
 pub async fn stop_runner_by_id(
     state: &SharedState,
     runner_id: &str,
     force: bool,
+    intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
     let managed = state
         .get_runner(runner_id)
@@ -5098,6 +5155,7 @@ pub async fn stop_runner_by_id(
         &managed,
         crate::restart_readiness::GateAction::Stop,
         force,
+        intent,
     )
     .await?;
 
@@ -5221,13 +5279,16 @@ pub async fn stop_runner_by_id(
     //    hooks run (notably UsbTransport::release_all, which removes adb
     //    forwards — see qontinui-runner §1.6a). Best-effort: on any failure
     //    we fall through to the PID kill below.
-    request_graceful_stop(state, port, &runner_name).await;
+    request_graceful_stop(state, port, &runner_name, intent).await;
 
-    // 2. Poll the monitor's `running` flag for up to
-    //    RUNNER_GRACEFUL_STOP_TIMEOUT_MS. When the runner exits, the monitor
-    //    task sets running=false — that's our signal that graceful worked.
-    let graceful_deadline =
-        std::time::Instant::now() + Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS);
+    // 2. Poll the monitor's `running` flag for up to the intent's graceful
+    //    wait — RUNNER_GRACEFUL_STOP_TIMEOUT_MS normally, extended to cover
+    //    the runner's teardown budget for a handoff (see
+    //    `CloseIntent::graceful_stop_timeout`). When the runner exits, the
+    //    monitor task sets running=false — that's our signal that graceful
+    //    worked.
+    let graceful_timeout = intent.graceful_stop_timeout();
+    let graceful_deadline = std::time::Instant::now() + graceful_timeout;
     let mut exited_gracefully = false;
     while std::time::Instant::now() < graceful_deadline {
         if !managed.runner.read().await.running {
@@ -5249,7 +5310,8 @@ pub async fn stop_runner_by_id(
     if !exited_gracefully {
         let msg = format!(
             "Graceful stop timed out for runner '{}' after {}ms, falling through to taskkill",
-            runner_name, RUNNER_GRACEFUL_STOP_TIMEOUT_MS
+            runner_name,
+            graceful_timeout.as_millis()
         );
         info!("{}", msg);
         state
@@ -5681,6 +5743,70 @@ pub async fn refuse_if_port_held_by_live_runner(port: u16) -> Result<(), Supervi
     Ok(())
 }
 
+/// What a stop or restart asks the runner to do with its holder-backed panes
+/// when it POSTs the close-request (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7).
+///
+/// **The supervisor only forwards this intent.** The decision of which panes
+/// survive, and the mechanism that detaches them, live in the runner; the
+/// supervisor is dev-only and nothing a user has depends on it. This type
+/// carries the operator's request to the runner, selects which readiness field
+/// gates it, and sizes the graceful wait — and nothing else.
+///
+/// The wire spelling on every restart door is `handoff: bool` (default
+/// `false`); read it through [`CloseIntent::from_handoff`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseIntent {
+    /// Today's close: the close-request carries NO body, every pane is killed,
+    /// and the readiness gate reads `safe_to_restart`.
+    #[default]
+    Kill,
+    /// The close-request carries `{"handoff":"holders"}`: the runner detaches
+    /// holder-backed panes instead of killing them. The readiness gate reads
+    /// `safe_with_handoff` instead (absent = UNKNOWN = refuse), and the
+    /// graceful wait is extended to cover the runner's teardown budget.
+    HandoffHolders,
+}
+
+impl CloseIntent {
+    /// The typed value for a wire `handoff` flag. The one place that bool's
+    /// polarity is interpreted.
+    pub fn from_handoff(handoff: bool) -> Self {
+        if handoff {
+            CloseIntent::HandoffHolders
+        } else {
+            CloseIntent::Kill
+        }
+    }
+
+    pub fn is_handoff(self) -> bool {
+        matches!(self, CloseIntent::HandoffHolders)
+    }
+
+    /// The close-request body. `None` for [`CloseIntent::Kill`], so a
+    /// non-handoff stop sends exactly the bodyless POST it always has.
+    pub fn close_request_body(self) -> Option<serde_json::Value> {
+        match self {
+            CloseIntent::Kill => None,
+            CloseIntent::HandoffHolders => Some(serde_json::json!({ "handoff": "holders" })),
+        }
+    }
+
+    /// How long the stop waits for the runner to exit on its own after the
+    /// close-request, before the PID kill. See
+    /// [`RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`] for why the handoff wait is
+    /// longer and where its value comes from.
+    pub fn graceful_stop_timeout(self) -> Duration {
+        match self {
+            CloseIntent::Kill => Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS),
+            CloseIntent::HandoffHolders => {
+                Duration::from_millis(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS)
+            }
+        }
+    }
+}
+
 /// Which tree a rebuild compiles **for the primary runner**.
 ///
 /// A two-variant enum rather than a `bool`, deliberately. This was a bare
@@ -5760,6 +5886,12 @@ impl BuildTree {
 /// reads that flag, so its first failed attempt would have silenced it for
 /// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
 /// finding).
+///
+/// `intent` ([`CloseIntent`]) is the restart's handoff option. With
+/// [`CloseIntent::HandoffHolders`] the readiness gate reads the runner's
+/// `safe_with_handoff` instead of `safe_to_restart` (absent refuses), the
+/// close-request carries `{"handoff":"holders"}`, and the graceful wait is
+/// extended. `force` keeps exactly its existing meaning under either intent.
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -5767,6 +5899,7 @@ pub async fn restart_runner_by_id(
     source: RestartSource,
     force: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
     if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
@@ -5825,6 +5958,7 @@ pub async fn restart_runner_by_id(
         &managed,
         crate::restart_readiness::GateAction::Restart,
         force,
+        intent,
     )
     .await
     {
@@ -5846,7 +5980,7 @@ pub async fn restart_runner_by_id(
 
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
-    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, build_tree).await;
+    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, build_tree, intent).await;
 
     {
         let mut runner = managed.runner.write().await;
@@ -5915,6 +6049,7 @@ async fn restart_after_gate(
     runner_id: &str,
     rebuild: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -5942,7 +6077,9 @@ async fn restart_after_gate(
         // re-probing here would pay a second HTTP round trip and, worse,
         // could refuse a restart the caller was already granted because a
         // session appeared in between. One decision per operator request.
-        stop_runner_by_id(state, runner_id, true).await?;
+        // `intent` rides along so a handoff restart's close-request carries
+        // the handoff body and gets the extended graceful wait.
+        stop_runner_by_id(state, runner_id, true, intent).await?;
     }
 
     // Rebuild if requested (global — single binary).
@@ -5992,7 +6129,7 @@ pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), Supervi
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    stop_runner_by_id(state, &primary.config.id, force).await
+    stop_runner_by_id(state, &primary.config.id, force, CloseIntent::Kill).await
 }
 
 /// Legacy restart wrapper — targets the primary runner.
@@ -6010,6 +6147,7 @@ pub async fn restart_runner(
     source: RestartSource,
     force: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
@@ -6023,6 +6161,7 @@ pub async fn restart_runner(
         source,
         force,
         build_tree,
+        intent,
     )
     .await
 }
@@ -6081,7 +6220,7 @@ pub async fn rebuild_and_restart_by_id(
     // semantics. Currently a no-op" and carried `#[allow(dead_code)]`. It is
     // no longer a no-op: it is the readiness-gate override, same meaning as on
     // `/runners/{id}/stop` and `/runners/{id}/restart`.
-    match stop_runner_by_id(state, runner_id, body.force).await {
+    match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
         Ok(()) | Err(SupervisorError::RunnerNotRunning) => {}
         Err(e) => return Err(e),
     }

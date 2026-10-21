@@ -4288,8 +4288,13 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
                 );
                 // Temp runner (the arm is gated on `is_temp`), which the
                 // readiness gate exempts; `false` is the honest value.
-                if let Err(e) =
-                    crate::process::manager::stop_runner_by_id(state, &runner_id, false).await
+                if let Err(e) = crate::process::manager::stop_runner_by_id(
+                    state,
+                    &runner_id,
+                    false,
+                    crate::process::manager::CloseIntent::Kill,
+                )
+                .await
                 {
                     warn!(
                         "stop_runner_by_id('{}') failed: {} — escalating to direct kill",
@@ -4437,8 +4442,13 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
                 "Stopping temp runner '{}' (PID {}) running from slot exe {:?} before build",
                 managed.config.name, pid, exe_path
             );
-            if let Err(e) =
-                crate::process::manager::stop_runner_by_id(state, &managed.config.id, false).await
+            if let Err(e) = crate::process::manager::stop_runner_by_id(
+                state,
+                &managed.config.id,
+                false,
+                crate::process::manager::CloseIntent::Kill,
+            )
+            .await
             {
                 warn!(
                     "Failed to stop temp runner '{}' before build: {}",
