@@ -1416,6 +1416,44 @@ fn restart_runner_request_honours_explicit_from_working_tree() {
     assert!(opted.from_working_tree);
 }
 
+/// `handoff` on the per-runner restart (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7): omitted means today's kill-every-pane restart; `true` selects the
+/// handoff intent. Same on `rebuild-and-restart`, whose body is lenient.
+#[test]
+fn restart_runner_request_handoff_defaults_off_and_selects_the_intent() {
+    let omitted: super::RestartRunnerRequest =
+        serde_json::from_str(r#"{"rebuild":false}"#).expect("deserialize");
+    assert!(!omitted.handoff);
+    assert_eq!(
+        omitted.close_intent(),
+        crate::process::manager::CloseIntent::Kill
+    );
+
+    let opted: super::RestartRunnerRequest =
+        serde_json::from_str(r#"{"handoff":true,"force":false}"#).expect("deserialize");
+    assert_eq!(
+        opted.close_intent(),
+        crate::process::manager::CloseIntent::HandoffHolders
+    );
+    assert!(!opted.force, "handoff must not imply force");
+
+    // The route keeps `deny_unknown_fields`: a misspelled handoff is a 422,
+    // never a silent kill-every-pane restart.
+    assert!(serde_json::from_str::<super::RestartRunnerRequest>(r#"{"hand_off":true}"#).is_err());
+
+    let rr: super::RebuildAndRestartRequest =
+        serde_json::from_str(r#"{"handoff":true}"#).expect("deserialize");
+    assert_eq!(
+        rr.close_intent(),
+        crate::process::manager::CloseIntent::HandoffHolders
+    );
+    assert_eq!(
+        super::RebuildAndRestartRequest::default().close_intent(),
+        crate::process::manager::CloseIntent::Kill
+    );
+}
+
 /// `from_working_tree` must round-trip through serde and default to
 /// `false` — a body that omits it gets the safe origin/main default.
 #[test]

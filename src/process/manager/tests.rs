@@ -3399,6 +3399,7 @@ async fn failed_restart_clears_restart_requested() {
         RestartSource::Manual,
         false,
         BuildTree::OriginMain,
+        CloseIntent::Kill,
     )
     .await
     .expect_err("no exe can be resolved from an empty project dir");
@@ -3437,6 +3438,7 @@ async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
         RestartSource::Manual,
         false,
         BuildTree::OriginMain,
+        CloseIntent::Kill,
     )
     .await
     .expect_err("the start still fails at exe resolution");
@@ -3471,6 +3473,7 @@ async fn wire_watchdog_source_is_still_blocked_for_non_temp_runners() {
         RestartSource::Watchdog,
         false,
         BuildTree::OriginMain,
+        CloseIntent::Kill,
     )
     .await
     .expect_err("wire watchdog must be blocked");
@@ -3627,4 +3630,138 @@ fn primary_drops_an_inherited_subject_root() {
     let envs = command_envs(&cmd);
     assert_eq!(envs.get("QONTINUI_INSTANCE_ROOT"), Some(&None));
     assert_eq!(envs.get("QONTINUI_DISABLE_KEYCHAIN"), Some(&None));
+}
+
+// ── Handoff close intent (plan
+//    2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them, D7)
+
+/// What one close-request looked like on the wire.
+#[derive(Debug)]
+struct SeenCloseRequest {
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+/// A real HTTP server on an ephemeral port that records every
+/// close-request it receives.
+async fn spawn_close_request_recorder() -> (
+    String,
+    std::sync::Arc<tokio::sync::Mutex<Vec<SeenCloseRequest>>>,
+) {
+    use axum::routing::post;
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<SeenCloseRequest>::new()));
+    let sink = seen.clone();
+    let app = axum::Router::new().route(
+        CLOSE_REQUEST_PATH,
+        post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().await.push(SeenCloseRequest {
+                        content_type: headers
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                        body: body.to_vec(),
+                    });
+                    axum::http::StatusCode::OK
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://127.0.0.1:{}", addr.port()), seen)
+}
+
+/// A handoff stop sends `{"handoff":"holders"}` as JSON on the close-request.
+#[tokio::test]
+async fn handoff_close_request_carries_the_handoff_body() {
+    let (base, seen) = spawn_close_request_recorder().await;
+    let client = reqwest::Client::new();
+    let resp = post_close_request(&client, &base, CloseIntent::HandoffHolders)
+        .await
+        .expect("close-request sent");
+    assert!(resp.status().is_success());
+
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(&seen[0].body).expect("handoff body is JSON");
+    assert_eq!(body, serde_json::json!({ "handoff": "holders" }));
+    assert_eq!(seen[0].content_type.as_deref(), Some("application/json"));
+}
+
+/// A non-handoff stop sends exactly what it always did: a bodyless POST with
+/// no `Content-Type`. The runner reads an absent body as a normal close.
+#[tokio::test]
+async fn normal_close_request_sends_no_body() {
+    let (base, seen) = spawn_close_request_recorder().await;
+    let client = reqwest::Client::new();
+    post_close_request(&client, &base, CloseIntent::Kill)
+        .await
+        .expect("close-request sent");
+
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].body.is_empty(), "body was {:?}", seen[0].body);
+    assert_eq!(seen[0].content_type, None);
+    assert_eq!(CloseIntent::Kill.close_request_body(), None);
+    assert_eq!(CloseIntent::default(), CloseIntent::Kill);
+}
+
+/// The graceful wait is extended in handoff mode ONLY: a normal stop keeps
+/// the 3 s it always had, a handoff stop waits past the runner's own
+/// teardown force-exit budget.
+#[test]
+fn graceful_wait_is_extended_only_for_a_handoff() {
+    assert_eq!(
+        CloseIntent::Kill.graceful_stop_timeout(),
+        Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS)
+    );
+    assert_eq!(
+        CloseIntent::HandoffHolders.graceful_stop_timeout(),
+        Duration::from_millis(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS)
+    );
+    assert!(
+        CloseIntent::HandoffHolders.graceful_stop_timeout()
+            > Duration::from_millis(crate::config::RUNNER_TEARDOWN_FORCE_EXIT_BUDGET_MS)
+    );
+    assert!(CloseIntent::from_handoff(true).is_handoff());
+    assert!(!CloseIntent::from_handoff(false).is_handoff());
+}
+
+/// The stop's graceful poll is sized by the intent, and the intent reaches
+/// the close-request. Pinned at source level because the stop path cannot
+/// be driven end to end without a live runner process: a revert to the bare
+/// constant would silently cut every handoff teardown at 3 s.
+#[test]
+fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let stop = crate::source_scan::fn_body(&src, "pub async fn stop_runner_by_id(")
+        .expect("stop_runner_by_id exists")
+        .to_string();
+    assert!(stop.contains("let graceful_timeout = intent.graceful_stop_timeout();"));
+    assert!(stop.contains("request_graceful_stop(state, port, &runner_name, intent).await;"));
+    assert!(
+        !stop.contains("RUNNER_GRACEFUL_STOP_TIMEOUT_MS)"),
+        "the graceful wait must come from the intent, not the bare default constant"
+    );
+
+    // And the restart funnel hands its intent to that stop.
+    let after_gate = crate::source_scan::fn_body(&src, "async fn restart_after_gate(")
+        .expect("restart_after_gate exists")
+        .to_string();
+    assert!(after_gate.contains("stop_runner_by_id(state, runner_id, true, intent).await?;"));
 }

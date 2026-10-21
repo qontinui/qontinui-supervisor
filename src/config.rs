@@ -640,6 +640,37 @@ pub const EXPO_PORT: u16 = 8081;
 /// Gives the runner's WindowEvent::CloseRequested handler time to run
 /// teardown hooks (e.g. UsbTransport::release_all releasing adb forwards).
 pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
+/// The graceful wait used INSTEAD of [`RUNNER_GRACEFUL_STOP_TIMEOUT_MS`] when a
+/// restart carries the handoff intent (`{"handoff":"holders"}` on the
+/// close-request; plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7).
+///
+/// A handoff close only keeps a holder-backed pane alive if the runner's
+/// teardown gets to DETACH it, and the teardown writes its
+/// `handoff: N detached…` summary only once it finishes. The 3 s default is
+/// shorter than that teardown is allowed to take, so a slow-but-healthy
+/// teardown would be cut by the PID kill mid-detach — the panes the caller
+/// asked to keep would die the crash way, and the summary line that proves
+/// what happened would never be written.
+///
+/// Source: qontinui-runner `src-tauri/src/main.rs` `mod shutdown_budget`
+/// (read at qontinui-runner `origin/main` 1b59d9316): `WORKER_BUDGET` = 22 s
+/// (join 3 + drain 8 + terminal close 5 + AI kill 4 + misc 2) is the whole
+/// off-thread `run_teardown` sequence, and `FORCE_EXIT_BUDGET` = 25 s
+/// (`WORKER_BUDGET` + `FORCE_EXIT_MARGIN` 3 s) is the runner's own absolute
+/// watchdog. 30 s clears the runner's own hard exit, so the supervisor's kill
+/// is never the thing that ends a handoff teardown that is still within its
+/// budget. If the runner widens those budgets, widen this with them —
+/// `handoff_wait_clears_the_runner_force_exit_budget` pins the relation.
+pub const RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS: u64 = 30_000;
+/// The runner's `shutdown_budget::FORCE_EXIT_BUDGET` (25 s) as last read from
+/// qontinui-runner `origin/main` 1b59d9316, kept here only so the relation
+/// [`RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`] must hold is checked rather than
+/// restated. A copy of a value another repo owns — not an authority, and
+/// test-only for that reason: nothing at runtime may branch on it.
+#[cfg(test)]
+pub const RUNNER_TEARDOWN_FORCE_EXIT_BUDGET_MS: u64 = 25_000;
 /// Per-request timeout for the graceful close POST itself. Short because
 /// the endpoint returns as soon as the event is queued — if it hangs, the
 /// runner is already unhealthy and we want to fall through to kill quickly.
@@ -1379,6 +1410,21 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Handoff graceful wait ---
+
+    /// The handoff wait must outlast the runner's own hard exit, or the
+    /// supervisor's PID kill can end a handoff teardown that is still inside
+    /// its budget — killing the panes the caller asked to keep. And it must be
+    /// strictly longer than the default wait, or the handoff mode changes
+    /// nothing.
+    #[test]
+    fn handoff_wait_clears_the_runner_force_exit_budget() {
+        const {
+            assert!(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS > RUNNER_TEARDOWN_FORCE_EXIT_BUDGET_MS);
+            assert!(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS > RUNNER_GRACEFUL_STOP_TIMEOUT_MS);
+        }
+    }
 
     // --- Serving-restart threshold ---
 

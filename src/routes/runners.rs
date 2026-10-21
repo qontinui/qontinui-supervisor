@@ -95,6 +95,26 @@ pub struct RestartRunnerRequest {
     /// typecheck.
     #[serde(default)]
     pub from_working_tree: bool,
+    /// Restart with the HANDOFF intent: holder-backed panes are detached and
+    /// left running for the successor runner to adopt, instead of killed. Plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D7. Defaults to `false`, which is the restart this route always did.
+    ///
+    /// With `true` the supervisor only FORWARDS the intent — the runner decides
+    /// which panes survive:
+    ///
+    /// - the close-request it POSTs carries `{"handoff":"holders"}`;
+    /// - the readiness gate reads the runner's `safe_with_handoff` instead of
+    ///   `safe_to_restart`, and refuses with
+    ///   `409 restart_refused_unsafe_for_handoff` when it is `false` OR absent
+    ///   (an older runner is UNKNOWN, never safe);
+    /// - the graceful wait before the PID kill is extended to cover the
+    ///   runner's teardown budget.
+    ///
+    /// `force` keeps its meaning under either value. Read it through
+    /// [`RestartRunnerRequest::close_intent`].
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 impl RestartRunnerRequest {
@@ -102,6 +122,11 @@ impl RestartRunnerRequest {
     /// below the wire takes.
     pub fn build_tree(&self) -> manager::BuildTree {
         manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -146,6 +171,12 @@ pub struct RebuildAndRestartRequest {
     /// gate existed to give it something to override.
     #[serde(default)]
     pub force: bool,
+    /// Stop with the HANDOFF intent — same meaning as
+    /// [`RestartRunnerRequest::handoff`]: the close-request carries
+    /// `{"handoff":"holders"}`, the gate reads `safe_with_handoff` (absent
+    /// refuses), and the graceful wait is extended. Defaults to `false`.
+    #[serde(default)]
+    pub handoff: bool,
     /// If true, after starting the runner block until its `/health` returns
     /// 200 OK or `wait_timeout_secs` elapses.
     #[serde(default)]
@@ -153,6 +184,13 @@ pub struct RebuildAndRestartRequest {
     /// Maximum seconds to wait when `wait` is true. Defaults to 120s.
     #[serde(default)]
     pub wait_timeout_secs: Option<u64>,
+}
+
+impl RebuildAndRestartRequest {
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
+    }
 }
 
 fn default_source_manual() -> String {
@@ -1240,7 +1278,7 @@ pub async fn stop_runner(
         None
     };
 
-    manager::stop_runner_by_id(&state, &id, force).await?;
+    manager::stop_runner_by_id(&state, &id, force, manager::CloseIntent::Kill).await?;
 
     // Explicit user-facing /stop is the only path that deletes the
     // early-log file. The spawn-test failed-probe cleanup path also calls
@@ -1305,6 +1343,7 @@ pub async fn restart_runner(
         let exec_state = state.clone();
         let force = body.force;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
         // Echoed in the 202 so the build decision is visible before the build
         // runs. `null` when the id names no registered runner: the detached
         // restart fails on it, and a label would describe a build that never
@@ -1336,6 +1375,7 @@ pub async fn restart_runner(
                     source,
                     force,
                     build_tree,
+                    intent,
                 )
                 .await
                 {
@@ -1389,8 +1429,16 @@ pub async fn restart_runner(
     // threaded rather than passed as a literal so both call sites say the same
     // thing, and so a future change that starts building here cannot inherit a
     // hardcoded provenance.
-    manager::restart_runner_by_id(&state, &id, false, source, body.force, body.build_tree())
-        .await?;
+    manager::restart_runner_by_id(
+        &state,
+        &id,
+        false,
+        source,
+        body.force,
+        body.build_tree(),
+        body.close_intent(),
+    )
+    .await?;
 
     Ok(Json(json!({
         "status": "restarted",
@@ -4265,7 +4313,8 @@ async fn execute_spawn_build_inner(
                 // probe just failed — there is no session on it to protect,
                 // and a readiness refusal here would leak the zombie this
                 // line exists to prevent.
-                let _ = manager::stop_runner_by_id(state, id, true).await;
+                let _ =
+                    manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
                 {
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
@@ -4446,7 +4495,7 @@ async fn execute_spawn_build_inner(
         // Stop the runner we just spawned — we will not ship a broken/stale
         // UI to the caller. `force: true` for the same reason as the
         // failed-probe teardown above: nothing has ever run on this runner.
-        let _ = manager::stop_runner_by_id(state, id, true).await;
+        let _ = manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(id);
@@ -5578,7 +5627,7 @@ pub async fn spawn_named(
         // refusing to hand back because it embeds no frontend. It has never
         // hosted a session, and leaving it running while also returning 503
         // would leak it.
-        let _ = manager::stop_runner_by_id(&state, &id, true).await;
+        let _ = manager::stop_runner_by_id(&state, &id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(&id);

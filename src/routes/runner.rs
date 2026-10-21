@@ -233,6 +233,15 @@ pub struct RestartRequest {
     /// compiles a fresh exe, so an LKG pin would be self-defeating).
     #[serde(default)]
     pub use_lkg: Option<bool>,
+    /// Restart the primary with the HANDOFF intent — same contract as
+    /// `POST /runners/{id}/restart`'s `handoff`
+    /// ([`crate::routes::runners::RestartRunnerRequest::handoff`]): the
+    /// close-request carries `{"handoff":"holders"}`, the readiness gate reads
+    /// `safe_with_handoff` (false or absent refuses with
+    /// `409 restart_refused_unsafe_for_handoff`), and the graceful wait is
+    /// extended. Defaults to `false`, the restart this route always did.
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +265,11 @@ impl RestartRequest {
     /// representation is an enum and not this bool.
     pub fn build_tree(&self) -> manager::BuildTree {
         manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -526,6 +540,7 @@ pub async fn rebuild_when_idle(
                 RestartSource::Manual,
                 false,
                 REBUILD_WHEN_IDLE_TREE,
+                manager::CloseIntent::Kill,
             )
             .await
             {
@@ -610,7 +625,13 @@ pub async fn restart_runner(
     let (action_record, states_active, predicted, risk) = mint_primary_action(
         &state,
         action_kind,
-        format!("rebuild={};force={}", rebuild, body.force),
+        // `;handoff=true` only when set, so a non-handoff action's label is
+        // unchanged.
+        if body.handoff {
+            format!("rebuild={};force={};handoff=true", rebuild, body.force)
+        } else {
+            format!("rebuild={};force={}", rebuild, body.force)
+        },
         None,
         None,
     )
@@ -643,6 +664,7 @@ pub async fn restart_runner(
         let force = body.force;
         let from_working_tree = body.from_working_tree;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
         let build_source = if state.get_primary().await.is_some() {
             serde_json::json!(build_tree.build_source(true))
         } else {
@@ -664,6 +686,7 @@ pub async fn restart_runner(
                     RestartSource::Manual,
                     force,
                     build_tree,
+                    intent,
                 )
                 .await
                 {
@@ -925,6 +948,7 @@ pub async fn restart_runner(
         RestartSource::Manual,
         body.force,
         body.build_tree(),
+        body.close_intent(),
     )
     .await;
 
@@ -1463,6 +1487,16 @@ mod tests {
         assert!(err.to_string().contains("trigger_auto_continue"), "{err}");
         let ok: RestartRequest = serde_json::from_str(r#"{"rebuild":true,"force":true}"#).unwrap();
         assert!(ok.rebuild && ok.force);
+        assert_eq!(ok.close_intent(), manager::CloseIntent::Kill);
+    }
+
+    /// The legacy primary restart door carries the same `handoff` option as
+    /// `POST /runners/{id}/restart`, default off.
+    #[test]
+    fn restart_request_handoff_selects_the_intent() {
+        let opted: RestartRequest = serde_json::from_str(r#"{"handoff":true}"#).unwrap();
+        assert_eq!(opted.close_intent(), manager::CloseIntent::HandoffHolders);
+        assert!(!opted.force);
     }
     use crate::build_submissions::{BuildKind, BuildStatus, BuildSubmission};
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
@@ -1586,6 +1620,7 @@ mod tests {
                 force: false,
                 from_working_tree: false,
                 use_lkg: None,
+                handoff: false,
             }),
         )
         .await
@@ -1703,6 +1738,7 @@ mod tests {
                     // origin/main worktree materialization in the sandbox.
                     from_working_tree: true,
                     use_lkg: None,
+                    handoff: false,
                 }),
             ),
         )
@@ -1906,6 +1942,7 @@ mod tests {
                 force: false,
                 from_working_tree: false,
                 use_lkg: None,
+                handoff: false,
             }),
         )
         .await;
