@@ -659,19 +659,31 @@ pub fn decide_skip(
     }
 }
 
-/// Does an exemption still apply under this close intent?
+/// [`decide_skip`] under a close intent.
 ///
-/// The exemptions answer "is there work to protect?". A handoff asks a
-/// different question — "will this runner honour the intent?" — and only the
-/// runner can answer it, so under [`CloseIntent::HandoffHolders`] the temp and
-/// unprotected exemptions do NOT skip the probe: an older build would ignore
-/// the handoff body and kill every pane, exactly as on a protected runner.
-/// [`SkipReason::NotRunning`] still skips: no runner process is alive to
-/// receive the intent or to kill a pane, so there is nothing to hand off.
-pub fn skip_applies(reason: SkipReason, intent: CloseIntent) -> bool {
+/// The temp and unprotected exemptions answer "is there work to protect?". A
+/// handoff asks a different question — "will this runner honour the intent?"
+/// — and only the runner can answer it, so under
+/// [`CloseIntent::HandoffHolders`] the decision is re-run with those two
+/// exemptions OFF (as if the runner were a protected non-temp one): an older
+/// build would ignore the handoff body and kill every pane. Only
+/// [`SkipReason::NotRunning`] can come back — no runner process is alive to
+/// receive the intent or to kill a pane — and it comes back for a stopped temp
+/// or unprotected runner too, which the first-match order of [`decide_skip`]
+/// would otherwise hide behind `TempRunner` / `NotProtected`.
+pub fn decide_skip_for_intent(
+    intent: CloseIntent,
+    liveness: RunnerLiveness,
+    port_open: bool,
+    tracked_running: bool,
+    is_temp: bool,
+    protected: bool,
+) -> Option<SkipReason> {
     match intent {
-        CloseIntent::Kill => true,
-        CloseIntent::HandoffHolders => matches!(reason, SkipReason::NotRunning),
+        CloseIntent::Kill => decide_skip(liveness, port_open, tracked_running, is_temp, protected),
+        CloseIntent::HandoffHolders => {
+            decide_skip(liveness, port_open, tracked_running, false, true)
+        }
     }
 }
 
@@ -1196,24 +1208,16 @@ pub async fn enforce(
         )
     };
 
-    if let Some(reason) = decide_skip(
+    if let Some(reason) = decide_skip_for_intent(
+        intent,
         liveness,
         port_open,
         tracked_running,
         crate::process::manager::is_temp_runner(&runner_id),
         managed.is_protected().await,
     ) {
-        if skip_applies(reason, intent) {
-            skip(&runner_id, action, reason);
-            return Ok(());
-        }
-        debug!(
-            "restart-readiness: '{}' ({}) would skip ({}) but the HANDOFF intent must be \
-             confirmed by the runner — probing",
-            runner_id,
-            action.as_str(),
-            reason.as_str()
-        );
+        skip(&runner_id, action, reason);
+        return Ok(());
     }
 
     // Ask the runner; fall back to the supervisor's own process table only
@@ -2602,25 +2606,78 @@ mod tests {
 
     #[test]
     fn handoff_keeps_only_the_not_running_exemption() {
-        for reason in [
-            SkipReason::TempRunner,
-            SkipReason::NotProtected,
-            SkipReason::NotRunning,
-        ] {
-            assert!(skip_applies(reason, CloseIntent::Kill), "{reason:?}");
+        use RunnerLiveness as L;
+        let live = L::Responding;
+        let h = CloseIntent::HandoffHolders;
+        let k = CloseIntent::Kill;
+        // A LIVE temp / unprotected runner: exempt normally, probed under handoff.
+        assert_eq!(
+            decide_skip_for_intent(k, live, true, true, true, true),
+            Some(SkipReason::TempRunner)
+        );
+        assert_eq!(
+            decide_skip_for_intent(k, live, true, true, false, false),
+            Some(SkipReason::NotProtected)
+        );
+        assert_eq!(
+            decide_skip_for_intent(h, live, true, true, true, true),
+            None
+        );
+        assert_eq!(
+            decide_skip_for_intent(h, live, true, true, false, false),
+            None
+        );
+        // A STOPPED temp / unprotected runner: still NotRunning under handoff,
+        // which the first-match order would otherwise hide.
+        for (is_temp, protected) in [(true, true), (false, false), (false, true)] {
+            assert_eq!(
+                decide_skip_for_intent(h, L::Stopped, false, false, is_temp, protected),
+                Some(SkipReason::NotRunning),
+                "temp={is_temp} protected={protected}"
+            );
+            assert_eq!(
+                decide_skip_for_intent(h, L::Unknown, false, false, is_temp, protected),
+                Some(SkipReason::NotRunning),
+                "temp={is_temp} protected={protected}"
+            );
         }
-        assert!(!skip_applies(
-            SkipReason::TempRunner,
-            CloseIntent::HandoffHolders
-        ));
-        assert!(!skip_applies(
-            SkipReason::NotProtected,
-            CloseIntent::HandoffHolders
-        ));
-        assert!(skip_applies(
-            SkipReason::NotRunning,
-            CloseIntent::HandoffHolders
-        ));
+    }
+
+    /// End to end through `enforce`: a stopped temp runner (nothing listening,
+    /// never seen responding) is not refused under a handoff — there is no
+    /// runner process to receive the intent, so it skips as NotRunning rather
+    /// than probing a dead port into an UNKNOWN refusal.
+    #[tokio::test]
+    async fn enforce_skips_a_handoff_of_a_stopped_temp_runner() {
+        let state = enforce_state();
+        let id = "test-18f2a3b4-a";
+        let (managed, _) = managed_on_dead_port(
+            id,
+            qontinui_types::wire::runner_kind::RunnerKind::Temp { id: id.to_string() },
+            true,
+            false,
+        )
+        .await;
+        enforce(
+            &state,
+            &managed,
+            GateAction::Restart,
+            false,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect("a stopped temp runner has nothing to hand off and must not be refused");
+        // Non-vacuous: the same runner, LIVE, is probed and refused (dead port).
+        managed.runner.write().await.running = true;
+        enforce(
+            &state,
+            &managed,
+            GateAction::Restart,
+            false,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect_err("a live temp runner under handoff is probed, and an unreachable probe refuses");
     }
 
     /// The case the exemption used to hide: a temp runner whose build predates

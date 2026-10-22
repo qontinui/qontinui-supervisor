@@ -3688,6 +3688,123 @@ enum StopReapOutcome {
     StillHeld,
 }
 
+/// One kill primitive the stop reap can run. Named so the ladder's choice is
+/// a value a test can read, not only code it has to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapKill {
+    /// `kill_by_pid_tree` on the tracked PID: its child tree / process group.
+    TrackedPidTree,
+    /// `kill_by_pid_tree` on a listener the registry never tracked.
+    UntrackedListenerTree,
+    /// `kill_by_port`: on Unix it tree-kills each listener (`-(pgid)`).
+    PortTree,
+    /// `kill_listeners_by_port`: a plain per-PID kill of each listener,
+    /// never a group or tree kill.
+    ListenersOnly,
+}
+
+impl ReapKill {
+    /// Does this primitive signal anything beyond the listener itself?
+    pub(crate) fn reaches_beyond_the_listener(self) -> bool {
+        !matches!(self, ReapKill::ListenersOnly)
+    }
+}
+
+/// Why the tree rung records itself as not run under a handoff.
+const HANDOFF_TREE_KILL_SKIPPED: &str = "skipped under handoff: a tree / process-group kill \
+                                          would signal the holder processes the handoff keeps \
+                                          alive";
+
+/// The kill primitives an escalation step runs. Under a handoff only the
+/// listener-only kill runs, at BOTH escalation steps: every other primitive
+/// can reach the holder processes the handoff exists to keep.
+fn reap_kills(outcome: StopReapOutcome, intent: CloseIntent) -> &'static [ReapKill] {
+    match (outcome, intent) {
+        (
+            StopReapOutcome::EscalateTree | StopReapOutcome::EscalatePort,
+            CloseIntent::HandoffHolders,
+        ) => &[ReapKill::ListenersOnly],
+        (StopReapOutcome::EscalateTree, CloseIntent::Kill) => {
+            &[ReapKill::TrackedPidTree, ReapKill::UntrackedListenerTree]
+        }
+        (StopReapOutcome::EscalatePort, CloseIntent::Kill) => &[ReapKill::PortTree],
+        _ => &[],
+    }
+}
+
+/// Run one [`ReapKill`] and record what it actually did on the ledger.
+async fn run_reap_kill(
+    kill: ReapKill,
+    port: u16,
+    pid_to_kill: Option<u32>,
+    no_target_why: &str,
+    runner_name: &str,
+    ledger: &mut StopLedger,
+) {
+    match kill {
+        ReapKill::TrackedPidTree => match pid_to_kill {
+            Some(pid) => {
+                let killed = crate::process::proc_kill::kill_by_pid_tree(pid)
+                    .await
+                    .unwrap_or(false);
+                ledger.ran(
+                    StopStrategy::TreeKill,
+                    format!("PID {} (+ child tree)", pid),
+                    killed,
+                );
+            }
+            None => ledger.no_target(StopStrategy::TreeKill, no_target_why.to_string()),
+        },
+        // Also catch a survivor whose PID we never tracked (orphan adopted on
+        // a port we knew but no PID for). A probe that could not RUN is
+        // UNKNOWN — never a kill; the next escalation step re-confirms anyway.
+        ReapKill::UntrackedListenerTree => {
+            match crate::process::proc_kill::find_pid_on_port(port).await {
+                Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
+                    let killed = crate::process::proc_kill::kill_by_pid_tree(live_pid)
+                        .await
+                        .unwrap_or(false);
+                    ledger.ran(
+                        StopStrategy::TreeKill,
+                        format!("untracked listener PID {}", live_pid),
+                        killed,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "Stop-reap escalation for runner '{}': listener probe on port {} failed \
+                     ({}) — skipping the untracked-survivor kill",
+                    runner_name, port, e
+                ),
+            }
+        }
+        // The listener probe could not answer, so the port-level kill had
+        // nothing to aim at. Recording this as a NON-RUN is the whole point:
+        // it is exactly the case the old fixed failure sentence misreported as
+        // an attempted kill.
+        ReapKill::PortTree => match crate::process::proc_kill::kill_by_port(port).await {
+            Ok(killed) => ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed),
+            Err(e) => ledger.no_target(
+                StopStrategy::KillByPort,
+                format!("listener probe could not answer: {}", e),
+            ),
+        },
+        ReapKill::ListenersOnly => {
+            match crate::process::proc_kill::kill_listeners_by_port(port).await {
+                Ok(killed) => ledger.ran(
+                    StopStrategy::KillByPort,
+                    format!("port {} (listeners only, no group kill)", port),
+                    killed,
+                ),
+                Err(e) => ledger.no_target(
+                    StopStrategy::KillByPort,
+                    format!("listener probe could not answer: {}", e),
+                ),
+            }
+        }
+    }
+}
+
 /// Extra bounded wait before the final re-confirmation of the stop reap
 /// (see [`StopReapOutcome::RetryAfterBackoff`]).
 const STOP_REAP_BACKOFF_SECS: u64 = 4;
@@ -4968,31 +5085,53 @@ pub(crate) enum GracefulExitSignal {
     /// The registry's `running` flag went false — today's signal, used for
     /// every non-handoff stop.
     RunningFlag,
-    /// This PID is no longer alive. Used under a handoff whenever a target PID
-    /// is known, because `running` can flip on one failed `/health` probe
-    /// while the runner is still mid-teardown.
+    /// This PID is no longer alive. Used under a handoff when the target PID
+    /// came from the registry, because `running` can flip on one failed
+    /// `/health` probe while the runner is still mid-teardown.
     PidGone(u32),
+    /// As [`GracefulExitSignal::PidGone`], OR `running` is false AND the port
+    /// is free. Used under a handoff when the PID came from a probe (listener
+    /// or image identity): that PID is only a candidate, so the runner's own
+    /// exit is also accepted on the joint evidence of a cleared flag and a
+    /// released port — the flag alone is never enough.
+    PidGoneOrStoppedAndPortFree(u32),
 }
 
-/// Pick the graceful-exit signal. A handoff with no known PID falls back to
-/// [`GracefulExitSignal::RunningFlag`], and the caller logs that it did.
-pub(crate) fn graceful_exit_signal(intent: CloseIntent, pid: Option<u32>) -> GracefulExitSignal {
+/// Pick the graceful-exit signal. `pid_from_registry` says whether `pid` came
+/// from the registry (exact) or from a probe (a candidate). A handoff with no
+/// known PID falls back to [`GracefulExitSignal::RunningFlag`], and the caller
+/// logs that it did.
+pub(crate) fn graceful_exit_signal(
+    intent: CloseIntent,
+    pid: Option<u32>,
+    pid_from_registry: bool,
+) -> GracefulExitSignal {
     match (intent, pid) {
-        (CloseIntent::HandoffHolders, Some(pid)) => GracefulExitSignal::PidGone(pid),
+        (CloseIntent::HandoffHolders, Some(pid)) if pid_from_registry => {
+            GracefulExitSignal::PidGone(pid)
+        }
+        (CloseIntent::HandoffHolders, Some(pid)) => {
+            GracefulExitSignal::PidGoneOrStoppedAndPortFree(pid)
+        }
         _ => GracefulExitSignal::RunningFlag,
     }
 }
 
-/// Has the runner exited, by `signal`? `pid_alive` is injected so the
-/// decision is testable without a process.
+/// Has the runner exited, by `signal`? `pid_alive` and `port_held` are
+/// injected so the decision is testable without a process or a socket;
+/// `port_held` is consulted only by the arm that needs it.
 pub(crate) fn graceful_exit_observed(
     signal: GracefulExitSignal,
     running: bool,
     pid_alive: impl Fn(u32) -> bool,
+    port_held: impl Fn() -> bool,
 ) -> bool {
     match signal {
         GracefulExitSignal::RunningFlag => !running,
         GracefulExitSignal::PidGone(pid) => !pid_alive(pid),
+        GracefulExitSignal::PidGoneOrStoppedAndPortFree(pid) => {
+            !pid_alive(pid) || (!running && !port_held())
+        }
     }
 }
 
@@ -5328,7 +5467,14 @@ pub async fn stop_runner_by_id(
     //    would end the wait early and the PID kill below would cut the detach.
     //    See `graceful_exit_signal`.
     let graceful_timeout = intent.graceful_stop_timeout();
-    let exit_signal = graceful_exit_signal(intent, pid_to_kill);
+    let pid_from_registry = matches!(
+        &stop_target,
+        StopTarget::Found {
+            source: PidSource::Registry,
+            ..
+        }
+    );
+    let exit_signal = graceful_exit_signal(intent, pid_to_kill, pid_from_registry);
     if intent.is_handoff() && exit_signal == GracefulExitSignal::RunningFlag {
         let msg = format!(
             "Runner '{}' handoff stop: no target PID was identified, so the graceful wait \
@@ -5345,7 +5491,12 @@ pub async fn stop_runner_by_id(
     let mut exited_gracefully = false;
     while std::time::Instant::now() < graceful_deadline {
         let running = managed.runner.read().await.running;
-        if graceful_exit_observed(exit_signal, running, crate::process::proc_kill::pid_alive) {
+        if graceful_exit_observed(
+            exit_signal,
+            running,
+            crate::process::proc_kill::pid_alive,
+            || crate::process::port::is_port_listening(port),
+        ) {
             let msg = format!(
                 "Runner '{}' exited gracefully after close-request",
                 runner_name
@@ -5448,92 +5599,41 @@ pub async fn stop_runner_by_id(
             // Confirm-first: poll the port for up to 5s. A graceful exit or a
             // prior kill that lands late resolves here without escalation.
             let port_free = wait_for_port_free(port, 5).await;
-            match decide_stop_reap(attempt, !port_free) {
+            let outcome = decide_stop_reap(attempt, !port_free);
+            match outcome {
                 StopReapOutcome::Confirmed => break,
-                StopReapOutcome::EscalateTree if intent.is_handoff() => {
-                    // A tree / process-group kill would signal the holders the
-                    // handoff exists to keep. Skip that rung and go straight
-                    // to the port-level kill, which reaches only the listener.
-                    let why = "skipped under handoff: a process-group kill would signal the \
-                               holder processes the handoff keeps alive";
+                StopReapOutcome::EscalateTree | StopReapOutcome::EscalatePort => {
+                    // WHICH kill primitives run is decided by `reap_kills`, a
+                    // pure table, so the handoff guarantee — no tree or
+                    // process-group kill, which would signal the holder
+                    // processes the handoff keeps alive — is tested on the
+                    // decision rather than on this loop's text.
+                    let kills = reap_kills(outcome, intent);
                     warn!(
-                        "Port {} still in use after stopping runner '{}' (handoff, attempt {}) \
-                         — {}; escalating to kill-by-port instead",
-                        port, runner_name, attempt, why
-                    );
-                    ledger.no_target(StopStrategy::TreeKill, why);
-                    match crate::process::proc_kill::kill_by_port(port).await {
-                        Ok(killed) => {
-                            ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
+                        "Port {} still in use for runner '{}' (attempt {}), escalating: {:?}{}",
+                        port,
+                        runner_name,
+                        attempt,
+                        kills,
+                        if intent.is_handoff() {
+                            " — handoff: listener-only kills, no tree / process-group kill"
+                        } else {
+                            ""
                         }
-                        Err(e) => ledger.no_target(
-                            StopStrategy::KillByPort,
-                            format!("listener probe could not answer: {}", e),
-                        ),
+                    );
+                    if intent.is_handoff() && outcome == StopReapOutcome::EscalateTree {
+                        ledger.no_target(StopStrategy::TreeKill, HANDOFF_TREE_KILL_SKIPPED);
                     }
-                }
-                StopReapOutcome::EscalateTree => {
-                    warn!(
-                        "Port {} still in use after stopping runner '{}', \
-                         escalating to tree-kill (attempt {})",
-                        port, runner_name, attempt
-                    );
-                    {
-                        match pid_to_kill {
-                            Some(pid) => {
-                                let killed = crate::process::proc_kill::kill_by_pid_tree(pid)
-                                    .await
-                                    .unwrap_or(false);
-                                ledger.ran(
-                                    StopStrategy::TreeKill,
-                                    format!("PID {} (+ child tree)", pid),
-                                    killed,
-                                );
-                            }
-                            None => ledger.no_target(StopStrategy::TreeKill, no_target_why.clone()),
-                        }
-                        // Also catch a survivor whose PID we never tracked
-                        // (orphan adopted on a port we knew but no PID for).
-                        // A probe that could not RUN is UNKNOWN — never a
-                        // kill; the next escalation step re-confirms anyway.
-                        match crate::process::proc_kill::find_pid_on_port(port).await {
-                            Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
-                                let killed = crate::process::proc_kill::kill_by_pid_tree(live_pid)
-                                    .await
-                                    .unwrap_or(false);
-                                ledger.ran(
-                                    StopStrategy::TreeKill,
-                                    format!("untracked listener PID {}", live_pid),
-                                    killed,
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => warn!(
-                                "Stop-reap escalation for runner '{}': listener probe on port \
-                                 {} failed ({}) — skipping the untracked-survivor kill",
-                                runner_name, port, e
-                            ),
-                        }
-                    }
-                }
-                StopReapOutcome::EscalatePort => {
-                    warn!(
-                        "Port {} STILL in use for runner '{}' after tree-kill, \
-                         escalating to kill-by-port (attempt {})",
-                        port, runner_name, attempt
-                    );
-                    match crate::process::proc_kill::kill_by_port(port).await {
-                        Ok(killed) => {
-                            ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
-                        }
-                        // The listener probe could not answer, so kill-by-port
-                        // had nothing to aim at. Recording this as a NON-RUN is
-                        // the whole point: it is exactly the case the old fixed
-                        // failure sentence misreported as an attempted kill.
-                        Err(e) => ledger.no_target(
-                            StopStrategy::KillByPort,
-                            format!("listener probe could not answer: {}", e),
-                        ),
+                    for kill in kills {
+                        run_reap_kill(
+                            *kill,
+                            port,
+                            pid_to_kill,
+                            &no_target_why,
+                            &runner_name,
+                            &mut ledger,
+                        )
+                        .await;
                     }
                 }
                 StopReapOutcome::RetryAfterBackoff => {

@@ -28,7 +28,10 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
 ///
 /// Unix: `kill(pid, 0)` ([`crate::process::unix_kill::pid_alive`]) — an
 /// unreaped zombie still reads alive, which errs toward waiting longer, never
-/// toward killing early. Windows: sysinfo can name the PID.
+/// toward killing early. Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+/// + `GetExitCodeProcess` == `STILL_ACTIVE` — one handle per call, no process
+/// enumeration, so it is cheap enough to poll every 100 ms. An open refused
+/// with `ERROR_ACCESS_DENIED` means the process exists, so it reads alive.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
@@ -36,11 +39,28 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
-        let system = System::new_with_specifics(
-            RefreshKind::new().with_processes(ProcessRefreshKind::new()),
-        );
-        system.process(Pid::from_u32(pid)).is_some()
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: documented call with scalar arguments; bInheritHandle = 0.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: reads the calling thread's last-error value.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut code: u32 = 0;
+        // SAFETY: `handle` is a valid open process handle; `code` is a valid
+        // out pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        // SAFETY: `handle` is a valid open handle, closed exactly once.
+        unsafe {
+            CloseHandle(handle);
+        }
+        // A failed query is UNKNOWN; read it as alive so the wait errs long.
+        ok == 0 || code == STILL_ACTIVE as u32
     }
 }
 
@@ -59,6 +79,15 @@ pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
 /// than as an attempted kill.
 pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     imp::kill_by_port(port).await
+}
+
+/// Kill every process LISTENING on `port` with a plain per-PID kill — never a
+/// process-group or child-tree kill. A handoff stop uses this instead of
+/// [`kill_by_port`], whose Unix arm tree-kills each listener (signalling its
+/// whole process group, holders included). Same `Err` contract as
+/// [`kill_by_port`].
+pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
+    imp::kill_listeners_by_port(port).await
 }
 
 /// Return the PID of the first process LISTENING on `port`.
