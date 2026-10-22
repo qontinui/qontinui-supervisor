@@ -3093,3 +3093,206 @@ fn stated_defaults_reads_each_doc_spelling() {
     assert_eq!(stated_defaults("Defaults to sixty."), vec![(None, None)]);
     assert_eq!(stated_defaults("no default stated"), vec![]);
 }
+
+// ── Handoff restart through the route (plan
+//    2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them, D7)
+
+/// A fake runner: serves `/restart-readiness` with `readiness`, records every
+/// close-request body, and — like a real runner finishing its teardown — on
+/// the close-request kills `child` (the runner's stand-in process) and stops
+/// listening, so the stop's PID wait and port reap both resolve without
+/// any kill landing on this test process.
+#[cfg(unix)]
+async fn spawn_fake_runner(
+    readiness: &'static str,
+    child: Option<tokio::process::Child>,
+) -> (u16, Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>) {
+    use axum::routing::{get, post};
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let child = Arc::new(tokio::sync::Mutex::new(child));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sink = seen.clone();
+    let app = axum::Router::new()
+        .route(
+            crate::restart_readiness::READINESS_PATH,
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    readiness,
+                )
+            }),
+        )
+        .route(
+            crate::process::manager::CLOSE_REQUEST_PATH,
+            post(move |body: axum::body::Bytes| {
+                let sink = sink.clone();
+                let child = child.clone();
+                let stop_tx = stop_tx.clone();
+                async move {
+                    sink.lock().await.push(body.to_vec());
+                    if let Some(mut c) = child.lock().await.take() {
+                        let _ = c.kill().await; // kill + reap
+                    }
+                    let _ = stop_tx.send(true);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut rx = stop_rx;
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.wait_for(|v| *v).await;
+            })
+            .await;
+    });
+    (port, seen)
+}
+
+/// A registered, protected, responding named runner on `port`, with `pid` as
+/// its registry PID.
+#[cfg(unix)]
+async fn register_live_named_runner(
+    state: &crate::state::SharedState,
+    id: &str,
+    port: u16,
+    pid: Option<u32>,
+) {
+    let config = crate::config::RunnerConfig {
+        id: id.to_string(),
+        name: format!("Runner {id}"),
+        port,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: id.to_string(),
+        },
+        protected: true,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: Default::default(),
+    };
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    {
+        let mut h = managed.cached_health.write().await;
+        h.runner_port_open = true;
+        h.runner_responding = true;
+    }
+    {
+        let mut r = managed.runner.write().await;
+        r.running = true;
+        r.pid = pid;
+        r.last_seen_responding_at = Some(chrono::Utc::now());
+    }
+    state.runners.write().await.insert(id.to_string(), managed);
+}
+
+#[cfg(unix)]
+fn handoff_route_state() -> crate::state::SharedState {
+    use crate::config::{CliArgs, SupervisorConfig};
+    use clap::Parser;
+    let args = CliArgs::parse_from(["test", "--project-dir", "."]);
+    Arc::new(crate::state::SupervisorState::new(
+        SupervisorConfig::from_args(args),
+    ))
+}
+
+#[cfg(unix)]
+async fn call_restart_route(
+    state: crate::state::SharedState,
+    id: &str,
+    body: serde_json::Value,
+) -> axum::http::StatusCode {
+    use axum::response::IntoResponse;
+    let req: super::RestartRunnerRequest = serde_json::from_value(body).expect("request");
+    match super::restart_runner(
+        axum::extract::State(state),
+        axum::extract::Path(id.to_string()),
+        axum::Json(req),
+    )
+    .await
+    {
+        Ok(resp) => resp.status(),
+        Err(e) => e.into_response().status(),
+    }
+}
+
+/// Entry-level: `POST /runners/{id}/restart {"handoff":true}` against a runner
+/// reporting `safe_with_handoff: true` passes the gate and the runner receives
+/// `{"handoff":"holders"}` on its close-request. Enters through the route
+/// handler `routes::runners::restart_runner` (no rebuild); the restart then
+/// fails at the START half, since this state has no runner exe — which is
+/// past everything this test asserts.
+#[cfg(unix)]
+#[tokio::test]
+async fn handoff_restart_route_forwards_the_intent_to_the_runner() {
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn stand-in runner process");
+    let child_pid = child.id().expect("pid");
+    let (port, seen) = spawn_fake_runner(
+        r#"{"safe_to_restart": false, "safe_with_handoff": true,
+            "terminal_sessions": {"count": 2}}"#,
+        Some(child),
+    )
+    .await;
+    let state = handoff_route_state();
+    register_live_named_runner(&state, "named-handoff-route", port, Some(child_pid)).await;
+
+    let started = std::time::Instant::now();
+    let status = call_restart_route(
+        state,
+        "named-handoff-route",
+        serde_json::json!({ "handoff": true }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "the gate admitted it"
+    );
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1, "exactly one close-request");
+    let body: serde_json::Value = serde_json::from_slice(&seen[0]).expect("JSON body");
+    assert_eq!(body, serde_json::json!({ "handoff": "holders" }));
+    // The stand-in exited on the close-request, so the PID wait ended well
+    // inside the 30 s handoff window rather than timing out.
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(!crate::process::proc_kill::pid_alive(child_pid));
+}
+
+/// Entry-level: the same request against a runner reporting
+/// `safe_with_handoff: false` is refused 409, and no close-request is sent.
+#[cfg(unix)]
+#[tokio::test]
+async fn handoff_restart_route_refuses_when_the_runner_says_unsafe() {
+    let (port, seen) = spawn_fake_runner(
+        r#"{"safe_to_restart": false, "safe_with_handoff": false,
+            "terminal_sessions": {"count": 2}}"#,
+        None,
+    )
+    .await;
+    let state = handoff_route_state();
+    register_live_named_runner(&state, "named-handoff-refused", port, None).await;
+
+    let status = call_restart_route(
+        state,
+        "named-handoff-refused",
+        serde_json::json!({ "handoff": true }),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert!(seen.lock().await.is_empty(), "no close-request may be sent");
+}

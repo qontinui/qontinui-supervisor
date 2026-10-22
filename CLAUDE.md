@@ -666,7 +666,7 @@ unnecessary.
 | POST | `/runners/{id}/start` | Start a runner |
 | POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). **`force` is the restart-readiness override** — see "The restart-readiness gate". |
 | POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?, from_working_tree?, handoff?}` — every field defaults but **the body itself is required** (this route takes `Json`, not `OptionalJson`, unlike `/runners/{id}/stop`), and unknown fields are **rejected** rather than ignored, so a misspelled `from_working_tree` is a **422** (axum's `JsonDataError`, not the hand-rolled 400 the spawn-test alias guard returns) and never a silent revert to origin/main. **`force` is the restart-readiness override** — see "The restart-readiness gate". **`handoff` (default `false`) forwards the handoff intent** — see "Handoff restarts". **`from_working_tree` defaults to `false`**, so a rebuild of the PRIMARY through this route compiles a fresh `origin/main` worktree; it is inert for named/temp runners, which build the live tree regardless. The **build source** then matches `POST /runner/restart`, but the two doors are not otherwise equivalent: only the singular route mints a dev-action record with risk/prediction, optionally waits for the runner to bind its port, and attaches `origin_main_drift` to the recorded outcome — and that last one only on the **escape-hatch** (live-tree) rebuild, since an origin/main worktree is at origin/main by construction and the default path deliberately records `null`. The readiness gate is shared (it lives inside `restart_runner_by_id`), so the safety half is the same; the observability is not. `rebuild: true` returns **202** `{status:"rebuilding", build_id, poll, build_source}`; `build_source` (`origin_main` \| `live_tree`) names the tree the rebuild selects and is `null` when the id names no registered runner — see "The 202 says which tree". |
-| POST | `/runners/{id}/rebuild-and-restart` | Stop → build the **live tree** → start any **non-primary** runner, **detached**. Body `{source?, force?, handoff?, wait?, wait_timeout_secs?}` — every field defaults but **the body itself is required** (`Json`, not `OptionalJson`), and unknown fields are ignored; `force` is the restart-readiness override, `handoff` the handoff intent (see "Handoff restarts"). Refuses the primary. Returns **202** `{status:"rebuilding", build_id, submission_id, poll:"/builds", build_source}` — `build_source` is `live_tree`, or `null` when the id names no runner or the primary (see "The 202 says which tree"). Poll `GET /build/{id}/status` for the terminal outcome. |
+| POST | `/runners/{id}/rebuild-and-restart` | Stop → build the **live tree** → start any **non-primary** runner, **detached**. Body `{source?, force?, handoff?, wait?, wait_timeout_secs?}` — every field defaults but **the body itself is required** (`Json`, not `OptionalJson`), and unknown fields are **rejected** (422); `force` is the restart-readiness override, `handoff` the handoff intent (see "Handoff restarts"). Refuses the primary. Returns **202** `{status:"rebuilding", build_id, submission_id, poll:"/builds", build_source}` — `build_source` is `live_tree`, or `null` when the id names no runner or the primary (see "The 202 says which tree"). Poll `GET /build/{id}/status` for the terminal outcome. |
 | POST | `/runners/{id}/protect` | Toggle protection on a runner |
 | POST | `/runners/{id}/watchdog` | Control watchdog for a specific runner |
 | GET | `/runners/{id}/logs` | Log history for a specific runner |
@@ -849,7 +849,7 @@ killing them, so the successor runner can adopt them (plan
 D7). **The decision and the mechanism live in the runner; the supervisor only
 forwards the intent and gates on the runner's answer** — it is dev-only, and
 nothing a user has depends on it. Internally the flag is
-`manager::CloseIntent` (`Kill` / `HandoffHolders`). Three things change, and
+`manager::CloseIntent` (`Kill` / `HandoffHolders`). What changes, and
 only these:
 
 - **The close-request carries `{"handoff":"holders"}`** as JSON. Without
@@ -861,14 +861,28 @@ only these:
   (`cause: handoff_unsafe`); **absent or `null` refuses the same way**
   (`cause: handoff_verdict_absent`, `safe_with_handoff: null`) — an older
   runner that does not serve the field would also ignore the handoff body and
-  kill every pane, so it is UNKNOWN, never safe. The census and UNKNOWN arms
-  are unchanged, and `force` overrides every refusal exactly as before.
+  kill every pane, so it is UNKNOWN, never safe. The UNKNOWN
+  arm is unchanged, and `force` overrides every refusal exactly as before.
+- **The `temp_runner` and `runner_not_protected` exemptions do NOT apply under
+  a handoff.** They answer "is there work to protect?"; a handoff asks "will
+  this runner honour the intent?", which only the runner can answer, so the
+  probe runs and the same refusals apply. `runner_not_running` still skips —
+  no runner process is there to receive the intent. A wedged door's **zero
+  census does not admit a handoff** either (`handoff_verdict_absent`,
+  `source: supervisor_census`): the runner could not be asked, and a holder
+  process need not sit in its process subtree.
 - **The graceful wait before the PID kill is 30 s instead of 3 s**
   (`config::RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`), above the runner's own
   teardown `FORCE_EXIT_BUDGET` (25 s = `WORKER_BUDGET` 22 s + 3 s margin,
   `mod shutdown_budget` in qontinui-runner `src-tauri/src/main.rs`), so the
   supervisor's kill never cuts a handoff teardown that is still inside its
-  budget. A handoff close-request that does not land is logged at `Warn`
+  budget. The wait ends when the **target PID is gone**, not when `running`
+  flips: for the primary `running` mirrors `/health`, so one failed probe
+  mid-teardown would end it early. With no known PID it falls back to
+  `running` and says so at `Warn`.
+- **The reap escalation skips the tree / process-group kill** (which would
+  signal the holders) and goes straight to kill-by-port, recording the tree
+  rung as skipped. A handoff close-request that does not land is logged at `Warn`
   (a normal one stays at `Debug`).
 
 The serving watchdog and every other internal stop pass `CloseIntent::Kill`.

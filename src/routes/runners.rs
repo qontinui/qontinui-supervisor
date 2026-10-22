@@ -159,7 +159,12 @@ pub struct PurgeStaleRequest {
 /// have to combine `POST /runners/{id}/stop` + a build + `POST .../start`
 /// manually. Refuses to operate on the primary; any other registered runner
 /// is accepted.
+///
+/// Unknown fields are REJECTED (422): a misspelled `handoff` must never
+/// silently become a kill-every-pane restart. No in-repo caller sends extra
+/// keys (the dashboard has no client for this route).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildAndRestartRequest {
     /// Optional source label, recorded in diagnostic events.
     #[serde(default)]
