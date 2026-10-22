@@ -29,9 +29,10 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
 /// Unix: `kill(pid, 0)` ([`crate::process::unix_kill::pid_alive`]) — an
 /// unreaped zombie still reads alive, which errs toward waiting longer, never
 /// toward killing early. Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
-/// + `GetExitCodeProcess` == `STILL_ACTIVE` — one handle per call, no process
-/// enumeration, so it is cheap enough to poll every 100 ms. An open refused
-/// with `ERROR_ACCESS_DENIED` means the process exists, so it reads alive.
+/// then `GetExitCodeProcess` == `STILL_ACTIVE` — one handle per call, no
+/// process enumeration, so it is cheap enough to poll every 100 ms. An open
+/// refused with `ERROR_ACCESS_DENIED` means the process exists, so it reads
+/// alive.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
