@@ -3705,6 +3705,7 @@ pub(crate) enum ReapKill {
 
 impl ReapKill {
     /// Does this primitive signal anything beyond the listener itself?
+    #[cfg(test)]
     pub(crate) fn reaches_beyond_the_listener(self) -> bool {
         !matches!(self, ReapKill::ListenersOnly)
     }
