@@ -3760,3 +3760,77 @@ fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
         .to_string();
     assert!(after_gate.contains("stop_runner_by_id(state, runner_id, true, intent).await?;"));
 }
+
+/// Under a handoff the graceful wait ends on the PID being gone, never on the
+/// `running` flag — which, for a user-managed runner, one failed `/health`
+/// probe during teardown would clear. A normal stop is unchanged.
+#[test]
+fn handoff_graceful_wait_ends_on_the_pid_not_the_running_flag() {
+    let alive = |_: u32| true;
+    let dead = |_: u32| false;
+
+    let handoff = graceful_exit_signal(CloseIntent::HandoffHolders, Some(4242));
+    assert_eq!(handoff, GracefulExitSignal::PidGone(4242));
+    // The failed-probe case: `running` already reads false, the PID lives on.
+    assert!(!graceful_exit_observed(handoff, false, alive));
+    assert!(graceful_exit_observed(handoff, true, dead));
+
+    // No known PID: falls back to today's flag (the stop logs that it did).
+    let fallback = graceful_exit_signal(CloseIntent::HandoffHolders, None);
+    assert_eq!(fallback, GracefulExitSignal::RunningFlag);
+
+    // A normal stop keeps the flag whatever the PID says.
+    let normal = graceful_exit_signal(CloseIntent::Kill, Some(4242));
+    assert_eq!(normal, GracefulExitSignal::RunningFlag);
+    assert!(graceful_exit_observed(normal, false, alive));
+    assert!(!graceful_exit_observed(normal, true, dead));
+}
+
+/// The liveness probe the handoff wait uses: this process is alive, and a
+/// child that has exited and been reaped is not.
+#[tokio::test]
+async fn pid_alive_tracks_a_reaped_child() {
+    assert!(crate::process::proc_kill::pid_alive(std::process::id()));
+    let mut child = if cfg!(target_os = "windows") {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap()
+    } else {
+        tokio::process::Command::new("true").spawn().unwrap()
+    };
+    let pid = child.id().expect("child pid");
+    child.wait().await.unwrap();
+    assert!(!crate::process::proc_kill::pid_alive(pid));
+}
+
+/// Under a handoff the reap escalation never takes the process-group rung:
+/// it records the tree kill as skipped and goes to kill-by-port. Pinned at
+/// source level for the same reason as the wait above — the rung only runs
+/// against a live runner process.
+#[test]
+fn handoff_reap_skips_the_process_group_kill() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let stop = crate::source_scan::fn_body(&src, "pub async fn stop_runner_by_id(")
+        .expect("stop_runner_by_id exists")
+        .to_string();
+    let (_, handoff_arm) = stop
+        .split_once("StopReapOutcome::EscalateTree if intent.is_handoff() => {")
+        .expect("a handoff-specific tree rung");
+    let handoff_arm = handoff_arm
+        .split_once("StopReapOutcome::EscalateTree => {")
+        .expect("the normal tree rung follows")
+        .0;
+    assert!(!handoff_arm.contains("kill_by_pid_tree("));
+    assert!(handoff_arm.contains("ledger.no_target(StopStrategy::TreeKill, why);"));
+    assert!(handoff_arm.contains("kill_by_port(port)"));
+    assert!(stop.contains("graceful_exit_observed(exit_signal, running,"));
+}

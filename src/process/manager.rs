@@ -4962,6 +4962,40 @@ async fn request_drain(state: &SharedState, port: u16, runner_name: &str) {
     }
 }
 
+/// What the stop's graceful poll treats as "the runner has exited".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GracefulExitSignal {
+    /// The registry's `running` flag went false — today's signal, used for
+    /// every non-handoff stop.
+    RunningFlag,
+    /// This PID is no longer alive. Used under a handoff whenever a target PID
+    /// is known, because `running` can flip on one failed `/health` probe
+    /// while the runner is still mid-teardown.
+    PidGone(u32),
+}
+
+/// Pick the graceful-exit signal. A handoff with no known PID falls back to
+/// [`GracefulExitSignal::RunningFlag`], and the caller logs that it did.
+pub(crate) fn graceful_exit_signal(intent: CloseIntent, pid: Option<u32>) -> GracefulExitSignal {
+    match (intent, pid) {
+        (CloseIntent::HandoffHolders, Some(pid)) => GracefulExitSignal::PidGone(pid),
+        _ => GracefulExitSignal::RunningFlag,
+    }
+}
+
+/// Has the runner exited, by `signal`? `pid_alive` is injected so the
+/// decision is testable without a process.
+pub(crate) fn graceful_exit_observed(
+    signal: GracefulExitSignal,
+    running: bool,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    match signal {
+        GracefulExitSignal::RunningFlag => !running,
+        GracefulExitSignal::PidGone(pid) => !pid_alive(pid),
+    }
+}
+
 /// Path of the runner's close-request door (`mcp/ui_bridge/page.rs`).
 pub(crate) const CLOSE_REQUEST_PATH: &str = "/ui-bridge/control/page/close-request";
 
@@ -5287,11 +5321,31 @@ pub async fn stop_runner_by_id(
     //    `CloseIntent::graceful_stop_timeout`). When the runner exits, the
     //    monitor task sets running=false — that's our signal that graceful
     //    worked.
+    //
+    //    Under a handoff the signal is the target PID being GONE, not the
+    //    `running` flag: for a user-managed runner `running` mirrors the last
+    //    `/health` probe, so one probe the tearing-down runner fails to answer
+    //    would end the wait early and the PID kill below would cut the detach.
+    //    See `graceful_exit_signal`.
     let graceful_timeout = intent.graceful_stop_timeout();
+    let exit_signal = graceful_exit_signal(intent, pid_to_kill);
+    if intent.is_handoff() && exit_signal == GracefulExitSignal::RunningFlag {
+        let msg = format!(
+            "Runner '{}' handoff stop: no target PID was identified, so the graceful wait \
+             falls back to the `running` flag, which a failed /health probe can end early",
+            runner_name
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+            .await;
+    }
     let graceful_deadline = std::time::Instant::now() + graceful_timeout;
     let mut exited_gracefully = false;
     while std::time::Instant::now() < graceful_deadline {
-        if !managed.runner.read().await.running {
+        let running = managed.runner.read().await.running;
+        if graceful_exit_observed(exit_signal, running, crate::process::proc_kill::pid_alive) {
             let msg = format!(
                 "Runner '{}' exited gracefully after close-request",
                 runner_name
@@ -5396,6 +5450,28 @@ pub async fn stop_runner_by_id(
             let port_free = wait_for_port_free(port, 5).await;
             match decide_stop_reap(attempt, !port_free) {
                 StopReapOutcome::Confirmed => break,
+                StopReapOutcome::EscalateTree if intent.is_handoff() => {
+                    // A tree / process-group kill would signal the holders the
+                    // handoff exists to keep. Skip that rung and go straight
+                    // to the port-level kill, which reaches only the listener.
+                    let why = "skipped under handoff: a process-group kill would signal the \
+                               holder processes the handoff keeps alive";
+                    warn!(
+                        "Port {} still in use after stopping runner '{}' (handoff, attempt {}) \
+                         — {}; escalating to kill-by-port instead",
+                        port, runner_name, attempt, why
+                    );
+                    ledger.no_target(StopStrategy::TreeKill, why);
+                    match crate::process::proc_kill::kill_by_port(port).await {
+                        Ok(killed) => {
+                            ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
+                        }
+                        Err(e) => ledger.no_target(
+                            StopStrategy::KillByPort,
+                            format!("listener probe could not answer: {}", e),
+                        ),
+                    }
+                }
                 StopReapOutcome::EscalateTree => {
                     warn!(
                         "Port {} still in use after stopping runner '{}', \

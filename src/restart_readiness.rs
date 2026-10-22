@@ -659,6 +659,22 @@ pub fn decide_skip(
     }
 }
 
+/// Does an exemption still apply under this close intent?
+///
+/// The exemptions answer "is there work to protect?". A handoff asks a
+/// different question — "will this runner honour the intent?" — and only the
+/// runner can answer it, so under [`CloseIntent::HandoffHolders`] the temp and
+/// unprotected exemptions do NOT skip the probe: an older build would ignore
+/// the handoff body and kill every pane, exactly as on a protected runner.
+/// [`SkipReason::NotRunning`] still skips: no runner process is alive to
+/// receive the intent or to kill a pane, so there is nothing to hand off.
+pub fn skip_applies(reason: SkipReason, intent: CloseIntent) -> bool {
+    match intent {
+        CloseIntent::Kill => true,
+        CloseIntent::HandoffHolders => matches!(reason, SkipReason::NotRunning),
+    }
+}
+
 /// Everything an operator or a caller needs to see about a refusal — or about
 /// an override, which is logged with the identical payload so the two are
 /// comparable in a log search.
@@ -955,6 +971,42 @@ pub fn decide(
     let url = format!("http://127.0.0.1:{}{}", port, READINESS_PATH);
 
     let refusal = match readiness {
+        // Under a handoff a zero census is not enough: the runner's door is
+        // wedged, so it cannot say whether it honours the intent, and holder
+        // processes need not sit in its process subtree for the census to see.
+        Readiness::CensusSafe { census } if intent.is_handoff() => {
+            let message = format!(
+                "restart_refused_unsafe_for_handoff: runner '{runner_name}' (port {port}) did not \
+                 answer {READINESS_PATH}, so it cannot report safe_with_handoff — whether a \
+                 handoff {act} would keep its work is UNKNOWN, and UNKNOWN is never safe. The \
+                 supervisor's census found zero live `claude` under PID {root}, but a holder \
+                 process need not be in that subtree, and a runner that cannot answer may not \
+                 receive the handoff intent either. Re-issue without `handoff`, or with \
+                 {{\"force\": true}} to {act} anyway; the override is logged with this verdict.",
+                act = action.as_str(),
+                root = census.root_pid,
+            );
+            RefusalDetail {
+                cause: "handoff_verdict_absent",
+                payload: serde_json::json!({
+                    "error": "restart_refused_unsafe_for_handoff",
+                    "cause": "handoff_verdict_absent",
+                    "source": ReadinessSource::SupervisorCensus.as_str(),
+                    "runner_id": runner_id,
+                    "runner_name": runner_name,
+                    "action": action.as_str(),
+                    "handoff": true,
+                    "message": message,
+                    "safe_with_handoff": serde_json::Value::Null,
+                    "would_be_lost": serde_json::Value::Null,
+                    "readiness_url": url,
+                    "readiness": serde_json::Value::Null,
+                    "census": census.to_json(),
+                    "override": "re-issue with {\"force\": true}, or without `handoff`",
+                }),
+                message,
+            }
+        }
         Readiness::CensusSafe { .. } => return GateDecision::Allowed,
         Readiness::Safe { report, raw } | Readiness::Unsafe { report, raw }
             if intent.is_handoff() =>
@@ -1151,8 +1203,17 @@ pub async fn enforce(
         crate::process::manager::is_temp_runner(&runner_id),
         managed.is_protected().await,
     ) {
-        skip(&runner_id, action, reason);
-        return Ok(());
+        if skip_applies(reason, intent) {
+            skip(&runner_id, action, reason);
+            return Ok(());
+        }
+        debug!(
+            "restart-readiness: '{}' ({}) would skip ({}) but the HANDOFF intent must be \
+             confirmed by the runner — probing",
+            runner_id,
+            action.as_str(),
+            reason.as_str()
+        );
     }
 
     // Ask the runner; fall back to the supervisor's own process table only
@@ -2517,5 +2578,155 @@ mod tests {
                 v.reason
             );
         }
+    }
+
+    // ── Handoff ignores the "nothing to protect" exemptions (review round 1)
+
+    /// A temp runner whose port serves `body` at `/restart-readiness`.
+    async fn temp_runner_serving(id: &str, body: &'static str) -> crate::state::ManagedRunner {
+        let base = spawn_mock(200, body).await;
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        let (managed, _) = managed_on_dead_port(
+            id,
+            qontinui_types::wire::runner_kind::RunnerKind::Temp { id: id.to_string() },
+            true,
+            true,
+        )
+        .await;
+        let mut config = managed.config.clone();
+        config.port = port;
+        let managed = crate::state::ManagedRunner::new(config, false);
+        managed.runner.write().await.running = true;
+        managed
+    }
+
+    #[test]
+    fn handoff_keeps_only_the_not_running_exemption() {
+        for reason in [
+            SkipReason::TempRunner,
+            SkipReason::NotProtected,
+            SkipReason::NotRunning,
+        ] {
+            assert!(skip_applies(reason, CloseIntent::Kill), "{reason:?}");
+        }
+        assert!(!skip_applies(
+            SkipReason::TempRunner,
+            CloseIntent::HandoffHolders
+        ));
+        assert!(!skip_applies(
+            SkipReason::NotProtected,
+            CloseIntent::HandoffHolders
+        ));
+        assert!(skip_applies(
+            SkipReason::NotRunning,
+            CloseIntent::HandoffHolders
+        ));
+    }
+
+    /// The case the exemption used to hide: a temp runner whose build predates
+    /// `safe_with_handoff` would ignore the intent and kill every pane, so a
+    /// handoff restart of it must be refused, not waved through as "temp".
+    #[tokio::test]
+    async fn enforce_refuses_a_handoff_of_a_temp_runner_that_does_not_report_the_field() {
+        let state = enforce_state();
+        let managed = temp_runner_serving("test-18f2a3b4-7", SAFE).await;
+
+        // Non-vacuous: a normal restart of the same runner is exempt.
+        enforce(
+            &state,
+            &managed,
+            GateAction::Restart,
+            false,
+            CloseIntent::Kill,
+        )
+        .await
+        .expect("a normal restart of a temp runner stays exempt");
+
+        let err = enforce(
+            &state,
+            &managed,
+            GateAction::Restart,
+            false,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect_err("an absent safe_with_handoff must refuse even on a temp runner");
+        let crate::error::SupervisorError::RestartUnsafe(detail) = &err else {
+            panic!("expected RestartUnsafe, got {err:?}");
+        };
+        assert_eq!(detail.cause, "handoff_verdict_absent");
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body["error"], "restart_refused_unsafe_for_handoff");
+
+        // `force` still overrides.
+        enforce(
+            &state,
+            &managed,
+            GateAction::Restart,
+            true,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect("force overrides the handoff refusal");
+    }
+
+    #[tokio::test]
+    async fn enforce_refuses_a_handoff_of_a_temp_runner_reporting_false_and_admits_true() {
+        let state = enforce_state();
+        let refused = temp_runner_serving("test-18f2a3b4-8", HANDOFF_UNSAFE).await;
+        let err = enforce(
+            &state,
+            &refused,
+            GateAction::Restart,
+            false,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect_err("safe_with_handoff=false must refuse on a temp runner");
+        let crate::error::SupervisorError::RestartUnsafe(detail) = &err else {
+            panic!("expected RestartUnsafe, got {err:?}");
+        };
+        assert_eq!(detail.cause, "handoff_unsafe");
+
+        let admitted = temp_runner_serving("test-18f2a3b4-9", UNSAFE_BUT_HANDOFF_SAFE).await;
+        enforce(
+            &state,
+            &admitted,
+            GateAction::Restart,
+            false,
+            CloseIntent::HandoffHolders,
+        )
+        .await
+        .expect("safe_with_handoff=true admits a handoff of a temp runner");
+    }
+
+    /// A wedged door's zero census admits a normal restart but not a handoff:
+    /// the runner could not say whether it honours the intent.
+    #[test]
+    fn a_zero_census_does_not_admit_a_handoff() {
+        let folded = fold_census(
+            Readiness::Unknown(ReadinessUnknown::Unreachable {
+                detail: "connection refused".to_string(),
+            }),
+            Some(Ok(census(&[]))),
+        );
+        assert!(matches!(
+            decide_restart_kill(&folded),
+            GateDecision::Allowed
+        ));
+        let GateDecision::Refused(detail) = decide_handoff(false, &folded) else {
+            panic!("a zero census must not admit a handoff");
+        };
+        assert_eq!(detail.cause, "handoff_verdict_absent");
+        assert_eq!(detail.payload["source"], "supervisor_census");
+        assert_eq!(
+            detail.payload["error"],
+            "restart_refused_unsafe_for_handoff"
+        );
+        assert!(matches!(
+            decide_handoff(true, &folded),
+            GateDecision::Overridden(_)
+        ));
     }
 }

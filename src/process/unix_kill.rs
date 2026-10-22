@@ -45,7 +45,7 @@ const TERM_GRACE_MS: u64 = 1500;
 
 /// Return true if `pid` refers to a live process. Uses `kill(pid, 0)` which
 /// performs the permission/existence check without sending a signal.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 only probes for existence/permission and
     // never delivers a signal. `pid` is a plain integer; no memory is touched.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };

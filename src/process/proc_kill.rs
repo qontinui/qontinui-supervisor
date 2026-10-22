@@ -24,6 +24,26 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
     imp::kill_by_pid(pid).await
 }
 
+/// True while `pid` names a live process.
+///
+/// Unix: `kill(pid, 0)` ([`crate::process::unix_kill::pid_alive`]) — an
+/// unreaped zombie still reads alive, which errs toward waiting longer, never
+/// toward killing early. Windows: sysinfo can name the PID.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::process::unix_kill::pid_alive(pid)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+        let system = System::new_with_specifics(
+            RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+        );
+        system.process(Pid::from_u32(pid)).is_some()
+    }
+}
+
 /// Kill a PID and its child process tree / group. Used by the stop
 /// escalation path so child panes/helpers release the port.
 pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
