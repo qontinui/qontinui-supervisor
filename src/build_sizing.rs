@@ -76,9 +76,11 @@ pub struct DiskInputs {
     pub total_bytes: Option<u64>,
     /// One built slot target dir's size ([`OneTargetEstimate::bytes`]).
     pub one_target_bytes: Option<u64>,
-    /// Slot target dirs ALREADY built on disk. Their space is already gone
-    /// from `free_bytes`, so they are credited rather than charged again.
-    pub built_slots: u32,
+    /// Indices of slot target dirs ALREADY built on disk (a runner exe in
+    /// `debug/`). Their space is already gone from `free_bytes`, so the ones
+    /// the pool would actually use (index below the candidate size) are
+    /// credited rather than charged again.
+    pub built_slot_ids: Vec<usize>,
     /// `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` when set: the floor the guard
     /// will actually enforce, so the derivation subtracts that one.
     pub floor_override_gb: Option<u64>,
@@ -118,6 +120,12 @@ pub fn derive_pool_size(host: HostCapacity, disk: &DiskInputs) -> (u32, PoolSize
     let candidate = cpu_memory_term.clamp(1, DERIVED_POOL_SIZE_CAP);
     let one_target = disk.one_target_bytes.filter(|b| *b > 0);
     let mut disk_floor_gb = None;
+    let built_slots = disk
+        .built_slot_ids
+        .iter()
+        .filter(|id| **id < candidate as usize)
+        .count()
+        .min(u32::MAX as usize) as u32;
     let disk_term = match (disk.free_bytes, one_target) {
         (Some(free), Some(target)) => {
             let floor_gb = disk.floor_override_gb.unwrap_or_else(|| {
@@ -126,7 +134,7 @@ pub fn derive_pool_size(host: HostCapacity, disk: &DiskInputs) -> (u32, PoolSize
             disk_floor_gb = Some(floor_gb);
             let more = (free.saturating_sub(floor_gb.saturating_mul(GIB)) / target)
                 .min(u32::MAX as u64) as u32;
-            Some(disk.built_slots.saturating_add(more))
+            Some(built_slots.saturating_add(more))
         }
         _ => None,
     };
@@ -140,7 +148,7 @@ pub fn derive_pool_size(host: HostCapacity, disk: &DiskInputs) -> (u32, PoolSize
             disk_term,
             disk_free_bytes: disk.free_bytes,
             one_target_bytes: one_target,
-            built_slots: disk.built_slots,
+            built_slots,
             disk_floor_gb,
             cap: DERIVED_POOL_SIZE_CAP,
         },
@@ -358,25 +366,31 @@ pub fn slot_dirs_beyond_pool(pool_root: &Path, pool_size: usize) -> Vec<std::pat
     out
 }
 
-/// Non-empty `slot-*` target dirs under `pool_root`, at any index — the slots
-/// whose bytes are already out of the volume's free space. A `read_dir` per
-/// slot (is it empty?), never a tree walk, so it is cheap at startup and,
-/// unlike the footprint (which walks only `0..pool_size`), it also sees dirs
-/// left beyond a pool that shrank.
-pub fn count_built_slot_dirs(pool_root: &Path) -> u32 {
+/// Indices of the `slot-*` target dirs under `pool_root` that hold a built
+/// runner exe (`debug/<RUNNER_BIN_NAME>` — the same "already built" test the
+/// prewarm uses), sorted. Their bytes are already out of the volume's free
+/// space. One `stat` per slot, never a tree walk, so it is cheap at startup;
+/// unlike the footprint (which walks only `0..pool_size`) it also sees dirs a
+/// shrunk pool left behind. A slot holding only a failed build's stderr or a
+/// prewarm `cargo check` is not built.
+pub fn built_slot_ids(pool_root: &Path) -> Vec<usize> {
     let Ok(entries) = std::fs::read_dir(pool_root) else {
-        return 0;
+        return Vec::new();
     };
-    entries
+    let mut ids: Vec<usize> = entries
         .flatten()
-        .filter(|e| {
+        .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.strip_prefix("slot-")
-                .is_some_and(|n| n.parse::<usize>().is_ok())
-                && std::fs::read_dir(e.path()).is_ok_and(|mut d| d.next().is_some())
+            let id = name.strip_prefix("slot-")?.parse::<usize>().ok()?;
+            e.path()
+                .join("debug")
+                .join(crate::config::RUNNER_BIN_NAME)
+                .is_file()
+                .then_some(id)
         })
-        .count()
-        .min(u32::MAX as usize) as u32
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// The persisted one-target size estimate (see [`ONE_TARGET_ESTIMATE_FILE`]).
@@ -509,12 +523,22 @@ mod tests {
     fn already_built_slots_are_credited() {
         // 3 slots built at 15 GiB, 60 GiB free, floor 45 → 3 + (60-45)/15 = 4.
         let d = DiskInputs {
-            built_slots: 3,
+            built_slot_ids: vec![0, 1, 2],
             ..disk(Some(60 * GIB), Some(2000 * GIB), Some(15 * GIB))
         };
         let (pool, der) = derive_pool_size(host(368, 48), &d);
         assert_eq!(der.disk_term, Some(4));
         assert_eq!(pool, 3);
+        // Leftover dirs ABOVE the slots the pool would use earn no credit:
+        // their space never becomes available to slot-0..2.
+        let d = DiskInputs {
+            built_slot_ids: vec![3, 4, 5],
+            ..disk(Some(60 * GIB), Some(2000 * GIB), Some(15 * GIB))
+        };
+        let (pool, der) = derive_pool_size(host(368, 48), &d);
+        assert_eq!(der.built_slots, 0);
+        assert_eq!(der.disk_term, Some(1));
+        assert_eq!(pool, 1);
     }
 
     /// The disk term subtracts the floor the guard will enforce: the override
@@ -737,11 +761,16 @@ mod tests {
         );
         assert!(slot_dirs_beyond_pool(dir.path(), 3).is_empty());
         assert!(slot_dirs_beyond_pool(&dir.path().join("missing"), 0).is_empty());
-        // Only non-empty numbered slot dirs count as built.
-        assert_eq!(count_built_slot_dirs(dir.path()), 0);
-        std::fs::write(dir.path().join("slot-2").join("f"), "x").unwrap();
-        std::fs::write(dir.path().join("lkg").join("f"), "x").unwrap();
-        assert_eq!(count_built_slot_dirs(dir.path()), 1);
-        assert_eq!(count_built_slot_dirs(&dir.path().join("missing")), 0);
+        // Only numbered slot dirs holding a runner exe count as built: a
+        // failed build's stderr or an `lkg` exe does not.
+        assert!(built_slot_ids(dir.path()).is_empty());
+        std::fs::write(dir.path().join("slot-1").join("last-build.stderr"), "x").unwrap();
+        for d in ["slot-2", "lkg"] {
+            let debug = dir.path().join(d).join("debug");
+            std::fs::create_dir_all(&debug).unwrap();
+            std::fs::write(debug.join(crate::config::RUNNER_BIN_NAME), "exe").unwrap();
+        }
+        assert_eq!(built_slot_ids(dir.path()), vec![2]);
+        assert!(built_slot_ids(&dir.path().join("missing")).is_empty());
     }
 }
