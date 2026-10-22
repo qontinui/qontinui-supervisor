@@ -1208,15 +1208,15 @@ pub(crate) fn fresh_identity_extra_env_refusal(
     config: &crate::config::RunnerConfig,
     key: &str,
 ) -> Option<String> {
-    (config.fresh_device_identity && key == crate::process::instance_root::MACHINE_ID_ENV).then(
-        || {
-            format!(
-                "runner '{}' runs under a fresh device identity: its extra_env {key} is NOT \
+    (config.fresh_device_identity
+        && key.eq_ignore_ascii_case(crate::process::instance_root::MACHINE_ID_ENV))
+    .then(|| {
+        format!(
+            "runner '{}' runs under a fresh device identity: its extra_env {key} is NOT \
                  applied — it would override the device id the runner mints for itself",
-                config.name
-            )
-        },
-    )
+            config.name
+        )
+    })
 }
 
 /// The value `cmd` currently carries for `key`, if it set one.
@@ -1865,5 +1865,7 @@ mod tests {
             .expect("refused for a fresh runner");
         assert!(msg.contains("NOT applied"), "{msg}");
         assert!(super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_API_URL").is_none());
+        // Case-insensitively: Windows env names are.
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "qontinui_machine_id").is_some());
     }
 }

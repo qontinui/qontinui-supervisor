@@ -549,7 +549,10 @@ pub async fn pair_with_token_copying_into(
     // `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b) is
     // given the same identity treatment its spawn got: no harness
     // `machine.json`, no inherited `QONTINUI_MACHINE_ID` — otherwise pairing
-    // it before its first start would hand it the harness's device id.
+    // it would hand it the harness's device id. The pair CLI only READS
+    // `machine.json` (it never mints one), so a flagged target that has not
+    // yet started and minted its own id is refused up front with a typed 409
+    // rather than failing inside the CLI.
     let target_identity = match body.target_runner_id.as_deref() {
         Some(runner_id) => state.get_runner(runner_id).await.map_or(
             crate::process::instance_root::DeviceIdentity::Harness,
@@ -561,6 +564,14 @@ pub async fn pair_with_token_copying_into(
         ),
         None => crate::process::instance_root::DeviceIdentity::Harness,
     };
+    let target_home = body
+        .target_runner_id
+        .as_deref()
+        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .map(|root| root.home_dir());
+    if let Some(refusal) = fresh_target_not_yet_minted(target_identity, target_home.as_deref()) {
+        return (StatusCode::CONFLICT, Json(refusal)).into_response();
+    }
     if let Some(dir) = &target_dir {
         let root = body
             .target_runner_id
@@ -753,6 +764,33 @@ fn server_error(error_kind: &str, message: &str) -> axum::response::Response {
 
 /// Read `device_id` from `~/.qontinui/machine.json`. Tolerates the legacy
 /// `machine_id` key via the same serde alias the runner uses.
+/// The 409 body for pairing a `fresh_device_identity` target that has not
+/// minted its own `<root>/home/machine.json` yet (it mints at first start,
+/// runner `pair::ensure_device_initialized`). The pair CLI reads that file and
+/// never creates it, so the pair could only fail — or, were the harness's
+/// file projected, pair the subject under the harness's device id. `None` for
+/// a harness-identity target, and for a fresh one whose id is minted. PURE
+/// apart from the one `is_file` probe.
+pub(crate) fn fresh_target_not_yet_minted(
+    identity: crate::process::instance_root::DeviceIdentity,
+    target_home: Option<&Path>,
+) -> Option<serde_json::Value> {
+    if identity != crate::process::instance_root::DeviceIdentity::Fresh {
+        return None;
+    }
+    let machine_json = target_home.map(|home| home.join("machine.json"));
+    if machine_json.as_deref().is_some_and(Path::is_file) {
+        return None;
+    }
+    Some(json!({
+        "error": "fresh_identity_not_yet_minted",
+        "machine_json": machine_json.map(|p| p.display().to_string()),
+        "message": "the target runner runs under fresh_device_identity and has not minted its \
+                    own device id yet: start it first, wait until its device_identity.status \
+                    reads \"minted\" (GET /runners), then pair it",
+    }))
+}
+
 pub(crate) fn read_machine_device_id(path: &Path) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct MachineFile {
@@ -785,6 +823,50 @@ pub(crate) fn read_paired_user(path: &Path) -> Result<(String, Option<String>), 
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Phase 8b: a fresh-identity pair target with no minted `machine.json` is
+    /// refused with a typed body; once the runner has minted, and for every
+    /// harness-identity target, nothing is refused. MUTATION: drop the call
+    /// from `pair_with_token_copying_into` and
+    /// `pair_route_refuses_an_unminted_fresh_target` goes red; return `None`
+    /// here and this goes red.
+    #[test]
+    fn fresh_target_is_refused_until_it_has_minted() {
+        use crate::process::instance_root::DeviceIdentity;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Harness, Some(&home)).is_none());
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Harness, None).is_none());
+
+        let body = fresh_target_not_yet_minted(DeviceIdentity::Fresh, Some(&home)).expect("409");
+        assert_eq!(body["error"], "fresh_identity_not_yet_minted");
+        assert!(body["machine_json"]
+            .as_str()
+            .unwrap()
+            .ends_with("machine.json"));
+        let body = fresh_target_not_yet_minted(DeviceIdentity::Fresh, None).expect("409");
+        assert_eq!(body["machine_json"], serde_json::Value::Null);
+
+        fs::write(home.join("machine.json"), br#"{"device_id":"dev-own"}"#).unwrap();
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Fresh, Some(&home)).is_none());
+    }
+
+    /// The handler consults the refusal BEFORE the pair CLI is spawned.
+    #[test]
+    fn pair_route_refuses_an_unminted_fresh_target() {
+        let src = include_str!("runners_pair.rs");
+        let start = src
+            .find("pub async fn pair_with_token_copying_into(")
+            .expect("handler");
+        let body = &src[start..];
+        let guard = body
+            .find("fresh_target_not_yet_minted(target_identity")
+            .expect("the handler must consult fresh_target_not_yet_minted");
+        let spawn = body.find("cmd.spawn()").expect("the CLI spawn");
+        assert!(guard < spawn, "the refusal must precede the CLI spawn");
+    }
     use tempfile::tempdir;
 
     // `stage_private_cli_copy` — the pair route runs a private copy of the

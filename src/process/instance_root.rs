@@ -213,7 +213,11 @@ fn read_device_id(machine_json: &Path) -> DeviceIdRead {
     serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|v| {
+            // `machine_id` is the legacy shape the operator's own
+            // `machine.json` still carries (runner `pair.rs`); the runner and
+            // `runners_pair::read_machine_device_id` accept it too.
             v.get("device_id")
+                .or_else(|| v.get("machine_id"))
                 .and_then(|d| d.as_str())
                 .map(str::trim)
                 .filter(|d| !d.is_empty())
@@ -839,6 +843,20 @@ pub(crate) mod tests {
         assert_eq!(
             device_identity_json(&a, None)["differs_from_harness"],
             serde_json::Value::Null
+        );
+
+        // A harness `machine.json` in the legacy `{"machine_id": ...}` shape
+        // (the operator's own) is still read, so the comparison is made.
+        let legacy = tmp.path().join("legacy-harness");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("machine.json"),
+            br#"{"machine_id":"legacy-device"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            device_identity_json(&a, Some(&legacy))["differs_from_harness"],
+            true
         );
 
         // A subject that somehow carries the harness's id is reported as such.

@@ -497,7 +497,9 @@ fn sync_spawn_test_wait_is_shutdown_aware() {
 fn spawn_path_applies_paired_state_even_without_a_profile_id() {
     let body = fn_source("async fn execute_spawn_build_inner(");
     assert!(
-        body.contains("body.paired_profile_id.as_deref(),\n        id,\n    ) {")
+        body.split_whitespace()
+            .collect::<String>()
+            .contains("body.paired_profile_id.as_deref(),id,){")
             && body.contains("let paired_state = match apply_paired_state_for_spawn("),
         "execute_spawn_build_inner must pass the OPTIONAL paired_profile_id straight to \
              apply_paired_state_for_spawn, so an absent id snapshots the primary"
@@ -3401,6 +3403,16 @@ fn fresh_identity_contradictions_are_refused_with_a_typed_body() {
         .as_str()
         .unwrap()
         .contains("paired_profile_id"));
+
+    // Case-insensitively: Windows env names are, so a lowercase key would
+    // still reach the runner's `QONTINUI_MACHINE_ID` read there.
+    let mut lower = HashMap::new();
+    lower.insert("qontinui_machine_id".to_string(), "x".to_string());
+    let body = super::fresh_device_identity_conflict(true, None, &lower).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["extra_env.qontinui_machine_id"])
+    );
 }
 
 /// Both spawn bodies default the flag to false (and spawn-named's new

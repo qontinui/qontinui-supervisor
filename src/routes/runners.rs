@@ -2155,6 +2155,10 @@ pub struct SpawnNamedRequest {
     /// as `SpawnTestRequest::extra_env` (applied last), and persisted with the
     /// runner's settings entry like every named runner's `extra_env`. A
     /// `DISPLAY` here satisfies the Linux display preflight.
+    ///
+    /// PERSISTED IN PLAINTEXT: unlike a temp runner's, these values are written
+    /// to the supervisor's settings file and survive restarts. Never put a
+    /// token, secret, password or JWT here.
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
 }
@@ -2183,8 +2187,12 @@ pub(crate) fn fresh_device_identity_conflict(
         conflicts.push("paired_profile_id".to_string());
     }
     let machine_id_env = crate::process::instance_root::MACHINE_ID_ENV;
-    if extra_env.contains_key(machine_id_env) {
-        conflicts.push(format!("extra_env.{machine_id_env}"));
+    // Case-insensitively: Windows env names are, so `qontinui_machine_id`
+    // would still reach the runner's `QONTINUI_MACHINE_ID` read there.
+    for key in extra_env.keys() {
+        if key.eq_ignore_ascii_case(machine_id_env) {
+            conflicts.push(format!("extra_env.{key}"));
+        }
     }
     if conflicts.is_empty() {
         return None;

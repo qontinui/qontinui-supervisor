@@ -3926,6 +3926,7 @@ fn fresh_device_identity_reaches_the_non_primary_env_block() {
     fresh_b.fresh_device_identity = true;
     let plain = temp_config(&format!("test-fresh-id-plain-{pid}"), 9879);
     if instance_config_dir(&plain.id).is_none() {
+        eprintln!("SKIP fresh_device_identity_reaches_the_non_primary_env_block: no resolvable instance config dir on this platform");
         return;
     }
     let _cleanup = scopeguard::guard(
