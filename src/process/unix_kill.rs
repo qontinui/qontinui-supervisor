@@ -185,6 +185,24 @@ pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
     Ok(find_pids_on_port(port).await?.into_iter().next())
 }
 
+/// Kill every process listening on `port` with a plain per-PID
+/// [`kill_by_pid`] — NEVER a process-group or tree kill. Used by a handoff
+/// stop, where the group would include holder processes the handoff exists to
+/// keep. Same `Err` contract as [`kill_by_port`].
+pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
+    let mut killed_any = false;
+    for pid in find_pids_on_port(port).await? {
+        info!(
+            "kill_listeners_by_port: killing listener PID {} on port {} (no group kill)",
+            pid, port
+        );
+        if kill_by_pid(pid).await.unwrap_or(false) {
+            killed_any = true;
+        }
+    }
+    Ok(killed_any)
+}
+
 /// Kill every process listening on a specific port. Returns true if at least
 /// one kill landed. Propagates the probe failure as `Err` so a caller that
 /// records what it actually did can distinguish "the port was idle" from

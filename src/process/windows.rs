@@ -123,6 +123,14 @@ pub async fn kill_by_port(port: u16) -> anyhow::Result<bool> {
     Ok(killed_any)
 }
 
+/// Kill every process listening on `port`, one PID at a time
+/// (`taskkill /F /PID`, never `/T`). On Windows this is what [`kill_by_port`]
+/// already does; it exists so a handoff stop names the listener-only
+/// primitive on every platform.
+pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
+    kill_by_port(port).await
+}
+
 /// Process-snapshot variant that also captures each process's command line and
 /// environment. Heavier than [`snapshot_processes`] (cmd + environ are large on
 /// Windows), so it is used ONLY by the slot-scoped cleanup, which needs those

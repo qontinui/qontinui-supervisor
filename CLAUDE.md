@@ -867,7 +867,9 @@ only these:
   a handoff.** They answer "is there work to protect?"; a handoff asks "will
   this runner honour the intent?", which only the runner can answer, so the
   probe runs and the same refusals apply. `runner_not_running` still skips —
-  no runner process is there to receive the intent. A wedged door's **zero
+  no runner process is there to receive the intent — and it does so for a
+  stopped temp or unprotected runner too (`decide_skip_for_intent` re-runs the
+  decision with the two work-to-protect exemptions off). A wedged door's **zero
   census does not admit a handoff** either (`handoff_verdict_absent`,
   `source: supervisor_census`): the runner could not be asked, and a holder
   process need not sit in its process subtree.
@@ -878,11 +880,16 @@ only these:
   supervisor's kill never cuts a handoff teardown that is still inside its
   budget. The wait ends when the **target PID is gone**, not when `running`
   flips: for the primary `running` mirrors `/health`, so one failed probe
-  mid-teardown would end it early. With no known PID it falls back to
-  `running` and says so at `Warn`.
-- **The reap escalation skips the tree / process-group kill** (which would
-  signal the holders) and goes straight to kill-by-port, recording the tree
-  rung as skipped. A handoff close-request that does not land is logged at `Warn`
+  mid-teardown would end it early. A PID that came from a probe rather than
+  the registry is only a candidate, so the wait also ends on `running` false
+  **and** the port free together (never on the flag alone). With no known PID
+  it falls back to `running` and says so at `Warn`.
+- **The reap escalation never runs a tree or process-group kill** — both
+  escalation steps run only `proc_kill::kill_listeners_by_port`, a plain
+  per-PID kill of each listener. The normal ladder's `kill_by_pid_tree` and
+  `kill_by_port` (which on Unix tree-kills each listener, `-(pgid)`) would
+  signal the holders. The tree rung is recorded as skipped; the choice is the
+  `manager::reap_kills` table. A handoff close-request that does not land is logged at `Warn`
   (a normal one stays at `Debug`).
 
 The serving watchdog and every other internal stop pass `CloseIntent::Kill`.

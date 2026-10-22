@@ -3762,28 +3762,58 @@ fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
 }
 
 /// Under a handoff the graceful wait ends on the PID being gone, never on the
-/// `running` flag — which, for a user-managed runner, one failed `/health`
-/// probe during teardown would clear. A normal stop is unchanged.
+/// `running` flag alone — which, for a user-managed runner, one failed
+/// `/health` probe during teardown would clear. A normal stop is unchanged.
 #[test]
 fn handoff_graceful_wait_ends_on_the_pid_not_the_running_flag() {
     let alive = |_: u32| true;
     let dead = |_: u32| false;
+    let held = || true;
+    let free = || false;
 
-    let handoff = graceful_exit_signal(CloseIntent::HandoffHolders, Some(4242));
+    // Registry PID: only the PID decides.
+    let handoff = graceful_exit_signal(CloseIntent::HandoffHolders, Some(4242), true);
     assert_eq!(handoff, GracefulExitSignal::PidGone(4242));
     // The failed-probe case: `running` already reads false, the PID lives on.
-    assert!(!graceful_exit_observed(handoff, false, alive));
-    assert!(graceful_exit_observed(handoff, true, dead));
+    assert!(!graceful_exit_observed(handoff, false, alive, free));
+    assert!(graceful_exit_observed(handoff, true, dead, held));
 
     // No known PID: falls back to today's flag (the stop logs that it did).
-    let fallback = graceful_exit_signal(CloseIntent::HandoffHolders, None);
+    let fallback = graceful_exit_signal(CloseIntent::HandoffHolders, None, false);
     assert_eq!(fallback, GracefulExitSignal::RunningFlag);
 
     // A normal stop keeps the flag whatever the PID says.
-    let normal = graceful_exit_signal(CloseIntent::Kill, Some(4242));
+    let normal = graceful_exit_signal(CloseIntent::Kill, Some(4242), true);
     assert_eq!(normal, GracefulExitSignal::RunningFlag);
-    assert!(graceful_exit_observed(normal, false, alive));
-    assert!(!graceful_exit_observed(normal, true, dead));
+    assert!(graceful_exit_observed(normal, false, alive, held));
+    assert!(!graceful_exit_observed(normal, true, dead, free));
+}
+
+/// A probe-derived PID is only a candidate: the wait also ends when `running`
+/// is false AND the port is free — never on the flag alone, and never on a
+/// free port while the runner is still believed running.
+#[test]
+fn a_probe_derived_pid_also_ends_on_a_cleared_flag_and_a_free_port() {
+    let alive = |_: u32| true;
+    let dead = |_: u32| false;
+    let held = || true;
+    let free = || false;
+
+    let signal = graceful_exit_signal(CloseIntent::HandoffHolders, Some(7), false);
+    assert_eq!(signal, GracefulExitSignal::PidGoneOrStoppedAndPortFree(7));
+    assert!(graceful_exit_observed(signal, true, dead, held), "PID gone");
+    assert!(
+        graceful_exit_observed(signal, false, alive, free),
+        "flag + port"
+    );
+    assert!(
+        !graceful_exit_observed(signal, false, alive, held),
+        "flag alone"
+    );
+    assert!(
+        !graceful_exit_observed(signal, true, alive, free),
+        "port alone"
+    );
 }
 
 /// The liveness probe the handoff wait uses: this process is alive, and a
@@ -3804,12 +3834,45 @@ async fn pid_alive_tracks_a_reaped_child() {
     assert!(!crate::process::proc_kill::pid_alive(pid));
 }
 
-/// Under a handoff the reap escalation never takes the process-group rung:
-/// it records the tree kill as skipped and goes to kill-by-port. Pinned at
-/// source level for the same reason as the wait above — the rung only runs
-/// against a live runner process.
+/// The kill primitives each reap escalation step runs. Under a handoff only
+/// the listener-only kill runs, at BOTH steps — every other primitive
+/// (`kill_by_pid_tree`, and `kill_by_port`, which tree-kills each listener on
+/// Unix) can reach the holder processes. A normal stop keeps today's ladder.
 #[test]
-fn handoff_reap_skips_the_process_group_kill() {
+fn handoff_reap_runs_only_the_listener_only_kill() {
+    for outcome in [StopReapOutcome::EscalateTree, StopReapOutcome::EscalatePort] {
+        let kills = reap_kills(outcome, CloseIntent::HandoffHolders);
+        assert_eq!(kills, &[ReapKill::ListenersOnly], "{outcome:?}");
+        assert!(
+            kills.iter().all(|k| !k.reaches_beyond_the_listener()),
+            "{outcome:?}: {kills:?}"
+        );
+    }
+    assert_eq!(
+        reap_kills(StopReapOutcome::EscalateTree, CloseIntent::Kill),
+        &[ReapKill::TrackedPidTree, ReapKill::UntrackedListenerTree]
+    );
+    assert_eq!(
+        reap_kills(StopReapOutcome::EscalatePort, CloseIntent::Kill),
+        &[ReapKill::PortTree]
+    );
+    for outcome in [
+        StopReapOutcome::Confirmed,
+        StopReapOutcome::RetryAfterBackoff,
+        StopReapOutcome::StillHeld,
+    ] {
+        for intent in [CloseIntent::Kill, CloseIntent::HandoffHolders] {
+            assert!(reap_kills(outcome, intent).is_empty());
+        }
+    }
+}
+
+/// The stop's escalation runs exactly the kills `reap_kills` chose and no
+/// other kill primitive: the only ones it names are inside `run_reap_kill`,
+/// which dispatches on a [`ReapKill`]. This pins the WIRING between the
+/// tested table and the loop, which cannot run without a live runner.
+#[test]
+fn stop_escalation_only_runs_kills_from_the_table() {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
@@ -3822,15 +3885,17 @@ fn handoff_reap_skips_the_process_group_kill() {
     let stop = crate::source_scan::fn_body(&src, "pub async fn stop_runner_by_id(")
         .expect("stop_runner_by_id exists")
         .to_string();
-    let (_, handoff_arm) = stop
-        .split_once("StopReapOutcome::EscalateTree if intent.is_handoff() => {")
-        .expect("a handoff-specific tree rung");
-    let handoff_arm = handoff_arm
-        .split_once("StopReapOutcome::EscalateTree => {")
-        .expect("the normal tree rung follows")
-        .0;
-    assert!(!handoff_arm.contains("kill_by_pid_tree("));
-    assert!(handoff_arm.contains("ledger.no_target(StopStrategy::TreeKill, why);"));
-    assert!(handoff_arm.contains("kill_by_port(port)"));
-    assert!(stop.contains("graceful_exit_observed(exit_signal, running,"));
+    assert!(stop.contains("let kills = reap_kills(outcome, intent);"));
+    assert!(stop.contains("run_reap_kill("));
+    for primitive in [
+        "kill_by_pid_tree(",
+        "kill_by_port(",
+        "kill_listeners_by_port(",
+    ] {
+        assert!(
+            !stop.contains(primitive),
+            "stop_runner_by_id calls {primitive} directly"
+        );
+    }
+    assert!(stop.contains("graceful_exit_observed("));
 }
