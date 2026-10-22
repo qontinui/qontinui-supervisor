@@ -384,9 +384,9 @@ impl BuildPoolConfig {
             free_bytes: usage.as_ref().map(|d| d.free_bytes),
             total_bytes: usage.as_ref().map(|d| d.total_bytes),
             one_target_bytes: estimate.as_ref().map(|e| e.bytes),
-            // Counted on disk now (one read_dir per slot), not taken from the
-            // last walk, which saw only `0..pool_size` of that process.
-            built_slots: crate::build_sizing::count_built_slot_dirs(pool_root),
+            // Read on disk now (one stat per slot), not taken from the last
+            // walk, which saw only `0..pool_size` of that process.
+            built_slot_ids: crate::build_sizing::built_slot_ids(pool_root),
             floor_override_gb: min_free_disk_gb_override(),
         };
         Self::resolve(
