@@ -112,6 +112,12 @@ struct RunnerHealthBody {
     /// (e.g. `window_not_visible`). Same two locations as `frontend_ready`.
     #[serde(default, rename = "frontendState")]
     frontend_state: Option<String>,
+    /// `/health.buildProfile` — the cargo profile DIRECTORY the runner binary
+    /// was built in (`debug`, `release-checked`), measured by the runner's own
+    /// build script (qontinui-runner#2364). Published at the root AND under
+    /// `data`; `null` or absent (a runner predating the field) is UNKNOWN.
+    #[serde(default, rename = "buildProfile")]
+    build_profile: Option<String>,
     /// The runner's `data` envelope. Only the fields this supervisor reads
     /// from it are modelled; everything else is ignored.
     #[serde(default)]
@@ -127,6 +133,8 @@ struct RunnerHealthBody {
 /// alone meant `degraded_reason` never named a cause on a real runner.
 #[derive(Debug, Default, Deserialize)]
 struct RunnerHealthData {
+    #[serde(default, rename = "buildProfile")]
+    build_profile: Option<String>,
     #[serde(default, rename = "frontendReady")]
     frontend_ready: Option<bool>,
     #[serde(default, rename = "frontendState")]
@@ -167,6 +175,16 @@ impl RunnerHealthBody {
     fn frontend_ready(&self) -> Option<bool> {
         self.frontend_ready
             .or_else(|| self.data.as_ref().and_then(|d| d.frontend_ready))
+    }
+
+    /// `buildProfile`, preferring a top-level value over the `data` one. A
+    /// blank string is UNKNOWN, like an absent one.
+    fn build_profile(&self) -> Option<&str> {
+        self.build_profile
+            .as_deref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.build_profile.as_deref()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// `frontendState`, preferring a top-level value over the `data` one.
@@ -320,6 +338,10 @@ pub struct CachedRunnerHealth {
     /// end it). `None` when there is no run. See [`next_frontend_run`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontend_not_ready_since: Option<DateTime<Utc>>,
+    /// The runner's own `/health` `buildProfile` on this tick — the OBSERVED
+    /// build profile directory (`debug` / `release-checked`). `None` =
+    /// UNKNOWN (API silent, or a runner predating the field), never `debug`.
+    pub build_profile: Option<String>,
 }
 
 /// How long a run of `frontendReady == false` observations survives a
@@ -905,6 +927,9 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     runner_responding,
                     health_body.as_ref(),
                 );
+                let build_profile = health_body
+                    .as_ref()
+                    .and_then(|b| b.build_profile().map(str::to_string));
                 let frontend_ready = health_body.as_ref().and_then(|b| b.frontend_ready());
                 let frontend_state = health_body
                     .as_ref()
@@ -939,6 +964,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     frontend_ready,
                     frontend_state,
                     frontend_not_ready_since: frontend_run.map(|r| r.since),
+                    build_profile,
                 });
                 drop(runner_state);
 
@@ -1233,6 +1259,29 @@ mod tests {
         };
         let status = derive_runner_status(true, true, Some(&body));
         assert!(matches!(status, RunnerStatus::Errored { .. }));
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// the runner's `buildProfile` is read at the root and under `data`; an
+    /// absent, null or blank one is UNKNOWN (`None`), never `"debug"`.
+    #[test]
+    fn build_profile_is_read_from_root_or_data_and_absent_is_unknown() {
+        assert_eq!(
+            body(r#"{"data":{"buildProfile":"release-checked"}}"#).build_profile(),
+            Some("release-checked")
+        );
+        assert_eq!(
+            body(r#"{"buildProfile":"debug","data":{"buildProfile":"release-checked"}}"#)
+                .build_profile(),
+            Some("debug"),
+            "the root value wins"
+        );
+        assert_eq!(
+            body(r#"{"data":{"buildProfile":null}}"#).build_profile(),
+            None
+        );
+        assert_eq!(body(r#"{"buildProfile":"  "}"#).build_profile(), None);
+        assert_eq!(body(r#"{"data":{"status":"ok"}}"#).build_profile(), None);
     }
 
     /// The 2026-10-05 shape: a runner serving the PLACEHOLDER frontend

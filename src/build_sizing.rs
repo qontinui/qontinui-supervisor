@@ -373,6 +373,16 @@ pub fn slot_dirs_beyond_pool(pool_root: &Path, pool_size: usize) -> Vec<std::pat
 /// unlike the footprint (which walks only `0..pool_size`) it also sees dirs a
 /// shrunk pool left behind. A slot holding only a failed build's stderr or a
 /// prewarm `cargo check` is not built.
+///
+/// **The primary build dir is explicitly NOT a slot here**, and so not in the
+/// disk-floor derivation either. `target-pool/primary/` (plan
+/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`) holds a
+/// `release-checked` target whose bytes are already out of free space once
+/// built, and a primary build takes one of the pool's permits, so the floor's
+/// `pool_size × one_target` already bounds the concurrent builds it guards.
+/// Counting it as a slot would credit the disk term with a slot the pool
+/// cannot use. Its size is reported on its own (`footprint`'s
+/// `primary_target_bytes`).
 pub fn built_slot_ids(pool_root: &Path) -> Vec<usize> {
     let Ok(entries) = std::fs::read_dir(pool_root) else {
         return Vec::new();
@@ -382,9 +392,9 @@ pub fn built_slot_ids(pool_root: &Path) -> Vec<usize> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let id = name.strip_prefix("slot-")?.parse::<usize>().ok()?;
-            e.path()
-                .join("debug")
-                .join(crate::config::RUNNER_BIN_NAME)
+            // Pool slots only ever hold the dev profile.
+            crate::build_profile::RunnerBuildProfile::Dev
+                .runner_exe(&e.path())
                 .is_file()
                 .then_some(id)
         })
@@ -670,6 +680,7 @@ mod tests {
                 .map(|(id, &bytes)| SlotFootprint { id, bytes })
                 .collect(),
             lkg_bytes: 0,
+            primary_target_bytes: 0,
             spawn_containers: Default::default(),
             exe_copies: Default::default(),
         }
@@ -772,5 +783,34 @@ mod tests {
         }
         assert_eq!(built_slot_ids(dir.path()), vec![2]);
         assert!(built_slot_ids(&dir.path().join("missing")).is_empty());
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// a BUILT `target-pool/primary/release-checked/` is not a slot — neither
+    /// a built slot for the disk floor nor a slot dir beyond the pool — while a
+    /// built `slot-0/debug/` beside it still is.
+    #[test]
+    fn the_primary_build_dir_is_never_counted_as_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = dir.path();
+        let exe = crate::config::RUNNER_BIN_NAME;
+        for rel in [
+            format!("primary/release-checked/{exe}"),
+            format!("primary/debug/{exe}"),
+            format!("slot-0/debug/{exe}"),
+            format!("lkg/release-checked/{exe}"),
+        ] {
+            let p = pool.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "exe").unwrap();
+        }
+        assert_eq!(built_slot_ids(pool), vec![0]);
+        assert!(slot_dirs_beyond_pool(pool, 1).is_empty());
+        // A slot holds only the dev profile: a release-checked exe in a slot
+        // dir is not a built slot.
+        let stray = pool.join(format!("slot-1/release-checked/{exe}"));
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "exe").unwrap();
+        assert_eq!(built_slot_ids(pool), vec![0]);
     }
 }

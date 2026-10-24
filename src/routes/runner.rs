@@ -133,7 +133,13 @@ async fn mint_primary_action(
     // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
     // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
     // unevaluated so the state surfaces as `Unknown`, never a false `False`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+    // These routes act on the PRIMARY: resolve in its configured profile.
+    let slot_resolution = match manager::resolve_source_exe_with_origin(
+        state,
+        crate::build_profile::primary_profile(&state.config),
+    )
+    .await
+    {
         Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
@@ -903,8 +909,16 @@ pub async fn restart_runner(
     // from fresh predictions rather than inheriting a sticky pin).
     let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
     if want_lkg {
-        let lkg_exe = state.config.lkg_exe_path();
-        if lkg_exe.exists() {
+        // The PRIMARY's LKG is the one of its configured profile: a
+        // release-checked primary is never biased onto the dev LKG (a debug
+        // primary is an opt-in), and a dev primary keeps today's behaviour.
+        let lkg_profile = crate::build_profile::primary_profile(&state.config);
+        let lkg_on_disk = crate::state::lkg_on_disk(&state.config, lkg_profile);
+        let lkg_exe = lkg_on_disk
+            .as_ref()
+            .map(|(_, exe)| exe.clone())
+            .unwrap_or_else(|| state.config.lkg_exe_path(lkg_profile));
+        if lkg_on_disk.is_some() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
                 let reason = if body.use_lkg == Some(true) {
@@ -930,9 +944,7 @@ pub async fn restart_runner(
                 "Restart wanted the last-known-good binary (risk_route_lkg={}, \
                  use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
                  freshest slot exe",
-                risk.route_lkg,
-                body.use_lkg,
-                state.config.lkg_exe_path()
+                risk.route_lkg, body.use_lkg, lkg_exe
             );
             tracing::warn!("{msg}");
             state
@@ -1562,6 +1574,7 @@ mod tests {
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
+            primary_build_profile: Default::default(),
         };
         Arc::new(SupervisorState::new(config))
     }

@@ -1265,7 +1265,7 @@ pub async fn start_runner(
     Path(id): Path<String>,
     Query(wait_q): Query<crate::routes::runner::StartWaitQuery>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    manager::start_runner_by_id(&state, &id).await?;
+    manager::start_runner_by_id(&state, &id, manager::StartIntent::Operator).await?;
 
     if wait_q.wait {
         if let Err(failure) =
@@ -2619,7 +2619,13 @@ async fn mint_spawn_action(
     // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
     // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
     // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+    // A spawn is a temp/named runner: the dev profile.
+    let slot_resolution = match manager::resolve_source_exe_with_origin(
+        state,
+        crate::build_profile::RunnerBuildProfile::Dev,
+    )
+    .await
+    {
         Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
@@ -4261,7 +4267,7 @@ async fn execute_spawn_build_inner(
     // optional rebuild so a `{rebuild: true, use_lkg: true}` call uses the
     // freshly-rebuilt binary as its LKG (the rebuild updated LKG on success).
     if body.use_lkg {
-        match manager::resolve_lkg_exe(state).await {
+        match manager::resolve_lkg_exe(state, crate::build_profile::RunnerBuildProfile::Dev).await {
             Ok(lkg_path) => {
                 let mut slot = managed.source_exe_override.write().await;
                 *slot = Some(lkg_path.clone());
@@ -4374,7 +4380,9 @@ async fn execute_spawn_build_inner(
     // spawn's failed health probe, the reaper).
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed).await {
+    if let Err(e) =
+        manager::start_managed_runner(state, managed, manager::StartIntent::Operator).await
+    {
         // Clean up on failure — the registry entry AND the instance dir the
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
@@ -4620,10 +4628,13 @@ async fn execute_spawn_build_inner(
     // runner was pinned to LKG, prefer the LKG path's metadata over the
     // freshest slot's so the response describes what's actually running.
     let exe_meta = if body.use_lkg {
-        crate::process::manager::resolve_lkg_exe(state)
-            .await
-            .ok()
-            .and_then(|p| crate::process::manager::binary_meta(&p))
+        crate::process::manager::resolve_lkg_exe(
+            state,
+            crate::build_profile::RunnerBuildProfile::Dev,
+        )
+        .await
+        .ok()
+        .and_then(|p| crate::process::manager::binary_meta(&p))
     } else {
         crate::process::manager::resolve_source_exe(state)
             .await
@@ -5684,7 +5695,9 @@ pub async fn spawn_named(
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    if let Err(e) =
+        manager::start_managed_runner(&state, &managed, manager::StartIntent::Operator).await
+    {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);
@@ -6485,10 +6498,7 @@ pub async fn clean_slot_endpoint(
     // Refusal 2: the slot exe is held open by a live process. Holder detection
     // is Windows-only (sysinfo image-path match); on other platforms there is
     // no holder concept for a stalled file lock, so the check is a no-op.
-    let exe_path = slot
-        .target_dir
-        .join("debug")
-        .join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot.exe_path();
     let holders = crate::build_monitor::slot_exe_holders(&exe_path).await;
     if !holders.is_empty() {
         return (

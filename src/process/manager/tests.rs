@@ -2504,6 +2504,8 @@ fn resolved(
         mtime,
         provenance,
         unverified_warning: None,
+        profile: crate::build_profile::RunnerBuildProfile::Dev,
+        profile_fallback: None,
     }
 }
 
@@ -2879,6 +2881,8 @@ fn an_adopted_local_build_passes_the_unverified_exe_gate() {
             origin: ExeOrigin::AdoptedLocalBuild(TargetDirSource::WorkspaceDefault),
             provenance: Some(p),
             unverified_warning: None,
+            profile: crate::build_profile::RunnerBuildProfile::Dev,
+            profile_fallback: None,
         };
         assert_eq!(
             unverified_exe_gate(false, &resolved).expect("must not refuse an adopted build"),
@@ -3988,4 +3992,189 @@ fn fresh_device_identity_reaches_the_non_primary_env_block() {
         command_envs(&cmd).get(crate::process::instance_root::MACHINE_ID_ENV),
         None
     );
+}
+
+// ---------------------------------------------------------------
+// Phase 5 of plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it:
+// the primary resolves and falls back in its own build profile.
+// ---------------------------------------------------------------
+
+fn profile_state_under(root: &std::path::Path) -> SharedState {
+    use clap::Parser;
+    let src_tauri = root.join("qontinui-runner").join("src-tauri");
+    std::fs::create_dir_all(&src_tauri).expect("mkdir");
+    let project_dir = src_tauri.to_string_lossy().into_owned();
+    let config = crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
+        "test",
+        "--project-dir",
+        project_dir.as_str(),
+    ]));
+    std::sync::Arc::new(crate::state::SupervisorState::new(config))
+}
+
+fn write_file(p: &std::path::Path, bytes: &[u8]) {
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, bytes).unwrap();
+}
+
+/// The unattended dev-LKG exception, every arm. An OPERATOR start never takes
+/// the dev LKG; an UNATTENDED one does only when no optimized LKG exists.
+#[test]
+fn primary_fallback_decisions() {
+    use StartIntent::{Operator, Unattended};
+    // The same profile's LKG wins for both intents.
+    for intent in [Operator, Unattended] {
+        assert_eq!(
+            decide_primary_fallback(intent, true, true, true),
+            PrimaryFallback::ProfileLkg
+        );
+    }
+    assert_eq!(
+        decide_primary_fallback(Unattended, false, true, true),
+        PrimaryFallback::DevLkg
+    );
+    assert_eq!(
+        decide_primary_fallback(Operator, false, false, true),
+        PrimaryFallback::Refuse,
+        "an operator start never falls back to a debug artifact"
+    );
+    assert_eq!(
+        decide_primary_fallback(Operator, false, true, true),
+        PrimaryFallback::UnverifiedLocalBuild
+    );
+    assert_eq!(
+        decide_primary_fallback(Unattended, false, false, false),
+        PrimaryFallback::Refuse
+    );
+}
+
+#[test]
+fn only_the_serving_watchdog_restart_is_unattended() {
+    assert_eq!(
+        StartIntent::of_restart(&RestartSource::ServingWatchdog),
+        StartIntent::Unattended
+    );
+    // `watchdog` is a wire value any caller can claim.
+    assert_eq!(
+        StartIntent::of_restart(&RestartSource::Watchdog),
+        StartIntent::Operator
+    );
+    assert_eq!(
+        StartIntent::of_restart(&RestartSource::Manual),
+        StartIntent::Operator
+    );
+}
+
+#[test]
+fn new_origins_label_their_profile_and_are_not_the_legacy_fallback() {
+    use crate::build_profile::RunnerBuildProfile;
+    let built = ExeOrigin::PrimaryBuildDir(RunnerBuildProfile::ReleaseChecked);
+    assert_eq!(built.label(), "primary_build_dir:release-checked");
+    assert_eq!(
+        ExeOrigin::LkgFallback(RunnerBuildProfile::Dev).label(),
+        "lkg_fallback:dev"
+    );
+    for o in [built, ExeOrigin::LkgFallback(RunnerBuildProfile::Dev)] {
+        assert!(!o.is_legacy_fallback());
+        assert_eq!(o.slot_id(), None);
+        assert_eq!(o.target_dir_source(), None);
+    }
+}
+
+/// The primary resolves `target-pool/primary/release-checked/<exe>`; with
+/// nothing there it finds nothing — never a `debug/` artifact, even though
+/// one sits in slot 0 and in `target/debug/`.
+#[tokio::test]
+async fn a_release_checked_primary_resolves_its_own_dir_and_never_debug() {
+    use crate::build_profile::RunnerBuildProfile;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = profile_state_under(tmp.path());
+    let npm = state.config.runner_npm_dir();
+    let exe = crate::config::RUNNER_BIN_NAME;
+    write_file(&npm.join(format!("target-pool/slot-0/debug/{exe}")), b"dev");
+    write_file(&npm.join(format!("target/debug/{exe}")), b"dev");
+
+    assert!(
+        resolve_primary_dir_exe(&state, RunnerBuildProfile::ReleaseChecked)
+            .await
+            .is_none(),
+        "no release-checked artifact must resolve to nothing, not to debug/"
+    );
+    assert!(
+        resolve_source_exe_detailed(&state, RunnerBuildProfile::ReleaseChecked)
+            .await
+            .is_err()
+    );
+
+    // Temp and named runners (Dev) still resolve slot-0/debug/ — unchanged.
+    let dev = resolve_source_exe_detailed(&state, RunnerBuildProfile::Dev)
+        .await
+        .expect("dev resolution");
+    assert_eq!(dev.origin, ExeOrigin::Slot(0));
+    assert_eq!(
+        dev.path,
+        npm.join(format!("target-pool/slot-0/debug/{exe}"))
+    );
+    assert_eq!(dev.profile, RunnerBuildProfile::Dev);
+
+    let built = npm.join(format!("target-pool/primary/release-checked/{exe}"));
+    write_file(&built, b"optimized");
+    let r = resolve_primary_dir_exe(&state, RunnerBuildProfile::ReleaseChecked)
+        .await
+        .expect("release-checked artifact");
+    assert_eq!(r.path, built);
+    assert_eq!(
+        r.origin,
+        ExeOrigin::PrimaryBuildDir(RunnerBuildProfile::ReleaseChecked)
+    );
+    assert_eq!(r.profile, RunnerBuildProfile::ReleaseChecked);
+}
+
+/// A local `target/release-checked/` build with no provenance sidecar is
+/// resolved as the UNVERIFIED fallthrough (the identity gate decides), never
+/// as a startable artifact.
+#[tokio::test]
+async fn an_unvouched_local_release_checked_build_is_the_unverified_fallthrough() {
+    use crate::build_profile::RunnerBuildProfile;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = profile_state_under(tmp.path());
+    let npm = state.config.runner_npm_dir();
+    let local = npm.join(format!(
+        "target/release-checked/{}",
+        crate::config::RUNNER_BIN_NAME
+    ));
+    write_file(&local, b"hand-built");
+    let r = resolve_primary_dir_exe(&state, RunnerBuildProfile::ReleaseChecked)
+        .await
+        .expect("a local artifact exists");
+    assert!(
+        matches!(r.origin, ExeOrigin::CargoTargetDir(_)),
+        "{:?}",
+        r.origin
+    );
+    assert_eq!(r.path, local);
+}
+
+#[test]
+fn lkg_profile_of_names_each_lkg_location() {
+    use crate::build_profile::RunnerBuildProfile;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let state = rt.block_on(async { profile_state_under(tmp.path()) });
+    let c = &state.config;
+    assert_eq!(
+        lkg_profile_of(c, &c.lkg_exe_path(RunnerBuildProfile::ReleaseChecked)),
+        Some(RunnerBuildProfile::ReleaseChecked)
+    );
+    assert_eq!(
+        lkg_profile_of(c, &c.lkg_exe_path(RunnerBuildProfile::Dev)),
+        Some(RunnerBuildProfile::Dev)
+    );
+    assert_eq!(
+        lkg_profile_of(c, &c.legacy_lkg_exe_path()),
+        Some(RunnerBuildProfile::Dev)
+    );
+    assert_eq!(lkg_profile_of(c, &c.runner_exe_path_for_slot(0)), None);
 }

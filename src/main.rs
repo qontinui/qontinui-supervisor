@@ -3,6 +3,7 @@ mod bazel_remote;
 /// out of `build_monitor` so the Linux-only merge gate can test it.
 mod build_diagnostics;
 mod build_monitor;
+mod build_profile;
 mod build_sizing;
 mod build_submissions;
 mod cache_key;
@@ -175,6 +176,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut config = SupervisorConfig::from_args(args);
+
+    // The one announcement of the primary's build profile (plan
+    // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    // `release-checked (default)` or `dev (opt-in via <source>)`. A debug
+    // opt-in also WARNs its cost, and an ignored env value WARNs too.
+    info!("{}", config.primary_build_profile.announce_line());
+    if let Some(warning) = config.primary_build_profile.opt_in_warning() {
+        warn!("{}", warning);
+    }
+    if let Some(raw) = &config.primary_build_profile.ignored_env_value {
+        warn!(
+            "{}={:?} is not a build profile (accepted: dev, release-checked) and was IGNORED; \
+             the primary uses the release-checked default",
+            build_profile::PRIMARY_BUILD_PROFILE_ENV,
+            raw
+        );
+    }
 
     // Build pool sizing (plan 2026-10-02-cargo-jobs-…): say what was derived,
     // and name slot dirs a smaller pool no longer walks — they still hold disk.
@@ -407,8 +425,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(primary_id) => {
                     info!("auto-start: boot-starting primary runner '{}'", primary_id);
-                    match process::manager::start_runner_by_id(&state_for_autostart, &primary_id)
-                        .await
+                    match process::manager::start_runner_by_id(
+                        &state_for_autostart,
+                        &primary_id,
+                        process::manager::StartIntent::Unattended,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             info!("auto-start: primary runner '{}' started", primary_id);

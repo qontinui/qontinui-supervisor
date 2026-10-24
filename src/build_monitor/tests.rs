@@ -220,7 +220,7 @@ fn artifact_probe_moves_when_the_target_dir_changes() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("slot-0");
     std::fs::create_dir_all(target.join("debug").join("deps")).unwrap();
-    let probe = artifact_progress_probe(&target);
+    let probe = artifact_progress_probe(&target, crate::build_profile::RunnerBuildProfile::Dev);
     let before = probe();
     // mtimes have 1s granularity on some filesystems; make the write
     // unambiguously later.
@@ -1088,6 +1088,7 @@ fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
     Arc::new(SupervisorState::new(config))
 }
@@ -1146,7 +1147,9 @@ async fn live_tree_build_promotes_and_records_provenance() {
         .expect("live-tree build must promote to LKG");
 
     // Exe promoted with the slot's bytes.
-    let lkg_exe = state.config.lkg_exe_path();
+    let lkg_exe = state
+        .config
+        .lkg_exe_path(crate::build_profile::RunnerBuildProfile::Dev);
     assert_eq!(
         fs::read(&lkg_exe).expect("read lkg exe"),
         b"fresh-live-tree-bytes",
@@ -1154,7 +1157,12 @@ async fn live_tree_build_promotes_and_records_provenance() {
     );
 
     // Sidecar carries sha + source from provenance.
-    let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+    let meta_raw = fs::read_to_string(
+        state
+            .config
+            .lkg_metadata_path(crate::build_profile::RunnerBuildProfile::Dev),
+    )
+    .expect("read lkg.json");
     let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
     assert_eq!(meta["sha"], "abc123def456", "lkg.json must record sha");
     assert_eq!(
@@ -1187,7 +1195,12 @@ async fn live_tree_build_with_null_sha_promotes_with_null_in_sidecar() {
         .await
         .expect("live-tree build must promote even when sha probe failed");
 
-    let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+    let meta_raw = fs::read_to_string(
+        state
+            .config
+            .lkg_metadata_path(crate::build_profile::RunnerBuildProfile::Dev),
+    )
+    .expect("read lkg.json");
     let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
     assert!(
         meta["sha"].is_null(),
@@ -1208,11 +1221,17 @@ async fn override_build_does_not_touch_lkg() {
     // Pre-seed a prior good LKG (exe + sidecar) so we can prove the
     // override build leaves it intact rather than there simply being
     // nothing to write.
-    let lkg_dir = state.config.lkg_dir();
+    let lkg_dir = state
+        .config
+        .lkg_dir(crate::build_profile::RunnerBuildProfile::Dev);
     fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
-    let lkg_exe = state.config.lkg_exe_path();
+    let lkg_exe = state
+        .config
+        .lkg_exe_path(crate::build_profile::RunnerBuildProfile::Dev);
     fs::write(&lkg_exe, b"prior-good-lkg-bytes").expect("seed lkg exe");
-    let meta_path = state.config.lkg_metadata_path();
+    let meta_path = state
+        .config
+        .lkg_metadata_path(crate::build_profile::RunnerBuildProfile::Dev);
     let prior_meta = r#"{"built_at":"2026-06-01T00:00:00Z","source_slot":2,"exe_size":20,"sha":"prior0000000","source":"live_tree"}"#;
     fs::write(&meta_path, prior_meta).expect("seed lkg.json");
 
@@ -1268,7 +1287,9 @@ async fn origin_main_build_promotes_to_lkg() {
         .expect("origin/main build must promote to LKG");
 
     // Exe promoted with the slot's bytes.
-    let lkg_exe = state.config.lkg_exe_path();
+    let lkg_exe = state
+        .config
+        .lkg_exe_path(crate::build_profile::RunnerBuildProfile::Dev);
     assert_eq!(
         fs::read(&lkg_exe).expect("read lkg exe"),
         b"fresh-origin-main-bytes",
@@ -1276,7 +1297,12 @@ async fn origin_main_build_promotes_to_lkg() {
     );
 
     // Sidecar records sha + source=origin_main from provenance.
-    let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
+    let meta_raw = fs::read_to_string(
+        state
+            .config
+            .lkg_metadata_path(crate::build_profile::RunnerBuildProfile::Dev),
+    )
+    .expect("read lkg.json");
     let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
     assert_eq!(meta["sha"], "0a1b2c3d4e5f", "lkg.json must record sha");
     assert_eq!(
@@ -1645,7 +1671,9 @@ async fn lkg_carries_every_real_sidecar_and_never_a_zero_length_one() {
 
     // A zero-length session CLI already in the LKG dir, from a build that
     // predates the zero-length refusal.
-    let lkg_dir = state.config.lkg_dir();
+    let lkg_dir = state
+        .config
+        .lkg_dir(crate::build_profile::RunnerBuildProfile::Dev);
     fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
     fs::write(lkg_dir.join(SESSION_CLI_EXE_FILENAME), b"").expect("stale empty cli");
 
@@ -1656,7 +1684,12 @@ async fn lkg_carries_every_real_sidecar_and_never_a_zero_length_one() {
         .expect("a sidecar refusal must never fail the LKG promotion");
 
     assert_eq!(
-        fs::read(state.config.lkg_exe_path()).unwrap(),
+        fs::read(
+            state
+                .config
+                .lkg_exe_path(crate::build_profile::RunnerBuildProfile::Dev)
+        )
+        .unwrap(),
         b"runner-bytes"
     );
     assert_eq!(
@@ -2504,4 +2537,177 @@ mod mem_gate {
             "proceeded_after_wait"
         );
     }
+}
+
+// ---------------------------------------------------------------
+// Phase 5 of plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it:
+// the primary build dir and its profile thread through every build step.
+// ---------------------------------------------------------------
+
+/// The no-progress watchdog must see a `release-checked` primary build move:
+/// it writes under `release-checked/`, never under `debug/`, so a probe fixed
+/// on `debug/` (the old code) would read a long opt-level-2 compile as wedged.
+#[test]
+fn a_release_checked_build_registers_artifact_progress() {
+    use crate::build_profile::RunnerBuildProfile;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("primary");
+    let deps = target.join("release-checked").join("deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let rc_probe = super::artifact_progress_probe(&target, RunnerBuildProfile::ReleaseChecked);
+    let dev_probe = super::artifact_progress_probe(&target, RunnerBuildProfile::Dev);
+    let (rc_before, dev_before) = (rc_probe(), dev_probe());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(deps.join("x.rcgu.o"), b"obj").unwrap();
+    assert!(
+        rc_probe() > rc_before,
+        "the release-checked probe must move"
+    );
+    assert_eq!(
+        dev_probe(),
+        dev_before,
+        "a debug/-fixed probe sees nothing of a release-checked build"
+    );
+}
+
+#[test]
+fn artifact_progress_paths_watch_the_profile_dir_being_built() {
+    use crate::build_profile::RunnerBuildProfile;
+    let target = std::path::Path::new("/ws/qontinui-runner/target-pool/primary");
+    let rel: Vec<String> =
+        super::artifact_progress_paths(target, RunnerBuildProfile::ReleaseChecked)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(target)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+    assert_eq!(
+        rel,
+        vec![
+            "",
+            "release-checked",
+            "release-checked/deps",
+            "release-checked/incremental",
+            "release-checked/build",
+            "release-checked/.fingerprint",
+        ]
+    );
+}
+
+#[test]
+fn runner_build_args_carry_the_profile_selector() {
+    use crate::build_profile::RunnerBuildProfile;
+    assert_eq!(
+        super::runner_build_args(RunnerBuildProfile::Dev),
+        vec![
+            "build",
+            "--bin",
+            "qontinui-runner",
+            "--features",
+            "custom-protocol"
+        ]
+    );
+    assert_eq!(
+        super::runner_build_args(RunnerBuildProfile::ReleaseChecked),
+        vec![
+            "build",
+            "--bin",
+            "qontinui-runner",
+            "--features",
+            "custom-protocol",
+            "--profile",
+            "release-checked"
+        ]
+    );
+}
+
+/// The sidecar roster is built in the SAME profile as the runner exe — so it
+/// lands in `release-checked/` beside the exe a start deploys, instead of
+/// leaving tauri-build's 0-byte placeholders there.
+#[test]
+fn sidecar_args_build_the_roster_in_the_runner_profile() {
+    use crate::build_profile::RunnerBuildProfile;
+    let rc = super::sidecar_cargo_args(None, RunnerBuildProfile::ReleaseChecked);
+    assert_eq!(&rc[rc.len() - 2..], &["--profile", "release-checked"]);
+    for bin in [
+        "qontinui-shim",
+        "qontinui-pr",
+        "qontinui_profile",
+        "qontinui-pty-holder",
+    ] {
+        assert!(rc.contains(&bin), "{bin} missing from {rc:?}");
+    }
+    assert_eq!(
+        super::sidecar_cargo_args(None, RunnerBuildProfile::Dev),
+        SIDECAR_BUILD_ARGS.to_vec()
+    );
+}
+
+/// A primary-dir build promotes into the `release-checked` LKG — its own dir,
+/// with `profile` recorded — and leaves the dev LKG (every temp runner's
+/// `use_lkg`) untouched.
+#[tokio::test]
+async fn a_primary_build_promotes_into_the_release_checked_lkg_only() {
+    use crate::build_profile::RunnerBuildProfile;
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canon root");
+    let state = lkg_test_state(&root);
+    let slot = state.build_pool.primary_slot.clone();
+    assert_eq!(slot.profile, RunnerBuildProfile::ReleaseChecked);
+    let exe = slot.exe_path();
+    assert!(
+        exe.ends_with(format!(
+            "target-pool/primary/release-checked/{}",
+            crate::config::RUNNER_BIN_NAME
+        )),
+        "{exe:?}"
+    );
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, b"optimized-bytes").unwrap();
+
+    let prov = origin_main_provenance(Some("feedface"), "/ws/.spawn-origin-main");
+    update_lkg_after_success(&state, &slot, &prov)
+        .await
+        .expect("a vouched primary build promotes");
+
+    let lkg_exe = root
+        .join("target-pool")
+        .join("lkg")
+        .join("release-checked")
+        .join(crate::config::RUNNER_BIN_NAME);
+    assert_eq!(fs::read(&lkg_exe).unwrap(), b"optimized-bytes");
+    let meta: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(lkg_exe.parent().unwrap().join("lkg.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["profile"], "release-checked");
+    assert_eq!(meta["source_slot"], 255);
+    assert!(state.build_pool.release_checked_lkg.read().await.is_some());
+    assert!(state.build_pool.last_known_good.read().await.is_none());
+    assert!(!root.join("target-pool").join("lkg").join("debug").exists());
+}
+
+/// A pool-slot build promotes into `lkg/debug/` with `profile: "dev"`.
+#[tokio::test]
+async fn a_slot_build_promotes_into_the_dev_lkg_dir() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canon root");
+    let state = lkg_test_state(&root);
+    stage_slot0_exe(&state, b"dev-bytes");
+    let slot = state.build_pool.slots[0].clone();
+    update_lkg_after_success(&state, &slot, &live_provenance(Some("a1"), "/ws"))
+        .await
+        .expect("promote");
+    let dir = root.join("target-pool").join("lkg").join("debug");
+    assert_eq!(
+        fs::read(dir.join(crate::config::RUNNER_BIN_NAME)).unwrap(),
+        b"dev-bytes"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("lkg.json")).unwrap()).unwrap();
+    assert_eq!(meta["profile"], "dev");
+    assert!(state.build_pool.release_checked_lkg.read().await.is_none());
 }

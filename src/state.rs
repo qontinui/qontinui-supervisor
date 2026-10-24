@@ -947,6 +947,12 @@ pub fn truncate_error_detail_keep_tail(s: String) -> String {
 pub struct BuildSlot {
     pub id: usize,
     pub target_dir: PathBuf,
+    /// The cargo profile this build dir is built in. `Dev` for every pool
+    /// slot; the configured primary profile for the primary's dedicated
+    /// `target-pool/primary/` dir ([`BuildPool::primary_slot`]). Every artifact
+    /// path a build on this slot reads or writes derives from it
+    /// ([`BuildSlot::artifact_dir`]).
+    pub profile: crate::build_profile::RunnerBuildProfile,
     pub busy: RwLock<Option<BuildInfo>>,
     /// Rolling per-slot build duration history. Separate lock from `busy` so
     /// `list_builds` can `try_read` it without blocking in-progress builds.
@@ -996,6 +1002,42 @@ pub struct BuildSlot {
 }
 
 impl BuildSlot {
+    /// Construct an idle slot.
+    pub fn new(
+        id: usize,
+        target_dir: PathBuf,
+        profile: crate::build_profile::RunnerBuildProfile,
+    ) -> Self {
+        let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        BuildSlot {
+            id,
+            target_dir,
+            profile,
+            busy: RwLock::new(None),
+            history: RwLock::new(SlotHistory::new()),
+            frontend_stale: RwLock::new(false),
+            last_build_stderr_capture: RwLock::new(None),
+            last_build_log: RwLock::new(None),
+            log_stream: log_tx,
+        }
+    }
+
+    /// `<target_dir>/<profile-dir>/` — where cargo writes this slot's
+    /// artifacts (`slot-N/debug/`, `primary/release-checked/`).
+    pub fn artifact_dir(&self) -> PathBuf {
+        self.profile.artifact_dir(&self.target_dir)
+    }
+
+    /// The runner exe a build on this slot produces.
+    pub fn exe_path(&self) -> PathBuf {
+        self.profile.runner_exe(&self.target_dir)
+    }
+
+    /// Is this the primary's dedicated build dir rather than a pool slot?
+    pub fn is_primary_build_dir(&self) -> bool {
+        self.id == crate::build_profile::PRIMARY_BUILD_SLOT_ID
+    }
+
     /// Mark this slot busy with `info`. `busy` MUST be this slot's own
     /// `busy` write guard, which the caller holds across the call.
     ///
@@ -1054,6 +1096,18 @@ pub struct LkgInfo {
     /// hydrated from a legacy sidecar without this field.
     #[serde(default = "default_lkg_source")]
     pub source: crate::process::manager::BuildSource,
+    /// The cargo profile the LKG exe was built in. A `lkg.json` written before
+    /// per-profile LKGs carries no such field and reads as `Dev` — the only
+    /// profile that was ever built then. It is never upgraded: a profile-less
+    /// record found where a `release-checked` LKG belongs is rejected
+    /// ([`lkg_on_disk`]), not adopted.
+    #[serde(default = "default_lkg_profile")]
+    pub profile: crate::build_profile::RunnerBuildProfile,
+}
+
+/// Default `profile` for a legacy `lkg.json` (see [`LkgInfo::profile`]).
+fn default_lkg_profile() -> crate::build_profile::RunnerBuildProfile {
+    crate::build_profile::RunnerBuildProfile::Dev
 }
 
 /// Default `source` for an `LkgInfo` hydrated from a legacy `lkg.json` that
@@ -1103,6 +1157,21 @@ pub struct BuildPool {
     /// restarts. `None` only when no successful build has ever produced an
     /// LKG (fresh checkout) or the sidecar failed to load.
     pub last_known_good: RwLock<Option<LkgInfo>>,
+    /// The primary's dedicated build dir, `target-pool/primary/`, built in the
+    /// configured primary profile. NOT in [`Self::slots`]: every slot routine
+    /// (resolution picks, freshness, fingerprints, `GET /builds` slot rows)
+    /// keeps its one-profile `debug/` assumption. A build on it still takes a
+    /// permit from [`Self::permits`], so the box's build concurrency is
+    /// unchanged.
+    pub primary_slot: Arc<BuildSlot>,
+    /// Serializes builds on [`Self::primary_slot`] (two concurrent builds into
+    /// one target dir would clobber each other). Taken BEFORE the permit, so a
+    /// queued primary build never holds a pool permit while it waits.
+    pub primary_build_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The `release-checked` LKG (`target-pool/lkg/release-checked/`), the
+    /// primary's twin of [`Self::last_known_good`] (which is the `dev` LKG every
+    /// temp-runner `use_lkg` reads).
+    pub release_checked_lkg: RwLock<Option<LkgInfo>>,
 }
 
 impl BuildPool {
@@ -1119,24 +1188,30 @@ impl BuildPool {
                     e
                 );
             }
-            let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
-            slots.push(Arc::new(BuildSlot {
+            slots.push(Arc::new(BuildSlot::new(
                 id,
                 target_dir,
-                busy: RwLock::new(None),
-                history: RwLock::new(SlotHistory::new()),
-                frontend_stale: RwLock::new(false),
-                last_build_stderr_capture: RwLock::new(None),
-                last_build_log: RwLock::new(None),
-                log_stream: log_tx,
-            }));
+                crate::build_profile::RunnerBuildProfile::Dev,
+            )));
         }
+        // The primary build dir is created lazily by the first primary build
+        // (cargo creates CARGO_TARGET_DIR): creating it here would put an empty
+        // `target-pool/primary/` on every box, including dev-primary ones.
+        let primary_slot = Arc::new(BuildSlot::new(
+            crate::build_profile::PRIMARY_BUILD_SLOT_ID,
+            config.primary_target_dir(),
+            crate::build_profile::primary_profile(config),
+        ));
         // Try to hydrate LKG metadata from the on-disk sidecar. We do this
         // synchronously in `BuildPool::new` (which runs once at startup) so
         // the field is correctly populated before any HTTP handler can read
         // it. A missing or unparsable sidecar is non-fatal — the LKG will
         // simply be considered absent until the next successful build.
-        let lkg = load_lkg_from_disk(config);
+        let lkg = load_lkg_from_disk(config, crate::build_profile::RunnerBuildProfile::Dev);
+        let release_checked_lkg = load_lkg_from_disk(
+            config,
+            crate::build_profile::RunnerBuildProfile::ReleaseChecked,
+        );
 
         Self {
             slots,
@@ -1146,6 +1221,20 @@ impl BuildPool {
             npm_lock_waiters: Arc::new(AtomicUsize::new(0)),
             last_successful_slot: RwLock::new(None),
             last_known_good: RwLock::new(lkg),
+            primary_slot,
+            primary_build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            release_checked_lkg: RwLock::new(release_checked_lkg),
+        }
+    }
+
+    /// The in-memory LKG record for `profile`.
+    pub fn lkg_for(
+        &self,
+        profile: crate::build_profile::RunnerBuildProfile,
+    ) -> &RwLock<Option<LkgInfo>> {
+        match profile {
+            crate::build_profile::RunnerBuildProfile::Dev => &self.last_known_good,
+            crate::build_profile::RunnerBuildProfile::ReleaseChecked => &self.release_checked_lkg,
         }
     }
 
@@ -1213,20 +1302,73 @@ impl BuildPool {
     }
 }
 
-/// Hydrate `LkgInfo` from `target-pool/lkg/lkg.json`. Returns `None` if the
-/// sidecar is missing, unreadable, malformed, or its companion exe doesn't
-/// exist. Called once during `BuildPool::new`. A missing LKG is benign — it
-/// just means the supervisor was started before any successful build, or the
-/// dir was wiped. Build success will rewrite both files.
-fn load_lkg_from_disk(config: &SupervisorConfig) -> Option<LkgInfo> {
-    let exe = config.lkg_exe_path();
-    let meta = config.lkg_metadata_path();
-    if !exe.exists() {
-        return None;
+/// Where the LKG of `profile` may live on disk: `(lkg.json, exe)` candidates in
+/// preference order. The per-profile dir first; for `Dev` only, the legacy
+/// flat `target-pool/lkg/` after it (a pre-per-profile LKG, which can only be a
+/// dev build). Pure — no I/O.
+pub fn lkg_location_candidates(
+    config: &SupervisorConfig,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = vec![(
+        config.lkg_metadata_path(profile),
+        config.lkg_exe_path(profile),
+    )];
+    if profile == crate::build_profile::RunnerBuildProfile::Dev {
+        out.push((
+            config.legacy_lkg_metadata_path(),
+            config.legacy_lkg_exe_path(),
+        ));
     }
-    let raw = std::fs::read_to_string(&meta).ok()?;
-    let parsed: LkgInfo = serde_json::from_str(&raw).ok()?;
-    Some(parsed)
+    out
+}
+
+/// The LKG of `profile` that is on disk right now, as `(info, exe path)`: the
+/// first [`lkg_location_candidates`] entry whose exe exists and whose
+/// `lkg.json` parses AND records `profile`.
+///
+/// A record whose `profile` disagrees is skipped, never adopted — in
+/// particular a profile-less (legacy) `lkg.json` reads as `Dev` and so can
+/// never stand in for a `release-checked` LKG. The per-profile dir wins over
+/// the legacy flat one: only current code writes it, so it is the newer.
+pub fn lkg_on_disk(
+    config: &SupervisorConfig,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Option<(LkgInfo, PathBuf)> {
+    for (meta, exe) in lkg_location_candidates(config, profile) {
+        if !exe.exists() {
+            continue;
+        }
+        let Some(parsed) = std::fs::read_to_string(&meta)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<LkgInfo>(&raw).ok())
+        else {
+            continue;
+        };
+        if parsed.profile != profile {
+            tracing::warn!(
+                "LKG record {:?} says profile {} but sits where the {} LKG belongs; ignoring it \
+                 (an LKG is never re-labelled to another profile)",
+                meta,
+                parsed.profile,
+                profile
+            );
+            continue;
+        }
+        return Some((parsed, exe));
+    }
+    None
+}
+
+/// Hydrate the `profile` LKG's `LkgInfo` from disk (see [`lkg_on_disk`]).
+/// `None` if no candidate has an exe plus a parseable, same-profile sidecar.
+/// Called once per profile during `BuildPool::new`. A missing LKG is benign —
+/// no successful build of that profile has happened yet, or the dir was wiped.
+fn load_lkg_from_disk(
+    config: &SupervisorConfig,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Option<LkgInfo> {
+    lkg_on_disk(config, profile).map(|(info, _)| info)
 }
 
 pub struct AiState {
@@ -2004,6 +2146,7 @@ mod tests {
             no_prewarm: false,
             no_webview: true,
             temp_runner_display: None,
+            primary_build_profile: Default::default(),
         }
     }
 
@@ -3010,6 +3153,126 @@ mod tests {
         assert_eq!(
             slot.history.read().await.last_mem_gate,
             Some(MemGateOutcome::ProceededAfterWait)
+        );
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// per-profile LKGs, and the legacy flat `lkg/` read as dev only.
+    fn lkg_config_under(root: &std::path::Path) -> SupervisorConfig {
+        let mut config = make_test_config();
+        let src_tauri = root.join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).unwrap();
+        config.project_dir = src_tauri;
+        config
+    }
+
+    fn write_lkg(dir: &std::path::Path, json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(crate::config::RUNNER_BIN_NAME), b"exe").unwrap();
+        std::fs::write(dir.join("lkg.json"), json).unwrap();
+    }
+
+    const LEGACY_LKG_JSON: &str = r#"{"built_at":"2026-10-23T22:30:42Z","source_slot":0,"exe_size":3,"sha":"851c6fef6","source":"origin_main"}"#;
+
+    #[test]
+    fn an_old_lkg_json_without_profile_reads_as_dev_and_never_as_release_checked() {
+        use crate::build_profile::RunnerBuildProfile;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = lkg_config_under(tmp.path());
+        let lkg_root = config.lkg_root();
+        assert!(
+            lkg_root.ends_with("qontinui-runner/target-pool/lkg"),
+            "{lkg_root:?}"
+        );
+        // The pre-per-profile flat layout this fleet has on disk today.
+        write_lkg(&lkg_root, LEGACY_LKG_JSON);
+
+        let (info, exe) = lkg_on_disk(&config, RunnerBuildProfile::Dev).expect("legacy dev LKG");
+        assert_eq!(info.profile, RunnerBuildProfile::Dev);
+        assert_eq!(info.sha.as_deref(), Some("851c6fef6"));
+        assert_eq!(exe, lkg_root.join(crate::config::RUNNER_BIN_NAME));
+        assert!(lkg_on_disk(&config, RunnerBuildProfile::ReleaseChecked).is_none());
+
+        // A profile-less record sitting where the release-checked LKG belongs
+        // is NOT silently upgraded.
+        write_lkg(&lkg_root.join("release-checked"), LEGACY_LKG_JSON);
+        assert!(lkg_on_disk(&config, RunnerBuildProfile::ReleaseChecked).is_none());
+    }
+
+    #[test]
+    fn per_profile_lkgs_resolve_from_their_own_dirs() {
+        use crate::build_profile::RunnerBuildProfile;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = lkg_config_under(tmp.path());
+        let lkg_root = config.lkg_root();
+        write_lkg(&lkg_root, LEGACY_LKG_JSON);
+        write_lkg(
+            &lkg_root.join("debug"),
+            r#"{"built_at":"2026-10-24T01:00:00Z","source_slot":1,"exe_size":3,"sha":"d","source":"origin_main","profile":"dev"}"#,
+        );
+        write_lkg(
+            &lkg_root.join("release-checked"),
+            r#"{"built_at":"2026-10-24T02:00:00Z","source_slot":255,"exe_size":3,"sha":"r","source":"origin_main","profile":"release-checked"}"#,
+        );
+        let (dev, dev_exe) = lkg_on_disk(&config, RunnerBuildProfile::Dev).unwrap();
+        assert_eq!(
+            dev.sha.as_deref(),
+            Some("d"),
+            "lkg/debug/ wins over the legacy flat one"
+        );
+        assert_eq!(
+            dev_exe,
+            lkg_root.join("debug").join(crate::config::RUNNER_BIN_NAME)
+        );
+        let (rc, rc_exe) = lkg_on_disk(&config, RunnerBuildProfile::ReleaseChecked).unwrap();
+        assert_eq!(rc.sha.as_deref(), Some("r"));
+        assert_eq!(rc.profile, RunnerBuildProfile::ReleaseChecked);
+        assert_eq!(
+            rc_exe,
+            lkg_root
+                .join("release-checked")
+                .join(crate::config::RUNNER_BIN_NAME)
+        );
+        // BuildPool hydrates both records at startup.
+        let pool = BuildPool::new(&config);
+        assert!(pool.last_known_good.try_read().unwrap().is_some());
+        assert_eq!(
+            pool.release_checked_lkg
+                .try_read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .sha
+                .as_deref(),
+            Some("r")
+        );
+    }
+
+    #[test]
+    fn the_primary_slot_is_its_own_dir_in_the_configured_profile() {
+        use crate::build_profile::{PrimaryBuildProfile, RunnerBuildProfile};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = lkg_config_under(tmp.path());
+        let pool = BuildPool::new(&config);
+        assert_eq!(
+            pool.primary_slot.profile,
+            RunnerBuildProfile::ReleaseChecked
+        );
+        assert!(pool.primary_slot.is_primary_build_dir());
+        assert!(pool
+            .primary_slot
+            .target_dir
+            .ends_with("target-pool/primary"));
+        assert!(pool
+            .slots
+            .iter()
+            .all(|s| s.profile == RunnerBuildProfile::Dev));
+        assert!(!pool.slots.iter().any(|s| s.is_primary_build_dir()));
+        config.primary_build_profile =
+            PrimaryBuildProfile::resolve(Some(RunnerBuildProfile::Dev), None);
+        assert_eq!(
+            BuildPool::new(&config).primary_slot.profile,
+            RunnerBuildProfile::Dev
         );
     }
 }

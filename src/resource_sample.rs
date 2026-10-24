@@ -423,6 +423,7 @@ mod tests {
             },
             slots: vec![],
             lkg_bytes: 0,
+            primary_target_bytes: 0,
             spawn_containers: SpawnContainersFootprint::default(),
             exe_copies: ExeCopiesFootprint::default(),
         }

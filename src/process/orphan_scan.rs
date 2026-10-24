@@ -204,8 +204,14 @@ fn exe_table_for<'a>(
                 is_temp: r.kind().is_temp(),
                 exe_copy_path,
             };
-            std::iter::once(entry(config.runner_exe_copy_path(r)))
-                .chain(config.legacy_flat_named_exe_copy_path(r).map(entry))
+            // Every identity path: the primary's copy in EVERY profile dir
+            // (one started before the profile switch runs from
+            // `target/debug/`), plus a named runner's legacy flat path.
+            config
+                .runner_exe_identity_paths(r)
+                .into_iter()
+                .map(entry)
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -309,38 +315,61 @@ fn path_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(mtime.into())
 }
 
-/// Freshest mtime across every existing
-/// `target-pool/slot-*/debug/qontinui-runner.exe` plus
-/// `target-pool/lkg/qontinui-runner.exe`. This is the upper bound on what
-/// `start_managed_runner` would launch on the user's next `/runner/restart`.
+/// The source binaries [`freshest_source_mtime`] considers: every pool slot's
+/// `slot-*/debug/` exe, the primary build dir's exe
+/// (`target-pool/primary/<profile-dir>/`), and every LKG exe — each
+/// per-profile dir plus the legacy flat dev one. Pure — no I/O. Slot paths
+/// come from the same `slots` list the build pool walks, so they never go out
+/// of sync with supervisor config.
+fn freshest_source_candidates(
+    config: &crate::config::SupervisorConfig,
+    slots: &[std::sync::Arc<crate::state::BuildSlot>],
+    primary_slot: &crate::state::BuildSlot,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = slots.iter().map(|s| s.exe_path()).collect();
+    out.push(primary_slot.exe_path());
+    for profile in crate::build_profile::RunnerBuildProfile::ALL {
+        out.extend(
+            crate::state::lkg_location_candidates(config, profile)
+                .into_iter()
+                .map(|(_, exe)| exe),
+        );
+    }
+    out
+}
+
+/// Freshest mtime across [`freshest_source_candidates`]. This is the upper
+/// bound on what `start_managed_runner` would launch on the user's next
+/// `/runner/restart`.
 ///
 /// Returns `None` only when no source binary exists anywhere — at that
 /// point the orphan is the only artifact on disk and there is no staleness
-/// to report. Slot scans use the same `state.build_pool.slots` list
-/// that the build pool itself walks, so we never go out of sync with
-/// supervisor config.
+/// to report.
 async fn freshest_source_mtime(state: &SharedState) -> Option<DateTime<Utc>> {
-    let mut best: Option<DateTime<Utc>> = None;
-    for slot in &state.build_pool.slots {
-        let p = slot
-            .target_dir
-            .join("debug")
-            .join(crate::config::RUNNER_BIN_NAME);
-        if let Some(mt) = path_mtime_utc(&p) {
-            best = Some(match best {
-                Some(b) if b >= mt => b,
-                _ => mt,
-            });
-        }
-    }
-    let lkg = state.config.lkg_exe_path();
-    if let Some(mt) = path_mtime_utc(&lkg) {
-        best = Some(match best {
-            Some(b) if b >= mt => b,
-            _ => mt,
-        });
-    }
-    best
+    freshest_source_candidates(
+        &state.config,
+        &state.build_pool.slots,
+        &state.build_pool.primary_slot,
+    )
+    .iter()
+    .filter_map(|p| path_mtime_utc(p))
+    .max()
+}
+
+/// The directories the startup orphan scan recognizes as "ours": a runner
+/// image under any of them is classified; anything elsewhere is "not our
+/// concern". `target-pool/` (slots, the primary build dir, LKGs) and
+/// `target/<profile-dir>/` for EVERY profile — the primary's copy lives in
+/// `target/release-checked/` by default, and in `target/debug/` for a dev
+/// primary and for one started before the profile switch. Pure — no I/O.
+fn orphan_scan_roots(runner_root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![runner_root.join("target-pool")];
+    roots.extend(
+        crate::build_profile::RunnerBuildProfile::ALL
+            .iter()
+            .map(|p| p.artifact_dir(&runner_root.join("target"))),
+    );
+    roots
 }
 
 /// Result of resolving a single orphan PID — used to log the summary.
@@ -397,11 +426,10 @@ pub async fn scan_orphans_at_startup(state: &SharedState) {
     // same helper the build pool uses, so the prefix check matches what
     // ends up on disk after a build copies a binary into a slot.
     let runner_root = state.config.runner_npm_dir();
-    let target_pool = runner_root.join("target-pool");
-    let target_debug = runner_root.join("target").join("debug");
-
-    let target_pool_canon = canonicalize_or_keep(&target_pool);
-    let target_debug_canon = canonicalize_or_keep(&target_debug);
+    let roots_canon: Vec<PathBuf> = orphan_scan_roots(&runner_root)
+        .iter()
+        .map(|r| canonicalize_or_keep(r))
+        .collect();
 
     let our_pid = std::process::id();
     let processes = find_runner_processes().await;
@@ -432,8 +460,9 @@ pub async fn scan_orphans_at_startup(state: &SharedState) {
         // Only consider runners running from our build outputs. A runner
         // launched from somewhere else (a developer's hand-built install,
         // a different checkout, etc.) is not our concern.
-        if !path_is_under(&exe_path, &target_pool_canon)
-            && !path_is_under(&exe_path, &target_debug_canon)
+        if !roots_canon
+            .iter()
+            .any(|root| path_is_under(&exe_path, root))
         {
             continue;
         }
@@ -1187,5 +1216,100 @@ mod tests {
                 stale_gap_secs: Some(1)
             }
         );
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it).
+    fn config_under(root: &Path) -> crate::config::SupervisorConfig {
+        use clap::Parser;
+        let src_tauri = root.join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir");
+        let project_dir = src_tauri.to_string_lossy().into_owned();
+        crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
+            "test",
+            "--project-dir",
+            project_dir.as_str(),
+        ]))
+    }
+
+    fn rel(root: &Path, p: &Path) -> String {
+        p.strip_prefix(root)
+            .expect("under the runner root")
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// A primary copy under `target/release-checked/` is inside the scan's
+    /// root set — it used to be `target-pool` + `target/debug` only, so an
+    /// optimized primary would have been skipped as "not our concern".
+    #[test]
+    fn orphan_scan_roots_cover_every_profile_dir() {
+        let runner = Path::new("/ws/qontinui-runner");
+        let roots: Vec<String> = orphan_scan_roots(runner)
+            .iter()
+            .map(|r| rel(runner, r))
+            .collect();
+        assert_eq!(
+            roots,
+            vec!["target-pool", "target/debug", "target/release-checked"]
+        );
+    }
+
+    /// The primary is recognised from a copy in EITHER profile dir — the
+    /// configured `target/release-checked/` one and the `target/debug/` one a
+    /// primary started before the switch still runs from.
+    #[test]
+    fn exe_table_owns_the_primary_in_both_profile_dirs() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let config = config_under(root.path());
+        let primary = crate::config::RunnerConfig::default_primary();
+        let table = exe_table_for(&config, [&primary].into_iter());
+        let target = config.runner_npm_dir().join("target");
+        let name = format!("qontinui-runner-primary{}", std::env::consts::EXE_SUFFIX);
+        for dir in ["release-checked", "debug"] {
+            assert_eq!(
+                classify_exe_owner(&target.join(dir).join(&name), &table),
+                ExeOwner::Registered {
+                    runner_id: "primary".to_string(),
+                    is_temp: false
+                },
+                "{dir}"
+            );
+        }
+        assert_eq!(
+            classify_exe_owner(&target.join("release").join(&name), &table),
+            ExeOwner::Unowned
+        );
+    }
+
+    /// Staleness is measured against the primary build dir and every LKG too,
+    /// not only the slots' `debug/` exes and the flat LKG.
+    #[test]
+    fn freshest_source_candidates_include_the_primary_dir_and_every_lkg() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let config = config_under(root.path());
+        let pool = crate::state::BuildPool::new(&config);
+        let npm = config.runner_npm_dir();
+        let got: Vec<String> = freshest_source_candidates(&config, &pool.slots, &pool.primary_slot)
+            .iter()
+            .map(|p| rel(&npm, p))
+            .collect();
+        let exe = crate::config::RUNNER_BIN_NAME;
+        assert!(
+            got.contains(&format!("target-pool/slot-0/debug/{exe}")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&format!("target-pool/primary/release-checked/{exe}")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&format!("target-pool/lkg/release-checked/{exe}")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&format!("target-pool/lkg/debug/{exe}")),
+            "{got:?}"
+        );
+        assert!(got.contains(&format!("target-pool/lkg/{exe}")), "{got:?}");
     }
 }

@@ -28,6 +28,7 @@ fn test_config_from_fields() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
 
     assert!(!config.watchdog_enabled_at_start);
@@ -58,9 +59,11 @@ fn test_config_runner_exe_path() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
 
-    let exe_path = config.runner_exe_path();
+    let exe_path =
+        config.runner_exe_path(qontinui_supervisor::build_profile::RunnerBuildProfile::Dev);
     // Platform-aware: `qontinui-runner.exe` on Windows, bare `qontinui-runner`
     // on macOS/Linux. Asserting the literal `.exe` here would fail the
     // Linux-only merge gate for exactly the reason `RUNNER_BIN_NAME` exists.
@@ -90,6 +93,7 @@ fn test_config_runner_npm_dir() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
 
     let npm_dir = config.runner_npm_dir();

@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
+use crate::build_profile::RunnerBuildProfile;
 use crate::config::{
     TargetDirSource, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
     RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS,
@@ -273,12 +274,19 @@ pub struct StaleBinary {
 /// this supervisor, or the path resolver failed to copy). The live path is
 /// determined by [`crate::config::SupervisorConfig::runner_exe_copy_path`] —
 /// pool-named for `Temp`/`Named`, id-named for `Primary`/`External`.
+///
+/// A primary can run from a copy in either profile dir (see
+/// [`crate::config::SupervisorConfig::runner_exe_identity_paths`]); the first
+/// one that exists — the configured profile's first — is the one reported.
 pub fn running_binary_mtime(
     state: &SharedState,
     config: &crate::config::RunnerConfig,
 ) -> Option<std::time::SystemTime> {
-    let path = state.config.runner_exe_copy_path(config);
-    std::fs::metadata(&path).ok()?.modified().ok()
+    state
+        .config
+        .runner_exe_identity_paths(config)
+        .iter()
+        .find_map(|path| std::fs::metadata(path).ok()?.modified().ok())
 }
 
 /// Scan every `target-pool/slot-*/debug/qontinui-runner.exe` and return the
@@ -287,10 +295,7 @@ pub fn running_binary_mtime(
 pub async fn newest_slot_binary_mtime(state: &SharedState) -> Option<(u8, std::time::SystemTime)> {
     let mut best: Option<(u8, std::time::SystemTime)> = None;
     for slot in &state.build_pool.slots {
-        let path = slot
-            .target_dir
-            .join("debug")
-            .join(crate::config::RUNNER_BIN_NAME);
+        let path = slot.exe_path();
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -353,8 +358,18 @@ pub async fn stale_binary_for_runner(
     config: &crate::config::RunnerConfig,
 ) -> Option<StaleBinary> {
     let running = running_binary_mtime(state, config);
-    let newest_slot = newest_slot_binary_mtime(state).await;
-    compute_stale_binary(running, newest_slot)
+    // An optimized primary is built into its own dir, not a pool slot: a
+    // newer dev slot build is not a newer build of what the primary runs.
+    let profile = state.config.runner_profile(config);
+    let newest = if profile == RunnerBuildProfile::Dev {
+        newest_slot_binary_mtime(state).await
+    } else {
+        std::fs::metadata(state.config.primary_exe_path(profile))
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| (crate::build_profile::PRIMARY_BUILD_SLOT_ID as u8, t))
+    };
+    compute_stale_binary(running, newest)
 }
 
 /// Resolve the last-known-good runner exe path.
@@ -369,26 +384,48 @@ pub async fn stale_binary_for_runner(
 /// or a subsequent rename never landed), the stale `LkgInfo` is cleared
 /// before returning the error so `/health.build.lkg` no longer reports
 /// metadata for an exe that doesn't exist.
-pub async fn resolve_lkg_exe(state: &SharedState) -> Result<std::path::PathBuf, SupervisorError> {
-    let info_present = state.build_pool.last_known_good.read().await.is_some();
+///
+/// Per profile: temp runners' `use_lkg` asks for the `dev` LKG; the primary's
+/// fallbacks ask for its configured profile's. Where that LKG lives on disk is
+/// [`crate::state::lkg_on_disk`] (which also reads a legacy flat `dev` LKG).
+pub async fn resolve_lkg_exe(
+    state: &SharedState,
+    profile: RunnerBuildProfile,
+) -> Result<std::path::PathBuf, SupervisorError> {
+    let lock = state.build_pool.lkg_for(profile);
+    let info_present = lock.read().await.is_some();
     if !info_present {
-        return Err(SupervisorError::Process(
-            "No last-known-good runner binary recorded yet. Run a build that succeeds first."
-                .to_string(),
-        ));
-    }
-    let p = state.config.lkg_exe_path();
-    if !p.exists() {
-        // Drop the stale in-memory entry so /health and /builds stop
-        // reporting metadata for an exe that's no longer on disk.
-        let mut guard = state.build_pool.last_known_good.write().await;
-        *guard = None;
         return Err(SupervisorError::Process(format!(
-            "LKG metadata is set but exe is missing at {:?}. The LKG dir may have been wiped; rebuild to repopulate.",
-            p
+            "No {profile} last-known-good runner binary recorded yet. Run a {profile} build \
+             that succeeds first."
         )));
     }
-    Ok(p)
+    match crate::state::lkg_on_disk(&state.config, profile) {
+        Some((_, p)) => Ok(p),
+        None => {
+            // Drop the stale in-memory entry so /health and /builds stop
+            // reporting metadata for an exe that's no longer on disk.
+            *lock.write().await = None;
+            Err(SupervisorError::Process(format!(
+                "{profile} LKG metadata is set but no exe is at {:?}. The LKG dir may have been \
+                 wiped; rebuild to repopulate.",
+                state.config.lkg_exe_path(profile)
+            )))
+        }
+    }
+}
+
+/// Which profile's LKG exe `path` is, if it is one (the per-profile dirs and
+/// the legacy flat dev LKG). `None` for any other path.
+pub fn lkg_profile_of(
+    config: &crate::config::SupervisorConfig,
+    path: &std::path::Path,
+) -> Option<RunnerBuildProfile> {
+    RunnerBuildProfile::ALL.into_iter().find(|profile| {
+        crate::state::lkg_location_candidates(config, *profile)
+            .iter()
+            .any(|(_, exe)| exe == path)
+    })
 }
 
 /// Filename of the sidecar that records the provenance of a slot's exe — the
@@ -483,8 +520,9 @@ pub struct BuildProvenance {
 /// Absence is "unknown provenance" — never an error. Slots self-heal on the
 /// next successful build, which rewrites the sidecar.
 pub fn read_slot_provenance(slot_target_dir: &std::path::Path) -> Option<BuildProvenance> {
-    let p = slot_target_dir
-        .join("debug")
+    // Pool slots only ever hold the dev profile.
+    let p = RunnerBuildProfile::Dev
+        .artifact_dir(slot_target_dir)
         .join(SLOT_PROVENANCE_SIDECAR_FILENAME);
     let content = std::fs::read_to_string(&p).ok()?;
     serde_json::from_str::<BuildProvenance>(&content).ok()
@@ -731,14 +769,7 @@ pub async fn pick_slot_for_resolution(state: &SharedState) -> Option<usize> {
         .build_pool
         .slots
         .iter()
-        .map(|s| {
-            (
-                s.id,
-                s.target_dir
-                    .join("debug")
-                    .join(crate::config::RUNNER_BIN_NAME),
-            )
-        })
+        .map(|s| (s.id, s.exe_path()))
         .collect();
     pick_slot_decision(last, &slots, |p| p.exists())
 }
@@ -802,6 +833,7 @@ pub async fn compute_slot_freshness(state: &SharedState) -> SlotFreshness {
     let local_build_adoption = picked_slot_id.and_then(|pid| {
         evaluate_local_build_adoption(
             &state.config,
+            RunnerBuildProfile::Dev,
             pid,
             &state.config.runner_exe_path_for_slot(pid),
         )
@@ -1078,12 +1110,17 @@ impl LocalBuildAdoption {
 ///
 /// `None` when there is nothing to say: no readable local build, no readable
 /// slot mtime, or the slot is at least as new (the healthy steady state).
+///
+/// `profile` is the profile being resolved: the local build compared is the
+/// one in THAT profile's dir (`target/debug/` for the pool, `target/release-checked/`
+/// against the primary's own build dir).
 pub fn evaluate_local_build_adoption(
     config: &crate::config::SupervisorConfig,
+    profile: RunnerBuildProfile,
     picked_slot_id: usize,
     picked_slot_path: &std::path::Path,
 ) -> Option<LocalBuildAdoption> {
-    let (target_dir_source, legacy_exe) = config.runner_exe_path_resolved();
+    let (target_dir_source, legacy_exe) = config.runner_exe_path_resolved(profile);
     evaluate_local_build_adoption_at(
         &legacy_exe,
         target_dir_source,
@@ -1153,19 +1190,12 @@ pub fn format_target_debug_warning(s: &TargetDebugStaleness) -> String {
 /// check. Returns `None` when the legacy exe is absent, no slot exes exist,
 /// or the legacy exe is not strictly older than every slot exe.
 fn compute_target_debug_staleness_for_state(state: &SharedState) -> Option<TargetDebugStaleness> {
-    let legacy = state.config.runner_exe_path();
+    let legacy = state.config.runner_exe_path(RunnerBuildProfile::Dev);
     let slot_paths: Vec<(usize, std::path::PathBuf)> = state
         .build_pool
         .slots
         .iter()
-        .map(|s| {
-            (
-                s.id,
-                s.target_dir
-                    .join("debug")
-                    .join(crate::config::RUNNER_BIN_NAME),
-            )
-        })
+        .map(|s| (s.id, s.exe_path()))
         .collect();
     let slot_refs: Vec<(usize, &std::path::Path)> = slot_paths
         .iter()
@@ -1211,6 +1241,15 @@ pub enum ExeOrigin {
     AdoptedLocalBuild(TargetDirSource),
     /// A per-runner `source_exe_override` (today: the LKG pin).
     PinnedOverride,
+    /// The primary's dedicated build dir (`target-pool/primary/<profile-dir>/`),
+    /// built by the supervisor in an optimized profile. The primary's analogue
+    /// of [`ExeOrigin::Slot`]: a supervisor build, gated the same way.
+    PrimaryBuildDir(RunnerBuildProfile),
+    /// The primary's optimized profile had nothing startable and its build
+    /// failed, so an UNATTENDED start fell back to an LKG — the profile is the
+    /// LKG's. `Dev` is the debug fallback that `/health` shows as configured ≠
+    /// observed. Never produced for an operator start (which refuses instead).
+    LkgFallback(RunnerBuildProfile),
 }
 
 impl ExeOrigin {
@@ -1223,6 +1262,8 @@ impl ExeOrigin {
                 format!("adopted_local_build:{}", src.label())
             }
             ExeOrigin::PinnedOverride => "pinned_override".to_string(),
+            ExeOrigin::PrimaryBuildDir(profile) => format!("primary_build_dir:{profile}"),
+            ExeOrigin::LkgFallback(profile) => format!("lkg_fallback:{profile}"),
         }
     }
 
@@ -1239,7 +1280,10 @@ impl ExeOrigin {
     pub fn target_dir_source(self) -> Option<TargetDirSource> {
         match self {
             ExeOrigin::CargoTargetDir(src) | ExeOrigin::AdoptedLocalBuild(src) => Some(src),
-            ExeOrigin::Slot(_) | ExeOrigin::PinnedOverride => None,
+            ExeOrigin::Slot(_)
+            | ExeOrigin::PinnedOverride
+            | ExeOrigin::PrimaryBuildDir(_)
+            | ExeOrigin::LkgFallback(_) => None,
         }
     }
 
@@ -1275,6 +1319,12 @@ pub struct ResolvedRunnerExe {
     /// explicit opt-in. Callers MUST surface it — an opted-in stale spawn
     /// states its staleness, it does not go quiet.
     pub unverified_warning: Option<String>,
+    /// The cargo profile of the resolved artifact — what the runner will
+    /// actually be (the configured profile, except on an LKG fallback).
+    pub profile: RunnerBuildProfile,
+    /// Why the resolved profile differs from the configured one, when it does
+    /// (the unattended dev-LKG fallback). Surfaced on `/health`.
+    pub profile_fallback: Option<String>,
 }
 
 impl ResolvedRunnerExe {
@@ -1373,8 +1423,12 @@ pub fn unverified_exe_gate(
     resolved: &ResolvedRunnerExe,
 ) -> Result<ExeIdentityVerdict, SupervisorError> {
     let target_dir_source = match resolved.origin {
-        // Slots and explicit pins are governed elsewhere.
-        ExeOrigin::Slot(_) | ExeOrigin::PinnedOverride => return Ok(ExeIdentityVerdict::Verified),
+        // Slots, the primary build dir, LKGs and explicit pins are governed
+        // elsewhere — each is a supervisor-produced artifact.
+        ExeOrigin::Slot(_)
+        | ExeOrigin::PinnedOverride
+        | ExeOrigin::PrimaryBuildDir(_)
+        | ExeOrigin::LkgFallback(_) => return Ok(ExeIdentityVerdict::Verified),
         // Both non-pool origins run the SAME gate. An adopted local build is
         // vouched by construction, so it takes the allow arm below — but it is
         // routed through the identical predicate rather than short-circuited,
@@ -1452,10 +1506,15 @@ pub fn unverified_exe_gate(
 /// log line when the picked slot's `.git_sha` sidecar differs from any other
 /// slot's sidecar. The warning is observability only — resolution proceeds
 /// with the picked slot regardless. See `proj_supervisor_slot_resolution_order`.
+///
+/// Resolves in the `dev` profile — the profile of every temp and named runner,
+/// which is what every caller of this thin wrapper starts.
 pub async fn resolve_source_exe(
     state: &SharedState,
 ) -> Result<std::path::PathBuf, SupervisorError> {
-    resolve_source_exe_detailed(state).await.map(|r| r.path)
+    resolve_source_exe_detailed(state, RunnerBuildProfile::Dev)
+        .await
+        .map(|r| r.path)
 }
 
 /// [`resolve_source_exe`] variant that ALSO returns the [`ExeOrigin`] the exe
@@ -1478,18 +1537,359 @@ pub async fn resolve_source_exe(
 /// class the gate exists to kill. One pick, gate and path from the same id.
 pub async fn resolve_source_exe_with_origin(
     state: &SharedState,
+    profile: RunnerBuildProfile,
 ) -> Result<(ExeOrigin, std::path::PathBuf), SupervisorError> {
-    resolve_source_exe_detailed(state)
+    resolve_source_exe_detailed(state, profile)
         .await
         .map(|r| (r.origin, r.path))
 }
 
-/// Full resolution: the winning path, WHICH source produced it, its mtime and
-/// its build identity. The two thinner wrappers above delegate here so there is
-/// exactly one resolution implementation.
+/// Full resolution in `profile`: the winning path, WHICH source produced it,
+/// its mtime and its build identity. The thinner wrappers above delegate here
+/// so there is exactly one resolution implementation.
+///
+/// `profile` selects the artifact store: `Dev` resolves the build pool (every
+/// temp and named runner, and a primary configured as `dev` — behaviour
+/// unchanged); an optimized profile resolves the primary's own build dir
+/// ([`resolve_primary_dir_exe`]). An optimized resolution NEVER yields a `dev`
+/// artifact — that substitution is a decision only the primary start path
+/// makes, and only for an unattended start ([`decide_primary_fallback`]).
 pub async fn resolve_source_exe_detailed(
     state: &SharedState,
+    profile: RunnerBuildProfile,
 ) -> Result<ResolvedRunnerExe, SupervisorError> {
+    if profile != RunnerBuildProfile::Dev {
+        return resolve_primary_dir_exe(state, profile)
+            .await
+            .ok_or_else(|| {
+                let tried = std::iter::once(state.config.primary_exe_path(profile))
+                    .chain(
+                        state
+                            .config
+                            .runner_exe_candidates(profile)
+                            .into_iter()
+                            .map(|(_, p)| p),
+                    )
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                SupervisorError::Process(format!(
+                    "No {profile} runner exe found (tried: {tried}). Build one with \
+                 POST /runner/restart {{\"rebuild\": true}}."
+                ))
+            });
+    }
+    resolve_pool_exe(state).await
+}
+
+/// Resolution for an optimized primary profile. `None` when no artifact of
+/// `profile` exists anywhere.
+///
+/// 1. The supervisor's own build, `target-pool/primary/<profile-dir>/` —
+///    unless a NEWER, vouched local build of the same profile
+///    (`<target>/<profile-dir>/`, what dev-start builds) can be adopted over it,
+///    by the same rule a slot uses ([`evaluate_local_build_adoption_at`]).
+/// 2. Otherwise the local build of that profile through cargo's target-dir
+///    precedence — `CargoTargetDir` when it proves nothing, so the caller's
+///    [`unverified_exe_gate`] decides; `AdoptedLocalBuild` when it carries a
+///    vouched sidecar.
+pub async fn resolve_primary_dir_exe(
+    state: &SharedState,
+    profile: RunnerBuildProfile,
+) -> Option<ResolvedRunnerExe> {
+    let built = state.config.primary_exe_path(profile);
+    if built.exists() {
+        if let Some(adoption) = evaluate_local_build_adoption(
+            &state.config,
+            profile,
+            crate::build_profile::PRIMARY_BUILD_SLOT_ID,
+            &built,
+        ) {
+            let msg = adoption.message();
+            if adoption.adopted {
+                info!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                    .await;
+                return Some(ResolvedRunnerExe {
+                    mtime: Some(adoption.finding.legacy_mtime),
+                    path: adoption.finding.legacy_path,
+                    origin: ExeOrigin::AdoptedLocalBuild(adoption.target_dir_source),
+                    provenance: adoption.provenance,
+                    unverified_warning: None,
+                    profile,
+                    profile_fallback: None,
+                });
+            }
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+        }
+        return Some(ResolvedRunnerExe {
+            mtime: file_mtime(&built),
+            provenance: read_provenance_beside_exe(&built),
+            path: built,
+            origin: ExeOrigin::PrimaryBuildDir(profile),
+            unverified_warning: None,
+            profile,
+            profile_fallback: None,
+        });
+    }
+    let candidates = state.config.runner_exe_candidates(profile);
+    let (src, path) = candidates.into_iter().find(|(_, p)| p.exists())?;
+    let provenance = read_provenance_beside_exe(&path);
+    let sidecar_mtime = path
+        .parent()
+        .map(|d| d.join(SLOT_PROVENANCE_SIDECAR_FILENAME))
+        .and_then(|p| file_mtime(&p));
+    let mtime = file_mtime(&path);
+    let adoptable =
+        mtime.is_some_and(|m| local_build_is_adoptable(provenance.as_ref(), sidecar_mtime, m));
+    Some(ResolvedRunnerExe {
+        mtime,
+        provenance,
+        path,
+        origin: if adoptable {
+            ExeOrigin::AdoptedLocalBuild(src)
+        } else {
+            ExeOrigin::CargoTargetDir(src)
+        },
+        unverified_warning: None,
+        profile,
+        profile_fallback: None,
+    })
+}
+
+/// What an optimized primary starts from when its own profile has nothing
+/// startable and building one FAILED. Pure, so every arm is testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryFallback {
+    /// The same profile's LKG — still optimized, so allowed for any start.
+    ProfileLkg,
+    /// The newest `dev` LKG — UNATTENDED starts only, announced at ERROR.
+    DevLkg,
+    /// An unverified local build of the profile; the identity gate decides.
+    UnverifiedLocalBuild,
+    /// Nothing may be started: refuse and name why.
+    Refuse,
+}
+
+/// Decide [`PrimaryFallback`].
+///
+/// The debug substitution is the 2026-10-24 re-vet's one exception
+/// (robustness): a box with no primary and no operator present is worse than
+/// an announced debug primary, so an UNATTENDED start (`--auto-start` boot,
+/// the crash and serving watchdogs) takes the dev LKG. An OPERATOR start never
+/// does — the operator is present to read the refusal, and a debug primary
+/// is an opt-in (`--primary-build-profile dev`) they did not make.
+pub fn decide_primary_fallback(
+    intent: StartIntent,
+    has_profile_lkg: bool,
+    has_unverified_local_build: bool,
+    has_dev_lkg: bool,
+) -> PrimaryFallback {
+    if has_profile_lkg {
+        return PrimaryFallback::ProfileLkg;
+    }
+    if intent == StartIntent::Unattended && has_dev_lkg {
+        return PrimaryFallback::DevLkg;
+    }
+    if has_unverified_local_build {
+        return PrimaryFallback::UnverifiedLocalBuild;
+    }
+    PrimaryFallback::Refuse
+}
+
+/// Who asked for a runner start. Decides only what an optimized primary may
+/// fall back to when its own profile cannot be built ([`decide_primary_fallback`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartIntent {
+    /// An operator or caller request: an HTTP start, restart or spawn.
+    Operator,
+    /// The supervisor on its own, with nobody present: the `--auto-start`
+    /// boot start, the crash-only watchdog, the serving watchdog.
+    Unattended,
+}
+
+impl StartIntent {
+    /// The intent of a restart from `source`. Only the in-process serving
+    /// watchdog is unattended: `Watchdog` is a WIRE value any HTTP caller can
+    /// claim (and is refused for non-temp runners anyway), so it must not buy
+    /// a caller the unattended debug fallback.
+    pub fn of_restart(source: &RestartSource) -> Self {
+        match source {
+            RestartSource::ServingWatchdog => StartIntent::Unattended,
+            _ => StartIntent::Operator,
+        }
+    }
+}
+
+/// Resolve what an optimized-profile PRIMARY starts from, building the
+/// artifact when none is startable (plan
+/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 5).
+///
+/// A supervisor build (`PrimaryBuildDir`) or an adopted, vouched local build is
+/// startable. Anything else — nothing at all, or only an unverified local
+/// build — triggers ONE primary build from `origin/main` into
+/// `target-pool/primary/`. If that build fails, [`decide_primary_fallback`]
+/// picks the fallback; a dev fallback is announced with an ERROR line naming
+/// why, and the resolved record carries `profile: Dev` plus the reason, so
+/// `/health` shows configured `release-checked` ≠ resolved `debug`.
+async fn resolve_optimized_primary_exe(
+    state: &SharedState,
+    profile: RunnerBuildProfile,
+    intent: StartIntent,
+) -> Result<ResolvedRunnerExe, SupervisorError> {
+    let startable = |r: &ResolvedRunnerExe| {
+        matches!(
+            r.origin,
+            ExeOrigin::PrimaryBuildDir(_) | ExeOrigin::AdoptedLocalBuild(_)
+        )
+    };
+    let found = resolve_primary_dir_exe(state, profile).await;
+    if let Some(r) = found.as_ref().filter(|r| startable(r)) {
+        return Ok(r.clone());
+    }
+
+    let msg = format!(
+        "Primary start: no startable {profile} artifact (looked in {:?} and the {profile} local \
+         build dir) — building one from origin/main before starting",
+        state.config.primary_exe_path(profile)
+    );
+    warn!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+        .await;
+    let build_error = match primary_build(state, BuildTree::OriginMain).await {
+        Ok(()) => match resolve_primary_dir_exe(state, profile).await {
+            Some(r) if startable(&r) => return Ok(r),
+            _ => format!(
+                "the {profile} build reported success but left no exe at {:?}",
+                state.config.primary_exe_path(profile)
+            ),
+        },
+        Err(e) => e.to_string(),
+    };
+
+    let profile_lkg = crate::state::lkg_on_disk(&state.config, profile);
+    let dev_lkg = crate::state::lkg_on_disk(&state.config, RunnerBuildProfile::Dev);
+    match decide_primary_fallback(
+        intent,
+        profile_lkg.is_some(),
+        found.is_some(),
+        dev_lkg.is_some(),
+    ) {
+        PrimaryFallback::ProfileLkg => {
+            let (info, exe) = profile_lkg.expect("decided on its presence");
+            let msg = format!(
+                "Primary start: the {profile} build failed ({build_error}); starting the {profile} \
+                 last-known-good {exe:?} (built_at {}, sha {})",
+                info.built_at.to_rfc3339(),
+                info.sha.as_deref().unwrap_or("(unknown)")
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                .await;
+            Ok(lkg_resolution(info, exe, profile, None))
+        }
+        PrimaryFallback::DevLkg => {
+            let (info, exe) = dev_lkg.expect("decided on its presence");
+            let reason = format!(
+                "configured {profile}, but no {profile} artifact was startable and the {profile} \
+                 build failed ({build_error}); an UNATTENDED start fell back to the newest dev LKG \
+                 {exe:?} (built_at {}) rather than leave the box with no primary. Rebuild with \
+                 POST /runner/restart {{\"rebuild\": true}} once the build is fixed.",
+                info.built_at.to_rfc3339()
+            );
+            error!("DEBUG PRIMARY FALLBACK: {}", reason);
+            state
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Error,
+                    format!("DEBUG PRIMARY FALLBACK: {reason}"),
+                )
+                .await;
+            Ok(lkg_resolution(
+                info,
+                exe,
+                RunnerBuildProfile::Dev,
+                Some(reason),
+            ))
+        }
+        PrimaryFallback::UnverifiedLocalBuild => Ok(found.expect("decided on its presence")),
+        PrimaryFallback::Refuse => Err(SupervisorError::Process(format!(
+            "Refusing to start the primary: it is configured for the {profile} build profile \
+             ({source}), no {profile} artifact is startable, and building one failed: \
+             {build_error}. {why} Fix the build and retry, or opt into a debug primary with \
+             --primary-build-profile dev / QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE=dev.",
+            source = state.config.primary_build_profile.source.knob(),
+            why = match intent {
+                StartIntent::Operator => {
+                    "An operator start never falls back to a debug/ artifact unless the dev \
+                     profile was opted into."
+                }
+                StartIntent::Unattended =>
+                    "There is no dev last-known-good to fall back to either.",
+            },
+        ))),
+    }
+}
+
+/// A [`ResolvedRunnerExe`] for an LKG start.
+fn lkg_resolution(
+    info: crate::state::LkgInfo,
+    exe: std::path::PathBuf,
+    profile: RunnerBuildProfile,
+    profile_fallback: Option<String>,
+) -> ResolvedRunnerExe {
+    ResolvedRunnerExe {
+        mtime: file_mtime(&exe),
+        provenance: Some(BuildProvenance {
+            sha: info.sha.clone(),
+            source: info.source,
+            built_from: exe.to_string_lossy().to_string(),
+            built_at: info.built_at.to_rfc3339(),
+        }),
+        path: exe,
+        origin: ExeOrigin::LkgFallback(profile),
+        unverified_warning: None,
+        profile,
+        profile_fallback,
+    }
+}
+
+/// Build the PRIMARY in its configured profile from `build_tree`: into the
+/// build pool for a `dev` primary (unchanged), into `target-pool/primary/`
+/// for an optimized one ([`crate::build_monitor::run_primary_build`]).
+pub(crate) async fn primary_build(
+    state: &SharedState,
+    build_tree: BuildTree,
+) -> Result<(), SupervisorError> {
+    if build_tree.is_origin_main() {
+        return primary_rebuild_from_origin_main(state).await;
+    }
+    if crate::build_profile::primary_profile(&state.config) == RunnerBuildProfile::Dev {
+        crate::build_monitor::run_cargo_build(state).await
+    } else {
+        crate::build_monitor::run_primary_build(
+            state,
+            Some("primary-rebuild:live_tree".to_string()),
+            None,
+            crate::build_monitor::BuildSourceKind::LiveTree,
+        )
+        .await
+    }
+}
+
+/// Pool resolution (the `dev` profile): the existing slot ladder.
+async fn resolve_pool_exe(state: &SharedState) -> Result<ResolvedRunnerExe, SupervisorError> {
     if let Some(picked_id) = pick_slot_for_resolution(state).await {
         let picked_path = state.config.runner_exe_path_for_slot(picked_id);
 
@@ -1552,9 +1952,12 @@ pub async fn resolve_source_exe_detailed(
         // An explicit LKG request never reaches here — `source_exe_override`
         // short-circuits resolution upstream — so "unless the operator asks for
         // the LKG binary" holds by construction.
-        if let Some(adoption) =
-            evaluate_local_build_adoption(&state.config, picked_id, &picked_path)
-        {
+        if let Some(adoption) = evaluate_local_build_adoption(
+            &state.config,
+            RunnerBuildProfile::Dev,
+            picked_id,
+            &picked_path,
+        ) {
             let adopt = adoption.adopted;
             let msg = adoption.message();
             // Adoption is the HEALTHY outcome this fix exists to produce — the
@@ -1588,6 +1991,8 @@ pub async fn resolve_source_exe_detailed(
                     origin: ExeOrigin::AdoptedLocalBuild(adoption.target_dir_source),
                     provenance: adoption.provenance,
                     unverified_warning: None,
+                    profile: RunnerBuildProfile::Dev,
+                    profile_fallback: None,
                 });
             }
         }
@@ -1604,13 +2009,15 @@ pub async fn resolve_source_exe_detailed(
             origin: ExeOrigin::Slot(picked_id),
             provenance,
             unverified_warning: None,
+            profile: RunnerBuildProfile::Dev,
+            profile_fallback: None,
         });
     }
 
     // Preference 3: the non-pool cargo target dir, resolved through cargo's own
     // precedence ladder. No slot id — callers that gate on provenance treat
     // this as the most-unknown artifact there is.
-    let candidates = state.config.runner_exe_candidates();
+    let candidates = state.config.runner_exe_candidates(RunnerBuildProfile::Dev);
     if let Some((src, path)) = candidates.iter().find(|(_, p)| p.exists()) {
         return Ok(ResolvedRunnerExe {
             mtime: file_mtime(path),
@@ -1618,6 +2025,8 @@ pub async fn resolve_source_exe_detailed(
             path: path.clone(),
             origin: ExeOrigin::CargoTargetDir(*src),
             unverified_warning: None,
+            profile: RunnerBuildProfile::Dev,
+            profile_fallback: None,
         });
     }
 
@@ -2259,12 +2668,13 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
 pub async fn start_runner_by_id(
     state: &SharedState,
     runner_id: &str,
+    intent: StartIntent,
 ) -> Result<(), SupervisorError> {
     let managed = state
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
-    start_managed_runner(state, &managed).await
+    start_managed_runner(state, &managed, intent).await
 }
 
 /// Start a runner given a direct `Arc<ManagedRunner>` reference.
@@ -2275,9 +2685,13 @@ pub async fn start_runner_by_id(
 /// missing from the registry when we start (which shouldn't normally happen,
 /// but has been observed as a transient 404 under load), we re-insert the Arc
 /// so downstream health / monitoring can find it by id.
+///
+/// `intent` says who asked; it matters only to an optimized primary whose
+/// profile cannot be built ([`decide_primary_fallback`]).
 pub async fn start_managed_runner(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
+    intent: StartIntent,
 ) -> Result<(), SupervisorError> {
     // With the parallel build pool, a concurrent build on one slot does not
     // prevent us from starting a runner from a previously-built exe in
@@ -2330,7 +2744,7 @@ pub async fn start_managed_runner(
     let SpawnResult {
         mut child,
         panic_log_dir,
-    } = start_exe_mode_for_runner(state, managed).await?;
+    } = start_exe_mode_for_runner(state, managed, intent).await?;
 
     let pid = child.id();
     info!(
@@ -3208,6 +3622,7 @@ pub(crate) fn apply_non_primary_instance_env_with(
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
+    intent: StartIntent,
 ) -> Result<SpawnResult, SupervisorError> {
     // Locate the source exe. The per-runner `source_exe_override` takes
     // precedence — set by `spawn_test` when the caller passes `use_lkg: true`
@@ -3245,8 +3660,9 @@ async fn start_exe_mode_for_runner(
                 // provenance — but only claim that when the override actually
                 // points at the LKG exe. A future override producer aiming
                 // elsewhere must not silently inherit the LKG's sha.
-                if p == state.config.lkg_exe_path() {
-                    if let Some(info) = state.build_pool.last_known_good.read().await.as_ref() {
+                let lkg_profile = lkg_profile_of(&state.config, &p);
+                if let Some(profile) = lkg_profile {
+                    if let Some(info) = state.build_pool.lkg_for(profile).read().await.as_ref() {
                         resolved_provenance = Some(BuildProvenance {
                             sha: info.sha.clone(),
                             source: info.source,
@@ -3261,6 +3677,11 @@ async fn start_exe_mode_for_runner(
                     origin: ExeOrigin::PinnedOverride,
                     provenance: resolved_provenance.clone(),
                     unverified_warning: None,
+                    // A pin names its profile only when it is an LKG; any
+                    // other pin is taken to be the runner's own profile.
+                    profile: lkg_profile
+                        .unwrap_or_else(|| state.config.runner_profile(&managed.config)),
+                    profile_fallback: None,
                 });
                 p
             }
@@ -3293,7 +3714,15 @@ async fn start_exe_mode_for_runner(
                 // exactly what moves `last_successful_slot` — could deploy a
                 // slot the gate never saw.)
                 let is_temp = is_temp_runner(&managed.config.id);
-                let mut resolved = resolve_source_exe_detailed(state).await?;
+                // The profile threads from the config: `dev` for temp/named
+                // runners (unchanged), the configured profile for the primary.
+                let profile = state.config.runner_profile(&managed.config);
+                let mut resolved =
+                    if managed.config.kind().is_primary() && profile != RunnerBuildProfile::Dev {
+                        resolve_optimized_primary_exe(state, profile, intent).await?
+                    } else {
+                        resolve_source_exe_detailed(state, profile).await?
+                    };
                 match resolved.origin {
                     ExeOrigin::Slot(picked_id) => {
                         // Same single pick the gate evaluates, so the recorded
@@ -3335,6 +3764,26 @@ async fn start_exe_mode_for_runner(
                             }
                         }
                     }
+                    // The primary's own build dir is a supervisor build: the
+                    // same posture as a slot.
+                    ExeOrigin::PrimaryBuildDir(_) => {
+                        resolved_provenance = resolved.provenance.clone();
+                        if let Some(StartProvenanceWarning(msg)) = start_provenance_gate(
+                            is_temp,
+                            crate::build_profile::PRIMARY_BUILD_SLOT_ID,
+                            resolved.provenance.as_ref(),
+                        )? {
+                            warn!("{}", msg);
+                            state
+                                .logs
+                                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                                .await;
+                        }
+                    }
+                    // An LKG holds only vouched builds by construction.
+                    ExeOrigin::LkgFallback(_) => {
+                        resolved_provenance = resolved.provenance.clone();
+                    }
                     // `resolve_source_exe_detailed` never yields a pinned
                     // override — that arm is handled above, from the per-runner
                     // `source_exe_override`.
@@ -3351,14 +3800,21 @@ async fn start_exe_mode_for_runner(
     // binary's directory.
     if let Some(record) = &resolved_record {
         info!(
-            "Runner '{}' source exe resolved: {} (origin {}, mtime {}, identity {})",
+            "Runner '{}' source exe resolved: {} (origin {}, profile {}, mtime {}, identity {})",
             managed.config.name,
             record.path.display(),
             record.origin.label(),
+            record.profile,
             record.mtime_rfc3339().as_deref().unwrap_or("(unreadable)"),
             record.identity_label(),
         );
     }
+    // The profile of what is about to run. Decides the copy's directory, so a
+    // copy always sits in the dir of the profile it holds.
+    let resolved_profile = resolved_record
+        .as_ref()
+        .map(|r| r.profile)
+        .unwrap_or_else(|| state.config.runner_profile(&managed.config));
     // Publish before the (fallible) copy+spawn below: the provenance describes
     // the artifact we RESOLVED, which is a fact regardless of whether the
     // subsequent copy or process start succeeds — and a failed start is exactly
@@ -3384,7 +3840,9 @@ async fn start_exe_mode_for_runner(
     // (locked previous copy, disk full, AV) instead of silently producing
     // a worse failure mode later.
     let exe_path = {
-        let copy_path = state.config.runner_exe_copy_path(&managed.config);
+        let copy_path = state
+            .config
+            .runner_exe_copy_path_for(&managed.config, resolved_profile);
         // Ensure the copy target's parent dir exists. Supervisor-managed trees
         // only ever materialize `target-pool/`; a tree that has never had a
         // default `cargo build` won't have `target/debug/`, so the copy below
@@ -3472,7 +3930,7 @@ async fn start_exe_mode_for_runner(
     // (it skips the install when absent), so a miss is logged at info, not
     // warned.
     {
-        let local_build_exe = state.config.runner_exe_path();
+        let local_build_exe = state.config.runner_exe_path(resolved_profile);
         let helper_source = [source_exe.as_path(), local_build_exe.as_path()]
             .into_iter()
             .find(|exe| {
@@ -4615,7 +5073,7 @@ async fn maybe_crash_restart(
                         rebuild: false,
                     });
                 let started = std::time::Instant::now();
-                match start_runner_by_id(&state, &runner_id).await {
+                match start_runner_by_id(&state, &runner_id, StartIntent::Unattended).await {
                     Ok(()) => {
                         let msg = format!(
                             "crash-only watchdog restarted runner '{}' (attempt {}/{})",
@@ -5275,8 +5733,16 @@ async fn resolve_stop_target_for(
     let listener = crate::process::proc_kill::find_pid_on_port(port)
         .await
         .map_err(|e| e.to_string());
-    let exe_copy = state.config.runner_exe_copy_path(&managed.config);
-    let by_exe = crate::process::proc_kill::find_pids_holding_exe(&exe_copy).await;
+    // Every image path this runner may run from (a primary: both profile
+    // dirs), so a primary started in the other profile is still identified.
+    let mut by_exe: Vec<u32> = Vec::new();
+    for exe_copy in state.config.runner_exe_identity_paths(&managed.config) {
+        for pid in crate::process::proc_kill::find_pids_holding_exe(&exe_copy).await {
+            if !by_exe.contains(&pid) {
+                by_exe.push(pid);
+            }
+        }
+    }
     resolve_stop_target(None, listener, &by_exe)
 }
 
@@ -5296,8 +5762,21 @@ async fn verify_kill_target(
         // conservative default beats an unwrap.
         StopTarget::NotFound { .. } => PidSource::ListenerProbe,
     };
-    let expected = state.config.runner_exe_copy_path(&managed.config);
     let observed = crate::process::proc_kill::pid_exe_path(pid).await;
+    // Compare against the identity path the target actually runs from when it
+    // is one of this runner's (a primary in either profile dir); otherwise
+    // against the configured copy, which yields the mismatch refusal.
+    let identity = state.config.runner_exe_identity_paths(&managed.config);
+    let expected = observed
+        .as_deref()
+        .and_then(|o| {
+            let o = o.to_string_lossy().to_ascii_lowercase();
+            identity
+                .iter()
+                .find(|p| p.to_string_lossy().to_ascii_lowercase() == o)
+        })
+        .unwrap_or(&identity[0])
+        .clone();
     verify_target_image(&source, observed.as_deref(), &expected)
 }
 
@@ -5804,26 +6283,40 @@ pub async fn stop_runner_by_id(
 async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), SupervisorError> {
     let prepared =
         crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
+    let profile = crate::build_profile::primary_profile(&state.config);
 
     let msg = format!(
-        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}). \
-         This is the default Phase B path — the primary runs latest-green-main, not the working \
-         checkout. Pass from_working_tree:true to compile the live tree instead.",
+        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}, \
+         profile {profile}). This is the default Phase B path — the primary runs \
+         latest-green-main, not the working checkout. Pass from_working_tree:true to compile the \
+         live tree instead.",
         prepared.resolved_sha, prepared.src_tauri
     );
     info!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
 
-    crate::build_monitor::run_cargo_build_with_dir(
-        state,
-        Some("primary-rebuild:origin/main".to_string()),
-        Some(prepared.src_tauri.clone()),
-        false,
-        crate::build_monitor::BuildSourceKind::OriginMain {
-            resolved_sha: prepared.resolved_sha.clone(),
-        },
-    )
-    .await
+    let source_kind = crate::build_monitor::BuildSourceKind::OriginMain {
+        resolved_sha: prepared.resolved_sha.clone(),
+    };
+    let requester = Some("primary-rebuild:origin/main".to_string());
+    if profile == RunnerBuildProfile::Dev {
+        crate::build_monitor::run_cargo_build_with_dir(
+            state,
+            requester,
+            Some(prepared.src_tauri.clone()),
+            false,
+            source_kind,
+        )
+        .await
+    } else {
+        crate::build_monitor::run_primary_build(
+            state,
+            requester,
+            Some(prepared.src_tauri.clone()),
+            source_kind,
+        )
+        .await
+    }
 }
 
 /// Pure gate for [`restart_runner_by_id`]: is an automated restart of this
@@ -6167,7 +6660,16 @@ pub async fn restart_runner_by_id(
 
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
-    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, build_tree, intent).await;
+    let outcome = restart_after_gate(
+        state,
+        &managed,
+        runner_id,
+        rebuild,
+        build_tree,
+        intent,
+        StartIntent::of_restart(&source),
+    )
+    .await;
 
     {
         let mut runner = managed.runner.write().await;
@@ -6237,6 +6739,7 @@ async fn restart_after_gate(
     rebuild: bool,
     build_tree: BuildTree,
     intent: CloseIntent,
+    start_intent: StartIntent,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -6278,11 +6781,14 @@ async fn restart_after_gate(
     // live-tree build. Non-primary runners (named/temp) keep the legacy
     // live-tree build unconditionally — origin/main pinning is a
     // primary-only policy.
+    //
+    // A primary rebuild builds in the primary's configured profile
+    // ([`primary_build`]): into `target-pool/primary/` when optimized, so the
+    // start below resolves the artifact the rebuild just produced.
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
-        let build_origin_main = build_tree.compiles_origin_main(managed.config.kind().is_primary());
-        if build_origin_main {
-            primary_rebuild_from_origin_main(state).await?;
+        if managed.config.kind().is_primary() {
+            primary_build(state, build_tree).await?;
         } else {
             crate::build_monitor::run_cargo_build(state).await?;
         }
@@ -6301,7 +6807,7 @@ async fn restart_after_gate(
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
-    start_managed_runner(state, managed).await?;
+    start_managed_runner(state, managed, start_intent).await?;
 
     Ok(build_duration)
 }
@@ -6428,7 +6934,7 @@ pub async fn rebuild_and_restart_by_id(
 
     // Step 3: start.
     let started_at = chrono::Utc::now();
-    start_managed_runner(state, &managed).await?;
+    start_managed_runner(state, &managed, StartIntent::Operator).await?;
     state
         .logs
         .emit(

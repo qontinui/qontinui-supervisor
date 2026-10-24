@@ -1699,6 +1699,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1734,6 +1735,7 @@ async fn seed_lkg(state: &crate::state::SharedState, sha: Option<String>) {
         exe_size: 1234,
         sha,
         source: crate::process::manager::BuildSource::LiveTree,
+        profile: crate::build_profile::RunnerBuildProfile::Dev,
     });
 }
 
@@ -1888,6 +1890,7 @@ fn make_state() -> crate::state::SharedState {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -2282,6 +2285,7 @@ async fn list_builds_marks_a_drift_reading_superseded_when_the_lkg_moved() {
         exe_size: 1,
         sha: Some("bbbbbbbb".to_string()),
         source: crate::process::manager::BuildSource::OriginMain,
+        profile: crate::build_profile::RunnerBuildProfile::Dev,
     });
     // Reading was computed for a DIFFERENT sha than the LKG now records.
     *state.origin_drift.write().await = Some(crate::state::OriginDriftSnapshot {
