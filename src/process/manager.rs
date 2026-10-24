@@ -6472,7 +6472,20 @@ pub async fn restart_runner_by_id(
         return Err(e);
     }
 
-    let latch = RestartLatch::set(&managed).await;
+    let latch = match RestartLatch::acquire(&managed).await {
+        Ok(latch) => latch,
+        Err(e) => {
+            state
+                .diagnostics
+                .write()
+                .await
+                .emit(DiagnosticEventKind::RestartFailed {
+                    source,
+                    error: e.to_string(),
+                });
+            return Err(e);
+        }
+    };
 
     // Everything from the latch on runs in its OWN task, awaited. A
     // synchronous HTTP door (`POST /runner/restart` without rebuild,
@@ -6506,27 +6519,47 @@ pub async fn restart_runner_by_id(
     })?
 }
 
-/// Holds `restart_requested` for the life of one admitted restart.
+/// Holds `restart_requested` for the life of one admitted restart, and
+/// [`crate::state::ManagedRunner::restart_in_flight`] beside it so a second
+/// restart of the same runner is refused while this one runs.
 ///
 /// [`RestartLatch::clear`] is the normal exit; `Drop` is the backstop for an
 /// exit that never reaches it (a panic, or the task cancelled by runtime
-/// shutdown), so the latch can never outlive the restart that set it.
+/// shutdown), so the latch can never outlive the restart that set it. On
+/// every path `restart_in_flight` is released only after `restart_requested`
+/// is written false, so no newer restart can latch in between and have its
+/// flag cleared by this one.
 pub(crate) struct RestartLatch {
     managed: Option<Arc<ManagedRunner>>,
 }
 
 impl RestartLatch {
-    pub(crate) async fn set(managed: &Arc<ManagedRunner>) -> Self {
-        managed.runner.write().await.restart_requested = true;
-        Self {
-            managed: Some(managed.clone()),
+    pub(crate) async fn acquire(managed: &Arc<ManagedRunner>) -> Result<Self, SupervisorError> {
+        if managed
+            .restart_in_flight
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SupervisorError::Validation(format!(
+                "restart_in_flight: a restart of runner '{}' is already in progress (a                  restart whose caller disconnected keeps running); wait for it rather than                  restarting it twice",
+                managed.config.id
+            )));
         }
+        managed.runner.write().await.restart_requested = true;
+        Ok(Self {
+            managed: Some(managed.clone()),
+        })
     }
 
     pub(crate) async fn clear(mut self) {
-        if let Some(managed) = self.managed.take() {
+        if let Some(managed) = self.managed.as_ref() {
             managed.runner.write().await.restart_requested = false;
+            managed
+                .restart_in_flight
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
+        // Disarm `Drop` only once both writes are done: a cancellation during
+        // the await above leaves `managed` in place for `Drop` to finish.
+        self.managed = None;
     }
 }
 
@@ -6537,12 +6570,20 @@ impl Drop for RestartLatch {
         };
         if let Ok(mut runner) = managed.runner.try_write() {
             runner.restart_requested = false;
+            drop(runner);
+            managed
+                .restart_in_flight
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
-        // Contended: clear it as soon as the lock frees.
+        // Contended: clear it as soon as the lock frees, and only then let a
+        // new restart in.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 managed.runner.write().await.restart_requested = false;
+                managed
+                    .restart_in_flight
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             });
         } else {
             warn!(

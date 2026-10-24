@@ -25,6 +25,7 @@ pub type SharedState = Arc<SupervisorState>;
 ///
 /// Removes on drop only what it inserted: a path another holder registered
 /// first stays registered for that holder.
+#[must_use = "the container is registered only while this guard is held; bind it to a named variable"]
 pub struct ActiveSpawnContainer {
     state: SharedState,
     path: PathBuf,
@@ -155,6 +156,12 @@ pub struct ManagedRunner {
     /// take a whole build, and a second start racing it must be refused, not
     /// queued into a second spawn.
     pub start_in_flight: std::sync::atomic::AtomicBool,
+    /// Held for the life of one admitted restart
+    /// ([`crate::process::manager::RestartLatch`]): a restart whose caller
+    /// disconnected keeps running, so a retried restart must be refused rather
+    /// than overlap it. Released only AFTER `restart_requested` is cleared, so
+    /// a late clear can never land on a newer restart's latch.
+    pub restart_in_flight: std::sync::atomic::AtomicBool,
     /// Per-spawn opt-in: allow starting from a resolved exe whose build
     /// identity cannot be established (see
     /// [`crate::process::manager::unverified_exe_gate`]). Set from the
@@ -260,6 +267,7 @@ impl ManagedRunner {
             resolved_exe: RwLock::new(None),
 
             start_in_flight: std::sync::atomic::AtomicBool::new(false),
+            restart_in_flight: std::sync::atomic::AtomicBool::new(false),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
         }

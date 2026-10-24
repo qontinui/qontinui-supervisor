@@ -647,7 +647,7 @@ async fn main() -> anyhow::Result<()> {
                 &active,
                 std::time::SystemTime::now(),
                 None,
-                Some(&locks),
+                &locks,
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {

@@ -4238,7 +4238,7 @@ async fn execute_spawn_build_inner(
                 &active_now,
                 std::time::SystemTime::now(),
                 None,
-                Some(&locks),
+                &locks,
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
@@ -6466,7 +6466,7 @@ pub async fn prune_spawn_worktrees_endpoint(
         &active_now,
         std::time::SystemTime::now(),
         query.older_than_hours,
-        Some(&locks),
+        &locks,
     )
     .await;
 

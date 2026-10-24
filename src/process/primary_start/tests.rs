@@ -687,6 +687,38 @@ async fn a_restart_dropped_mid_prepare_still_clears_its_latch() {
         || async { !managed.runner.read().await.restart_requested },
     )
     .await;
+    // The restart RAN TO ITS END after its caller was gone: only the latched
+    // half (`restart_in_flight`) records a `RestartFailed` once the gate has
+    // admitted the request. A latch that merely cleared on drop, with the
+    // restart abandoned, would record nothing.
+    let state2 = state.clone();
+    eventually(
+        "the abandoned caller's restart records its failure",
+        move || {
+            let state = state2.clone();
+            async move {
+                state
+                    .diagnostics
+                    .read()
+                    .await
+                    .events(100, None)
+                    .iter()
+                    .any(|e| {
+                        matches!(
+                            e.kind,
+                            crate::diagnostics::DiagnosticEventKind::RestartFailed { .. }
+                        )
+                    })
+            }
+        },
+    )
+    .await;
+    assert!(
+        !managed
+            .restart_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight guard is released with the latch"
+    );
     assert!(
         !managed.runner.read().await.stop_requested,
         "a refused start must not have stopped anything"
@@ -702,26 +734,72 @@ async fn a_dropped_restart_latch_clears_the_flag() {
     let state = state_under(tmp.path());
     let managed = register_dead_primary(&state).await;
 
-    let latch = RestartLatch::set(&managed).await;
+    let in_flight = || {
+        managed
+            .restart_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let latch = RestartLatch::acquire(&managed).await.expect("acquire");
     assert!(managed.runner.read().await.restart_requested);
+    assert!(in_flight());
     drop(latch);
     assert!(!managed.runner.read().await.restart_requested);
+    assert!(!in_flight());
 
-    // Contended at drop: cleared as soon as the lock frees.
-    let latch = RestartLatch::set(&managed).await;
+    // Contended at drop: cleared as soon as the lock frees — and no new
+    // restart can latch before that clear lands, or the late clear would
+    // switch off the newer restart's flag.
+    let latch = RestartLatch::acquire(&managed).await.expect("acquire");
     let reader = managed.runner.read().await;
     drop(latch);
     assert!(reader.restart_requested);
+    assert!(
+        RestartLatch::acquire(&managed).await.is_err(),
+        "a restart must not latch while the previous one's clear is pending"
+    );
     drop(reader);
     eventually("the contended latch clears", || async {
-        !managed.runner.read().await.restart_requested
+        !managed.runner.read().await.restart_requested && !in_flight()
     })
     .await;
 
     // The normal exit.
-    let latch = RestartLatch::set(&managed).await;
+    let latch = RestartLatch::acquire(&managed).await.expect("acquire");
     latch.clear().await;
     assert!(!managed.runner.read().await.restart_requested);
+    assert!(!in_flight());
+}
+
+/// A restart whose caller disconnected keeps running, so a retried restart
+/// is refused while it runs instead of overlapping it, and is admitted once
+/// it ends.
+#[tokio::test]
+async fn a_second_restart_is_refused_while_one_is_in_flight() {
+    use crate::process::manager::RestartLatch;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let managed = register_dead_primary(&state).await;
+
+    let first = RestartLatch::acquire(&managed).await.expect("first");
+    let refused = RestartLatch::acquire(&managed)
+        .await
+        .err()
+        .expect("a second restart must be refused");
+    assert!(
+        refused.to_string().contains("already in progress"),
+        "{refused}"
+    );
+    assert!(
+        managed.runner.read().await.restart_requested,
+        "the refusal must not clear the running restart's latch"
+    );
+    first.clear().await;
+    RestartLatch::acquire(&managed)
+        .await
+        .expect("admitted once the first ends")
+        .clear()
+        .await;
 }
 
 /// Finding 1, both doors: the latched half of `restart_runner_by_id` runs in
@@ -735,10 +813,19 @@ fn the_synchronous_restart_doors_run_their_restart_in_a_task() {
         "pub async fn restart_runner_by_id(",
         "pub(crate) struct RestartLatch",
     );
-    let latch = by_id.find("RestartLatch::set").expect("latches");
-    let spawn = by_id.find("tokio::spawn").expect("spawns");
+    let latch = by_id.find("RestartLatch::acquire").expect("latches");
+    let spawn = by_id.find("tokio::spawn(async move {").expect("spawns");
+    // The body must run INSIDE the spawned closure, not after it.
+    let closure_end = spawn
+        + by_id[spawn..]
+            .find(
+                "
+    })
+    .await",
+            )
+            .expect("the spawned closure is awaited");
     let body = by_id.find("restart_in_flight(").expect("runs the body");
-    assert!(latch < spawn && spawn < body);
+    assert!(latch < spawn && spawn < body && body < closure_end);
     let runner = include_str!("../../routes/runner.rs");
     let handler = fn_body(
         runner,
@@ -784,9 +871,10 @@ fn both_origin_main_arms_of_the_primary_build_register_their_container() {
     let (dev, optimized) = build.split_at(build.find("let lock = state").expect("optimized arm"));
     for arm in [dev, optimized] {
         let lock = arm.find("spawn_container_lock").expect("container lock");
+        // Bound to a NAMED variable: `let _ = …` would drop the guard at once.
         let active = arm
-            .find("ActiveSpawnContainer::register(state, &container)")
-            .expect("registered");
+            .find("let _active = ActiveSpawnContainer::register(state, &container);")
+            .expect("registered and held");
         let prepare = arm.find("prepare_worktree").expect("prepares");
         assert!(lock < active && active < prepare);
     }

@@ -172,8 +172,8 @@ async fn git(args: &[&str], cwd: &Path, quiet_offline_ok: bool) -> Result<String
 /// [`crate::git_provenance::fetch_timeout`]. Never fails the caller: a fetch
 /// that errors or overruns leaves the refs already present (logged at WARN),
 /// and the ref is validated by the checkout / rev-parse that follows. The
-/// overrun child is left to finish rather than killed — killing a fetch can
-/// strand ref lock files that would break the next one.
+/// overrun child is not killed (`git` sets no `kill_on_drop`): it is left to
+/// finish on its own rather than interrupted mid-write.
 async fn fetch_best_effort(args: &[&str], cwd: &Path) {
     let budget = crate::git_provenance::fetch_timeout();
     match tokio::time::timeout(budget, git(args, cwd, false)).await {
@@ -195,6 +195,21 @@ async fn fetch_best_effort(args: &[&str], cwd: &Path) {
 /// branch, tag or abbreviated sha.
 pub(crate) fn is_full_sha(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether `checkout` needs no fetch: a full sha that ALREADY names a commit
+/// in `repo_root`'s object database (worktrees share it). Anything else — a
+/// branch, a tag, or a full sha pushed since the last fetch (a spawn-test
+/// `git_ref` may name one) — is fetched first.
+async fn checkout_is_local_commit(repo_root: &Path, checkout: &str) -> bool {
+    is_full_sha(checkout)
+        && git(
+            &["cat-file", "-e", &format!("{checkout}^{{commit}}")],
+            repo_root,
+            false,
+        )
+        .await
+        .is_ok()
 }
 
 /// Prefix prepended to a build-failure error when [`classify_drift`] detects
@@ -638,11 +653,11 @@ pub async fn prepare_worktree_at(
 
     // Best-effort fetch on the runner repo so the ref is resolvable even if it
     // was pushed after this supervisor started. Offline ⇒ tolerated. Skipped
-    // for a checkout that is already a full sha: the caller resolved it from
-    // refs in this repo (the primary build, after its own fetch), so there is
-    // nothing to fetch for it, and this runs under the caller's locks.
-    let checkout_is_sha = is_full_sha(checkout);
-    if !checkout_is_sha {
+    // only for a full sha whose commit is already here (the primary build's
+    // pinned sha, read after its own fetch): there is nothing to fetch for it,
+    // and this runs under the caller's locks.
+    let checkout_is_local = checkout_is_local_commit(&repo_root, checkout).await;
+    if !checkout_is_local {
         fetch_best_effort(&["fetch", "--quiet", "origin"], &repo_root).await;
     }
 
@@ -681,7 +696,7 @@ pub async fn prepare_worktree_at(
         .await?;
     } else {
         // Reuse: refresh + hard-pin the runner worktree to the ref.
-        if !checkout_is_sha {
+        if !checkout_is_local {
             fetch_best_effort(&["fetch", "--quiet", "origin"], &runner_wt).await;
         }
         git(
@@ -971,12 +986,15 @@ pub async fn prune_spawn_worktrees_with_window(
     now: std::time::SystemTime,
     window_hours_override: Option<u64>,
 ) -> PruneReport {
+    // No production path takes this form; a fresh, never-held lock per
+    // container keeps the guarded engine's semantics without a lock table.
+    let unheld = |_: &Path| std::sync::Arc::new(tokio::sync::Mutex::new(()));
     prune_spawn_worktrees_guarded(
         project_dir,
         active_containers,
         now,
         window_hours_override,
-        None,
+        &unheld,
     )
     .await
 }
@@ -986,8 +1004,10 @@ pub async fn prune_spawn_worktrees_with_window(
 pub type ContainerLockLookup<'a> =
     &'a (dyn Fn(&Path) -> std::sync::Arc<tokio::sync::Mutex<()>> + Send + Sync);
 
-/// [`prune_spawn_worktrees_with_window`] that also respects the per-container
-/// locks. Every path that materializes or builds a container holds its lock
+/// Enumerate and prune stale `.spawn-*` containers (the retention rules are
+/// on the test-only `prune_spawn_worktrees`), respecting the per-container
+/// locks. Every production sweep calls this form, and the lookup is required
+/// so none can skip the locks. Every path that materializes or builds a container holds its lock
 /// (spawn-test, the primary build), and the active set alone is only as good
 /// as every such path remembering to register; so a container whose lock is
 /// held is kept as busy, and the sweep HOLDS the lock of a container while it
@@ -998,7 +1018,7 @@ pub async fn prune_spawn_worktrees_guarded(
     active_containers: &std::collections::HashSet<PathBuf>,
     now: std::time::SystemTime,
     window_hours_override: Option<u64>,
-    container_locks: Option<ContainerLockLookup<'_>>,
+    container_locks: ContainerLockLookup<'_>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
 
@@ -1092,17 +1112,14 @@ pub async fn prune_spawn_worktrees_guarded(
         // Invariant 2, by lock: a container someone is materializing or
         // building holds its lock. Held to the end of this iteration (the
         // removal included) when taken.
-        let _container_guard = match container_locks {
-            Some(lookup) => match lookup(&path).try_lock_owned() {
-                Ok(guard) => Some(guard),
-                Err(_) => {
-                    report
-                        .kept
-                        .push((path.clone(), "busy (container lock held)".to_string()));
-                    continue;
-                }
-            },
-            None => None,
+        let _container_guard = match container_locks(&path).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                report
+                    .kept
+                    .push((path.clone(), "busy (container lock held)".to_string()));
+                continue;
+            }
         };
 
         // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
@@ -1871,14 +1888,9 @@ mod tests {
         let held = lookup(&prepared.container_path).lock_owned().await;
 
         let none: HashSet<PathBuf> = HashSet::new();
-        let r = prune_spawn_worktrees_guarded(
-            &src_tauri,
-            &none,
-            now_plus_hours(999),
-            None,
-            Some(&lookup),
-        )
-        .await;
+        let r =
+            prune_spawn_worktrees_guarded(&src_tauri, &none, now_plus_hours(999), None, &lookup)
+                .await;
         assert!(
             prepared.container_path.exists(),
             "a container whose lock is held must never be pruned"
@@ -1893,14 +1905,9 @@ mod tests {
         );
 
         drop(held);
-        let r = prune_spawn_worktrees_guarded(
-            &src_tauri,
-            &none,
-            now_plus_hours(999),
-            None,
-            Some(&lookup),
-        )
-        .await;
+        let r =
+            prune_spawn_worktrees_guarded(&src_tauri, &none, now_plus_hours(999), None, &lookup)
+                .await;
         assert_eq!(r.removed, vec![prepared.container_path.clone()]);
         assert!(!prepared.container_path.exists());
     }
@@ -1913,6 +1920,53 @@ mod tests {
         assert!(!is_full_sha("HEAD"));
         assert!(!is_full_sha("abc1234"));
         assert!(!is_full_sha(&"g".repeat(40)));
+    }
+
+    /// A spawn-test `git_ref` may be a full sha pushed after the last fetch.
+    /// It exists only on origin, so preparing it must still fetch.
+    #[tokio::test]
+    async fn a_full_sha_that_exists_only_on_origin_still_prepares() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_root, src_tauri) = build_workspace_fixture(tmp.path());
+        let runner = src_tauri.parent().expect("runner root").to_path_buf();
+
+        // An upstream with one commit the runner repo has never fetched.
+        let upstream = tmp.path().join("upstream");
+        git_in(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                &runner.to_string_lossy(),
+                &upstream.to_string_lossy(),
+            ],
+        );
+        git_in(&upstream, &["config", "user.email", "test@example.com"]);
+        git_in(&upstream, &["config", "user.name", "test"]);
+        std::fs::write(upstream.join("pushed-later.txt"), "x").expect("write");
+        git_in(&upstream, &["add", "-A"]);
+        git_in(&upstream, &["commit", "-q", "-m", "pushed later"]);
+        let out = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&upstream)
+            .output()
+            .expect("rev-parse");
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(is_full_sha(&sha), "{sha}");
+        git_in(
+            &runner,
+            &["remote", "set-url", "origin", &upstream.to_string_lossy()],
+        );
+        assert!(
+            !checkout_is_local_commit(&runner, &sha).await,
+            "the fixture's sha must not be in the runner repo yet"
+        );
+
+        let prepared = prepare_worktree(&src_tauri, &sha)
+            .await
+            .expect("a full sha that exists only on origin must prepare");
+        assert_eq!(prepared.resolved_sha, sha);
+        assert!(prepared.worktree_path.join("pushed-later.txt").exists());
     }
 
     #[tokio::test]

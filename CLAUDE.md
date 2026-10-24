@@ -439,7 +439,10 @@ stay on `dev`, unchanged.
     disconnects does not cancel it. The latched half of every restart
     (`manager::restart_runner_by_id`) runs in its own task too, behind an RAII
     `RestartLatch`, so a dropped caller neither abandons the restart nor
-    leaves `restart_requested` set (which would silence the serving watchdog);
+    leaves `restart_requested` set (which would silence the serving watchdog).
+    Because such a restart keeps running, a second restart of the same runner
+    is refused while it is in flight (`restart_in_flight`, released only
+    after the latch is cleared) instead of overlapping it;
     `POST /runner/restart` runs its whole no-rebuild tail (LKG pin, restart,
     dev-action result) in a task as well. It files a restart that will build
     as a `build`-kind dev action (`cold_build=true`) — decided after an
@@ -1837,7 +1840,7 @@ Verification surfaces (still the right thing to check before drawing conclusions
 
 ### Primary rebuild builds origin/main by default
 
-A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detached `manager::restart_runner`) does **not** compile the contested working checkout by default. It materializes a fresh `origin/main` worktree via `spawn_worktree::prepare_worktree(project_dir, "origin/main")` — which fetches origin itself and pins the `qontinui-schemas` sibling to `origin/main` — and compiles that worktree's `src-tauri`. The resulting build is provenance-classified `origin_main` (a third `BuildSource` alongside `live_tree` and `override`): it is LKG-eligible and allowed to start as the primary, so the primary always runs latest-green-main and the 2026-06-07 silent-stale-build incident cannot recur. A `log::info!` (and a `Build` log entry) names the chosen source + resolved sha before the build so the next operator restart self-documents which commit the primary will run.
+A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detached `manager::restart_runner`) does **not** compile the contested working checkout by default. It materializes a fresh `origin/main` worktree and compiles that worktree's `src-tauri`, with the `qontinui-schemas` sibling pinned to `origin/main`. For a `dev` primary that is `spawn_worktree::prepare_worktree(project_dir, "origin/main")`, which fetches origin itself; for an optimized primary it is `prepare_worktree_at(project_dir, "origin/main", <sha>)` at the ONE sha the profile check read after its own bounded fetch, with no further fetch of the runner repo (see "Primary build profile"). The resulting build is provenance-classified `origin_main` (a third `BuildSource` alongside `live_tree` and `override`): it is LKG-eligible and allowed to start as the primary, so the primary always runs latest-green-main and the 2026-06-07 silent-stale-build incident cannot recur. A `log::info!` (and a `Build` log entry) names the chosen source + resolved sha before the build so the next operator restart self-documents which commit the primary will run.
 
 - **Escape hatch:** `POST /runner/restart {rebuild: true, from_working_tree: true}` reverts to the legacy behavior — compile the live working tree (`project_dir`, provenance `live_tree`) — for the rare case the operator deliberately wants the primary to run uncommitted local changes. **The canonical WIP-test path is a temp runner via spawn-test, not the primary.**
 - **Scope — the two RESTART doors, keyed on the runner, not on the route.** `restart_runner_by_id` selects the origin/main build with `build_tree.compiles_origin_main(is_primary())`, so **both** restart doors apply it: `POST /runner/restart` and `POST /runners/primary/restart` each compile `origin/main` by default. Named/temp runners keep the legacy live-tree build through either door — `is_primary()` is already false for them, so the build-source argument is inert there. spawn-test is unchanged (see the spawn-test hazard above).
