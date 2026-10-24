@@ -3498,8 +3498,10 @@ async fn start_exe_mode_for_runner(
                     "Runner '{}' pinned to source exe override {:?}",
                     managed.config.name, p
                 );
-                // The only producer of `source_exe_override` today is a
-                // `use_lkg: true` spawn, so the LKG record IS this exe's
+                // The producers of `source_exe_override` are a
+                // `use_lkg: true` spawn and an LKG-pinned primary restart
+                // (`RestartLatch::pin`), both pointing at an LKG exe, so the
+                // LKG record IS this exe's
                 // provenance — but only claim that when the override actually
                 // points at the LKG exe. A future override producer aiming
                 // elsewhere must not silently inherit the LKG's sha.
@@ -6431,9 +6433,9 @@ pub async fn restart_runner_by_id(
 /// [`restart_runner_by_id`] that starts the runner from `exe_pin` (an LKG
 /// pin) when one is given. The pin is written to the runner's
 /// `source_exe_override` only AFTER this restart holds its [`RestartLatch`],
-/// and cleared before the latch comes off, so a restart refused as already in
-/// flight — or by the readiness gate — never touches the exe a running restart
-/// is about to start.
+/// which restores the previous value before it comes off, so a restart refused
+/// as already in flight — or by the readiness gate — never touches the exe a
+/// running restart is about to start.
 #[allow(clippy::too_many_arguments)]
 pub async fn restart_runner_by_id_pinned(
     state: &SharedState,
@@ -6622,9 +6624,12 @@ impl RestartLatch {
 
     pub(crate) async fn clear(mut self) {
         if let Some(managed) = self.managed.as_ref() {
-            if let Some(previous) = self.restore_override.take() {
-                *managed.source_exe_override.write().await = previous;
+            if let Some(previous) = self.restore_override.as_ref() {
+                *managed.source_exe_override.write().await = previous.clone();
             }
+            // Forgotten only once written: a cancellation during the await
+            // above leaves it for `Drop` to restore.
+            self.restore_override = None;
             managed.runner.write().await.restart_requested = false;
             managed
                 .restart_in_flight

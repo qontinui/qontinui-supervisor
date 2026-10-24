@@ -837,6 +837,21 @@ async fn an_acquire_cancelled_at_its_lock_wait_releases_the_in_flight_bit() {
         .await;
 }
 
+/// The serving watchdog gives an attempt back for a refusal that stopped
+/// nothing (the readiness gate, the restart latch) and for nothing else: a
+/// start-latch refusal can come after the restart's stop.
+#[test]
+fn the_watchdog_refunds_only_refusals_that_stopped_nothing() {
+    let manager = include_str!("../manager.rs");
+    let at = manager
+        .find("let refunded = matches!(")
+        .expect("refund decision");
+    let decision = &manager[at..at + manager[at..].find(");").expect("end") + 2];
+    assert!(decision.contains("SupervisorError::RestartUnsafe(_)"));
+    assert!(decision.contains("SupervisorError::RestartInFlight(_)"));
+    assert!(!decision.contains("StartInFlight"), "{decision}");
+}
+
 /// The LKG pin a restart carries is applied only under its latch: a retry
 /// refused as already in flight leaves the running restart's override alone.
 #[test]

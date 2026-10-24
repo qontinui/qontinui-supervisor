@@ -73,7 +73,8 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 /// ran, so no effect surface was touched and a clean attribution window carries
 /// no information about it. [`SupervisorError::RestartInFlight`] is the same:
 /// the restart latch refused before anything was stopped. Everything else ran
-/// and failed. Both classify to
+/// and failed (a START-latch refusal included: it can come after a restart's
+/// stop). All of them classify to
 /// `D3Category::Failure` (plan §5 rejects a sixth category); the distinction is
 /// carried on the record and surfaces in the outcome's `evidence_ref`.
 ///
@@ -946,7 +947,8 @@ pub async fn restart_runner(
             None => risk.route_lkg,
         };
         // The pin is handed to the restart, which applies it only once it holds
-        // the restart latch and clears it before releasing it: a retry refused
+        // the restart latch and restores the previous override before releasing
+        // it: a retry refused
         // as already in flight (or by the readiness gate) never touches the exe
         // a running restart starts, and later restarts re-decide from fresh
         // predictions rather than inheriting a sticky pin.
@@ -1985,6 +1987,35 @@ mod tests {
             crate::dev_action::attribution::classify(Some(&errored), &[]),
             crate::dev_action::record::D3Category::Failure
         );
+
+        // A restart-latch refusal stopped nothing: Refused. A start-latch
+        // refusal can come after a restart's stop: Errored.
+        assert!(matches!(
+            run_result_for(&SupervisorError::RestartInFlight(
+                "restart_in_flight: x".into()
+            )),
+            crate::dev_action::ActionRunResult::Refused { .. }
+        ));
+        assert!(matches!(
+            run_result_for(&SupervisorError::StartInFlight("start_in_flight: x".into())),
+            crate::dev_action::ActionRunResult::Errored { .. }
+        ));
+    }
+
+    /// Both in-flight refusals are `409 Conflict`: the request was well formed
+    /// and the runner is busy.
+    #[test]
+    fn in_flight_refusals_are_409() {
+        use axum::response::IntoResponse;
+        for err in [
+            SupervisorError::RestartInFlight("restart_in_flight: x".into()),
+            SupervisorError::StartInFlight("start_in_flight: x".into()),
+        ] {
+            assert_eq!(
+                err.into_response().status(),
+                axum::http::StatusCode::CONFLICT
+            );
+        }
     }
 
     /// Plan §6 Phase 5 test 5a — the SYNCHRONOUS `rebuild:false` path. The
