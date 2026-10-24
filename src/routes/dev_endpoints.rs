@@ -173,6 +173,7 @@ mod tests {
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
+            primary_build_profile: Default::default(),
         }
     }
 

@@ -669,7 +669,7 @@ pub async fn list_runners(
         // badge prompting the user to restart. File-stat only, swallows I/O
         // errors — this is strictly informational and must never block the
         // listing.
-        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config).await;
+        let stale_binary = manager::stale_binary_for_runner(&state, managed).await;
 
         // friction-1: surface the owning requester so a session can pin its own
         // runner by stable id rather than by the reusable port.
@@ -1265,7 +1265,7 @@ pub async fn start_runner(
     Path(id): Path<String>,
     Query(wait_q): Query<crate::routes::runner::StartWaitQuery>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    manager::start_runner_by_id(&state, &id).await?;
+    manager::start_runner_by_id(&state, &id, manager::StartIntent::Operator).await?;
 
     if wait_q.wait {
         if let Err(failure) =
@@ -1461,12 +1461,15 @@ pub async fn restart_runner(
             .into_response());
     }
 
-    // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
-    // The build source is inert here - `restart_runner_by_id` reads it only
-    // inside its `if rebuild` arm, and nothing is compiled on this path. It is
-    // threaded rather than passed as a literal so both call sites say the same
-    // thing, and so a future change that starts building here cannot inherit a
-    // hardcoded provenance.
+    // ── No-rebuild path: synchronous. ───────────────────────────────────────
+    // Usually a fast restart. One exception compiles: an optimized primary
+    // with nothing startable builds its artifact before stopping the old
+    // process (`primary_start::prepare_primary_start`). That build runs in its
+    // own task (`primary_build_detached`), and so does the whole latched
+    // restart (`manager::restart_runner_by_id`), so a client that disconnects
+    // from this handler cancels neither the build nor the restart, and cannot
+    // strand `restart_requested`. The build source is threaded rather
+    // than passed as a literal so both call sites say the same thing.
     manager::restart_runner_by_id(
         &state,
         &id,
@@ -2619,7 +2622,13 @@ async fn mint_spawn_action(
     // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
     // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
     // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+    // A spawn is a temp/named runner: the dev profile.
+    let slot_resolution = match manager::resolve_source_exe_with_origin(
+        state,
+        crate::build_profile::RunnerBuildProfile::Dev,
+    )
+    .await
+    {
         Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
@@ -4222,12 +4231,14 @@ async fn execute_spawn_build_inner(
                 .unwrap()
                 .remove(&container);
 
-            let active_now: std::collections::HashSet<std::path::PathBuf> =
-                state.active_spawn_worktrees.lock().unwrap().clone();
-            let report = crate::spawn_worktree::prune_spawn_worktrees(
+            let active_now = state.active_spawn_containers();
+            let locks = |p: &std::path::Path| state.spawn_container_lock(p);
+            let report = crate::spawn_worktree::prune_spawn_worktrees_guarded(
                 &state.config.project_dir,
                 &active_now,
                 std::time::SystemTime::now(),
+                None,
+                &locks,
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
@@ -4261,7 +4272,7 @@ async fn execute_spawn_build_inner(
     // optional rebuild so a `{rebuild: true, use_lkg: true}` call uses the
     // freshly-rebuilt binary as its LKG (the rebuild updated LKG on success).
     if body.use_lkg {
-        match manager::resolve_lkg_exe(state).await {
+        match manager::resolve_lkg_exe(state, crate::build_profile::RunnerBuildProfile::Dev).await {
             Ok(lkg_path) => {
                 let mut slot = managed.source_exe_override.write().await;
                 *slot = Some(lkg_path.clone());
@@ -4374,7 +4385,9 @@ async fn execute_spawn_build_inner(
     // spawn's failed health probe, the reaper).
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed).await {
+    if let Err(e) =
+        manager::start_managed_runner(state, managed, manager::StartIntent::Operator).await
+    {
         // Clean up on failure — the registry entry AND the instance dir the
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
@@ -4620,10 +4633,13 @@ async fn execute_spawn_build_inner(
     // runner was pinned to LKG, prefer the LKG path's metadata over the
     // freshest slot's so the response describes what's actually running.
     let exe_meta = if body.use_lkg {
-        crate::process::manager::resolve_lkg_exe(state)
-            .await
-            .ok()
-            .and_then(|p| crate::process::manager::binary_meta(&p))
+        crate::process::manager::resolve_lkg_exe(
+            state,
+            crate::build_profile::RunnerBuildProfile::Dev,
+        )
+        .await
+        .ok()
+        .and_then(|p| crate::process::manager::binary_meta(&p))
     } else {
         crate::process::manager::resolve_source_exe(state)
             .await
@@ -5684,7 +5700,9 @@ pub async fn spawn_named(
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    if let Err(e) =
+        manager::start_managed_runner(&state, &managed, manager::StartIntent::Operator).await
+    {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);
@@ -6077,6 +6095,44 @@ pub async fn list_builds(
         slots_json.push(slot_json);
     }
 
+    // The primary's dedicated build dir (`target-pool/primary/`). Not a pool
+    // slot, but a build on it holds one of the pool's permits, so it is listed
+    // as its own labelled row and counted in `active_builds` — otherwise the
+    // invariant below would hide a permit and `/builds` would show a free slot
+    // the semaphore does not have. Its log is at `/builds/255/log[/stream]`.
+    let primary = &state.build_pool.primary_slot;
+    let primary_busy = primary.busy.read().await.clone();
+    let primary_build_dir_json = {
+        let base = json!({
+            "id": primary.id,
+            "label": "primary",
+            "profile": primary.profile,
+            "target_dir": primary.target_dir.to_string_lossy(),
+            "log_url": format!("/builds/{}/log", primary.id),
+        });
+        let mut row = base;
+        match primary_busy {
+            Some(ref i) => {
+                let elapsed = (now - i.started_at).num_seconds().max(0);
+                active_builds.push(json!({
+                    "slot": primary.id,
+                    "label": "primary",
+                    "started_at": i.started_at.to_rfc3339(),
+                    "elapsed_secs": elapsed,
+                    "requester_id": i.requester_id,
+                    "rebuild_kind": i.rebuild_kind,
+                    "mem_gate": i.mem_gate,
+                }));
+                row["state"] = json!("building");
+                row["started_at"] = json!(i.started_at.to_rfc3339());
+                row["elapsed_secs"] = json!(elapsed);
+                row["requester_id"] = json!(i.requester_id);
+            }
+            None => row["state"] = json!("idle"),
+        }
+        row
+    };
+
     let avg_build_duration_secs: Option<f64> = if global_count > 0 {
         Some(global_sum / global_count as f64)
     } else {
@@ -6108,7 +6164,11 @@ pub async fn list_builds(
     // versa. Deriving from the same iteration as `slots_json` / `active_builds`
     // makes the three views mathematically consistent: by construction
     // `pool_size = available_permits + active_builds.len()`.
-    let available = state.build_pool.slots.len() - active_builds.len();
+    let available = state
+        .build_pool
+        .slots
+        .len()
+        .saturating_sub(active_builds.len());
     // Also expose the raw semaphore count under a distinct field so callers
     // who care about the throttle (queue admission) can still read it. When
     // it disagrees with `available_permits`, the semaphore is the gate; the
@@ -6132,6 +6192,24 @@ pub async fn list_builds(
                 // via BuildSource as "live_tree"/"override".
                 "sha": info.sha,
                 "source": info.source,
+            })
+        });
+    // The primary's `release-checked` LKG (`target-pool/lkg/release-checked/`),
+    // beside the dev one above that temp runners' `use_lkg` reads.
+    let lkg_release_checked_json = state
+        .build_pool
+        .release_checked_lkg
+        .read()
+        .await
+        .as_ref()
+        .map(|info| {
+            json!({
+                "built_at": info.built_at.to_rfc3339(),
+                "source_slot": info.source_slot,
+                "exe_size": info.exe_size,
+                "sha": info.sha,
+                "source": info.source,
+                "profile": info.profile,
             })
         });
     // Phase A: origin/main drift for the LKG sha — turns the silent stale-build
@@ -6296,7 +6374,9 @@ pub async fn list_builds(
         // matches the 503 `build_pool_full` error body for symmetry.
         // Invariant: `pool_size == available_permits + active_builds.len()`.
         "active_builds": active_builds,
+        "primary_build_dir": primary_build_dir_json,
         "lkg": lkg_json,
+        "lkg_release_checked": lkg_release_checked_json,
         // Phase A: drift of the LKG sha vs origin/main. `null` when up-to-date,
         // unknown, or not computable; otherwise carries behind_count + a
         // `diverged` flag (is_ancestor == false). The loud counterpart to the
@@ -6338,7 +6418,7 @@ pub struct PruneSpawnQuery {
 /// scratch-worktree containers.
 ///
 /// Thin wrapper over the existing engine
-/// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
+/// [`crate::spawn_worktree::prune_spawn_worktrees_guarded`]. The engine
 /// owns ALL selection + safety (prefix-under-root filter, active-build
 /// exclusion, age + dirty double-retention). This handler only:
 ///   1. passes the LIVE active-container set from state (same source the
@@ -6376,14 +6456,17 @@ pub async fn prune_spawn_worktrees_endpoint(
         };
 
     // Live active-build container set — mirror the opportunistic sweep.
-    let active_now: std::collections::HashSet<std::path::PathBuf> =
-        state.active_spawn_worktrees.lock().unwrap().clone();
+    // A container whose lock is held (a spawn-test or primary build reading
+    // it) is kept as busy, whatever its age.
+    let active_now = state.active_spawn_containers();
+    let locks = |p: &std::path::Path| state.spawn_container_lock(p);
 
-    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
+    let report = crate::spawn_worktree::prune_spawn_worktrees_guarded(
         &state.config.project_dir,
         &active_now,
         std::time::SystemTime::now(),
         query.older_than_hours,
+        &locks,
     )
     .await;
 
@@ -6485,10 +6568,7 @@ pub async fn clean_slot_endpoint(
     // Refusal 2: the slot exe is held open by a live process. Holder detection
     // is Windows-only (sysinfo image-path match); on other platforms there is
     // no holder concept for a stalled file lock, so the check is a no-op.
-    let exe_path = slot
-        .target_dir
-        .join("debug")
-        .join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot.exe_path();
     let holders = crate::build_monitor::slot_exe_holders(&exe_path).await;
     if !holders.is_empty() {
         return (
@@ -6579,7 +6659,7 @@ pub async fn slot_build_log(
     State(state): State<SharedState>,
     Path(slot_id): Path<usize>,
 ) -> impl IntoResponse {
-    let slot = match state.build_pool.slots.get(slot_id) {
+    let slot = match state.build_pool.slot_by_id(slot_id) {
         Some(s) => s.clone(),
         None => {
             return (
@@ -6642,7 +6722,7 @@ pub async fn slot_build_log_stream(
     Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>,
     axum::response::Response,
 > {
-    let slot = match state.build_pool.slots.get(slot_id) {
+    let slot = match state.build_pool.slot_by_id(slot_id) {
         Some(s) => s.clone(),
         None => {
             return Err((
@@ -6794,7 +6874,7 @@ pub async fn slot_last_build_stderr(
     State(state): State<SharedState>,
     Path(slot_id): Path<usize>,
 ) -> impl IntoResponse {
-    let slot = match state.build_pool.slots.get(slot_id) {
+    let slot = match state.build_pool.slot_by_id(slot_id) {
         Some(s) => s.clone(),
         None => {
             return (
@@ -6889,7 +6969,7 @@ pub async fn runner_log_history(
         // Phase 2c (Item 9): mirror `stale_binary` from the `/runners` listing
         // so single-runner-drill-down callers (dashboard log pane, CLI) see
         // the same freshness signal without issuing a second request.
-        let stale_binary = manager::stale_binary_for_runner(&state, &managed.config).await;
+        let stale_binary = manager::stale_binary_for_runner(&state, &managed).await;
         // Per-spawn early-death log file path, when the runner was started
         // by the supervisor (any spawn flow). `null` for primary runners or
         // runners imported into the registry without a managed start.

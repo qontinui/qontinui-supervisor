@@ -3,6 +3,7 @@ mod bazel_remote;
 /// out of `build_monitor` so the Linux-only merge gate can test it.
 mod build_diagnostics;
 mod build_monitor;
+mod build_profile;
 mod build_sizing;
 mod build_submissions;
 mod cache_key;
@@ -175,6 +176,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut config = SupervisorConfig::from_args(args);
+
+    // The one announcement of the primary's build profile (plan
+    // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    // `release-checked (default)` or `dev (opt-in via <source>)`. A debug
+    // opt-in also WARNs its cost, and an ignored env value WARNs too.
+    info!("{}", config.primary_build_profile.announce_line());
+    if let Some(warning) = config.primary_build_profile.opt_in_warning() {
+        warn!("{}", warning);
+    }
+    if let Some(raw) = &config.primary_build_profile.ignored_env_value {
+        warn!(
+            "{}={:?} is not a build profile (accepted: dev, release-checked) and was IGNORED; \
+             the primary uses the release-checked default",
+            build_profile::PRIMARY_BUILD_PROFILE_ENV,
+            raw
+        );
+    }
 
     // Build pool sizing (plan 2026-10-02-cargo-jobs-…): say what was derived,
     // and name slot dirs a smaller pool no longer walks — they still hold disk.
@@ -407,8 +425,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(primary_id) => {
                     info!("auto-start: boot-starting primary runner '{}'", primary_id);
-                    match process::manager::start_runner_by_id(&state_for_autostart, &primary_id)
-                        .await
+                    match process::manager::start_runner_by_id(
+                        &state_for_autostart,
+                        &primary_id,
+                        process::manager::StartIntent::Unattended,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             info!("auto-start: primary runner '{}' started", primary_id);
@@ -610,17 +632,22 @@ async fn main() -> anyhow::Result<()> {
 
     // One-shot startup sweep of stale `.spawn-*` scratch worktree containers
     // (deferred #64 Phase 4). Non-blocking — spawned as its own task so a slow
-    // `git worktree remove` of a GB-scale checkout never delays serving. No
-    // build is active at startup, so the active-container exclusion set is
-    // empty. Best-effort: the pruner logs + swallows every failure internally.
+    // `git worktree remove` of a GB-scale checkout never delays serving. It
+    // runs concurrently with the boot start, which on a cold box BUILDS the
+    // primary in the `.spawn-origin_main` container, so it honours the live
+    // active set and the container locks like every other sweep.
+    // Best-effort: the pruner logs + swallows every failure internally.
     {
         let state_for_prune = state.clone();
         tokio::spawn(async move {
-            let active = std::collections::HashSet::new();
-            let report = spawn_worktree::prune_spawn_worktrees(
+            let active = state_for_prune.active_spawn_containers();
+            let locks = |p: &std::path::Path| state_for_prune.spawn_container_lock(p);
+            let report = spawn_worktree::prune_spawn_worktrees_guarded(
                 &state_for_prune.config.project_dir,
                 &active,
                 std::time::SystemTime::now(),
+                None,
+                &locks,
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
@@ -822,7 +849,14 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
         let now = chrono::Utc::now();
         let max_age = max_build_age_secs();
 
-        for slot in &state.build_pool.slots {
+        // The primary's build dir too: a stuck primary build holds a pool
+        // permit just like a stuck slot build.
+        for slot in state
+            .build_pool
+            .slots
+            .iter()
+            .chain(std::iter::once(&state.build_pool.primary_slot))
+        {
             if let Ok(mut busy) = slot.busy.try_write() {
                 if let Some(ref info) = *busy {
                     let elapsed = (now - info.started_at).num_seconds().max(0);

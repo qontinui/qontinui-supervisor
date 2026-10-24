@@ -191,8 +191,9 @@ so the sidecars deployed beside it never land in the live tree's shared
 (`reap_stale_test_runners`) now removes it too** — the other three removal
 sites already did, but the sweep did not, so a temp runner reaped for age
 rather than stopped or purged leaked its whole per-runner directory (runner
-exe + shim + git-credential helper) forever. The primary keeps its flat
-`target/debug/qontinui-runner-primary[.exe]`.
+exe + shim + git-credential helper) forever. The primary keeps a flat
+`target/<profile-dir>/qontinui-runner-primary[.exe]` — `target/release-checked/`
+by default, `target/debug/` for a `dev` primary (see "Primary build profile").
 
 **A temp runner's RESTART keeps all of that per-instance state** — pairing
 copy, config, dev logs, Restate journal, macros/prompts, WebView2 profile.
@@ -373,6 +374,110 @@ cargo clippy -- -D warnings    # Lint
 | `--port` | Supervisor HTTP port (default: 9875) |
 | `--no-prewarm` | Disable post-startup `cargo check` slot pre-warming (also `QONTINUI_SUPERVISOR_NO_PREWARM=1`) |
 | `--temp-runner-display` | Linux: `DISPLAY` handed to temp AND named runners when the supervisor's env has none (also `QONTINUI_SUPERVISOR_TEMP_DISPLAY`; the flag wins). Without a display, a temp or named spawn is refused with `no_display`. |
+| `--primary-build-profile` | `release-checked` (default) or `dev`: the cargo profile the PRIMARY is built and resolved in (also `QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE`; the flag wins; an unrecognised env value is ignored with a WARN). Temp and named runners are always `dev`. See "Primary build profile". |
+
+## Primary build profile
+
+Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 5;
+code in `src/build_profile.rs` and `src/process/primary_start.rs`. The primary
+is built and resolved in the `release-checked` profile (release optimization,
+debug assertions and overflow checks ON — the plan's Phase 3 specification for
+the runner workspace) unless `dev` is opted into. Temp, named and slot builds
+stay on `dev`, unchanged.
+
+- **The runner tree must declare the profile.** Only on the path that is about
+  to build, and before any worktree prep or frontend build, `primary_build`
+  checks the EXACT tree it will compile: for origin/main a `git fetch` with a
+  deadline (`QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`; one that does not
+  complete is named in the cause, since the check then read a possibly stale
+  local `origin/main`), `origin/main` resolved ONCE to a sha,
+  `git show <sha>:Cargo.toml`, and the worktree prepared at that same sha with
+  no further fetch of the runner repo (the schemas pin's fetches carry the same
+  deadline; the live tree's `Cargo.toml` otherwise). A tree with no
+  `[profile.release-checked]` makes the optimized build unavailable with that
+  cause named — never a cargo error mid-build. Until the runner's Phase 3
+  lands, every release-checked build on this fleet is unavailable this way.
+  Lock order: primary build lock → spawn container lock → pool permit. While
+  it holds the container, the build registers `.spawn-origin_main` in the
+  pruner's active set, and every pruner sweep also keeps (and, when removing,
+  holds) a container whose lock is taken, so no sweep removes the tree a
+  primary or spawn-test build is reading.
+
+- **Its own target dir, never a slot.** Primary builds (a primary
+  `restart {rebuild:true}`, or a primary start with nothing startable) run
+  `cargo build … --profile release-checked` with
+  `CARGO_TARGET_DIR=target-pool/primary/` under the pool's permit semaphore,
+  serialized by their own lock, and never move `last_successful_slot`. The
+  sidecar roster is built in the same profile, into
+  `target-pool/primary/release-checked/`. The no-progress watchdog probes that
+  dir, not `debug/`.
+- **Per-profile LKGs:** `target-pool/lkg/<profile-dir>/` with `profile` in
+  `lkg.json`. A legacy flat `target-pool/lkg/lkg.json` (no `profile`) reads as a
+  `dev` LKG and is never re-labelled; temp runners' `use_lkg` reads the dev LKG,
+  the primary's `use_lkg` bias reads its own profile's.
+- **Resolution** (`manager::resolve_source_exe_detailed(state, profile)`): `dev`
+  resolves the pool exactly as before; `release-checked` resolves
+  `target-pool/primary/release-checked/` (origin `primary_build_dir:release-checked`),
+  adopting a newer vouched `target/release-checked/` local build, and NEVER a
+  `debug/` artifact.
+- **With nothing startable** (`primary_start::prepare_optimized_primary`):
+  - an **unattended** start (`--auto-start` boot, crash or serving watchdog)
+    starts the `release-checked` LKG if there is one, else the newest DEV
+    artifact (the dev LKG, else a dev slot exe whose provenance is not
+    `override`), announced at ERROR (`DEBUG PRIMARY FALLBACK: …`, origin
+    `lkg_fallback:dev` or `slot-N`, `/health` resolved `dev` ≠ configured), and
+    kicks ONE background `release-checked` build so the next start finds one.
+    On a COLD box with nothing at all to start it builds in the foreground,
+    since nothing else could be started (a serving-watchdog restart still has
+    its wedged primary up; it is stopped only after the build);
+  - an **operator** start builds from `origin/main` in the foreground; if that
+    fails it takes the `release-checked` LKG, else refuses and names why. It
+    never falls back to `debug/`.
+  - Every such build runs in its own task (`primary_build_detached`), so a
+    synchronous door (`POST /runner/restart` without rebuild,
+    `POST /runners/{id}/restart`, `POST /runners/{id}/start`) whose client
+    disconnects does not cancel it. The latched half of every restart
+    (`manager::restart_runner_by_id`) runs in its own task too, behind an RAII
+    `RestartLatch`, so a dropped caller neither abandons the restart nor
+    leaves `restart_requested` set (which would silence the serving watchdog).
+    Because such a restart keeps running, a second `restart_runner_by_id`
+    restart of the same runner is refused with `409` while it is in flight
+    (`restart_in_flight`, released only after the latch is cleared) instead of
+    overlapping it, and an LKG pin is applied only under the latch;
+    `POST /runners/{id}/rebuild-and-restart` does not take that latch;
+    `POST /runner/restart` runs its whole no-rebuild tail (LKG pin, restart,
+    dev-action result) in a task as well. It files a restart that will build
+    as a `build`-kind dev action (`cold_build=true`) — decided after an
+    explicit `use_lkg: true` pin, which builds nothing.
+- **A restart prepares before it stops** (`manager::restart_after_gate`): for an
+  optimized primary the rebuild (if asked) and the start resolution above run
+  FIRST and are handed to the start as a parameter; the old process is stopped
+  only once something startable exists, so a failed build or a refusal leaves
+  the running primary untouched. A pin (`use_lkg`, the risk LKG bias) skips the
+  preparation — the pin decides the artifact. A start latch refuses a second
+  concurrent start of the same runner, and the port is re-checked after a
+  (possibly long) preparation.
+- **Prewarm** warms `target-pool/primary/` FIRST (`cargo check --profile
+  release-checked`) when the live tree declares the profile, holding the
+  primary build lock (try, never wait) for that one prewarm only. The
+  primary's sidecar build also carries `qontinui-git-credential` (checked
+  after the build like the roster); the helper otherwise falls back to the dev
+  `target/debug/` one. `reap_stuck_build_slots` visits the primary dir too.
+- **Visible while building:** a primary build holds one pool permit, so
+  `GET /builds` lists it as `primary_build_dir` (`label: "primary"`, id 255,
+  counted in `active_builds`), the resource sample counts it busy, and its log
+  is at `/builds/255/log[/stream]`. `GET /health` `build.lkg_release_checked`
+  and `GET /builds` `lkg_release_checked` serve the release-checked LKG.
+- **Identity:** the primary's orphan-scan and stop identity covers its copy in
+  every profile dir, so a primary started from `target/debug/` before the
+  switch is still the operator's.
+- **Announced:** one INFO line at start (`primary build profile: release-checked
+  (default)` | `dev (opt-in via <source>)`, plus a WARN for a dev opt-in);
+  `/health` `primary_build_profile` `{configured, configured_dir, source,
+  resolved, resolved_fallback, observed, matches_configured}`; and every
+  `runners[]` row's `build_profile`, read from the runner's own `/health`
+  `buildProfile`. `null` is UNKNOWN (a runner predating the field), never
+  `debug`.
 
 ## Serving-watchdog environment
 
@@ -1338,7 +1443,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint, targets the primary). Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies"). `force` is the restart-readiness override — it reaches `manager::stop_runner`, where it used to be a dead `_force`. |
 | POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?, use_lkg?, handoff?}` (`handoff`: see "Handoff restarts") — every field defaults, and unknown fields are **rejected** (422, `#[serde(deny_unknown_fields)]`), so a stale caller sending `trigger_auto_continue` or `wait_timeout_seconds` fails loudly instead of being ignored. `use_lkg` is only meaningful on the `rebuild: false` restart: `null` lets the supervisor auto-bias toward the last-known-good exe when the risk assessment flags the restart as high-risk, `true` pins LKG, `false` opts out of the bias. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"submitted", build_id, poll:"/builds", build_source, action_id, …}` immediately — `build_source` (`origin_main` \| `live_tree`, `null` with no configured primary) names the tree the rebuild selects — and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
-| POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll, build_source}` immediately (`build_source` is always `live_tree` — this route has no origin/main arm); the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
+| POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll, build_source}` immediately (`build_source` is always `live_tree` — this route has no origin/main arm); the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. For an optimized primary (see "Primary build profile") it builds `target-pool/primary/<profile-dir>/`, not a pool slot, so `POST /runner/restart` (no rebuild) applies it. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). For the primary the usual recovery is `POST /runner/restart {"rebuild": true}` (origin/main). |
 
 ### Debug endpoints (gated)
 
@@ -1575,11 +1680,11 @@ unverified_warning}`. `origin` distinguishes `slot-N` /
 env-override-vs-workspace-default split is visible on the adoption path too. Nothing reported the path before, which is the whole
 reason the stale spawn survived a full manual-test iteration.
 
-Every runner start copies the resolved source exe to its `config::runner_exe_copy_path` — `target/debug/qontinui-runner-primary.exe` for the primary, `target/debug/runners/<pool-name>/qontinui-runner.exe` for temp/named runners — so the build artifact is never locked by a running process. The sidecar roster (`build_monitor::RUNNER_SIDECARS`: `qontinui-shim`, `qontinui-pr`, `qontinui_profile`, `qontinui-pty-holder`) rides along: the supervisor builds all four into the same slot right after the runner build (one fail-open `--keep-going` invocation), preserves them in the LKG dir, and on every start copies the three the runner resolves beside its own exe — the `qontinui-shim` stub, the `qontinui-pr` session CLI and the `qontinui-pty-holder` — from next to the source exe to next to the exe copy (`deploy_sidecar` in `src/process/manager.rs`). `qontinui_profile` is built and carried but not deployed: nothing in the runner resolves it beside its exe; `POST /runners/pair-with-token` resolves it from the non-pool `target/debug/`, the slots and the LKG dir, and runs a private temp copy of it (with `kill_on_drop`), never the file in place. The `qontinui-git-credential` helper is deployed the same way (from the source exe's dir, else the non-pool `target/debug/`), because the runner also finds it only via `current_exe().parent()`. The runner materializes terminal identity shims and the session CLI from next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed sidecar build/copy logs a WARN naming the sidecar (e.g. "identity shims will be stale") but never fails the build or start. A **zero-length** sidecar is never deployed, and no zero-length copy survives a deploy beside the runner exe — at start time; the primary's `target/debug/` can be refilled with one by a later non-pool build until the runner's Phase 1a lands (see "Correct manual build command").
+Every runner start copies the resolved source exe to its `config::runner_exe_copy_path` — `target/<profile-dir>/qontinui-runner-primary.exe` for the primary (the profile of the artifact deployed), `target/debug/runners/<pool-name>/qontinui-runner.exe` for temp/named runners — so the build artifact is never locked by a running process. The sidecar roster (`build_monitor::RUNNER_SIDECARS`: `qontinui-shim`, `qontinui-pr`, `qontinui_profile`, `qontinui-pty-holder`) rides along: the supervisor builds all four into the same slot right after the runner build (one fail-open `--keep-going` invocation), preserves them in the LKG dir, and on every start copies the three the runner resolves beside its own exe — the `qontinui-shim` stub, the `qontinui-pr` session CLI and the `qontinui-pty-holder` — from next to the source exe to next to the exe copy (`deploy_sidecar` in `src/process/manager.rs`). `qontinui_profile` is built and carried but not deployed: nothing in the runner resolves it beside its exe; `POST /runners/pair-with-token` resolves it from the non-pool `target/debug/`, the slots and the LKG dir, and runs a private temp copy of it (with `kill_on_drop`), never the file in place. The `qontinui-git-credential` helper is deployed the same way (from the source exe's dir, else the non-pool `target/debug/`), because the runner also finds it only via `current_exe().parent()`. The runner materializes terminal identity shims and the session CLI from next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed sidecar build/copy logs a WARN naming the sidecar (e.g. "identity shims will be stale") but never fails the build or start. A **zero-length** sidecar is never deployed, and no zero-length copy survives a deploy beside the runner exe — at start time; the primary's `target/debug/` can be refilled with one by a later non-pool build until the runner's Phase 1a lands (see "Correct manual build command").
 
 ### Last-known-good (LKG) fallback for agents
 
-The supervisor preserves the most recently successfully-built runner exe at `target-pool/lkg/qontinui-runner.exe` after every successful **vouched** (`live_tree` or `origin_main`) `cargo build`. Slot dirs can be clobbered by a subsequent failed build that overwrites or partially-deletes the slot's exe; the LKG copy is independent and survives those events. A sidecar at `target-pool/lkg/lkg.json` records `{built_at, source_slot, exe_size, sha, source}` and is hydrated into `state.build_pool.last_known_good` at supervisor startup so it survives restarts.
+The supervisor preserves the most recently successfully-built runner exe of each profile at `target-pool/lkg/<profile-dir>/qontinui-runner.exe` (`lkg/debug/` from pool builds, `lkg/release-checked/` from primary builds; a legacy flat `target-pool/lkg/` is still read as the dev LKG) after every successful **vouched** (`live_tree` or `origin_main`) `cargo build`. Slot dirs can be clobbered by a subsequent failed build that overwrites or partially-deletes the slot's exe; the LKG copy is independent and survives those events. A sidecar `lkg.json` beside it records `{built_at, source_slot, exe_size, sha, source, profile}` and is hydrated into `state.build_pool.last_known_good` (dev) / `release_checked_lkg` at supervisor startup so it survives restarts.
 
 **Override builds are never promoted to LKG; vouched builds are.** A `spawn-test {git_ref}` / `{worktree_path}` build of a foreign tree carries `provenance.source == override`; `update_lkg_after_success` skips LKG promotion for it entirely (the slot's exe + provenance sidecar are still written — only LKG is gated) and logs `skipping LKG promotion (override build of <path>)`. This is the root fix for the 2026-06-05 incident where a branch exe became LKG and a restart deployed it to the primary. The gate is `BuildSource::is_vouched()` — it promotes BOTH `live_tree` AND `origin_main` (the default primary rebuild path, which materializes an `origin/main` worktree — see "Primary rebuild builds origin/main by default" below) and skips only `override`. So `lkg.json` records `source: "live_tree"` **or** `source: "origin_main"` (taken from `provenance.source`, never hard-coded). `sha` is the git SHA of the built tree (the `origin/main` resolved sha for an `origin_main` build; the live tree's HEAD for a `live_tree` build; `null` if the git probe failed). Legacy `lkg.json` files predating these fields still hydrate: missing `sha` → `null`, missing `source` → `live_tree`.
 
@@ -1636,7 +1741,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 | `rebuild` | `use_lkg` | Behavior |
 |-----------|-----------|----------|
 | `false`   | `false`   | Default. Uses freshest slot exe via `resolve_source_exe`. |
-| `false`   | `true`    | Skip the build, run from `lkg/qontinui-runner.exe`. |
+| `false`   | `true`    | Skip the build, run from the dev LKG, `lkg/debug/qontinui-runner.exe` (a legacy flat `lkg/qontinui-runner.exe` is read as the dev LKG only). The primary's `use_lkg` reads its own profile's, `lkg/<profile-dir>/`. |
 | `true`    | `false`   | Build, then run the freshest slot exe (which is the just-built one). |
 | `true`    | `true`    | Build, then run from LKG. On build success, LKG is updated first, so this runs your fresh build. On build failure the request fails — `use_lkg` is NOT an automatic build-failure fallback; the agent decides whether to retry without `rebuild`. |
 
@@ -1737,14 +1842,14 @@ Verification surfaces (still the right thing to check before drawing conclusions
 
 ### Primary rebuild builds origin/main by default
 
-A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detached `manager::restart_runner`) does **not** compile the contested working checkout by default. It materializes a fresh `origin/main` worktree via `spawn_worktree::prepare_worktree(project_dir, "origin/main")` — which fetches origin itself and pins the `qontinui-schemas` sibling to `origin/main` — and compiles that worktree's `src-tauri`. The resulting build is provenance-classified `origin_main` (a third `BuildSource` alongside `live_tree` and `override`): it is LKG-eligible and allowed to start as the primary, so the primary always runs latest-green-main and the 2026-06-07 silent-stale-build incident cannot recur. A `log::info!` (and a `Build` log entry) names the chosen source + resolved sha before the build so the next operator restart self-documents which commit the primary will run.
+A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detached `manager::restart_runner`) does **not** compile the contested working checkout by default. It materializes a fresh `origin/main` worktree and compiles that worktree's `src-tauri`, with the `qontinui-schemas` sibling pinned to `origin/main`. For a `dev` primary that is `spawn_worktree::prepare_worktree(project_dir, "origin/main")`, which fetches origin itself; for an optimized primary it is `prepare_worktree_at(project_dir, "origin/main", <sha>)` at the ONE sha the profile check read after its own bounded fetch, with no further fetch of the runner repo (see "Primary build profile"). The resulting build is provenance-classified `origin_main` (a third `BuildSource` alongside `live_tree` and `override`): it is LKG-eligible and allowed to start as the primary, so the primary always runs latest-green-main and the 2026-06-07 silent-stale-build incident cannot recur. A `log::info!` (and a `Build` log entry) names the chosen source + resolved sha before the build so the next operator restart self-documents which commit the primary will run.
 
 - **Escape hatch:** `POST /runner/restart {rebuild: true, from_working_tree: true}` reverts to the legacy behavior — compile the live working tree (`project_dir`, provenance `live_tree`) — for the rare case the operator deliberately wants the primary to run uncommitted local changes. **The canonical WIP-test path is a temp runner via spawn-test, not the primary.**
 - **Scope — the two RESTART doors, keyed on the runner, not on the route.** `restart_runner_by_id` selects the origin/main build with `build_tree.compiles_origin_main(is_primary())`, so **both** restart doors apply it: `POST /runner/restart` and `POST /runners/primary/restart` each compile `origin/main` by default. Named/temp runners keep the legacy live-tree build through either door — `is_primary()` is already false for them, so the build-source argument is inert there. spawn-test is unchanged (see the spawn-test hazard above).
 
   **One other build path still puts a `live_tree` build under the primary, and this policy does NOT cover it:**
 
-  - `POST /runner/fix-and-rebuild` calls `build_monitor::run_cargo_build`, whose `build_dir_override` is always `None` — i.e. `BuildSourceKind::LiveTree`. It builds and returns *"Runner rebuilt (restart manually to apply)"*; a subsequent no-rebuild restart then starts the primary on the contested checkout. Same outcome as the defect fixed below, reachable through a different door.
+  - `POST /runner/fix-and-rebuild` builds the live tree (`BuildSourceKind::LiveTree`) — for a `dev` primary into a pool slot via `build_monitor::run_cargo_build` (*"Runner rebuilt (restart manually to apply)"*), for an optimized primary into `target-pool/primary/<profile-dir>/` via `primary_start::primary_build` (*"Runner rebuilt into target-pool/primary/release-checked/; POST /runner/restart (no rebuild) applies it"*). Either way a subsequent no-rebuild restart then starts the primary on the contested checkout. Same outcome as the defect fixed below, reachable through a different door.
 
   `manager::restart_all` used to build the same way; it had no caller, so it was deleted rather than converted.
 

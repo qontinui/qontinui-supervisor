@@ -31,6 +31,7 @@ fn pool_test_config(pool_size: usize) -> SupervisorConfig {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     }
 }
 

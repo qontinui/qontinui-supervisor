@@ -36,6 +36,11 @@ pub struct HealthResponse {
     /// Multi-runner status array (includes all managed runners).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runners: Vec<RunnerInstanceHealth>,
+    /// The primary runner's build profile: what is CONFIGURED, what the
+    /// supervisor last RESOLVED for it, and what the runner itself reports
+    /// (OBSERVED) — three values that can visibly disagree (plan
+    /// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`).
+    pub primary_build_profile: PrimaryBuildProfileHealth,
     /// SDK feature inventory baked at compile time. Lets test drivers tell
     /// in one round-trip whether the running supervisor binary's bundled
     /// `@qontinui/ui-bridge` SDK includes a feature they need; an absent
@@ -88,6 +93,60 @@ pub struct HealthResponse {
     pub sse_active_connections: usize,
 }
 
+/// `/health` `primary_build_profile`.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PrimaryBuildProfileHealth {
+    /// The configured profile (`release-checked` default, `dev` opt-in).
+    pub configured: crate::build_profile::RunnerBuildProfile,
+    /// Its artifact directory — the value a runner's `buildProfile` reports.
+    pub configured_dir: &'static str,
+    /// What chose it: `default`, `flag` or `env`.
+    pub source: crate::build_profile::PrimaryProfileSource,
+    /// An env value that was set but ignored as unrecognised.
+    pub ignored_env_value: Option<String>,
+    /// The profile of the artifact the supervisor last resolved to start the
+    /// primary. `null` = this supervisor has not started it (an adopted
+    /// primary) — UNKNOWN, not "matches".
+    pub resolved: Option<crate::build_profile::RunnerBuildProfile>,
+    /// Why `resolved` differs from `configured` (the unattended dev-LKG
+    /// fallback), else `null`.
+    pub resolved_fallback: Option<String>,
+    /// The primary's own `/health` `buildProfile` (a profile DIRECTORY).
+    /// `null` = UNKNOWN: the API is silent or the runner predates the field.
+    pub observed: Option<String>,
+    /// `observed == configured_dir` — `configured_dir`, not `configured`, is
+    /// the comparand, because a runner reports its profile DIRECTORY (`debug`,
+    /// never `dev`). `null` when `observed` is UNKNOWN.
+    pub matches_configured: Option<bool>,
+}
+
+impl PrimaryBuildProfileHealth {
+    /// Pure: assemble from the configured value, the last resolution, and the
+    /// runner-reported directory.
+    pub fn new(
+        configured: &crate::build_profile::PrimaryBuildProfile,
+        resolved: Option<(crate::build_profile::RunnerBuildProfile, Option<String>)>,
+        observed: Option<String>,
+    ) -> Self {
+        let configured_dir = configured.profile.dir_name();
+        let matches_configured = observed.as_deref().map(|o| o == configured_dir);
+        let (resolved, resolved_fallback) = match resolved {
+            Some((p, why)) => (Some(p), why),
+            None => (None, None),
+        };
+        PrimaryBuildProfileHealth {
+            configured: configured.profile,
+            configured_dir,
+            source: configured.source,
+            ignored_env_value: configured.ignored_env_value.clone(),
+            resolved,
+            resolved_fallback,
+            observed,
+            matches_configured,
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct RunnerInstanceHealth {
     pub id: String,
@@ -133,6 +192,10 @@ pub struct RunnerInstanceHealth {
     /// is derived from, so an operator can check the derivation rather than
     /// trust it.
     pub port_open: bool,
+    /// The runner's own `/health` `buildProfile` — the build profile
+    /// directory it was actually built in. `null` = UNKNOWN (API silent, or a
+    /// runner predating the field); never read it as `debug`.
+    pub build_profile: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -283,6 +346,11 @@ pub struct BuildHealth {
     /// predates the changes and would silently run stale code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lkg: Option<LkgHealth>,
+    /// The PRIMARY's `release-checked` LKG (`target-pool/lkg/release-checked/`)
+    /// — the optimized fallback an optimized primary starts from before any
+    /// dev artifact. `lkg` above is the dev LKG temp runners' `use_lkg` reads.
+    /// `null` when none has been built.
+    pub lkg_release_checked: Option<LkgHealth>,
     /// How the build pool is sized for this machine: pool size and its
     /// source, the per-slot `CARGO_BUILD_JOBS`, slot occupancy, and the
     /// effective disk floor with its inputs (plan
@@ -369,6 +437,18 @@ pub struct LkgHealth {
     /// `"live_tree"` for any LKG written from #65 forward (override builds are
     /// never promoted to LKG).
     pub source: crate::process::manager::BuildSource,
+}
+
+impl LkgHealth {
+    pub fn from_info(info: &crate::state::LkgInfo) -> Self {
+        LkgHealth {
+            built_at: info.built_at.to_rfc3339(),
+            source_slot: info.source_slot,
+            exe_size: info.exe_size,
+            sha: info.sha.clone(),
+            source: info.source,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -591,6 +671,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 liveness: r.liveness,
                 last_seen_responding_at: r.last_seen_responding_at.map(|t| t.to_rfc3339()),
                 port_open: r.port_open,
+                build_profile: r.build_profile.clone(),
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -632,13 +713,14 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         .read()
         .await
         .as_ref()
-        .map(|info| LkgHealth {
-            built_at: info.built_at.to_rfc3339(),
-            source_slot: info.source_slot,
-            exe_size: info.exe_size,
-            sha: info.sha.clone(),
-            source: info.source,
-        });
+        .map(LkgHealth::from_info);
+    let lkg_release_checked = state
+        .build_pool
+        .release_checked_lkg
+        .read()
+        .await
+        .as_ref()
+        .map(LkgHealth::from_info);
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
     let cached = state.cached_health.read().await;
@@ -759,9 +841,28 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             liveness: mr.liveness(mc.runner_port_open, mc.runner_responding),
             last_seen_responding_at: mr.last_seen_responding_at.map(|t| t.to_rfc3339()),
             port_open: mc.runner_port_open,
+            build_profile: cached.and_then(|c| c.build_profile.clone()),
         });
     }
+    let primary_observed_profile = cached_snapshots
+        .iter()
+        .find(|c| c.kind.is_primary())
+        .and_then(|c| c.build_profile.clone());
     drop(cached_snapshots);
+    let primary_resolved_profile = match state.get_primary().await {
+        Some(p) => p
+            .resolved_exe
+            .read()
+            .await
+            .as_ref()
+            .map(|r| (r.profile, r.profile_fallback.clone())),
+        None => None,
+    };
+    let primary_build_profile = PrimaryBuildProfileHealth::new(
+        &state.config.primary_build_profile,
+        primary_resolved_profile,
+        primary_observed_profile,
+    );
 
     HealthResponse {
         status: overall.status.to_string(),
@@ -790,6 +891,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             lkg,
+            lkg_release_checked,
             pool: build_pool_health(state),
         },
         expo: ExpoHealth {
@@ -800,6 +902,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         },
         supervisor: SupervisorInfo::current(state.config.project_dir.display().to_string()),
         runners: runners_health,
+        primary_build_profile,
         sdk_features: SDK_FEATURES.to_vec(),
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         build_id: state.build_id.clone(),
@@ -885,15 +988,25 @@ fn try_build_sse_health(
     let primary_server_mode = primary_managed
         .as_ref()
         .is_some_and(|m| m.config.server_mode);
-    let primary_legacy_exe = match primary_managed {
-        Some(m) => m
-            .resolved_exe
-            .try_read()
-            .map_err(|_| ())?
-            .as_ref()
-            .is_some_and(|r| r.origin.is_legacy_fallback()),
-        None => false,
+    let (primary_legacy_exe, primary_resolved_profile) = match primary_managed {
+        Some(m) => {
+            let resolved = m.resolved_exe.try_read().map_err(|_| ())?;
+            (
+                resolved
+                    .as_ref()
+                    .is_some_and(|r| r.origin.is_legacy_fallback()),
+                resolved
+                    .as_ref()
+                    .map(|r| (r.profile, r.profile_fallback.clone())),
+            )
+        }
+        None => (false, None),
     };
+    let primary_build_profile = PrimaryBuildProfileHealth::new(
+        &state.config.primary_build_profile,
+        primary_resolved_profile,
+        primary_snapshot.and_then(|p| p.build_profile.clone()),
+    );
     let overall = resolve_overall_status(
         primary_running,
         api_responding,
@@ -951,15 +1064,13 @@ fn try_build_sse_health(
                 .last_known_good
                 .try_read()
                 .ok()
-                .and_then(|g| {
-                    g.as_ref().map(|info| LkgHealth {
-                        built_at: info.built_at.to_rfc3339(),
-                        source_slot: info.source_slot,
-                        exe_size: info.exe_size,
-                        sha: info.sha.clone(),
-                        source: info.source,
-                    })
-                }),
+                .and_then(|g| g.as_ref().map(LkgHealth::from_info)),
+            lkg_release_checked: state
+                .build_pool
+                .release_checked_lkg
+                .try_read()
+                .ok()
+                .and_then(|g| g.as_ref().map(LkgHealth::from_info)),
             pool: build_pool_health(state),
         },
         expo: ExpoHealth {
@@ -971,6 +1082,7 @@ fn try_build_sse_health(
         supervisor: SupervisorInfo::current(state.config.project_dir.display().to_string()),
         // Read cached runner snapshots (built by background health refresher)
         runners: build_sse_runners(state),
+        primary_build_profile,
         sdk_features: SDK_FEATURES.to_vec(),
         sdk_features_doc_url: SDK_FEATURE_DOC_URL,
         build_id,
@@ -1247,6 +1359,7 @@ mod tests {
             frontend_ready: None,
             frontend_state: None,
             frontend_not_ready_since: None,
+            build_profile: None,
         }
     }
 
@@ -1282,6 +1395,7 @@ mod tests {
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
+            primary_build_profile: Default::default(),
         };
         let state: SharedState = std::sync::Arc::new(crate::state::SupervisorState::new(config));
         let primary = state
@@ -1297,6 +1411,8 @@ mod tests {
             mtime: None,
             provenance: None,
             unverified_warning: None,
+            profile: crate::build_profile::RunnerBuildProfile::Dev,
+            profile_fallback: None,
         });
         state.cached_health.write().await.runner_responding = true;
         state.cached_health.write().await.runner_port_open = true;
@@ -1476,6 +1592,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                lkg_release_checked: None,
                 pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
@@ -1486,6 +1603,11 @@ mod tests {
             },
             supervisor: SupervisorInfo::current("/tmp/test".to_string()),
             runners: Vec::new(),
+            primary_build_profile: PrimaryBuildProfileHealth::new(
+                &crate::build_profile::PrimaryBuildProfile::default(),
+                None,
+                None,
+            ),
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
             build_id: "2026-04-25T00:00:00+00:00".to_string(),
@@ -1601,6 +1723,7 @@ mod tests {
             liveness: crate::state::RunnerLiveness::UnresponsiveSince(seen),
             last_seen_responding_at: Some(seen.to_rfc3339()),
             port_open: true,
+            build_profile: None,
         });
 
         let value = serde_json::to_value(&response).expect("health response serializes");
@@ -1647,6 +1770,86 @@ mod tests {
             );
         }
     }
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// configured vs resolved vs observed, and UNKNOWN stays `null`.
+    #[test]
+    fn primary_build_profile_reports_configured_resolved_and_observed() {
+        use crate::build_profile::{PrimaryBuildProfile, RunnerBuildProfile};
+        let default = PrimaryBuildProfile::default();
+
+        // An adopted primary on a runner predating `buildProfile`: both UNKNOWN.
+        let h = PrimaryBuildProfileHealth::new(&default, None, None);
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["configured"], "release-checked");
+        assert_eq!(v["configured_dir"], "release-checked");
+        assert_eq!(v["source"], "default");
+        assert!(v["resolved"].is_null());
+        assert!(v["observed"].is_null());
+        assert!(
+            v["matches_configured"].is_null(),
+            "UNKNOWN is never a match"
+        );
+
+        // The unattended dev-LKG fallback: configured != resolved != ok.
+        let h = PrimaryBuildProfileHealth::new(
+            &default,
+            Some((RunnerBuildProfile::Dev, Some("build failed".to_string()))),
+            Some("debug".to_string()),
+        );
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["resolved"], "dev");
+        assert_eq!(v["resolved_fallback"], "build failed");
+        assert_eq!(v["observed"], "debug");
+        assert_eq!(v["matches_configured"], false);
+
+        // The healthy default.
+        let h = PrimaryBuildProfileHealth::new(
+            &default,
+            Some((RunnerBuildProfile::ReleaseChecked, None)),
+            Some("release-checked".to_string()),
+        );
+        assert_eq!(h.matches_configured, Some(true));
+
+        // A dev opt-in reports `debug` as its directory.
+        let dev = PrimaryBuildProfile::resolve(Some(RunnerBuildProfile::Dev), None);
+        let h = PrimaryBuildProfileHealth::new(&dev, None, Some("debug".to_string()));
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["configured"], "dev");
+        assert_eq!(v["configured_dir"], "debug");
+        assert_eq!(v["source"], "flag");
+        assert_eq!(v["matches_configured"], true);
+    }
+
+    #[test]
+    fn health_serializes_primary_build_profile_and_a_null_runner_build_profile() {
+        let mut response = build_minimal_health_response();
+        response.runners.push(RunnerInstanceHealth {
+            id: "primary".to_string(),
+            name: "Primary".to_string(),
+            port: RUNNER_API_PORT,
+            kind: RunnerKind::Primary,
+            running: true,
+            pid: None,
+            started_at: None,
+            api_responding: true,
+            watchdog_status: WatchdogHealth::unavailable(),
+            ui_error: None,
+            recent_crash: None,
+            derived_status: RunnerStatus::default(),
+            liveness: crate::state::RunnerLiveness::Unknown,
+            last_seen_responding_at: None,
+            port_open: true,
+            build_profile: None,
+        });
+        let v = serde_json::to_value(&response).unwrap();
+        assert_eq!(v["primary_build_profile"]["configured"], "release-checked");
+        let row = &v["runners"][0];
+        assert!(
+            row.get("build_profile").is_some_and(|b| b.is_null()),
+            "build_profile must be present and null when UNKNOWN: {row}"
+        );
+    }
+
     /// Minimal `HealthResponse` for serialization-shape assertions.
     fn build_minimal_health_response() -> HealthResponse {
         HealthResponse {
@@ -1676,6 +1879,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                lkg_release_checked: None,
                 pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
@@ -1686,6 +1890,11 @@ mod tests {
             },
             supervisor: SupervisorInfo::current("/tmp/test".to_string()),
             runners: Vec::new(),
+            primary_build_profile: PrimaryBuildProfileHealth::new(
+                &crate::build_profile::PrimaryBuildProfile::default(),
+                None,
+                None,
+            ),
             sdk_features: SDK_FEATURES.to_vec(),
             sdk_features_doc_url: SDK_FEATURE_DOC_URL,
             build_id: "test".to_string(),
