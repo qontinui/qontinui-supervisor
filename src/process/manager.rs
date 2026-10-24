@@ -2482,7 +2482,7 @@ impl<'a> StartLatch<'a> {
             .start_in_flight
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(SupervisorError::Validation(format!(
+            return Err(SupervisorError::InFlight(format!(
                 "start_in_flight: a start of runner '{}' is already in progress (an optimized \
                  primary's start may be building its artifact); wait for it rather than \
                  starting it twice",
@@ -4716,7 +4716,10 @@ pub async fn maybe_serving_restart(
                 // and refunding second would let the next 2 s tick push its
                 // own history entry in between, and the refund would pop the
                 // wrong one.
-                let refunded = matches!(result, Err(SupervisorError::RestartUnsafe(_)));
+                let refunded = matches!(
+                    result,
+                    Err(SupervisorError::RestartUnsafe(_)) | Err(SupervisorError::InFlight(_))
+                );
                 {
                     let mut wd = managed.watchdog.write().await;
                     if refunded {
@@ -4775,6 +4778,21 @@ pub async fn maybe_serving_restart(
                             Some(detail.cause.to_string()),
                         )
                         .await;
+                    }
+                    // Another restart of this runner (an operator's) holds
+                    // the latch: that restart is the recovery, so this is
+                    // neither a refusal nor a failure, and its attempt was
+                    // given back above.
+                    Err(SupervisorError::InFlight(detail)) => {
+                        let msg = format!(
+                            "serving watchdog deferred restarting runner '{runner_name}': \
+                             {detail}"
+                        );
+                        warn!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                            .await;
                     }
                     Err(e) => {
                         let msg = format!(
@@ -6400,6 +6418,29 @@ pub async fn restart_runner_by_id(
     build_tree: BuildTree,
     intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
+    restart_runner_by_id_pinned(
+        state, runner_id, rebuild, source, force, build_tree, intent, None,
+    )
+    .await
+}
+
+/// [`restart_runner_by_id`] that starts the runner from `exe_pin` (an LKG
+/// pin) when one is given. The pin is written to the runner's
+/// `source_exe_override` only AFTER this restart holds its [`RestartLatch`],
+/// and cleared before the latch comes off, so a restart refused as already in
+/// flight — or by the readiness gate — never touches the exe a running restart
+/// is about to start.
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_runner_by_id_pinned(
+    state: &SharedState,
+    runner_id: &str,
+    rebuild: bool,
+    source: RestartSource,
+    force: bool,
+    build_tree: BuildTree,
+    intent: CloseIntent,
+    exe_pin: Option<std::path::PathBuf>,
+) -> Result<(), SupervisorError> {
     if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
             "Automated restart of non-temp runner '{}' blocked (source: {}). \
@@ -6510,6 +6551,7 @@ pub async fn restart_runner_by_id(
             build_tree,
             intent,
             restart_start,
+            exe_pin,
         )
         .await
     })
@@ -6539,15 +6581,20 @@ impl RestartLatch {
             .restart_in_flight
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(SupervisorError::Validation(format!(
-                "restart_in_flight: a restart of runner '{}' is already in progress (a                  restart whose caller disconnected keeps running); wait for it rather than                  restarting it twice",
+            return Err(SupervisorError::InFlight(format!(
+                "restart_in_flight: a restart of runner '{}' is already in progress (a \
+                 restart whose caller disconnected keeps running); wait for it rather than \
+                 restarting it twice",
                 managed.config.id
             )));
         }
-        managed.runner.write().await.restart_requested = true;
-        Ok(Self {
+        // The guard exists BEFORE the await below: a caller dropped while
+        // waiting for the write lock drops it, and `Drop` releases the bit.
+        let latch = Self {
             managed: Some(managed.clone()),
-        })
+        };
+        managed.runner.write().await.restart_requested = true;
+        Ok(latch)
     }
 
     pub(crate) async fn clear(mut self) {
@@ -6608,7 +6655,14 @@ async fn restart_in_flight(
     build_tree: BuildTree,
     intent: CloseIntent,
     restart_start: std::time::Instant,
+    exe_pin: Option<std::path::PathBuf>,
 ) -> Result<(), SupervisorError> {
+    // The pin is this restart's alone: set under the latch, cleared before it
+    // comes off.
+    let pinned = exe_pin.is_some();
+    if let Some(pin) = exe_pin {
+        *managed.source_exe_override.write().await = Some(pin);
+    }
     let outcome = restart_after_gate(
         state,
         &managed,
@@ -6619,6 +6673,9 @@ async fn restart_in_flight(
         StartIntent::of_restart(&source),
     )
     .await;
+    if pinned {
+        *managed.source_exe_override.write().await = None;
+    }
 
     latch.clear().await;
 
@@ -6865,12 +6922,26 @@ pub async fn restart_runner(
     build_tree: BuildTree,
     intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
+    restart_runner_pinned(state, rebuild, source, force, build_tree, intent, None).await
+}
+
+/// [`restart_runner`] with an exe pin, applied under the restart latch
+/// ([`restart_runner_by_id_pinned`]).
+pub async fn restart_runner_pinned(
+    state: &SharedState,
+    rebuild: bool,
+    source: RestartSource,
+    force: bool,
+    build_tree: BuildTree,
+    intent: CloseIntent,
+    exe_pin: Option<std::path::PathBuf>,
+) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    restart_runner_by_id(
+    restart_runner_by_id_pinned(
         state,
         &primary.config.id,
         rebuild,
@@ -6878,6 +6949,7 @@ pub async fn restart_runner(
         force,
         build_tree,
         intent,
+        exe_pin,
     )
     .await
 }

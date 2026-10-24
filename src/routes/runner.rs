@@ -940,10 +940,12 @@ pub async fn restart_runner(
             Some(explicit) => explicit,
             None => risk.route_lkg,
         };
-        // Track whether we set a transient override so we can clear it after the
-        // restart, keeping the bias scoped to THIS restart (later restarts re-decide
-        // from fresh predictions rather than inheriting a sticky pin).
-        let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+        // The pin is handed to the restart, which applies it only once it holds
+        // the restart latch and clears it before releasing it: a retry refused
+        // as already in flight (or by the readiness gate) never touches the exe
+        // a running restart starts, and later restarts re-decide from fresh
+        // predictions rather than inheriting a sticky pin.
+        let mut exe_pin: Option<std::path::PathBuf> = None;
         if want_lkg {
             // The PRIMARY's LKG is the one of its configured profile: a
             // release-checked primary is never biased onto the dev LKG (a debug
@@ -955,8 +957,8 @@ pub async fn restart_runner(
                 .map(|(_, exe)| exe.clone())
                 .unwrap_or_else(|| state.config.lkg_exe_path(lkg_profile));
             if lkg_on_disk.is_some() {
-                if let Some(primary) = state.get_primary().await {
-                    *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                if state.get_primary().await.is_some() {
+                    exe_pin = Some(lkg_exe.clone());
                     let reason = if body.use_lkg == Some(true) {
                         "operator-requested (use_lkg:true)"
                     } else {
@@ -971,7 +973,6 @@ pub async fn restart_runner(
                         .logs
                         .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                         .await;
-                    biased_primary = Some(primary);
                 }
             } else if risk.route_lkg || body.use_lkg == Some(true) {
                 // Wanted LKG but none exists — surface it rather than silently
@@ -990,23 +991,17 @@ pub async fn restart_runner(
             }
         }
 
-        let restart_result = manager::restart_runner(
+        let restart_result = manager::restart_runner_pinned(
             &state,
             false,
             RestartSource::Manual,
             body.force,
             body.build_tree(),
             body.close_intent(),
+            exe_pin,
         )
         .await;
 
-        // Clear the transient LKG override so the bias does not leak into the next
-        // restart (which re-evaluates risk from fresh predictions). The runner has
-        // already resolved + copied its exe by the time `restart_runner` returns, so
-        // clearing now does not affect the just-started process.
-        if let Some(primary) = biased_primary {
-            *primary.source_exe_override.write().await = None;
-        }
         // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
         // minted before the `if rebuild` branch, so a readiness refusal here
         // returned 409 to the caller while the minted action still closed

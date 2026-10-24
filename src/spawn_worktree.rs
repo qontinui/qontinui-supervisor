@@ -201,15 +201,22 @@ pub(crate) fn is_full_sha(s: &str) -> bool {
 /// in `repo_root`'s object database (worktrees share it). Anything else — a
 /// branch, a tag, or a full sha pushed since the last fetch (a spawn-test
 /// `git_ref` may name one) — is fetched first.
+/// Bounded, and with lazy fetching off, so the probe of a partial clone can
+/// never turn into the network fetch it exists to skip.
 async fn checkout_is_local_commit(repo_root: &Path, checkout: &str) -> bool {
-    is_full_sha(checkout)
-        && git(
-            &["cat-file", "-e", &format!("{checkout}^{{commit}}")],
-            repo_root,
-            false,
-        )
-        .await
-        .is_ok()
+    if !is_full_sha(checkout) {
+        return false;
+    }
+    let probe = Command::new("git")
+        .args(["cat-file", "-e", &format!("{checkout}^{{commit}}")])
+        .current_dir(repo_root)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .kill_on_drop(true)
+        .output();
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), probe).await,
+        Ok(Ok(out)) if out.status.success()
+    )
 }
 
 /// Prefix prepended to a build-failure error when [`classify_drift`] detects
@@ -975,10 +982,9 @@ pub async fn prune_spawn_worktrees(
 ///   dirty-worktree double-retention window). `Some(0)` prunes every idle
 ///   container immediately, subject to the dirty double-retention rule.
 ///
-/// Exists so the `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint can
-/// pass an operator-chosen window WITHOUT changing the env-derived default for
-/// the background sweeps. All selection/safety invariants are identical — only
-/// the window source differs.
+/// Test-only, like [`prune_spawn_worktrees`]: production sweeps, and the
+/// `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint's operator-chosen
+/// window, go through [`prune_spawn_worktrees_guarded`].
 #[cfg(test)]
 pub async fn prune_spawn_worktrees_with_window(
     project_dir: &Path,
@@ -1004,9 +1010,21 @@ pub async fn prune_spawn_worktrees_with_window(
 pub type ContainerLockLookup<'a> =
     &'a (dyn Fn(&Path) -> std::sync::Arc<tokio::sync::Mutex<()>> + Send + Sync);
 
-/// Enumerate and prune stale `.spawn-*` containers (the retention rules are
-/// on the test-only `prune_spawn_worktrees`), respecting the per-container
-/// locks. Every production sweep calls this form, and the lookup is required
+/// Enumerate and prune stale `.spawn-*` scratch worktree containers,
+/// respecting the per-container locks.
+///
+/// `project_dir` is the supervisor's configured runner `src-tauri` (the
+/// workspace root and owning repos are derived from it exactly as
+/// `prepare_worktree` derives them). `active_containers` is the set a build
+/// is using (always kept). `now` is injected so tests can pin time.
+/// `window_hours_override` is the operator's `older_than_hours` (`None` = the
+/// [`SPAWN_RETENTION_ENV`] / default window).
+///
+/// Retention: an idle container older than the window is prunable, unless it
+/// is a dirty registered worktree, which needs DOUBLE the window (a peer may
+/// have adopted the scratch tree). Best-effort throughout: a failure to derive
+/// roots, stat or remove a dir is logged and skipped, never returned.
+/// Every production sweep calls this form, and the lookup is required
 /// so none can skip the locks. Every path that materializes or builds a container holds its lock
 /// (spawn-test, the primary build), and the active set alone is only as good
 /// as every such path remembering to register; so a container whose lock is

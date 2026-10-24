@@ -802,6 +802,73 @@ async fn a_second_restart_is_refused_while_one_is_in_flight() {
         .await;
 }
 
+/// A caller dropped while `acquire` waits for the runner's write lock must
+/// not leave `restart_in_flight` set, or every later restart of the runner
+/// (the serving watchdog's included) would be refused for good.
+#[tokio::test]
+async fn an_acquire_cancelled_at_its_lock_wait_releases_the_in_flight_bit() {
+    use crate::process::manager::RestartLatch;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let managed = register_dead_primary(&state).await;
+    let in_flight = || {
+        managed
+            .restart_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let reader = managed.runner.read().await;
+    let parked = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        RestartLatch::acquire(&managed),
+    )
+    .await;
+    assert!(parked.is_err(), "acquire must park on the held lock");
+    drop(reader);
+    eventually("the cancelled acquire's bit is released", || async {
+        !in_flight()
+    })
+    .await;
+    assert!(!managed.runner.read().await.restart_requested);
+    RestartLatch::acquire(&managed)
+        .await
+        .expect("a later restart is admitted")
+        .clear()
+        .await;
+}
+
+/// The LKG pin a restart carries is applied only under its latch: a retry
+/// refused as already in flight leaves the running restart's override alone.
+#[test]
+fn the_restart_door_hands_its_pin_to_the_restart() {
+    let runner = include_str!("../../routes/runner.rs");
+    let handler = fn_body(
+        runner,
+        "pub async fn restart_runner(",
+        "pub async fn control_watchdog(",
+    );
+    assert!(
+        !handler.contains("source_exe_override"),
+        "the route must not write the shared override itself"
+    );
+    assert!(handler.contains("exe_pin,"));
+    let manager = include_str!("../manager.rs");
+    let in_flight = fn_body(
+        manager,
+        "async fn restart_in_flight(",
+        "pub(crate) fn orphaned_by_failed_restart(",
+    );
+    let set = in_flight
+        .find("source_exe_override.write().await = Some(pin)")
+        .expect("pins under the latch");
+    let gate = in_flight.find("restart_after_gate(").expect("restarts");
+    let unset = in_flight
+        .find("source_exe_override.write().await = None")
+        .expect("unpins");
+    let clear = in_flight.find("latch.clear().await").expect("clears");
+    assert!(set < gate && gate < unset && unset < clear);
+}
+
 /// Finding 1, both doors: the latched half of `restart_runner_by_id` runs in
 /// its own task, and so does the no-rebuild tail of `POST /runner/restart`
 /// (LKG pin, restart, dev-action result).
@@ -841,8 +908,8 @@ fn the_synchronous_restart_doors_run_their_restart_in_a_task() {
         .find("tokio::spawn(async move {")
         .expect("spawns the tail");
     for needle in [
-        "source_exe_override.write().await = Some",
-        "manager::restart_runner(",
+        "exe_pin = Some(lkg_exe.clone())",
+        "manager::restart_runner_pinned(",
         "record_run_result(run_result_for(e))",
         "record_run_result(ActionRunResult::Ran)",
     ] {

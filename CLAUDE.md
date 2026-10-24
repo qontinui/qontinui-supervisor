@@ -440,9 +440,11 @@ stay on `dev`, unchanged.
     (`manager::restart_runner_by_id`) runs in its own task too, behind an RAII
     `RestartLatch`, so a dropped caller neither abandons the restart nor
     leaves `restart_requested` set (which would silence the serving watchdog).
-    Because such a restart keeps running, a second restart of the same runner
-    is refused while it is in flight (`restart_in_flight`, released only
-    after the latch is cleared) instead of overlapping it;
+    Because such a restart keeps running, a second `restart_runner_by_id`
+    restart of the same runner is refused with `409` while it is in flight
+    (`restart_in_flight`, released only after the latch is cleared) instead of
+    overlapping it, and an LKG pin is applied only under the latch;
+    `POST /runners/{id}/rebuild-and-restart` does not take that latch;
     `POST /runner/restart` runs its whole no-rebuild tail (LKG pin, restart,
     dev-action result) in a task as well. It files a restart that will build
     as a `build`-kind dev action (`cold_build=true`) — decided after an

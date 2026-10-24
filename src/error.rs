@@ -79,6 +79,13 @@ pub enum SupervisorError {
     #[error("{}", .0.message)]
     RestartUnsafe(Box<crate::restart_readiness::RefusalDetail>),
 
+    /// A start or restart was refused because one of the same runner is
+    /// already in flight (`manager::StartLatch` / `manager::RestartLatch`).
+    /// `409 Conflict`, not `400`: the request was well formed and the runner
+    /// is busy, so the caller waits for the running one and retries.
+    #[error("{0}")]
+    InFlight(String),
+
     /// A start was refused because the runner's port is already held by a
     /// LIVE `qontinui-runner` process. Spawning a second runner against a held
     /// port is the OPEN finding S2 (double-spawn, measured on PID 247696 —
@@ -280,6 +287,7 @@ impl SupervisorError {
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
+            SupervisorError::InFlight(_) => StatusCode::CONFLICT,
             SupervisorError::PortHeldByLiveRunner { .. } => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
