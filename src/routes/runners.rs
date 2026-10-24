@@ -1465,8 +1465,10 @@ pub async fn restart_runner(
     // Usually a fast restart. One exception compiles: an optimized primary
     // with nothing startable builds its artifact before stopping the old
     // process (`primary_start::prepare_primary_start`). That build runs in its
-    // own task (`primary_build_detached`), so a client that disconnects from
-    // this handler does not cancel it. The build source is threaded rather
+    // own task (`primary_build_detached`), and so does the whole latched
+    // restart (`manager::restart_runner_by_id`), so a client that disconnects
+    // from this handler cancels neither the build nor the restart, and cannot
+    // strand `restart_requested`. The build source is threaded rather
     // than passed as a literal so both call sites say the same thing.
     manager::restart_runner_by_id(
         &state,
@@ -4229,12 +4231,14 @@ async fn execute_spawn_build_inner(
                 .unwrap()
                 .remove(&container);
 
-            let active_now: std::collections::HashSet<std::path::PathBuf> =
-                state.active_spawn_worktrees.lock().unwrap().clone();
-            let report = crate::spawn_worktree::prune_spawn_worktrees(
+            let active_now = state.active_spawn_containers();
+            let locks = |p: &std::path::Path| state.spawn_container_lock(p);
+            let report = crate::spawn_worktree::prune_spawn_worktrees_guarded(
                 &state.config.project_dir,
                 &active_now,
                 std::time::SystemTime::now(),
+                None,
+                Some(&locks),
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
@@ -6414,7 +6418,7 @@ pub struct PruneSpawnQuery {
 /// scratch-worktree containers.
 ///
 /// Thin wrapper over the existing engine
-/// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
+/// [`crate::spawn_worktree::prune_spawn_worktrees_guarded`]. The engine
 /// owns ALL selection + safety (prefix-under-root filter, active-build
 /// exclusion, age + dirty double-retention). This handler only:
 ///   1. passes the LIVE active-container set from state (same source the
@@ -6452,14 +6456,17 @@ pub async fn prune_spawn_worktrees_endpoint(
         };
 
     // Live active-build container set — mirror the opportunistic sweep.
-    let active_now: std::collections::HashSet<std::path::PathBuf> =
-        state.active_spawn_worktrees.lock().unwrap().clone();
+    // A container whose lock is held (a spawn-test or primary build reading
+    // it) is kept as busy, whatever its age.
+    let active_now = state.active_spawn_containers();
+    let locks = |p: &std::path::Path| state.spawn_container_lock(p);
 
-    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
+    let report = crate::spawn_worktree::prune_spawn_worktrees_guarded(
         &state.config.project_dir,
         &active_now,
         std::time::SystemTime::now(),
         query.older_than_hours,
+        Some(&locks),
     )
     .await;
 

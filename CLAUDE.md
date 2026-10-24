@@ -387,14 +387,21 @@ stay on `dev`, unchanged.
 
 - **The runner tree must declare the profile.** Only on the path that is about
   to build, and before any worktree prep or frontend build, `primary_build`
-  checks the EXACT tree it will compile: for origin/main a bounded fetch,
-  `origin/main` resolved ONCE to a sha, `git show <sha>:Cargo.toml`, and the
-  worktree prepared at that same sha (the live tree's `Cargo.toml` otherwise).
-  A tree with no `[profile.release-checked]` makes the optimized build
-  unavailable with that cause named — never a cargo error mid-build. Until the
-  runner's Phase 3 lands, every release-checked build on this fleet is
-  unavailable this way. Lock order: primary build lock → spawn container lock
-  → pool permit.
+  checks the EXACT tree it will compile: for origin/main a `git fetch` with a
+  deadline (`QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`; one that does not
+  complete is named in the cause, since the check then read a possibly stale
+  local `origin/main`), `origin/main` resolved ONCE to a sha,
+  `git show <sha>:Cargo.toml`, and the worktree prepared at that same sha with
+  no further fetch of the runner repo (the schemas pin's fetches carry the same
+  deadline; the live tree's `Cargo.toml` otherwise). A tree with no
+  `[profile.release-checked]` makes the optimized build unavailable with that
+  cause named — never a cargo error mid-build. Until the runner's Phase 3
+  lands, every release-checked build on this fleet is unavailable this way.
+  Lock order: primary build lock → spawn container lock → pool permit. While
+  it holds the container, the build registers `.spawn-origin_main` in the
+  pruner's active set, and every pruner sweep also keeps (and, when removing,
+  holds) a container whose lock is taken, so no sweep removes the tree a
+  primary or spawn-test build is reading.
 
 - **Its own target dir, never a slot.** Primary builds (a primary
   `restart {rebuild:true}`, or a primary start with nothing startable) run
@@ -420,16 +427,23 @@ stay on `dev`, unchanged.
     `override`), announced at ERROR (`DEBUG PRIMARY FALLBACK: …`, origin
     `lkg_fallback:dev` or `slot-N`, `/health` resolved `dev` ≠ configured), and
     kicks ONE background `release-checked` build so the next start finds one.
-    On a COLD box with nothing at all to start it builds in the foreground —
-    there is no running primary to protect;
+    On a COLD box with nothing at all to start it builds in the foreground,
+    since nothing else could be started (a serving-watchdog restart still has
+    its wedged primary up; it is stopped only after the build);
   - an **operator** start builds from `origin/main` in the foreground; if that
     fails it takes the `release-checked` LKG, else refuses and names why. It
     never falls back to `debug/`.
   - Every such build runs in its own task (`primary_build_detached`), so a
     synchronous door (`POST /runner/restart` without rebuild,
     `POST /runners/{id}/restart`, `POST /runners/{id}/start`) whose client
-    disconnects does not cancel it. `POST /runner/restart` files a restart that
-    will build as a `build`-kind dev action (`cold_build=true`).
+    disconnects does not cancel it. The latched half of every restart
+    (`manager::restart_runner_by_id`) runs in its own task too, behind an RAII
+    `RestartLatch`, so a dropped caller neither abandons the restart nor
+    leaves `restart_requested` set (which would silence the serving watchdog);
+    `POST /runner/restart` runs its whole no-rebuild tail (LKG pin, restart,
+    dev-action result) in a task as well. It files a restart that will build
+    as a `build`-kind dev action (`cold_build=true`) — decided after an
+    explicit `use_lkg: true` pin, which builds nothing.
 - **A restart prepares before it stops** (`manager::restart_after_gate`): for an
   optimized primary the rebuild (if asked) and the start resolution above run
   FIRST and are handed to the start as a parameter; the old process is stopped

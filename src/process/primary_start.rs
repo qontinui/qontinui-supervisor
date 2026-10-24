@@ -27,7 +27,10 @@
 //! runner half of the plan, Phase 3) makes the optimized build unavailable with
 //! a named cause instead of a cargo error forty seconds into a frontend build.
 //! An unattended start with nothing at all to start (a cold box) builds in the
-//! foreground: there is no running primary to protect.
+//! foreground, because there is nothing else it could start. That is not "no
+//! primary is running": the serving watchdog's restart is unattended and has
+//! a wedged primary on the box; a restart prepares before it stops, so that
+//! primary is stopped only once the build has produced something to start.
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
@@ -39,10 +42,9 @@ use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager::{
-    file_mtime, resolve_primary_dir_exe, resolve_source_exe_detailed, BuildProvenance, BuildTree,
-    ExeOrigin, ResolvedRunnerExe,
+    file_mtime, resolve_primary_dir_exe, BuildProvenance, BuildTree, ExeOrigin, ResolvedRunnerExe,
 };
-use crate::state::{LkgInfo, SharedState};
+use crate::state::{ActiveSpawnContainer, LkgInfo, SharedState};
 
 /// Who asked for a runner start. Decides only what an optimized primary
 /// starts from when its own profile has nothing startable.
@@ -85,19 +87,29 @@ impl ProfileSupport {
 
 /// The ONE point an `origin/main` primary build compiles, and its manifest.
 ///
-/// A bounded `git fetch` (so a ref pushed since the last fetch is seen — no
-/// ticker is relied on: the origin-drift refresher returns before fetching on a
-/// box with no dev LKG sha), then `origin/main` is resolved to a sha ONCE, and
-/// the workspace `Cargo.toml` is read AT that sha. The caller prepares the
-/// worktree at the same sha, so the tree the profile check read IS the tree
-/// that is built. A failed fetch degrades to the refs already present (logged).
+/// A `git fetch` with a deadline ([`crate::git_provenance::fetch_origin`]) so a
+/// ref pushed since the last fetch is seen — no ticker is relied on: the
+/// origin-drift refresher returns before fetching on a box with no dev LKG
+/// sha. Then `origin/main` is resolved to a sha ONCE, and the workspace
+/// `Cargo.toml` is read AT that sha. The caller prepares the worktree at the
+/// same sha (without fetching again), so the tree the profile check read IS
+/// the tree that is built.
+///
+/// A fetch that did not complete (offline, a remote error, the deadline)
+/// degrades to the refs already present — and says so in the label, which
+/// every profile cause quotes, so a `Missing` read off a possibly stale local
+/// `origin/main` is never presented as firm.
 async fn origin_main_build_point(
     state: &SharedState,
 ) -> Result<(String, Option<String>, String), SupervisorError> {
     let repo = crate::spawn_worktree::find_repo_root(&state.config.project_dir)?;
-    if let Err(e) = crate::git_provenance::fetch_origin(&repo).await {
-        warn!("Primary build: {e}");
-    }
+    let fetched = match crate::git_provenance::fetch_origin(&repo).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Primary build: {e}");
+            false
+        }
+    };
     let sha = git_stdout(&repo, &["rev-parse", "--verify", "origin/main^{commit}"])
         .await
         .ok_or_else(|| {
@@ -107,9 +119,22 @@ async fn origin_main_build_point(
             ))
         })?;
     let manifest = git_stdout(&repo, &["show", &format!("{sha}:Cargo.toml")]).await;
-    let label = format!("{sha}:Cargo.toml (origin/main) in {}", repo.display());
+    let label = build_point_label(&sha, &repo, fetched);
     Ok((sha, manifest, label))
 }
+
+/// What the profile check names as the tree it read.
+fn build_point_label(sha: &str, repo: &std::path::Path, fetched: bool) -> String {
+    let mut label = format!("{sha}:Cargo.toml (origin/main) in {}", repo.display());
+    if !fetched {
+        label.push_str(STALE_ORIGIN_NOTE);
+    }
+    label
+}
+
+/// Appended to the build-point label when the pre-check fetch did not land.
+const STALE_ORIGIN_NOTE: &str =
+    "; fetch did not complete; checked the local origin/main ref, which may be stale";
 
 /// `git <args>` in `cwd`, bounded to 20 s; trimmed stdout on success, `None`
 /// on any failure.
@@ -217,8 +242,9 @@ fn unavailable(
 /// [`crate::build_monitor::run_primary_build`]:
 /// 1. the `IfAbsent` re-check under the build lock;
 /// 2. the profile pre-check on the exact tree that will be built (origin/main
-///    resolved ONCE to a sha after a bounded fetch, its manifest read at that
-///    sha, the worktree prepared at that sha) — before any frontend build;
+///    resolved ONCE to a sha after a fetch with a deadline, its manifest read
+///    at that sha, the worktree prepared at that sha with no further fetch of
+///    the runner repo) — before any frontend build;
 /// 3. the build into `target-pool/primary/`.
 pub async fn primary_build(
     state: &SharedState,
@@ -233,6 +259,7 @@ pub async fn primary_build(
                 let container =
                     crate::spawn_worktree::container_path_for_ref(&project_dir, "origin/main")?;
                 let _container = state.spawn_container_lock(&container).lock_owned().await;
+                let _active = ActiveSpawnContainer::register(state, &container);
                 let prepared =
                     crate::spawn_worktree::prepare_worktree(&project_dir, "origin/main").await?;
                 log_origin_main_build(state, &prepared, profile).await;
@@ -266,6 +293,9 @@ pub async fn primary_build(
             let container =
                 crate::spawn_worktree::container_path_for_ref(&project_dir, "origin/main")?;
             let _container = state.spawn_container_lock(&container).lock_owned().await;
+            // Registered for the whole arm (dropped before the lock above), so
+            // no pruner sweep removes the tree this build is reading.
+            let _active = ActiveSpawnContainer::register(state, &container);
             let (sha, manifest, label) = origin_main_build_point(state).await?;
             unavailable(
                 profile,
@@ -314,15 +344,31 @@ pub async fn primary_build(
 /// running inside it would be cancelled mid-flight (KillOnDrop kills cargo).
 /// A spawned task is not cancelled with its awaiter, so the build always
 /// finishes and the next start finds the artifact.
+///
+/// A failure is logged INSIDE the task: once the awaiter is gone, nobody
+/// reads the returned error, and the early refusals (profile unavailable, an
+/// unresolvable origin/main, a failed worktree prep, the sha guard) happen
+/// before the build monitor logs anything of its own.
 pub async fn primary_build_detached(
     state: &SharedState,
     tree: BuildTree,
     need: BuildNeed,
 ) -> Result<(), SupervisorError> {
     let state = state.clone();
-    tokio::spawn(async move { primary_build(&state, tree, need).await })
-        .await
-        .map_err(|e| SupervisorError::BuildFailed(format!("the primary build task failed: {e}")))?
+    tokio::spawn(async move {
+        let outcome = primary_build(&state, tree, need).await;
+        if let Err(e) = &outcome {
+            let msg = format!("Primary build failed: {e}");
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Build, LogLevel::Error, msg)
+                .await;
+        }
+        outcome
+    })
+    .await
+    .map_err(|e| SupervisorError::BuildFailed(format!("the primary build task failed: {e}")))?
 }
 
 async fn log_origin_main_build(
@@ -452,8 +498,10 @@ pub async fn prepare_primary_start(
 ///    local build (the identity gate decides), else refuse. Never `debug/`.
 /// 3. Unattended: the profile's LKG, else the newest dev artifact (ERROR,
 ///    configured ≠ resolved) — both kick a background build; with NOTHING to
-///    start at all (a cold box: there is no primary to protect) build in the
-///    foreground; on failure an unverified local build, else refuse.
+///    start at all (a cold box: nothing else could be started — a wedged
+///    primary under a serving-watchdog restart is stopped only after this
+///    build) build in the foreground; on failure an unverified local build,
+///    else refuse.
 pub async fn prepare_optimized_primary<B, Fut>(
     state: &SharedState,
     profile: RunnerBuildProfile,
@@ -511,7 +559,8 @@ where
     }
 
     // Build now: an operator start, or an unattended start with nothing at all
-    // to start (a cold box — there is no running primary to protect).
+    // to start (a cold box — nothing else could be started; a restart stops
+    // the old process, wedged or not, only after this returns).
     let msg = format!("Primary start: {why} — building one from origin/main before starting");
     warn!("{}", msg);
     state
@@ -589,27 +638,31 @@ async fn log_profile_lkg_start(
 }
 
 /// The newest DEV artifact an unattended fallback may start: the dev LKG,
-/// else a dev pool-slot exe (a supervisor build) — never one whose provenance
-/// says it was built from a foreign override tree; the next slot is tried
-/// instead. Its record carries `profile: Dev`, which `/health` shows as
-/// resolved.
+/// else a dev pool-slot exe (a supervisor build) picked by [`pick_dev_slot`] —
+/// never a slot mid-build, and never one whose provenance says it was built
+/// from a foreign override tree. Its record carries `profile: Dev`, which
+/// `/health` shows as resolved.
 async fn newest_dev_artifact(state: &SharedState) -> Option<ResolvedRunnerExe> {
     if let Some((info, exe)) = crate::state::lkg_on_disk(&state.config, RunnerBuildProfile::Dev) {
         return Some(lkg_resolution(info, exe, RunnerBuildProfile::Dev, None));
     }
-    let is_override = |p: &Option<BuildProvenance>| {
-        p.as_ref()
-            .is_some_and(|p| p.source == crate::process::manager::BuildSource::Override)
-    };
-    if let Ok(r) = resolve_source_exe_detailed(state, RunnerBuildProfile::Dev).await {
-        if matches!(r.origin, ExeOrigin::Slot(_)) && !is_override(&r.provenance) {
-            return Some(r);
-        }
-    }
-    state.build_pool.slots.iter().find_map(|slot| {
+    let last_successful = *state.build_pool.last_successful_slot.read().await;
+    let mut candidates = Vec::new();
+    for slot in state.build_pool.slots.iter() {
+        // A lock held for write is a build starting or ending: busy too.
+        let busy = slot.busy.try_read().map_or(true, |b| b.is_some());
         let path = slot.exe_path();
+        if busy || !path.exists() {
+            continue;
+        }
         let provenance = crate::process::manager::read_slot_provenance(&slot.target_dir);
-        (path.exists() && !is_override(&provenance)).then(|| ResolvedRunnerExe {
+        if provenance
+            .as_ref()
+            .is_some_and(|p| p.source == crate::process::manager::BuildSource::Override)
+        {
+            continue;
+        }
+        candidates.push(ResolvedRunnerExe {
             mtime: file_mtime(&path),
             path,
             origin: ExeOrigin::Slot(slot.id),
@@ -617,8 +670,23 @@ async fn newest_dev_artifact(state: &SharedState) -> Option<ResolvedRunnerExe> {
             unverified_warning: None,
             profile: RunnerBuildProfile::Dev,
             profile_fallback: None,
-        })
-    })
+        });
+    }
+    pick_dev_slot(candidates, last_successful)
+}
+
+/// Among idle, non-override dev slot exes: the `last_successful_slot` one
+/// (the pool's own record of its newest good build), else the newest by exe
+/// mtime. Never iteration order — slot 0 is not the newest by being first.
+fn pick_dev_slot(
+    candidates: Vec<ResolvedRunnerExe>,
+    last_successful: Option<usize>,
+) -> Option<ResolvedRunnerExe> {
+    let is_last = |r: &ResolvedRunnerExe| matches!(r.origin, ExeOrigin::Slot(id) if Some(id) == last_successful);
+    if let Some(i) = candidates.iter().position(is_last) {
+        return candidates.into_iter().nth(i);
+    }
+    candidates.into_iter().max_by_key(|r| r.mtime)
 }
 
 /// A [`ResolvedRunnerExe`] for an LKG start.

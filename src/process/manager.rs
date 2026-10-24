@@ -6375,8 +6375,11 @@ impl BuildTree {
 /// `restart_requested` is latched `true` only while a restart is genuinely in
 /// flight: it is set after the readiness gate admits the request and cleared
 /// on EVERY exit of the stop → build → start sequence, success or failure
-/// (`restart_after_gate` is the single body; this wrapper clears the flag
-/// once, before matching its result). Before this shape the flag was cleared
+/// (`restart_after_gate` is the single body; `restart_in_flight` clears the
+/// flag once, before matching its result, and the [`RestartLatch`] guard
+/// clears it on any exit that never gets there). The latched half runs in its
+/// own task, so a caller that is dropped mid-restart (a disconnected HTTP
+/// client) neither abandons the restart nor strands the latch. Before this shape the flag was cleared
 /// only on the success path, so one failed stop or start left it `true` for
 /// the runner's lifetime — and the serving watchdog's `SkipOperatorIntent`
 /// reads that flag, so its first failed attempt would have silenced it for
@@ -6469,13 +6472,102 @@ pub async fn restart_runner_by_id(
         return Err(e);
     }
 
-    {
-        let mut runner = managed.runner.write().await;
-        runner.restart_requested = true;
+    let latch = RestartLatch::set(&managed).await;
+
+    // Everything from the latch on runs in its OWN task, awaited. A
+    // synchronous HTTP door (`POST /runner/restart` without rebuild,
+    // `POST /runners/{id}/restart`) awaits this, and a no-rebuild restart of
+    // an optimized primary with nothing startable runs a whole cold build
+    // inside it. If that client disconnects, axum drops the handler future;
+    // run inline, the restart would stop wherever it was, the operator's
+    // restart would never complete, its diagnostics would never be emitted,
+    // and the latch would stay `true` — which the serving watchdog reads as
+    // operator intent (`SkipOperatorIntent`), silencing it for the primary
+    // for good. A spawned task is not cancelled with its awaiter.
+    let task_state = state.clone();
+    let task_id = runner_id.to_string();
+    tokio::spawn(async move {
+        restart_in_flight(
+            &task_state,
+            managed,
+            &task_id,
+            latch,
+            rebuild,
+            source,
+            build_tree,
+            intent,
+            restart_start,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| {
+        SupervisorError::Process(format!("the restart task of '{runner_id}' failed: {e}"))
+    })?
+}
+
+/// Holds `restart_requested` for the life of one admitted restart.
+///
+/// [`RestartLatch::clear`] is the normal exit; `Drop` is the backstop for an
+/// exit that never reaches it (a panic, or the task cancelled by runtime
+/// shutdown), so the latch can never outlive the restart that set it.
+pub(crate) struct RestartLatch {
+    managed: Option<Arc<ManagedRunner>>,
+}
+
+impl RestartLatch {
+    pub(crate) async fn set(managed: &Arc<ManagedRunner>) -> Self {
+        managed.runner.write().await.restart_requested = true;
+        Self {
+            managed: Some(managed.clone()),
+        }
     }
 
-    // The single in-flight body. Whatever it returns, the latch comes off
-    // BEFORE the result is inspected — there is exactly one exit from here.
+    pub(crate) async fn clear(mut self) {
+        if let Some(managed) = self.managed.take() {
+            managed.runner.write().await.restart_requested = false;
+        }
+    }
+}
+
+impl Drop for RestartLatch {
+    fn drop(&mut self) {
+        let Some(managed) = self.managed.take() else {
+            return;
+        };
+        if let Ok(mut runner) = managed.runner.try_write() {
+            runner.restart_requested = false;
+            return;
+        }
+        // Contended: clear it as soon as the lock frees.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                managed.runner.write().await.restart_requested = false;
+            });
+        } else {
+            warn!(
+                "restart latch of '{}' dropped with its lock held and no runtime to clear it on",
+                managed.config.id
+            );
+        }
+    }
+}
+
+/// The latched half of [`restart_runner_by_id`]: the single in-flight body,
+/// then the latch comes off BEFORE the result is inspected — there is exactly
+/// one exit from here.
+#[allow(clippy::too_many_arguments)]
+async fn restart_in_flight(
+    state: &SharedState,
+    managed: Arc<ManagedRunner>,
+    runner_id: &str,
+    latch: RestartLatch,
+    rebuild: bool,
+    source: RestartSource,
+    build_tree: BuildTree,
+    intent: CloseIntent,
+    restart_start: std::time::Instant,
+) -> Result<(), SupervisorError> {
     let outcome = restart_after_gate(
         state,
         &managed,
@@ -6487,10 +6579,7 @@ pub async fn restart_runner_by_id(
     )
     .await;
 
-    {
-        let mut runner = managed.runner.write().await;
-        runner.restart_requested = false;
-    }
+    latch.clear().await;
 
     match outcome {
         Ok(build_duration) => {

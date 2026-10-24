@@ -60,10 +60,13 @@ fn no_build() -> impl FnOnce() -> std::future::Ready<Result<(), SupervisorError>
     || panic!("this start must not build in the foreground")
 }
 
+/// Whether any entry, in EITHER log buffer, contains `needle`: a
+/// `LogSource::Build` entry lands only in the build buffer, which `history()`
+/// does not read.
 async fn logged(state: &SharedState, needle: &str) -> bool {
     state
         .logs
-        .history()
+        .merged_history()
         .await
         .iter()
         .any(|e| e.message.contains(needle))
@@ -195,8 +198,8 @@ async fn an_unattended_start_takes_the_dev_lkg_at_once_and_kicks_a_background_bu
 }
 
 /// Round 2, item 1: a COLD box (nothing at all to start) is not refused — an
-/// unattended start builds in the foreground, because there is no running
-/// primary to protect.
+/// unattended start builds in the foreground, because nothing else could be
+/// started (a restart still stops the old process only after the build).
 #[tokio::test]
 async fn an_unattended_start_on_a_cold_box_builds_in_the_foreground() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -591,4 +594,339 @@ async fn primary_start_needs_build_only_when_nothing_is_startable() {
         b"optimized",
     );
     assert!(!primary_start_needs_build(&state).await);
+}
+
+// ── Review round 3 ──────────────────────────────────────────────────────────
+
+/// A registered, UNPROTECTED primary on a port nothing listens on, so the
+/// readiness gate skips and a restart reaches its latch without probing
+/// anything real.
+async fn register_dead_primary(state: &SharedState) -> Arc<crate::state::ManagedRunner> {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.port = port;
+    config.protected = false;
+    let id = config.id.clone();
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state.runners.write().await.insert(id, managed.clone());
+    managed
+}
+
+/// Wait (bounded) until `cond` holds.
+async fn eventually<F, Fut>(what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !cond().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Finding 1: a caller dropped MID-PREPARE (a disconnected HTTP client while
+/// a no-rebuild restart cold-builds) neither abandons the restart nor strands
+/// `restart_requested`, which the serving watchdog reads as operator intent.
+/// The held build lock parks the restart inside its cold build; the caller is
+/// dropped there; the restart still runs to its end (the build fails on this
+/// fixture's missing schemas sibling, so the start is refused) and the latch
+/// comes off.
+#[tokio::test]
+async fn a_restart_dropped_mid_prepare_still_clears_its_latch() {
+    use crate::process::manager::{restart_runner_by_id, CloseIntent};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let managed = register_dead_primary(&state).await;
+    let build_lock = state
+        .build_pool
+        .primary_build_lock
+        .clone()
+        .lock_owned()
+        .await;
+
+    {
+        let restart = restart_runner_by_id(
+            &state,
+            "primary",
+            false,
+            RestartSource::Manual,
+            false,
+            BuildTree::OriginMain,
+            CloseIntent::Kill,
+        );
+        tokio::pin!(restart);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut restart => panic!("the restart must park on the held build lock: {r:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+            if managed.runner.read().await.restart_requested {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restart never latched"
+            );
+        }
+        // Let it reach the parked build, then drop the caller.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(managed.runner.read().await.restart_requested);
+    }
+
+    drop(build_lock);
+    eventually(
+        "the latch comes off after the dropped restart ends",
+        || async { !managed.runner.read().await.restart_requested },
+    )
+    .await;
+    assert!(
+        !managed.runner.read().await.stop_requested,
+        "a refused start must not have stopped anything"
+    );
+}
+
+/// Finding 1: the latch guard's `Drop` is the backstop for an exit that never
+/// reaches `clear` (a panic, a cancelled task).
+#[tokio::test]
+async fn a_dropped_restart_latch_clears_the_flag() {
+    use crate::process::manager::RestartLatch;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let managed = register_dead_primary(&state).await;
+
+    let latch = RestartLatch::set(&managed).await;
+    assert!(managed.runner.read().await.restart_requested);
+    drop(latch);
+    assert!(!managed.runner.read().await.restart_requested);
+
+    // Contended at drop: cleared as soon as the lock frees.
+    let latch = RestartLatch::set(&managed).await;
+    let reader = managed.runner.read().await;
+    drop(latch);
+    assert!(reader.restart_requested);
+    drop(reader);
+    eventually("the contended latch clears", || async {
+        !managed.runner.read().await.restart_requested
+    })
+    .await;
+
+    // The normal exit.
+    let latch = RestartLatch::set(&managed).await;
+    latch.clear().await;
+    assert!(!managed.runner.read().await.restart_requested);
+}
+
+/// Finding 1, both doors: the latched half of `restart_runner_by_id` runs in
+/// its own task, and so does the no-rebuild tail of `POST /runner/restart`
+/// (LKG pin, restart, dev-action result).
+#[test]
+fn the_synchronous_restart_doors_run_their_restart_in_a_task() {
+    let manager = include_str!("../manager.rs");
+    let by_id = fn_body(
+        manager,
+        "pub async fn restart_runner_by_id(",
+        "pub(crate) struct RestartLatch",
+    );
+    let latch = by_id.find("RestartLatch::set").expect("latches");
+    let spawn = by_id.find("tokio::spawn").expect("spawns");
+    let body = by_id.find("restart_in_flight(").expect("runs the body");
+    assert!(latch < spawn && spawn < body);
+    let runner = include_str!("../../routes/runner.rs");
+    let handler = fn_body(
+        runner,
+        "pub async fn restart_runner(",
+        "pub async fn control_watchdog(",
+    );
+    // The rebuild branch runs detached through `submit_detached` and spells
+    // the same calls, so read only the no-rebuild tail after it.
+    let tail = &handler[handler
+        .find("// ── No-rebuild path")
+        .expect("no-rebuild tail")..];
+    let spawn = tail
+        .find("tokio::spawn(async move {")
+        .expect("spawns the tail");
+    for needle in [
+        "source_exe_override.write().await = Some",
+        "manager::restart_runner(",
+        "record_run_result(run_result_for(e))",
+        "record_run_result(ActionRunResult::Ran)",
+    ] {
+        let at = tail
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing"));
+        assert!(spawn < at, "{needle} must run inside the spawned task");
+    }
+    // Nit: the cold-build filing is decided after the explicit LKG pin.
+    let pin = handler.find("let explicit_lkg_pin").expect("explicit pin");
+    let cold = handler.find("let cold_build").expect("cold_build");
+    assert!(pin < cold);
+    assert!(handler.contains("&& !explicit_lkg_pin"));
+}
+
+/// Finding 2: both origin/main arms of `primary_build` register their
+/// container with the pruner while they hold its lock.
+#[test]
+fn both_origin_main_arms_of_the_primary_build_register_their_container() {
+    let src = include_str!("../primary_start.rs");
+    let build = fn_body(
+        src,
+        "pub async fn primary_build(",
+        "pub async fn primary_build_detached(",
+    );
+    let (dev, optimized) = build.split_at(build.find("let lock = state").expect("optimized arm"));
+    for arm in [dev, optimized] {
+        let lock = arm.find("spawn_container_lock").expect("container lock");
+        let active = arm
+            .find("ActiveSpawnContainer::register(state, &container)")
+            .expect("registered");
+        let prepare = arm.find("prepare_worktree").expect("prepares");
+        assert!(lock < active && active < prepare);
+    }
+}
+
+/// Finding 2: the guard holds the container in the active set until it drops,
+/// and never removes a registration it did not make.
+#[tokio::test]
+async fn an_active_spawn_container_is_registered_until_dropped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let container = tmp.path().join(".spawn-origin_main");
+    {
+        let _active = crate::state::ActiveSpawnContainer::register(&state, &container);
+        assert!(state.active_spawn_containers().contains(&container));
+    }
+    assert!(!state.active_spawn_containers().contains(&container));
+
+    state
+        .active_spawn_worktrees
+        .lock()
+        .unwrap()
+        .insert(container.clone());
+    drop(crate::state::ActiveSpawnContainer::register(
+        &state, &container,
+    ));
+    assert!(
+        state.active_spawn_containers().contains(&container),
+        "a registration another holder made must survive this guard"
+    );
+}
+
+/// Finding 3: a pre-check that read a local origin/main its fetch did not
+/// refresh says so in the label every profile cause quotes.
+#[test]
+fn a_profile_check_after_a_failed_fetch_says_its_ref_may_be_stale() {
+    let repo = std::path::Path::new("/ws/qontinui-runner");
+    let fresh = build_point_label("abc", repo, true);
+    assert!(!fresh.contains("may be stale"), "{fresh}");
+    let stale = build_point_label("abc", repo, false);
+    assert!(stale.contains(STALE_ORIGIN_NOTE), "{stale}");
+    for manifest in [None, Some(WITHOUT_PROFILE)] {
+        match profile_support_from_manifest(manifest, &stale, RunnerBuildProfile::ReleaseChecked) {
+            ProfileSupport::Missing(cause) => assert!(
+                cause.contains(
+                    "fetch did not complete; checked the local origin/main ref, which may be stale"
+                ),
+                "{cause}"
+            ),
+            ProfileSupport::Supported => panic!("not supported"),
+        }
+    }
+}
+
+/// Finding 4: a detached build that fails with nobody awaiting it still logs
+/// its error. The awaiter is dropped while the build waits for the lock; the
+/// build then fails at once (this fixture has no schemas sibling).
+#[tokio::test]
+async fn a_detached_build_logs_its_failure_when_the_awaiter_is_gone() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let build_lock = state
+        .build_pool
+        .primary_build_lock
+        .clone()
+        .lock_owned()
+        .await;
+    {
+        let build = primary_build_detached(&state, BuildTree::OriginMain, BuildNeed::Always);
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(200), build).await;
+        assert!(parked.is_err(), "the build must park on the held lock");
+    }
+    drop(build_lock);
+    let state2 = state.clone();
+    eventually("the orphaned build's failure is logged", move || {
+        let state = state2.clone();
+        async move { logged(&state, "Primary build failed").await }
+    })
+    .await;
+}
+
+fn slot_exe(id: usize, mtime_secs: u64) -> ResolvedRunnerExe {
+    ResolvedRunnerExe {
+        mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs)),
+        path: std::path::PathBuf::from(format!("slot-{id}")),
+        origin: ExeOrigin::Slot(id),
+        provenance: None,
+        unverified_warning: None,
+        profile: RunnerBuildProfile::Dev,
+        profile_fallback: None,
+    }
+}
+
+/// Nit: the dev fallback takes the pool's last successful slot, else the
+/// NEWEST slot exe — never the first slot by iteration order.
+#[test]
+fn the_dev_fallback_slot_is_the_last_successful_else_the_newest() {
+    let pick = |last| {
+        pick_dev_slot(
+            vec![slot_exe(0, 100), slot_exe(1, 300), slot_exe(2, 200)],
+            last,
+        )
+        .map(|r| r.origin)
+    };
+    assert_eq!(pick(None), Some(ExeOrigin::Slot(1)));
+    assert_eq!(pick(Some(2)), Some(ExeOrigin::Slot(2)));
+    // A last-successful slot that is not a candidate (busy, gone) falls back.
+    assert_eq!(pick(Some(7)), Some(ExeOrigin::Slot(1)));
+    assert!(pick_dev_slot(Vec::new(), None).is_none());
+}
+
+/// Nit: a slot that is building right now is never the dev fallback, even
+/// when its exe is the newest.
+#[tokio::test]
+async fn a_busy_dev_slot_is_never_the_fallback() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    for id in [0, 1] {
+        write_file(&state.config.runner_exe_path_for_slot(id), b"dev-slot");
+    }
+    // Slot 1 is an hour older; slot 0 is the newest, and is building.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(state.config.runner_exe_path_for_slot(1))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3_600))
+        .unwrap();
+    *state.build_pool.slots[0].busy.write().await = Some(crate::state::BuildInfo {
+        started_at: chrono::Utc::now(),
+        requester_id: None,
+        rebuild_kind: "exe".to_string(),
+        mem_gate: None,
+    });
+    let p = prepare_optimized_primary(
+        &state,
+        RunnerBuildProfile::ReleaseChecked,
+        StartIntent::Unattended,
+        no_build(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.resolved.origin, ExeOrigin::Slot(1));
 }

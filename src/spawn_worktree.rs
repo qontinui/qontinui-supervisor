@@ -168,6 +168,35 @@ async fn git(args: &[&str], cwd: &Path, quiet_offline_ok: bool) -> Result<String
     }
 }
 
+/// A best-effort `git fetch`, bounded by
+/// [`crate::git_provenance::fetch_timeout`]. Never fails the caller: a fetch
+/// that errors or overruns leaves the refs already present (logged at WARN),
+/// and the ref is validated by the checkout / rev-parse that follows. The
+/// overrun child is left to finish rather than killed — killing a fetch can
+/// strand ref lock files that would break the next one.
+async fn fetch_best_effort(args: &[&str], cwd: &Path) {
+    let budget = crate::git_provenance::fetch_timeout();
+    match tokio::time::timeout(budget, git(args, cwd, false)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("spawn-worktree: {e}; continuing with the refs already present")
+        }
+        Err(_) => tracing::warn!(
+            "spawn-worktree: `git {}` in {:?} exceeded {}s and was abandoned; continuing \
+             with the refs already present",
+            args.join(" "),
+            cwd,
+            budget.as_secs()
+        ),
+    }
+}
+
+/// Whether `s` is a full hex object name (SHA-1 or SHA-256), as opposed to a
+/// branch, tag or abbreviated sha.
+pub(crate) fn is_full_sha(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Prefix prepended to a build-failure error when [`classify_drift`] detects
 /// the cargo error references a file OUTSIDE the spawn container — i.e. the
 /// failure is shared path-dep drift, not the requested ref's fault.
@@ -608,8 +637,14 @@ pub async fn prepare_worktree_at(
     let schemas_wt: PathBuf = container.join("qontinui-schemas");
 
     // Best-effort fetch on the runner repo so the ref is resolvable even if it
-    // was pushed after this supervisor started. Offline ⇒ tolerated.
-    git(&["fetch", "--quiet", "origin"], &repo_root, true).await?;
+    // was pushed after this supervisor started. Offline ⇒ tolerated. Skipped
+    // for a checkout that is already a full sha: the caller resolved it from
+    // refs in this repo (the primary build, after its own fetch), so there is
+    // nothing to fetch for it, and this runs under the caller's locks.
+    let checkout_is_sha = is_full_sha(checkout);
+    if !checkout_is_sha {
+        fetch_best_effort(&["fetch", "--quiet", "origin"], &repo_root).await;
+    }
 
     // Migrate an old flat-layout container (src-tauri directly inside) to the
     // nested layout: tear it down (pruning the leaked runner worktree
@@ -646,7 +681,9 @@ pub async fn prepare_worktree_at(
         .await?;
     } else {
         // Reuse: refresh + hard-pin the runner worktree to the ref.
-        git(&["fetch", "--quiet", "origin"], &runner_wt, true).await?;
+        if !checkout_is_sha {
+            fetch_best_effort(&["fetch", "--quiet", "origin"], &runner_wt).await;
+        }
         git(
             &["checkout", "--detach", "--force", checkout],
             &runner_wt,
@@ -662,12 +699,7 @@ pub async fn prepare_worktree_at(
     // failure on the fresh path triggers full cleanup below.
     let prepare_schemas = async {
         // Best-effort fetch on the shared schemas repo so origin/main is current.
-        git(
-            &["fetch", "--quiet", "origin", "main"],
-            &schemas_repo_root,
-            true,
-        )
-        .await?;
+        fetch_best_effort(&["fetch", "--quiet", "origin", "main"], &schemas_repo_root).await;
         if !schemas_wt.exists() {
             let schemas_wt_str = schemas_wt.to_string_lossy().to_string();
             git(
@@ -684,7 +716,7 @@ pub async fn prepare_worktree_at(
             .await?;
         } else {
             // Re-pin an existing schemas worktree to origin/main.
-            git(&["fetch", "--quiet", "origin", "main"], &schemas_wt, true).await?;
+            fetch_best_effort(&["fetch", "--quiet", "origin", "main"], &schemas_wt).await;
             git(
                 &["checkout", "--detach", "--force", SCHEMAS_PIN_REF],
                 &schemas_wt,
@@ -759,7 +791,7 @@ pub async fn prepare_worktree_at(
 //
 // Safety is the whole point — getting it wrong deletes a checkout. The
 // predicate is intentionally conservative and layered (see
-// [`prune_spawn_worktrees`]). The three never-touch invariants are enforced
+// [`prune_spawn_worktrees_guarded`]). The three never-touch invariants are enforced
 // structurally, not by comment:
 //
 //   1. Only directories whose name starts with the supervisor's own
@@ -907,14 +939,16 @@ async fn remove_spawn_container(
 /// Best-effort throughout: a failure to derive roots, stat a dir, or remove a
 /// dir is logged and skipped — this never returns an error and never fails the
 /// caller. Returns a [`PruneReport`] for logging/tests.
+// Test-only: every production sweep takes the lock-aware
+// [`prune_spawn_worktrees_guarded`].
+#[cfg(test)]
 pub async fn prune_spawn_worktrees(
     project_dir: &Path,
     active_containers: &std::collections::HashSet<PathBuf>,
     now: std::time::SystemTime,
 ) -> PruneReport {
     // Delegate to the window-parameterized inner fn with no override, so the
-    // engine resolves the retention window from env exactly as before. Existing
-    // callers (startup sweep, opportunistic sweep) are unchanged.
+    // engine resolves the retention window from env.
     prune_spawn_worktrees_with_window(project_dir, active_containers, now, None).await
 }
 
@@ -930,11 +964,41 @@ pub async fn prune_spawn_worktrees(
 /// pass an operator-chosen window WITHOUT changing the env-derived default for
 /// the background sweeps. All selection/safety invariants are identical — only
 /// the window source differs.
+#[cfg(test)]
 pub async fn prune_spawn_worktrees_with_window(
     project_dir: &Path,
     active_containers: &std::collections::HashSet<PathBuf>,
     now: std::time::SystemTime,
     window_hours_override: Option<u64>,
+) -> PruneReport {
+    prune_spawn_worktrees_guarded(
+        project_dir,
+        active_containers,
+        now,
+        window_hours_override,
+        None,
+    )
+    .await
+}
+
+/// Looks up a spawn container's mutual-exclusion lock — in the supervisor,
+/// [`crate::state::SupervisorState::spawn_container_lock`].
+pub type ContainerLockLookup<'a> =
+    &'a (dyn Fn(&Path) -> std::sync::Arc<tokio::sync::Mutex<()>> + Send + Sync);
+
+/// [`prune_spawn_worktrees_with_window`] that also respects the per-container
+/// locks. Every path that materializes or builds a container holds its lock
+/// (spawn-test, the primary build), and the active set alone is only as good
+/// as every such path remembering to register; so a container whose lock is
+/// held is kept as busy, and the sweep HOLDS the lock of a container while it
+/// removes it, so nothing can start preparing that tree mid-removal. The
+/// lock is only ever `try_lock`ed — a sweep never waits on a build.
+pub async fn prune_spawn_worktrees_guarded(
+    project_dir: &Path,
+    active_containers: &std::collections::HashSet<PathBuf>,
+    now: std::time::SystemTime,
+    window_hours_override: Option<u64>,
+    container_locks: Option<ContainerLockLookup<'_>>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
 
@@ -1025,6 +1089,21 @@ pub async fn prune_spawn_worktrees_with_window(
             report.kept.push((path.clone(), "active build".to_string()));
             continue;
         }
+        // Invariant 2, by lock: a container someone is materializing or
+        // building holds its lock. Held to the end of this iteration (the
+        // removal included) when taken.
+        let _container_guard = match container_locks {
+            Some(lookup) => match lookup(&path).try_lock_owned() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    report
+                        .kept
+                        .push((path.clone(), "busy (container lock held)".to_string()));
+                    continue;
+                }
+            },
+            None => None,
+        };
 
         // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
         let age = match dir_age(&path, now) {
@@ -1766,6 +1845,74 @@ mod tests {
             Some(&prepared.schemas_path),
         )
         .await;
+    }
+
+    /// An aged container that is NOT in the active set but whose container
+    /// lock is held (a primary build or spawn-test reading it) is kept as
+    /// busy; once the lock is free the same sweep removes it.
+    #[tokio::test]
+    async fn prune_keeps_a_container_whose_lock_is_held() {
+        let _g = retention_env_guard().lock().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_root, src_tauri) = build_workspace_fixture(tmp.path());
+        let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        let locks: std::sync::Mutex<
+            std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        > = Default::default();
+        let lookup = |p: &Path| {
+            locks
+                .lock()
+                .unwrap()
+                .entry(p.to_path_buf())
+                .or_default()
+                .clone()
+        };
+        let held = lookup(&prepared.container_path).lock_owned().await;
+
+        let none: HashSet<PathBuf> = HashSet::new();
+        let r = prune_spawn_worktrees_guarded(
+            &src_tauri,
+            &none,
+            now_plus_hours(999),
+            None,
+            Some(&lookup),
+        )
+        .await;
+        assert!(
+            prepared.container_path.exists(),
+            "a container whose lock is held must never be pruned"
+        );
+        assert!(r.removed.is_empty());
+        assert!(
+            r.kept
+                .iter()
+                .any(|(p, why)| p == &prepared.container_path && why.contains("busy")),
+            "kept reason must cite the held lock; got {:?}",
+            r.kept
+        );
+
+        drop(held);
+        let r = prune_spawn_worktrees_guarded(
+            &src_tauri,
+            &none,
+            now_plus_hours(999),
+            None,
+            Some(&lookup),
+        )
+        .await;
+        assert_eq!(r.removed, vec![prepared.container_path.clone()]);
+        assert!(!prepared.container_path.exists());
+    }
+
+    #[test]
+    fn only_a_full_hex_object_name_skips_the_fetch() {
+        assert!(is_full_sha(&"a".repeat(40)));
+        assert!(is_full_sha(&"0123456789abcdef".repeat(4)));
+        assert!(!is_full_sha("origin/main"));
+        assert!(!is_full_sha("HEAD"));
+        assert!(!is_full_sha("abc1234"));
+        assert!(!is_full_sha(&"g".repeat(40)));
     }
 
     #[tokio::test]

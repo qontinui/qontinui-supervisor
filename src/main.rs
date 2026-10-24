@@ -632,17 +632,22 @@ async fn main() -> anyhow::Result<()> {
 
     // One-shot startup sweep of stale `.spawn-*` scratch worktree containers
     // (deferred #64 Phase 4). Non-blocking — spawned as its own task so a slow
-    // `git worktree remove` of a GB-scale checkout never delays serving. No
-    // build is active at startup, so the active-container exclusion set is
-    // empty. Best-effort: the pruner logs + swallows every failure internally.
+    // `git worktree remove` of a GB-scale checkout never delays serving. It
+    // runs concurrently with the boot start, which on a cold box BUILDS the
+    // primary in the `.spawn-origin_main` container, so it honours the live
+    // active set and the container locks like every other sweep.
+    // Best-effort: the pruner logs + swallows every failure internally.
     {
         let state_for_prune = state.clone();
         tokio::spawn(async move {
-            let active = std::collections::HashSet::new();
-            let report = spawn_worktree::prune_spawn_worktrees(
+            let active = state_for_prune.active_spawn_containers();
+            let locks = |p: &std::path::Path| state_for_prune.spawn_container_lock(p);
+            let report = spawn_worktree::prune_spawn_worktrees_guarded(
                 &state_for_prune.config.project_dir,
                 &active,
                 std::time::SystemTime::now(),
+                None,
+                Some(&locks),
             )
             .await;
             if !report.removed.is_empty() || !report.failed.is_empty() {

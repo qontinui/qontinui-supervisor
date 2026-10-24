@@ -2078,7 +2078,9 @@ fn temp_restart_keeps_the_instance_state() {
         );
     }
 
-    let restart = body_of("pub async fn restart_runner_by_id(");
+    // The latched half of `restart_runner_by_id` runs in its own task, in
+    // `restart_in_flight`, so that is where a failed restart's reap lives.
+    let restart = body_of("async fn restart_in_flight(");
     assert!(
         restart
             .contains("if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)")

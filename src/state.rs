@@ -20,6 +20,44 @@ use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
 
 pub type SharedState = Arc<SupervisorState>;
 
+/// Holds one spawn container in [`SupervisorState::active_spawn_worktrees`]
+/// until it drops, so the pruner never removes a tree a build is reading.
+///
+/// Removes on drop only what it inserted: a path another holder registered
+/// first stays registered for that holder.
+pub struct ActiveSpawnContainer {
+    state: SharedState,
+    path: PathBuf,
+    inserted: bool,
+}
+
+impl ActiveSpawnContainer {
+    pub fn register(state: &SharedState, path: &std::path::Path) -> Self {
+        let inserted = state
+            .active_spawn_worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf());
+        Self {
+            state: state.clone(),
+            path: path.to_path_buf(),
+            inserted,
+        }
+    }
+}
+
+impl Drop for ActiveSpawnContainer {
+    fn drop(&mut self) {
+        if self.inserted {
+            self.state
+                .active_spawn_worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.path);
+        }
+    }
+}
+
 /// Per-runner state container. Each managed runner has its own state.
 pub struct ManagedRunner {
     pub config: RunnerConfig,
@@ -475,7 +513,7 @@ pub struct SupervisorState {
     ///
     /// [`crate::routes::runners::spawn_test`] inserts the container path before
     /// the build and removes it after (success or failure). The spawn-worktree
-    /// pruner ([`crate::spawn_worktree::prune_spawn_worktrees`]) consults this
+    /// pruner ([`crate::spawn_worktree::prune_spawn_worktrees_guarded`]) consults this
     /// set as its active-build exclusion: any candidate present here is skipped,
     /// regardless of age. Keyed by the canonical container path string so the
     /// pruner's directory enumeration and the build wiring agree on identity.
@@ -1903,6 +1941,14 @@ impl SupervisorState {
             .unwrap_or_else(|e| e.into_inner());
         map.entry(container.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// The live active-build exclusion set, for a pruner sweep.
+    pub fn active_spawn_containers(&self) -> std::collections::HashSet<PathBuf> {
+        self.active_spawn_worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 

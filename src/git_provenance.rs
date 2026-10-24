@@ -9,8 +9,10 @@
 //!
 //! This module turns that silent stale-build into a loud, API-surfaced signal:
 //!
-//! * [`fetch_origin`] — `git fetch origin --quiet`, best-effort and
-//!   offline-tolerant (a stale origin ref must never block a build).
+//! * [`fetch_origin`] — `git fetch origin --quiet` with a deadline. It reports
+//!   a fetch that did not land as `Err` so a caller can say its compare used a
+//!   possibly stale ref; no caller fails a build on it (a stale origin ref must
+//!   never block a build).
 //! * [`origin_main_drift`] — compares a built SHA against `origin/main`,
 //!   returning [`OriginMainDrift`] with a behind-count and an ancestor test:
 //!   - `is_ancestor == true && behind_count > 0` = clean-but-stale (the
@@ -186,7 +188,7 @@ async fn git(args: &[&str], cwd: &Path, quiet_offline_ok: bool) -> Result<String
 /// A non-numeric or zero override is ignored rather than honored: zero would
 /// abandon every fetch before it could start, which is a footgun disguised as a
 /// tuning knob.
-fn fetch_timeout() -> std::time::Duration {
+pub(crate) fn fetch_timeout() -> std::time::Duration {
     parse_fetch_timeout(std::env::var("QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS").ok())
 }
 
@@ -203,19 +205,18 @@ fn parse_fetch_timeout(raw: Option<String>) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Best-effort `git fetch origin --quiet` in `repo_root`, bounded by
-/// [`fetch_timeout`].
+/// `git fetch origin --quiet` in `repo_root`, bounded by [`fetch_timeout`].
 ///
-/// Offline-tolerant: a network / remote failure resolves to `Ok(())` (like the
-/// `quiet_offline_ok` path of [`git`]) because a stale origin ref must never
-/// block a build. Only a spawn failure (git missing) — or exceeding the
-/// timeout — bubbles up as `Err`.
+/// `Ok(())` only when the fetch LANDED. A fetch that did not — a network or
+/// remote failure, a spawn failure (git missing), or exceeding the timeout —
+/// is `Err` naming why. It used to resolve a network failure to `Ok(())`, so an
+/// offline box reported a fresh compare it never made.
 ///
-/// The sole caller ([`origin_main_drift`]) reads this as
-/// `fetched = fetch_origin(..).is_ok()`, so an abandoned fetch lands as
-/// `fetched: false`, which already means "the compare used a possibly-stale
-/// local `origin/main`". The timeout therefore degrades the ANSWER's confidence
-/// rather than failing the caller.
+/// Callers treat `Err` as "the refs already present were used", never as a
+/// reason to fail: [`drift_against`] reads it as `fetched: false` ("the compare
+/// used a possibly-stale local `origin/main`"), and the primary build's
+/// profile check names it in its cause. A failed fetch therefore degrades the
+/// ANSWER's confidence rather than failing the caller.
 pub async fn fetch_origin(repo_root: &Path) -> Result<(), SupervisorError> {
     // Read the deadline ONCE: the error message must name the budget that was
     // actually applied, and re-reading env could report a different number than
@@ -223,11 +224,15 @@ pub async fn fetch_origin(repo_root: &Path) -> Result<(), SupervisorError> {
     let budget = fetch_timeout();
     match tokio::time::timeout(
         budget,
-        git(&["fetch", "origin", "--quiet"], repo_root, true),
+        git(&["fetch", "origin", "--quiet"], repo_root, false),
     )
     .await
     {
-        Ok(res) => res.map(|_| ()),
+        Ok(res) => res.map(|_| ()).map_err(|e| {
+            SupervisorError::Process(format!(
+                "`git fetch origin` did not complete ({e}); continuing with the refs already present"
+            ))
+        }),
         Err(_) => Err(SupervisorError::Process(format!(
             "`git fetch origin` exceeded {}s and was abandoned; \
              continuing with the refs already present",
@@ -580,6 +585,35 @@ mod tests {
         let drift = origin_main_drift(tmp.path(), "deadbeef").await;
         assert!(drift.origin_main_sha.is_empty());
         assert!(drift.is_up_to_date(), "not-computable reads as up-to-date");
+    }
+
+    /// A fetch that did not land is `Err`, not a silent `Ok` — so a drift
+    /// reads `fetched: false` and the primary build's profile check names a
+    /// possibly stale ref, instead of both claiming a fresh compare. A fetch
+    /// that DID land is `Ok`.
+    #[tokio::test]
+    async fn a_fetch_that_did_not_land_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let built = init_repo_with_self_origin(dir);
+        assert!(
+            fetch_origin(dir).await.is_ok(),
+            "a reachable origin fetches"
+        );
+
+        let missing = dir.join("no-such-remote");
+        git_in(
+            dir,
+            &["remote", "set-url", "origin", &missing.to_string_lossy()],
+        );
+        let err = fetch_origin(dir).await.expect_err("an unreachable origin");
+        assert!(err.to_string().contains("did not complete"), "{err}");
+        let drift = origin_main_drift(dir, &built).await;
+        assert!(
+            !drift.fetched,
+            "the drift must say its compare may be stale"
+        );
+        assert_eq!(drift.origin_main_sha, built, "the local ref is still used");
     }
 
     /// The fetch deadline exists because `git()` has none of its own: a hanging

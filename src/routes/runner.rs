@@ -628,8 +628,23 @@ pub async fn restart_runner(
     // BUILDS before it starts (`primary_start`), so it is filed as the build it
     // is: a `restart` window would close ~30 s in, mid-compile, and record a
     // verdict about an action that had not happened yet.
-    let cold_build =
-        !rebuild && crate::process::primary_start::primary_start_needs_build(&state).await;
+    //
+    // Decided AFTER the pin it can be decided from: an explicit
+    // `use_lkg: true` with that profile's LKG on disk pins the artifact, and a
+    // pinned restart prepares (and so builds) nothing. The automatic risk
+    // bias (`use_lkg: null` + `risk.route_lkg`) cannot be known here — the
+    // risk is assessed for the action kind this decides — so when it pins, a
+    // restart filed as `build` builds nothing; its window still closes on
+    // the run result recorded below, not on a guess.
+    let explicit_lkg_pin = body.use_lkg == Some(true)
+        && crate::state::lkg_on_disk(
+            &state.config,
+            crate::build_profile::primary_profile(&state.config),
+        )
+        .is_some();
+    let cold_build = !rebuild
+        && !explicit_lkg_pin
+        && crate::process::primary_start::primary_start_needs_build(&state).await;
     let action_kind = if rebuild || cold_build {
         ActionKind::Build
     } else {
@@ -912,133 +927,147 @@ pub async fn restart_runner(
     //   - `use_lkg: None`        ⇒ auto: bias to LKG iff `risk.route_lkg`.
     // The bias only applies when the LKG exe actually exists on disk; otherwise
     // it is a no-op (fail-open) and the normal slot resolution runs.
-    let want_lkg = match body.use_lkg {
-        Some(explicit) => explicit,
-        None => risk.route_lkg,
-    };
-    // Track whether we set a transient override so we can clear it after the
-    // restart, keeping the bias scoped to THIS restart (later restarts re-decide
-    // from fresh predictions rather than inheriting a sticky pin).
-    let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
-    if want_lkg {
-        // The PRIMARY's LKG is the one of its configured profile: a
-        // release-checked primary is never biased onto the dev LKG (a debug
-        // primary is an opt-in), and a dev primary keeps today's behaviour.
-        let lkg_profile = crate::build_profile::primary_profile(&state.config);
-        let lkg_on_disk = crate::state::lkg_on_disk(&state.config, lkg_profile);
-        let lkg_exe = lkg_on_disk
-            .as_ref()
-            .map(|(_, exe)| exe.clone())
-            .unwrap_or_else(|| state.config.lkg_exe_path(lkg_profile));
-        if lkg_on_disk.is_some() {
-            if let Some(primary) = state.get_primary().await {
-                *primary.source_exe_override.write().await = Some(lkg_exe.clone());
-                let reason = if body.use_lkg == Some(true) {
-                    "operator-requested (use_lkg:true)"
-                } else {
-                    "high-risk prediction (auto-bias)"
-                };
-                let msg = format!(
-                    "Restart biased to last-known-good binary {lkg_exe:?} — {reason}; \
+    //
+    // Everything from here runs in its OWN task, awaited. This door is
+    // synchronous, and a restart of an optimized primary with nothing
+    // startable runs a whole cold build inside it; a client that disconnects
+    // drops this handler future, and run inline the transient LKG pin would
+    // stay set (a sticky pin on every later restart) and the dev-action record
+    // would never get its run result. A spawned task is not cancelled with
+    // its awaiter.
+    tokio::spawn(async move {
+        let want_lkg = match body.use_lkg {
+            Some(explicit) => explicit,
+            None => risk.route_lkg,
+        };
+        // Track whether we set a transient override so we can clear it after the
+        // restart, keeping the bias scoped to THIS restart (later restarts re-decide
+        // from fresh predictions rather than inheriting a sticky pin).
+        let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+        if want_lkg {
+            // The PRIMARY's LKG is the one of its configured profile: a
+            // release-checked primary is never biased onto the dev LKG (a debug
+            // primary is an opt-in), and a dev primary keeps today's behaviour.
+            let lkg_profile = crate::build_profile::primary_profile(&state.config);
+            let lkg_on_disk = crate::state::lkg_on_disk(&state.config, lkg_profile);
+            let lkg_exe = lkg_on_disk
+                .as_ref()
+                .map(|(_, exe)| exe.clone())
+                .unwrap_or_else(|| state.config.lkg_exe_path(lkg_profile));
+            if lkg_on_disk.is_some() {
+                if let Some(primary) = state.get_primary().await {
+                    *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                    let reason = if body.use_lkg == Some(true) {
+                        "operator-requested (use_lkg:true)"
+                    } else {
+                        "high-risk prediction (auto-bias)"
+                    };
+                    let msg = format!(
+                        "Restart biased to last-known-good binary {lkg_exe:?} — {reason}; \
                      pass use_lkg:false to opt out"
+                    );
+                    tracing::warn!("{msg}");
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                        .await;
+                    biased_primary = Some(primary);
+                }
+            } else if risk.route_lkg || body.use_lkg == Some(true) {
+                // Wanted LKG but none exists — surface it rather than silently
+                // running the freshest slot exe under known high risk.
+                let msg = format!(
+                    "Restart wanted the last-known-good binary (risk_route_lkg={}, \
+                 use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
+                 freshest slot exe",
+                    risk.route_lkg, body.use_lkg, lkg_exe
                 );
                 tracing::warn!("{msg}");
                 state
                     .logs
                     .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                     .await;
-                biased_primary = Some(primary);
             }
-        } else if risk.route_lkg || body.use_lkg == Some(true) {
-            // Wanted LKG but none exists — surface it rather than silently
-            // running the freshest slot exe under known high risk.
-            let msg = format!(
-                "Restart wanted the last-known-good binary (risk_route_lkg={}, \
-                 use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
-                 freshest slot exe",
-                risk.route_lkg, body.use_lkg, lkg_exe
-            );
-            tracing::warn!("{msg}");
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-                .await;
         }
-    }
 
-    let restart_result = manager::restart_runner(
-        &state,
-        false,
-        RestartSource::Manual,
-        body.force,
-        body.build_tree(),
-        body.close_intent(),
-    )
-    .await;
+        let restart_result = manager::restart_runner(
+            &state,
+            false,
+            RestartSource::Manual,
+            body.force,
+            body.build_tree(),
+            body.close_intent(),
+        )
+        .await;
 
-    // Clear the transient LKG override so the bias does not leak into the next
-    // restart (which re-evaluates risk from fresh predictions). The runner has
-    // already resolved + copied its exe by the time `restart_runner` returns, so
-    // clearing now does not affect the just-started process.
-    if let Some(primary) = biased_primary {
-        *primary.source_exe_override.write().await = None;
-    }
-    // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
-    // minted before the `if rebuild` branch, so a readiness refusal here
-    // returned 409 to the caller while the minted action still closed
-    // `Confirmed` 30s later — and was ingested to coord that way.
-    if let Err(e) = &restart_result {
-        action_record.record_run_result(run_result_for(e));
-    }
-    restart_result?;
+        // Clear the transient LKG override so the bias does not leak into the next
+        // restart (which re-evaluates risk from fresh predictions). The runner has
+        // already resolved + copied its exe by the time `restart_runner` returns, so
+        // clearing now does not affect the just-started process.
+        if let Some(primary) = biased_primary {
+            *primary.source_exe_override.write().await = None;
+        }
+        // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
+        // minted before the `if rebuild` branch, so a readiness refusal here
+        // returned 409 to the caller while the minted action still closed
+        // `Confirmed` 30s later — and was ingested to coord that way.
+        if let Err(e) = &restart_result {
+            action_record.record_run_result(run_result_for(e));
+        }
+        restart_result?;
 
-    // Port-bind verification: the manager call above returns the moment the
-    // OS process is spawned, but the runner may still be pre-bind (or hung).
-    // Poll its `/health` for up to 30s so callers can distinguish a healthy
-    // restart from a wedged one. `wait=false` opts out (legacy behavior).
-    if wait_q.wait {
-        // Look up the primary runner id so the probe targets the right
-        // managed entry. The legacy endpoint always restarts the primary,
-        // so this mirrors `manager::restart_runner`'s lookup.
-        if let Some(primary) = state.get_primary().await {
-            let runner_id = primary.config.id.clone();
-            if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
-                action_record.record_run_result(ActionRunResult::Errored {
-                    reason: format!(
-                        "runner_unhealthy_after_start: runner '{}' did not become healthy \
+        // Port-bind verification: the manager call above returns the moment the
+        // OS process is spawned, but the runner may still be pre-bind (or hung).
+        // Poll its `/health` for up to 30s so callers can distinguish a healthy
+        // restart from a wedged one. `wait=false` opts out (legacy behavior).
+        if wait_q.wait {
+            // Look up the primary runner id so the probe targets the right
+            // managed entry. The legacy endpoint always restarts the primary,
+            // so this mirrors `manager::restart_runner`'s lookup.
+            if let Some(primary) = state.get_primary().await {
+                let runner_id = primary.config.id.clone();
+                if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
+                    action_record.record_run_result(ActionRunResult::Errored {
+                        reason: format!(
+                            "runner_unhealthy_after_start: runner '{}' did not become healthy \
                          within {}ms of the restart",
-                        runner_id, failure.elapsed_ms
-                    ),
-                });
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Warn,
-                        format!(
-                            "Runner '{}' did not become healthy {}ms after restart",
                             runner_id, failure.elapsed_ms
                         ),
-                    )
-                    .await;
-                return Ok(unhealthy_after_start_response(&runner_id, failure));
+                    });
+                    state
+                        .logs
+                        .emit(
+                            LogSource::Supervisor,
+                            LogLevel::Warn,
+                            format!(
+                                "Runner '{}' did not become healthy {}ms after restart",
+                                runner_id, failure.elapsed_ms
+                            ),
+                        )
+                        .await;
+                    return Ok(unhealthy_after_start_response(&runner_id, failure));
+                }
             }
         }
-    }
 
-    action_record.record_run_result(ActionRunResult::Ran);
+        action_record.record_run_result(ActionRunResult::Ran);
 
-    Ok(Json(serde_json::json!({
-        "status": "restarted",
-        "message": "Runner restarted successfully",
-        "action_id": action_id.to_string(),
-        "states_active": states_active,
-        "predicted": predicted,
-        "risk": risk_json,
-        "routed_lkg": want_lkg,
-        "outcome_url": format!("/actions/{}/outcome", action_id),
-    }))
-    .into_response())
+        Ok::<Response, SupervisorError>(
+            Json(serde_json::json!({
+                "status": "restarted",
+                "message": "Runner restarted successfully",
+                "action_id": action_id.to_string(),
+                "states_active": states_active,
+                "predicted": predicted,
+                "risk": risk_json,
+                "routed_lkg": want_lkg,
+                "outcome_url": format!("/actions/{}/outcome", action_id),
+            }))
+            .into_response(),
+        )
+    })
+    .await
+    .map_err(|e| SupervisorError::Process(format!("the restart task failed: {e}")))?
 }
 
 pub async fn control_watchdog(
