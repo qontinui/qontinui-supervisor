@@ -379,10 +379,19 @@ cargo clippy -- -D warnings    # Lint
 ## Primary build profile
 
 Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 5;
-code in `src/build_profile.rs`. The primary is built and resolved in the runner
-workspace's `release-checked` profile (release optimization, debug assertions
-and overflow checks ON) unless `dev` is opted into. Temp, named and slot builds
+code in `src/build_profile.rs` and `src/process/primary_start.rs`. The primary
+is built and resolved in the `release-checked` profile (release optimization,
+debug assertions and overflow checks ON — the plan's Phase 3 specification for
+the runner workspace) unless `dev` is opted into. Temp, named and slot builds
 stay on `dev`, unchanged.
+
+- **The runner tree must declare the profile.** Before any stop, worktree prep
+  or frontend build, `primary_start::build_tree_profile_support` reads the build
+  tree's workspace `Cargo.toml` (`origin/main:Cargo.toml` from the local
+  remote-tracking ref, or the live tree's). A tree with no
+  `[profile.release-checked]` makes the optimized build unavailable with that
+  cause named — never a cargo error mid-build. Until the runner's Phase 3 lands,
+  every release-checked build on this fleet is unavailable this way.
 
 - **Its own target dir, never a slot.** Primary builds (a primary
   `restart {rebuild:true}`, or a primary start with nothing startable) run
@@ -400,12 +409,33 @@ stay on `dev`, unchanged.
   resolves the pool exactly as before; `release-checked` resolves
   `target-pool/primary/release-checked/` (origin `primary_build_dir:release-checked`),
   adopting a newer vouched `target/release-checked/` local build, and NEVER a
-  `debug/` artifact. With nothing startable the primary start builds one from
-  `origin/main`. If that build fails: the `release-checked` LKG; else, on an
-  **unattended** start only (`--auto-start` boot, crash or serving watchdog), the
-  newest dev LKG, announced at ERROR (`DEBUG PRIMARY FALLBACK: …`, origin
-  `lkg_fallback:dev`); an **operator** start refuses and names why
-  (`manager::decide_primary_fallback`).
+  `debug/` artifact.
+- **With nothing startable** (`primary_start::prepare_optimized_primary`):
+  - an **unattended** start (`--auto-start` boot, crash or serving watchdog)
+    never waits for a cold build: it starts the `release-checked` LKG if there
+    is one, else the newest DEV artifact (the dev LKG, else a dev slot exe),
+    announced at ERROR (`DEBUG PRIMARY FALLBACK: …`, origin `lkg_fallback:dev`
+    or `slot-N`, `/health` resolved `dev` ≠ configured), and kicks ONE
+    background `release-checked` build so the next start finds one;
+  - an **operator** start builds from `origin/main` in the foreground; if that
+    fails it takes the `release-checked` LKG, else refuses and names why. It
+    never falls back to `debug/`.
+- **A restart prepares before it stops** (`manager::restart_after_gate`): for an
+  optimized primary the rebuild (if asked) and the start resolution above run
+  FIRST; the old process is stopped only once something startable exists, so a
+  failed build or a refusal leaves the running primary untouched. A start
+  latch refuses a second concurrent start of the same runner, and the port is
+  re-checked after a (possibly long) preparation.
+- **Prewarm** also warms `target-pool/primary/` (`cargo check --profile
+  release-checked`, under the primary build lock) when the live tree declares
+  the profile. The primary's sidecar build also carries
+  `qontinui-git-credential`; the helper otherwise falls back to the dev
+  `target/debug/` one.
+- **Visible while building:** a primary build holds one pool permit, so
+  `GET /builds` lists it as `primary_build_dir` (`label: "primary"`, id 255,
+  counted in `active_builds`), the resource sample counts it busy, and its log
+  is at `/builds/255/log[/stream]`. `GET /health` `build.lkg_release_checked`
+  and `GET /builds` `lkg_release_checked` serve the release-checked LKG.
 - **Identity:** the primary's orphan-scan and stop identity covers its copy in
   every profile dir, so a primary started from `target/debug/` before the
   switch is still the operator's.
@@ -1679,7 +1709,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 | `rebuild` | `use_lkg` | Behavior |
 |-----------|-----------|----------|
 | `false`   | `false`   | Default. Uses freshest slot exe via `resolve_source_exe`. |
-| `false`   | `true`    | Skip the build, run from `lkg/qontinui-runner.exe`. |
+| `false`   | `true`    | Skip the build, run from the dev LKG, `lkg/debug/qontinui-runner.exe` (a legacy flat `lkg/qontinui-runner.exe` is read as the dev LKG only). The primary's `use_lkg` reads its own profile's, `lkg/<profile-dir>/`. |
 | `true`    | `false`   | Build, then run the freshest slot exe (which is the just-built one). |
 | `true`    | `true`    | Build, then run from LKG. On build success, LKG is updated first, so this runs your fresh build. On build failure the request fails — `use_lkg` is NOT an automatic build-failure fallback; the agent decides whether to retry without `rebuild`. |
 

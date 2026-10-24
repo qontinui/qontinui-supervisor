@@ -16,6 +16,7 @@ use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::env_forwarders;
 use crate::process::instance_root::{self, InstanceRoot};
 use crate::process::port::wait_for_port_free;
+pub use crate::process::primary_start::StartIntent;
 use crate::process::stop_ledger::{
     resolve_stop_target, verify_target_image, PidSource, StopLedger, StopStrategy, StopTarget,
     TargetVerification as StopVerification,
@@ -268,25 +269,42 @@ pub struct StaleBinary {
     pub age_delta_secs: i64,
 }
 
-/// Stat the supervisor's per-runner exe copy and return its mtime.
+/// Stat the copy THIS runner is running and return its mtime.
 ///
 /// Returns `None` when the copy does not exist yet (runner never started under
 /// this supervisor, or the path resolver failed to copy). The live path is
 /// determined by [`crate::config::SupervisorConfig::runner_exe_copy_path`] —
 /// pool-named for `Temp`/`Named`, id-named for `Primary`/`External`.
 ///
-/// A primary can run from a copy in either profile dir (see
-/// [`crate::config::SupervisorConfig::runner_exe_identity_paths`]); the first
-/// one that exists — the configured profile's first — is the one reported.
-pub fn running_binary_mtime(
+/// A primary can run from a copy in either profile dir, and an old copy can
+/// sit beside the live one, so "the first copy that exists" can name the wrong
+/// binary. The copy is therefore the one this supervisor DEPLOYED (the
+/// resolved record's profile), else — for an adopted runner it never started —
+/// the live PID's own image path, else the configured copy path.
+pub async fn running_binary_mtime(
     state: &SharedState,
-    config: &crate::config::RunnerConfig,
+    managed: &ManagedRunner,
 ) -> Option<std::time::SystemTime> {
-    state
-        .config
-        .runner_exe_identity_paths(config)
-        .iter()
-        .find_map(|path| std::fs::metadata(path).ok()?.modified().ok())
+    let deployed_profile = managed
+        .resolved_exe
+        .read()
+        .await
+        .as_ref()
+        .map(|r| r.profile);
+    let path = match deployed_profile {
+        Some(profile) => state
+            .config
+            .runner_exe_copy_path_for(&managed.config, profile),
+        None => {
+            let pid = managed.runner.read().await.pid;
+            let image = match pid {
+                Some(pid) => crate::process::proc_kill::pid_exe_path(pid).await,
+                None => None,
+            };
+            image.unwrap_or_else(|| state.config.runner_exe_copy_path(&managed.config))
+        }
+    };
+    std::fs::metadata(&path).ok()?.modified().ok()
 }
 
 /// Scan every `target-pool/slot-*/debug/qontinui-runner.exe` and return the
@@ -355,9 +373,10 @@ pub fn compute_stale_binary(
 /// treat the field as strictly informational.
 pub async fn stale_binary_for_runner(
     state: &SharedState,
-    config: &crate::config::RunnerConfig,
+    managed: &ManagedRunner,
 ) -> Option<StaleBinary> {
-    let running = running_binary_mtime(state, config);
+    let config = &managed.config;
+    let running = running_binary_mtime(state, managed).await;
     // An optimized primary is built into its own dir, not a pool slot: a
     // newer dev slot build is not a newer build of what the primary runs.
     let profile = state.config.runner_profile(config);
@@ -1553,7 +1572,7 @@ pub async fn resolve_source_exe_with_origin(
 /// unchanged); an optimized profile resolves the primary's own build dir
 /// ([`resolve_primary_dir_exe`]). An optimized resolution NEVER yields a `dev`
 /// artifact — that substitution is a decision only the primary start path
-/// makes, and only for an unattended start ([`decide_primary_fallback`]).
+/// makes, and only for an unattended start ([`crate::process::primary_start`]).
 pub async fn resolve_source_exe_detailed(
     state: &SharedState,
     profile: RunnerBuildProfile,
@@ -1661,231 +1680,6 @@ pub async fn resolve_primary_dir_exe(
         profile,
         profile_fallback: None,
     })
-}
-
-/// What an optimized primary starts from when its own profile has nothing
-/// startable and building one FAILED. Pure, so every arm is testable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrimaryFallback {
-    /// The same profile's LKG — still optimized, so allowed for any start.
-    ProfileLkg,
-    /// The newest `dev` LKG — UNATTENDED starts only, announced at ERROR.
-    DevLkg,
-    /// An unverified local build of the profile; the identity gate decides.
-    UnverifiedLocalBuild,
-    /// Nothing may be started: refuse and name why.
-    Refuse,
-}
-
-/// Decide [`PrimaryFallback`].
-///
-/// The debug substitution is the 2026-10-24 re-vet's one exception
-/// (robustness): a box with no primary and no operator present is worse than
-/// an announced debug primary, so an UNATTENDED start (`--auto-start` boot,
-/// the crash and serving watchdogs) takes the dev LKG. An OPERATOR start never
-/// does — the operator is present to read the refusal, and a debug primary
-/// is an opt-in (`--primary-build-profile dev`) they did not make.
-pub fn decide_primary_fallback(
-    intent: StartIntent,
-    has_profile_lkg: bool,
-    has_unverified_local_build: bool,
-    has_dev_lkg: bool,
-) -> PrimaryFallback {
-    if has_profile_lkg {
-        return PrimaryFallback::ProfileLkg;
-    }
-    if intent == StartIntent::Unattended && has_dev_lkg {
-        return PrimaryFallback::DevLkg;
-    }
-    if has_unverified_local_build {
-        return PrimaryFallback::UnverifiedLocalBuild;
-    }
-    PrimaryFallback::Refuse
-}
-
-/// Who asked for a runner start. Decides only what an optimized primary may
-/// fall back to when its own profile cannot be built ([`decide_primary_fallback`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartIntent {
-    /// An operator or caller request: an HTTP start, restart or spawn.
-    Operator,
-    /// The supervisor on its own, with nobody present: the `--auto-start`
-    /// boot start, the crash-only watchdog, the serving watchdog.
-    Unattended,
-}
-
-impl StartIntent {
-    /// The intent of a restart from `source`. Only the in-process serving
-    /// watchdog is unattended: `Watchdog` is a WIRE value any HTTP caller can
-    /// claim (and is refused for non-temp runners anyway), so it must not buy
-    /// a caller the unattended debug fallback.
-    pub fn of_restart(source: &RestartSource) -> Self {
-        match source {
-            RestartSource::ServingWatchdog => StartIntent::Unattended,
-            _ => StartIntent::Operator,
-        }
-    }
-}
-
-/// Resolve what an optimized-profile PRIMARY starts from, building the
-/// artifact when none is startable (plan
-/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 5).
-///
-/// A supervisor build (`PrimaryBuildDir`) or an adopted, vouched local build is
-/// startable. Anything else — nothing at all, or only an unverified local
-/// build — triggers ONE primary build from `origin/main` into
-/// `target-pool/primary/`. If that build fails, [`decide_primary_fallback`]
-/// picks the fallback; a dev fallback is announced with an ERROR line naming
-/// why, and the resolved record carries `profile: Dev` plus the reason, so
-/// `/health` shows configured `release-checked` ≠ resolved `debug`.
-async fn resolve_optimized_primary_exe(
-    state: &SharedState,
-    profile: RunnerBuildProfile,
-    intent: StartIntent,
-) -> Result<ResolvedRunnerExe, SupervisorError> {
-    let startable = |r: &ResolvedRunnerExe| {
-        matches!(
-            r.origin,
-            ExeOrigin::PrimaryBuildDir(_) | ExeOrigin::AdoptedLocalBuild(_)
-        )
-    };
-    let found = resolve_primary_dir_exe(state, profile).await;
-    if let Some(r) = found.as_ref().filter(|r| startable(r)) {
-        return Ok(r.clone());
-    }
-
-    let msg = format!(
-        "Primary start: no startable {profile} artifact (looked in {:?} and the {profile} local \
-         build dir) — building one from origin/main before starting",
-        state.config.primary_exe_path(profile)
-    );
-    warn!("{}", msg);
-    state
-        .logs
-        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-        .await;
-    let build_error = match primary_build(state, BuildTree::OriginMain).await {
-        Ok(()) => match resolve_primary_dir_exe(state, profile).await {
-            Some(r) if startable(&r) => return Ok(r),
-            _ => format!(
-                "the {profile} build reported success but left no exe at {:?}",
-                state.config.primary_exe_path(profile)
-            ),
-        },
-        Err(e) => e.to_string(),
-    };
-
-    let profile_lkg = crate::state::lkg_on_disk(&state.config, profile);
-    let dev_lkg = crate::state::lkg_on_disk(&state.config, RunnerBuildProfile::Dev);
-    match decide_primary_fallback(
-        intent,
-        profile_lkg.is_some(),
-        found.is_some(),
-        dev_lkg.is_some(),
-    ) {
-        PrimaryFallback::ProfileLkg => {
-            let (info, exe) = profile_lkg.expect("decided on its presence");
-            let msg = format!(
-                "Primary start: the {profile} build failed ({build_error}); starting the {profile} \
-                 last-known-good {exe:?} (built_at {}, sha {})",
-                info.built_at.to_rfc3339(),
-                info.sha.as_deref().unwrap_or("(unknown)")
-            );
-            warn!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-                .await;
-            Ok(lkg_resolution(info, exe, profile, None))
-        }
-        PrimaryFallback::DevLkg => {
-            let (info, exe) = dev_lkg.expect("decided on its presence");
-            let reason = format!(
-                "configured {profile}, but no {profile} artifact was startable and the {profile} \
-                 build failed ({build_error}); an UNATTENDED start fell back to the newest dev LKG \
-                 {exe:?} (built_at {}) rather than leave the box with no primary. Rebuild with \
-                 POST /runner/restart {{\"rebuild\": true}} once the build is fixed.",
-                info.built_at.to_rfc3339()
-            );
-            error!("DEBUG PRIMARY FALLBACK: {}", reason);
-            state
-                .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Error,
-                    format!("DEBUG PRIMARY FALLBACK: {reason}"),
-                )
-                .await;
-            Ok(lkg_resolution(
-                info,
-                exe,
-                RunnerBuildProfile::Dev,
-                Some(reason),
-            ))
-        }
-        PrimaryFallback::UnverifiedLocalBuild => Ok(found.expect("decided on its presence")),
-        PrimaryFallback::Refuse => Err(SupervisorError::Process(format!(
-            "Refusing to start the primary: it is configured for the {profile} build profile \
-             ({source}), no {profile} artifact is startable, and building one failed: \
-             {build_error}. {why} Fix the build and retry, or opt into a debug primary with \
-             --primary-build-profile dev / QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE=dev.",
-            source = state.config.primary_build_profile.source.knob(),
-            why = match intent {
-                StartIntent::Operator => {
-                    "An operator start never falls back to a debug/ artifact unless the dev \
-                     profile was opted into."
-                }
-                StartIntent::Unattended =>
-                    "There is no dev last-known-good to fall back to either.",
-            },
-        ))),
-    }
-}
-
-/// A [`ResolvedRunnerExe`] for an LKG start.
-fn lkg_resolution(
-    info: crate::state::LkgInfo,
-    exe: std::path::PathBuf,
-    profile: RunnerBuildProfile,
-    profile_fallback: Option<String>,
-) -> ResolvedRunnerExe {
-    ResolvedRunnerExe {
-        mtime: file_mtime(&exe),
-        provenance: Some(BuildProvenance {
-            sha: info.sha.clone(),
-            source: info.source,
-            built_from: exe.to_string_lossy().to_string(),
-            built_at: info.built_at.to_rfc3339(),
-        }),
-        path: exe,
-        origin: ExeOrigin::LkgFallback(profile),
-        unverified_warning: None,
-        profile,
-        profile_fallback,
-    }
-}
-
-/// Build the PRIMARY in its configured profile from `build_tree`: into the
-/// build pool for a `dev` primary (unchanged), into `target-pool/primary/`
-/// for an optimized one ([`crate::build_monitor::run_primary_build`]).
-pub(crate) async fn primary_build(
-    state: &SharedState,
-    build_tree: BuildTree,
-) -> Result<(), SupervisorError> {
-    if build_tree.is_origin_main() {
-        return primary_rebuild_from_origin_main(state).await;
-    }
-    if crate::build_profile::primary_profile(&state.config) == RunnerBuildProfile::Dev {
-        crate::build_monitor::run_cargo_build(state).await
-    } else {
-        crate::build_monitor::run_primary_build(
-            state,
-            Some("primary-rebuild:live_tree".to_string()),
-            None,
-            crate::build_monitor::BuildSourceKind::LiveTree,
-        )
-        .await
-    }
 }
 
 /// Pool resolution (the `dev` profile): the existing slot ladder.
@@ -2046,7 +1840,7 @@ async fn resolve_pool_exe(state: &SharedState) -> Result<ResolvedRunnerExe, Supe
 
 /// mtime of a path, `None` when it can't be stat'd. Best-effort by design —
 /// an unreadable mtime is reported as unknown, never as fresh.
-fn file_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+pub(crate) fn file_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
@@ -2677,6 +2471,34 @@ pub async fn start_runner_by_id(
     start_managed_runner(state, &managed, intent).await
 }
 
+/// RAII latch over [`ManagedRunner::start_in_flight`].
+struct StartLatch<'a>(&'a ManagedRunner);
+
+impl<'a> StartLatch<'a> {
+    fn acquire(managed: &'a ManagedRunner) -> Result<Self, SupervisorError> {
+        if managed
+            .start_in_flight
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SupervisorError::Validation(format!(
+                "start_in_flight: a start of runner '{}' is already in progress (an optimized \
+                 primary's start may be building its artifact); wait for it rather than \
+                 starting it twice",
+                managed.config.id
+            )));
+        }
+        Ok(StartLatch(managed))
+    }
+}
+
+impl Drop for StartLatch<'_> {
+    fn drop(&mut self) {
+        self.0
+            .start_in_flight
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Start a runner given a direct `Arc<ManagedRunner>` reference.
 ///
 /// Used by `spawn_test` / `spawn_named` to avoid a re-lookup race: the
@@ -2687,7 +2509,7 @@ pub async fn start_runner_by_id(
 /// so downstream health / monitoring can find it by id.
 ///
 /// `intent` says who asked; it matters only to an optimized primary whose
-/// profile cannot be built ([`decide_primary_fallback`]).
+/// profile cannot be built ([`crate::process::primary_start`]).
 pub async fn start_managed_runner(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -2720,6 +2542,12 @@ pub async fn start_managed_runner(
             return Err(SupervisorError::RunnerAlreadyRunning);
         }
     }
+
+    // One start at a time per runner. An optimized primary's start can take a
+    // whole build (`primary_start`); a second start racing it (the boot
+    // auto-start, a watchdog, an operator click) would otherwise build or
+    // spawn a second time. Released on every exit by the guard.
+    let _start_latch = StartLatch::acquire(managed)?;
 
     let is_primary = managed.config.kind().is_primary();
     let port = managed.config.port;
@@ -3717,12 +3545,35 @@ async fn start_exe_mode_for_runner(
                 // The profile threads from the config: `dev` for temp/named
                 // runners (unchanged), the configured profile for the primary.
                 let profile = state.config.runner_profile(&managed.config);
-                let mut resolved =
-                    if managed.config.kind().is_primary() && profile != RunnerBuildProfile::Dev {
-                        resolve_optimized_primary_exe(state, profile, intent).await?
-                    } else {
-                        resolve_source_exe_detailed(state, profile).await?
+                let optimized_primary =
+                    managed.config.kind().is_primary() && profile != RunnerBuildProfile::Dev;
+                let mut resolved = if optimized_primary {
+                    // A restart prepared the artifact before stopping the old
+                    // process (`restart_after_gate`); a plain start prepares
+                    // it here. Either way: build, fall back or refuse per
+                    // `primary_start`.
+                    let prepared = managed
+                        .prepared_exe
+                        .write()
+                        .await
+                        .take()
+                        .filter(|r| r.path.exists());
+                    let resolved = match prepared {
+                        Some(r) => r,
+                        None => {
+                            crate::process::primary_start::prepare_primary_start(
+                                state, profile, intent,
+                            )
+                            .await?
+                        }
                     };
+                    // Preparing can take a whole build; another start may
+                    // have bound the port meanwhile. Re-check before spawning.
+                    refuse_if_port_held_by_live_runner(managed.config.port).await?;
+                    resolved
+                } else {
+                    resolve_source_exe_detailed(state, profile).await?
+                };
                 match resolved.origin {
                     ExeOrigin::Slot(picked_id) => {
                         // Same single pick the gate evaluates, so the recorded
@@ -3930,16 +3781,25 @@ async fn start_exe_mode_for_runner(
     // (it skips the install when absent), so a miss is logged at info, not
     // warned.
     {
+        // The resolved profile's local build dir, then the dev one: an
+        // optimized primary's sidecar build carries the helper beside its
+        // exe, but an LKG or adopted start may not, and a dev `target/debug/`
+        // helper serves every profile.
         let local_build_exe = state.config.runner_exe_path(resolved_profile);
-        let helper_source = [source_exe.as_path(), local_build_exe.as_path()]
-            .into_iter()
-            .find(|exe| {
-                exe.parent().is_some_and(|d| {
-                    crate::build_monitor::SidecarFile::inspect(&d.join(GIT_CREDENTIAL_EXE_FILENAME))
-                        .is_present()
-                })
+        let dev_build_exe = state.config.runner_exe_path(RunnerBuildProfile::Dev);
+        let helper_source = [
+            source_exe.as_path(),
+            local_build_exe.as_path(),
+            dev_build_exe.as_path(),
+        ]
+        .into_iter()
+        .find(|exe| {
+            exe.parent().is_some_and(|d| {
+                crate::build_monitor::SidecarFile::inspect(&d.join(GIT_CREDENTIAL_EXE_FILENAME))
+                    .is_present()
             })
-            .unwrap_or(source_exe.as_path());
+        })
+        .unwrap_or(source_exe.as_path());
         let outcome = deploy_sidecar(helper_source, &exe_path, GIT_CREDENTIAL_EXE_FILENAME);
         report_sidecar_deploy(
             state,
@@ -6266,59 +6126,6 @@ pub async fn stop_runner_by_id(
     Ok(())
 }
 
-/// Phase B: build the primary from a fresh `origin/main` worktree.
-///
-/// Materializes (or refreshes) a managed `origin/main` worktree via
-/// [`crate::spawn_worktree::prepare_worktree`] — which fetches origin itself and
-/// pins the `qontinui-schemas` sibling to `origin/main`, handling the
-/// shared-path-dep-drift hazard for the primary too — then compiles its
-/// `src-tauri` with an explicit [`BuildSourceKind::OriginMain`] carrying the
-/// worktree's resolved SHA. The result is provenance-classified `origin_main`:
-/// LKG-eligible and startable as the primary, unlike a spawn-test `Override`.
-///
-/// The chosen source + resolved sha are logged before the (long) build so the
-/// next operator restart self-documents which commit the primary will run
-/// (Phase B verification is deferred to that real restart — it can't be
-/// exercised against the live primary from a session).
-async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), SupervisorError> {
-    let prepared =
-        crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
-    let profile = crate::build_profile::primary_profile(&state.config);
-
-    let msg = format!(
-        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}, \
-         profile {profile}). This is the default Phase B path — the primary runs \
-         latest-green-main, not the working checkout. Pass from_working_tree:true to compile the \
-         live tree instead.",
-        prepared.resolved_sha, prepared.src_tauri
-    );
-    info!("{}", msg);
-    state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
-
-    let source_kind = crate::build_monitor::BuildSourceKind::OriginMain {
-        resolved_sha: prepared.resolved_sha.clone(),
-    };
-    let requester = Some("primary-rebuild:origin/main".to_string());
-    if profile == RunnerBuildProfile::Dev {
-        crate::build_monitor::run_cargo_build_with_dir(
-            state,
-            requester,
-            Some(prepared.src_tauri.clone()),
-            false,
-            source_kind,
-        )
-        .await
-    } else {
-        crate::build_monitor::run_primary_build(
-            state,
-            requester,
-            Some(prepared.src_tauri.clone()),
-            source_kind,
-        )
-        .await
-    }
-}
-
 /// Pure gate for [`restart_runner_by_id`]: is an automated restart of this
 /// runner refused outright?
 ///
@@ -6741,6 +6548,65 @@ async fn restart_after_gate(
     intent: CloseIntent,
     start_intent: StartIntent,
 ) -> Result<Option<f64>, SupervisorError> {
+    // ── An optimized primary has something startable BEFORE it is stopped ──
+    //
+    // The stop below is the destructive step. For a primary in an optimized
+    // profile the artifact it will start from may not exist yet (a cold box,
+    // a wiped `target-pool/primary/`, a runner tree that predates the
+    // profile), and finding that out AFTER the stop leaves the box with no
+    // primary for a whole cold build — or none at all. So the rebuild (if
+    // asked) runs FIRST, into `target-pool/primary/`, which no running
+    // process holds; then the start is resolved (building, falling back or
+    // refusing per `primary_start`); only then is the old process stopped.
+    // Any failure up to here returns with the running primary untouched.
+    let profile = state.config.runner_profile(&managed.config);
+    let optimized_primary =
+        managed.config.kind().is_primary() && profile != RunnerBuildProfile::Dev;
+    let mut early_build_duration = None;
+    if optimized_primary {
+        if rebuild {
+            let build_start = std::time::Instant::now();
+            crate::process::primary_start::primary_build(
+                state,
+                build_tree,
+                crate::process::primary_start::BuildNeed::Always,
+            )
+            .await?;
+            early_build_duration = Some(build_start.elapsed().as_secs_f64());
+        }
+        let prepared =
+            crate::process::primary_start::prepare_primary_start(state, profile, start_intent)
+                .await?;
+        *managed.prepared_exe.write().await = Some(prepared);
+    }
+    let outcome = stop_rebuild_and_start(
+        state,
+        managed,
+        runner_id,
+        rebuild && !optimized_primary,
+        build_tree,
+        intent,
+        start_intent,
+    )
+    .await;
+    if outcome.is_err() {
+        // A prepared artifact belongs to THIS restart only.
+        *managed.prepared_exe.write().await = None;
+    }
+    outcome.map(|late| late.or(early_build_duration))
+}
+
+/// The stop → (dev) rebuild → start half of [`restart_after_gate`], entered
+/// only once an optimized primary has a prepared, startable artifact.
+async fn stop_rebuild_and_start(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+    rebuild: bool,
+    build_tree: BuildTree,
+    intent: CloseIntent,
+    start_intent: StartIntent,
+) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
     // process alive and holding its port, the API silent — reads
@@ -6782,13 +6648,18 @@ async fn restart_after_gate(
     // live-tree build unconditionally — origin/main pinning is a
     // primary-only policy.
     //
-    // A primary rebuild builds in the primary's configured profile
-    // ([`primary_build`]): into `target-pool/primary/` when optimized, so the
-    // start below resolves the artifact the rebuild just produced.
+    // An OPTIMIZED primary never reaches here with `rebuild` set: its build
+    // ran before the stop, in `restart_after_gate`. A `dev` primary builds
+    // into the pool exactly as before.
     let build_duration = if rebuild {
         let build_start = std::time::Instant::now();
         if managed.config.kind().is_primary() {
-            primary_build(state, build_tree).await?;
+            crate::process::primary_start::primary_build(
+                state,
+                build_tree,
+                crate::process::primary_start::BuildNeed::Always,
+            )
+            .await?;
         } else {
             crate::build_monitor::run_cargo_build(state).await?;
         }

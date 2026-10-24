@@ -315,41 +315,53 @@ fn path_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(mtime.into())
 }
 
-/// The source binaries [`freshest_source_mtime`] considers: every pool slot's
-/// `slot-*/debug/` exe, the primary build dir's exe
-/// (`target-pool/primary/<profile-dir>/`), and every LKG exe — each
-/// per-profile dir plus the legacy flat dev one. Pure — no I/O. Slot paths
-/// come from the same `slots` list the build pool walks, so they never go out
-/// of sync with supervisor config.
+/// The source binaries [`freshest_source_mtime`] considers for a runner
+/// resolved in `profile` — what that runner's next start could launch:
+/// - `dev` (every temp and named runner, a dev primary): every pool slot's
+///   `slot-*/debug/` exe plus the dev LKG (its per-profile dir and the legacy
+///   flat one);
+/// - an optimized profile (the primary): the primary build dir's exe
+///   (`target-pool/primary/<profile-dir>/`) plus that profile's LKG.
+///
+/// Per kind, because comparing a temp orphan against an optimized primary
+/// build (or the reverse) reports a staleness gap between binaries the
+/// runner could never swap for each other. Pure — no I/O. Slot paths come
+/// from the same `slots` list the build pool walks.
 fn freshest_source_candidates(
     config: &crate::config::SupervisorConfig,
     slots: &[std::sync::Arc<crate::state::BuildSlot>],
     primary_slot: &crate::state::BuildSlot,
+    profile: crate::build_profile::RunnerBuildProfile,
 ) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = slots.iter().map(|s| s.exe_path()).collect();
-    out.push(primary_slot.exe_path());
-    for profile in crate::build_profile::RunnerBuildProfile::ALL {
-        out.extend(
-            crate::state::lkg_location_candidates(config, profile)
-                .into_iter()
-                .map(|(_, exe)| exe),
-        );
-    }
+    let mut out: Vec<PathBuf> = if profile == crate::build_profile::RunnerBuildProfile::Dev {
+        slots.iter().map(|s| s.exe_path()).collect()
+    } else {
+        vec![profile.runner_exe(&primary_slot.target_dir)]
+    };
+    out.extend(
+        crate::state::lkg_location_candidates(config, profile)
+            .into_iter()
+            .map(|(_, exe)| exe),
+    );
     out
 }
 
-/// Freshest mtime across [`freshest_source_candidates`]. This is the upper
-/// bound on what `start_managed_runner` would launch on the user's next
-/// `/runner/restart`.
+/// Freshest mtime across [`freshest_source_candidates`] for `runner`'s
+/// profile. This is the upper bound on what `start_managed_runner` would
+/// launch on that runner's next restart.
 ///
 /// Returns `None` only when no source binary exists anywhere — at that
 /// point the orphan is the only artifact on disk and there is no staleness
 /// to report.
-async fn freshest_source_mtime(state: &SharedState) -> Option<DateTime<Utc>> {
+async fn freshest_source_mtime(
+    state: &SharedState,
+    runner: &crate::config::RunnerConfig,
+) -> Option<DateTime<Utc>> {
     freshest_source_candidates(
         &state.config,
         &state.build_pool.slots,
         &state.build_pool.primary_slot,
+        state.config.runner_profile(runner),
     )
     .iter()
     .filter_map(|p| path_mtime_utc(p))
@@ -618,7 +630,7 @@ async fn apply_registered_orphan(
     // dirs + LKG, once per orphan.
     let is_temp = managed.config.kind().is_temp();
     let orphan_mtime = path_mtime_utc(exe_path);
-    let fresh_mtime = freshest_source_mtime(state).await;
+    let fresh_mtime = freshest_source_mtime(state, &managed.config).await;
     let stale_gap_secs =
         match resolve_registered_orphan(is_temp, orphan_mtime, fresh_mtime, STALENESS_GAP_SECS) {
             OrphanAction::KillEphemeral => {
@@ -1224,10 +1236,14 @@ mod tests {
         let src_tauri = root.join("qontinui-runner").join("src-tauri");
         std::fs::create_dir_all(&src_tauri).expect("mkdir");
         let project_dir = src_tauri.to_string_lossy().into_owned();
+        // The profile is passed explicitly so an ambient
+        // QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE cannot change the fixture.
         crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
             "test",
             "--project-dir",
             project_dir.as_str(),
+            "--primary-build-profile",
+            "release-checked",
         ]))
     }
 
@@ -1281,35 +1297,38 @@ mod tests {
         );
     }
 
-    /// Staleness is measured against the primary build dir and every LKG too,
-    /// not only the slots' `debug/` exes and the flat LKG.
+    /// Staleness is measured per runner kind: a temp/named (dev) orphan
+    /// against the slots and the dev LKGs only; the optimized primary against
+    /// its build dir and its own LKG only.
     #[test]
-    fn freshest_source_candidates_include_the_primary_dir_and_every_lkg() {
+    fn freshest_source_candidates_are_per_runner_profile() {
+        use crate::build_profile::RunnerBuildProfile;
         let root = tempfile::TempDir::new().expect("tempdir");
         let config = config_under(root.path());
         let pool = crate::state::BuildPool::new(&config);
         let npm = config.runner_npm_dir();
-        let got: Vec<String> = freshest_source_candidates(&config, &pool.slots, &pool.primary_slot)
-            .iter()
-            .map(|p| rel(&npm, p))
-            .collect();
         let exe = crate::config::RUNNER_BIN_NAME;
-        assert!(
-            got.contains(&format!("target-pool/slot-0/debug/{exe}")),
-            "{got:?}"
+        let rels = |profile| -> Vec<String> {
+            freshest_source_candidates(&config, &pool.slots, &pool.primary_slot, profile)
+                .iter()
+                .map(|p| rel(&npm, p))
+                .collect()
+        };
+        let mut dev = rels(RunnerBuildProfile::Dev);
+        dev.sort();
+        let mut want_dev: Vec<String> = (0..pool.slots.len())
+            .map(|i| format!("target-pool/slot-{i}/debug/{exe}"))
+            .collect();
+        want_dev.push(format!("target-pool/lkg/debug/{exe}"));
+        want_dev.push(format!("target-pool/lkg/{exe}"));
+        want_dev.sort();
+        assert_eq!(dev, want_dev);
+        assert_eq!(
+            rels(RunnerBuildProfile::ReleaseChecked),
+            vec![
+                format!("target-pool/primary/release-checked/{exe}"),
+                format!("target-pool/lkg/release-checked/{exe}"),
+            ]
         );
-        assert!(
-            got.contains(&format!("target-pool/primary/release-checked/{exe}")),
-            "{got:?}"
-        );
-        assert!(
-            got.contains(&format!("target-pool/lkg/release-checked/{exe}")),
-            "{got:?}"
-        );
-        assert!(
-            got.contains(&format!("target-pool/lkg/debug/{exe}")),
-            "{got:?}"
-        );
-        assert!(got.contains(&format!("target-pool/lkg/{exe}")), "{got:?}");
     }
 }

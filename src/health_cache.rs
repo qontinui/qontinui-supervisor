@@ -113,9 +113,9 @@ struct RunnerHealthBody {
     #[serde(default, rename = "frontendState")]
     frontend_state: Option<String>,
     /// `/health.buildProfile` — the cargo profile DIRECTORY the runner binary
-    /// was built in (`debug`, `release-checked`), measured by the runner's own
-    /// build script (qontinui-runner#2364). Published at the root AND under
-    /// `data`; `null` or absent (a runner predating the field) is UNKNOWN.
+    /// was built in (`debug`, `release-checked`), which the runner's own build
+    /// script measures once qontinui-runner#2364 lands, at the root AND under
+    /// `data`. `null` or absent (every runner until then) is UNKNOWN.
     #[serde(default, rename = "buildProfile")]
     build_profile: Option<String>,
     /// The runner's `data` envelope. Only the fields this supervisor reads

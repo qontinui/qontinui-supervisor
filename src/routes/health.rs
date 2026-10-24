@@ -114,7 +114,9 @@ pub struct PrimaryBuildProfileHealth {
     /// The primary's own `/health` `buildProfile` (a profile DIRECTORY).
     /// `null` = UNKNOWN: the API is silent or the runner predates the field.
     pub observed: Option<String>,
-    /// `observed == configured_dir`; `null` when `observed` is UNKNOWN.
+    /// `observed == configured_dir` — `configured_dir`, not `configured`, is
+    /// the comparand, because a runner reports its profile DIRECTORY (`debug`,
+    /// never `dev`). `null` when `observed` is UNKNOWN.
     pub matches_configured: Option<bool>,
 }
 
@@ -344,6 +346,11 @@ pub struct BuildHealth {
     /// predates the changes and would silently run stale code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lkg: Option<LkgHealth>,
+    /// The PRIMARY's `release-checked` LKG (`target-pool/lkg/release-checked/`)
+    /// — the optimized fallback an optimized primary starts from before any
+    /// dev artifact. `lkg` above is the dev LKG temp runners' `use_lkg` reads.
+    /// `null` when none has been built.
+    pub lkg_release_checked: Option<LkgHealth>,
     /// How the build pool is sized for this machine: pool size and its
     /// source, the per-slot `CARGO_BUILD_JOBS`, slot occupancy, and the
     /// effective disk floor with its inputs (plan
@@ -430,6 +437,18 @@ pub struct LkgHealth {
     /// `"live_tree"` for any LKG written from #65 forward (override builds are
     /// never promoted to LKG).
     pub source: crate::process::manager::BuildSource,
+}
+
+impl LkgHealth {
+    pub fn from_info(info: &crate::state::LkgInfo) -> Self {
+        LkgHealth {
+            built_at: info.built_at.to_rfc3339(),
+            source_slot: info.source_slot,
+            exe_size: info.exe_size,
+            sha: info.sha.clone(),
+            source: info.source,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -694,13 +713,14 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         .read()
         .await
         .as_ref()
-        .map(|info| LkgHealth {
-            built_at: info.built_at.to_rfc3339(),
-            source_slot: info.source_slot,
-            exe_size: info.exe_size,
-            sha: info.sha.clone(),
-            source: info.source,
-        });
+        .map(LkgHealth::from_info);
+    let lkg_release_checked = state
+        .build_pool
+        .release_checked_lkg
+        .read()
+        .await
+        .as_ref()
+        .map(LkgHealth::from_info);
 
     // Read from background health cache instead of live port checks (~100µs vs ~3s)
     let cached = state.cached_health.read().await;
@@ -871,6 +891,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             lkg,
+            lkg_release_checked,
             pool: build_pool_health(state),
         },
         expo: ExpoHealth {
@@ -1043,15 +1064,13 @@ fn try_build_sse_health(
                 .last_known_good
                 .try_read()
                 .ok()
-                .and_then(|g| {
-                    g.as_ref().map(|info| LkgHealth {
-                        built_at: info.built_at.to_rfc3339(),
-                        source_slot: info.source_slot,
-                        exe_size: info.exe_size,
-                        sha: info.sha.clone(),
-                        source: info.source,
-                    })
-                }),
+                .and_then(|g| g.as_ref().map(LkgHealth::from_info)),
+            lkg_release_checked: state
+                .build_pool
+                .release_checked_lkg
+                .try_read()
+                .ok()
+                .and_then(|g| g.as_ref().map(LkgHealth::from_info)),
             pool: build_pool_health(state),
         },
         expo: ExpoHealth {
@@ -1573,6 +1592,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                lkg_release_checked: None,
                 pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
@@ -1859,6 +1879,7 @@ mod tests {
                 last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                lkg_release_checked: None,
                 pool: fixture_pool_health(),
             },
             expo: ExpoHealth {

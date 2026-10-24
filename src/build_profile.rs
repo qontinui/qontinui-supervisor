@@ -3,11 +3,14 @@
 //!
 //! Plan `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`,
 //! Phase 5. The primary serves every live session on the box, so it is built
-//! in the optimized `release-checked` profile (`inherits = "release"`, with
-//! `debug-assertions` and `overflow-checks` kept ON, so every
+//! in the optimized `release-checked` profile. That profile is the plan's
+//! Phase 3 SPECIFICATION for the runner workspace (`inherits = "release"`,
+//! with `debug-assertions` and `overflow-checks` kept ON, so every
 //! `cfg(debug_assertions)` door and the std UB tripwire behave exactly as in a
-//! dev build — the ONLY variable is optimization). Temp, named and slot builds
-//! are the iteration loop and stay on the dev profile, byte for byte.
+//! dev build — the only variable is optimization); a runner tree that does not
+//! yet declare it cannot build it, which [`manifest_declares_profile`] detects
+//! before any build starts. Temp, named and slot builds are the iteration loop
+//! and stay on the dev profile, byte for byte.
 //!
 //! **Why one enum, threaded everywhere, instead of a `"release"` literal.** The
 //! supervisor resolved every artifact through `.join("debug")`, and the one time
@@ -253,6 +256,20 @@ impl PrimaryBuildProfile {
     }
 }
 
+/// Does this workspace `Cargo.toml` text declare `[profile.<name>]` for
+/// `profile`? `dev` is cargo's built-in profile and always counts. Profiles
+/// are honoured only at the workspace root, so that is the manifest to read.
+/// Unparseable TOML declares nothing.
+pub fn manifest_declares_profile(manifest_text: &str, profile: RunnerBuildProfile) -> bool {
+    if profile == RunnerBuildProfile::Dev {
+        return true;
+    }
+    toml::from_str::<toml::Value>(manifest_text)
+        .ok()
+        .and_then(|v| v.get("profile")?.get(profile.cargo_name()).cloned())
+        .is_some_and(|t| t.is_table())
+}
+
 /// The profile the primary runner is built and resolved in.
 pub fn primary_profile(config: &crate::config::SupervisorConfig) -> RunnerBuildProfile {
     config.primary_build_profile.profile
@@ -355,6 +372,22 @@ mod tests {
     fn primary_build_slot_id_fits_a_u8_and_is_outside_the_pool() {
         assert_eq!(PRIMARY_BUILD_SLOT_ID, 255);
         assert!(PRIMARY_BUILD_SLOT_ID > crate::build_sizing::DERIVED_POOL_SIZE_CAP as usize);
+    }
+
+    #[test]
+    fn manifest_declares_profile_reads_the_workspace_profile_table() {
+        let without = "[workspace]\nmembers = []\n[profile.release]\nopt-level = 2\n";
+        let with = format!("{without}[profile.release-checked]\ninherits = \"release\"\n");
+        let rc = RunnerBuildProfile::ReleaseChecked;
+        assert!(manifest_declares_profile(&with, rc));
+        assert!(!manifest_declares_profile(without, rc));
+        assert!(!manifest_declares_profile("not = valid = toml", rc));
+        // A key named release-checked that is not a table is not a profile.
+        assert!(!manifest_declares_profile(
+            "[profile]\nrelease-checked = 1\n",
+            rc
+        ));
+        assert!(manifest_declares_profile("", RunnerBuildProfile::Dev));
     }
 
     #[test]

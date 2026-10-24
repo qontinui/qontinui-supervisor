@@ -3500,3 +3500,57 @@ fn spawn_routes_wire_fresh_device_identity_end_to_end() {
         list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
     );
 }
+
+/// Phase 5 review M4: a primary build holds one of the pool's permits, so
+/// `/builds` lists it as a labelled `primary` row and counts it in
+/// `active_builds` — keeping `pool_size == available_permits + active_builds`.
+#[tokio::test]
+async fn list_builds_shows_a_primary_build_as_a_labelled_row_holding_a_permit() {
+    use axum::extract::{Query, State};
+    use axum::response::IntoResponse;
+    let state = make_state(); // BuildPoolConfig::fixed(1)
+    {
+        let primary = state.build_pool.primary_slot.clone();
+        let mut busy = primary.busy.write().await;
+        primary
+            .occupy(
+                &mut busy,
+                crate::state::BuildInfo {
+                    started_at: chrono::Utc::now(),
+                    requester_id: Some("primary-rebuild:origin/main".to_string()),
+                    rebuild_kind: "exe".to_string(),
+                    mem_gate: None,
+                },
+            )
+            .await;
+    }
+    let resp = super::list_builds(State(state.clone()), Query(Default::default()))
+        .await
+        .into_response();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let row = &body["primary_build_dir"];
+    assert_eq!(row["label"], "primary");
+    assert_eq!(row["id"], 255);
+    assert_eq!(row["state"], "building");
+    assert_eq!(row["profile"], "release-checked");
+    assert_eq!(row["log_url"], "/builds/255/log");
+    let active = body["active_builds"].as_array().unwrap();
+    assert!(active.iter().any(|b| b["label"] == "primary"));
+    assert_eq!(
+        body["pool_size"].as_u64().unwrap(),
+        body["available_permits"].as_u64().unwrap() + active.len() as u64
+    );
+    assert!(body.get("lkg_release_checked").is_some());
+    // The resource sample counts it as busy capacity too.
+    assert_eq!(state.build_pool.occupancy().await.build_slots_busy, Some(1));
+    // And its log is addressable by id.
+    assert!(state
+        .build_pool
+        .slot_by_id(255)
+        .is_some_and(|s| s.is_primary_build_dir()));
+    assert_eq!(state.build_pool.slot_by_id(0).map(|s| s.id), Some(0));
+    assert!(state.build_pool.slot_by_id(7).is_none());
+}

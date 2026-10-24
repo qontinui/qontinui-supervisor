@@ -1138,8 +1138,14 @@ pub enum BuildTarget {
 /// the profile's LKG dir), with two differences: builds on the primary dir are
 /// serialized by `primary_build_lock`, and a success never moves
 /// `last_successful_slot` — pool resolution never sees this dir.
+///
+/// The caller holds `primary_build_lock` (`_lock` is the proof) for the whole
+/// sequence — worktree prep, any artifact re-check, and this build — so two
+/// primary starts can never prepare or build into the primary dir at once
+/// ([`crate::process::primary_start::primary_build`]).
 pub async fn run_primary_build(
     state: &SharedState,
+    _lock: &tokio::sync::OwnedMutexGuard<()>,
     requester_id: Option<String>,
     build_dir_override: Option<PathBuf>,
     source_kind: BuildSourceKind,
@@ -1187,19 +1193,9 @@ async fn run_cargo_build_on(
         return Err((e, BuildAttempt::default()));
     }
 
-    // One build at a time into the primary dir, taken BEFORE the permit so a
-    // queued primary build never sits on a pool permit while it waits.
-    let _primary_dir_lock = match target {
-        BuildTarget::PrimaryDir => Some(
-            state
-                .build_pool
-                .primary_build_lock
-                .clone()
-                .lock_owned()
-                .await,
-        ),
-        BuildTarget::Pool => None,
-    };
+    // A PrimaryDir build runs under `primary_build_lock`, which the caller
+    // took BEFORE this point (see `run_primary_build`), so a queued primary
+    // build never sits on a pool permit while it waits for the lock.
 
     // Pre-permit memory guard: defer (never reject) while the box lacks the
     // commit headroom a single rustc on the runner's bin crate needs. Runs
@@ -2599,14 +2595,26 @@ pub(crate) fn sidecar_build_args(
     args
 }
 
+/// The `qontinui-git-credential` bin. Pool slots never build it (a temp or
+/// named runner falls back to the dev `target/debug/` helper), but an
+/// optimized primary's dir has no such fallback in its own profile, so the
+/// primary's sidecar build carries it.
+pub(crate) const GIT_CREDENTIAL_BIN: &str = "qontinui-git-credential";
+
 /// The sidecar build's full args in `profile`: [`sidecar_build_args`] plus the
 /// profile selector, so the roster lands in the same `<profile-dir>/` as the
-/// runner exe the start deploys it beside.
+/// runner exe the start deploys it beside. An optimized profile also builds
+/// [`GIT_CREDENTIAL_BIN`] when the tree declares it (or is unreadable).
 pub(crate) fn sidecar_cargo_args(
     declared: Option<&std::collections::BTreeSet<String>>,
     profile: crate::build_profile::RunnerBuildProfile,
 ) -> Vec<&'static str> {
     let mut args = sidecar_build_args(declared);
+    if profile != crate::build_profile::RunnerBuildProfile::Dev
+        && declared.is_none_or(|d| d.contains(GIT_CREDENTIAL_BIN))
+    {
+        args.extend(["--bin", GIT_CREDENTIAL_BIN]);
+    }
     args.extend_from_slice(profile.cargo_args());
     args
 }
@@ -4982,7 +4990,42 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
         return;
     }
 
-    let slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
+    let mut slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
+    // The primary's own build dir is warmed too when it is an optimized dir
+    // the live tree can build — under its build lock, so a prewarm never runs
+    // beside a primary build into the same target dir. Skipped (and said so)
+    // when the tree does not declare the profile.
+    let primary = state.build_pool.primary_slot.clone();
+    let primary_lock = if primary.profile != crate::build_profile::RunnerBuildProfile::Dev {
+        match crate::process::primary_start::build_tree_profile_support(
+            &state,
+            primary.profile,
+            crate::process::manager::BuildTree::LiveWorkingTree,
+        )
+        .await
+        {
+            crate::process::primary_start::ProfileSupport::Supported => {
+                match state.build_pool.primary_build_lock.clone().try_lock_owned() {
+                    Ok(guard) => {
+                        slots.push(primary.clone());
+                        Some(guard)
+                    }
+                    Err(_) => {
+                        info!(
+                            "Primary build dir busy (a primary build holds it) — not prewarming it"
+                        );
+                        None
+                    }
+                }
+            }
+            crate::process::primary_start::ProfileSupport::Missing(cause) => {
+                info!("Not prewarming the primary build dir: {cause}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     info!("Pre-warming {} build slot(s)...", slots.len());
 
     for slot in slots {
@@ -5003,6 +5046,7 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
                 .await;
         }
     }
+    drop(primary_lock);
     info!("Build slot pre-warm complete");
 }
 
@@ -5083,13 +5127,15 @@ async fn prewarm_single_slot(
 
     let start = std::time::Instant::now();
 
-    let args: Vec<&str> = vec![
+    // In the slot's own profile: the primary build dir warms `release-checked/`.
+    let mut args: Vec<&str> = vec![
         "check",
         "--bin",
         "qontinui-runner",
         "--features",
         "custom-protocol",
     ];
+    args.extend_from_slice(slot.profile.cargo_args());
 
     // Per-build line bus so prewarm stderr lines stream to logs live (mirrors
     // the legacy reader task) while GuardedCommand owns the pipe + JobObject.

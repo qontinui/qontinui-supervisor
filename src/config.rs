@@ -1954,7 +1954,9 @@ mod tests {
             no_prewarm: false,
             no_webview: false,
             temp_runner_display: None,
-            primary_build_profile: None,
+            // Explicit, so an ambient QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE
+            // cannot change what these fixtures resolve.
+            primary_build_profile: Some(RunnerBuildProfile::ReleaseChecked),
         }
     }
 

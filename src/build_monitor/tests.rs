@@ -2711,3 +2711,23 @@ async fn a_slot_build_promotes_into_the_dev_lkg_dir() {
     assert_eq!(meta["profile"], "dev");
     assert!(state.build_pool.release_checked_lkg.read().await.is_none());
 }
+
+/// Review M3: the optimized primary's sidecar build carries the git credential
+/// helper (pool slots do not, and fall back to the dev `target/debug/` one),
+/// and only when the tree declares it.
+#[test]
+fn the_primary_sidecar_build_carries_the_git_credential_helper() {
+    use crate::build_profile::RunnerBuildProfile;
+    let rc = super::sidecar_cargo_args(None, RunnerBuildProfile::ReleaseChecked);
+    assert!(rc
+        .windows(2)
+        .any(|w| w == ["--bin", "qontinui-git-credential"]));
+    let dev = super::sidecar_cargo_args(None, RunnerBuildProfile::Dev);
+    assert!(!dev.contains(&"qontinui-git-credential"));
+    let lacking: std::collections::BTreeSet<String> =
+        ["qontinui-shim".to_string()].into_iter().collect();
+    assert!(
+        !super::sidecar_cargo_args(Some(&lacking), RunnerBuildProfile::ReleaseChecked)
+            .contains(&"qontinui-git-credential")
+    );
+}

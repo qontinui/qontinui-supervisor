@@ -3771,11 +3771,17 @@ fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
         "the graceful wait must come from the intent, not the bare default constant"
     );
 
-    // And the restart funnel hands its intent to that stop.
+    // And the restart funnel hands its intent to that stop — through
+    // `stop_rebuild_and_start`, the half `restart_after_gate` enters only
+    // once an optimized primary has something startable.
     let after_gate = crate::source_scan::fn_body(&src, "async fn restart_after_gate(")
         .expect("restart_after_gate exists")
         .to_string();
-    assert!(after_gate.contains("stop_runner_by_id(state, runner_id, true, intent).await?;"));
+    assert!(after_gate.contains("intent,"));
+    let stop_half = crate::source_scan::fn_body(&src, "async fn stop_rebuild_and_start(")
+        .expect("stop_rebuild_and_start exists")
+        .to_string();
+    assert!(stop_half.contains("stop_runner_by_id(state, runner_id, true, intent).await?;"));
 }
 
 /// Under a handoff the graceful wait ends on the PID being gone, never on the
@@ -4004,10 +4010,14 @@ fn profile_state_under(root: &std::path::Path) -> SharedState {
     let src_tauri = root.join("qontinui-runner").join("src-tauri");
     std::fs::create_dir_all(&src_tauri).expect("mkdir");
     let project_dir = src_tauri.to_string_lossy().into_owned();
+    // The profile is passed explicitly so an ambient
+    // QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE cannot change the fixture.
     let config = crate::config::SupervisorConfig::from_args(crate::config::CliArgs::parse_from([
         "test",
         "--project-dir",
         project_dir.as_str(),
+        "--primary-build-profile",
+        "release-checked",
     ]));
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -4015,54 +4025,6 @@ fn profile_state_under(root: &std::path::Path) -> SharedState {
 fn write_file(p: &std::path::Path, bytes: &[u8]) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(p, bytes).unwrap();
-}
-
-/// The unattended dev-LKG exception, every arm. An OPERATOR start never takes
-/// the dev LKG; an UNATTENDED one does only when no optimized LKG exists.
-#[test]
-fn primary_fallback_decisions() {
-    use StartIntent::{Operator, Unattended};
-    // The same profile's LKG wins for both intents.
-    for intent in [Operator, Unattended] {
-        assert_eq!(
-            decide_primary_fallback(intent, true, true, true),
-            PrimaryFallback::ProfileLkg
-        );
-    }
-    assert_eq!(
-        decide_primary_fallback(Unattended, false, true, true),
-        PrimaryFallback::DevLkg
-    );
-    assert_eq!(
-        decide_primary_fallback(Operator, false, false, true),
-        PrimaryFallback::Refuse,
-        "an operator start never falls back to a debug artifact"
-    );
-    assert_eq!(
-        decide_primary_fallback(Operator, false, true, true),
-        PrimaryFallback::UnverifiedLocalBuild
-    );
-    assert_eq!(
-        decide_primary_fallback(Unattended, false, false, false),
-        PrimaryFallback::Refuse
-    );
-}
-
-#[test]
-fn only_the_serving_watchdog_restart_is_unattended() {
-    assert_eq!(
-        StartIntent::of_restart(&RestartSource::ServingWatchdog),
-        StartIntent::Unattended
-    );
-    // `watchdog` is a wire value any caller can claim.
-    assert_eq!(
-        StartIntent::of_restart(&RestartSource::Watchdog),
-        StartIntent::Operator
-    );
-    assert_eq!(
-        StartIntent::of_restart(&RestartSource::Manual),
-        StartIntent::Operator
-    );
 }
 
 #[test]
@@ -4177,4 +4139,35 @@ fn lkg_profile_of_names_each_lkg_location() {
         Some(RunnerBuildProfile::Dev)
     );
     assert_eq!(lkg_profile_of(c, &c.runner_exe_path_for_slot(0)), None);
+}
+
+/// Review m3: the running copy is the one of the DEPLOYED profile — not the
+/// first identity path that happens to exist (a stale `target/debug/` copy
+/// beside a release-checked primary must not be read as what is running).
+#[tokio::test]
+async fn running_binary_mtime_reads_the_deployed_profiles_copy() {
+    use crate::build_profile::RunnerBuildProfile;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = profile_state_under(tmp.path());
+    let primary = state.get_primary().await.expect("primary");
+    let dev_copy = state
+        .config
+        .runner_exe_copy_path_for(&primary.config, RunnerBuildProfile::Dev);
+    write_file(&dev_copy, b"old debug copy");
+    let resolved = |profile| ResolvedRunnerExe {
+        path: std::path::PathBuf::from("/unused"),
+        origin: ExeOrigin::PrimaryBuildDir(profile),
+        mtime: None,
+        provenance: None,
+        unverified_warning: None,
+        profile,
+        profile_fallback: None,
+    };
+    *primary.resolved_exe.write().await = Some(resolved(RunnerBuildProfile::ReleaseChecked));
+    assert!(
+        running_binary_mtime(&state, &primary).await.is_none(),
+        "the release-checked copy does not exist; the debug one is not it"
+    );
+    *primary.resolved_exe.write().await = Some(resolved(RunnerBuildProfile::Dev));
+    assert!(running_binary_mtime(&state, &primary).await.is_some());
 }

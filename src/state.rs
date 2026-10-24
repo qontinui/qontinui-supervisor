@@ -111,6 +111,15 @@ pub struct ManagedRunner {
     ///
     /// `None` until this supervisor starts the runner.
     pub resolved_exe: RwLock<Option<crate::process::manager::ResolvedRunnerExe>>,
+    /// An artifact a RESTART resolved for an optimized primary BEFORE it
+    /// stopped the old process (`manager::restart_after_gate`), consumed by
+    /// the start that follows. `None` otherwise.
+    pub prepared_exe: RwLock<Option<crate::process::manager::ResolvedRunnerExe>>,
+    /// Latched while a start of this runner is in flight
+    /// (`manager::start_managed_runner`): an optimized primary's start can
+    /// take a whole build, and a second start racing it must be refused, not
+    /// queued into a second spawn.
+    pub start_in_flight: std::sync::atomic::AtomicBool,
     /// Per-spawn opt-in: allow starting from a resolved exe whose build
     /// identity cannot be established (see
     /// [`crate::process::manager::unverified_exe_gate`]). Set from the
@@ -214,6 +223,8 @@ impl ManagedRunner {
             requester_id: RwLock::new(None),
             build_provenance: RwLock::new(None),
             resolved_exe: RwLock::new(None),
+            prepared_exe: RwLock::new(None),
+            start_in_flight: std::sync::atomic::AtomicBool::new(false),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
         }
@@ -1168,6 +1179,9 @@ pub struct BuildPool {
     /// one target dir would clobber each other). Taken BEFORE the permit, so a
     /// queued primary build never holds a pool permit while it waits.
     pub primary_build_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set while a BACKGROUND optimized primary build (kicked by an
+    /// unattended fallback start) is in flight, so only one is ever queued.
+    pub primary_background_build_in_flight: std::sync::atomic::AtomicBool,
     /// The `release-checked` LKG (`target-pool/lkg/release-checked/`), the
     /// primary's twin of [`Self::last_known_good`] (which is the `dev` LKG every
     /// temp-runner `use_lkg` reads).
@@ -1223,8 +1237,19 @@ impl BuildPool {
             last_known_good: RwLock::new(lkg),
             primary_slot,
             primary_build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            primary_background_build_in_flight: std::sync::atomic::AtomicBool::new(false),
             release_checked_lkg: RwLock::new(release_checked_lkg),
         }
+    }
+
+    /// The build dir with this id: a pool slot, or the primary's dir
+    /// ([`crate::build_profile::PRIMARY_BUILD_SLOT_ID`]). The log routes use
+    /// it so a primary build's output is reachable at `/builds/255/log`.
+    pub fn slot_by_id(&self, id: usize) -> Option<&Arc<BuildSlot>> {
+        if id == crate::build_profile::PRIMARY_BUILD_SLOT_ID {
+            return Some(&self.primary_slot);
+        }
+        self.slots.get(id)
     }
 
     /// The in-memory LKG record for `profile`.
@@ -1265,7 +1290,10 @@ impl BuildPool {
     /// exactly this reason and exposes the raw semaphore separately.
     pub async fn occupancy(&self) -> crate::footprint::BuildPoolOccupancy {
         let slots = self.snapshot().await;
-        let busy = slots.iter().filter(|(_, _, info)| info.is_some()).count();
+        // A primary build holds one of the pool's permits, so it is busy
+        // capacity even though the primary dir is not in `slots`.
+        let primary_busy = usize::from(self.primary_slot.busy.read().await.is_some());
+        let busy = slots.iter().filter(|(_, _, info)| info.is_some()).count() + primary_busy;
         crate::footprint::BuildPoolOccupancy {
             build_slots_total: Some(slots.len() as u32),
             build_slots_busy: Some(busy as u32),

@@ -26,6 +26,7 @@ pub mod netstat_parse;
 pub mod orphan_scan;
 pub mod panic_log;
 pub mod port;
+pub mod primary_start;
 pub mod proc_kill;
 pub mod restate_port;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
