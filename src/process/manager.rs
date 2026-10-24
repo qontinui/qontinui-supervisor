@@ -2482,7 +2482,7 @@ impl<'a> StartLatch<'a> {
             .start_in_flight
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(SupervisorError::InFlight(format!(
+            return Err(SupervisorError::StartInFlight(format!(
                 "start_in_flight: a start of runner '{}' is already in progress (an optimized \
                  primary's start may be building its artifact); wait for it rather than \
                  starting it twice",
@@ -4716,9 +4716,13 @@ pub async fn maybe_serving_restart(
                 // and refunding second would let the next 2 s tick push its
                 // own history entry in between, and the refund would pop the
                 // wrong one.
+                // A RESTART-latch refusal gives its attempt back too: it is
+                // refused before anything is stopped. A START-latch refusal is
+                // not: it can come from inside the restart, after the stop.
                 let refunded = matches!(
                     result,
-                    Err(SupervisorError::RestartUnsafe(_)) | Err(SupervisorError::InFlight(_))
+                    Err(SupervisorError::RestartUnsafe(_))
+                        | Err(SupervisorError::RestartInFlight(_))
                 );
                 {
                     let mut wd = managed.watchdog.write().await;
@@ -4783,7 +4787,7 @@ pub async fn maybe_serving_restart(
                     // the latch: that restart is the recovery, so this is
                     // neither a refusal nor a failure, and its attempt was
                     // given back above.
-                    Err(SupervisorError::InFlight(detail)) => {
+                    Err(SupervisorError::RestartInFlight(detail)) => {
                         let msg = format!(
                             "serving watchdog deferred restarting runner '{runner_name}': \
                              {detail}"
@@ -6573,6 +6577,11 @@ pub async fn restart_runner_by_id_pinned(
 /// flag cleared by this one.
 pub(crate) struct RestartLatch {
     managed: Option<Arc<ManagedRunner>>,
+    /// Set by [`RestartLatch::pin`]: the `source_exe_override` this restart
+    /// replaced. Restored on EVERY exit (clear, panic, cancellation) before
+    /// the in-flight bit is released, so a pin can never outlive its restart
+    /// nor clobber an override someone else set.
+    restore_override: Option<Option<std::path::PathBuf>>,
 }
 
 impl RestartLatch {
@@ -6581,7 +6590,7 @@ impl RestartLatch {
             .restart_in_flight
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(SupervisorError::InFlight(format!(
+            return Err(SupervisorError::RestartInFlight(format!(
                 "restart_in_flight: a restart of runner '{}' is already in progress (a \
                  restart whose caller disconnected keeps running); wait for it rather than \
                  restarting it twice",
@@ -6592,13 +6601,30 @@ impl RestartLatch {
         // waiting for the write lock drops it, and `Drop` releases the bit.
         let latch = Self {
             managed: Some(managed.clone()),
+            restore_override: None,
         };
         managed.runner.write().await.restart_requested = true;
         Ok(latch)
     }
 
+    /// Start this restart from `exe` (an LKG pin): set the runner's
+    /// `source_exe_override`, remembering what it replaced so the latch
+    /// restores it on every exit.
+    pub(crate) async fn pin(&mut self, exe: std::path::PathBuf) {
+        if let Some(managed) = self.managed.as_ref() {
+            let mut slot = managed.source_exe_override.write().await;
+            let previous = slot.replace(exe);
+            if self.restore_override.is_none() {
+                self.restore_override = Some(previous);
+            }
+        }
+    }
+
     pub(crate) async fn clear(mut self) {
         if let Some(managed) = self.managed.as_ref() {
+            if let Some(previous) = self.restore_override.take() {
+                *managed.source_exe_override.write().await = previous;
+            }
             managed.runner.write().await.restart_requested = false;
             managed
                 .restart_in_flight
@@ -6615,18 +6641,30 @@ impl Drop for RestartLatch {
         let Some(managed) = self.managed.take() else {
             return;
         };
-        if let Ok(mut runner) = managed.runner.try_write() {
-            runner.restart_requested = false;
-            drop(runner);
-            managed
-                .restart_in_flight
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
+        let mut restore = self.restore_override.take();
+        if let Some(previous) = restore.as_ref() {
+            if let Ok(mut slot) = managed.source_exe_override.try_write() {
+                *slot = previous.clone();
+                restore = None;
+            }
         }
-        // Contended: clear it as soon as the lock frees, and only then let a
-        // new restart in.
+        if restore.is_none() {
+            if let Ok(mut runner) = managed.runner.try_write() {
+                runner.restart_requested = false;
+                drop(runner);
+                managed
+                    .restart_in_flight
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        }
+        // Contended: restore and clear as soon as the locks free, and only
+        // then let a new restart in.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                if let Some(previous) = restore {
+                    *managed.source_exe_override.write().await = previous;
+                }
                 managed.runner.write().await.restart_requested = false;
                 managed
                     .restart_in_flight
@@ -6649,7 +6687,7 @@ async fn restart_in_flight(
     state: &SharedState,
     managed: Arc<ManagedRunner>,
     runner_id: &str,
-    latch: RestartLatch,
+    mut latch: RestartLatch,
     rebuild: bool,
     source: RestartSource,
     build_tree: BuildTree,
@@ -6657,11 +6695,10 @@ async fn restart_in_flight(
     restart_start: std::time::Instant,
     exe_pin: Option<std::path::PathBuf>,
 ) -> Result<(), SupervisorError> {
-    // The pin is this restart's alone: set under the latch, cleared before it
-    // comes off.
-    let pinned = exe_pin.is_some();
+    // The pin is this restart's alone: set under the latch, which restores
+    // the previous override on every exit before it lets another restart in.
     if let Some(pin) = exe_pin {
-        *managed.source_exe_override.write().await = Some(pin);
+        latch.pin(pin).await;
     }
     let outcome = restart_after_gate(
         state,
@@ -6673,9 +6710,6 @@ async fn restart_in_flight(
         StartIntent::of_restart(&source),
     )
     .await;
-    if pinned {
-        *managed.source_exe_override.write().await = None;
-    }
 
     latch.clear().await;
 

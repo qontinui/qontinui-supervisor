@@ -71,7 +71,9 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 ///
 /// [`SupervisorError::RestartUnsafe`] is the readiness gate REFUSING — nothing
 /// ran, so no effect surface was touched and a clean attribution window carries
-/// no information about it. Everything else ran and failed. Both classify to
+/// no information about it. [`SupervisorError::RestartInFlight`] is the same:
+/// the restart latch refused before anything was stopped. Everything else ran
+/// and failed. Both classify to
 /// `D3Category::Failure` (plan §5 rejects a sixth category); the distinction is
 /// carried on the record and surfaces in the outcome's `evidence_ref`.
 ///
@@ -84,6 +86,9 @@ fn run_result_for(err: &SupervisorError) -> ActionRunResult {
     match err {
         SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
             reason: detail.message.clone(),
+        },
+        SupervisorError::RestartInFlight(message) => ActionRunResult::Refused {
+            reason: message.clone(),
         },
         other => ActionRunResult::Errored {
             reason: other.to_string(),
@@ -965,8 +970,9 @@ pub async fn restart_runner(
                         "high-risk prediction (auto-bias)"
                     };
                     let msg = format!(
-                        "Restart biased to last-known-good binary {lkg_exe:?} — {reason}; \
-                     pass use_lkg:false to opt out"
+                        "Restart will be biased to last-known-good binary {lkg_exe:?} — \
+                     {reason}; applied once the restart is admitted; pass use_lkg:false \
+                     to opt out"
                     );
                     tracing::warn!("{msg}");
                     state

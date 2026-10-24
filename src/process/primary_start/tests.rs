@@ -859,14 +859,68 @@ fn the_restart_door_hands_its_pin_to_the_restart() {
         "pub(crate) fn orphaned_by_failed_restart(",
     );
     let set = in_flight
-        .find("source_exe_override.write().await = Some(pin)")
+        .find("latch.pin(pin)")
         .expect("pins under the latch");
     let gate = in_flight.find("restart_after_gate(").expect("restarts");
-    let unset = in_flight
-        .find("source_exe_override.write().await = None")
-        .expect("unpins");
     let clear = in_flight.find("latch.clear().await").expect("clears");
-    assert!(set < gate && gate < unset && unset < clear);
+    assert!(set < gate && gate < clear);
+    assert!(
+        !in_flight.contains("source_exe_override"),
+        "the pin is the latch's: restart_in_flight must not write the override itself"
+    );
+}
+
+/// The latch restores the override its pin replaced on EVERY exit — the
+/// normal clear, and a drop (a panic or cancellation inside the restart) —
+/// before it lets another restart in, so a pin can neither outlive its restart
+/// nor clobber an override someone else had set.
+#[tokio::test]
+async fn a_restart_pin_is_restored_on_clear_and_on_drop() {
+    use crate::process::manager::RestartLatch;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    let managed = register_dead_primary(&state).await;
+    let earlier = std::path::PathBuf::from("earlier-override.exe");
+    let pin = std::path::PathBuf::from("lkg.exe");
+    *managed.source_exe_override.write().await = Some(earlier.clone());
+
+    // Normal exit.
+    let mut latch = RestartLatch::acquire(&managed).await.expect("acquire");
+    latch.pin(pin.clone()).await;
+    assert_eq!(*managed.source_exe_override.read().await, Some(pin.clone()));
+    latch.clear().await;
+    assert_eq!(
+        *managed.source_exe_override.read().await,
+        Some(earlier.clone())
+    );
+
+    // Dropped (a panic or cancellation inside the restart), uncontended.
+    let mut latch = RestartLatch::acquire(&managed).await.expect("acquire");
+    latch.pin(pin.clone()).await;
+    drop(latch);
+    assert_eq!(
+        *managed.source_exe_override.read().await,
+        Some(earlier.clone())
+    );
+    assert!(!managed.runner.read().await.restart_requested);
+
+    // Dropped while the override is contended: restored before the bit frees.
+    let mut latch = RestartLatch::acquire(&managed).await.expect("acquire");
+    latch.pin(pin.clone()).await;
+    let reader = managed.source_exe_override.read().await;
+    drop(latch);
+    assert!(
+        RestartLatch::acquire(&managed).await.is_err(),
+        "no restart may latch before the pin is restored"
+    );
+    drop(reader);
+    eventually("the contended pin is restored", || async {
+        !managed
+            .restart_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(*managed.source_exe_override.read().await, Some(earlier));
 }
 
 /// Finding 1, both doors: the latched half of `restart_runner_by_id` runs in

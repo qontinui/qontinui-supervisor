@@ -201,8 +201,9 @@ pub(crate) fn is_full_sha(s: &str) -> bool {
 /// in `repo_root`'s object database (worktrees share it). Anything else — a
 /// branch, a tag, or a full sha pushed since the last fetch (a spawn-test
 /// `git_ref` may name one) — is fetched first.
-/// Bounded, and with lazy fetching off, so the probe of a partial clone can
-/// never turn into the network fetch it exists to skip.
+/// Bounded (10 s), and with lazy fetching off on git >= 2.45
+/// (`GIT_NO_LAZY_FETCH`; an older git ignores it, leaving the bound), so the
+/// probe of a partial clone does not turn into the fetch it exists to skip.
 async fn checkout_is_local_commit(repo_root: &Path, checkout: &str) -> bool {
     if !is_full_sha(checkout) {
         return false;

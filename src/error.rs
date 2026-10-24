@@ -79,12 +79,19 @@ pub enum SupervisorError {
     #[error("{}", .0.message)]
     RestartUnsafe(Box<crate::restart_readiness::RefusalDetail>),
 
-    /// A start or restart was refused because one of the same runner is
-    /// already in flight (`manager::StartLatch` / `manager::RestartLatch`).
-    /// `409 Conflict`, not `400`: the request was well formed and the runner
-    /// is busy, so the caller waits for the running one and retries.
+    /// A restart was refused because a restart of the same runner is already
+    /// in flight (`manager::RestartLatch`). `409 Conflict`, not `400`: the
+    /// request was well formed and the runner is busy, so the caller waits for
+    /// the running restart and retries. Nothing was stopped.
     #[error("{0}")]
-    InFlight(String),
+    RestartInFlight(String),
+
+    /// A start was refused because a start of the same runner is already in
+    /// flight (`manager::StartLatch`). `409 Conflict`. Distinct from
+    /// [`SupervisorError::RestartInFlight`]: a start latch can refuse INSIDE a
+    /// restart, after its stop half already ran, so it is not a no-op refusal.
+    #[error("{0}")]
+    StartInFlight(String),
 
     /// A start was refused because the runner's port is already held by a
     /// LIVE `qontinui-runner` process. Spawning a second runner against a held
@@ -287,7 +294,8 @@ impl SupervisorError {
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
-            SupervisorError::InFlight(_) => StatusCode::CONFLICT,
+            SupervisorError::RestartInFlight(_) => StatusCode::CONFLICT,
+            SupervisorError::StartInFlight(_) => StatusCode::CONFLICT,
             SupervisorError::PortHeldByLiveRunner { .. } => StatusCode::CONFLICT,
             SupervisorError::RunnerApi(_) => StatusCode::BAD_GATEWAY,
             SupervisorError::BuildFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
