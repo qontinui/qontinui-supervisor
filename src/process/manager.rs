@@ -726,8 +726,9 @@ pub fn start_provenance_gate(
                 "Refusing to start non-temp runner from slot {slot_id}: its exe was built \
                  from a foreign override tree (source=override, built_from={}, sha={sha}), \
                  not the live runner tree. Deploying it would put unverified branch code on \
-                 a managed runner. Recovery: POST /runner/fix-and-rebuild to rebuild the \
-                 live tree into the slots, then start. (Temp runners via spawn-test may run \
+                 a managed runner. Recovery: POST /runner/restart {{\"rebuild\": true}} to \
+                 rebuild the primary from origin/main (or POST /runner/fix-and-rebuild to rebuild the \
+                 live tree into the slots), then start. (Temp runners via spawn-test may run \
                  foreign refs; non-temp runners may not.)",
                 prov.built_from,
             )))
@@ -1472,7 +1473,8 @@ pub fn unverified_exe_gate(
          an exe, so resolution fell through to this artifact — the one nobody maintains (on \
          2026-08-06 it was a 54-day-old binary that started healthy and served the UI Bridge \
          while a spawn-test believed it was measuring a branch). Recovery: \
-         POST /runners/spawn-test {{\"rebuild\": true}} (or POST /runner/fix-and-rebuild) so the \
+         POST /runners/spawn-test {{\"rebuild\": true}} (for the primary, POST /runner/restart \
+         {{\"rebuild\": true}}) so the \
          binary carries a provenance record. To deliberately run whatever exists, re-send with \
          {{\"allow_stale_fallback\": true}} — the response will state the staleness — or set \
          {env}=1 on the supervisor.",
@@ -2515,6 +2517,18 @@ pub async fn start_managed_runner(
     managed: &Arc<ManagedRunner>,
     intent: StartIntent,
 ) -> Result<(), SupervisorError> {
+    start_managed_runner_prepared(state, managed, intent, None).await
+}
+
+/// [`start_managed_runner`] with an artifact the caller already resolved for
+/// an optimized primary (a restart prepares it before stopping the old
+/// process, [`restart_after_gate`]). `None` resolves at start, as always.
+pub(crate) async fn start_managed_runner_prepared(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    intent: StartIntent,
+    prepared: Option<ResolvedRunnerExe>,
+) -> Result<(), SupervisorError> {
     // With the parallel build pool, a concurrent build on one slot does not
     // prevent us from starting a runner from a previously-built exe in
     // another slot (or the legacy target path). `resolve_source_exe` inside
@@ -2572,7 +2586,7 @@ pub async fn start_managed_runner(
     let SpawnResult {
         mut child,
         panic_log_dir,
-    } = start_exe_mode_for_runner(state, managed, intent).await?;
+    } = start_exe_mode_for_runner(state, managed, intent, prepared).await?;
 
     let pid = child.id();
     info!(
@@ -3451,6 +3465,7 @@ async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
     intent: StartIntent,
+    prepared: Option<ResolvedRunnerExe>,
 ) -> Result<SpawnResult, SupervisorError> {
     // Locate the source exe. The per-runner `source_exe_override` takes
     // precedence — set by `spawn_test` when the caller passes `use_lkg: true`
@@ -3552,13 +3567,7 @@ async fn start_exe_mode_for_runner(
                     // process (`restart_after_gate`); a plain start prepares
                     // it here. Either way: build, fall back or refuse per
                     // `primary_start`.
-                    let prepared = managed
-                        .prepared_exe
-                        .write()
-                        .await
-                        .take()
-                        .filter(|r| r.path.exists());
-                    let resolved = match prepared {
+                    let resolved = match prepared.filter(|r| r.path.exists()) {
                         Some(r) => r,
                         None => {
                             crate::process::primary_start::prepare_primary_start(
@@ -6562,11 +6571,15 @@ async fn restart_after_gate(
     let profile = state.config.runner_profile(&managed.config);
     let optimized_primary =
         managed.config.kind().is_primary() && profile != RunnerBuildProfile::Dev;
+    // A pin (`use_lkg`, the high-risk LKG bias) decides the artifact itself —
+    // `source_exe_override` wins in the start — so nothing is prepared for it.
+    let pinned = managed.source_exe_override.read().await.is_some();
     let mut early_build_duration = None;
+    let mut prepared = None;
     if optimized_primary {
         if rebuild {
             let build_start = std::time::Instant::now();
-            crate::process::primary_start::primary_build(
+            crate::process::primary_start::primary_build_detached(
                 state,
                 build_tree,
                 crate::process::primary_start::BuildNeed::Always,
@@ -6574,26 +6587,35 @@ async fn restart_after_gate(
             .await?;
             early_build_duration = Some(build_start.elapsed().as_secs_f64());
         }
-        let prepared =
-            crate::process::primary_start::prepare_primary_start(state, profile, start_intent)
-                .await?;
-        *managed.prepared_exe.write().await = Some(prepared);
+        if !pinned {
+            prepared = Some(
+                crate::process::primary_start::prepare_primary_start(state, profile, start_intent)
+                    .await?,
+            );
+        }
     }
-    let outcome = stop_rebuild_and_start(
+    stop_rebuild_and_start(
         state,
         managed,
         runner_id,
         rebuild && !optimized_primary,
         build_tree,
         intent,
-        start_intent,
+        PlannedStart {
+            intent: start_intent,
+            prepared,
+        },
     )
-    .await;
-    if outcome.is_err() {
-        // A prepared artifact belongs to THIS restart only.
-        *managed.prepared_exe.write().await = None;
-    }
-    outcome.map(|late| late.or(early_build_duration))
+    .await
+    .map(|late| late.or(early_build_duration))
+}
+
+/// What the start half of a restart starts with: who asked, and the artifact
+/// an optimized primary's preparation already resolved (`None` resolves at
+/// start).
+struct PlannedStart {
+    intent: StartIntent,
+    prepared: Option<ResolvedRunnerExe>,
 }
 
 /// The stop → (dev) rebuild → start half of [`restart_after_gate`], entered
@@ -6605,7 +6627,7 @@ async fn stop_rebuild_and_start(
     rebuild: bool,
     build_tree: BuildTree,
     intent: CloseIntent,
-    start_intent: StartIntent,
+    start: PlannedStart,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -6678,7 +6700,7 @@ async fn stop_rebuild_and_start(
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
-    start_managed_runner(state, managed, start_intent).await?;
+    start_managed_runner_prepared(state, managed, start.intent, start.prepared).await?;
 
     Ok(build_duration)
 }

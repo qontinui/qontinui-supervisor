@@ -623,7 +623,14 @@ pub async fn restart_runner(
     // an in-place restart is a `restart`-kind action. The attribution watcher
     // (spawned inside `mint_primary_action`) folds the verdict in after the
     // per-kind window and writes it back for `GET /actions/{id}/outcome`.
-    let action_kind = if rebuild {
+    //
+    // A no-rebuild restart of an optimized primary with nothing startable
+    // BUILDS before it starts (`primary_start`), so it is filed as the build it
+    // is: a `restart` window would close ~30 s in, mid-compile, and record a
+    // verdict about an action that had not happened yet.
+    let cold_build =
+        !rebuild && crate::process::primary_start::primary_start_needs_build(&state).await;
+    let action_kind = if rebuild || cold_build {
         ActionKind::Build
     } else {
         ActionKind::Restart
@@ -633,10 +640,15 @@ pub async fn restart_runner(
         action_kind,
         // `;handoff=true` only when set, so a non-handoff action's label is
         // unchanged.
-        if body.handoff {
-            format!("rebuild={};force={};handoff=true", rebuild, body.force)
-        } else {
-            format!("rebuild={};force={}", rebuild, body.force)
+        {
+            let mut digest = format!("rebuild={};force={}", rebuild, body.force);
+            if body.handoff {
+                digest.push_str(";handoff=true");
+            }
+            if cold_build {
+                digest.push_str(";cold_build=true");
+            }
+            digest
         },
         None,
         None,
@@ -1289,14 +1301,38 @@ pub async fn fix_and_rebuild(
         state.config.project_dir.clone(),
         None,
         async move {
-            match crate::build_monitor::run_cargo_build(&exec_state).await {
+            // An optimized primary starts from `target-pool/primary/`, which a
+            // pool-slot build never writes — so for it this door builds the
+            // primary's own dir, or "restart to apply" would apply nothing.
+            let profile = crate::build_profile::primary_profile(&exec_state.config);
+            let (outcome, applied) = if profile == crate::build_profile::RunnerBuildProfile::Dev {
+                (
+                    crate::build_monitor::run_cargo_build(&exec_state).await,
+                    "Runner rebuilt (restart manually to apply)".to_string(),
+                )
+            } else {
+                (
+                    crate::process::primary_start::primary_build(
+                        &exec_state,
+                        crate::process::manager::BuildTree::LiveWorkingTree,
+                        crate::process::primary_start::BuildNeed::Always,
+                    )
+                    .await,
+                    format!(
+                        "Runner rebuilt into target-pool/primary/{}/; POST /runner/restart \
+                         (no rebuild) applies it",
+                        profile.dir_name()
+                    ),
+                )
+            };
+            match outcome {
                 Ok(()) => {
                     exec_record.record_run_result(ActionRunResult::Ran);
                     (
                         StatusCode::OK.as_u16(),
                         serde_json::json!({
                             "status": "ok",
-                            "message": "Runner rebuilt (restart manually to apply)"
+                            "message": applied,
                         }),
                     )
                 }

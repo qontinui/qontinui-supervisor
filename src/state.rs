@@ -111,10 +111,7 @@ pub struct ManagedRunner {
     ///
     /// `None` until this supervisor starts the runner.
     pub resolved_exe: RwLock<Option<crate::process::manager::ResolvedRunnerExe>>,
-    /// An artifact a RESTART resolved for an optimized primary BEFORE it
-    /// stopped the old process (`manager::restart_after_gate`), consumed by
-    /// the start that follows. `None` otherwise.
-    pub prepared_exe: RwLock<Option<crate::process::manager::ResolvedRunnerExe>>,
+
     /// Latched while a start of this runner is in flight
     /// (`manager::start_managed_runner`): an optimized primary's start can
     /// take a whole build, and a second start racing it must be refused, not
@@ -223,7 +220,7 @@ impl ManagedRunner {
             requester_id: RwLock::new(None),
             build_provenance: RwLock::new(None),
             resolved_exe: RwLock::new(None),
-            prepared_exe: RwLock::new(None),
+
             start_in_flight: std::sync::atomic::AtomicBool::new(false),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),

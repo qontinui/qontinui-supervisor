@@ -19,12 +19,15 @@
 //!      name why. An operator start never falls back to a `debug/` artifact —
 //!      a debug primary is the `dev` opt-in.
 //!
-//! **The build tree must DECLARE the profile.** Before any stop, worktree prep
-//! or frontend build, [`build_tree_profile_support`] reads the runner tree's
-//! workspace `Cargo.toml`; a tree with no `[profile.release-checked]` (one
-//! that predates the runner half of the plan, Phase 3) makes the optimized
-//! build unavailable with a named cause instead of a cargo error forty seconds
-//! into a frontend build.
+//! **The build tree must DECLARE the profile.** On the path that is about to
+//! build — and only there — [`primary_build`] reads the workspace `Cargo.toml`
+//! of the exact tree it will compile (origin/main resolved once to a sha, the
+//! manifest read and the worktree prepared at that sha) before any frontend
+//! build; a tree with no `[profile.release-checked]` (one that predates the
+//! runner half of the plan, Phase 3) makes the optimized build unavailable with
+//! a named cause instead of a cargo error forty seconds into a frontend build.
+//! An unattended start with nothing at all to start (a cold box) builds in the
+//! foreground: there is no running primary to protect.
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
@@ -73,56 +76,69 @@ pub enum ProfileSupport {
     Missing(String),
 }
 
+#[cfg(test)]
 impl ProfileSupport {
     pub fn is_supported(&self) -> bool {
         matches!(self, ProfileSupport::Supported)
     }
 }
 
-/// Read the workspace `Cargo.toml` of the tree `tree` names, with a label
-/// saying where it was read from. `None` when it cannot be read.
+/// The ONE point an `origin/main` primary build compiles, and its manifest.
 ///
-/// `LiveWorkingTree` reads `<runner>/Cargo.toml`. `OriginMain` reads
-/// `origin/main:Cargo.toml` from the runner repo's LOCAL remote-tracking ref
-/// (no fetch here: the origin-drift ticker fetches every two minutes), so it
-/// costs one `git show` and runs before any worktree is prepared.
-async fn read_build_tree_manifest(
+/// A bounded `git fetch` (so a ref pushed since the last fetch is seen — no
+/// ticker is relied on: the origin-drift refresher returns before fetching on a
+/// box with no dev LKG sha), then `origin/main` is resolved to a sha ONCE, and
+/// the workspace `Cargo.toml` is read AT that sha. The caller prepares the
+/// worktree at the same sha, so the tree the profile check read IS the tree
+/// that is built. A failed fetch degrades to the refs already present (logged).
+async fn origin_main_build_point(
     state: &SharedState,
-    tree: BuildTree,
-) -> (Option<String>, String) {
-    let npm = state.config.runner_npm_dir();
-    match tree {
-        BuildTree::LiveWorkingTree => {
-            let path = npm.join("Cargo.toml");
-            (
-                std::fs::read_to_string(&path).ok(),
-                format!("{}", path.display()),
-            )
-        }
-        BuildTree::OriginMain => {
-            let label = format!("origin/main:Cargo.toml in {}", npm.display());
-            let out = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                tokio::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&npm)
-                    .args(["show", "origin/main:Cargo.toml"])
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await;
-            let text = match out {
-                Ok(Ok(o)) if o.status.success() => String::from_utf8(o.stdout).ok(),
-                _ => None,
-            };
-            (text, label)
-        }
+) -> Result<(String, Option<String>, String), SupervisorError> {
+    let repo = crate::spawn_worktree::find_repo_root(&state.config.project_dir)?;
+    if let Err(e) = crate::git_provenance::fetch_origin(&repo).await {
+        warn!("Primary build: {e}");
     }
+    let sha = git_stdout(&repo, &["rev-parse", "--verify", "origin/main^{commit}"])
+        .await
+        .ok_or_else(|| {
+            SupervisorError::BuildFailed(format!(
+                "the primary build could not resolve origin/main in {}",
+                repo.display()
+            ))
+        })?;
+    let manifest = git_stdout(&repo, &["show", &format!("{sha}:Cargo.toml")]).await;
+    let label = format!("{sha}:Cargo.toml (origin/main) in {}", repo.display());
+    Ok((sha, manifest, label))
+}
+
+/// `git <args>` in `cwd`, bounded to 20 s; trimmed stdout on success, `None`
+/// on any failure.
+async fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// [`ProfileSupport`] of `profile` for the tree `tree`. `dev` is always
 /// supported (cargo's built-in profile). An unreadable manifest is NOT
 /// support — unknown never reads as "fine" — so it is `Missing` naming that.
+///
+/// `LiveWorkingTree` reads `<runner>/Cargo.toml`; `OriginMain` reads it at the
+/// sha [`origin_main_build_point`] resolves. Called only on a path that is
+/// about to build (or prewarm) — never on a start that already has a
+/// startable artifact.
 pub async fn build_tree_profile_support(
     state: &SharedState,
     profile: RunnerBuildProfile,
@@ -131,8 +147,19 @@ pub async fn build_tree_profile_support(
     if profile == RunnerBuildProfile::Dev {
         return ProfileSupport::Supported;
     }
-    let (manifest, label) = read_build_tree_manifest(state, tree).await;
-    profile_support_from_manifest(manifest.as_deref(), &label, profile)
+    match tree {
+        BuildTree::LiveWorkingTree => {
+            let path = state.config.runner_npm_dir().join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&path).ok();
+            profile_support_from_manifest(manifest.as_deref(), &path.display().to_string(), profile)
+        }
+        BuildTree::OriginMain => match origin_main_build_point(state).await {
+            Ok((_, manifest, label)) => {
+                profile_support_from_manifest(manifest.as_deref(), &label, profile)
+            }
+            Err(e) => ProfileSupport::Missing(e.to_string()),
+        },
+    }
 }
 
 /// Pure core of [`build_tree_profile_support`].
@@ -162,7 +189,7 @@ pub fn profile_support_from_manifest(
 /// Whether [`primary_build`] must compile even when the artifact exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildNeed {
-    /// An explicit rebuild (`restart {rebuild: true}`).
+    /// An explicit rebuild (`restart {rebuild: true}`, fix-and-rebuild).
     Always,
     /// A start that found nothing startable: re-checked after the build lock
     /// is taken, so a start that queued behind another start's build does not
@@ -170,26 +197,44 @@ pub enum BuildNeed {
     IfAbsent,
 }
 
+fn unavailable(
+    profile: RunnerBuildProfile,
+    support: ProfileSupport,
+) -> Result<(), SupervisorError> {
+    match support {
+        ProfileSupport::Supported => Ok(()),
+        ProfileSupport::Missing(cause) => Err(SupervisorError::BuildFailed(format!(
+            "the {profile} primary build is unavailable: {cause}"
+        ))),
+    }
+}
+
 /// Build the PRIMARY in its configured profile from `tree`.
 ///
-/// `dev`: into the build pool, exactly as before. Optimized: under
-/// `primary_build_lock` — taken FIRST, so the worktree prep happens under it
-/// too — after the profile pre-check, into `target-pool/primary/`
-/// ([`crate::build_monitor::run_primary_build`]).
+/// `dev`: into the build pool, as before (the origin/main worktree under its
+/// container lock). Optimized, in this order — `primary_build_lock`, then (for
+/// origin/main) the spawn container lock, then the pool permit inside
+/// [`crate::build_monitor::run_primary_build`]:
+/// 1. the `IfAbsent` re-check under the build lock;
+/// 2. the profile pre-check on the exact tree that will be built (origin/main
+///    resolved ONCE to a sha after a bounded fetch, its manifest read at that
+///    sha, the worktree prepared at that sha) — before any frontend build;
+/// 3. the build into `target-pool/primary/`.
 pub async fn primary_build(
     state: &SharedState,
     tree: BuildTree,
     need: BuildNeed,
 ) -> Result<(), SupervisorError> {
     let profile = crate::build_profile::primary_profile(&state.config);
+    let project_dir = state.config.project_dir.clone();
     if profile == RunnerBuildProfile::Dev {
         return match tree {
             BuildTree::OriginMain => {
-                let prepared = crate::spawn_worktree::prepare_worktree(
-                    &state.config.project_dir,
-                    "origin/main",
-                )
-                .await?;
+                let container =
+                    crate::spawn_worktree::container_path_for_ref(&project_dir, "origin/main")?;
+                let _container = state.spawn_container_lock(&container).lock_owned().await;
+                let prepared =
+                    crate::spawn_worktree::prepare_worktree(&project_dir, "origin/main").await?;
                 log_origin_main_build(state, &prepared, profile).await;
                 crate::build_monitor::run_cargo_build_with_dir(
                     state,
@@ -206,12 +251,6 @@ pub async fn primary_build(
         };
     }
 
-    if let ProfileSupport::Missing(cause) = build_tree_profile_support(state, profile, tree).await {
-        return Err(SupervisorError::BuildFailed(format!(
-            "the {profile} primary build is unavailable: {cause}"
-        )));
-    }
-
     let lock = state
         .build_pool
         .primary_build_lock
@@ -224,22 +263,39 @@ pub async fn primary_build(
     }
     match tree {
         BuildTree::OriginMain => {
+            let container =
+                crate::spawn_worktree::container_path_for_ref(&project_dir, "origin/main")?;
+            let _container = state.spawn_container_lock(&container).lock_owned().await;
+            let (sha, manifest, label) = origin_main_build_point(state).await?;
+            unavailable(
+                profile,
+                profile_support_from_manifest(manifest.as_deref(), &label, profile),
+            )?;
             let prepared =
-                crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main")
+                crate::spawn_worktree::prepare_worktree_at(&project_dir, "origin/main", &sha)
                     .await?;
+            if prepared.resolved_sha != sha {
+                return Err(SupervisorError::BuildFailed(format!(
+                    "the primary worktree resolved {} but the profile check read {sha}; refusing \
+                     to build a tree other than the one checked",
+                    prepared.resolved_sha
+                )));
+            }
             log_origin_main_build(state, &prepared, profile).await;
             crate::build_monitor::run_primary_build(
                 state,
                 &lock,
                 Some("primary-rebuild:origin/main".to_string()),
                 Some(prepared.src_tauri.clone()),
-                crate::build_monitor::BuildSourceKind::OriginMain {
-                    resolved_sha: prepared.resolved_sha.clone(),
-                },
+                crate::build_monitor::BuildSourceKind::OriginMain { resolved_sha: sha },
             )
             .await
         }
         BuildTree::LiveWorkingTree => {
+            unavailable(
+                profile,
+                build_tree_profile_support(state, profile, BuildTree::LiveWorkingTree).await,
+            )?;
             crate::build_monitor::run_primary_build(
                 state,
                 &lock,
@@ -250,6 +306,23 @@ pub async fn primary_build(
             .await
         }
     }
+}
+
+/// [`primary_build`] in its OWN task, awaited. A synchronous HTTP door (a
+/// no-rebuild restart, `POST /runners/{id}/start`) can reach a cold build;
+/// if the client disconnects, axum drops the handler future, and a build
+/// running inside it would be cancelled mid-flight (KillOnDrop kills cargo).
+/// A spawned task is not cancelled with its awaiter, so the build always
+/// finishes and the next start finds the artifact.
+pub async fn primary_build_detached(
+    state: &SharedState,
+    tree: BuildTree,
+    need: BuildNeed,
+) -> Result<(), SupervisorError> {
+    let state = state.clone();
+    tokio::spawn(async move { primary_build(&state, tree, need).await })
+        .await
+        .map_err(|e| SupervisorError::BuildFailed(format!("the primary build task failed: {e}")))?
 }
 
 async fn log_origin_main_build(
@@ -268,9 +341,23 @@ async fn log_origin_main_build(
     state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
 }
 
-/// Kick ONE background `release-checked` primary build from `origin/main`, so
-/// the next primary start finds an optimized artifact. A no-op while one is
-/// already in flight.
+/// Clears `primary_background_build_in_flight` on every exit, a panic
+/// included, so one failed background build cannot block every later one.
+struct BackgroundBuildLatch(SharedState);
+
+impl Drop for BackgroundBuildLatch {
+    fn drop(&mut self) {
+        self.0
+            .build_pool
+            .primary_background_build_in_flight
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+/// Kick ONE background optimized primary build from `origin/main`, so the
+/// next primary start finds an optimized artifact. A no-op while one is
+/// already in flight. A tree that cannot build the profile fails fast with
+/// the cause named.
 pub fn spawn_background_primary_build(state: &SharedState) {
     if state
         .build_pool
@@ -279,8 +366,10 @@ pub fn spawn_background_primary_build(state: &SharedState) {
     {
         return;
     }
+    let latch = BackgroundBuildLatch(state.clone());
     let state = state.clone();
     tokio::spawn(async move {
+        let _latch = latch;
         let msg = "Background primary build: building the optimized primary artifact so the \
                    next primary start does not fall back"
             .to_string();
@@ -302,10 +391,6 @@ pub fn spawn_background_primary_build(state: &SharedState) {
             _ => info!("{}", msg),
         }
         state.logs.emit(LogSource::Build, level, msg).await;
-        state
-            .build_pool
-            .primary_background_build_in_flight
-            .store(false, Ordering::SeqCst);
     });
 }
 
@@ -314,21 +399,41 @@ pub fn spawn_background_primary_build(state: &SharedState) {
 pub struct PreparedPrimary {
     pub resolved: ResolvedRunnerExe,
     /// The caller should start a background optimized build (an unattended
-    /// start that fell back, on a tree that supports the profile).
+    /// start that took a fallback).
     pub kick_background_build: bool,
 }
 
+/// Would an optimized primary's next start BUILD before it could start?
+/// True when the primary is configured optimized and no supervisor build or
+/// adoptable local build of that profile exists. Cheap (stats only); lets a
+/// synchronous door file its dev-action record as the build it will run.
+pub async fn primary_start_needs_build(state: &SharedState) -> bool {
+    let profile = crate::build_profile::primary_profile(&state.config);
+    if profile == RunnerBuildProfile::Dev {
+        return false;
+    }
+    !resolve_primary_dir_exe(state, profile)
+        .await
+        .is_some_and(|r| startable(&r))
+}
+
+fn startable(r: &ResolvedRunnerExe) -> bool {
+    matches!(
+        r.origin,
+        ExeOrigin::PrimaryBuildDir(_) | ExeOrigin::AdoptedLocalBuild(_)
+    )
+}
+
 /// The entry the start and restart paths use: decide what an optimized
-/// primary starts from, building in the foreground for an operator, and
-/// kicking a background build after an unattended fallback.
+/// primary starts from. Any build runs DETACHED ([`primary_build_detached`]),
+/// and an unattended fallback kicks a background build.
 pub async fn prepare_primary_start(
     state: &SharedState,
     profile: RunnerBuildProfile,
     intent: StartIntent,
 ) -> Result<ResolvedRunnerExe, SupervisorError> {
-    let support = build_tree_profile_support(state, profile, BuildTree::OriginMain).await;
-    let prepared = prepare_optimized_primary(state, profile, intent, &support, || {
-        primary_build(state, BuildTree::OriginMain, BuildNeed::IfAbsent)
+    let prepared = prepare_optimized_primary(state, profile, intent, || {
+        primary_build_detached(state, BuildTree::OriginMain, BuildNeed::IfAbsent)
     })
     .await?;
     if prepared.kick_background_build {
@@ -337,25 +442,28 @@ pub async fn prepare_primary_start(
     Ok(prepared.resolved)
 }
 
-/// The decision, with the build step and the profile support injected so
-/// every arm is testable without cargo. See the module docs for the rules.
+/// The decision, with the build step injected so every arm is testable
+/// without cargo. The build step carries the profile pre-check itself
+/// ([`primary_build`]), so a tree without the profile is a build failure
+/// naming the missing `[profile.release-checked]`.
+///
+/// 1. A startable artifact → it.
+/// 2. Operator: build now; on failure the profile's LKG, else an unverified
+///    local build (the identity gate decides), else refuse. Never `debug/`.
+/// 3. Unattended: the profile's LKG, else the newest dev artifact (ERROR,
+///    configured ≠ resolved) — both kick a background build; with NOTHING to
+///    start at all (a cold box: there is no primary to protect) build in the
+///    foreground; on failure an unverified local build, else refuse.
 pub async fn prepare_optimized_primary<B, Fut>(
     state: &SharedState,
     profile: RunnerBuildProfile,
     intent: StartIntent,
-    support: &ProfileSupport,
     build: B,
 ) -> Result<PreparedPrimary, SupervisorError>
 where
     B: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), SupervisorError>>,
 {
-    let startable = |r: &ResolvedRunnerExe| {
-        matches!(
-            r.origin,
-            ExeOrigin::PrimaryBuildDir(_) | ExeOrigin::AdoptedLocalBuild(_)
-        )
-    };
     let found = resolve_primary_dir_exe(state, profile).await;
     if let Some(r) = found.as_ref().filter(|r| startable(r)) {
         return Ok(PreparedPrimary {
@@ -364,73 +472,26 @@ where
         });
     }
     let profile_lkg = crate::state::lkg_on_disk(&state.config, profile);
-
-    // Why the optimized artifact is not startable, for every line below.
-    let mut why = match support {
-        ProfileSupport::Supported => format!(
-            "no startable {profile} artifact (looked in {:?} and the {profile} local build dir)",
-            state.config.primary_exe_path(profile)
-        ),
-        ProfileSupport::Missing(cause) => cause.clone(),
-    };
-
-    if intent == StartIntent::Operator && support.is_supported() {
-        let msg = format!("Primary start: {why} — building one from origin/main before starting");
-        warn!("{}", msg);
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-            .await;
-        match build().await {
-            Ok(()) => match resolve_primary_dir_exe(state, profile).await {
-                Some(r) if startable(&r) => {
-                    return Ok(PreparedPrimary {
-                        resolved: r,
-                        kick_background_build: false,
-                    })
-                }
-                _ => {
-                    why = format!(
-                        "the {profile} build reported success but left no exe at {:?}",
-                        state.config.primary_exe_path(profile)
-                    )
-                }
-            },
-            Err(e) => why = format!("the {profile} build failed: {e}"),
-        }
-    }
-
-    // The same profile's LKG: still optimized, so allowed for any start.
-    if let Some((info, exe)) = profile_lkg {
-        let msg = format!(
-            "Primary start: {why}; starting the {profile} last-known-good {exe:?} (built_at {}, \
-             sha {})",
-            info.built_at.to_rfc3339(),
-            info.sha.as_deref().unwrap_or("(unknown)")
-        );
-        warn!("{}", msg);
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
-            .await;
-        return Ok(PreparedPrimary {
-            resolved: lkg_resolution(info, exe, profile, None),
-            kick_background_build: intent == StartIntent::Unattended && support.is_supported(),
-        });
-    }
+    let mut why = format!(
+        "no startable {profile} artifact (looked in {:?} and the {profile} local build dir)",
+        state.config.primary_exe_path(profile)
+    );
 
     if intent == StartIntent::Unattended {
+        if let Some((info, exe)) = profile_lkg.clone() {
+            log_profile_lkg_start(state, profile, &why, &info, &exe).await;
+            return Ok(PreparedPrimary {
+                resolved: lkg_resolution(info, exe, profile, None),
+                kick_background_build: true,
+            });
+        }
         if let Some(mut dev) = newest_dev_artifact(state).await {
             let reason = format!(
                 "configured {profile}, but {why}; an UNATTENDED start fell back to the newest dev \
-                 artifact {:?} (origin {}) rather than leave the box with no primary{}.",
+                 artifact {:?} (origin {}) rather than leave the box with no primary, and started \
+                 a background {profile} build for the next start.",
                 dev.path,
                 dev.origin.label(),
-                if support.is_supported() {
-                    "; a background release-checked build was started for the next start"
-                } else {
-                    ""
-                }
             );
             error!("DEBUG PRIMARY FALLBACK: {}", reason);
             state
@@ -444,9 +505,44 @@ where
             dev.profile_fallback = Some(reason);
             return Ok(PreparedPrimary {
                 resolved: dev,
-                kick_background_build: support.is_supported(),
+                kick_background_build: true,
             });
         }
+    }
+
+    // Build now: an operator start, or an unattended start with nothing at all
+    // to start (a cold box — there is no running primary to protect).
+    let msg = format!("Primary start: {why} — building one from origin/main before starting");
+    warn!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+        .await;
+    match build().await {
+        Ok(()) => match resolve_primary_dir_exe(state, profile).await {
+            Some(r) if startable(&r) => {
+                return Ok(PreparedPrimary {
+                    resolved: r,
+                    kick_background_build: false,
+                })
+            }
+            _ => {
+                why = format!(
+                    "the {profile} build reported success but left no exe at {:?}",
+                    state.config.primary_exe_path(profile)
+                )
+            }
+        },
+        Err(e) => why = format!("the {profile} build failed: {e}"),
+    }
+
+    // The same profile's LKG: still optimized, so allowed for any start.
+    if let Some((info, exe)) = profile_lkg {
+        log_profile_lkg_start(state, profile, &why, &info, &exe).await;
+        return Ok(PreparedPrimary {
+            resolved: lkg_resolution(info, exe, profile, None),
+            kick_background_build: false,
+        });
     }
 
     // An unverified local build of the profile: the identity gate decides.
@@ -459,8 +555,9 @@ where
 
     Err(SupervisorError::Process(format!(
         "Refusing to start the primary: it is configured for the {profile} build profile \
-         ({source}) and {why}. {tail} Fix that and retry, or opt into a debug primary with \
-         --primary-build-profile dev / QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE=dev.",
+         ({source}) and {why}. {tail} Fix that and retry (POST /runner/restart \
+         {{\"rebuild\": true}}), or opt into a debug primary with --primary-build-profile dev / \
+         QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE=dev.",
         source = state.config.primary_build_profile.source.knob(),
         tail = match intent {
             StartIntent::Operator => {
@@ -472,17 +569,56 @@ where
     )))
 }
 
+async fn log_profile_lkg_start(
+    state: &SharedState,
+    profile: RunnerBuildProfile,
+    why: &str,
+    info: &LkgInfo,
+    exe: &std::path::Path,
+) {
+    let msg = format!(
+        "Primary start: {why}; starting the {profile} last-known-good {exe:?} (built_at {}, sha {})",
+        info.built_at.to_rfc3339(),
+        info.sha.as_deref().unwrap_or("(unknown)")
+    );
+    warn!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+        .await;
+}
+
 /// The newest DEV artifact an unattended fallback may start: the dev LKG,
-/// else a dev pool-slot exe (a supervisor build). Its record carries
-/// `profile: Dev`, which is what `/health` shows as resolved.
+/// else a dev pool-slot exe (a supervisor build) — never one whose provenance
+/// says it was built from a foreign override tree; the next slot is tried
+/// instead. Its record carries `profile: Dev`, which `/health` shows as
+/// resolved.
 async fn newest_dev_artifact(state: &SharedState) -> Option<ResolvedRunnerExe> {
     if let Some((info, exe)) = crate::state::lkg_on_disk(&state.config, RunnerBuildProfile::Dev) {
         return Some(lkg_resolution(info, exe, RunnerBuildProfile::Dev, None));
     }
-    match resolve_source_exe_detailed(state, RunnerBuildProfile::Dev).await {
-        Ok(r) if matches!(r.origin, ExeOrigin::Slot(_)) => Some(r),
-        _ => None,
+    let is_override = |p: &Option<BuildProvenance>| {
+        p.as_ref()
+            .is_some_and(|p| p.source == crate::process::manager::BuildSource::Override)
+    };
+    if let Ok(r) = resolve_source_exe_detailed(state, RunnerBuildProfile::Dev).await {
+        if matches!(r.origin, ExeOrigin::Slot(_)) && !is_override(&r.provenance) {
+            return Some(r);
+        }
     }
+    state.build_pool.slots.iter().find_map(|slot| {
+        let path = slot.exe_path();
+        let provenance = crate::process::manager::read_slot_provenance(&slot.target_dir);
+        (path.exists() && !is_override(&provenance)).then(|| ResolvedRunnerExe {
+            mtime: file_mtime(&path),
+            path,
+            origin: ExeOrigin::Slot(slot.id),
+            provenance,
+            unverified_warning: None,
+            profile: RunnerBuildProfile::Dev,
+            profile_fallback: None,
+        })
+    })
 }
 
 /// A [`ResolvedRunnerExe`] for an LKG start.

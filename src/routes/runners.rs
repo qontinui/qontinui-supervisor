@@ -1461,12 +1461,13 @@ pub async fn restart_runner(
             .into_response());
     }
 
-    // ── No-rebuild path: stays synchronous (fast restart). ──────────────────
-    // The build source is inert here - `restart_runner_by_id` reads it only
-    // inside its `if rebuild` arm, and nothing is compiled on this path. It is
-    // threaded rather than passed as a literal so both call sites say the same
-    // thing, and so a future change that starts building here cannot inherit a
-    // hardcoded provenance.
+    // ── No-rebuild path: synchronous. ───────────────────────────────────────
+    // Usually a fast restart. One exception compiles: an optimized primary
+    // with nothing startable builds its artifact before stopping the old
+    // process (`primary_start::prepare_primary_start`). That build runs in its
+    // own task (`primary_build_detached`), so a client that disconnects from
+    // this handler does not cancel it. The build source is threaded rather
+    // than passed as a literal so both call sites say the same thing.
     manager::restart_runner_by_id(
         &state,
         &id,

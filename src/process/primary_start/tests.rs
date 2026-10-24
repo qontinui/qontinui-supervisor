@@ -31,6 +31,9 @@ fn state_under(root: &std::path::Path) -> SharedState {
         "--primary-build-profile",
         "release-checked",
     ]));
+    let mut config = config;
+    // A fixed two-slot pool, so no test depends on this machine's sizing.
+    config.build_pool = crate::config::BuildPoolConfig::fixed(2);
     Arc::new(crate::state::SupervisorState::new(config))
 }
 
@@ -160,7 +163,6 @@ async fn an_unattended_start_takes_the_dev_lkg_at_once_and_kicks_a_background_bu
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Unattended,
-        &ProfileSupport::Supported,
         no_build(),
     )
     .await
@@ -192,24 +194,64 @@ async fn an_unattended_start_takes_the_dev_lkg_at_once_and_kicks_a_background_bu
     );
 }
 
+/// Round 2, item 1: a COLD box (nothing at all to start) is not refused — an
+/// unattended start builds in the foreground, because there is no running
+/// primary to protect.
 #[tokio::test]
-async fn an_unattended_fallback_on_a_tree_without_the_profile_names_it_and_kicks_nothing() {
+async fn an_unattended_start_on_a_cold_box_builds_in_the_foreground() {
     let tmp = tempfile::TempDir::new().unwrap();
     let state = state_under(tmp.path());
-    write_lkg(&state, RunnerBuildProfile::Dev);
-    let cause = "the runner tree declares no [profile.release-checked]".to_string();
+    let built = state
+        .config
+        .primary_exe_path(RunnerBuildProfile::ReleaseChecked);
+    let target = built.clone();
     let p = prepare_optimized_primary(
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Unattended,
-        &ProfileSupport::Missing(cause.clone()),
+        move || {
+            write_file(&target, b"cold-built");
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .expect("a cold box builds");
+    assert_eq!(
+        p.resolved.origin,
+        ExeOrigin::PrimaryBuildDir(RunnerBuildProfile::ReleaseChecked)
+    );
+    assert_eq!(p.resolved.path, built);
+    assert!(p.resolved.profile_fallback.is_none());
+    assert!(!p.kick_background_build);
+}
+
+/// m5 nit: a dev slot whose provenance says `override` is never the last
+/// resort while another slot is clean.
+#[tokio::test]
+async fn an_override_dev_slot_is_skipped_for_a_clean_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    for id in [0, 1] {
+        write_file(&state.config.runner_exe_path_for_slot(id), b"dev-slot");
+    }
+    let override_prov = r#"{"sha":"f00","source":"override","built_from":"/ws/.spawn-feat","built_at":"2026-10-24T00:00:00Z"}"#;
+    std::fs::write(
+        state
+            .config
+            .runner_exe_path_for_slot(0)
+            .with_file_name(crate::process::manager::SLOT_PROVENANCE_SIDECAR_FILENAME),
+        override_prov,
+    )
+    .unwrap();
+    let p = prepare_optimized_primary(
+        &state,
+        RunnerBuildProfile::ReleaseChecked,
+        StartIntent::Unattended,
         no_build(),
     )
     .await
     .unwrap();
-    assert_eq!(p.resolved.profile, RunnerBuildProfile::Dev);
-    assert!(p.resolved.profile_fallback.unwrap().contains(&cause));
-    assert!(!p.kick_background_build, "nothing to build on this tree");
+    assert_eq!(p.resolved.origin, ExeOrigin::Slot(1));
 }
 
 /// m5: with no dev LKG an unattended start takes an existing dev slot exe.
@@ -223,7 +265,6 @@ async fn an_unattended_start_with_no_dev_lkg_takes_a_dev_slot_exe() {
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Unattended,
-        &ProfileSupport::Supported,
         no_build(),
     )
     .await
@@ -235,20 +276,22 @@ async fn an_unattended_start_with_no_dev_lkg_takes_a_dev_slot_exe() {
     assert!(logged(&state, "DEBUG PRIMARY FALLBACK").await);
 }
 
+/// A cold box whose foreground build fails is refused, naming the failure.
 #[tokio::test]
-async fn an_unattended_start_with_nothing_at_all_refuses() {
+async fn an_unattended_cold_box_whose_build_fails_refuses_naming_it() {
     let tmp = tempfile::TempDir::new().unwrap();
     let state = state_under(tmp.path());
     let err = prepare_optimized_primary(
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Unattended,
-        &ProfileSupport::Supported,
-        no_build(),
+        || std::future::ready(Err(SupervisorError::BuildFailed("cold-boom".to_string()))),
     )
     .await
     .expect_err("nothing to start");
-    assert!(err.to_string().contains("no dev artifact"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("cold-boom"), "{msg}");
+    assert!(msg.contains("no dev artifact"), "{msg}");
 }
 
 /// The release-checked LKG is still optimized, so it comes before any dev
@@ -263,7 +306,6 @@ async fn the_release_checked_lkg_beats_every_dev_artifact() {
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Unattended,
-        &ProfileSupport::Supported,
         no_build(),
     )
     .await
@@ -290,7 +332,6 @@ async fn a_startable_artifact_is_used_without_building_or_kicking() {
             &state,
             RunnerBuildProfile::ReleaseChecked,
             intent,
-            &ProfileSupport::Supported,
             no_build(),
         )
         .await
@@ -313,7 +354,6 @@ async fn an_operator_build_failure_refuses_and_never_takes_the_dev_lkg() {
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Operator,
-        &ProfileSupport::Supported,
         move || {
             flag.store(true, Ordering::SeqCst);
             std::future::ready(Err(SupervisorError::BuildFailed("boom".to_string())))
@@ -346,7 +386,6 @@ async fn an_operator_build_success_starts_the_fresh_artifact() {
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Operator,
-        &ProfileSupport::Supported,
         move || {
             write_file(&target, b"fresh");
             std::future::ready(Ok(()))
@@ -362,16 +401,23 @@ async fn an_operator_build_success_starts_the_fresh_artifact() {
 }
 
 #[tokio::test]
-async fn an_operator_start_on_a_tree_without_the_profile_refuses_without_building() {
+async fn an_operator_start_on_a_tree_without_the_profile_refuses_naming_it() {
     let tmp = tempfile::TempDir::new().unwrap();
     let state = state_under(tmp.path());
     write_lkg(&state, RunnerBuildProfile::Dev);
+    // The build step carries the profile pre-check (`primary_build`), so an
+    // unsupported tree arrives as a named build failure.
     let err = prepare_optimized_primary(
         &state,
         RunnerBuildProfile::ReleaseChecked,
         StartIntent::Operator,
-        &ProfileSupport::Missing("declares no [profile.release-checked]".to_string()),
-        no_build(),
+        || {
+            std::future::ready(Err(SupervisorError::BuildFailed(
+                "the release-checked primary build is unavailable: the tree declares no \
+                 [profile.release-checked]"
+                    .to_string(),
+            )))
+        },
     )
     .await
     .expect_err("refused");
@@ -462,4 +508,87 @@ fn only_the_serving_watchdog_restart_is_unattended() {
         StartIntent::of_restart(&RestartSource::Manual),
         StartIntent::Operator
     );
+}
+
+/// Round 2 items 2, 4, 7, 8, pinned at source level (they order locks and
+/// tasks that a unit test cannot drive without cargo).
+#[test]
+fn the_primary_build_orders_its_locks_and_detaches_its_task() {
+    let src = include_str!("../primary_start.rs");
+    let build = fn_body(
+        src,
+        "pub async fn primary_build(",
+        "pub async fn primary_build_detached(",
+    );
+    let optimized = &build[build.find("let lock = state").expect("optimized arm")..];
+    // primary lock -> container lock -> one resolved sha -> profile check at it
+    // -> worktree at the SAME sha (the permit is taken inside run_primary_build).
+    let order = [
+        "primary_build_lock",
+        "spawn_container_lock",
+        "origin_main_build_point",
+        "profile_support_from_manifest",
+        "prepare_worktree_at(&project_dir, \"origin/main\", &sha)",
+        "run_primary_build",
+    ];
+    let mut at = 0;
+    for needle in order {
+        let i = optimized[at..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing or out of order"))
+            + at;
+        at = i;
+    }
+    let point = fn_body(
+        src,
+        "async fn origin_main_build_point(",
+        "async fn git_stdout(",
+    );
+    let fetch = point.find("fetch_origin").expect("bounded fetch");
+    let rev = point.find("rev-parse").expect("resolve once");
+    let show = point.find("show").expect("read at the sha");
+    assert!(fetch < rev && rev < show);
+    let prepare = fn_body(
+        src,
+        "pub async fn prepare_primary_start(",
+        "pub async fn prepare_optimized_primary<",
+    );
+    assert!(
+        prepare.contains("primary_build_detached"),
+        "the start-path build must be detached"
+    );
+    let detached = fn_body(
+        src,
+        "pub async fn primary_build_detached(",
+        "async fn log_origin_main_build(",
+    );
+    assert!(detached.contains("tokio::spawn"));
+    let kick = fn_body(
+        src,
+        "pub fn spawn_background_primary_build(",
+        "/// What [`prepare_optimized_primary`] decided.",
+    );
+    assert!(
+        kick.contains("BackgroundBuildLatch"),
+        "the in-flight flag needs a Drop guard"
+    );
+}
+
+/// Round 2 item 2: the predicate a synchronous door uses to file a no-rebuild
+/// restart as the build it will run.
+#[tokio::test]
+async fn primary_start_needs_build_only_when_nothing_is_startable() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = state_under(tmp.path());
+    assert!(primary_start_needs_build(&state).await);
+    // An LKG is a fallback, not a startable build: the operator path still builds.
+    write_lkg(&state, RunnerBuildProfile::ReleaseChecked);
+    assert!(primary_start_needs_build(&state).await);
+    write_file(
+        &state
+            .config
+            .primary_exe_path(RunnerBuildProfile::ReleaseChecked),
+        b"optimized",
+    );
+    assert!(!primary_start_needs_build(&state).await);
 }

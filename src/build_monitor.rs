@@ -1304,7 +1304,11 @@ async fn run_cargo_build_on(
 
     // Stop non-primary exe-mode runners that lock the build artifact.
     // (Non-primary runners now use copied exes, but stop any still using the original.)
-    stop_exe_runners_for_build(state).await;
+    // A primary-dir build writes only `target-pool/primary/`, which no temp or
+    // named runner ever runs from, so it stops nothing.
+    if target == BuildTarget::Pool {
+        stop_exe_runners_for_build(state).await;
+    }
 
     // Reap stale cargo/rustc left building into THIS slot by a previous build
     // (e.g. after a supervisor crash), so the slot's target/exe is not locked.
@@ -2804,6 +2808,40 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         warn!("{}", msg);
         state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
     }
+    if let Some(msg) =
+        git_credential_verdict(slot.id, slot.profile, &artifact_dir, declared.as_ref())
+    {
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+}
+
+/// The post-build check for [`GIT_CREDENTIAL_BIN`], which only an optimized
+/// profile's sidecar build carries ([`sidecar_cargo_args`]): a WARN when the
+/// tree declares it and the artifact dir holds no real binary of it. `None`
+/// for a dev slot, or when it is present and non-empty.
+pub(crate) fn git_credential_verdict(
+    slot_id: usize,
+    profile: crate::build_profile::RunnerBuildProfile,
+    artifact_dir: &std::path::Path,
+    declared: Option<&std::collections::BTreeSet<String>>,
+) -> Option<String> {
+    if profile == crate::build_profile::RunnerBuildProfile::Dev
+        || declared.is_some_and(|d| !d.contains(GIT_CREDENTIAL_BIN))
+    {
+        return None;
+    }
+    let path = artifact_dir.join(crate::process::manager::GIT_CREDENTIAL_EXE_FILENAME);
+    let problem = match SidecarFile::inspect(&path) {
+        SidecarFile::Present { .. } => return None,
+        SidecarFile::Missing => "is missing",
+        SidecarFile::Empty => "is ZERO-LENGTH (a build placeholder, not a binary)",
+    };
+    Some(format!(
+        "{GIT_CREDENTIAL_BIN} sidecar {path:?} {problem} on slot {slot_id} after the sidecar \
+         build — the runner falls back to the dev target/debug/ helper, or skips installing one \
+         (runner build itself succeeded; deploy continues)"
+    ))
 }
 
 /// What [`build_sidecars`] reports after cargo returns: the sidecars that are
@@ -4990,42 +5028,14 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
         return;
     }
 
-    let mut slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
-    // The primary's own build dir is warmed too when it is an optimized dir
-    // the live tree can build — under its build lock, so a prewarm never runs
-    // beside a primary build into the same target dir. Skipped (and said so)
-    // when the tree does not declare the profile.
-    let primary = state.build_pool.primary_slot.clone();
-    let primary_lock = if primary.profile != crate::build_profile::RunnerBuildProfile::Dev {
-        match crate::process::primary_start::build_tree_profile_support(
-            &state,
-            primary.profile,
-            crate::process::manager::BuildTree::LiveWorkingTree,
-        )
-        .await
-        {
-            crate::process::primary_start::ProfileSupport::Supported => {
-                match state.build_pool.primary_build_lock.clone().try_lock_owned() {
-                    Ok(guard) => {
-                        slots.push(primary.clone());
-                        Some(guard)
-                    }
-                    Err(_) => {
-                        info!(
-                            "Primary build dir busy (a primary build holds it) — not prewarming it"
-                        );
-                        None
-                    }
-                }
-            }
-            crate::process::primary_start::ProfileSupport::Missing(cause) => {
-                info!("Not prewarming the primary build dir: {cause}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // The primary's own build dir FIRST, when it is an optimized dir the live
+    // tree can build. Its build lock is held for that one prewarm only — try,
+    // never wait — and dropped before the pool slots, so a primary build is
+    // never blocked behind pool prewarms. Skipped (and said so) when the tree
+    // does not declare the profile.
+    prewarm_primary_build_dir(&state).await;
+
+    let slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
     info!("Pre-warming {} build slot(s)...", slots.len());
 
     for slot in slots {
@@ -5046,8 +5056,45 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
                 .await;
         }
     }
-    drop(primary_lock);
     info!("Build slot pre-warm complete");
+}
+
+/// Prewarm `target-pool/primary/` (see [`prewarm_build_slots`]).
+async fn prewarm_primary_build_dir(state: &crate::state::SharedState) {
+    let primary = state.build_pool.primary_slot.clone();
+    if primary.profile == crate::build_profile::RunnerBuildProfile::Dev {
+        return;
+    }
+    if primary.exe_path().exists() {
+        info!("Primary build dir already has a binary, skipping prewarm");
+        return;
+    }
+    if let crate::process::primary_start::ProfileSupport::Missing(cause) =
+        crate::process::primary_start::build_tree_profile_support(
+            state,
+            primary.profile,
+            crate::process::manager::BuildTree::LiveWorkingTree,
+        )
+        .await
+    {
+        info!("Not prewarming the primary build dir: {cause}");
+        return;
+    }
+    let Ok(_lock) = state.build_pool.primary_build_lock.clone().try_lock_owned() else {
+        info!("Primary build dir busy (a primary build holds it) — not prewarming it");
+        return;
+    };
+    if let Err(e) = prewarm_single_slot(state, &primary).await {
+        warn!("Prewarm of the primary build dir failed: {}", e);
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Warn,
+                format!("Prewarm of the primary build dir failed: {e}"),
+            )
+            .await;
+    }
 }
 
 async fn prewarm_single_slot(

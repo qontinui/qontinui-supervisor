@@ -844,7 +844,14 @@ async fn reap_stuck_build_slots(state: state::SharedState) {
         let now = chrono::Utc::now();
         let max_age = max_build_age_secs();
 
-        for slot in &state.build_pool.slots {
+        // The primary's build dir too: a stuck primary build holds a pool
+        // permit just like a stuck slot build.
+        for slot in state
+            .build_pool
+            .slots
+            .iter()
+            .chain(std::iter::once(&state.build_pool.primary_slot))
+        {
             if let Ok(mut busy) = slot.busy.try_write() {
                 if let Some(ref info) = *busy {
                     let elapsed = (now - info.started_at).num_seconds().max(0);

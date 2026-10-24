@@ -2390,6 +2390,10 @@ fn start_gate_non_temp_override_refuses_with_recovery() {
         msg.contains("POST /runner/fix-and-rebuild"),
         "missing recovery: {msg}"
     );
+    assert!(
+        msg.contains(r#"POST /runner/restart {"rebuild": true}"#),
+        "missing the primary's recovery: {msg}"
+    );
     // Maps to a 500 through existing start-failure plumbing.
     assert_eq!(
         err.to_status_body().0,

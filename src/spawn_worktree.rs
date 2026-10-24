@@ -570,6 +570,24 @@ pub async fn prepare_worktree(
     project_dir: &Path,
     git_ref: &str,
 ) -> Result<PreparedWorktree, SupervisorError> {
+    prepare_worktree_at(project_dir, git_ref, git_ref).await
+}
+
+/// [`prepare_worktree`] with the container named by `git_ref` but the runner
+/// worktree checked out at `checkout` — e.g. the `origin/main` container
+/// pinned to ONE already-resolved sha, so a caller that inspected that sha
+/// builds exactly what it inspected even if `origin/main` moves meanwhile.
+/// `requested_ref` is `git_ref`; `resolved_sha` is what was checked out.
+pub async fn prepare_worktree_at(
+    project_dir: &Path,
+    git_ref: &str,
+    checkout: &str,
+) -> Result<PreparedWorktree, SupervisorError> {
+    if checkout.trim().is_empty() {
+        return Err(SupervisorError::Validation(
+            "checkout must be a non-empty git ref".to_string(),
+        ));
+    }
     if git_ref.trim().is_empty() {
         return Err(SupervisorError::Validation(
             "git_ref must be a non-empty git ref".to_string(),
@@ -621,7 +639,7 @@ pub async fn prepare_worktree(
         // <ref>` creates the intermediate `<container>/` dir as needed.
         let runner_wt_str = runner_wt.to_string_lossy().to_string();
         git(
-            &["worktree", "add", "--detach", &runner_wt_str, git_ref],
+            &["worktree", "add", "--detach", &runner_wt_str, checkout],
             &repo_root,
             false,
         )
@@ -630,12 +648,12 @@ pub async fn prepare_worktree(
         // Reuse: refresh + hard-pin the runner worktree to the ref.
         git(&["fetch", "--quiet", "origin"], &runner_wt, true).await?;
         git(
-            &["checkout", "--detach", "--force", git_ref],
+            &["checkout", "--detach", "--force", checkout],
             &runner_wt,
             false,
         )
         .await?;
-        git(&["reset", "--hard", git_ref], &runner_wt, false).await?;
+        git(&["reset", "--hard", checkout], &runner_wt, false).await?;
     }
 
     // Prepare (or re-pin) the schemas worktree. Done for BOTH fresh and reuse

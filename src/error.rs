@@ -230,7 +230,7 @@ impl SupervisorError {
                 ],
                 "recovery": [
                     "POST /runners/spawn-test {\"rebuild\": true}",
-                    "POST /runner/fix-and-rebuild",
+                    "POST /runner/restart {\"rebuild\": true} (the primary)",
                 ],
             });
             return (StatusCode::CONFLICT, body);

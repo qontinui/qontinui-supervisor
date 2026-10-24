@@ -2731,3 +2731,65 @@ fn the_primary_sidecar_build_carries_the_git_credential_helper() {
             .contains(&"qontinui-git-credential")
     );
 }
+
+/// Round 2 nit: the post-build sidecar check covers the git credential helper
+/// for an optimized profile — and only there.
+#[test]
+fn the_git_credential_verdict_checks_optimized_profiles_only() {
+    use crate::build_profile::RunnerBuildProfile;
+    let dir = tempfile::tempdir().unwrap();
+    let rc = RunnerBuildProfile::ReleaseChecked;
+    let msg = super::git_credential_verdict(255, rc, dir.path(), None).expect("missing");
+    assert!(msg.contains("is missing"), "{msg}");
+    assert_eq!(
+        super::git_credential_verdict(0, RunnerBuildProfile::Dev, dir.path(), None),
+        None
+    );
+    let undeclared: std::collections::BTreeSet<String> = Default::default();
+    assert_eq!(
+        super::git_credential_verdict(255, rc, dir.path(), Some(&undeclared)),
+        None
+    );
+    let helper = dir
+        .path()
+        .join(crate::process::manager::GIT_CREDENTIAL_EXE_FILENAME);
+    fs::write(&helper, b"").unwrap();
+    assert!(super::git_credential_verdict(255, rc, dir.path(), None)
+        .unwrap()
+        .contains("ZERO-LENGTH"));
+    fs::write(&helper, b"bin").unwrap();
+    assert_eq!(
+        super::git_credential_verdict(255, rc, dir.path(), None),
+        None
+    );
+}
+
+/// Round 2 item 6 + nit: prewarm never holds the primary build lock across the
+/// pool slots, and a primary-dir build stops no exe-mode runners.
+#[test]
+fn prewarm_and_primary_builds_keep_their_scope() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("build_monitor.rs"),
+    )
+    .unwrap()
+    .replace("\r\n", "\n");
+    let prewarm = crate::source_scan::fn_body(&src, "pub async fn prewarm_build_slots(")
+        .expect("prewarm_build_slots")
+        .to_string();
+    assert!(
+        !prewarm.contains("primary_build_lock"),
+        "the pool prewarm loop must not hold the primary build lock"
+    );
+    let primary = crate::source_scan::fn_body(&src, "async fn prewarm_primary_build_dir(")
+        .expect("prewarm_primary_build_dir")
+        .to_string();
+    assert!(primary.contains("try_lock_owned"));
+    let build = crate::source_scan::fn_body(&src, "async fn run_cargo_build_on(")
+        .expect("run_cargo_build_on")
+        .to_string();
+    assert!(build.contains(
+        "if target == BuildTarget::Pool {\n        stop_exe_runners_for_build(state).await;"
+    ));
+}
