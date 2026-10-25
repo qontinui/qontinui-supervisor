@@ -203,11 +203,7 @@ pub async fn evaluate_all(state: &SharedState, resolution: SlotResolution) -> Ve
         .build_pool
         .slots
         .iter()
-        .map(|s| {
-            s.target_dir
-                .join("debug")
-                .join(crate::config::RUNNER_BIN_NAME)
-        })
+        .map(|s| s.exe_path())
         .collect();
     let slots_empty = slots_empty_from_paths(&slot_exe_paths);
 

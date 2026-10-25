@@ -134,7 +134,15 @@ pub struct FootprintSnapshot {
     #[serde(flatten)]
     pub build_pool: BuildPoolOccupancy,
     pub slots: Vec<SlotFootprint>,
+    /// Every LKG under `target-pool/lkg/` — each per-profile dir and any
+    /// legacy flat one.
     pub lkg_bytes: u64,
+    /// The primary's dedicated build dir, `target-pool/primary/` (plan
+    /// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`). Its
+    /// own field, not a slot: the disk floor is derived from SLOT sizes only
+    /// (`build_sizing::largest_slot`), and this dir is deliberately excluded
+    /// from that derivation — see `build_sizing::built_slot_ids`.
+    pub primary_target_bytes: u64,
     pub spawn_containers: SpawnContainersFootprint,
     pub exe_copies: ExeCopiesFootprint,
 }
@@ -306,12 +314,12 @@ pub fn disk_free_bytes_for(path: &Path) -> Option<u64> {
 }
 
 /// Enumerate per-runner exe copies: the flat
-/// `<npm_dir>/target/debug/qontinui-runner-*.exe` copies (NOT the bare
-/// `qontinui-runner.exe`, which is the build output) and the
-/// `<npm_dir>/target/debug/runners/*/qontinui-runner[.exe]` per-runner
+/// `<npm_dir>/target/<profile-dir>/qontinui-runner-*.exe` copies in EVERY
+/// profile dir (the primary's copy sits in `target/release-checked/` by
+/// default — NOT the bare `qontinui-runner.exe`, which is the build output)
+/// and the `<npm_dir>/target/debug/runners/*/qontinui-runner[.exe]` per-runner
 /// directories. Returns count + total bytes.
 fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
-    let debug_dir = npm_dir.join("target").join("debug");
     let mut out = ExeCopiesFootprint::default();
     let mut count_file = |path: &Path| {
         if let Ok(meta) = std::fs::metadata(path) {
@@ -321,7 +329,13 @@ fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
             }
         }
     };
-    if let Ok(entries) = std::fs::read_dir(&debug_dir) {
+    let target = npm_dir.join("target");
+    for profile_dir in
+        crate::build_profile::RunnerBuildProfile::ALL.map(|p| p.artifact_dir(&target))
+    {
+        let Ok(entries) = std::fs::read_dir(&profile_dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -340,7 +354,10 @@ fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
             }
         }
     }
-    let copies_root = debug_dir.join(crate::config::RUNNER_COPIES_DIR);
+    // Temp and named copies are dev-built only.
+    let copies_root = crate::build_profile::RunnerBuildProfile::Dev
+        .artifact_dir(&target)
+        .join(crate::config::RUNNER_COPIES_DIR);
     if let Ok(entries) = std::fs::read_dir(&copies_root) {
         for entry in entries.flatten() {
             count_file(&entry.path().join(crate::config::RUNNER_BIN_NAME));
@@ -418,7 +435,8 @@ pub fn compute_snapshot(config: &SupervisorConfig) -> FootprintSnapshot {
         });
     }
 
-    let lkg_bytes = dir_size_bytes(&config.lkg_dir());
+    let lkg_bytes = dir_size_bytes(&config.lkg_root());
+    let primary_target_bytes = dir_size_bytes(&config.primary_target_dir());
 
     // Derive the workspace root exactly as the prune engine does so the
     // `.spawn-*` accounting and the pruner look at the same dir.
@@ -447,6 +465,7 @@ pub fn compute_snapshot(config: &SupervisorConfig) -> FootprintSnapshot {
         build_pool: BuildPoolOccupancy::default(),
         slots,
         lkg_bytes,
+        primary_target_bytes,
         spawn_containers,
         exe_copies,
     }
@@ -626,6 +645,7 @@ mod tests {
             },
             slots: vec![],
             lkg_bytes: 0,
+            primary_target_bytes: 0,
             spawn_containers: SpawnContainersFootprint::default(),
             exe_copies: ExeCopiesFootprint::default(),
         };

@@ -42,6 +42,7 @@ fn config_with_project_dir(dir: PathBuf) -> SupervisorConfig {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        primary_build_profile: Default::default(),
     }
 }
 
@@ -55,6 +56,7 @@ async fn state_for(project_dir: PathBuf, lkg_at: Option<DateTime<Utc>>) -> Share
             exe_size: 0,
             sha: None,
             source: qontinui_supervisor::process::manager::BuildSource::LiveTree,
+            profile: qontinui_supervisor::build_profile::RunnerBuildProfile::Dev,
         });
     }
     state

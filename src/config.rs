@@ -3,6 +3,8 @@ use qontinui_types::wire::runner_kind::RunnerKind;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::build_profile::RunnerBuildProfile;
+
 /// Runner binary filename for the current platform: `qontinui-runner.exe` on
 /// Windows, `qontinui-runner` on Unix. Build/spawn/LKG/footprint paths must use
 /// this (or [`std::env::consts::EXE_SUFFIX`] for derived names) instead of a
@@ -262,6 +264,14 @@ pub struct CliArgs {
     /// `process::env_forwarders::DisplayEnv`.
     #[arg(long = "temp-runner-display")]
     pub temp_runner_display: Option<String>,
+
+    /// Cargo profile the PRIMARY runner is built and resolved in:
+    /// `release-checked` (the default — optimized, debug assertions kept on)
+    /// or `dev` (an announced opt-in to a debug primary). Also settable via
+    /// env `QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE` (this flag wins). Temp
+    /// and named runners always use `dev`. See `crate::build_profile`.
+    #[arg(long = "primary-build-profile", value_parser = crate::build_profile::parse_profile_arg)]
+    pub primary_build_profile: Option<crate::build_profile::RunnerBuildProfile>,
 }
 
 /// Env var equivalent of [`CliArgs::temp_runner_display`].
@@ -295,6 +305,11 @@ pub struct SupervisorConfig {
     /// has none (`--temp-runner-display`, else
     /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`). Blank counts as unset.
     pub temp_runner_display: Option<String>,
+    /// The CONFIGURED build profile of the primary runner (default
+    /// `release-checked`; `--primary-build-profile dev` /
+    /// `QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE=dev` opt into a debug
+    /// primary). See [`crate::build_profile`].
+    pub primary_build_profile: crate::build_profile::PrimaryBuildProfile,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -1155,6 +1170,10 @@ impl SupervisorConfig {
             args.temp_runner_display,
             std::env::var(TEMP_RUNNER_DISPLAY_ENV).ok(),
         );
+        let primary_build_profile = crate::build_profile::PrimaryBuildProfile::resolve(
+            args.primary_build_profile,
+            std::env::var(crate::build_profile::PRIMARY_BUILD_PROFILE_ENV).ok(),
+        );
 
         let mut config = SupervisorConfig {
             project_dir: args.project_dir,
@@ -1175,6 +1194,7 @@ impl SupervisorConfig {
             no_prewarm,
             no_webview,
             temp_runner_display,
+            primary_build_profile,
         };
         config.build_pool =
             BuildPoolConfig::for_pool_root(&config.runner_npm_dir().join("target-pool"));
@@ -1194,31 +1214,70 @@ impl SupervisorConfig {
 
     /// Path to the runner executable inside a specific slot's target dir.
     /// Used by the binary copy step after a per-slot cargo build completes.
+    ///
+    /// Pool slots only ever hold the `dev` profile (the primary's optimized
+    /// builds go to [`Self::primary_target_dir`]), so this is
+    /// `slot-N/debug/<RUNNER_BIN_NAME>` by construction.
     pub fn runner_exe_path_for_slot(&self, slot_id: usize) -> PathBuf {
-        self.runner_slot_target_dir(slot_id)
-            .join("debug")
-            .join(RUNNER_BIN_NAME)
+        RunnerBuildProfile::Dev.runner_exe(&self.runner_slot_target_dir(slot_id))
     }
 
-    /// Last-known-good directory under the build pool. Holds a copy of the
-    /// most recent successfully built runner exe plus a `lkg.json` sidecar
-    /// describing when it was built and which slot it came from. Survives
-    /// any subsequent failed build that overwrites or deletes a slot's exe.
-    pub fn lkg_dir(&self) -> PathBuf {
+    /// The primary runner's dedicated `CARGO_TARGET_DIR`,
+    /// `target-pool/primary/` — never a pool slot, so no slot holds two
+    /// profiles. See [`crate::build_profile`].
+    pub fn primary_target_dir(&self) -> PathBuf {
+        crate::build_profile::primary_target_dir(&self.runner_npm_dir())
+    }
+
+    /// The runner exe a primary build in `profile` produces:
+    /// `target-pool/primary/<profile-dir>/<RUNNER_BIN_NAME>`.
+    pub fn primary_exe_path(&self, profile: RunnerBuildProfile) -> PathBuf {
+        profile.runner_exe(&self.primary_target_dir())
+    }
+
+    /// The root of every last-known-good store, `target-pool/lkg/`.
+    ///
+    /// Before per-profile LKGs existed this directory itself held the (debug)
+    /// LKG exe and `lkg.json`; such a flat LKG is still read, as a `dev` LKG
+    /// only (see [`Self::legacy_lkg_metadata_path`]).
+    pub fn lkg_root(&self) -> PathBuf {
         self.runner_npm_dir().join("target-pool").join("lkg")
     }
 
-    /// Path to the LKG runner exe. The file is replaced atomically on every
-    /// successful build via copy-to-temp + rename.
-    pub fn lkg_exe_path(&self) -> PathBuf {
-        self.lkg_dir().join(RUNNER_BIN_NAME)
+    /// Last-known-good directory for `profile`: `target-pool/lkg/<profile-dir>/`.
+    /// Holds a copy of the most recent successfully built runner exe of that
+    /// profile plus a `lkg.json` sidecar (which records the `profile`).
+    /// Survives any subsequent failed build that overwrites or deletes the
+    /// build dir's exe.
+    pub fn lkg_dir(&self, profile: RunnerBuildProfile) -> PathBuf {
+        self.lkg_root().join(profile.dir_name())
     }
 
-    /// Path to the LKG metadata sidecar (`built_at`, `source_slot`, `exe_size`,
-    /// `sha`, `source`). Loaded at supervisor startup so the in-memory
-    /// `last_known_good` field survives restarts.
-    pub fn lkg_metadata_path(&self) -> PathBuf {
-        self.lkg_dir().join("lkg.json")
+    /// Path to the LKG runner exe for `profile`. Replaced atomically on every
+    /// successful build of that profile via copy-to-temp + rename.
+    pub fn lkg_exe_path(&self, profile: RunnerBuildProfile) -> PathBuf {
+        self.lkg_dir(profile).join(RUNNER_BIN_NAME)
+    }
+
+    /// Path to the LKG metadata sidecar for `profile` (`built_at`,
+    /// `source_slot`, `exe_size`, `sha`, `source`, `profile`). Loaded at
+    /// supervisor startup so the in-memory LKG survives restarts.
+    pub fn lkg_metadata_path(&self, profile: RunnerBuildProfile) -> PathBuf {
+        self.lkg_dir(profile).join("lkg.json")
+    }
+
+    /// The pre-per-profile flat LKG sidecar, `target-pool/lkg/lkg.json`.
+    /// Transitional: it can only ever describe a `dev` build (nothing else was
+    /// ever written there), carries no `profile` field, and is read as a `dev`
+    /// LKG — never upgraded to any other profile. Delete once no box can still
+    /// hold one (the first successful dev build writes `lkg/debug/`).
+    pub fn legacy_lkg_metadata_path(&self) -> PathBuf {
+        self.lkg_root().join("lkg.json")
+    }
+
+    /// The exe beside [`Self::legacy_lkg_metadata_path`].
+    pub fn legacy_lkg_exe_path(&self) -> PathBuf {
+        self.lkg_root().join(RUNNER_BIN_NAME)
     }
 
     /// The directory cargo is invoked from for runner builds (`src-tauri`),
@@ -1255,16 +1314,21 @@ impl SupervisorConfig {
     }
 
     /// The same ladder as [`Self::runner_target_dir_candidates`], expressed as
-    /// runner-exe paths (`<target-dir>/debug/<RUNNER_BIN_NAME>`).
+    /// runner-exe paths for `profile` (`<target-dir>/<profile-dir>/<RUNNER_BIN_NAME>`).
     ///
-    /// `build_monitor::run_cargo_build` runs `cargo build --bin qontinui-runner`
-    /// with no `--release`, so the fresh artifact is always under `debug/`.
-    /// Pointing this at release once caused `spawn-test {rebuild:true}` to
-    /// rebuild debug and then silently launch a stale release binary.
-    pub fn runner_exe_candidates(&self) -> Vec<(TargetDirSource, PathBuf)> {
+    /// The profile is a PARAMETER, never a literal: pointing this at `release`
+    /// by hand once caused `spawn-test {rebuild:true}` to rebuild debug and
+    /// then silently launch a stale release binary. Callers pass the profile
+    /// they are resolving FOR (`dev` for temp/named runners, the configured
+    /// primary profile for the primary), so the build that just ran and the
+    /// artifact resolution read the same directory.
+    pub fn runner_exe_candidates(
+        &self,
+        profile: RunnerBuildProfile,
+    ) -> Vec<(TargetDirSource, PathBuf)> {
         self.runner_target_dir_candidates()
             .into_iter()
-            .map(|(src, dir)| (src, dir.join("debug").join(RUNNER_BIN_NAME)))
+            .map(|(src, dir)| (src, profile.runner_exe(&dir)))
             .collect()
     }
 
@@ -1274,16 +1338,30 @@ impl SupervisorConfig {
     /// refusal messages) should use this rather than [`Self::runner_exe_path`]:
     /// the whole reason the stale-binary incident went unnoticed is that
     /// nothing ever reported where the binary came from.
-    pub fn runner_exe_path_resolved(&self) -> (TargetDirSource, PathBuf) {
-        let candidates = self.runner_exe_candidates();
+    pub fn runner_exe_path_resolved(
+        &self,
+        profile: RunnerBuildProfile,
+    ) -> (TargetDirSource, PathBuf) {
+        let candidates = self.runner_exe_candidates(profile);
         pick_exe_candidate(&candidates, |p| p.exists())
     }
 
     /// Path to the runner executable (for exe mode), resolved through cargo's
     /// target-dir precedence. Convenience wrapper over
     /// [`Self::runner_exe_path_resolved`] for call sites that only need the path.
-    pub fn runner_exe_path(&self) -> PathBuf {
-        self.runner_exe_path_resolved().1
+    pub fn runner_exe_path(&self, profile: RunnerBuildProfile) -> PathBuf {
+        self.runner_exe_path_resolved(profile).1
+    }
+
+    /// The build profile a runner of this config is built and resolved in:
+    /// the configured [`Self::primary_build_profile`] for the `Primary`, `dev`
+    /// for every other kind (temp and named runners are the iteration loop).
+    pub fn runner_profile(&self, config: &RunnerConfig) -> RunnerBuildProfile {
+        if config.kind().is_primary() {
+            self.primary_build_profile.profile
+        } else {
+            RunnerBuildProfile::Dev
+        }
     }
 
     /// Per-runner copy DIRECTORY for `Temp` and `Named` runners:
@@ -1316,10 +1394,10 @@ impl SupervisorConfig {
             RunnerKind::Named { .. } => format!("qontinui-runner-named-{}", config.port),
             _ => return None,
         };
+        // Temp and named runners are always dev-built (`runner_profile`).
         Some(
-            self.runner_npm_dir()
-                .join("target")
-                .join("debug")
+            RunnerBuildProfile::Dev
+                .artifact_dir(&self.runner_npm_dir().join("target"))
                 .join(RUNNER_COPIES_DIR)
                 .join(pool_name),
         )
@@ -1338,9 +1416,8 @@ impl SupervisorConfig {
     pub fn legacy_flat_named_exe_copy_path(&self, config: &RunnerConfig) -> Option<PathBuf> {
         match &config.kind {
             RunnerKind::Named { .. } => Some(
-                self.runner_npm_dir()
-                    .join("target")
-                    .join("debug")
+                RunnerBuildProfile::Dev
+                    .artifact_dir(&self.runner_npm_dir().join("target"))
                     .join(format!(
                         "qontinui-runner-named-{}{}",
                         config.port,
@@ -1361,15 +1438,57 @@ impl SupervisorConfig {
     ///   — primary's id is already a stable `"primary"`, and external runners
     ///   are user-managed (the supervisor only observes them). Any future
     ///   `RunnerKind` variant (the enum is `#[non_exhaustive]`) takes this arm.
+    ///
+    /// The flat arm sits in the profile dir of the runner's configured profile
+    /// ([`Self::runner_profile`]): `target/release-checked/qontinui-runner-primary[.exe]`
+    /// for the default primary, `target/debug/...` for a `dev` one. A start that
+    /// deploys an artifact of a DIFFERENT profile (the unattended dev-LKG
+    /// fallback) copies to [`Self::runner_exe_copy_path_for`] of that profile,
+    /// so a copy's directory always names what it holds.
     pub fn runner_exe_copy_path(&self, config: &RunnerConfig) -> PathBuf {
+        self.runner_exe_copy_path_for(config, self.runner_profile(config))
+    }
+
+    /// [`Self::runner_exe_copy_path`] for an explicit artifact profile. Only
+    /// the flat (`Primary` / `External`) arm depends on it; the per-runner
+    /// `Temp` / `Named` directories are always dev-built.
+    pub fn runner_exe_copy_path_for(
+        &self,
+        config: &RunnerConfig,
+        profile: RunnerBuildProfile,
+    ) -> PathBuf {
         if let Some(dir) = self.runner_exe_copy_dir(config) {
             return dir.join(RUNNER_BIN_NAME);
         }
         let sfx = std::env::consts::EXE_SUFFIX;
-        self.runner_npm_dir()
-            .join("target")
-            .join("debug")
+        profile
+            .artifact_dir(&self.runner_npm_dir().join("target"))
             .join(format!("qontinui-runner-{}{}", config.id, sfx))
+    }
+
+    /// Every image path a live process of this runner may be running from —
+    /// the identity set for the orphan scan and the stop path.
+    ///
+    /// For the `Primary` that is its copy path in EVERY profile dir: a primary
+    /// started before the profile switch (or by the unattended dev-LKG
+    /// fallback) runs from `target/debug/qontinui-runner-primary[.exe]` while the
+    /// configured copy path is under `target/release-checked/`, and a stop or
+    /// orphan scan that knew only the configured path would read the
+    /// operator's runner as unowned. A `Named` runner adds its pre-layout flat
+    /// path ([`Self::legacy_flat_named_exe_copy_path`]). The configured path is
+    /// always first.
+    pub fn runner_exe_identity_paths(&self, config: &RunnerConfig) -> Vec<PathBuf> {
+        let mut out = vec![self.runner_exe_copy_path(config)];
+        if config.kind().is_primary() {
+            for profile in RunnerBuildProfile::ALL {
+                let p = self.runner_exe_copy_path_for(config, profile);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out.extend(self.legacy_flat_named_exe_copy_path(config));
+        out
     }
 
     /// Path to the runner npm project root (parent of src-tauri).
@@ -1835,6 +1954,9 @@ mod tests {
             no_prewarm: false,
             no_webview: false,
             temp_runner_display: None,
+            // Explicit, so an ambient QONTINUI_SUPERVISOR_PRIMARY_BUILD_PROFILE
+            // cannot change what these fixtures resolve.
+            primary_build_profile: Some(RunnerBuildProfile::ReleaseChecked),
         }
     }
 
@@ -1896,8 +2018,109 @@ mod tests {
     fn test_runner_exe_path() {
         let args = make_test_args(false, false);
         let config = SupervisorConfig::from_args(args);
-        let exe_path = config.runner_exe_path();
+        let exe_path = config.runner_exe_path(RunnerBuildProfile::Dev);
         assert!(exe_path.ends_with(format!("target/debug/{}", RUNNER_BIN_NAME)));
+        let rc = config.runner_exe_path(RunnerBuildProfile::ReleaseChecked);
+        assert!(rc.ends_with(format!("target/release-checked/{}", RUNNER_BIN_NAME)));
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// every path the primary's profile reaches, asserted as a LITERAL suffix.
+    #[test]
+    fn primary_and_lkg_paths_are_per_profile_and_slots_stay_debug() {
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        let npm = config.runner_npm_dir();
+        let rel = |p: PathBuf| {
+            p.strip_prefix(&npm)
+                .expect("under the runner npm dir")
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let exe = RUNNER_BIN_NAME;
+        assert_eq!(rel(config.primary_target_dir()), "target-pool/primary");
+        assert_eq!(
+            rel(config.primary_exe_path(RunnerBuildProfile::ReleaseChecked)),
+            format!("target-pool/primary/release-checked/{exe}")
+        );
+        assert_eq!(
+            rel(config.runner_exe_path_for_slot(0)),
+            format!("target-pool/slot-0/debug/{exe}")
+        );
+        assert_eq!(
+            rel(config.lkg_exe_path(RunnerBuildProfile::ReleaseChecked)),
+            format!("target-pool/lkg/release-checked/{exe}")
+        );
+        assert_eq!(
+            rel(config.lkg_metadata_path(RunnerBuildProfile::Dev)),
+            "target-pool/lkg/debug/lkg.json"
+        );
+        assert_eq!(
+            rel(config.legacy_lkg_metadata_path()),
+            "target-pool/lkg/lkg.json"
+        );
+        assert_eq!(
+            rel(config.legacy_lkg_exe_path()),
+            format!("target-pool/lkg/{exe}")
+        );
+    }
+
+    #[test]
+    fn runner_profile_is_the_configured_one_for_the_primary_only() {
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+        let primary = RunnerConfig::default_primary();
+        let mut temp = RunnerConfig::default_primary();
+        temp.id = "test-abc".to_string();
+        temp.kind = RunnerKind::Temp {
+            id: "test-abc".to_string(),
+        };
+        assert_eq!(
+            config.runner_profile(&primary),
+            RunnerBuildProfile::ReleaseChecked
+        );
+        assert_eq!(config.runner_profile(&temp), RunnerBuildProfile::Dev);
+        config.primary_build_profile =
+            crate::build_profile::PrimaryBuildProfile::resolve(Some(RunnerBuildProfile::Dev), None);
+        assert_eq!(config.runner_profile(&primary), RunnerBuildProfile::Dev);
+    }
+
+    /// The primary's copy follows its profile, and its identity set covers
+    /// EVERY profile dir so a primary started from `target/debug/` before the
+    /// switch is still recognised as the operator's.
+    #[test]
+    fn primary_copy_path_follows_the_profile_and_identity_covers_both() {
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+        let target = config.runner_npm_dir().join("target");
+        let primary = RunnerConfig::default_primary();
+        let name = format!("qontinui-runner-primary{}", std::env::consts::EXE_SUFFIX);
+        let rc_copy = target.join("release-checked").join(&name);
+        let dev_copy = target.join("debug").join(&name);
+        assert_eq!(config.runner_exe_copy_path(&primary), rc_copy);
+        assert_eq!(
+            config.runner_exe_identity_paths(&primary),
+            vec![rc_copy.clone(), dev_copy.clone()]
+        );
+        config.primary_build_profile =
+            crate::build_profile::PrimaryBuildProfile::resolve(Some(RunnerBuildProfile::Dev), None);
+        assert_eq!(config.runner_exe_copy_path(&primary), dev_copy);
+        assert_eq!(
+            config.runner_exe_identity_paths(&primary),
+            vec![dev_copy, rc_copy]
+        );
+        // A temp runner's identity is its one dev-built copy.
+        let mut temp = RunnerConfig::default_primary();
+        temp.id = "test-abc".to_string();
+        temp.port = 9877;
+        temp.kind = RunnerKind::Temp {
+            id: "test-abc".to_string(),
+        };
+        assert_eq!(
+            config.runner_exe_identity_paths(&temp),
+            vec![target
+                .join("debug")
+                .join("runners")
+                .join("qontinui-runner-test-9877")
+                .join(RUNNER_BIN_NAME)]
+        );
     }
 
     /// S-2: `Temp` and `Named` copies each get their own port-pooled
@@ -1936,14 +2159,20 @@ mod tests {
                 .join(RUNNER_BIN_NAME)
         );
 
+        // The default primary is release-checked, so its flat copy is under
+        // `target/release-checked/` (see the profile tests below).
         let primary = RunnerConfig::default_primary();
         assert_eq!(config.runner_exe_copy_dir(&primary), None);
         assert_eq!(
             config.runner_exe_copy_path(&primary),
-            debug.join(format!(
-                "qontinui-runner-primary{}",
-                std::env::consts::EXE_SUFFIX
-            ))
+            config
+                .runner_npm_dir()
+                .join("target")
+                .join("release-checked")
+                .join(format!(
+                    "qontinui-runner-primary{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
         );
     }
 

@@ -1312,6 +1312,7 @@ mod router_tests {
             no_prewarm: false,
             no_webview: true,
             temp_runner_display: None,
+            primary_build_profile: Default::default(),
         }
     }
 

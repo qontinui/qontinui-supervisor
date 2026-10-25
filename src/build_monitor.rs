@@ -31,16 +31,36 @@ use std::sync::Arc;
 /// killed a healthy build.
 const ARTIFACT_PROGRESS_DIRS: &[&str] = &["deps", "incremental", "build", ".fingerprint"];
 
-/// Build the artifact-progress probe for a slot's target dir: the newest mtime
-/// (in seconds) across the slot's `debug/` output dirs. Any change counts as
+/// The paths [`artifact_progress_probe`] stats: the target dir, the profile
+/// dir being BUILT (`debug/` for a pool slot, `release-checked/` for an
+/// optimized primary build), and its [`ARTIFACT_PROGRESS_DIRS`].
+///
+/// The profile is a parameter because the probe must watch the directory cargo
+/// is actually writing: a `release-checked` build writes nothing under
+/// `debug/`, so a probe fixed on `debug/` would see no artifact movement during
+/// the long, silent opt-level-2 runner-crate compile, and the no-progress
+/// watchdog would kill a healthy primary build.
+fn artifact_progress_paths(
+    target_dir: &std::path::Path,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Vec<PathBuf> {
+    let profile_dir = profile.artifact_dir(target_dir);
+    let mut paths: Vec<PathBuf> = vec![target_dir.to_path_buf(), profile_dir.clone()];
+    paths.extend(ARTIFACT_PROGRESS_DIRS.iter().map(|d| profile_dir.join(d)));
+    paths
+}
+
+/// Build the artifact-progress probe for a build dir: the newest mtime (in
+/// seconds) across [`artifact_progress_paths`]. Any change counts as
 /// progress. Best-effort — an unreadable path contributes nothing, and a probe
 /// that can read NOTHING simply degrades to "stderr output is the only progress
 /// signal", never to a spurious kill (the watchdog only fires when *no* signal
 /// moved).
-fn artifact_progress_probe(target_dir: &std::path::Path) -> ProgressProbe {
-    let debug_dir = target_dir.join("debug");
-    let mut paths: Vec<PathBuf> = vec![target_dir.to_path_buf(), debug_dir.clone()];
-    paths.extend(ARTIFACT_PROGRESS_DIRS.iter().map(|d| debug_dir.join(d)));
+fn artifact_progress_probe(
+    target_dir: &std::path::Path,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> ProgressProbe {
+    let paths = artifact_progress_paths(target_dir, profile);
     Arc::new(move || newest_mtime_secs(&paths))
 }
 
@@ -1086,12 +1106,96 @@ pub async fn run_cargo_build_with_dir_detailed(
     // branch (the cancelled future returns no `BuildAttempt`). See [`BuildPhase`].
     phase: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<BuildAttempt, (SupervisorError, BuildAttempt)> {
+    run_cargo_build_on(
+        state,
+        BuildTarget::Pool,
+        requester_id,
+        build_dir_override,
+        force_frontend_build,
+        source_kind,
+        phase,
+    )
+    .await
+}
+
+/// Which build dir a cargo build runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildTarget {
+    /// The first idle pool slot (`target-pool/slot-N/`, dev profile).
+    Pool,
+    /// The primary's dedicated `target-pool/primary/`, in the configured
+    /// primary profile ([`crate::state::BuildPool::primary_slot`]).
+    PrimaryDir,
+}
+
+/// Build the runner into the PRIMARY's dedicated target dir
+/// (`target-pool/primary/<profile-dir>/`) in the configured primary profile —
+/// `release-checked` by default (plan
+/// `2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it`, Phase 5).
+///
+/// Same pipeline as a pool build (disk + memory guards, a permit from the same
+/// semaphore, frontend, cargo, sidecars, provenance sidecar, LKG capture into
+/// the profile's LKG dir), with two differences: builds on the primary dir are
+/// serialized by `primary_build_lock`, and a success never moves
+/// `last_successful_slot` — pool resolution never sees this dir.
+///
+/// The caller holds `primary_build_lock` (`_lock` is the proof) for the whole
+/// sequence — worktree prep, any artifact re-check, and this build — so two
+/// primary starts can never prepare or build into the primary dir at once
+/// ([`crate::process::primary_start::primary_build`]).
+pub async fn run_primary_build(
+    state: &SharedState,
+    _lock: &tokio::sync::OwnedMutexGuard<()>,
+    requester_id: Option<String>,
+    build_dir_override: Option<PathBuf>,
+    source_kind: BuildSourceKind,
+) -> Result<(), SupervisorError> {
+    let phase = Arc::new(std::sync::atomic::AtomicU8::new(
+        BuildPhase::AwaitingSlot.as_u8(),
+    ));
+    let msg = format!(
+        "Primary build: profile {} into {:?} (cargo {})",
+        state.build_pool.primary_slot.profile,
+        state.build_pool.primary_slot.artifact_dir(),
+        state.build_pool.primary_slot.profile.cargo_args().join(" ")
+    );
+    info!("{}", msg);
+    state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+    run_cargo_build_on(
+        state,
+        BuildTarget::PrimaryDir,
+        requester_id,
+        build_dir_override,
+        false,
+        source_kind,
+        phase,
+    )
+    .await
+    .map(|_attempt| ())
+    .map_err(|(e, _attempt)| e)
+}
+
+/// The one build implementation behind [`run_cargo_build_with_dir_detailed`]
+/// (pool) and [`run_primary_build`] (the primary dir).
+async fn run_cargo_build_on(
+    state: &SharedState,
+    target: BuildTarget,
+    requester_id: Option<String>,
+    build_dir_override: Option<PathBuf>,
+    force_frontend_build: bool,
+    source_kind: BuildSourceKind,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+) -> Result<BuildAttempt, (SupervisorError, BuildAttempt)> {
     // Pre-permit disk guard (Phase 2): refuse a doomed build BEFORE consuming a
     // permit/slot when free disk is below the configured floor. The refusal
     // embeds the cached footprint + prune-endpoint hints so the caller can act.
     if let Err(e) = check_disk_guard(state).await {
         return Err((e, BuildAttempt::default()));
     }
+
+    // A PrimaryDir build runs under `primary_build_lock`, which the caller
+    // took BEFORE this point (see `run_primary_build`), so a queued primary
+    // build never sits on a pool permit while it waits for the lock.
 
     // Pre-permit memory guard: defer (never reject) while the box lacks the
     // commit headroom a single rustc on the runner's bin crate needs. Runs
@@ -1132,7 +1236,25 @@ pub async fn run_cargo_build_with_dir_detailed(
     // `claim_idle_slot` records `mem_gate` on the slot's history under the
     // same busy lock as the claim, so `GET /builds` never pairs this build
     // with the previous build's `last_mem_gate`.
-    let slot = state.build_pool.claim_idle_slot(info).await;
+    let slot = match target {
+        BuildTarget::Pool => state.build_pool.claim_idle_slot(info).await,
+        BuildTarget::PrimaryDir => {
+            let slot = state.build_pool.primary_slot.clone();
+            // cargo creates CARGO_TARGET_DIR itself, but the failure-stderr
+            // sidecar is written into it even when cargo never got that far.
+            if let Err(e) = std::fs::create_dir_all(&slot.target_dir) {
+                warn!(
+                    "Failed to create primary build dir {:?}: {}",
+                    slot.target_dir, e
+                );
+            }
+            {
+                let mut busy = slot.busy.write().await;
+                slot.occupy(&mut busy, info).await;
+            }
+            slot
+        }
+    };
     // RAII guard: clears `slot.busy = None` AND reconciles the global
     // `build_in_progress` flag on every exit path (happy path, `?`, panic,
     // task cancellation). Prevents permanently-stuck slots and stale flags.
@@ -1182,7 +1304,11 @@ pub async fn run_cargo_build_with_dir_detailed(
 
     // Stop non-primary exe-mode runners that lock the build artifact.
     // (Non-primary runners now use copied exes, but stop any still using the original.)
-    stop_exe_runners_for_build(state).await;
+    // A primary-dir build writes only `target-pool/primary/`, which no temp or
+    // named runner ever runs from, so it stops nothing.
+    if target == BuildTarget::Pool {
+        stop_exe_runners_for_build(state).await;
+    }
 
     // Reap stale cargo/rustc left building into THIS slot by a previous build
     // (e.g. after a supervisor crash), so the slot's target/exe is not locked.
@@ -1323,13 +1449,22 @@ pub async fn run_cargo_build_with_dir_detailed(
     // If this build succeeded, record the slot as the most recent successful one.
     // Readers of `rebuild: false` use this to locate the exe to copy.
     if result.is_ok() {
-        info!(
-            "GCMD: build succeeded, promoting slot {} to last_successful_slot + computing provenance/LKG",
-            slot.id
-        );
-        let mut last = state.build_pool.last_successful_slot.write().await;
-        *last = Some(slot.id);
-        drop(last);
+        // The primary dir is not a pool slot: pool resolution
+        // (`pick_slot_for_resolution`) must never be pointed at it.
+        if !slot.is_primary_build_dir() {
+            info!(
+                "GCMD: build succeeded, promoting slot {} to last_successful_slot + computing provenance/LKG",
+                slot.id
+            );
+            let mut last = state.build_pool.last_successful_slot.write().await;
+            *last = Some(slot.id);
+            drop(last);
+        } else {
+            info!(
+                "GCMD: primary build ({}) succeeded, computing provenance/LKG",
+                slot.profile
+            );
+        }
 
         // Compute the provenance of THIS build ONCE — the SHA of the tree that
         // was actually compiled (the override worktree root when
@@ -1349,7 +1484,7 @@ pub async fn run_cargo_build_with_dir_detailed(
         // /builds can detect drift across slots (a fresh exe staged into one
         // slot while a stale or foreign exe lingers in another). Best-effort:
         // a write failure is logged but the build still succeeded.
-        write_slot_provenance_sidecar(state, &slot, &provenance).await;
+        write_slot_provenance_sidecar(&slot, &provenance).await;
 
         // Capture this exe as the new last-known-good — UNLESS this was an
         // override build (a spawn-test git_ref / worktree_path preview of a
@@ -1421,7 +1556,8 @@ async fn any_slot_busy(state: &SharedState) -> bool {
             return true;
         }
     }
-    false
+    // A primary build is a build in progress too (`/health` build flag).
+    state.build_pool.primary_slot.busy.read().await.is_some()
 }
 
 async fn run_build_inner(
@@ -1769,13 +1905,12 @@ async fn run_build_inner(
     // [`SIDECAR_BUILD_ARGS`]) on the same warm target dir, so the helper
     // binaries are produced in lockstep with the runner exe (see
     // [`SHIM_EXE_FILENAME`] for the placement contract).
-    const CARGO_BUILD_ARGS: &[&str] = &[
-        "build",
-        "--bin",
-        "qontinui-runner",
-        "--features",
-        "custom-protocol",
-    ];
+    //
+    // The profile args come from the SLOT ([`BuildSlot::profile`]): empty for
+    // a pool slot (dev), `--profile release-checked` for the primary dir — so
+    // the args cargo runs and the directory every later step reads from are
+    // derived from the same value. See [`CARGO_BUILD_ARGS`].
+    let cargo_build_args = runner_build_args(slot.profile);
 
     // Reset the per-slot full-build log at the start of each build so a reader
     // hitting `GET /builds/{slot_id}/log` while a build is in flight doesn't
@@ -1852,7 +1987,7 @@ async fn run_build_inner(
     let guarded =
         crate::sccache_guard::guarded_cargo(Duration::from_secs(absolute_secs), cargo_cwd)
             .await
-            .args(CARGO_BUILD_ARGS)
+            .args(&cargo_build_args)
             .current_dir(cargo_cwd)
             // Redirect cargo output to this slot's isolated target dir so
             // concurrent builds on other slots don't contend on the same target/.
@@ -1886,7 +2021,7 @@ async fn run_build_inner(
             // is NOT "no progress" — the newest artifact mtime under the slot's
             // target dir is. Without this the watchdog would still kill the exact
             // build that motivated it.
-            .progress_probe(artifact_progress_probe(&slot.target_dir));
+            .progress_probe(artifact_progress_probe(&slot.target_dir, slot.profile));
     // No QONTINUI_ALLOW_PLACEHOLDER_DIST here: this build produces the exe a
     // runner starts from, so build.rs must be free to refuse a placeholder dist.
     let guarded = with_invocation_env(
@@ -2095,6 +2230,26 @@ async fn run_build_inner(
 /// cancel / spawn-failure arms can call it too — they previously wrote
 /// NEITHER, which is how two failed builds came to be diagnosed against a
 /// `last-build.stderr` dated from the previous day.
+/// The profile-independent args of the runner build in `run_build_inner`.
+/// Always `--features custom-protocol`, so Tauri embeds `dist/`.
+const CARGO_BUILD_ARGS: &[&str] = &[
+    "build",
+    "--bin",
+    "qontinui-runner",
+    "--features",
+    "custom-protocol",
+];
+
+/// The runner build's cargo args for `profile`: [`CARGO_BUILD_ARGS`] followed
+/// by the profile selector ([`crate::build_profile::RunnerBuildProfile::cargo_args`]).
+pub(crate) fn runner_build_args(
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Vec<&'static str> {
+    let mut args = CARGO_BUILD_ARGS.to_vec();
+    args.extend_from_slice(profile.cargo_args());
+    args
+}
+
 async fn persist_slot_failure_stderr(slot: &Arc<BuildSlot>, full_stderr: &str) {
     let stderr_path = slot.target_dir.join("last-build.stderr");
     if let Err(e) = tokio::fs::write(&stderr_path, full_stderr.as_bytes()).await {
@@ -2444,6 +2599,30 @@ pub(crate) fn sidecar_build_args(
     args
 }
 
+/// The `qontinui-git-credential` bin. Pool slots never build it (a temp or
+/// named runner falls back to the dev `target/debug/` helper), but an
+/// optimized primary's dir has no such fallback in its own profile, so the
+/// primary's sidecar build carries it.
+pub(crate) const GIT_CREDENTIAL_BIN: &str = "qontinui-git-credential";
+
+/// The sidecar build's full args in `profile`: [`sidecar_build_args`] plus the
+/// profile selector, so the roster lands in the same `<profile-dir>/` as the
+/// runner exe the start deploys it beside. An optimized profile also builds
+/// [`GIT_CREDENTIAL_BIN`] when the tree declares it (or is unreadable).
+pub(crate) fn sidecar_cargo_args(
+    declared: Option<&std::collections::BTreeSet<String>>,
+    profile: crate::build_profile::RunnerBuildProfile,
+) -> Vec<&'static str> {
+    let mut args = sidecar_build_args(declared);
+    if profile != crate::build_profile::RunnerBuildProfile::Dev
+        && declared.is_none_or(|d| d.contains(GIT_CREDENTIAL_BIN))
+    {
+        args.extend(["--bin", GIT_CREDENTIAL_BIN]);
+    }
+    args.extend_from_slice(profile.cargo_args());
+    args
+}
+
 /// What sits at a sidecar's path. A zero-length file is NOT a binary: it is a
 /// build placeholder (or a copy of one), and executing it under Git Bash exits
 /// 0 having done nothing.
@@ -2530,7 +2709,11 @@ pub(crate) fn inspect_built_sidecars(
 /// if cargo did not uplift over it.
 async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &std::path::Path) {
     let declared = declared_bin_targets(cargo_cwd);
-    let args = sidecar_build_args(declared.as_ref());
+    // The roster MUST land in the profile dir the runner exe is in (and so the
+    // one a start deploys sidecars from): a fresh `release-checked/` dir holds
+    // only tauri-build's 0-byte placeholders until this runs in that profile —
+    // the qontinui-pr-shim-zero-byte-opens-no-pr failure.
+    let args = sidecar_cargo_args(declared.as_ref(), slot.profile);
     let undeclared: Vec<&'static str> = RUNNER_SIDECARS
         .iter()
         .filter(|s| declared.as_ref().is_some_and(|d| !d.contains(s.bin)))
@@ -2606,13 +2789,18 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         }
     };
 
-    let debug_dir = slot.target_dir.join("debug");
-    let verdict = sidecar_build_verdict(slot.id, &debug_dir, &undeclared, cargo_failure.as_deref());
+    let artifact_dir = slot.artifact_dir();
+    let verdict = sidecar_build_verdict(
+        slot.id,
+        &artifact_dir,
+        &undeclared,
+        cargo_failure.as_deref(),
+    );
     if !verdict.built.is_empty() {
         info!(
             "Slot {}: runner sidecars ready in {:?}: {}",
             slot.id,
-            debug_dir,
+            artifact_dir,
             verdict.built.join(", ")
         );
     }
@@ -2620,6 +2808,40 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         warn!("{}", msg);
         state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
     }
+    if let Some(msg) =
+        git_credential_verdict(slot.id, slot.profile, &artifact_dir, declared.as_ref())
+    {
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+}
+
+/// The post-build check for [`GIT_CREDENTIAL_BIN`], which only an optimized
+/// profile's sidecar build carries ([`sidecar_cargo_args`]): a WARN when the
+/// tree declares it and the artifact dir holds no real binary of it. `None`
+/// for a dev slot, or when it is present and non-empty.
+pub(crate) fn git_credential_verdict(
+    slot_id: usize,
+    profile: crate::build_profile::RunnerBuildProfile,
+    artifact_dir: &std::path::Path,
+    declared: Option<&std::collections::BTreeSet<String>>,
+) -> Option<String> {
+    if profile == crate::build_profile::RunnerBuildProfile::Dev
+        || declared.is_some_and(|d| !d.contains(GIT_CREDENTIAL_BIN))
+    {
+        return None;
+    }
+    let path = artifact_dir.join(crate::process::manager::GIT_CREDENTIAL_EXE_FILENAME);
+    let problem = match SidecarFile::inspect(&path) {
+        SidecarFile::Present { .. } => return None,
+        SidecarFile::Missing => "is missing",
+        SidecarFile::Empty => "is ZERO-LENGTH (a build placeholder, not a binary)",
+    };
+    Some(format!(
+        "{GIT_CREDENTIAL_BIN} sidecar {path:?} {problem} on slot {slot_id} after the sidecar \
+         build — the runner falls back to the dev target/debug/ helper, or skips installing one \
+         (runner build itself succeeded; deploy continues)"
+    ))
 }
 
 /// What [`build_sidecars`] reports after cargo returns: the sidecars that are
@@ -3920,13 +4142,11 @@ async fn compute_build_provenance(
 /// (Phase 2) the LKG promotion gate.
 ///
 /// Read back by [`crate::process::manager::read_slot_provenance`].
-async fn write_slot_provenance_sidecar(
-    state: &SharedState,
-    slot: &Arc<BuildSlot>,
-    provenance: &BuildProvenance,
-) {
+async fn write_slot_provenance_sidecar(slot: &Arc<BuildSlot>, provenance: &BuildProvenance) {
     use tracing::debug;
-    let exe_path = state.config.runner_exe_path_for_slot(slot.id);
+    // Beside the exe this slot's profile produced — the path resolution reads
+    // it back from (`read_provenance_beside_exe`).
+    let exe_path = slot.exe_path();
     let sidecar = match exe_path.parent() {
         Some(dir) => dir.join(crate::process::manager::SLOT_PROVENANCE_SIDECAR_FILENAME),
         None => {
@@ -4215,10 +4435,7 @@ async fn emit_exe_lock_kill_failed(
 ///   prevent it from recurring.)
 #[cfg(target_os = "windows")]
 async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(), SupervisorError> {
-    let exe_path = slot
-        .target_dir
-        .join("debug")
-        .join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot.exe_path();
     if !exe_path.exists() {
         return Ok(());
     }
@@ -4784,13 +5001,10 @@ async fn sweep_slot_for_stale_locks(
 }
 
 async fn check_slot_fingerprint(slot: &Arc<BuildSlot>) {
-    let fingerprint = slot.target_dir.join("debug").join(".fingerprint");
+    let fingerprint = slot.artifact_dir().join(".fingerprint");
     let exists = tokio::fs::metadata(&fingerprint).await.is_ok();
     if !exists {
-        let exe = slot
-            .target_dir
-            .join("debug")
-            .join(crate::config::RUNNER_BIN_NAME);
+        let exe = slot.exe_path();
         if tokio::fs::metadata(&exe).await.is_ok() {
             warn!(
                 "Slot {}: target/debug/.fingerprint missing but exe is present at {:?}; \
@@ -4814,14 +5028,18 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
         return;
     }
 
+    // The primary's own build dir FIRST, when it is an optimized dir the live
+    // tree can build. Its build lock is held for that one prewarm only — try,
+    // never wait — and dropped before the pool slots, so a primary build is
+    // never blocked behind pool prewarms. Skipped (and said so) when the tree
+    // does not declare the profile.
+    prewarm_primary_build_dir(&state).await;
+
     let slots: Vec<Arc<BuildSlot>> = state.build_pool.slots.clone();
     info!("Pre-warming {} build slot(s)...", slots.len());
 
     for slot in slots {
-        let exe_path = slot
-            .target_dir
-            .join("debug")
-            .join(crate::config::RUNNER_BIN_NAME);
+        let exe_path = slot.exe_path();
         if exe_path.exists() {
             info!("Slot {} already has a binary, skipping prewarm", slot.id);
             continue;
@@ -4839,6 +5057,44 @@ pub async fn prewarm_build_slots(state: crate::state::SharedState) {
         }
     }
     info!("Build slot pre-warm complete");
+}
+
+/// Prewarm `target-pool/primary/` (see [`prewarm_build_slots`]).
+async fn prewarm_primary_build_dir(state: &crate::state::SharedState) {
+    let primary = state.build_pool.primary_slot.clone();
+    if primary.profile == crate::build_profile::RunnerBuildProfile::Dev {
+        return;
+    }
+    if primary.exe_path().exists() {
+        info!("Primary build dir already has a binary, skipping prewarm");
+        return;
+    }
+    if let crate::process::primary_start::ProfileSupport::Missing(cause) =
+        crate::process::primary_start::build_tree_profile_support(
+            state,
+            primary.profile,
+            crate::process::manager::BuildTree::LiveWorkingTree,
+        )
+        .await
+    {
+        info!("Not prewarming the primary build dir: {cause}");
+        return;
+    }
+    let Ok(_lock) = state.build_pool.primary_build_lock.clone().try_lock_owned() else {
+        info!("Primary build dir busy (a primary build holds it) — not prewarming it");
+        return;
+    };
+    if let Err(e) = prewarm_single_slot(state, &primary).await {
+        warn!("Prewarm of the primary build dir failed: {}", e);
+        state
+            .logs
+            .emit(
+                LogSource::Build,
+                LogLevel::Warn,
+                format!("Prewarm of the primary build dir failed: {e}"),
+            )
+            .await;
+    }
 }
 
 async fn prewarm_single_slot(
@@ -4870,10 +5126,7 @@ async fn prewarm_single_slot(
         .map_err(|_| SupervisorError::Other("Build pool semaphore closed".to_string()))?;
 
     // Re-check after acquiring: another caller may have populated this slot.
-    let exe_path = slot
-        .target_dir
-        .join("debug")
-        .join(crate::config::RUNNER_BIN_NAME);
+    let exe_path = slot.exe_path();
     if exe_path.exists() {
         info!(
             "Slot {} populated while waiting for permit, skipping prewarm",
@@ -4921,13 +5174,15 @@ async fn prewarm_single_slot(
 
     let start = std::time::Instant::now();
 
-    let args: Vec<&str> = vec![
+    // In the slot's own profile: the primary build dir warms `release-checked/`.
+    let mut args: Vec<&str> = vec![
         "check",
         "--bin",
         "qontinui-runner",
         "--features",
         "custom-protocol",
     ];
+    args.extend_from_slice(slot.profile.cargo_args());
 
     // Per-build line bus so prewarm stderr lines stream to logs live (mirrors
     // the legacy reader task) while GuardedCommand owns the pipe + JobObject.
@@ -5182,7 +5437,7 @@ async fn update_lkg_after_success(
         return Ok(());
     }
 
-    let source_exe = state.config.runner_exe_path_for_slot(slot.id);
+    let source_exe = slot.exe_path();
     if !source_exe.exists() {
         return Err(SupervisorError::Process(format!(
             "build succeeded but slot {} exe not found at {:?}",
@@ -5190,7 +5445,10 @@ async fn update_lkg_after_success(
         )));
     }
 
-    let lkg_dir = state.config.lkg_dir();
+    // Each profile has its own LKG (`target-pool/lkg/<profile-dir>/`), so a
+    // dev pool build can never overwrite the primary's optimized fallback and
+    // a release-checked build can never become a temp runner's `use_lkg`.
+    let lkg_dir = state.config.lkg_dir(slot.profile);
     if let Err(e) = std::fs::create_dir_all(&lkg_dir) {
         return Err(SupervisorError::Process(format!(
             "failed to create lkg dir {:?}: {}",
@@ -5198,7 +5456,7 @@ async fn update_lkg_after_success(
         )));
     }
 
-    let final_exe = state.config.lkg_exe_path();
+    let final_exe = state.config.lkg_exe_path(slot.profile);
     // Per-slot temp filenames so two concurrent successful builds can't
     // clobber each other's in-flight copies. Without the suffix, slot 0's
     // remove_file would race slot 1's copy/rename and the final exe could
@@ -5271,9 +5529,10 @@ async fn update_lkg_after_success(
         // not by assumption.
         sha: provenance.sha.clone(),
         source: provenance.source,
+        profile: slot.profile,
     };
 
-    let final_meta = state.config.lkg_metadata_path();
+    let final_meta = state.config.lkg_metadata_path(slot.profile);
     let tmp_meta = lkg_dir.join(format!("lkg.json.tmp.{}", slot.id));
     let _ = std::fs::remove_file(&tmp_meta);
     let json = serde_json::to_string_pretty(&info)
@@ -5288,8 +5547,8 @@ async fn update_lkg_after_success(
     })?;
 
     info!(
-        "LKG updated from slot {} ({} bytes, built_at {})",
-        info.source_slot, info.exe_size, info.built_at
+        "LKG ({}) updated from slot {} ({} bytes, built_at {})",
+        info.profile, info.source_slot, info.exe_size, info.built_at
     );
     state
         .logs
@@ -5303,7 +5562,7 @@ async fn update_lkg_after_success(
         )
         .await;
 
-    let mut lkg_lock = state.build_pool.last_known_good.write().await;
+    let mut lkg_lock = state.build_pool.lkg_for(slot.profile).write().await;
     *lkg_lock = Some(info);
     Ok(())
 }

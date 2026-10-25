@@ -258,15 +258,28 @@ pub fn resolve_qontinui_profile_path(state: &SharedState) -> Result<PathBuf, Str
 /// root (`runner_npm_dir`), so the candidate order and the non-empty rule are
 /// testable against a tempdir.
 fn resolve_qontinui_profile_in(npm_dir: &Path) -> Result<PathBuf, String> {
+    use crate::build_profile::RunnerBuildProfile;
     let exe_name = crate::build_monitor::PROFILE_CLI_EXE_FILENAME;
-    let canonical = npm_dir.join("target").join("debug").join(exe_name);
+    // Any profile's `qontinui_profile` pairs the same way, so every profile
+    // dir is a candidate — dev first, preserving the historical order. The
+    // optimized primary's sidecars sit in `release-checked/` dirs.
+    let target = npm_dir.join("target");
+    let canonical = RunnerBuildProfile::Dev.artifact_dir(&target).join(exe_name);
     let pool_root = npm_dir.join("target-pool");
 
-    let mut candidates = vec![canonical.clone()];
+    let mut candidates: Vec<PathBuf> = RunnerBuildProfile::ALL
+        .iter()
+        .map(|p| p.artifact_dir(&target).join(exe_name))
+        .collect();
     if let Ok(entries) = std::fs::read_dir(&pool_root) {
         let mut pool_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
         pool_dirs.sort();
-        candidates.extend(pool_dirs.iter().map(|d| d.join("debug").join(exe_name)));
+        // Slots, the primary build dir, and the per-profile LKG dirs.
+        candidates.extend(
+            pool_dirs
+                .iter()
+                .flat_map(|d| RunnerBuildProfile::ALL.map(|p| p.artifact_dir(d).join(exe_name))),
+        );
     }
     candidates.push(pool_root.join("lkg").join(exe_name));
 
@@ -289,7 +302,7 @@ fn resolve_qontinui_profile_in(npm_dir: &Path) -> Result<PathBuf, String> {
         )
     };
     Err(format!(
-        "qontinui_profile binary not found at {:?}, under {:?}/*/debug or in {:?}.{} \
+        "qontinui_profile binary not found at {:?}, under {:?}/*/<debug|release-checked> or in {:?}.{} \
          Run a supervisor runner build first (e.g. POST /runners/spawn-test {{\"rebuild\": true}}); \
          its sidecar step builds qontinui_profile into the slot.",
         canonical,
@@ -979,6 +992,28 @@ mod tests {
 
         let canonical = write_profile(&npm.join("target").join("debug"), b"local-profile");
         assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), canonical);
+    }
+
+    /// Phase 5 (plan 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it):
+    /// a box whose only built `qontinui_profile` is the optimized primary's
+    /// still pairs.
+    #[test]
+    fn profile_resolution_finds_the_release_checked_primary_build() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        let rc = write_profile(
+            &npm.join("target-pool")
+                .join("primary")
+                .join("release-checked"),
+            b"rc-profile",
+        );
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), rc);
+        let rc_lkg = write_profile(
+            &npm.join("target-pool").join("lkg").join("release-checked"),
+            b"rc-lkg",
+        );
+        // `lkg` sorts before `primary`.
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), rc_lkg);
     }
 
     #[test]
