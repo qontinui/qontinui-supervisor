@@ -61,7 +61,7 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
 | `QONTINUI_EMBEDDED_PG_DIR` | `<root>/embedded-pg` (a private cluster per runner) |
 | `WEBVIEW2_USER_DATA_FOLDER` | `<root>/webview`, exported on every OS but read only by the Windows runner — on Linux, WebKitGTK data is NOT isolated by it |
 | `QONTINUI_DISABLE_KEYCHAIN` | `1` |
-| every other root-confined key (`QONTINUI_PROMPTS_DIR`, `QONTINUI_SESSION_NAMES_DIR`, `QONTINUI_CAPABILITY_STATE_DIR`) | **removed**, so the supervisor's own value is never inherited |
+| every other root-confined key (`QONTINUI_PROMPTS_DIR`, `QONTINUI_SESSION_NAMES_DIR`, `QONTINUI_CAPABILITY_STATE_DIR`, `QONTINUI_TOUCH_LEDGER_DIR`) | **removed**, so the supervisor's own value is never inherited. The list is `process::instance_root::ROOT_CONFINED_ENV_KEYS`, a copy of the runner's that `tests/root_confined_env_keys.rs` holds to the runner's default branch |
 | the harness-store keys (`process::instance_root::HARNESS_STORE_ENV_KEYS`: `RUNNER_DATABASE_URL`, `DATABASE_URL`, `REDIS_URL`, `COORD_DEVICE_JWT`, …) | **removed**, so a subject cannot reach the harness's database, cache or credentials through inherited env (`extra_env` can put one back) |
 
 - **A runner under a root refuses to start (exit 78, `<root>/startup-refusal.log`)

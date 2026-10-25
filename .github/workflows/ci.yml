@@ -120,12 +120,21 @@ jobs:
       # coord's CI (see that job's comment). If it ever goes private this step
       # fails and roster_matches_the_runner_definition then hard-fails on a
       # missing source. That direction is deliberate: red, never silently green.
+      #
+      # The same checkout carries src-tauri/src/instance_env.rs for
+      # tests/root_confined_env_keys.rs, which holds this repo's copy of the
+      # runner's ROOT_CONFINED_ENV_KEYS (src/process/instance_root.rs) to the
+      # runner's own list. In CI that test REQUIRES the file named by
+      # $QONTINUI_RUNNER_INSTANCE_ENV_RS: the copy had drifted (it lacked
+      # QONTINUI_TOUCH_LEDGER_DIR, coord finding 7a74f9f1) with nothing to see it.
       - name: Check out qontinui-runner's roster declaration
         uses: actions/checkout@v5
         with:
           repository: qontinui/qontinui-runner
           path: .runner-roster
-          sparse-checkout: src-tauri/src/fleet.rs
+          sparse-checkout: |
+            src-tauri/src/fleet.rs
+            src-tauri/src/instance_env.rs
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
@@ -364,6 +373,7 @@ jobs:
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+          QONTINUI_RUNNER_INSTANCE_ENV_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/instance_env.rs
 
       # `cargo test` swallows stdout for tests that pass, so the roster
       # cross-check's verdict — which source it read, and at which sha — would

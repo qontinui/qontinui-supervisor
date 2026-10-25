@@ -50,9 +50,19 @@ pub const STARTUP_REFUSAL_LOG: &str = "startup-refusal.log";
 /// instance root, each of these that is set non-blank must lie inside the root,
 /// or the runner refuses to start.
 ///
-/// Used by the `extra_env` override warning and by the tests that assert the
-/// whole non-primary spawn block honours the contract.
-pub const ROOT_CONFINED_ENV_KEYS: [&str; 10] = [
+/// Used by [`InstanceRoot::apply_env`] (which REMOVES every key it does not
+/// export, so an inherited value cannot reach the child), by
+/// `manager::drop_inherited_subject_env`, by the `extra_env` override warning,
+/// and by the tests that assert the whole non-primary spawn block honours the
+/// contract. A key missing here is therefore inherited by a subject child, which
+/// refuses to start (exit 78) when the value lies outside its root. That was
+/// `QONTINUI_TOUCH_LEDGER_DIR` until 2026-10-25 (coord finding 7a74f9f1).
+///
+/// A COPY, held to the runner's own list by `tests/root_confined_env_keys.rs`,
+/// which reads the runner's declaration on its default branch (and in CI is
+/// handed it by `ci.yml`). Why a copy rather than a shared definition is
+/// argued in that file's header.
+pub const ROOT_CONFINED_ENV_KEYS: [&str; 11] = [
     "QONTINUI_CAPABILITY_STATE_DIR",
     "QONTINUI_CONFIG_DIR",
     "QONTINUI_EMBEDDED_PG_DIR",
@@ -62,6 +72,7 @@ pub const ROOT_CONFINED_ENV_KEYS: [&str; 10] = [
     "QONTINUI_RUNNER_LOG_DIR",
     "QONTINUI_SECURE_STORAGE_DIR",
     "QONTINUI_SESSION_NAMES_DIR",
+    "QONTINUI_TOUCH_LEDGER_DIR",
     "WEBVIEW2_USER_DATA_FOLDER",
 ];
 
@@ -560,6 +571,35 @@ pub(crate) mod tests {
             Some("1")
         );
         assert!(root.home_dir().is_dir() && root.logs_dir().is_dir());
+    }
+
+    /// Coord finding 7a74f9f1: the copy of the runner's list lacked
+    /// `QONTINUI_TOUCH_LEDGER_DIR`, so `apply_env` left a value the supervisor
+    /// carries in the child's environment, and a runner under the root refuses
+    /// to start (exit 78) on a confined location outside it. The child must see
+    /// the key REMOVED, the same as the other stores it derives under its home.
+    #[test]
+    fn apply_env_removes_an_inherited_touch_ledger_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = InstanceRoot::at(tmp.path().join("root"));
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.env(
+            "QONTINUI_TOUCH_LEDGER_DIR",
+            tmp.path().join("harness-touch-ledger"),
+        );
+        root.apply_env(&mut cmd, None, DeviceIdentity::Harness)
+            .expect("apply");
+        let value = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "QONTINUI_TOUCH_LEDGER_DIR")
+            .map(|(_, v)| v.map(|v| v.to_os_string()));
+        assert_eq!(
+            value,
+            Some(None),
+            "QONTINUI_TOUCH_LEDGER_DIR must be removed from a subject child's env, not \
+             inherited from the supervisor's"
+        );
     }
 
     #[test]
