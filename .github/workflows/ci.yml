@@ -375,11 +375,17 @@ jobs:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
           QONTINUI_RUNNER_INSTANCE_ENV_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/instance_env.rs
 
-      # `cargo test` swallows stdout for tests that pass, so the roster
-      # cross-check's verdict — which source it read, and at which sha — would
-      # leave no artifact in the CI log, and a control that leaves no artifact
-      # cannot be audited. Re-run just this binary with --nocapture so the
-      # evidence is recorded.
+      # `cargo test` swallows stdout for tests that pass, so the two cross-repo
+      # checks' verdicts would leave no artifact in the CI log, and a control
+      # that leaves no artifact cannot be audited. Re-run just these two
+      # binaries with --nocapture so the evidence is recorded:
+      #   - machine_local_artifacts: which source the roster cross-check read,
+      #     and at which sha;
+      #   - root_confined_env_keys: which runner instance_env.rs it read, and
+      #     "all N runner keys present in the M-key copy" (or the keys the
+      #     runner has since dropped, which it reports rather than fails).
+      # Both run in ONE cargo invocation, so they share one compile rather than
+      # adding a second re-run step.
       #
       # It is NOT, however, "already compiled by the step above, so this costs
       # milliseconds" — that was this comment's original claim and it is wrong.
@@ -388,27 +394,41 @@ jobs:
       # `Finished ... in 44.01s`. The re-run is still worth ~44s; the number is
       # now measured rather than assumed. The recompile itself is a separate
       # defect (~90s per run across the two re-run steps) and is not fixed here.
-      - name: Record the machine-local artifact roster verdict
+      - name: Record the machine-local artifact roster and root-confined key verdicts
         run: |
           # `--test <target>` is a TARGET selector and cargo errors on an unknown
-          # target, so this step is already fail-closed against the target
-          # disappearing. The residual it is NOT closed against is the target
+          # target, so this step is already fail-closed against a target
+          # disappearing. The residual it is NOT closed against is a target
           # surviving with every #[test] removed — exit 0, "0 passed", and a step
-          # whose own name claims a verdict was recorded. That is what the count
-          # assertion below covers; the floor is 1 because this target holds a
-          # handful of tests and a number pretending to be tighter would be made
-          # up rather than measured (5 on 2026-09-06).
+          # whose own name claims a verdict was recorded. That is what the
+          # per-target count assertions below cover. Each floor is 1: both
+          # targets hold a handful of tests (5 and 2 on 2026-10-25) and a number
+          # pretending to be tighter would be made up rather than measured.
+          #
+          # --no-fail-fast: without it cargo stops after the first failing test
+          # binary, the second prints no summary, and the per-target check would
+          # blame the step's wiring for what is really the first binary's red.
           set +e
-          cargo test --test machine_local_artifacts -- --nocapture 2>&1 | tee /tmp/cargo-mla.out
+          cargo test --no-fail-fast --test machine_local_artifacts --test root_confined_env_keys -- --nocapture 2>&1 | tee /tmp/cargo-mla.out
           SUBRC=${PIPESTATUS[0]}
           set -e
 
-          # ── TEST-COUNT FLOOR ────────────────────────────────────────────
+          # ── TEST-COUNT FLOOR, PER TARGET ────────────────────────────────
           # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
-          # A target-selection change can collapse this suite to a handful of
-          # tests while the step still exits 0 and prints a plausible summary.
-          # The floor is the only thing that sees that, and it is committed so
-          # that LOWERING it shows up in a diff.
+          # A target-selection change can collapse a suite to nothing while the
+          # step still exits 0 and prints a plausible summary. The floor is the
+          # only thing that sees that, and it is committed so that LOWERING it
+          # shows up in a diff.
+          #
+          # The floor is applied to EACH target's own section of the output (from
+          # its `Running tests/<target>.rs` line to the next `Running` line), not
+          # to the sum: summed, one target's 2 tests would hide the other being
+          # emptied, since an emptied binary still prints a `0 passed` summary.
+          # The job sets CARGO_TERM_COLOR=always, so cargo wraps `Running` in
+          # ANSI codes; the extractor strips them before matching, as the shared
+          # vacuity awk does. A test that itself printed a line starting with
+          # `Running ` would end its target's section early — neither does
+          # today, and the result would be a red step, never a silent pass.
           #
           # The parser is `awk -f`, from a file this repo commits, because the
           # source of record lives in qontinui-claude-config and this runner
@@ -416,29 +436,33 @@ jobs:
           # number; a `grep` here would exit non-zero on no match and, under
           # this shell's `pipefail`, abort the step in exactly the zero-tests
           # case the guard exists for.
-          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-mla.out)
-          RAN=${VACUITY%% *}
-          SUMMARIES=${VACUITY##* }
           MIN_TESTS=1
-          # No crate-target floor above 1, by choice: `--test machine_local_artifacts`
-          # selects ONE target, so there is no suite to collapse (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
-          MIN_TARGETS=1
-          echo "supervisor machine_local_artifacts: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
-          if [ "${SUMMARIES}" -eq 0 ]; then
-            echo "::error::No test summary of either format was found in this run's output." \
-                 "The command exited ${SUBRC} but produced no evidence that any test executed." \
-                 "That is UNKNOWN, not a pass."
-            exit 1
-          fi
-          if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
-            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
-                 "suite collapsed — almost certainly a target-selection change rather than" \
-                 "deleted tests. Do NOT lower the floor to make this pass."
-            exit 1
-          fi
+          for TARGET in machine_local_artifacts root_confined_env_keys; do
+            awk -v t="${TARGET}" '
+              { l = $0; gsub(/\033\[[0-9;]*[a-zA-Z]/, "", l) }
+              l ~ /^[ \t]*Running / { f = (l ~ ("tests.?" t "[.]rs")); next }
+              f' /tmp/cargo-mla.out > "/tmp/cargo-${TARGET}.out"
+            VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk "/tmp/cargo-${TARGET}.out")
+            RAN=${VACUITY%% *}
+            SUMMARIES=${VACUITY##* }
+            echo "supervisor ${TARGET}: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests)"
+            if [ "${SUMMARIES}" -eq 0 ]; then
+              echo "::error::No test summary of either format was found for ${TARGET} in this run's output." \
+                   "The command exited ${SUBRC} but produced no evidence that this target executed." \
+                   "That is UNKNOWN, not a pass."
+              exit 1
+            fi
+            if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
+              echo "::error::Only ${RAN} ${TARGET} tests ran (floor ${MIN_TESTS}). The step exited" \
+                   "${SUBRC} but the target collapsed — almost certainly a target-selection change" \
+                   "or tests removed from the file. Do NOT lower the floor to make this pass."
+              exit 1
+            fi
+          done
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+          QONTINUI_RUNNER_INSTANCE_ENV_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/instance_env.rs
 
       # Same reason, for the orphan-kill suite — and here the silence is not
       # merely unaudited, it is a green that can mean the suite never ran.

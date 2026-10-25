@@ -344,8 +344,10 @@ impl InstanceRoot {
     /// - REMOVES every other [`ROOT_CONFINED_ENV_KEYS`] key, so a value this
     ///   process carries (a supervisor started from a runner-hosted session
     ///   inherits `QONTINUI_PROMPTS_DIR`; fleet scripts export
-    ///   `QONTINUI_SESSION_NAMES_DIR` / `QONTINUI_CAPABILITY_STATE_DIR`) is never
-    ///   inherited — outside the root it would make the child refuse (exit 78);
+    ///   `QONTINUI_SESSION_NAMES_DIR` / `QONTINUI_CAPABILITY_STATE_DIR`; the
+    ///   fleet's touch-ledger hooks honour an operator-set
+    ///   `QONTINUI_TOUCH_LEDGER_DIR`) is never inherited — outside the root it
+    ///   would make the child refuse (exit 78);
     /// - REMOVES every [`HARNESS_STORE_ENV_KEYS`] key, so the child cannot reach
     ///   the harness's database, cache or credentials through inherited env;
     /// - sets `QONTINUI_DISABLE_KEYCHAIN=1` — the OS keychain is keyed on a
