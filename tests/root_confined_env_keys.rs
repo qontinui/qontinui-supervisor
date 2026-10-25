@@ -22,15 +22,17 @@
 //! The list cannot be derived at build time without a crate both repos build
 //! against. The supervisor cannot depend on the runner crate (a Tauri
 //! application). The one crate both do depend on is `qontinui-types`
-//! (qontinui-schemas), and every repo pins that sibling to an exact commit
-//! (`.github/sibling-pins.conf` here). Moving the list there would turn each
+//! (qontinui-schemas), and both repos pin that sibling to an exact commit
+//! (`.github/sibling-pins.conf` in each). Moving the list there would turn each
 //! change to an eleven-entry list into three ordered PRs (schemas, then a pin
 //! bump in each consumer). It would also put a runner launch-contract constant
 //! in a types crate, and between the schemas land and the runner's pin bump
 //! the two copies would still disagree. A test that reads the runner's own
-//! declaration catches the drift on the next supervisor CI run with no
-//! cross-repo ordering. That is the mechanism `tests/machine_local_artifacts.rs`
-//! already uses for `MANAGED_REPO_EXCLUDES`, and this file reuses its rules:
+//! declaration needs no cross-repo ordering of its own: a key added on the
+//! runner's main turns this repo's CI red (every PR and merge candidate) until
+//! the copy is reconciled, and that red is the alarm. That is the mechanism
+//! `tests/machine_local_artifacts.rs` already uses for `MANAGED_REPO_EXCLUDES`,
+//! and this file reuses its rules:
 //!
 //! - the runner's source is read from its DEFAULT BRANCH, never from a sibling
 //!   checkout's working tree (a stale tree certifies a drift that has already
@@ -39,6 +41,15 @@
 //!   out and names it in `$QONTINUI_RUNNER_INSTANCE_ENV_RS`, so a CI run that
 //!   cannot read it fails rather than passing on a check it did not make;
 //! - elsewhere an unresolvable source is UNKNOWN: reported, never a pass.
+//!
+//! # Superset, not equality
+//!
+//! The property that protects a subject is that the copy holds EVERY key the
+//! runner enforces; a key missing here is inherited. A key the copy holds and
+//! the runner has since dropped costs nothing (the supervisor removes a variable
+//! nobody reads), and it is still needed while the supervisor launches LKG or
+//! older runner binaries that DO enforce it. So a missing key fails the test,
+//! and an extra key is reported without failing it.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -125,32 +136,41 @@ fn runner_source() -> Option<RunnerSource> {
 ///
 /// Anchored on the DECLARATION (`const ROOT_CONFINED_ENV_KEYS`), not the bare
 /// name, which the runner's doc comments also mention; the scan starts after
-/// the `=`, because the first `[` after the name is the type `&[&str]`, and
-/// line comments are dropped before the literals are collected. `None` (the
-/// declaration not found, or no entries) is "could not read the list", reported
-/// as UNKNOWN rather than as a mismatch, so an empty parse can never pass
-/// against an emptied copy.
+/// the `=`, because the first `[` after the name is the type `&[&str]`. Each
+/// line's `//` comment is dropped BEFORE the closing `]` is looked for, so a
+/// rustdoc-style `[`X`]` in a comment inside the list cannot end the parse
+/// early and hide the keys after it. `None` (the declaration not found, no
+/// closing `]`, or no entries) is "could not read the list", reported as
+/// UNKNOWN rather than as a mismatch, so an empty parse can never pass against
+/// an emptied copy.
 fn parse_runner_keys(source: &str) -> Option<Vec<String>> {
     let start = source.find("const ROOT_CONFINED_ENV_KEYS")?;
     let eq = source[start..].find('=')? + start;
     let open = source[eq..].find('[')? + eq;
-    let close = source[open..].find(']')? + open;
     let mut entries = Vec::new();
-    for line in source[open + 1..close].lines() {
-        let line = line.split("//").next().unwrap_or("");
-        let mut rest = line;
+    let mut closed = false;
+    for line in source[open + 1..].lines() {
+        let mut code = line.split("//").next().unwrap_or("");
+        if let Some(i) = code.find(']') {
+            code = &code[..i];
+            closed = true;
+        }
+        let mut rest = code;
         while let Some(a) = rest.find('"') {
             let after = &rest[a + 1..];
             let b = after.find('"')?;
             entries.push(after[..b].to_string());
             rest = &after[b + 1..];
         }
+        if closed {
+            break;
+        }
     }
-    (!entries.is_empty()).then_some(entries)
+    (closed && !entries.is_empty()).then_some(entries)
 }
 
 #[test]
-fn root_confined_env_keys_match_the_runner_definition() {
+fn the_copy_holds_every_runner_root_confined_key() {
     let Some(runner) = runner_source() else {
         assert!(
             !is_ci(),
@@ -160,7 +180,7 @@ fn root_confined_env_keys_match_the_runner_definition() {
              means that step stopped working and this control stopped running."
         );
         println!(
-            "SKIP root_confined_env_keys_match_the_runner_definition: neither ${SOURCE_ENV} \
+            "SKIP the_copy_holds_every_runner_root_confined_key: neither ${SOURCE_ENV} \
              nor a sibling qontinui-runner checkout with a resolvable origin/main. Drift is \
              UNKNOWN, not absent."
         );
@@ -174,45 +194,65 @@ fn root_confined_env_keys_match_the_runner_definition() {
             runner.label
         );
         println!(
-            "SKIP root_confined_env_keys_match_the_runner_definition: could not parse \
+            "SKIP the_copy_holds_every_runner_root_confined_key: could not parse \
              ROOT_CONFINED_ENV_KEYS out of {}. Drift is UNKNOWN, not absent.",
             runner.label
         );
         return;
     };
 
-    let mut actual: Vec<String> = ROOT_CONFINED_ENV_KEYS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let copy_len = actual.len();
-    expected.sort();
-    actual.sort();
-    actual.dedup();
+    let copy: Vec<&str> = ROOT_CONFINED_ENV_KEYS.to_vec();
+    let mut deduped = copy.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
     assert_eq!(
-        actual.len(),
-        copy_len,
+        deduped.len(),
+        copy.len(),
         "the supervisor's ROOT_CONFINED_ENV_KEYS repeats an entry"
     );
-    assert_eq!(
-        actual, expected,
-        "src/process/instance_root.rs ROOT_CONFINED_ENV_KEYS has drifted from \
-         qontinui-runner's instance_env::ROOT_CONFINED_ENV_KEYS, read from {}. A key the \
-         supervisor lacks is INHERITED by every subject child (apply_env removes only the \
+    expected.sort();
+    expected.dedup();
+
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|k| !copy.contains(&k.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "src/process/instance_root.rs ROOT_CONFINED_ENV_KEYS lacks {missing:?}, which \
+         qontinui-runner's instance_env::ROOT_CONFINED_ENV_KEYS carries (read from {}). A key \
+         the supervisor lacks is INHERITED by every subject child (apply_env removes only the \
          keys it knows), and the child refuses to start (exit 78) when the inherited value \
-         lies outside its root. Reconcile the copy.",
+         lies outside its root. Add it to the copy.",
         runner.label
     );
+    let extra: Vec<&str> = copy
+        .iter()
+        .copied()
+        .filter(|k| !expected.iter().any(|e| e == k))
+        .collect();
+    if !extra.is_empty() {
+        println!(
+            "NOTE the_copy_holds_every_runner_root_confined_key: the copy also holds \
+             {extra:?}, which the runner's list (from {}) no longer carries. Harmless, and \
+             still needed while an older runner binary that enforces it can be launched; \
+             remove it once none can.",
+            runner.label
+        );
+    }
     println!(
-        "root_confined_env_keys_match_the_runner_definition: {} keys verified against {}.",
-        actual.len(),
+        "the_copy_holds_every_runner_root_confined_key: all {} runner keys present in the \
+         {}-key copy, read from {}.",
+        expected.len(),
+        copy.len(),
         runner.label
     );
 }
 
 /// The cross-check is only as good as its parser, so the parser is pinned
 /// against the declaration's real shape, including the doc-comment mention of
-/// the name that precedes it, and a line comment inside the list.
+/// the name that precedes it, a line comment inside the list, and a comment
+/// holding a `]`.
 #[test]
 fn the_runner_key_parser_reads_the_real_declaration() {
     let real = r#"
@@ -231,6 +271,30 @@ pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
             "QONTINUI_TOUCH_LEDGER_DIR".to_string(),
             "WEBVIEW2_USER_DATA_FOLDER".to_string(),
         ])
+    );
+    // A rustdoc link inside the list must not end it: the keys after it count.
+    let linked = "pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
+    \"A\",
+    // the [`X`] stores (D6)
+    \"B\",
+];
+";
+    assert_eq!(
+        parse_runner_keys(linked),
+        Some(vec!["A".to_string(), "B".to_string()])
+    );
+    assert_eq!(
+        parse_runner_keys("pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[\"A\", \"B\"];"),
+        Some(vec!["A".to_string(), "B".to_string()])
+    );
+    assert_eq!(
+        parse_runner_keys(
+            "pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
+    \"A\",
+"
+        ),
+        None,
+        "a list that never closes is UNKNOWN"
     );
     assert_eq!(
         parse_runner_keys("pub const OTHER: &[&str] = &[\"A\"];"),
