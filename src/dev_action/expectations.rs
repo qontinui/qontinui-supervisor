@@ -10,7 +10,7 @@
 //!
 //! # Wire contract (coord, already built, public, no JWT)
 //!
-//! `GET <coord_base>/coord/dev-actions/expectations?action_kind=<kind>&state_ids=A,B,C&top_k=5`
+//! `GET <coord_base>/coord/dev-actions/expectations?action_kind=<kind>&state_ids=A,B,C&top_k=100`
 //!
 //! ```json
 //! { "action_kind":"restart", "state_ids":["LEGACY_EXE_FALLBACK","SLOTS_EMPTY"],
@@ -19,6 +19,12 @@
 //!                     "occurrences":3,"trials":5,"evidence_basis":"exact",
 //!                     "last_seen":"2026-06-07T..."} ] }
 //! ```
+//!
+//! The fetch asks for coord's top 100 rows, its ceiling ([`RISK_FETCH_TOP_K`]),
+//! and no caller chooses fewer. [`assess_then_cut`] hands that whole fetch to
+//! the risk assessment ([`crate::dev_action::policy`]) and only then cuts the
+//! ACK's `predicted` to the top [`ACK_PREDICTED_TOP_K`] by `posterior_mean` —
+//! the same list a `top_k=5` fetch returns.
 //!
 //! # Posture: best-effort, fail-open, SHORT timeout
 //!
@@ -35,11 +41,22 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::dev_action::ingest::coord_http_base;
+use crate::dev_action::policy::{assess_action_risk, ActionRisk};
 
 /// Short timeout for the outbound coord expectations GET. This is on the
 /// synchronous ACK path, so it MUST be short — 2s, far below the 5s ingest
 /// budget (ingest runs off the green path, this does not).
 const EXPECTATIONS_TIMEOUT_SECS: u64 = 2;
+
+/// `top_k` for the fetch the risk assessment reads: coord's ceiling (its
+/// `MAX_SERVED_ROWS`). coord ranks rows by its pooled `posterior_mean` before
+/// cutting to `top_k`, and the boot-failure row the exact-cell arm of
+/// [`crate::dev_action::policy`] exists for is the one whose pooled mean lags,
+/// so a smaller `top_k` could drop it before the policy sees it.
+pub const RISK_FETCH_TOP_K: usize = 100;
+
+/// Rows the ACK's `predicted` array carries: the top by `posterior_mean`.
+pub const ACK_PREDICTED_TOP_K: usize = 5;
 
 /// One state-conditioned expectation, as stamped into the action ACK's
 /// `predicted` array. Mirrors the per-signature shape coord returns in its
@@ -51,12 +68,32 @@ pub struct PredictedSignature {
     pub signature: String,
     /// Beta posterior mean P(signature | action_kind, states) in [0, 1].
     pub posterior_mean: f64,
-    /// Times this signature was observed for this (kind, states) cell.
+    /// Times this signature was observed in the cell `evidence_basis` names
+    /// (the exact state set, the active state with the most trials, or
+    /// global). coord's earlier reader summed a `marginal` row's counts over
+    /// the active states instead.
     pub occurrences: u64,
-    /// Total trials (actions) in this (kind, states) cell.
+    /// Total trials (actions) in the cell `evidence_basis` names (the exact
+    /// state set, the active state with the most trials, or global). coord's
+    /// earlier reader summed a `marginal` row's trials over the active states
+    /// the signature fired in.
     pub trials: u64,
-    /// `"exact" | "partial" | ...` — how the cell was matched on the coord side.
+    /// The cell that dominates the row on the coord side: `"exact"`,
+    /// `"marginal"` or `"prior_only"` (coord's top-level `"quarantined"` never
+    /// reaches a row: a quarantined kind's list is empty).
     pub evidence_basis: String,
+    /// The exact active-state cell's OWN trials and occurrences. coord's
+    /// `hierarchical-eb-v1` reader serves them beside its shrunk
+    /// `posterior_mean` (which pools the cell toward the kind's other state
+    /// sets); [`crate::dev_action::policy`] reads them so that pooling can
+    /// neither delay the LKG bias nor, once the set has enough trials of its
+    /// own, trip it against a healthy record. `None` when coord predates them —
+    /// then absent from the ACK too, rather than a `0` that would read as
+    /// "never seen".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_trials: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_occurrences: Option<u64>,
 }
 
 /// The coord `expectations` response shape. Private — mirrors the wire contract
@@ -72,18 +109,14 @@ struct ExpectationsResponse {
 /// Fetch state-conditioned expectations from coord for `(action_kind,
 /// state_ids)`. Best-effort + fail-open: returns an EMPTY `Vec` on any failure
 /// (unresolved coord base, network, non-2xx, parse) after a single
-/// `debug!`/`warn!`. NEVER blocks beyond [`EXPECTATIONS_TIMEOUT_SECS`], NEVER
+/// `debug!`/`warn!`. NEVER blocks beyond `EXPECTATIONS_TIMEOUT_SECS`, NEVER
 /// panics. Safe to `await` directly on the synchronous ACK path.
 ///
 /// `action_kind` is the `ActionKind::as_str()` value (`"restart" | "spawn" |
 /// "build"`); `state_ids` are the canonical SCREAMING_SNAKE active-state ids
-/// (the same `states_active` already stamped into the ACK); `top_k` bounds how
-/// many signatures coord returns.
-pub async fn fetch_expectations(
-    action_kind: &str,
-    state_ids: &[&str],
-    top_k: usize,
-) -> Vec<PredictedSignature> {
+/// (the same `states_active` already stamped into the ACK). It takes no
+/// `top_k`: `expectations_url` always asks for [`RISK_FETCH_TOP_K`] rows.
+pub async fn fetch_expectations(action_kind: &str, state_ids: &[&str]) -> Vec<PredictedSignature> {
     let base = match coord_http_base() {
         Some(b) => b,
         None => {
@@ -95,13 +128,7 @@ pub async fn fetch_expectations(
         }
     };
 
-    // `state_ids` is comma-joined; the canonical ids are SCREAMING_SNAKE so no
-    // escaping is needed. An empty active set sends `state_ids=` (coord answers
-    // with the unconditioned cell).
-    let joined = state_ids.join(",");
-    let url = format!(
-        "{base}/coord/dev-actions/expectations?action_kind={action_kind}&state_ids={joined}&top_k={top_k}"
-    );
+    let url = expectations_url(&base, action_kind, state_ids);
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(EXPECTATIONS_TIMEOUT_SECS))
@@ -142,6 +169,46 @@ pub async fn fetch_expectations(
     }
 }
 
+/// The expectations GET for `(action_kind, state_ids)` against coord's `base`.
+/// It always asks for [`RISK_FETCH_TOP_K`] rows, so no call site can fetch
+/// fewer than the risk assessment needs.
+fn expectations_url(base: &str, action_kind: &str, state_ids: &[&str]) -> String {
+    // `state_ids` is comma-joined; the canonical ids are SCREAMING_SNAKE so no
+    // escaping is needed. An empty active set sends `state_ids=` (coord answers
+    // with the unconditioned cell).
+    let joined = state_ids.join(",");
+    format!(
+        "{base}/coord/dev-actions/expectations?action_kind={action_kind}&state_ids={joined}&top_k={RISK_FETCH_TOP_K}"
+    )
+}
+
+/// The mint flow's `(predicted, risk)` from one fetch: `risk` is
+/// [`assess_action_risk`] over every fetched row, and `predicted` is the ACK's
+/// cut (`ack_predicted`), taken only after. Cutting first could drop the
+/// boot row the exact-cell arm reads (coord's pooled mean can rank it low),
+/// so both mint sites come through here rather than order the two themselves.
+pub fn assess_then_cut(
+    fetched: Vec<PredictedSignature>,
+    states_active: &[&str],
+) -> (Vec<PredictedSignature>, ActionRisk) {
+    let risk = assess_action_risk(&fetched, states_active);
+    (ack_predicted(fetched), risk)
+}
+
+/// The ACK's `predicted` array from the whole fetch: the
+/// [`ACK_PREDICTED_TOP_K`] rows with the highest `posterior_mean`, signature
+/// ascending on ties (coord's own order, so this is the list a `top_k=5`
+/// fetch returns, whatever order the rows arrived in).
+fn ack_predicted(mut predicted: Vec<PredictedSignature>) -> Vec<PredictedSignature> {
+    predicted.sort_by(|a, b| {
+        b.posterior_mean
+            .total_cmp(&a.posterior_mean)
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+    predicted.truncate(ACK_PREDICTED_TOP_K);
+    predicted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +224,8 @@ mod tests {
             occurrences: 3,
             trials: 5,
             evidence_basis: "exact".into(),
+            exact_trials: None,
+            exact_occurrences: None,
         };
         let json = serde_json::to_value(&pred).expect("serialize");
         assert_eq!(json["signature"], "DEV-TAURI-ASSET-MISSING");
@@ -164,7 +233,8 @@ mod tests {
         assert_eq!(json["occurrences"], 3);
         assert_eq!(json["trials"], 5);
         assert_eq!(json["evidence_basis"], "exact");
-        // No stray fields beyond the five contract fields.
+        // No stray fields beyond the five contract fields (the exact-cell
+        // counts appear only when coord sent them).
         assert_eq!(
             json.as_object().expect("object").len(),
             5,
@@ -217,6 +287,99 @@ mod tests {
         assert_eq!(second.signature, "DEV-UI-ERROR-BOUNDARY");
         assert_eq!(second.posterior_mean, 0.2);
         assert_eq!(second.evidence_basis, "partial");
+        // A coord that predates the exact-cell counts leaves them unset.
+        assert_eq!((first.exact_trials, first.exact_occurrences), (None, None));
+    }
+
+    /// coord's `hierarchical-eb-v1` row carries the exact cell's own counts
+    /// beside the shrunk mean (plus fields the supervisor ignores); they
+    /// decode, and they ride into the ACK only when coord sent them.
+    #[test]
+    fn decodes_the_exact_cell_counts_of_a_hierarchical_eb_row() {
+        let sample = r#"{
+            "action_kind": "restart",
+            "estimator": "hierarchical-eb-v1",
+            "expectations": [{
+                "signature": "DEV-TAURI-ASSET-MISSING",
+                "posterior_mean": 0.2345,
+                "occurrences": 5,
+                "trials": 12,
+                "evidence_basis": "marginal",
+                "ci_low": 0.05,
+                "ci_high": 0.61,
+                "exact_trials": 5,
+                "exact_occurrences": 5,
+                "kappa_exact": 64.0
+            }]
+        }"#;
+        let parsed: ExpectationsResponse = serde_json::from_str(sample).expect("decode");
+        let row = &parsed.expectations[0];
+        assert_eq!(
+            (row.exact_trials, row.exact_occurrences),
+            (Some(5), Some(5))
+        );
+        let json = serde_json::to_value(row).expect("serialize");
+        assert_eq!(json["exact_trials"], 5);
+        assert_eq!(json["exact_occurrences"], 5);
+        assert_eq!(json.as_object().expect("object").len(), 7);
+    }
+
+    /// The fetch asks coord for its ceiling, never the ACK's five: coord ranks
+    /// by its pooled mean before cutting to `top_k`, so fewer rows could drop
+    /// the boot row the exact-cell arm reads before the policy sees it. The
+    /// URL is the only place the fetch size is set; no caller passes one.
+    #[test]
+    fn the_fetch_asks_coord_for_its_top_100_rows() {
+        assert_eq!(
+            expectations_url(
+                "https://coord.example",
+                "restart",
+                &["LEGACY_EXE_FALLBACK", "SLOTS_EMPTY"]
+            ),
+            "https://coord.example/coord/dev-actions/expectations\
+             ?action_kind=restart&state_ids=LEGACY_EXE_FALLBACK,SLOTS_EMPTY&top_k=100"
+        );
+        // An empty active set sends `state_ids=` (the unconditioned cell).
+        assert_eq!(
+            expectations_url("https://coord.example", "spawn", &[]),
+            "https://coord.example/coord/dev-actions/expectations\
+             ?action_kind=spawn&state_ids=&top_k=100"
+        );
+    }
+
+    /// Both mint sites' `risk` reads the whole fetch and their ACK keeps the
+    /// top five by `posterior_mean` (signature ascending on ties), whatever
+    /// order the rows arrived in. coord's pooled mean can rank the incident row
+    /// sixth — 4 of 4 from this exact state set, below five other signatures —
+    /// and it must still trip the exact-cell arm and be echoed in `risk`,
+    /// though the ACK's five leave it out.
+    #[test]
+    fn the_risk_reads_the_whole_fetch_and_the_ack_keeps_the_top_five() {
+        let row = |sig: &str, posterior_mean: f64, exact: Option<(u64, u64)>| PredictedSignature {
+            signature: sig.to_string(),
+            posterior_mean,
+            occurrences: 1,
+            trials: 10,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: exact.map(|(_, n)| n),
+            exact_occurrences: exact.map(|(y, _)| y),
+        };
+        let fetched = vec![
+            row("DEV-B", 0.29, None),
+            row("DEV-TAURI-ASSET-MISSING", 0.2, Some((4, 4))),
+            row("DEV-E", 0.29, None),
+            row("DEV-A", 0.29, None),
+            row("DEV-D", 0.29, None),
+            row("DEV-C", 0.29, None),
+        ];
+        let (predicted, risk) = assess_then_cut(fetched, &["SLOTS_EMPTY"]);
+        assert!(risk.route_lkg, "the sixth-ranked boot row must still trip");
+        assert_eq!(
+            risk.top_signature.map(|p| p.signature).as_deref(),
+            Some("DEV-TAURI-ASSET-MISSING")
+        );
+        let ack: Vec<String> = predicted.into_iter().map(|p| p.signature).collect();
+        assert_eq!(ack, ["DEV-A", "DEV-B", "DEV-C", "DEV-D", "DEV-E"]);
     }
 
     /// A response with no `expectations` key (or an empty array) decodes to an

@@ -24,11 +24,39 @@
 //! # What counts as "high risk"
 //!
 //! A boot/asset/webview-failure-class `DEV-*` signature (the white-screen
-//! family — see [`is_boot_failure_signature`]) whose coord posterior_mean is at
-//! or above [`RISK_POSTERIOR_THRESHOLD`] AND whose evidence rests on at least
+//! family — see [`is_boot_failure_signature`]) that trips either of two arms.
+//!
+//! **The served arm:** coord's `posterior_mean` is at or above
+//! [`RISK_POSTERIOR_THRESHOLD`] AND its evidence rests on at least
 //! [`RISK_MIN_TRIALS`] trials. The trials floor keeps a single unlucky sample
 //! (1/1 = posterior 1.0) from tripping the bias — we only act when the recorded
 //! cell has enough history to mean something.
+//!
+//! **The exact-cell arm:** the EXACT state set's own posterior
+//! ([`exact_cell_posterior`]) is at or above the same threshold. coord's
+//! `hierarchical-eb-v1` reader serves a `posterior_mean` that pools the exact
+//! cell toward the kind's other state sets — better calibrated on average, but
+//! slow to move on the incident shape this guard exists for. Before coord's
+//! fit, the run of consecutive white-screens a new state set needs to reach a
+//! pooled 0.5 grows with the kind's healthy history: 3 on an empty kind, about
+//! 14 on restart's ledger as it stood on 2026-10-27 (39 trials, one boot
+//! failure), about 18 just before the 100-trial fit. The exact cell's own
+//! posterior (the formula the earlier reader served once a state set had 5
+//! trials of its own) reaches it at the 4th. This arm needs no trials floor
+//! of its own: under its Beta(0.4, 3.6) prior no record of fewer than 4
+//! trials reaches 0.5, so it already takes 4 consecutive failures. A false
+//! positive here costs one LKG-pinned restart and a warning; a late trip
+//! costs a white-screen per restart in between.
+//!
+//! **The veto:** pooling errs the other way too. Before coord's fit, a state
+//! set whose own record is healthy can be served a posterior above 0.5 (a
+//! served 0.62 beside an exact record of 0 of 10), which the earlier reader
+//! could not do: once a state set had [`N_MIN_EXACT`] trials of its own, it
+//! served that cell alone. So once the exact state set has [`N_MIN_EXACT`]
+//! trials and its own posterior is below the threshold, the served arm alone
+//! does not trip; from there the exact record decides, as it did under the
+//! earlier reader. Against a coord that sends no exact-cell counts (a reader
+//! that predates them) only the served arm exists, and its rule is unchanged.
 
 use crate::dev_action::expectations::PredictedSignature;
 
@@ -37,12 +65,21 @@ use crate::dev_action::expectations::PredictedSignature;
 /// boot/asset/webview check at least half the time."
 pub const RISK_POSTERIOR_THRESHOLD: f64 = 0.5;
 
-/// Minimum trials backing a prediction before it can trip the risk bias. Guards
-/// against a single unlucky sample (1/1 ⇒ posterior 1.0) auto-routing to LKG on
-/// one data point. Small by design — a handful of recorded restarts from a state
-/// set is enough signal to bias-and-warn (we never refuse, so the cost of a
-/// false positive is just an LKG-pinned restart + a warning).
+/// Minimum trials behind coord's served posterior before it can trip the risk
+/// bias (the served arm; the exact-cell arm's floor comes from its prior — see
+/// the module doc). Guards against a single unlucky sample (1/1 ⇒ posterior
+/// 1.0) auto-routing to LKG on one data point. Small by design — a handful of
+/// recorded restarts from a state set is enough signal to bias-and-warn (we
+/// never refuse, so the cost of a false positive is just an LKG-pinned restart
+/// + a warning).
 pub const RISK_MIN_TRIALS: u64 = 3;
+
+/// Exact-cell trials from which a healthy exact record vetoes the served arm
+/// (see the module doc). Named after coord's pre-hierarchical reader's
+/// `N_MIN_EXACT`: from this many trials of its own, that reader served the
+/// exact state set's own rate alone, so a pooled posterior could not outvote
+/// the set's own record.
+pub const N_MIN_EXACT: u64 = 5;
 
 /// The boot/asset/webview-failure-class `DEV-*` signatures — the white-screen
 /// family the LKG route exists to prevent. A prediction for any of these, with
@@ -60,12 +97,111 @@ pub fn is_boot_failure_signature(signature: &str) -> bool {
     BOOT_FAILURE_SIGNATURES.contains(&signature)
 }
 
-/// Whether one prediction is high-risk: a boot-failure-class signature, at or
-/// above the posterior threshold, backed by at least the trials floor.
-fn is_high_risk(pred: &PredictedSignature) -> bool {
-    is_boot_failure_signature(&pred.signature)
-        && pred.posterior_mean >= RISK_POSTERIOR_THRESHOLD
+/// Prior occurrences and prior trials of [`exact_cell_posterior`]: the
+/// Beta(0.4, 3.6) of coord's dev-signature prior (mean 0.1, strength 4).
+const EXACT_PRIOR_OCCURRENCES: f64 = 0.4;
+const EXACT_PRIOR_TRIALS: f64 = 4.0;
+
+/// The exact state set's OWN posterior mean, `(y + 0.4) / (n + 4)` over the
+/// cell's `exact_occurrences` / `exact_trials`, with no pooling toward other
+/// state sets. `None` when coord sent no exact-cell counts (an older reader)
+/// or the cell has no trials.
+pub fn exact_cell_posterior(pred: &PredictedSignature) -> Option<f64> {
+    let n = pred.exact_trials.filter(|&n| n > 0)?;
+    let y = pred.exact_occurrences.unwrap_or(0).min(n);
+    Some((y as f64 + EXACT_PRIOR_OCCURRENCES) / (n as f64 + EXACT_PRIOR_TRIALS))
+}
+
+/// Which arm made a prediction high-risk (see the module doc), so the warning
+/// can name the posterior that crossed the threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RiskArm {
+    /// coord's served posterior alone.
+    Served,
+    /// The exact state set's own posterior alone.
+    ExactCell,
+    /// Both posteriors.
+    Both,
+}
+
+/// Which arm, if any, makes one prediction high-risk. `None` unless the
+/// signature is boot-failure class and either coord's served posterior clears
+/// the threshold over at least [`RISK_MIN_TRIALS`] trials without a healthy
+/// exact record of [`N_MIN_EXACT`] or more trials vetoing it, or the exact
+/// state set's own posterior clears the threshold (see the module doc).
+fn high_risk_arm(pred: &PredictedSignature) -> Option<RiskArm> {
+    if !is_boot_failure_signature(&pred.signature) {
+        return None;
+    }
+    // No trials floor here: even at all failures, (n + 0.4) / (n + 4) >= 0.5
+    // needs n >= 3.2, so the Beta(0.4, 3.6) prior already takes 4 consecutive
+    // failures, more than the served arm's RISK_MIN_TRIALS.
+    let exact_cell = exact_cell_posterior(pred).is_some_and(|p| p >= RISK_POSTERIOR_THRESHOLD);
+    // From N_MIN_EXACT trials (so a posterior exists), the set's own record
+    // outvotes the pooled one: below the threshold, the served arm cannot trip.
+    let vetoed = !exact_cell && pred.exact_trials.is_some_and(|n| n >= N_MIN_EXACT);
+    let served = pred.posterior_mean >= RISK_POSTERIOR_THRESHOLD
         && pred.trials >= RISK_MIN_TRIALS
+        && !vetoed;
+    match (served, exact_cell) {
+        (true, true) => Some(RiskArm::Both),
+        (true, false) => Some(RiskArm::Served),
+        (false, true) => Some(RiskArm::ExactCell),
+        (false, false) => None,
+    }
+}
+
+/// A posterior as the warning prints it: two decimals, or as many more as it
+/// takes for one below [`RISK_POSTERIOR_THRESHOLD`] to print below it. A served
+/// 0.4968 reads "0.497", not a "0.50" that looks like it met the `>= 0.50`
+/// printed beside the other arm.
+fn posterior_text(p: f64) -> String {
+    (2..=17)
+        .map(|digits| format!("{p:.digits$}"))
+        .find(|text| {
+            p >= RISK_POSTERIOR_THRESHOLD
+                || text
+                    .parse::<f64>()
+                    .is_ok_and(|shown| shown < RISK_POSTERIOR_THRESHOLD)
+        })
+        .unwrap_or_else(|| p.to_string())
+}
+
+/// The warning's evidence clause for the prediction that tripped. When coord
+/// sent the exact-cell counts there are two arms to tell apart, so
+/// `>= <threshold> (<arm>)` follows each posterior that crossed it, and every
+/// posterior below the threshold prints below it ([`posterior_text`]).
+/// Without them only the served arm exists and the clause reads as it always
+/// did.
+fn evidence_clause(top: &PredictedSignature, arm: RiskArm) -> String {
+    let crossed = |arm_name: &str| format!(" >= {RISK_POSTERIOR_THRESHOLD:.2} ({arm_name})");
+    let served_mark = if top.exact_trials.is_some() && arm != RiskArm::ExactCell {
+        crossed("served arm")
+    } else {
+        String::new()
+    };
+    let own_posterior = exact_cell_posterior(top);
+    let exact_desc = match (top.exact_occurrences, top.exact_trials, own_posterior) {
+        (Some(y), Some(n), Some(own)) => {
+            let exact_mark = if arm == RiskArm::Served {
+                String::new()
+            } else {
+                crossed("exact-cell arm")
+            };
+            format!(
+                "; this exact state set: {y} of {n} trials, own posterior {}{exact_mark}",
+                posterior_text(own)
+            )
+        }
+        _ => String::new(),
+    };
+    format!(
+        "posterior {}{served_mark}, {}/{} trials, evidence={}{exact_desc}",
+        posterior_text(top.posterior_mean),
+        top.occurrences,
+        top.trials,
+        top.evidence_basis,
+    )
 }
 
 /// The assessment the policy returns for an action — pure advice the mint flow
@@ -74,8 +210,9 @@ fn is_high_risk(pred: &PredictedSignature) -> bool {
 pub struct ActionRisk {
     /// Advise routing the action to the last-known-good binary instead of the
     /// freshest slot exe. `true` only when a boot-failure-class prediction
-    /// cleared the threshold + trials floor. The caller may still override this
-    /// when the operator explicitly opted out (provenance/exe selector).
+    /// tripped the served or the exact-cell arm (see the module doc). The
+    /// caller may still override this when the operator explicitly opted out
+    /// (provenance/exe selector).
     pub route_lkg: bool,
     /// A loud, human-readable warning to log (`tracing::warn!`) and stamp into
     /// the ACK so the initiator sees the risk BEFORE the outcome lands. `None`
@@ -109,25 +246,38 @@ impl ActionRisk {
 ///
 /// Returns [`ActionRisk::none`] when `predicted` is empty or no prediction is
 /// high-risk (the common healthy case → behavior unchanged). When at least one
-/// boot/asset/webview-failure-class signature clears
-/// [`RISK_POSTERIOR_THRESHOLD`] with `trials >= `[`RISK_MIN_TRIALS`], returns an
-/// assessment with `route_lkg = true`, a loud `warn` naming the top signature +
-/// its evidence + the active states, and `top_signature` echoing that
+/// boot/asset/webview-failure-class prediction trips the served arm (its
+/// posterior clears [`RISK_POSTERIOR_THRESHOLD`] over at least
+/// [`RISK_MIN_TRIALS`] trials, unless a healthy exact record of
+/// [`N_MIN_EXACT`] or more trials vetoes it) or the exact-cell arm (the exact
+/// state set's own [`exact_cell_posterior`] clears the same threshold), returns
+/// an assessment with `route_lkg = true`, a loud `warn` naming the top
+/// signature + its evidence (and, when coord sent the exact-cell counts, the
+/// arm that crossed) + the active states, and `top_signature` echoing that
 /// prediction.
 ///
 /// The "top" signature is the highest-posterior high-risk prediction (ties
-/// broken by trials, then occurrences) — the strongest evidence in the cell.
+/// broken by trials, then occurrences, then the smaller signature) — the
+/// strongest evidence in the cell. The last key is coord's own tie order, so
+/// the pick depends on which rows qualify and not on the order they arrived
+/// in: a smaller fetch that still holds the winner names the same signature.
 pub fn assess_action_risk(predicted: &[PredictedSignature], states_active: &[&str]) -> ActionRisk {
     // Pick the strongest high-risk prediction. Compare by posterior, then by
-    // trials, then by occurrences so the "loudest, best-evidenced" one wins.
-    let top = predicted.iter().filter(|p| is_high_risk(p)).max_by(|a, b| {
-        a.posterior_mean
-            .total_cmp(&b.posterior_mean)
-            .then_with(|| a.trials.cmp(&b.trials))
-            .then_with(|| a.occurrences.cmp(&b.occurrences))
-    });
+    // trials, then by occurrences so the "loudest, best-evidenced" one wins; a
+    // full tie goes to the smaller signature (`max_by` alone would keep
+    // whichever tied row came last).
+    let top = predicted
+        .iter()
+        .filter_map(|p| high_risk_arm(p).map(|arm| (p, arm)))
+        .max_by(|(a, _), (b, _)| {
+            a.posterior_mean
+                .total_cmp(&b.posterior_mean)
+                .then_with(|| a.trials.cmp(&b.trials))
+                .then_with(|| a.occurrences.cmp(&b.occurrences))
+                .then_with(|| b.signature.cmp(&a.signature))
+        });
 
-    let Some(top) = top else {
+    let Some((top, arm)) = top else {
         return ActionRisk::none();
     };
 
@@ -138,14 +288,11 @@ pub fn assess_action_risk(predicted: &[PredictedSignature], states_active: &[&st
     };
     let warn = format!(
         "HIGH-RISK dev action: history predicts boot-failure signature {} \
-         (posterior {:.2}, {}/{} trials, evidence={}) under active states [{}]. \
+         ({}) under active states [{}]. \
          Biasing toward the last-known-good binary to avoid a white-screen; \
          pass an explicit exe/provenance selector to override.",
         top.signature,
-        top.posterior_mean,
-        top.occurrences,
-        top.trials,
-        top.evidence_basis,
+        evidence_clause(top, arm),
         states_desc,
     );
 
@@ -167,7 +314,206 @@ mod tests {
             occurrences: occ,
             trials,
             evidence_basis: "exact".to_string(),
+            exact_trials: None,
+            exact_occurrences: None,
         }
+    }
+
+    /// A `hierarchical-eb-v1` row: a pooled `posterior_mean` over the top
+    /// active state's marginal, beside the exact state set's own counts.
+    fn pooled(sig: &str, posterior: f64, exact_occ: u64, exact_trials: u64) -> PredictedSignature {
+        PredictedSignature {
+            signature: sig.to_string(),
+            posterior_mean: posterior,
+            occurrences: exact_occ,
+            trials: 12,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: Some(exact_trials),
+            exact_occurrences: Some(exact_occ),
+        }
+    }
+
+    /// A `hierarchical-eb-v1` row whose served side clears the threshold by
+    /// itself: a pooled 0.62 over the top active state's marginal 27 of 40
+    /// (what coord serves before its fit for {A} 27/30, {B} 27/30, {A,B} 0/10),
+    /// beside the exact state set's own `(y, n)` — `None` for a coord that
+    /// predates the exact-cell counts.
+    fn served_062(sig: &str, exact: Option<(u64, u64)>) -> PredictedSignature {
+        PredictedSignature {
+            signature: sig.to_string(),
+            posterior_mean: 0.62,
+            occurrences: 27,
+            trials: 40,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: exact.map(|(_, n)| n),
+            exact_occurrences: exact.map(|(y, _)| y),
+        }
+    }
+
+    /// The incident shape under coord's `hierarchical-eb-v1` reader: the
+    /// pooled posterior stays low (before the fit, the kind's healthy history
+    /// holds it near the global rate) while every restart from this exact
+    /// state set has white-screened. The exact cell's own record trips the
+    /// bias at the 4th consecutive failure; the pooled 0.23 alone would not.
+    #[test]
+    fn the_exact_state_sets_own_record_trips_the_bias_when_pooling_lags() {
+        // 3/3 white-screens: (3 + 0.4) / (3 + 4) = 0.486 — not yet.
+        let three = vec![pooled("DEV-TAURI-ASSET-MISSING", 0.21, 3, 3)];
+        assert_eq!(
+            assess_action_risk(&three, INCIDENT_STATES),
+            ActionRisk::none()
+        );
+        // 4/4: (4 + 0.4) / (4 + 4) = 0.55 — route to LKG.
+        let four = vec![pooled("DEV-TAURI-ASSET-MISSING", 0.23, 4, 4)];
+        let risk = assess_action_risk(&four, INCIDENT_STATES);
+        assert!(risk.route_lkg, "exact cell 4/4 must route_lkg");
+        let warn = risk.warn.expect("warns");
+        // The warning names the arm and the posterior that crossed, beside the
+        // served 0.23 that did not.
+        assert!(
+            warn.contains(
+                "(posterior 0.23, 4/12 trials, evidence=marginal; this exact state set: \
+                 4 of 4 trials, own posterior 0.55 >= 0.50 (exact-cell arm))"
+            ),
+            "{warn}"
+        );
+        assert!(!warn.contains("served arm"), "{warn}");
+        // A served posterior just under the threshold prints under it, never as
+        // a "0.50" that reads as meeting the `>= 0.50` the exact-cell arm shows.
+        for (served, printed) in [(0.4968, "0.497"), (0.4996, "0.4996")] {
+            let near = vec![pooled("DEV-TAURI-ASSET-MISSING", served, 4, 4)];
+            let warn = assess_action_risk(&near, INCIDENT_STATES)
+                .warn
+                .expect("warns");
+            assert!(
+                warn.contains(&format!(
+                    "(posterior {printed}, 4/12 trials, evidence=marginal; this exact state \
+                     set: 4 of 4 trials, own posterior 0.55 >= 0.50 (exact-cell arm))"
+                )),
+                "{warn}"
+            );
+        }
+        // A non-boot signature never trips, whatever its exact record.
+        let other = vec![pooled("DEV-UI-ERROR-BOUNDARY", 0.2, 9, 9)];
+        assert_eq!(
+            assess_action_risk(&other, INCIDENT_STATES),
+            ActionRisk::none()
+        );
+        // A healthy exact record leaves a pooled low posterior alone.
+        let healthy = vec![pooled("DEV-TAURI-ASSET-MISSING", 0.2, 1, 9)];
+        assert_eq!(
+            assess_action_risk(&healthy, INCIDENT_STATES),
+            ActionRisk::none()
+        );
+    }
+
+    /// The exact cell's own posterior: absent counts (an older coord) or an
+    /// empty cell give `None`; occurrences are clamped into the trials.
+    #[test]
+    fn exact_cell_posterior_reads_only_what_coord_sent() {
+        assert_eq!(
+            exact_cell_posterior(&pred("DEV-PANIC-STARTUP", 0.1, 1, 9)),
+            None
+        );
+        let empty = pooled("DEV-PANIC-STARTUP", 0.1, 0, 0);
+        assert_eq!(exact_cell_posterior(&empty), None);
+        let four = pooled("DEV-PANIC-STARTUP", 0.1, 4, 4);
+        assert_eq!(exact_cell_posterior(&four), Some(4.4 / 8.0));
+        let mut over = pooled("DEV-PANIC-STARTUP", 0.1, 4, 4);
+        over.exact_occurrences = Some(9);
+        assert_eq!(exact_cell_posterior(&over), Some(4.4 / 8.0));
+    }
+
+    /// A healthy exact record vetoes the served arm once the state set has
+    /// [`N_MIN_EXACT`] trials of its own. Before coord's fit a served 0.62 can
+    /// sit beside an exact record of 0 of 10, where the earlier reader served
+    /// that cell alone and listed no row. Below [`N_MIN_EXACT`] trials, and
+    /// against a coord that sends no exact-cell counts, the served arm routes
+    /// as before.
+    #[test]
+    fn a_healthy_exact_record_vetoes_the_served_arm_from_n_min_exact_trials() {
+        let asset = "DEV-TAURI-ASSET-MISSING";
+        // 0 of 10: own posterior 0.4 / 14 = 0.03 — vetoed.
+        assert_eq!(
+            assess_action_risk(&[served_062(asset, Some((0, 10)))], INCIDENT_STATES),
+            ActionRisk::none()
+        );
+        // 2 of 5, exactly N_MIN_EXACT: own posterior 2.4 / 9 = 0.27 — vetoed.
+        assert_eq!(
+            assess_action_risk(&[served_062(asset, Some((2, 5)))], INCIDENT_STATES),
+            ActionRisk::none()
+        );
+        // 1 of 4: too few trials to veto, so the served arm routes.
+        let one_of_four = assess_action_risk(&[served_062(asset, Some((1, 4)))], INCIDENT_STATES);
+        assert!(one_of_four.route_lkg, "4 exact trials cannot veto");
+        // No exact-cell counts (an older coord): routes, as before.
+        let older = assess_action_risk(&[served_062(asset, None)], INCIDENT_STATES);
+        assert!(older.route_lkg, "an older coord's served arm is unchanged");
+        // A non-boot signature never routes, whichever arms it clears.
+        let other = served_062("DEV-UI-ERROR-BOUNDARY", Some((9, 9)));
+        assert_eq!(
+            assess_action_risk(&[other], INCIDENT_STATES),
+            ActionRisk::none()
+        );
+    }
+
+    /// When coord sends the exact-cell counts the warning names the arm that
+    /// decided: `>= 0.50 (<arm>)` follows each posterior that crossed. Without
+    /// them only the served arm exists and the text reads as it always did.
+    #[test]
+    fn the_warning_names_the_served_arm_when_it_decided() {
+        let warn_for = |pred: PredictedSignature| {
+            assess_action_risk(&[pred], INCIDENT_STATES)
+                .warn
+                .expect("warns")
+        };
+        // The served arm alone: 2 of 4 is too few trials to veto, so the set's
+        // own posterior (2.4 / 8 = 0.30) is context, not a trip.
+        let served = warn_for(served_062("DEV-TAURI-ASSET-MISSING", Some((2, 4))));
+        assert!(
+            served.contains(
+                "(posterior 0.62 >= 0.50 (served arm), 27/40 trials, evidence=marginal; \
+                 this exact state set: 2 of 4 trials, own posterior 0.30)"
+            ),
+            "{served}"
+        );
+        assert!(!served.contains("exact-cell arm"), "{served}");
+        // Both arms: each posterior that crossed is marked.
+        let both = warn_for(served_062("DEV-TAURI-ASSET-MISSING", Some((6, 6))));
+        assert!(
+            both.contains("posterior 0.62 >= 0.50 (served arm)"),
+            "{both}"
+        );
+        assert!(
+            both.contains("6 of 6 trials, own posterior 0.64 >= 0.50 (exact-cell arm)"),
+            "{both}"
+        );
+        // An older coord: one arm, and the text from before the exact-cell arm.
+        let older = warn_for(served_062("DEV-TAURI-ASSET-MISSING", None));
+        assert!(
+            older.contains("(posterior 0.62, 27/40 trials, evidence=marginal) under active"),
+            "{older}"
+        );
+    }
+
+    /// The exact-cell arm needs no trials floor of its own: under the
+    /// Beta(0.4, 3.6) prior no record of fewer than 4 trials reaches the
+    /// threshold (even 3 of 3 is 3.4 / 7 = 0.486), and 4 is above
+    /// [`RISK_MIN_TRIALS`]. Fails if the prior, the threshold or the served
+    /// floor move far enough that a separate floor would change a verdict.
+    #[test]
+    fn the_exact_cell_arm_needs_no_trials_floor_of_its_own() {
+        for n in 1..RISK_MIN_TRIALS.max(4) {
+            for y in 0..=n {
+                let own = exact_cell_posterior(&pooled("DEV-PANIC-STARTUP", 0.1, y, n));
+                assert!(
+                    own.is_some_and(|p| p < RISK_POSTERIOR_THRESHOLD),
+                    "{y} of {n}: {own:?}"
+                );
+            }
+        }
+        let four = exact_cell_posterior(&pooled("DEV-PANIC-STARTUP", 0.1, 4, 4));
+        assert!(four.is_some_and(|p| p >= RISK_POSTERIOR_THRESHOLD));
     }
 
     const INCIDENT_STATES: &[&str] = &["SLOTS_EMPTY", "LEGACY_EXE_FALLBACK"];
@@ -276,6 +622,32 @@ mod tests {
             top.signature, "DEV-TAURI-ASSET-MISSING",
             "highest-posterior boot-failure signature must win"
         );
+    }
+
+    /// A full tie on posterior, trials and occurrences goes to the smaller
+    /// signature, so `top_signature` depends only on which rows qualify. Here
+    /// coord's order (posterior, then signature) puts one tied boot row fifth
+    /// and the other sixth: its top five, the whole list and the list in
+    /// reverse all name the same signature.
+    #[test]
+    fn a_full_tie_names_the_smaller_signature_whatever_was_fetched() {
+        let named = |rows: &[PredictedSignature]| {
+            assess_action_risk(rows, INCIDENT_STATES)
+                .top_signature
+                .map(|p| p.signature)
+        };
+        let fetched = vec![
+            pred("DEV-A", 0.9, 9, 10),
+            pred("DEV-B", 0.9, 9, 10),
+            pred("DEV-C", 0.9, 9, 10),
+            pred("DEV-D", 0.9, 9, 10),
+            pred("DEV-PANIC-STARTUP", 0.6, 6, 10),
+            pred("DEV-TAURI-ASSET-MISSING", 0.6, 6, 10),
+        ];
+        assert_eq!(named(&fetched[..5]).as_deref(), Some("DEV-PANIC-STARTUP"));
+        assert_eq!(named(&fetched).as_deref(), Some("DEV-PANIC-STARTUP"));
+        let reversed: Vec<PredictedSignature> = fetched.into_iter().rev().collect();
+        assert_eq!(named(&reversed).as_deref(), Some("DEV-PANIC-STARTUP"));
     }
 
     /// `is_boot_failure_signature` is an exact allowlist match — an unrelated

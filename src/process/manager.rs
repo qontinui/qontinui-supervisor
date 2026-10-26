@@ -1925,9 +1925,18 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                     //
                     // No unwind is needed on the `continue` path: the flag's
                     // lifecycle is "latched on stop request, cleared on the next
-                    // start", so a retry simply re-latches and a legitimate
-                    // operator restart clears it.
-                    managed.runner.write().await.stop_requested = true;
+                    // start", so a retry simply re-latches (keeping the first
+                    // request's time) and a legitimate operator restart clears
+                    // it. The flag makes the exit monitor stamp this spawn's
+                    // exit as requested (unless a start of the same runner
+                    // clears it first; see the residual of the attribution
+                    // watcher's `is_startup_panic_of` that says starts and stops
+                    // are not ordered against each other).
+                    managed
+                        .runner
+                        .write()
+                        .await
+                        .latch_stop_request(chrono::Utc::now());
                 } else {
                     // Port free but state says running — crashed
                     let mut runner = managed.runner.write().await;
@@ -2443,32 +2452,35 @@ pub async fn start_managed_runner(
     // spawn time, so this must precede them. If the file can't be opened
     // (out of disk space, perms, etc.) the runner still starts — early-log
     // capture is strictly best-effort. Drops any path stored from a prior
-    // start of this runner id.
+    // start of this runner id. `early_log_path` ends as the file this spawn
+    // opened, `None` when it opened none; its spawn-ring entry carries it.
     let early_log_path = crate::process::early_log::early_log_dir()
         .map(|dir| crate::process::early_log::early_log_path_for(&dir, &runner_id));
-    if let Some(ref path) = early_log_path {
-        match crate::process::early_log::EarlyLogWriter::open(path) {
+    let early_log_path = match early_log_path {
+        Some(path) => match crate::process::early_log::EarlyLogWriter::open(&path) {
             Some(writer) => {
                 managed.logs.set_early_log_writer(Some(writer));
-                let mut slot = managed.early_log_path.write().await;
-                *slot = Some(path.clone());
                 debug!(
                     "Early-log capture enabled for runner '{}' at {:?}",
                     runner_name, path
                 );
+                Some(path)
             }
+            // Couldn't open the file — clear any prior path below so we
+            // don't surface a stale value via the API.
             None => {
-                // Couldn't open the file — clear any prior path so we don't
-                // surface a stale value via the API.
                 managed.logs.set_early_log_writer(None);
-                let mut slot = managed.early_log_path.write().await;
-                *slot = None;
+                None
             }
+        },
+        None => {
+            managed.logs.set_early_log_writer(None);
+            None
         }
-    } else {
-        managed.logs.set_early_log_writer(None);
+    };
+    {
         let mut slot = managed.early_log_path.write().await;
-        *slot = None;
+        *slot = early_log_path.clone();
     }
 
     // Capture stdout/stderr to the managed runner's logs. Pass the managed
@@ -2489,19 +2501,12 @@ pub async fn start_managed_runner(
         );
     }
 
-    // Update per-runner state. Clearing `stop_requested` HERE (rather than
-    // at stop completion) makes the operator-stop marker race-free for the
-    // exit monitor: the flag can only transition true→false through a
-    // subsequent start, so any process exit observed after a stop request
-    // always reads `stop_requested == true`.
-    {
-        let mut runner = managed.runner.write().await;
-        runner.process = Some(child);
-        runner.running = true;
-        runner.started_at = Some(chrono::Utc::now());
-        runner.pid = pid;
-        runner.stop_requested = false;
-    }
+    // Record the spawn on the registry entry, and its entry in the spawn ring
+    // the dev-action attribution watcher reads at window close. After this
+    // spawn re-pointed the panic-log dir, the stored panic and the early log
+    // above; before the exit monitor is spawned below, so the entry exists
+    // before that monitor can attempt a stamp for it.
+    record_spawn_in_registry(managed, child, early_log_path).await;
 
     // If this is the primary runner, also update legacy state for backward compat
     if is_primary {
@@ -2509,7 +2514,7 @@ pub async fn start_managed_runner(
         runner.running = true;
         runner.started_at = Some(chrono::Utc::now());
         runner.pid = pid;
-        runner.stop_requested = false;
+        runner.clear_stop_request();
         // process stays None in legacy — managed runner owns it
     }
 
@@ -2546,6 +2551,53 @@ pub async fn start_managed_runner(
     }
 
     Ok(())
+}
+
+/// Record a spawn on the runner's registry entry: the live process, its pid
+/// (read from the child) and start time, `running`, the previous process's
+/// stop request cleared, and this spawn's entry in the spawn ring
+/// (`ManagedRunner::recent_spawns`), dated at the same instant as
+/// `started_at` and naming this spawn's own early log.
+///
+/// The stop request is cleared HERE, at the next start, rather than when a
+/// stop completes, so a completing stop cannot unset it before the exit
+/// monitor reads it: the flag and its time go back to unset only through a
+/// later start, and the monitor reads the flag as it stands when the monitor
+/// reads it (a failed stop's flag included), with the time of the earliest
+/// request. That read is not race-free: starts and stops of one runner are
+/// not ordered against each other, and this call clears every stop request
+/// latched before it (see the residual of the attribution watcher's
+/// `is_startup_panic_of` that says so).
+///
+/// A stop clears `started_at` and `pid` again, and an exit clears `pid`;
+/// neither removes the ring entry. `start_managed_runner` calls this once its
+/// spawn has re-pointed the panic-log dir, the stored panic and the early log,
+/// and before it spawns the exit monitor that stamps the entry (that residual
+/// excepted).
+async fn record_spawn_in_registry(
+    managed: &ManagedRunner,
+    child: tokio::process::Child,
+    early_log_path: Option<std::path::PathBuf>,
+) {
+    let pid = child.id();
+    let spawned_at = chrono::Utc::now();
+    {
+        let mut runner = managed.runner.write().await;
+        runner.process = Some(child);
+        runner.running = true;
+        runner.started_at = Some(spawned_at);
+        runner.pid = pid;
+        runner.clear_stop_request();
+    }
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            pid,
+            early_log_path,
+        ));
 }
 
 /// Outcome of a fail-open sidecar deploy step in
@@ -4874,6 +4926,10 @@ async fn monitor_runner_process_exit_inner(
     // crash-only watchdog must never restart a runner the supervisor didn't
     // spawn, so this is threaded into the restart decision.
     let had_child_handle = child.is_some();
+    // The child's pid names the spawn-ring entry this exit is stamped on. It
+    // is read BEFORE the wait: tokio's `Child::id` returns `None` once the
+    // child has been polled to completion.
+    let exited_pid = child.as_ref().and_then(|child| child.id());
 
     let exit_status = if let Some(mut child) = child {
         match child.wait().await {
@@ -4886,21 +4942,47 @@ async fn monitor_runner_process_exit_inner(
     } else {
         None
     };
+    let exited_at = chrono::Utc::now();
 
-    // Update per-runner state. Latch `stop_requested` in the same critical
-    // section, BEFORE publishing `running = false`: the operator stop path
-    // (`stop_runner_by_id`) only proceeds past its graceful-wait once it
-    // observes `running == false`, and the flag is only ever cleared by a
-    // subsequent start — so the value read here is exactly the operator's
-    // intent for THIS exit, race-free.
-    let stop_requested_at_exit = {
+    // Update per-runner state. Read `stop_requested`, and the time of the
+    // earliest request with it, in the same critical section, before
+    // publishing `running = false`. Both are only ever cleared by a
+    // subsequent start, so the values read here are the stop flag as it
+    // stands when this monitor reads it, a failed stop's flag included. That
+    // read and the reset below are not race-free: starts and stops of one
+    // runner are not ordered against each other, and
+    // `record_spawn_in_registry` clears every stop request latched before it
+    // (see the residual of the attribution watcher's `is_startup_panic_of`
+    // that says so).
+    let (stop_requested_at_exit, stop_request_time) = {
         let mut runner = managed.runner.write().await;
-        let latched = runner.stop_requested;
+        let latched = (runner.stop_requested, runner.stop_requested_at);
         runner.running = false;
         runner.process = None;
         runner.pid = None;
         latched
     };
+
+    // Stamp the exit on the exited spawn's ring entry at once (except as the
+    // residual of the attribution watcher's `is_startup_panic_of` that says
+    // starts and stops are not ordered against each other describes): before
+    // the legacy-state update, the log emit and the panic-log parse below,
+    // which would otherwise widen the lag in which the dev-action attribution
+    // watcher reads a process that has exited as still up. It still lags the
+    // exit by the wait's wake-up and the critical section above. When the
+    // stop flag read above was latched, the entry carries the request's
+    // time, or the exit's when the flag was latched with none.
+    // Only stamped, never removed; the panic parsed at this exit is attached
+    // below to the entry this stamps, if it stamps one.
+    let exit_requested_at =
+        stop_requested_at_exit.then_some(stop_request_time.unwrap_or(exited_at));
+    if let Some(pid) = exited_pid {
+        managed
+            .recent_spawns
+            .write()
+            .await
+            .stamp_exit(pid, exited_at, exit_requested_at);
+    }
 
     // Update legacy state for primary
     if is_primary {
@@ -4912,7 +4994,7 @@ async fn monitor_runner_process_exit_inner(
 
     state.notify_health_change();
 
-    if let Some(status) = exit_status {
+    let exit_panic = if let Some(status) = exit_status {
         let msg = if status.success() {
             format!("Runner '{}' process exited normally", runner_name)
         } else {
@@ -4933,8 +5015,10 @@ async fn monitor_runner_process_exit_inner(
         // axum router construction) doesn't flow through stderr in a
         // shape our buffered reader can latch onto, so this file is the
         // only place the panic payload actually lives.
-        if !status.success() {
-            check_and_record_panic_log(&state, &managed, &runner_name).await;
+        if status.success() {
+            None
+        } else {
+            check_and_record_panic_log(&state, &managed, &runner_name).await
         }
     } else {
         let msg = format!("Runner '{}' process terminated unexpectedly", runner_name);
@@ -4946,7 +5030,23 @@ async fn monitor_runner_process_exit_inner(
         // Also check on unexpected termination — the child is gone either
         // way, and if a panic log exists within the freshness window it's
         // almost certainly the cause.
-        check_and_record_panic_log(&state, &managed, &runner_name).await;
+        check_and_record_panic_log(&state, &managed, &runner_name).await
+    };
+
+    // Attach the panic parsed at this exit to the entry stamped above,
+    // matched by its pid and that exit time, so never to another spawn that
+    // reused the pid. A watcher that closes between the stamp and this attach
+    // sees the exit without the panic, and still finds it in `recent_panic`,
+    // which `check_and_record_panic_log` stored, or in the file. Both ring
+    // writes run BEFORE the crash watchdog below can schedule a restart, whose
+    // spawn pushes the next entry and clears `recent_panic`; the next panic
+    // then overwrites the file.
+    if let (Some(pid), Some(panic)) = (exited_pid, exit_panic) {
+        managed
+            .recent_spawns
+            .write()
+            .await
+            .attach_exit_panic(pid, exited_at, panic);
     }
 
     // Crash-only ambient watchdog: if this exit was a crash (not an
@@ -4970,6 +5070,8 @@ async fn monitor_runner_process_exit_inner(
 /// timestamp is within [`PANIC_LOG_FRESHNESS_SECS`] of now, parse it and
 /// stash it on the managed runner so `GET /runners` can surface it. Also
 /// emit a tagged `[runner-panic]` ERROR into the supervisor log buffer.
+/// Returns the panic it stashed, which the exit monitor also attaches to the
+/// ring entry it stamped for that exit, if it stamped one.
 ///
 /// All errors are swallowed at debug level — panic telemetry is strictly
 /// best-effort and must never interfere with normal process-exit handling.
@@ -4977,7 +5079,7 @@ async fn check_and_record_panic_log(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
     runner_name: &str,
-) {
+) -> Option<crate::process::panic_log::RecentPanic> {
     let dir_opt = managed.panic_log_dir.read().await.clone();
     let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
 
@@ -4986,7 +5088,7 @@ async fn check_and_record_panic_log(
             "No panic log found for runner '{}' at {:?}",
             runner_name, path
         );
-        return;
+        return None;
     };
 
     // Freshness gate — a stale file from a previous boot shouldn't be
@@ -4997,7 +5099,7 @@ async fn check_and_record_panic_log(
             "Panic log at {:?} is stale (timestamp {} vs now {}) — ignoring",
             path, parsed.timestamp, now
         );
-        return;
+        return None;
     }
 
     let location_str = parsed.location.as_deref().unwrap_or("<unknown>");
@@ -5018,7 +5120,8 @@ async fn check_and_record_panic_log(
     // passing `?include_stopped=true` to the logs endpoint see the
     // panic via the stopped-cache snapshot once we extend that path.
     let mut slot = managed.recent_panic.write().await;
-    *slot = Some(parsed);
+    *slot = Some(parsed.clone());
+    Some(parsed)
 }
 
 /// POST to the runner's UI Bridge close-request endpoint so that
@@ -5349,9 +5452,15 @@ pub async fn stop_runner_by_id(
     let port = managed.config.port;
     let is_primary = managed.config.kind().is_primary();
 
+    // Latch the stop intent, and the time of the earliest request still
+    // latched, before any kill rung. The exit monitor stamps that time on the
+    // exited spawn's ring entry (except as the residual of the attribution
+    // watcher's `is_startup_panic_of` that says starts and stops are not
+    // ordered against each other describes); this function never touches the
+    // ring.
     {
         let mut runner = managed.runner.write().await;
-        runner.stop_requested = true;
+        runner.latch_stop_request(chrono::Utc::now());
     }
 
     state

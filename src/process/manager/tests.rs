@@ -3464,6 +3464,406 @@ async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
     );
 }
 
+/// No stop removes or stamps a spawn's ring entry. This restart reaches
+/// `stop_runner_by_id` on port-held evidence and then fails at exe
+/// resolution, before any spawn, so the ring must be exactly as it was.
+#[tokio::test]
+async fn a_stop_leaves_the_spawn_ring_as_it_found_it() {
+    use crate::diagnostics::RestartSource;
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-ring-stop").await;
+    managed.cached_health.write().await.runner_port_open = true;
+    let entry = crate::state::SpawnMarker::new(
+        chrono::Utc::now() - chrono::Duration::seconds(30),
+        Some(4242),
+        None,
+    );
+    managed.recent_spawns.write().await.push(entry.clone());
+
+    restart_runner_by_id(
+        &state,
+        "named-ring-stop",
+        false,
+        RestartSource::Manual,
+        false,
+        BuildTree::OriginMain,
+        CloseIntent::Kill,
+    )
+    .await
+    .expect_err("the start still fails at exe resolution");
+    assert!(
+        managed.runner.read().await.stop_requested,
+        "the stop must have been reached"
+    );
+    let ring: Vec<crate::state::SpawnMarker> =
+        managed.recent_spawns.read().await.iter().cloned().collect();
+    assert_eq!(ring, [entry], "the stop changed the spawn ring");
+}
+
+/// A child process that exits 3 at once, killed if the test drops it first.
+fn spawn_a_child_that_exits_3() -> tokio::process::Child {
+    #[cfg(windows)]
+    let child = tokio::process::Command::new("cmd")
+        .args(["/C", "exit /b 3"])
+        .kill_on_drop(true)
+        .spawn();
+    #[cfg(not(windows))]
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", "exit 3"])
+        .kill_on_drop(true)
+        .spawn();
+    child.expect("spawn a child that exits 3")
+}
+
+/// How the runner's stop request stands when its process exits.
+#[derive(Clone, Copy, Debug)]
+enum StopAtExit {
+    /// Nobody asked for the exit.
+    NotRequested,
+    /// A stop latched at this time asked for it.
+    RequestedAt(chrono::DateTime<chrono::Utc>),
+    /// The flag was latched with no time, as no production path leaves it.
+    LatchedWithNoTime,
+}
+
+/// The exit monitor stamps the exit on the exited spawn's ring entry with
+/// the registry's stop-request time, `Some` when the stop flag was latched as
+/// the monitor read it (a failed stop's flag included), and then attaches
+/// the panic it parsed at the exit to that same entry. It removes no
+/// entry. It names the entry by the pid it read from the child before the
+/// wait: tokio's `Child::id` is `None` once the child has been polled to
+/// completion, and the registry's pid is no key either, since the health
+/// cache clears a booting primary's, as it is cleared here.
+#[tokio::test]
+async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its_panic() {
+    let requested_at = chrono::Utc::now() - chrono::Duration::seconds(2);
+    for stop in [
+        StopAtExit::RequestedAt(requested_at),
+        StopAtExit::NotRequested,
+        StopAtExit::LatchedWithNoTime,
+    ] {
+        let (state, root) = restart_test_state();
+        let id = "named-exit-stamp";
+        let managed = register_dead_named_runner(&state, id).await;
+        let child = spawn_a_child_that_exits_3();
+        let pid = child.id().expect("a child not yet waited on has a pid");
+
+        // The panic log that child's boot left, fresh at the exit.
+        let panic_dir = root.path().join("panic-logs");
+        std::fs::create_dir_all(&panic_dir).expect("mkdir panic-logs");
+        let written_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        std::fs::write(
+            panic_dir.join("runner-panic.log"),
+            format!(
+                "[{written_at}] PANIC runner-id={id} pid={pid} version=1.0.0\n\
+                 location: src/main.rs:10:5\n\
+                 thread: main\n\
+                 payload:\n\
+                 boot failed\n"
+            ),
+        )
+        .expect("write runner-panic.log");
+        *managed.panic_log_dir.write().await = Some(panic_dir);
+
+        // An earlier spawn of another pid, then the child's own spawn.
+        let spawned_at = chrono::Utc::now();
+        let earlier = crate::state::SpawnMarker::new(
+            spawned_at - chrono::Duration::seconds(60),
+            Some(pid.wrapping_add(1)),
+            None,
+        );
+        managed.recent_spawns.write().await.push(earlier.clone());
+        managed
+            .recent_spawns
+            .write()
+            .await
+            .push(crate::state::SpawnMarker::new(spawned_at, Some(pid), None));
+        {
+            let mut runner = managed.runner.write().await;
+            runner.process = Some(child);
+            runner.running = true;
+            // A health-cache tick before the port bound.
+            runner.pid = None;
+            match stop {
+                StopAtExit::NotRequested => {}
+                StopAtExit::RequestedAt(at) => runner.latch_stop_request(at),
+                StopAtExit::LatchedWithNoTime => runner.stop_requested = true,
+            }
+        }
+
+        monitor_runner_process_exit_inner(state.clone(), managed.clone(), id.to_string()).await;
+
+        let ring: Vec<crate::state::SpawnMarker> =
+            managed.recent_spawns.read().await.iter().cloned().collect();
+        assert_eq!(
+            ring.len(),
+            2,
+            "{stop:?}: the exit monitor removed an entry: {ring:?}"
+        );
+        assert_eq!(
+            ring[0], earlier,
+            "{stop:?}: another pid's entry was stamped"
+        );
+        let own = &ring[1];
+        let exited_at = own
+            .exited_at
+            .unwrap_or_else(|| panic!("{stop:?}: the child's exit was not stamped: {own:?}"));
+        assert!(exited_at >= spawned_at, "{stop:?}: {own:?}");
+        let expected = match stop {
+            StopAtExit::NotRequested => None,
+            StopAtExit::RequestedAt(at) => Some(at),
+            StopAtExit::LatchedWithNoTime => Some(exited_at),
+        };
+        assert_eq!(
+            own.stop_requested_at, expected,
+            "{stop:?}: the stamp does not carry the stop request: {own:?}"
+        );
+        assert_eq!(
+            own.exit_panic.as_ref().and_then(|panic| panic.pid),
+            Some(pid),
+            "{stop:?}: the panic parsed at the exit was not attached to the entry its exit \
+             stamped: {own:?}"
+        );
+    }
+}
+
+/// `start_managed_runner` records each spawn through
+/// `record_spawn_in_registry`: the registry entry gets the live process, its
+/// pid and start time, and the previous process's stop request is cleared;
+/// the ring's newest entry is exactly `SpawnMarker::new(started_at, pid,
+/// early_log_path)`, dated at that same instant, which is now.
+#[tokio::test]
+async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instant() {
+    let (state, root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-record-spawn").await;
+    // The previous process's stop request, still latched as its stop left it.
+    managed
+        .runner
+        .write()
+        .await
+        .latch_stop_request(chrono::Utc::now() - chrono::Duration::seconds(30));
+    let earlier = crate::state::SpawnMarker::new(
+        chrono::Utc::now() - chrono::Duration::seconds(60),
+        Some(1),
+        None,
+    );
+    managed.recent_spawns.write().await.push(earlier.clone());
+    let child = spawn_a_child_that_exits_3();
+    let pid = child.id().expect("a child not yet waited on has a pid");
+    let early_log = root.path().join("early.log");
+
+    let before = chrono::Utc::now();
+    record_spawn_in_registry(&managed, child, Some(early_log.clone())).await;
+    let after = chrono::Utc::now();
+
+    let started_at = {
+        let runner = managed.runner.read().await;
+        assert!(runner.running);
+        assert!(runner.process.is_some(), "the registry holds the child");
+        assert_eq!(runner.pid, Some(pid));
+        assert!(
+            !runner.stop_requested,
+            "the next start clears the stop flag"
+        );
+        assert_eq!(
+            runner.stop_requested_at, None,
+            "the next start clears the stop request's time"
+        );
+        runner.started_at.expect("the spawn's start time")
+    };
+    assert!(
+        before <= started_at && started_at <= after,
+        "the spawn is dated {started_at}, not between {before} and {after}"
+    );
+    let ring: Vec<crate::state::SpawnMarker> =
+        managed.recent_spawns.read().await.iter().cloned().collect();
+    assert_eq!(
+        ring,
+        [
+            earlier,
+            crate::state::SpawnMarker::new(started_at, Some(pid), Some(early_log)),
+        ],
+        "the ring's newest entry is not this spawn as the registry records it"
+    );
+}
+
+/// `stop_runner_by_id`, through which every restart passes, latches the stop
+/// with the time of the request; a second request keeps the first's time,
+/// the earliest. A dead, unprotected named runner stops at once.
+#[tokio::test]
+async fn a_stop_latches_the_time_of_its_request_and_a_later_stop_keeps_it() {
+    let (state, _root) = restart_test_state();
+    let id = "named-stop-latch";
+    let managed = register_dead_named_runner(&state, id).await;
+
+    let before = chrono::Utc::now();
+    stop_runner_by_id(&state, id, false, CloseIntent::Kill)
+        .await
+        .expect("a dead runner stops");
+    let after = chrono::Utc::now();
+    let first = {
+        let runner = managed.runner.read().await;
+        assert!(runner.stop_requested);
+        runner
+            .stop_requested_at
+            .expect("the stop latched the time of its request")
+    };
+    assert!(
+        before <= first && first <= after,
+        "the request is dated {first}, not between {before} and {after}"
+    );
+
+    stop_runner_by_id(&state, id, false, CloseIntent::Kill)
+        .await
+        .expect("a dead runner stops");
+    assert_eq!(
+        managed.runner.read().await.stop_requested_at,
+        Some(first),
+        "a later stop must keep the earliest request's time"
+    );
+}
+
+/// Both sites that ask a runner to stop latch the request through
+/// `RunnerState::latch_stop_request`, which records its time with the flag:
+/// `stop_runner_by_id` (driven above) and the max-age sweep's kill, whose
+/// endless loop no test can drive. Without the latch, the exit would be
+/// stamped as one nobody asked for. A bare `stop_requested = true` would be
+/// stamped with the exit's own time instead of the request's (the exit
+/// monitor's fallback).
+#[test]
+fn every_stop_request_latches_its_time() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    for sig in [
+        "pub async fn stop_runner_by_id(",
+        "pub async fn reap_stale_test_runners(",
+    ] {
+        let body: String = crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            body.matches(".latch_stop_request(chrono::Utc::now());")
+                .count(),
+            1,
+            "{sig} must latch its stop request, with its time, exactly once"
+        );
+        assert!(
+            !body.contains(".stop_requested=true"),
+            "{sig} sets the stop flag without its time"
+        );
+    }
+}
+
+/// `start_managed_runner` is the one place a spawn's ring entry is written,
+/// through `record_spawn_in_registry` (whose values
+/// `a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instant`
+/// pins), and the dev-action attribution watcher relies on where. No test drives a
+/// start to a successful spawn (every manager test that reaches it fails at
+/// exe resolution), so this pins it at source level:
+/// - one call per start, after the spawn re-pointed the panic-log dir,
+///   cleared the stored panic and re-pointed the early log, and before the
+///   exit monitor is spawned, so the entry exists before that monitor can
+///   attempt a stamp for it; the start touches the ring nowhere else;
+/// - no stop touches the ring;
+/// - the exit monitor touches it twice: the exit stamp, before the
+///   panic-log parse, then the panic attach, both before the crash-watchdog
+///   hook can schedule the next spawn.
+#[test]
+fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    // Whitespace dropped, so the checks read the code and not where rustfmt
+    // broke its lines.
+    let body_of = |sig: &str| -> String {
+        crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect()
+    };
+    const RECORD: &str = "record_spawn_in_registry(managed,child,early_log_path).await;";
+
+    let start = body_of("pub async fn start_managed_runner(");
+    assert_eq!(
+        start.matches(RECORD).count(),
+        1,
+        "one recorded spawn per start"
+    );
+    assert!(
+        !start.contains("recent_spawns"),
+        "the start writes the ring only through record_spawn_in_registry"
+    );
+    let record = start.find(RECORD).expect("the call");
+    for re_point in [
+        "managed.panic_log_dir.write()",
+        "managed.recent_panic.write()",
+        "managed.early_log_path.write()",
+    ] {
+        let last = start
+            .rfind(re_point)
+            .unwrap_or_else(|| panic!("start_managed_runner re-points {re_point}"));
+        assert!(
+            last < record,
+            "the spawn must be recorded after the start's last {re_point}"
+        );
+    }
+    let monitor_spawned = start
+        .find("monitor_runner_process_exit(")
+        .expect("start_managed_runner spawns the exit monitor");
+    assert!(
+        record < monitor_spawned,
+        "the spawn must be recorded before the exit monitor that stamps it is spawned"
+    );
+
+    let stop = body_of("pub async fn stop_runner_by_id(");
+    assert!(
+        !stop.contains("recent_spawns"),
+        "stop_runner_by_id must leave the spawn ring alone"
+    );
+
+    let monitor = body_of("async fn monitor_runner_process_exit_inner(");
+    assert_eq!(
+        monitor.matches("recent_spawns").count(),
+        2,
+        "the exit monitor touches the ring twice: the exit stamp and the panic attach"
+    );
+    let stamp = monitor
+        .find(".recent_spawns.write().await.stamp_exit(")
+        .expect("the exit monitor stamps the exited spawn's entry");
+    let attach = monitor
+        .find(".recent_spawns.write().await.attach_exit_panic(")
+        .expect("the exit monitor attaches the panic parsed at the exit");
+    let parse = monitor
+        .find("check_and_record_panic_log(")
+        .expect("the exit monitor parses the panic log");
+    let watchdog = monitor
+        .find("maybe_crash_restart(")
+        .expect("the exit monitor calls the crash-watchdog hook");
+    assert!(
+        stamp < parse,
+        "the exit stamp must come before the panic-log parse, which would widen the lag \
+         in which an exited process reads as up"
+    );
+    assert!(
+        stamp < watchdog && attach < watchdog,
+        "both ring writes must come before the crash watchdog can push the next spawn's entry"
+    );
+}
+
 /// The wire `watchdog` source is still refused for a non-temp runner, and
 /// the refusal happens BEFORE anything is latched or emitted.
 #[tokio::test]
