@@ -178,6 +178,31 @@ pub struct SnapshotIngestBody {
     metadata: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `text` with each NUL replaced by U+FFFD, for the body's three free-text
+/// fields (`requester_id`, `params_digest`, `evidence_ref`).
+///
+/// coord stores them as Postgres `text`, which cannot hold a NUL, and they can
+/// carry one: a startup panic's excerpt is the runner's payload verbatim (a
+/// `Display`-formatted, NUL-padded Win32 buffer, say), and the spawn routes
+/// take `requester_id` from the caller's body. A coord that hands the NUL to
+/// Postgres, as coord's main does before `clamp_snapshot_text`, fails the
+/// INSERT with a 500, and this fail-open ingest then drops the whole trial
+/// with one `warn!`, signatures included; a coord whose `clamp_snapshot_text`
+/// replaces the NUL itself keeps it. Replacing the NUL here keeps the trial
+/// whichever coord is listening.
+///
+/// A U+FFFD is 3 bytes against the NUL's 1 once decoded, and coord refuses no
+/// free-text field for its length (a coord with a text bound cuts the text to
+/// it). Its one length refusal is the route's body limit, a 413 counted in
+/// wire bytes (256 KiB on a coord with the text bound, axum's 2 MiB default
+/// before it), and on the wire the replacement is the shorter of the two:
+/// serde_json writes a NUL as the 6-byte `\u0000`. So the growth cannot cost
+/// the trial. A requester or git ref long enough to push the body past that
+/// limit does, NUL or not.
+fn without_nul(text: &str) -> String {
+    text.replace('\0', "\u{FFFD}")
+}
+
 impl SnapshotIngestBody {
     /// Build the wire body from a completed record + its folded outcome.
     pub fn from_record(
@@ -190,8 +215,8 @@ impl SnapshotIngestBody {
             action_id: record.action_id,
             kind: record.kind.as_str(),
             device_id,
-            requester_id: record.requester_id.clone(),
-            params_digest: record.params_digest.clone(),
+            requester_id: record.requester_id.as_deref().map(without_nul),
+            params_digest: without_nul(&record.params_digest),
             state_ids: record
                 .states_active
                 .iter()
@@ -206,7 +231,7 @@ impl SnapshotIngestBody {
             ended_at: Some(outcome.ended_at.to_rfc3339()),
             category: Some(outcome.category),
             duration_ms: Some(outcome.duration_ms),
-            evidence_ref: outcome.evidence_ref.clone(),
+            evidence_ref: outcome.evidence_ref.as_deref().map(without_nul),
             signatures: outcome.signatures.clone(),
             late_signatures: outcome.late_signatures.clone(),
             tenant_id,
@@ -229,6 +254,15 @@ pub async fn post_snapshot_to_coord(
     device_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
 ) {
+    // A unit-test build never posts. coord's ingest route takes no credential,
+    // and the coord base resolves from the box's own `COORD_HTTP_URL` or
+    // `profiles.json` (production coord, on a dev box), so a watcher test's
+    // fabricated outcome (a `DEV-PANIC-STARTUP` read from a fixture panic log,
+    // say) would land in the ledger the LKG restart guard reads, under the
+    // box's device id.
+    if cfg!(test) {
+        return;
+    }
     let base = match coord_http_base() {
         Some(b) => b,
         None => {
@@ -376,5 +410,36 @@ mod tests {
         assert!(json["evidence_ref"].is_null());
         assert_eq!(json["category"], "confirmed");
         assert_eq!(json["state_ids"], serde_json::json!([]));
+    }
+
+    /// coord cannot store a NUL in text, and one NUL in any free-text field
+    /// used to cost the whole trial. Each reaches the wire as U+FFFD.
+    #[test]
+    fn a_nul_in_each_free_text_field_reaches_coord_as_the_replacement_character() {
+        let record = ActionRecord::new(
+            ActionKind::Spawn,
+            Some("agent-7\0\0".into()),
+            "rebuild=false\0".into(),
+            &[],
+        );
+        let outcome = ActionOutcome {
+            category: D3Category::Failure,
+            signatures: vec!["DEV-PANIC-STARTUP".into()],
+            ended_at: Utc::now(),
+            duration_ms: 30_000,
+            evidence_ref: Some("panic: open C:\\runner\0\0\0 failed".into()),
+            late_signatures: vec![],
+        };
+        let body = SnapshotIngestBody::from_record(&record, &outcome, None, None);
+        let wire = serde_json::to_string(&body).expect("serialize");
+        assert!(!wire.contains("\\u0000"), "a NUL reached the wire: {wire}");
+
+        let json: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        assert_eq!(json["requester_id"], "agent-7\u{FFFD}\u{FFFD}");
+        assert_eq!(json["params_digest"], "rebuild=false\u{FFFD}");
+        assert_eq!(
+            json["evidence_ref"],
+            "panic: open C:\\runner\u{FFFD}\u{FFFD}\u{FFFD} failed"
+        );
     }
 }

@@ -17,7 +17,7 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
+    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
     ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::error::SupervisorError;
@@ -1309,7 +1309,13 @@ pub async fn stop_runner(
     // Capture the early-log path BEFORE stopping — for test-* runners the
     // stop also removes them from the registry, after which we can no longer
     // look up the path. We delete the file AFTER stop succeeds because the
-    // stop is the explicit "user is done diagnosing" signal.
+    // stop is the explicit "user is done diagnosing" signal. It is also the
+    // file the stopped spawn's entry names in the runner's spawn ring, which
+    // the dev-action attribution watcher reads only at a window's close: a
+    // window still open over that spawn then reads no early-log signature
+    // for it and, with no other signature, closes it `Confirmed` under `Ran`
+    // or with no run result. A residual, unchanged from 5fd1ca62, whose reach
+    // `dev_action::attribution::scan_spawn_effects` states.
     let early_log_path = if let Some(managed) = state.get_runner(&id).await {
         managed.early_log_path.read().await.clone()
     } else {
@@ -1323,8 +1329,13 @@ pub async fn stop_runner(
     // stop_runner_by_id, but it does NOT route through here — it goes
     // directly through the manager — so the early-log file is preserved
     // there (which is what we want for post-mortem debugging). Files for
-    // runners that died on their own and were reaped also persist. Best
-    // effort: missing-file errors are silently swallowed by delete_early_log.
+    // runners that died on their own and were reaped also persist. This
+    // route is what the dashboard's Stop (named and temp runners) and
+    // spawn-test's `stop_url` call, so the delete reaches spawn windows; a
+    // restart's, a build's or a `rebuild_when_idle`'s window is reached only
+    // by a direct `POST /runners/primary/stop`. A restart's own stop and the
+    // legacy `/runner/stop` delete nothing. Best effort: missing-file errors
+    // are silently swallowed by delete_early_log.
     if let Some(path) = early_log_path {
         crate::process::early_log::delete_early_log(&path);
     }
@@ -2591,20 +2602,28 @@ async fn wait_out_queue_timeout(
 /// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
 ///
 /// Evaluates the active dev-state set, stores the record, and spawns the
-/// attribution watcher targeting the spawned runner. The early-log is read
-/// lazily via the managed runner because its path is only set during the
-/// build, after mint.
+/// attribution watcher targeting the spawned runner. The watcher reads the
+/// runner's spawn ring, and each in-window spawn's early log and panic,
+/// lazily, at window close, because the spawn records them after the mint,
+/// once the build is done. A spawn that has not launched by the time its 30 s
+/// window closes (a `rebuild: true` build) has no spawn in the window, so the
+/// watcher reads neither file for it.
 ///
 /// Returns `(action_id, states_active, predicted, risk)` for stamping into the
 /// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
 /// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
-/// is unreachable / has no history (fail-open; never blocks the spawn).
+/// is unreachable / has no history (fail-open; never blocks the spawn). It is
+/// the ACK's cut, the top five by `posterior_mean`; the fetch itself reads
+/// coord's top 100 rows (its ceiling), and `risk` assesses all of them before
+/// the cut ([`assess_then_cut`]).
 ///
-/// "Act on predictions": `risk` is the pure [`assess_action_risk`] verdict over
-/// `predicted` + `states_active`. spawn-test/named is a *testing* surface, so we
-/// do NOT auto-route it to LKG — we only SURFACE the assessment (stamp it into
-/// the ACK + a loud warn) so the caller sees the risk before the spawn completes.
+/// "Act on predictions": `risk` is the pure
+/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk) verdict
+/// over that whole fetch + `states_active`. spawn-test/named is a *testing*
+/// surface, so we do NOT auto-route it to LKG — we only SURFACE the assessment
+/// (stamp it into the ACK + a loud warn) so the caller sees the risk before the
+/// spawn completes.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
@@ -2633,14 +2652,18 @@ async fn mint_spawn_action(
 
     // Phase 4: fetch coord's state-conditioned expectations for this
     // (spawn, states) so the ACK warns the agent before the spawn completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(ActionKind::Spawn.as_str(), &states_active, 5).await;
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
+    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
+    // pooled mean before cutting, which can drop the very row the exact-cell
+    // arm of the risk policy reads.
+    let fetched = fetch_expectations(ActionKind::Spawn.as_str(), &states_active).await;
 
-    // "Act on predictions" (surface-only for spawns): assess the prediction set
-    // and, when high-risk, warn loudly so the caller sees it before the spawn
-    // completes. spawn-test/named is a testing surface — we never auto-route it
-    // to LKG; the ACK `risk` field carries the advisory for the caller to act on.
-    let risk = assess_action_risk(&predicted, &states_active);
+    // "Act on predictions" (surface-only for spawns): assess the whole fetch,
+    // then cut the ACK's `predicted` to the top five by `posterior_mean`; when
+    // high-risk, warn loudly so the caller sees it before the spawn completes.
+    // spawn-test/named is a testing surface — we never auto-route it to LKG;
+    // the ACK `risk` field carries the advisory for the caller to act on.
+    let (predicted, risk) = assess_then_cut(fetched, &states_active);
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %action_id, kind = "spawn", "{warn}");
         state
@@ -2656,9 +2679,7 @@ async fn mint_spawn_action(
         state.clone(),
         arc,
         AttributionTargets {
-            early_log_path: None,
             managed: Some(managed),
-            panic_log_path: None,
             runner_id: Some(runner_id),
         },
         None,

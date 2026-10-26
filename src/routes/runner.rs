@@ -5,7 +5,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
+    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
     ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
     SlotResolution,
 };
@@ -111,9 +111,13 @@ fn run_result_for(err: &SupervisorError) -> ActionRunResult {
 /// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the action completes. An empty vec when
 /// coord is unreachable / has no history (fail-open; never blocks the action).
+/// It is the ACK's cut, the top five by `posterior_mean`; the fetch itself
+/// reads coord's top 100 rows (its ceiling), and `risk` assesses all of them
+/// before the cut ([`assess_then_cut`]).
 ///
 /// "Act on predictions": `risk` is the pure
-/// [`assess_action_risk`] verdict over `predicted` + `states_active`. It is
+/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
+/// verdict over that whole fetch + `states_active`. It is
 /// [`ActionRisk::none`] in the common healthy / no-history case (behavior
 /// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
 /// signature clears the threshold. The caller decides what to do with it
@@ -147,16 +151,20 @@ async fn mint_primary_action(
 
     // Phase 4: fetch coord's state-conditioned expectations for this
     // (kind, states) so the ACK warns the agent before the action completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(kind.as_str(), &states_active, 5).await;
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
+    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
+    // pooled mean before cutting, which can drop the very row the exact-cell
+    // arm of the risk policy reads.
+    let fetched = fetch_expectations(kind.as_str(), &states_active).await;
 
-    // "Act on predictions": assess the prediction set against the active states.
+    // "Act on predictions": assess the whole fetch against the active states,
+    // then cut the ACK's `predicted` to the top five by `posterior_mean`.
     // Pure + fail-open — `none()` in the healthy case. `route_lkg` + `warn` only
     // when a boot-failure-class signature clears the threshold. Emit the warning
     // here (loud `tracing::warn!` + a Supervisor log entry) so the risk is
     // visible BEFORE the action's outcome lands, regardless of how the caller
     // uses the advice.
-    let risk = assess_action_risk(&predicted, &states_active);
+    let (predicted, risk) = assess_then_cut(fetched, &states_active);
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
         state
@@ -166,31 +174,35 @@ async fn mint_primary_action(
     }
 
     let arc = state.dev_actions.write().await.insert(record);
-
-    // The watcher targets the primary's early-log + cached health. The
-    // early-log path is read at window close (it may not be set until the
-    // restart spawns the runner); capture the runner id now so the health scan
-    // can find the right cached snapshot.
-    let (early_log_path, runner_id) = match state.get_primary().await {
-        Some(primary) => (
-            primary.early_log_path.read().await.clone(),
-            Some(primary.config.id.clone()),
-        ),
-        None => (None, None),
-    };
     spawn_attribution_watcher(
         state.clone(),
         arc.clone(),
-        AttributionTargets {
-            early_log_path,
-            managed: None,
-            panic_log_path: None,
-            runner_id,
-        },
+        primary_attribution_targets(state).await,
         build_duration,
     );
 
     (arc, states_active, predicted, risk)
+}
+
+/// Where the watcher of a primary-runner action looks for its effects.
+///
+/// It is handed the primary's registry entry, the same `Arc` the restart
+/// starts again in place, so at window close it reads the entry's spawn ring
+/// and, for every spawn inside the window, that spawn's early log and startup
+/// panic (under `--log-dir` the panic log is in `<log-dir>/runner-primary`).
+/// It used to be handed no entry, and so read the runner default panic log
+/// whatever the supervisor's flags, and the early log of the boot that was
+/// running at the mint. The runner id is captured now so the health scan can
+/// find the right cached snapshot. With no primary registered there is
+/// nothing to read.
+async fn primary_attribution_targets(state: &SharedState) -> AttributionTargets {
+    match state.get_primary().await {
+        Some(primary) => AttributionTargets {
+            runner_id: Some(primary.config.id.clone()),
+            managed: Some(primary),
+        },
+        None => AttributionTargets::default(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -218,10 +230,11 @@ pub struct RestartRequest {
     ///
     /// - `None` (DEFAULT) — no explicit operator choice. The supervisor is free
     ///   to AUTO-bias toward the last-known-good binary when
-    ///   [`assess_action_risk`] flags this restart as high-risk (a
-    ///   boot-failure-class prediction under the active states), instead of the
-    ///   freshest slot exe that history says white-screens. The restart is never
-    ///   refused — only biased — and the risk is warned loudly.
+    ///   [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
+    ///   flags this restart as high-risk (a boot-failure-class prediction under
+    ///   the active states), instead of the freshest slot exe that history says
+    ///   white-screens. The restart is never refused — only biased — and the
+    ///   risk is warned loudly.
     /// - `Some(true)` — explicitly pin this restart to the LKG binary (same
     ///   effect the auto-bias would apply, but operator-requested).
     /// - `Some(false)` — explicitly OPT OUT of the auto-LKG bias: run the
@@ -1599,6 +1612,38 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).expect("response body must be JSON");
         (status, v)
+    }
+
+    /// The primary mint site hands the watcher the primary's registry entry:
+    /// the same `Arc` the restart starts again in place, which is where the
+    /// restart's spawn records its ring entry, its early log and its panic-log
+    /// dir. Handed `None` (or another entry), the watcher would never see that
+    /// spawn and would read no boot of it at all.
+    #[tokio::test]
+    async fn the_primary_mint_site_hands_the_watcher_the_primarys_registry_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let primary = state
+            .get_primary()
+            .await
+            .expect("the test state registers a primary");
+
+        let targets = primary_attribution_targets(&state).await;
+        let managed = targets
+            .managed
+            .expect("the primary's registry entry, not None");
+        assert!(
+            Arc::ptr_eq(&managed, &primary),
+            "the watcher must read the entry the restart starts"
+        );
+        assert_eq!(
+            targets.runner_id.as_deref(),
+            Some(primary.config.id.as_str())
+        );
+
+        state.runners.write().await.clear();
+        let targets = primary_attribution_targets(&state).await;
+        assert!(targets.managed.is_none() && targets.runner_id.is_none());
     }
 
     /// With no primary registered the ACK names no tree: the detached restart

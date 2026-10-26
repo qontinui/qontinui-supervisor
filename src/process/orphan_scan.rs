@@ -750,7 +750,7 @@ async fn adopt_pid_into_registry(managed: &ManagedRunner, pid: u32) -> bool {
     if runner.started_at.is_none() {
         runner.started_at = Some(Utc::now());
     }
-    runner.stop_requested = false;
+    runner.clear_stop_request();
     runner.restart_requested = false;
     true
 }

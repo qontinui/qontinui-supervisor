@@ -25,7 +25,12 @@
 //! so a runaway runner can't fill the disk. Files are deleted when the
 //! runner is explicitly stopped via `POST /runners/{id}/stop`; files for
 //! runners that died unexpectedly are preserved (the whole point of this
-//! capture).
+//! capture). That delete runs as soon as the stop succeeds, and the dev-action
+//! attribution watcher reads each spawn's early log only when its window
+//! closes, so a window still open over the stopped spawn reads no early-log
+//! signature for it and, with no other signature, closes it `Confirmed` under
+//! `Ran` or with no run result (a residual, unchanged from 5fd1ca62, whose
+//! reach `dev_action::attribution::scan_spawn_effects` states).
 //!
 //! # Best-effort
 //!
