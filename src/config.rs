@@ -91,7 +91,9 @@ pub enum AmbientTargetDir {
     /// LKG, the workspace default): a test controls those by rooting its config
     /// in a tempdir rather than a relative path. And an integration test under
     /// `tests/` links the library without `cfg(test)`, so `from_args` gives it
-    /// `Read`: one that calls `from_args` must set `Ignore` itself.
+    /// `Read`: it builds a struct literal that sets `Ignore` instead, and
+    /// `tests::no_test_config_is_rooted_at_the_working_directory` refuses a
+    /// `from_args` call there.
     Ignore,
 }
 
@@ -320,8 +322,8 @@ pub struct SupervisorConfig {
     pub temp_runner_display: Option<String>,
     /// Whether the non-pool runner exe may resolve through `CARGO_TARGET_DIR`
     /// and `.cargo/config.toml` ([`AmbientTargetDir`]): `Read` in production,
-    /// `Ignore` in a unit-test build. An integration test that calls
-    /// [`Self::from_args`] gets `Read` and must set `Ignore` itself.
+    /// `Ignore` in a unit-test build. [`Self::from_args`] would give an
+    /// integration test `Read`, so one sets `Ignore` in a struct literal.
     pub ambient_target_dir: AmbientTargetDir,
 }
 
@@ -1147,8 +1149,8 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 impl SupervisorConfig {
     /// Build the config from the command line. `ambient_target_dir` is
     /// [`AmbientTargetDir::Ignore`] in a unit-test build and `Read` everywhere
-    /// else, an integration test under `tests/` included: one that calls this
-    /// must set `Ignore` itself.
+    /// else, an integration test under `tests/` included, which is why no file
+    /// there calls this (see [`AmbientTargetDir::Ignore`]).
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1426,14 +1428,19 @@ impl SupervisorConfig {
 
     /// Path to the runner npm project root (parent of src-tauri).
     ///
-    /// Always returns an absolute path. When the supervisor was
-    /// launched with a relative `--project-dir` (e.g. `../qontinui-runner/src-tauri`),
-    /// the parent resolves to `../qontinui-runner` — still relative. If that
-    /// relative path is later passed to cargo via `CARGO_TARGET_DIR`, cargo
-    /// resolves it from its own CWD (`src-tauri`), producing a double-nested
-    /// path like `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
-    /// `canonicalize()` call prevents this by expanding to an absolute path
-    /// at the first call site.
+    /// Absolute whenever the parent exists on disk: `canonicalize` fails on a
+    /// path that does not, and the path is then returned as given. A project
+    /// dir of `.` has the parent `""`, so it returns `""`, and every slot, LKG
+    /// and target path built on it resolves against the working directory.
+    ///
+    /// When the supervisor was launched with a relative `--project-dir`
+    /// (e.g. `../qontinui-runner/src-tauri`), the parent resolves to
+    /// `../qontinui-runner` — still relative. If that relative path is later
+    /// passed to cargo via `CARGO_TARGET_DIR`, cargo resolves it from its own
+    /// CWD (`src-tauri`), producing a double-nested path like
+    /// `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
+    /// `canonicalize()` call prevents this by expanding to an absolute path at
+    /// the first call site.
     ///
     /// On Windows, `std::fs::canonicalize` returns verbatim paths with the
     /// `\\?\` UNC prefix. Third-party build scripts (notably `libusb1-sys`)
@@ -2118,6 +2125,244 @@ mod tests {
         let ignored = config.runner_target_dir_candidates();
         assert_eq!(ignored.len(), 1, "{ignored:?}");
         assert_eq!(ignored[0].0, TargetDirSource::WorkspaceDefault);
+    }
+
+    /// Every `.rs` file under this crate's `src/` and `tests/`. A directory
+    /// that cannot be listed panics rather than being skipped: a silent skip
+    /// would let the scan below rot into a no-op.
+    fn crate_sources() -> Vec<PathBuf> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        let mut stack = vec![manifest.join("src"), manifest.join("tests")];
+        while let Some(dir) = stack.pop() {
+            let entries =
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {dir:?}: {e}"));
+            for entry in entries {
+                let path = entry
+                    .unwrap_or_else(|e| panic!("cannot read an entry of {dir:?}: {e}"))
+                    .path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The spellings of a test config rooted at the working directory, with
+    /// whitespace removed. Built here rather than written out, so this file
+    /// never contains them.
+    fn working_directory_needles() -> Vec<String> {
+        let (dot, empty) = (".", "");
+        let mut needles = vec![
+            format!("\"--project-dir\",\"{dot}\""),
+            format!("\"--project-dir\",\"{dot}/\""),
+            format!("\"--project-dir={dot}\""),
+            format!("\"-p\",\"{dot}\""),
+            format!("\"-p{dot}\""),
+        ];
+        let values = [
+            format!("PathBuf::from(\"{dot}\")"),
+            format!("std::path::PathBuf::from(\"{dot}\")"),
+            "PathBuf::new()".to_string(),
+            "std::path::PathBuf::new()".to_string(),
+            format!("\"{dot}\".into()"),
+            format!("\"{empty}\".into()"),
+        ];
+        // A struct-literal field, and an assignment (`config.project_dir = …`).
+        for bind in ["project_dir:", "project_dir="] {
+            needles.extend(values.iter().map(|value| format!("{bind}{value}")));
+        }
+        needles
+    }
+
+    /// Source text with its whitespace removed, so a call split across lines
+    /// matches the same needle as one written on a single line, plus the line
+    /// each kept byte came from, so a match is reported where it is.
+    struct Squeezed {
+        text: String,
+        lines: Vec<usize>,
+    }
+
+    impl Squeezed {
+        fn new(source: &str) -> Self {
+            let mut text = String::with_capacity(source.len());
+            let mut lines = Vec::with_capacity(source.len());
+            for (idx, line) in source.lines().enumerate() {
+                for c in line.chars().filter(|c| !c.is_whitespace()) {
+                    text.push(c);
+                    lines.extend(std::iter::repeat_n(idx + 1, c.len_utf8()));
+                }
+            }
+            Self { text, lines }
+        }
+
+        /// The line of every match of any needle, in source order.
+        fn lines_matching(&self, needles: &[String]) -> Vec<usize> {
+            let mut at: Vec<usize> = needles
+                .iter()
+                .flat_map(|n| self.text.match_indices(n.as_str()).map(|(i, _)| i))
+                .collect();
+            at.sort_unstable();
+            at.into_iter().map(|i| self.lines[i]).collect()
+        }
+    }
+
+    #[test]
+    fn the_working_directory_scan_flags_each_spelling_and_nothing_else() {
+        // The needles prove nothing unless they match real source, so each
+        // one is checked against a sample written the way a test would write
+        // it, with its whitespace, the split-across-lines form included. The
+        // samples are built here for the same reason the needles are, and
+        // written out separately from them, so a broken escape in a needle
+        // shows up as a needle no sample matches.
+        let needles = working_directory_needles();
+        let (dot, empty) = (".", "");
+        let mut flagged = vec![
+            (
+                format!(
+                    "let a = 1;\nlet args = CliArgs::parse_from([\n    \"test\",\n    \
+                     \"--project-dir\",\n    \"{dot}\",\n]);\n"
+                ),
+                vec![4],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"--project-dir\", \"{dot}/\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"--project-dir={dot}\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"-p\", \"{dot}\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"-p{dot}\"]);\n"),
+                vec![1],
+            ),
+        ];
+        let values = [
+            format!("PathBuf::from(\"{dot}\")"),
+            format!("std::path::PathBuf::from(\"{dot}\")"),
+            "PathBuf::new()".to_string(),
+            "std::path::PathBuf::new()".to_string(),
+            format!("\"{dot}\".into()"),
+            format!("\"{empty}\".into()"),
+        ];
+        for value in &values {
+            flagged.push((
+                format!("SupervisorConfig {{\n    project_dir: {value},\n}}\n"),
+                vec![2],
+            ));
+            flagged.push((format!("\n\nconfig.project_dir = {value};\n"), vec![3]));
+        }
+        for (sample, lines) in &flagged {
+            assert_eq!(
+                Squeezed::new(sample).lines_matching(&needles),
+                *lines,
+                "{sample}"
+            );
+        }
+        for needle in &needles {
+            assert!(
+                flagged
+                    .iter()
+                    .any(|(sample, _)| Squeezed::new(sample).text.contains(needle.as_str())),
+                "no sample exercises the needle {needle}"
+            );
+        }
+
+        // Near misses are not flagged: the helper's own form, an assignment
+        // from a variable, an absolute root, and a `.` that is not a project
+        // dir (`symbol_watcher`'s watch roots).
+        let clean = format!(
+            "let config = SupervisorConfig::from_args(CliArgs::parse_from([\n    \
+             \"test\",\n    \"--project-dir\",\n    project_dir.as_str(),\n]));\n\
+             config.project_dir = src_tauri;\n\
+             SupervisorConfig {{ project_dir: PathBuf::from(\"/tmp/x\") }};\n\
+             WatcherConfig::build(vec![PathBuf::from(\"{dot}\")], None);\n"
+        );
+        assert_eq!(
+            Squeezed::new(&clean).lines_matching(&needles),
+            Vec::<usize>::new(),
+            "{clean}"
+        );
+    }
+
+    #[test]
+    fn no_test_config_is_rooted_at_the_working_directory() {
+        // A project dir of `.` resolves the slot, LKG and workspace-default
+        // candidates against the working directory (see `runner_npm_dir`),
+        // which `AmbientTargetDir::Ignore` does not cover: run from a runner
+        // checkout, a test that reaches a runner start finds that checkout's
+        // exe and starts it. #253 moved the two states that reach a start onto
+        // `config_over_an_empty_runner_tree`; this keeps the pattern from
+        // coming back at another. It also holds the half `Ignore` cannot
+        // reach: an integration test links the library without `cfg(test)`,
+        // so `from_args` gives it `Read`. No file under `tests/` calls it;
+        // they build a struct literal that names `Ignore`.
+        let needles = working_directory_needles();
+        let from_args = ["::from_args(".to_string()];
+        let helper_call = format!("{}()", "config_over_an_empty_runner_tree");
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+
+        let mut offenders = Vec::new();
+        let mut reading_the_ambient_target_dir = Vec::new();
+        let mut files_scanned = 0usize;
+        let mut integration_files_scanned = 0usize;
+        let mut helper_call_sites = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            let squeezed = Squeezed::new(&source);
+            helper_call_sites += squeezed.text.matches(helper_call.as_str()).count()
+                - squeezed.text.matches(&format!("fn{helper_call}")).count();
+            for line in squeezed.lines_matching(&needles) {
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+            if path.starts_with(&tests_dir) {
+                integration_files_scanned += 1;
+                for line in squeezed.lines_matching(&from_args) {
+                    reading_the_ambient_target_dir.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+
+        // Vacuity guards: a scan that read almost nothing, or that missed the
+        // integration tests, would pass while asserting nothing about them.
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            integration_files_scanned > 0,
+            "scanned no file under tests/ — the scan no longer covers the integration tests"
+        );
+        assert!(
+            helper_call_sites > 0,
+            "no test state builds its config through `{helper_call}` — either the scan \
+             is broken or the states stopped using it"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these test configs use the working directory as the runner project dir; \
+             build them with `config::config_over_an_empty_runner_tree` (or another \
+             tempdir root) instead:\n  {}",
+            offenders.join("\n  ")
+        );
+        assert!(
+            reading_the_ambient_target_dir.is_empty(),
+            "these integration tests call `from_args`, which gives them \
+             `AmbientTargetDir::Read` (`cfg(test)` is not set for the library they \
+             link); build a `SupervisorConfig` literal with \
+             `ambient_target_dir: AmbientTargetDir::Ignore` instead:\n  {}",
+            reading_the_ambient_target_dir.join("\n  ")
+        );
     }
 
     #[test]

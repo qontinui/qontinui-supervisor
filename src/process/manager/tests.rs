@@ -1260,9 +1260,7 @@ fn serving_restart_decision_table() {
 /// operator intent, "supervise the primary"), the env switches are not.
 #[test]
 fn the_two_arms_share_the_cli_flag_and_nothing_else() {
-    let mut config = crate::config::SupervisorConfig::from_args(
-        <crate::config::CliArgs as clap::Parser>::parse_from(["test", "--project-dir", "."]),
-    );
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
     config.watchdog_enabled_at_start = false;
     assert!(!serving_restart_globally_armed(&config));
     assert!(!crash_restart_globally_armed(&config));

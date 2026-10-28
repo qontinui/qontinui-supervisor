@@ -1552,6 +1552,32 @@ the test simply measured the wrong code. Repointing the constant at
 `src-tauri/target` would have inverted the bug onto every environment that sets
 no override, hence the precedence ladder.
 
+**A unit-test build reads neither ambient rung.** `SupervisorConfig.ambient_target_dir`
+is `AmbientTargetDir::Read` in production and `Ignore` when `from_args` runs
+under `cfg(test)`, so the ladder is the workspace default alone: a test never
+resolves a runner exe through the developer's `CARGO_TARGET_DIR` or a
+`.cargo/config.toml` above the checkout. A session's `CARGO_TARGET_DIR` once
+named a runner target holding a real exe, and two restart tests started it; the
+runners outlived the suite (coord finding `46f09ce5`, #253). Two things it does
+not cover, and one test, `config::tests::no_test_config_is_rooted_at_the_working_directory`,
+holds both by scanning every `.rs` file under `src/` and `tests/`:
+
+- **The candidates under `project_dir` itself** (slots, LKG, workspace default).
+  A project dir of `.` makes `runner_npm_dir()` return `""`, so all of them
+  resolve against the working directory. A test state therefore roots its
+  config in an empty tempdir (`config::config_over_an_empty_runner_tree`), and
+  the scan fails on the literal working-directory spellings it lists
+  (`working_directory_needles`), split across lines or not: `--project-dir .`,
+  `--project-dir ./`, `--project-dir=.`, `-p .` and `-p.`, and a `project_dir`
+  field or assignment of `PathBuf::from(".")`, `PathBuf::new()`, `".".into()`
+  or `"".into()`. It matches spellings, not paths: a single-component relative
+  project dir (`src-tauri`, whose parent is also `""`) behaves the same and is
+  not caught.
+- **Integration tests under `tests/`**, which link the library without
+  `cfg(test)`: `from_args` gives them `Read`. So no file there calls
+  `from_args` (the scan fails on one that does); one that needs a config builds
+  a `SupervisorConfig` literal that sets `ambient_target_dir: AmbientTargetDir::Ignore`.
+
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
 construction, which is this gate's own allow condition.) A fallthrough artifact

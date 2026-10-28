@@ -2169,7 +2169,7 @@ mod tests {
     /// a runner allow uses, and names the arm that answered.
     #[tokio::test]
     async fn enforce_allows_a_wedged_idle_runner_and_logs_the_census() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let (managed, port) = managed_on_dead_port(
             "primary",
             qontinui_types::wire::runner_kind::RunnerKind::Primary,
@@ -2224,13 +2224,17 @@ mod tests {
     // `manager::restart_runner_by_id` actually call, so they cover the three
     // exemptions and the refusal→SupervisorError mapping — not just `decide`.
 
-    fn enforce_state() -> crate::state::SharedState {
-        use crate::config::{CliArgs, SupervisorConfig};
-        use clap::Parser;
-        let args = CliArgs::parse_from(["test", "--project-dir", "."]);
-        std::sync::Arc::new(crate::state::SupervisorState::new(
-            SupervisorConfig::from_args(args),
-        ))
+    /// Rooted in an empty runner tree
+    /// ([`crate::config::config_over_an_empty_runner_tree`]), so a test that
+    /// goes on from the gate to the restart it guards fails at exe resolution
+    /// rather than starting whatever runner exe the working directory holds.
+    /// Hold the returned `TempDir` for the test's lifetime.
+    fn enforce_state() -> (crate::state::SharedState, tempfile::TempDir) {
+        let (config, root) = crate::config::config_over_an_empty_runner_tree();
+        (
+            std::sync::Arc::new(crate::state::SupervisorState::new(config)),
+            root,
+        )
     }
 
     /// A registered runner of the given id/kind on a port nothing listens on,
@@ -2266,7 +2270,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_refuses_a_live_protected_runner_whose_readiness_is_unreachable() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let (managed, _port) = managed_on_dead_port(
             "primary",
             qontinui_types::wire::runner_kind::RunnerKind::Primary,
@@ -2294,7 +2298,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_lets_force_through_and_reports_the_same_action_it_was_asked_about() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let (managed, _) = managed_on_dead_port(
             "primary",
             qontinui_types::wire::runner_kind::RunnerKind::Primary,
@@ -2332,7 +2336,7 @@ mod tests {
         // A temp runner on a dead port. Without the exemption this is exactly
         // the UNKNOWN refusal above — which would leak a zombie on every
         // failed spawn-test and wedge the max-age reaper.
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let id = "test-18f2a3b4-1";
         let (managed, _) = managed_on_dead_port(
             id,
@@ -2353,7 +2357,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_exempts_an_explicitly_unprotected_runner() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let (managed, _) = managed_on_dead_port(
             "named-9880-abc",
             qontinui_types::wire::runner_kind::RunnerKind::Named {
@@ -2371,7 +2375,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_exempts_a_runner_with_no_evidence_of_life() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let (managed, _) = managed_on_dead_port(
             "named-9881-abc",
             qontinui_types::wire::runner_kind::RunnerKind::Named {
@@ -2392,7 +2396,7 @@ mod tests {
     async fn enforce_refuses_and_logs_when_the_runner_reports_live_terminal_sessions() {
         // End-to-end through a real HTTP server: the runner says unsafe, the
         // gate refuses, and the operator log carries the verdict.
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let app = Router::new().route(
             READINESS_PATH,
             get(|| async {
@@ -2454,7 +2458,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_allows_and_logs_the_verdict_that_permitted_it() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let app = Router::new().route(
             READINESS_PATH,
             get(|| async {
@@ -2652,7 +2656,7 @@ mod tests {
     /// than probing a dead port into an UNKNOWN refusal.
     #[tokio::test]
     async fn enforce_skips_a_handoff_of_a_stopped_temp_runner() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let id = "test-18f2a3b4-a";
         let (managed, _) = managed_on_dead_port(
             id,
@@ -2688,7 +2692,7 @@ mod tests {
     /// handoff restart of it must be refused, not waved through as "temp".
     #[tokio::test]
     async fn enforce_refuses_a_handoff_of_a_temp_runner_that_does_not_report_the_field() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let managed = temp_runner_serving("test-18f2a3b4-7", SAFE).await;
 
         // Non-vacuous: a normal restart of the same runner is exempt.
@@ -2733,7 +2737,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_refuses_a_handoff_of_a_temp_runner_reporting_false_and_admits_true() {
-        let state = enforce_state();
+        let (state, _root) = enforce_state();
         let refused = temp_runner_serving("test-18f2a3b4-8", HANDOFF_UNSAFE).await;
         let err = enforce(
             &state,

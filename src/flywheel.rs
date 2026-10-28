@@ -578,16 +578,13 @@ mod tests {
     }
 
     /// Build a real `SharedState` cheap enough to use as the http_client
-    /// holder in tests. We don't exercise any other state field.
-    fn test_state() -> SharedState {
-        use crate::config::{CliArgs, SupervisorConfig};
-        use clap::Parser;
-        // Parse with a minimal arg vector — `--project-dir .` is the only
-        // required flag. The path doesn't need to exist for `SupervisorState::new`
-        // to construct.
-        let args = CliArgs::parse_from(["test", "--project-dir", "."]);
-        let config = SupervisorConfig::from_args(args);
-        Arc::new(crate::state::SupervisorState::new(config))
+    /// holder in tests. We don't exercise any other state field. Rooted in an
+    /// empty runner tree ([`crate::config::config_over_an_empty_runner_tree`]),
+    /// never the working directory. Hold the returned `TempDir` for the test's
+    /// lifetime.
+    fn test_state() -> (SharedState, tempfile::TempDir) {
+        let (config, root) = crate::config::config_over_an_empty_runner_tree();
+        (Arc::new(crate::state::SupervisorState::new(config)), root)
     }
 
     fn mk_app(app_id: &str) -> App {
@@ -611,7 +608,7 @@ mod tests {
     async fn tick_with_empty_app_list_does_nothing() {
         let mock = Arc::new(MockState::default());
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
@@ -631,7 +628,7 @@ mod tests {
         *mock.apps_response.lock() = vec![mk_app("qontinui-runner")];
         *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
@@ -658,7 +655,7 @@ mod tests {
             ]
         });
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
@@ -681,7 +678,7 @@ mod tests {
         let mock = Arc::new(MockState::default());
         *mock.apps_returns_404.lock() = true;
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let err = run_one_tick_against(&state, &base).await.unwrap_err();
         assert_eq!(err, FEATURE_OFF_SENTINEL);
@@ -719,7 +716,7 @@ mod tests {
             .port();
         let base = format!("http://127.0.0.1:{}", port);
 
-        let state = test_state();
+        let (state, _root) = test_state();
         let err = run_one_tick_against(&state, &base).await.unwrap_err();
 
         // Must NOT be the feature-off sentinel — that path is reserved for
@@ -749,7 +746,7 @@ mod tests {
         *mock.scan_response.lock() = serde_json::json!({ "queuedProposals": [] });
         mock.scan_fails_for.lock().insert("flaky-app".to_string());
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
@@ -795,7 +792,7 @@ mod tests {
             "queuedProposals": [{"proposal_id": "p1"}]
         });
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
@@ -816,7 +813,7 @@ mod tests {
             "queuedProposals": [{"proposal_id": "p1"}]
         });
         let base = spawn_mock_runner(mock.clone()).await;
-        let state = test_state();
+        let (state, _root) = test_state();
 
         let report = run_one_tick_against(&state, &base).await.unwrap();
 
