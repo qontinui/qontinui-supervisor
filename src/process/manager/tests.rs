@@ -3345,13 +3345,13 @@ async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
     assert!(refuse_if_port_held_by_live_runner(dead_port).await.is_ok());
 }
 
-fn restart_test_state() -> SharedState {
-    use crate::config::{CliArgs, SupervisorConfig};
-    use clap::Parser;
-    let args = CliArgs::parse_from(["test", "--project-dir", "."]);
-    Arc::new(crate::state::SupervisorState::new(
-        SupervisorConfig::from_args(args),
-    ))
+/// A supervisor state over an empty runner tree
+/// ([`crate::config::config_over_an_empty_runner_tree`]), so a start fails at
+/// exe resolution wherever the test process runs. Hold the returned `TempDir`
+/// for the test's lifetime.
+fn restart_test_state() -> (SharedState, tempfile::TempDir) {
+    let (config, root) = crate::config::config_over_an_empty_runner_tree();
+    (Arc::new(crate::state::SupervisorState::new(config)), root)
 }
 
 /// A registered, UNPROTECTED named runner on a port nothing listens on.
@@ -3397,7 +3397,7 @@ async fn register_dead_named_runner(state: &SharedState, id: &str) -> Arc<Manage
 #[tokio::test]
 async fn failed_restart_clears_restart_requested() {
     use crate::diagnostics::RestartSource;
-    let state = restart_test_state();
+    let (state, _root) = restart_test_state();
     let managed = register_dead_named_runner(&state, "named-p3-start-fail").await;
 
     let err = restart_runner_by_id(
@@ -3434,7 +3434,7 @@ async fn failed_restart_clears_restart_requested() {
 #[tokio::test]
 async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
     use crate::diagnostics::RestartSource;
-    let state = restart_test_state();
+    let (state, _root) = restart_test_state();
     let managed = register_dead_named_runner(&state, "named-p3-s2").await;
     managed.cached_health.write().await.runner_port_open = true;
     assert!(!managed.runner.read().await.running);
@@ -3471,7 +3471,7 @@ async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
 #[tokio::test]
 async fn wire_watchdog_source_is_still_blocked_for_non_temp_runners() {
     use crate::diagnostics::RestartSource;
-    let state = restart_test_state();
+    let (state, _root) = restart_test_state();
     let managed = register_dead_named_runner(&state, "named-p3-blocked").await;
 
     let err = restart_runner_by_id(

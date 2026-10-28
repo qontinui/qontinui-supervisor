@@ -2004,6 +2004,7 @@ mod tests {
             no_prewarm: false,
             no_webview: true,
             temp_runner_display: None,
+            ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         }
     }
 

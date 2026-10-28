@@ -1097,8 +1097,10 @@ pub fn evaluate_local_build_adoption(
 ///
 /// Separated so the composition — finding, sidecar read, freshness rule,
 /// adoption verdict — is testable against a `tempfile` tree without mutating
-/// `CARGO_TARGET_DIR`, which `runner_exe_path_resolved` reads at level-1
-/// precedence and which no test may set without breaking its neighbours.
+/// `CARGO_TARGET_DIR`, which no test may set without breaking its neighbours.
+/// (`runner_exe_path_resolved` reads it at level-1 precedence in production;
+/// a unit-test build's config does not read it at all, see
+/// [`crate::config::AmbientTargetDir`].)
 pub fn evaluate_local_build_adoption_at(
     legacy_exe: &std::path::Path,
     target_dir_source: TargetDirSource,

@@ -42,6 +42,7 @@ fn config_with_project_dir(dir: PathBuf) -> SupervisorConfig {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
     }
 }
 

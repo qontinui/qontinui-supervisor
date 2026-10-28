@@ -28,6 +28,7 @@ fn test_config_from_fields() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
     };
 
     assert!(!config.watchdog_enabled_at_start);
@@ -58,6 +59,7 @@ fn test_config_runner_exe_path() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
     };
 
     let exe_path = config.runner_exe_path();
@@ -90,6 +92,7 @@ fn test_config_runner_npm_dir() {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
     };
 
     let npm_dir = config.runner_npm_dir();

@@ -72,6 +72,29 @@ impl TargetDirSource {
     }
 }
 
+/// Whether [`SupervisorConfig::runner_target_dir_candidates`] consults the two
+/// AMBIENT sources of a target dir — the process's `CARGO_TARGET_DIR` (level 1)
+/// and the `.cargo/config.toml` hierarchy above the runner (level 2) — or only
+/// the workspace default (level 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientTargetDir {
+    /// Read both, on every call. Production.
+    Read,
+    /// Read neither. What [`SupervisorConfig::from_args`] picks in a unit-test
+    /// build, so a test never resolves a runner exe through the developer's
+    /// `CARGO_TARGET_DIR` or a config file above the checkout. When a session's
+    /// `CARGO_TARGET_DIR` named a runner target holding a real exe, two restart
+    /// tests resolved that exe and STARTED it, and the runners outlived the test
+    /// run (coord finding 46f09ce5).
+    ///
+    /// It does not cover the candidates under the project dir itself (slots,
+    /// LKG, the workspace default): a test controls those by rooting its config
+    /// in a tempdir rather than a relative path. And an integration test under
+    /// `tests/` links the library without `cfg(test)`, so `from_args` gives it
+    /// `Read`: one that calls `from_args` must set `Ignore` itself.
+    Ignore,
+}
+
 /// Resolve `p` against `base` when it is relative. Cargo resolves a relative
 /// `CARGO_TARGET_DIR` against its own working directory and a relative
 /// `build.target-dir` against the directory *containing* the `.cargo` dir the
@@ -295,6 +318,11 @@ pub struct SupervisorConfig {
     /// has none (`--temp-runner-display`, else
     /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`). Blank counts as unset.
     pub temp_runner_display: Option<String>,
+    /// Whether the non-pool runner exe may resolve through `CARGO_TARGET_DIR`
+    /// and `.cargo/config.toml` ([`AmbientTargetDir`]): `Read` in production,
+    /// `Ignore` in a unit-test build. An integration test that calls
+    /// [`Self::from_args`] gets `Read` and must set `Ignore` itself.
+    pub ambient_target_dir: AmbientTargetDir,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -1117,6 +1145,10 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 }
 
 impl SupervisorConfig {
+    /// Build the config from the command line. `ambient_target_dir` is
+    /// [`AmbientTargetDir::Ignore`] in a unit-test build and `Read` everywhere
+    /// else, an integration test under `tests/` included: one that calls this
+    /// must set `Ignore` itself.
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1175,6 +1207,11 @@ impl SupervisorConfig {
             no_prewarm,
             no_webview,
             temp_runner_display,
+            ambient_target_dir: if cfg!(test) {
+                AmbientTargetDir::Ignore
+            } else {
+                AmbientTargetDir::Read
+            },
         };
         config.build_pool =
             BuildPoolConfig::for_pool_root(&config.runner_npm_dir().join("target-pool"));
@@ -1239,11 +1276,26 @@ impl SupervisorConfig {
     /// call — deliberately, so an operator who exports a different
     /// `CARGO_TARGET_DIR` and rebuilds does not need to restart the supervisor
     /// for resolution to follow. Both reads are cheap and off any hot path
-    /// (resolution runs once per runner start).
+    /// (resolution runs once per runner start). With
+    /// [`AmbientTargetDir::Ignore`] (a unit-test build) neither is read, and the
+    /// workspace default is the only candidate.
     pub fn runner_target_dir_candidates(&self) -> Vec<(TargetDirSource, PathBuf)> {
+        self.runner_target_dir_candidates_with(|| std::env::var(CARGO_TARGET_DIR_ENV).ok())
+    }
+
+    /// [`Self::runner_target_dir_candidates`] with the `CARGO_TARGET_DIR` read
+    /// passed in, so a test can stand in for the environment without setting
+    /// process-global state. `read_env` is called only under
+    /// [`AmbientTargetDir::Read`].
+    fn runner_target_dir_candidates_with(
+        &self,
+        read_env: impl FnOnce() -> Option<String>,
+    ) -> Vec<(TargetDirSource, PathBuf)> {
         let cargo_cwd = self.runner_cargo_cwd();
-        let env_value = std::env::var(CARGO_TARGET_DIR_ENV).ok();
-        let config_value = read_cargo_config_target_dir(&cargo_cwd);
+        let (env_value, config_value) = match self.ambient_target_dir {
+            AmbientTargetDir::Read => (read_env(), read_cargo_config_target_dir(&cargo_cwd)),
+            AmbientTargetDir::Ignore => (None, None),
+        };
         target_dir_candidates(
             &cargo_cwd,
             &self.runner_npm_dir(),
@@ -1422,6 +1474,29 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[inline]
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
+}
+
+/// A config over a fresh, EMPTY runner tree in a tempdir: no build slot, no LKG
+/// and no workspace-default exe, so a runner start fails at exe resolution
+/// wherever the test process runs and whatever its environment holds. Hold the
+/// returned `TempDir` for the test's lifetime. A relative project dir (`.`)
+/// resolves those candidates against the working directory instead, which
+/// [`AmbientTargetDir::Ignore`] does not touch: a test binary run from a runner
+/// checkout would find that checkout's slot exe and start it. That is the
+/// incident class of coord finding 46f09ce5, which went through
+/// `CARGO_TARGET_DIR`.
+#[cfg(test)]
+pub(crate) fn config_over_an_empty_runner_tree() -> (SupervisorConfig, tempfile::TempDir) {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    let src_tauri = root.path().join("qontinui-runner").join("src-tauri");
+    std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
+    let project_dir = src_tauri.to_string_lossy().into_owned();
+    let config = SupervisorConfig::from_args(CliArgs::parse_from([
+        "test",
+        "--project-dir",
+        project_dir.as_str(),
+    ]));
+    (config, root)
 }
 
 #[cfg(test)]
@@ -1976,6 +2051,73 @@ mod tests {
                 PathBuf::from("/ws/qontinui-runner/target")
             )
         );
+    }
+
+    #[test]
+    fn a_test_build_resolves_no_runner_exe_through_the_ambient_target_dir() {
+        // Whatever this process's CARGO_TARGET_DIR or a config file above the
+        // checkout says, a test's config never consults them: the developer's
+        // environment must not hand a test a real runner exe to start.
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        assert_eq!(config.ambient_target_dir, AmbientTargetDir::Ignore);
+        let candidates = config
+            .runner_target_dir_candidates_with(|| panic!("a test build read CARGO_TARGET_DIR"));
+        assert_eq!(
+            candidates,
+            vec![(
+                TargetDirSource::WorkspaceDefault,
+                config.runner_npm_dir().join("target")
+            )]
+        );
+    }
+
+    #[test]
+    fn ignoring_the_ambient_target_dir_drops_the_cargo_target_dir_rung() {
+        // The environment is passed in, so this holds wherever the suite runs,
+        // CI included, where CARGO_TARGET_DIR is unset. `Read` takes the rung;
+        // `Ignore` never even reads it.
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+
+        config.ambient_target_dir = AmbientTargetDir::Read;
+        let read = config.runner_target_dir_candidates_with(|| Some("elsewhere".to_string()));
+        assert_eq!(read[0].0, TargetDirSource::CargoTargetDirEnv, "{read:?}");
+        assert!(read[0].1.ends_with("elsewhere"), "{read:?}");
+
+        config.ambient_target_dir = AmbientTargetDir::Ignore;
+        let ignored = config.runner_target_dir_candidates_with(|| panic!("Ignore read the env"));
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert_eq!(ignored[0].0, TargetDirSource::WorkspaceDefault);
+    }
+
+    #[test]
+    fn ignoring_the_ambient_target_dir_drops_the_cargo_config_rung() {
+        // The same checkout under a config file that names a target dir: `Read`
+        // takes that rung, `Ignore` does not. A file rather than the
+        // environment, so the test sets no process-global state.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tauri = tmp.path().join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cargo").join("config.toml"),
+            "[build]\ntarget-dir = \"shared-target\"\n",
+        )
+        .unwrap();
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+        config.project_dir = src_tauri;
+
+        config.ambient_target_dir = AmbientTargetDir::Read;
+        let read = config.runner_target_dir_candidates();
+        assert!(
+            read.iter()
+                .any(|(src, _)| *src == TargetDirSource::CargoConfigBuildTargetDir),
+            "{read:?}"
+        );
+
+        config.ambient_target_dir = AmbientTargetDir::Ignore;
+        let ignored = config.runner_target_dir_candidates();
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert_eq!(ignored[0].0, TargetDirSource::WorkspaceDefault);
     }
 
     #[test]

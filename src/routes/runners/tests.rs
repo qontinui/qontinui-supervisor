@@ -1699,6 +1699,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1888,6 +1889,7 @@ fn make_state() -> crate::state::SharedState {
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -3206,14 +3208,14 @@ async fn register_live_named_runner(
     state.runners.write().await.insert(id.to_string(), managed);
 }
 
+/// A supervisor state over an empty runner tree
+/// ([`crate::config::config_over_an_empty_runner_tree`]), so the restart route
+/// fails at the start half wherever the test process runs. Hold the returned
+/// `TempDir` for the test's lifetime.
 #[cfg(unix)]
-fn handoff_route_state() -> crate::state::SharedState {
-    use crate::config::{CliArgs, SupervisorConfig};
-    use clap::Parser;
-    let args = CliArgs::parse_from(["test", "--project-dir", "."]);
-    Arc::new(crate::state::SupervisorState::new(
-        SupervisorConfig::from_args(args),
-    ))
+fn handoff_route_state() -> (crate::state::SharedState, TempDir) {
+    let (config, root) = crate::config::config_over_an_empty_runner_tree();
+    (Arc::new(crate::state::SupervisorState::new(config)), root)
 }
 
 #[cfg(unix)]
@@ -3257,7 +3259,7 @@ async fn handoff_restart_route_forwards_the_intent_to_the_runner() {
         Some(child),
     )
     .await;
-    let state = handoff_route_state();
+    let (state, _root) = handoff_route_state();
     register_live_named_runner(&state, "named-handoff-route", port, Some(child_pid)).await;
 
     let started = std::time::Instant::now();
@@ -3298,7 +3300,7 @@ async fn handoff_restart_route_refuses_when_the_runner_says_unsafe() {
         None,
     )
     .await;
-    let state = handoff_route_state();
+    let (state, _root) = handoff_route_state();
     register_live_named_runner(&state, "named-handoff-refused", port, None).await;
 
     let status = call_restart_route(

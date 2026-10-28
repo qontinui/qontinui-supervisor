@@ -1282,6 +1282,7 @@ mod tests {
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
+            ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         };
         let state: SharedState = std::sync::Arc::new(crate::state::SupervisorState::new(config));
         let primary = state
