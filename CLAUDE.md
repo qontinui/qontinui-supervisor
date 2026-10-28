@@ -1360,7 +1360,7 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 - Velocity and evaluation dashboards
 - Confirmation dialogs for destructive actions
 
-**Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite. Production build output in `dist/` is embedded into the binary via `rust-embed`. Falls back to legacy `static/dashboard.html` if the SPA dist is missing.
+**Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite. Production build output in `dist/` is embedded into the binary via `rust-embed`. Falls back to legacy `static/dashboard.html` if the SPA dist is missing (a debug build reads `dist/` from disk per request, so there the fallback lasts only while `dist/` has no SPA; a release build keeps whatever it compiled). When `dist/index.html` is absent and `frontend/package.json` exists, `build.rs` runs `npm ci` (only if `frontend/node_modules` is missing; `ci` never rewrites the tracked lockfile) and `npm run build`, through `cmd /C` on a Windows host, because `Command::new("npm")` cannot find the `npm.cmd` shim there. If that fails it leaves an empty `dist/`, so `rerun-if-changed=dist` tracks a real directory and the next frontend build re-runs the script, and the embed is `#[allow_missing = true]`. Either way a build with no npm, or a failed frontend build, still compiles and serves the fallback. Before this, a fresh Windows worktree did not compile at all: `#[derive(RustEmbed)] folder '…dist/' does not exist`, then `E0599` on every `Assets::get`.
 
 **Data flow:**
 - SSE `GET /health/stream` for real-time health data

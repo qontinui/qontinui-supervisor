@@ -1,58 +1,96 @@
 fn main() {
     // FIRST, unconditionally: the crate does `env!("QONTINUI_SUPERVISOR_GIT_SHA")`,
-    // which is a COMPILE error when the var was never emitted. The frontend
-    // block below has an early `return` on an npm failure, so emitting the
-    // provenance after it would turn a missing npm into "the supervisor crate
-    // does not compile".
+    // which is a COMPILE error when the var was never emitted. Kept first so no
+    // early return added to `main` later can skip it and turn a frontend
+    // failure into "the supervisor crate does not compile".
     emit_self_build_provenance();
 
-    // Only build frontend if dist/ is missing index.html or in release mode.
-    // During dev, run `cd frontend && npm run dev` separately for HMR.
-    let dist_index = std::path::Path::new("dist/index.html");
-    if !dist_index.exists() {
-        // Check if frontend/ directory exists with package.json
-        let frontend_pkg = std::path::Path::new("frontend/package.json");
-        if frontend_pkg.exists() {
-            // Check if node_modules exists, install if not
-            let node_modules = std::path::Path::new("frontend/node_modules");
-            if !node_modules.exists() {
-                let status = std::process::Command::new("npm")
-                    .args(["install"])
-                    .current_dir("frontend")
-                    .status();
-                if let Err(e) = status {
-                    println!("cargo:warning=Failed to run npm install: {}", e);
-                    println!("cargo:warning=SPA will not be embedded. Run `cd frontend && npm install && npm run build` manually.");
-                    return;
-                }
-            }
-
-            let status = std::process::Command::new("npm")
-                .args(["run", "build"])
-                .current_dir("frontend")
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!("cargo:warning=Frontend built successfully into dist/");
-                }
-                Ok(s) => {
-                    println!(
-                        "cargo:warning=Frontend build failed with status: {}. Dashboard will use legacy HTML fallback.",
-                        s
-                    );
-                }
-                Err(e) => {
-                    println!("cargo:warning=Failed to run npm build: {}. Dashboard will use legacy HTML fallback.", e);
-                }
-            }
-        }
-    }
-
-    // Rebuild if frontend source changes
+    // Re-run this script (and re-embed `dist/`) when the frontend sources or
+    // `dist/` change. This does not rebuild a `dist/` that already has an
+    // `index.html`. Emitted before the frontend step, so a frontend built by
+    // hand after a failed attempt still re-runs this script and gets embedded.
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/index.html");
     println!("cargo:rerun-if-changed=frontend/vite.config.ts");
     println!("cargo:rerun-if-changed=dist");
+
+    build_frontend_if_missing();
+
+    // Cargo reads a `rerun-if-changed` path that does not exist as changed on
+    // every invocation, so after a failed frontend build every cargo command
+    // would retry npm and recompile the crate. An empty `dist/` gives it a real
+    // directory to track; the next Vite build writes into it. Creating it here
+    // makes it newer than this run, so the next invocation re-runs once more
+    // and then settles. The embed is `allow_missing`, and an empty folder
+    // serves the same legacy fallback.
+    if let Err(e) = std::fs::create_dir_all("dist") {
+        println!(
+            "cargo:warning=Could not create dist/ ({e}); every cargo command will re-run this build script until it exists."
+        );
+    }
+}
+
+/// Build the SPA into `dist/` when `dist/index.html` is absent. During dev,
+/// run `cd frontend && npm run dev` separately for HMR.
+fn build_frontend_if_missing() {
+    if std::path::Path::new("dist/index.html").exists()
+        || !std::path::Path::new("frontend/package.json").exists()
+    {
+        return;
+    }
+    // `npm ci`, not `npm install`: it installs exactly what the tracked
+    // `frontend/package-lock.json` says and never rewrites it, which would leave
+    // the worktree dirty (restart-supervisor.ps1 uses `npm ci` for the same
+    // reason).
+    if !std::path::Path::new("frontend/node_modules").exists() {
+        match npm(&["ci"]) {
+            Ok(s) if s.success() => {}
+            outcome => {
+                println!(
+                    "cargo:warning=npm ci did not succeed ({}; is npm on PATH?). The dashboard will use the legacy HTML fallback. Run `cd frontend && npm ci && npm run build` manually.",
+                    describe(&outcome)
+                );
+                return;
+            }
+        }
+    }
+    match npm(&["run", "build"]) {
+        Ok(s) if s.success() => {
+            println!("cargo:warning=Frontend built successfully into dist/");
+        }
+        outcome => {
+            println!(
+                "cargo:warning=Frontend build did not succeed ({}; is npm on PATH?). The dashboard will use the legacy HTML fallback. Run `cd frontend && npm ci && npm run build` manually.",
+                describe(&outcome)
+            );
+        }
+    }
+}
+
+/// Run `npm <args>` in `frontend/`. On Windows npm is a `.cmd` shim, and
+/// `Command::new("npm")` cannot find it (it appends only `.exe` when it
+/// searches `PATH`), so a fresh checkout with no `dist/` never got its SPA
+/// built. It goes through `cmd /C` instead, the way `expo.rs` and
+/// `build_monitor.rs` launch theirs, and cmd resolves `npm` through `PATHEXT`.
+/// So a missing npm is a non-zero exit there rather than an `Err`. `/D` skips
+/// the user's cmd AutoRun, which could change directory or print into the
+/// build script's stdout, which cargo parses.
+fn npm(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+    let mut command = if cfg!(windows) {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/D", "/C", "npm"]);
+        cmd
+    } else {
+        std::process::Command::new("npm")
+    };
+    command.args(args).current_dir("frontend").status()
+}
+
+fn describe(outcome: &std::io::Result<std::process::ExitStatus>) -> String {
+    match outcome {
+        Ok(status) => status.to_string(),
+        Err(e) => format!("could not run npm: {e}"),
+    }
 }
 
 // The pure classification rules (`UNKNOWN_STAMP`, `looks_like_sha`,
