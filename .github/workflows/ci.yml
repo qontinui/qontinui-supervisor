@@ -141,6 +141,36 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # build.rs builds dist/ with npm, and when npm fails the crate must still
+      # compile and serve static/dashboard.html: `Assets` is
+      # `#[allow_missing = true]` (src/routes/dashboard.rs). Without it, the
+      # derive fails on a missing dist/ and the crate does not compile. Until
+      # 2026-10-28 that was every fresh worktree on a standard Windows Node.js
+      # install (build.rs spawned a bare `npm`, which Windows did not find),
+      # and nothing here saw it, because this job has npm and so always builds
+      # a dist/. A fresh checkout has no dist/ and no frontend/node_modules, so
+      # the step puts a failing `npm` first on PATH. It must run BEFORE the
+      # clippy step, whose build.rs run produces dist/.
+      - name: The crate compiles when npm fails and there is no dist/
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e dist ] || [ -e frontend/node_modules ]; then
+            echo "::error::dist/ or frontend/node_modules exists before any build, so this step cannot test their absence"
+            exit 1
+          fi
+          shim="$RUNNER_TEMP/failing-npm"
+          mkdir -p "$shim"
+          printf '#!/bin/sh\necho "failing npm shim: $*" >&2\nexit 1\n' > "$shim/npm"
+          chmod +x "$shim/npm"
+          PATH="$shim:$PATH" cargo check --lib 2>&1 | tee /tmp/no-dist-check.out
+          grep -q 'SPA will not be embedded' /tmp/no-dist-check.out \
+            || { echo "::error::build.rs did not report the fallback, so the failing npm never ran"; exit 1; }
+          if [ -e dist ]; then
+            echo "::error::dist/ exists after a build whose npm failed, so the no-dist path was not exercised"
+            exit 1
+          fi
+
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
