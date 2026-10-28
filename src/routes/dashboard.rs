@@ -6,9 +6,17 @@ use rust_embed::Embed;
 
 use crate::state::SharedState;
 
-// Embedded SPA assets from frontend build output
+// SPA assets from the frontend build output. A release build embeds what
+// `dist/` held at compile time; a debug build reads `dist/` from disk on each
+// request. With no SPA there (npm absent, or its build failed) every
+// `Assets::get` is `None` and the dashboard serves `DASHBOARD_HTML`, which is
+// what build.rs's warnings promise. build.rs leaves an empty `dist/` behind in
+// that case; `allow_missing` covers the folder being absent anyway, which the
+// derive otherwise refuses with a compile error ("folder 'dist/' does not
+// exist", then E0599 on every `Assets::get`).
 #[derive(Embed)]
 #[folder = "dist/"]
+#[allow_missing = true]
 pub struct Assets;
 
 // Fallback: the original self-contained HTML dashboard
