@@ -24,6 +24,8 @@ pub mod mock;
 pub mod policy;
 pub mod record;
 pub mod states;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // `spawn_attribution_watcher_with_timing` / `WindowTiming` are deliberately NOT
@@ -32,7 +34,7 @@ pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // regression tests can run the real waiting logic in milliseconds. Reach it
 // at `crate::dev_action::attribution::…` from a test.
 pub use expectations::{assess_then_cut, fetch_expectations, PredictedSignature};
-pub use ingest::post_snapshot_to_coord;
+pub use ingest::{coord_base, post_snapshot_to_coord};
 pub use policy::ActionRisk;
 pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore};
 pub use states::{evaluate_all, SlotResolution};

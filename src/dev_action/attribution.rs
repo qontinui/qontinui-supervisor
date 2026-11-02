@@ -800,19 +800,28 @@ pub fn spawn_attribution_watcher_with_timing(
         // watcher. Detached via `tokio::spawn` so even the 5s ingest timeout
         // can't delay the dashboard nudge below. device_id / tenant_id come from
         // `~/.qontinui/machine.json` (the same `machine_id` field `fleet.rs`
-        // reads for the device id).
-        let device_id = crate::dev_action::ingest::resolve_device_id();
-        let tenant_id = crate::dev_action::ingest::resolve_tenant_id();
-        let ingest_record = Arc::clone(&record);
-        tokio::spawn(async move {
-            crate::dev_action::post_snapshot_to_coord(
-                &ingest_record,
-                &outcome,
-                device_id,
-                tenant_id,
-            )
-            .await;
-        });
+        // reads for the device id), and only when there is a coord to send them
+        // to.
+        if let Some(base) = crate::dev_action::coord_base(&state.config.ambient_coord) {
+            let device_id = crate::dev_action::ingest::resolve_device_id();
+            let tenant_id = crate::dev_action::ingest::resolve_tenant_id();
+            let ingest_record = Arc::clone(&record);
+            tokio::spawn(async move {
+                crate::dev_action::post_snapshot_to_coord(
+                    &base,
+                    &ingest_record,
+                    &outcome,
+                    device_id,
+                    tenant_id,
+                )
+                .await;
+            });
+        } else {
+            tracing::debug!(
+                "dev_action::attribution: no coord base — skipping snapshot {} persistence.",
+                record.action_id
+            );
+        }
 
         let level = match category {
             D3Category::Contradiction | D3Category::Failure => LogLevel::Warn,
@@ -891,9 +900,14 @@ mod tests {
 
     /// Same minimal `SupervisorState` shape the route tests use.
     fn watcher_test_state(root: &std::path::Path) -> SharedState {
+        Arc::new(crate::state::SupervisorState::new(watcher_test_config(
+            root,
+        )))
+    }
+
+    fn watcher_test_config(root: &std::path::Path) -> crate::config::SupervisorConfig {
         use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-        use crate::state::SupervisorState;
-        Arc::new(SupervisorState::new(SupervisorConfig {
+        SupervisorConfig {
             project_dir: root.join("src-tauri"),
             watchdog_enabled_at_start: false,
             auto_start: false,
@@ -911,7 +925,8 @@ mod tests {
             no_webview: true,
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
-        }))
+            ambient_coord: crate::config::AmbientCoord::Ignore,
+        }
     }
 
     fn bare_record(kind: ActionKind) -> Arc<ActionRecord> {
@@ -1193,6 +1208,44 @@ mod tests {
             outcome.evidence_ref
         );
         assert!(outcome.signatures.is_empty());
+    }
+
+    /// The positive control for the switch: a unit-test build posts when its
+    /// config names a coord, so the config governs the write and no compile flag
+    /// does. A refusal closes the window at once.
+    #[tokio::test]
+    async fn a_completed_snapshot_posts_to_the_configured_coord() {
+        use crate::dev_action::test_support::serve_planted_expectations;
+        let coord = serve_planted_expectations(serde_json::json!([])).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = watcher_test_config(tmp.path());
+        config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+        let state = Arc::new(crate::state::SupervisorState::new(config));
+        let record = bare_record(ActionKind::Restart);
+
+        spawn_attribution_watcher(state, record.clone(), AttributionTargets::default(), None);
+        record.record_run_result(ActionRunResult::Refused {
+            reason: "restart_refused_unsafe: a terminal-hosted agent session is live".to_string(),
+        });
+
+        let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + budget;
+        let seen = loop {
+            let seen = coord.seen();
+            if !seen.is_empty() {
+                break seen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher posted nothing to the configured coord within {budget:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].method, axum::http::Method::POST);
+        assert_eq!(seen[0].path, "/coord/dev-actions/snapshot");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].body).expect("a JSON body");
+        assert_eq!(body["action_id"], record.action_id.to_string());
     }
 
     /// Plan §6 Phase 5 test 4 — pins Phase 2, the framing fix. A build whose

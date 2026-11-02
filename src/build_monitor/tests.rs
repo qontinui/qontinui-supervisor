@@ -1089,6 +1089,7 @@ fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
         no_webview: true,
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     Arc::new(SupervisorState::new(config))
 }

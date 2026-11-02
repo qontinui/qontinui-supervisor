@@ -17,8 +17,8 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -2656,7 +2656,9 @@ async fn mint_spawn_action(
     // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
     // pooled mean before cutting, which can drop the very row the exact-cell
     // arm of the risk policy reads.
-    let fetched = fetch_expectations(ActionKind::Spawn.as_str(), &states_active).await;
+    let coord = coord_base(&state.config.ambient_coord);
+    let fetched =
+        fetch_expectations(coord.as_deref(), ActionKind::Spawn.as_str(), &states_active).await;
 
     // "Act on predictions" (surface-only for spawns): assess the whole fetch,
     // then cut the ACK's `predicted` to the top five by `posterior_mean`; when

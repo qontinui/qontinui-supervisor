@@ -40,7 +40,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::dev_action::ingest::coord_http_base;
 use crate::dev_action::policy::{assess_action_risk, ActionRisk};
 
 /// Short timeout for the outbound coord expectations GET. This is on the
@@ -106,29 +105,32 @@ struct ExpectationsResponse {
     expectations: Vec<PredictedSignature>,
 }
 
-/// Fetch state-conditioned expectations from coord for `(action_kind,
-/// state_ids)`. Best-effort + fail-open: returns an EMPTY `Vec` on any failure
-/// (unresolved coord base, network, non-2xx, parse) after a single
-/// `debug!`/`warn!`. NEVER blocks beyond `EXPECTATIONS_TIMEOUT_SECS`, NEVER
-/// panics. Safe to `await` directly on the synchronous ACK path.
+/// Fetch state-conditioned expectations from the coord at `base` for
+/// `(action_kind, state_ids)`. `base` comes from
+/// [`crate::dev_action::ingest::coord_base`]; `None` makes no request.
+/// Best-effort and fail-open: returns an EMPTY `Vec` on any failure (no base,
+/// network, non-2xx, parse) after a single `debug!`/`warn!`. NEVER blocks beyond
+/// `EXPECTATIONS_TIMEOUT_SECS`, NEVER panics. Safe to `await` directly on the
+/// synchronous ACK path.
 ///
 /// `action_kind` is the `ActionKind::as_str()` value (`"restart" | "spawn" |
 /// "build"`); `state_ids` are the canonical SCREAMING_SNAKE active-state ids
 /// (the same `states_active` already stamped into the ACK). It takes no
 /// `top_k`: `expectations_url` always asks for [`RISK_FETCH_TOP_K`] rows.
-pub async fn fetch_expectations(action_kind: &str, state_ids: &[&str]) -> Vec<PredictedSignature> {
-    let base = match coord_http_base() {
-        Some(b) => b,
-        None => {
-            debug!(
-                "dev_action::expectations: coord base unresolved (no COORD_HTTP_URL / \
-                 profiles.json coord_url) — returning empty predicted set for kind={action_kind}"
-            );
-            return Vec::new();
-        }
+pub async fn fetch_expectations(
+    base: Option<&str>,
+    action_kind: &str,
+    state_ids: &[&str],
+) -> Vec<PredictedSignature> {
+    let Some(base) = base else {
+        debug!(
+            "dev_action::expectations: no coord base — returning empty predicted set for \
+             kind={action_kind}"
+        );
+        return Vec::new();
     };
 
-    let url = expectations_url(&base, action_kind, state_ids);
+    let url = expectations_url(base, action_kind, state_ids);
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(EXPECTATIONS_TIMEOUT_SECS))
