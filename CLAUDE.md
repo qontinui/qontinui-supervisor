@@ -1588,12 +1588,13 @@ and the attribution watcher's snapshot POST, all resolved by
 `Ignore` under `cfg(test)`, which makes no request and reads none of the
 environment, `profiles.json` or `machine.json`; `At(<url>)` is how a test plants
 rows (`dev_action::test_support::serve_planted_expectations`). It replaced a
-`cfg!(test)` return in the POST that an integration test never compiled and that
+`cfg!(test)` return in the POST that an integration test never took and that
 left the read open, so `restart_runner`'s `use_lkg: None` branch could turn on
 production rows (coord finding `ab7c97d7`). An integration test names `Ignore` in
 its struct literal, and `config::tests::no_test_config_reads_the_ambient_coord`
-fails on any config outside `from_args` that names `Read`. It covers these paths
-only. `fleet::coord_http_base`, which ignores `COORD_HTTP_URL`, and the other
+fails on an `ambient_coord` field set to `Read` outside `from_args` (a source scan
+of field and binding forms, so a value passed through a local is not caught). It
+covers these paths only. `fleet::coord_http_base`, which ignores `COORD_HTTP_URL`, and the other
 coord resolvers have no such switch.
 
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An

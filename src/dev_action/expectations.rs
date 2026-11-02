@@ -45,7 +45,20 @@ use crate::dev_action::policy::{assess_action_risk, ActionRisk};
 /// Short timeout for the outbound coord expectations GET. This is on the
 /// synchronous ACK path, so it MUST be short — 2s, far below the 5s ingest
 /// budget (ingest runs off the green path, this does not).
+#[cfg(not(test))]
 const EXPECTATIONS_TIMEOUT_SECS: u64 = 2;
+
+#[cfg(not(test))]
+fn expectations_timeout() -> Duration {
+    Duration::from_secs(EXPECTATIONS_TIMEOUT_SECS)
+}
+
+/// A test's coord is a planted loopback listener, so the ACK-path budget would
+/// measure the box's load rather than the code.
+#[cfg(test)]
+fn expectations_timeout() -> Duration {
+    crate::test_clock::poll_budget(Duration::from_secs(30))
+}
 
 /// `top_k` for the fetch the risk assessment reads: coord's ceiling (its
 /// `MAX_SERVED_ROWS`). coord ranks rows by its pooled `posterior_mean` before
@@ -133,7 +146,7 @@ pub async fn fetch_expectations(
     let url = expectations_url(base, action_kind, state_ids);
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(EXPECTATIONS_TIMEOUT_SECS))
+        .timeout(expectations_timeout())
         .build()
     {
         Ok(c) => c,
