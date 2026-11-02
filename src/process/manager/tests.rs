@@ -4294,6 +4294,85 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
     }
 }
 
+/// Every start a dev action asks for names that action, or the attribution
+/// watcher reads no boot for it and the window closes clean. Pinned at source
+/// level: no unit test can reach a recorded spawn through these routes (#253).
+#[test]
+fn every_minted_start_names_its_action() {
+    let squeezed = |parts: &[&str]| -> String {
+        let path = parts.iter().fold(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
+            |dir, part| dir.join(part),
+        );
+        let src = std::fs::read_to_string(&path)
+            .expect("read the source")
+            .replace("\r\n", "\n");
+        crate::source_scan::production_span(&src)
+            .split_whitespace()
+            .collect()
+    };
+    let calls = |src: &str, call: &str| -> Vec<String> {
+        src.split(call)
+            .skip(1)
+            .map(|rest| rest.split(".await").next().unwrap_or(rest).to_string())
+            .collect()
+    };
+
+    // rebuild_when_idle, the detached restart and the synchronous restart.
+    let restarts = calls(
+        &squeezed(&["src", "routes", "runner.rs"]),
+        "manager::restart_runner(",
+    );
+    assert_eq!(restarts.len(), 3, "{restarts:?}");
+    for call in &restarts {
+        assert!(
+            call.contains(".action_id),"),
+            "a restart names no action: {call}"
+        );
+    }
+    // spawn-test and spawn-named.
+    let spawns = calls(
+        &squeezed(&["src", "routes", "runners.rs"]),
+        "manager::start_managed_runner(",
+    );
+    assert_eq!(spawns.len(), 2, "{spawns:?}");
+    for call in &spawns {
+        assert!(
+            call.contains("Some(action_id)"),
+            "a spawn names no action: {call}"
+        );
+    }
+    // The threading between the restart routes and the start.
+    let manager = squeezed(&["src", "process", "manager.rs"]);
+    for (sig, call, arg) in [
+        (
+            "pub async fn restart_runner(",
+            "restart_runner_by_id(",
+            "initiated_by,)",
+        ),
+        (
+            "pub async fn restart_runner_by_id(",
+            "restart_after_gate(",
+            "initiated_by,)",
+        ),
+        (
+            "async fn restart_after_gate(",
+            "start_managed_runner(",
+            "initiated_by)",
+        ),
+    ] {
+        let sig: String = sig.split_whitespace().collect();
+        let body = &manager[manager.find(&sig).unwrap_or_else(|| panic!("{sig} exists"))..];
+        let body = body.split_once('{').expect("a body").1;
+        let threaded = calls(body, call);
+        assert!(
+            threaded.first().is_some_and(|args| args.contains(arg)),
+            "{sig} does not thread the initiating action into {call}: {:?}",
+            threaded.first()
+        );
+    }
+}
+
 /// The wire `watchdog` source is still refused for a non-temp runner, and
 /// the refusal happens BEFORE anything is latched or emitted.
 #[tokio::test]
