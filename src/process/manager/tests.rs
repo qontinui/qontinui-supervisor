@@ -4139,8 +4139,11 @@ async fn a_stop_waits_for_a_start_to_record_its_spawn() {
     );
     tokio::time::resume();
 
-    // What the start records while the stop waits.
-    let (child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
+    // What the start records while the stop waits. Its stdin stays open past the
+    // stop, because the monitor's wait would otherwise close it and end the child
+    // with no help from the stop.
+    let (mut child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
+    let _stdin = child.stdin.take().expect("the child's stdin");
     let spawned_at = record_spawn_in_registry(&managed, Some(pid), None, None).await;
     let monitor = tokio::spawn(monitor_runner_process_exit_inner(
         state.clone(),
