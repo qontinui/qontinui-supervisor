@@ -1811,19 +1811,15 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             // One runner's starts, stops and this sweep are ordered by its
             // lifecycle lock, held from here through the removal below. The
             // sweep never waits for it: a runner a start or a stop holds is
-            // left for the next sweep. And `runners` is a snapshot, so a stop
-            // this loop waited behind may have removed this entry, and a new
-            // spawn may hold its port by now.
-            let Ok(_lifecycle) = managed.lifecycle.try_lock() else {
+            // left for the next sweep.
+            let Some(_lifecycle) = try_lock_registered(&state, managed).await else {
                 debug!(
-                    "reaper: skipping temp runner '{}' — a start or a stop holds it",
+                    "reaper: skipping temp runner '{}' — a start or a stop holds it, or it \
+                     is gone",
                     managed.config.id
                 );
                 continue;
             };
-            if !is_registered(&state, managed).await {
-                continue;
-            }
             // Max-age bound. Measured from when the runner actually STARTED,
             // not from when `spawn-test` reserved its placeholder — see
             // `resolve_temp_runner_age`. A cold `spawn-test {rebuild:true}`
@@ -2288,7 +2284,7 @@ pub async fn start_runner_by_id(
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
-    start_managed_runner(state, &managed, None).await
+    start_managed_runner(state, &managed, None, StartAs::Registered).await
 }
 
 /// Whether the registry still holds this very entry under its id. A caller
@@ -2302,14 +2298,43 @@ async fn is_registered(state: &SharedState, managed: &Arc<ManagedRunner>) -> boo
         .is_some_and(|current| Arc::ptr_eq(&current, managed))
 }
 
+/// The lifecycle lock for a caller that removes a runner and must not wait for
+/// it, as the sweeps and `DELETE /runners/{id}` must not. `None` when a start or
+/// a stop holds it, or when the registry no longer holds this entry: such a
+/// caller often works from a snapshot, so a later spawn may hold its port by now.
+pub(crate) async fn try_lock_registered<'a>(
+    state: &SharedState,
+    managed: &'a Arc<ManagedRunner>,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    let guard = managed.lifecycle.try_lock().ok()?;
+    is_registered(state, managed).await.then_some(guard)
+}
+
+/// What a start must still find once it holds the runner's lifecycle lock. It
+/// may have waited there behind a stop or a teardown, so what its caller decided
+/// before the wait can be out of date, and only the caller knows what it asked.
+#[derive(Clone, Copy, Debug)]
+pub enum StartAs {
+    /// Proceed only while the registry still holds this entry. A start queued
+    /// behind a `test-*` teardown must not spawn into the root it reaped.
+    Registered,
+    /// The start half of a restart. Its own stop removes a `test-*` entry, so
+    /// this start puts it back.
+    Restart,
+    /// The crash watchdog answering the exit of the spawn recorded at
+    /// `exited_spawned_at`. Proceed only while that is still the runner's spawn
+    /// and no stop has latched.
+    AfterCrash {
+        exited_spawned_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
 /// Start a runner given a direct `Arc<ManagedRunner>` reference.
 ///
 /// Used by `spawn_test` / `spawn_named` to avoid a re-lookup race: the
-/// registry insertion and the start must use the same ManagedRunner, even if
-/// another task concurrently removes the id from the map. If the id is
-/// missing from the registry when we start (which shouldn't normally happen,
-/// but has been observed as a transient 404 under load), we re-insert the Arc
-/// so downstream health / monitoring can find it by id.
+/// registry insertion and the start must use the same ManagedRunner. What
+/// happens when the id has gone from the registry by the time this start holds
+/// the lifecycle lock is `start_as`'s to say.
 ///
 /// `initiated_by` is the dev action this start belongs to, recorded on the
 /// spawn's ring entry (`SpawnMarker::initiated_by`). `None` for a start nothing
@@ -2318,6 +2343,7 @@ pub async fn start_managed_runner(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
     initiated_by: Option<uuid::Uuid>,
+    start_as: StartAs,
 ) -> Result<(), SupervisorError> {
     // With the parallel build pool, a concurrent build on one slot does not
     // prevent us from starting a runner from a previously-built exe in
@@ -2328,25 +2354,43 @@ pub async fn start_managed_runner(
     let runner_id = managed.config.id.clone();
 
     // Ordered against this runner's stops and the max-age sweep, from before
-    // the re-insert below through recording the spawn and spawning its exit
-    // monitor. Before the re-insert, because a start that re-inserted first
-    // could then wait behind a `test-*` stop that removes the entry and reaps
-    // its dirs, and spawn a process absent from the registry. A stop that
-    // arrives mid-start latches after the spawn is recorded and targets it; a
-    // second start finds that spawn below. See `ManagedRunner::lifecycle`.
+    // the checks below through recording the spawn and spawning its exit monitor.
+    // A stop that arrives mid-start latches after the spawn is recorded and
+    // targets it; a second start finds that spawn below. Before the re-insert,
+    // because a restart that re-inserted first could then wait behind a `test-*`
+    // stop that removes the entry and reaps its dirs, and spawn a process absent
+    // from the registry. See `ManagedRunner::lifecycle`.
     let _lifecycle = managed.lifecycle.lock().await;
 
-    // Defensive re-insertion: if something removed our id between placeholder
-    // insertion and start, put it back. This fixes the ~1-in-10 spawn-test
-    // 404 "Runner not found" race observed in smoke tests. Using `entry` +
-    // `or_insert` instead of unconditional insert preserves any other Arc
-    // that may have replaced ours (so we don't clobber a different managed
-    // runner sharing the same id, which would itself indicate a bug).
-    {
-        let mut runners = state.runners.write().await;
-        runners
-            .entry(runner_id.clone())
-            .or_insert_with(|| managed.clone());
+    match start_as {
+        StartAs::Registered => {
+            if !is_registered(state, managed).await {
+                return Err(SupervisorError::RunnerNotFound(runner_id));
+            }
+        }
+        // `entry` + `or_insert` rather than an unconditional insert preserves
+        // any other Arc that replaced ours, which would itself indicate a bug.
+        StartAs::Restart => {
+            let mut runners = state.runners.write().await;
+            runners
+                .entry(runner_id.clone())
+                .or_insert_with(|| managed.clone());
+        }
+        StartAs::AfterCrash { exited_spawned_at } => {
+            let runner = managed.runner.read().await;
+            if crash_restart_backoff_skips(
+                runner.running,
+                runner.stop_requested,
+                runner.started_at,
+                exited_spawned_at,
+            ) {
+                return Err(SupervisorError::StartSuperseded(format!(
+                    "runner '{runner_id}' changed while this start waited (running={}, \
+                     stop_requested={}, started_at={:?}, exited spawn={exited_spawned_at})",
+                    runner.running, runner.stop_requested, runner.started_at
+                )));
+            }
+        }
     }
 
     // `running` alone misses a primary still booting: the health cache lowers it
@@ -2604,11 +2648,19 @@ fn newest_spawn_is_up(
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     spawns: &crate::state::SpawnRing,
 ) -> bool {
-    spawns.newest().is_some_and(|spawn| {
-        started_at == Some(spawn.spawned_at)
-            && spawn.exited_at.is_none()
-            && spawn.pid.is_some_and(crate::process::proc_kill::pid_alive)
-    })
+    pid_of_newest_spawn_if_up(started_at, spawns).is_some()
+}
+
+/// The pid behind [`newest_spawn_is_up`].
+fn pid_of_newest_spawn_if_up(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    spawns: &crate::state::SpawnRing,
+) -> Option<u32> {
+    let spawn = spawns.newest()?;
+    (started_at == Some(spawn.spawned_at) && spawn.exited_at.is_none())
+        .then_some(spawn.pid)
+        .flatten()
+        .filter(|pid| crate::process::proc_kill::pid_alive(*pid))
 }
 
 /// Record a spawn on the runner's registry entry: its pid and start time,
@@ -4232,6 +4284,13 @@ async fn emit_serving_event(
             detail: detail.clone(),
         });
 
+    // A test drives `maybe_serving_restart` directly, and this would post its
+    // alert to whatever coord the box's profile names, which is production on
+    // the operator box.
+    if cfg!(test) {
+        return;
+    }
+
     let notice = crate::fleet::ServingWatchdogNotice {
         runner_id: runner_id.to_string(),
         event,
@@ -4291,17 +4350,31 @@ pub async fn maybe_serving_restart(
     };
     let adopted = runner_is_adopted(pid, &*managed.recent_spawns.read().await);
 
-    // Design decision 4: an ADOPTED runner that holds its port and has NEVER
-    // answered reads `Unknown` forever (adoption stamps `running`/`pid` from a
-    // port probe and never stamps `last_seen_responding_at`). That shape is
-    // occurrence 1's, and it is never restarted — the supervisor cannot back
-    // the classification — but it is never SILENT again either.
+    // Design decision 4: a runner that holds its port and has NEVER answered
+    // reads `Unknown` forever (adoption stamps `running`/`pid` from a port probe
+    // and never stamps `last_seen_responding_at`, and a spawn the first-healthy
+    // watchdog could not kill stays there too). That shape is occurrence 1's, and
+    // it is never restarted — the supervisor cannot back the classification — but
+    // it is never SILENT again either.
     if matches!(liveness, crate::state::RunnerLiveness::Unknown) {
-        if adopted && should_alert {
+        if should_alert {
+            let (whose, event, detail) = if adopted {
+                (
+                    format!("adopted runner '{runner_name}'"),
+                    ServingEvent::NeverAnsweredSinceAdoption,
+                    "never-answered-since-adoption",
+                )
+            } else {
+                (
+                    format!("runner '{runner_name}', which this supervisor started,"),
+                    ServingEvent::NeverAnsweredSinceSpawn,
+                    "never-answered-since-spawn",
+                )
+            };
             let msg = format!(
-                "serving watchdog: adopted runner '{runner_name}' (port {port}, pid {pid:?}) \
-                 holds its port and has NEVER answered its HTTP API. Alerting, not restarting — \
-                 the supervisor cannot classify this as a wedge, so it will not act on it."
+                "serving watchdog: {whose} (port {port}, pid {pid:?}) holds its port and has \
+                 NEVER answered its HTTP API. Alerting, not restarting — the supervisor cannot \
+                 classify this as a wedge, so it will not act on it."
             );
             warn!("{}", msg);
             state
@@ -4314,9 +4387,9 @@ pub async fn maybe_serving_restart(
                 port,
                 pid,
                 silent_for_secs,
-                ServingEvent::NeverAnsweredSinceAdoption,
+                event,
                 None,
-                Some("never-answered-since-adoption".to_string()),
+                Some(detail.to_string()),
             )
             .await;
         }
@@ -4628,11 +4701,17 @@ fn crash_restart_backoff_skips(
 }
 
 /// Whether the runner's current process is one this supervisor did not spawn:
-/// the registry's pid is not the newest spawn's. A runner with no spawn yet is
-/// adopted or has never started. A pid the health cache cleared from a booting
-/// primary reads as adopted too, until PID recovery restores it.
+/// it has no spawn yet, or the registry names a pid that is not the newest
+/// spawn's. A cleared pid says neither: the health cache clears a booting
+/// primary's, and PID recovery is Windows-only, so off Windows it stays cleared
+/// for that process's life and must not turn a spawned runner into an adopted
+/// one.
 fn runner_is_adopted(registry_pid: Option<u32>, spawns: &crate::state::SpawnRing) -> bool {
-    spawns.newest().map(|spawn| spawn.pid) != Some(registry_pid)
+    match (spawns.newest(), registry_pid) {
+        (None, _) => true,
+        (Some(spawn), Some(pid)) => spawn.pid != Some(pid),
+        (Some(_), None) => false,
+    }
 }
 
 /// Crash-only ambient watchdog hook, called by `monitor_runner_process_exit`
@@ -4706,10 +4785,9 @@ async fn maybe_crash_restart(
 
                 // Re-check intent right before starting: the operator may
                 // have stopped, started, or disabled the runner during the
-                // backoff window. A start running right now holds the
-                // lifecycle lock and has not written `started_at` yet, so this
-                // passes, and `start_runner_by_id` below waits for that lock
-                // and then finds that start's spawn.
+                // backoff window. The start below re-checks once it holds the
+                // lifecycle lock: a start or a stop running right now holds that
+                // lock, and has not written what this reads yet.
                 {
                     let runner = managed.runner.read().await;
                     if crash_restart_backoff_skips(
@@ -4752,7 +4830,8 @@ async fn maybe_crash_restart(
                         rebuild: false,
                     });
                 let started = std::time::Instant::now();
-                match start_runner_by_id(&state, &runner_id).await {
+                let start_as = StartAs::AfterCrash { exited_spawned_at };
+                match start_managed_runner(&state, &managed, None, start_as).await {
                     Ok(()) => {
                         let msg = format!(
                             "crash-only watchdog restarted runner '{}' (attempt {}/{})",
@@ -4771,6 +4850,17 @@ async fn maybe_crash_restart(
                                 build_duration_secs: None,
                             },
                         );
+                    }
+                    Err(SupervisorError::StartSuperseded(why)) => {
+                        info!("crash-only watchdog: not restarting: {why}");
+                        state
+                            .diagnostics
+                            .write()
+                            .await
+                            .emit(DiagnosticEventKind::RestartFailed {
+                                source: RestartSource::Watchdog,
+                                error: why,
+                            });
                     }
                     Err(e) => {
                         let msg = format!(
@@ -5129,15 +5219,22 @@ async fn monitor_runner_process_exit_inner(
     // crash — the process is gone and we can't prove it exited cleanly. The
     // hook reads the latch whatever the stamp above kept: a stop latched just
     // after an exit still means the operator was stopping this runner anyway.
+    //
+    // Only the current spawn's exit reaches it. Another spawn or a stop's reset
+    // has replaced this one, so this exit is no crash of the runner, and what
+    // the latch says belongs to that later start. It must not warn "crashed" or
+    // take a crash-loop budget slot, since one exit too many disarms the arm.
     let clean_exit = exit_status.map(|s| s.success()).unwrap_or(false);
-    maybe_crash_restart(
-        &state,
-        &managed,
-        stop_requested_at_exit,
-        clean_exit,
-        spawned_at,
-    )
-    .await;
+    if is_current_spawn {
+        maybe_crash_restart(
+            &state,
+            &managed,
+            stop_requested_at_exit,
+            clean_exit,
+            spawned_at,
+        )
+        .await;
+    }
 }
 
 /// Look for `<panic_log_dir>/runner-panic.log`; if it exists and its
@@ -5562,9 +5659,16 @@ pub async fn stop_runner_by_id(
     // For an ADOPTED runner there is no monitor task and no Child at all, and
     // the stored PID can be None indefinitely — so (b) is resolved below from
     // three independent sources rather than read straight out of the registry.
+    //
+    // A pid the health cache cleared from a primary still booting is still in the
+    // newest spawn's ring entry. Without it this stop could find no target, confirm
+    // on the free port, and leave that process running beside the next start.
     let registry_pid = {
         let runner = managed.runner.read().await;
-        runner.pid
+        let spawns = managed.recent_spawns.read().await;
+        runner
+            .pid
+            .or_else(|| pid_of_newest_spawn_if_up(runner.started_at, &spawns))
     };
 
     // Ledger of what this stop ACTUALLY does, so a failure can say which rungs
@@ -6049,8 +6153,18 @@ pub fn automated_restart_blocked(is_temp: bool, source: &RestartSource) -> bool 
 /// port-level fact the liveness classifier derives `UnresponsiveSince` from).
 /// `stop_runner_by_id` already copes with a runner it has no `Child` for; this
 /// predicate is what gets it *reached*.
-pub fn restart_should_stop(running: bool, pid: Option<u32>, port_open: bool) -> bool {
-    running || pid.is_some() || port_open
+///
+/// `newest_spawn_up` ([`newest_spawn_is_up`]) is the fourth signal. A primary
+/// booting or wedged before it binds has all three of the others false, since
+/// the health cache clears `running` and `pid` and its port is closed, and the
+/// start then refuses it as already running for as long as it lives.
+pub fn restart_should_stop(
+    running: bool,
+    pid: Option<u32>,
+    port_open: bool,
+    newest_spawn_up: bool,
+) -> bool {
+    running || pid.is_some() || port_open || newest_spawn_up
 }
 
 /// Pure half of [`refuse_if_port_held_by_live_runner`]: refuse only on
@@ -6453,17 +6567,22 @@ async fn restart_after_gate(
     // The port-level fact comes from the per-runner `CachedPortHealth`
     // (`managed.cached_health`), the same snapshot the liveness classifier
     // reads — never from the SSE `CachedRunnerHealth` vector.
-    let (running, pid) = {
+    let (running, pid, newest_spawn_up) = {
         let runner = managed.runner.read().await;
-        (runner.running, runner.pid)
+        let spawns = managed.recent_spawns.read().await;
+        (
+            runner.running,
+            runner.pid,
+            newest_spawn_is_up(runner.started_at, &spawns),
+        )
     };
     let port_open = managed.cached_health.read().await.runner_port_open;
-    if restart_should_stop(running, pid, port_open) {
+    if restart_should_stop(running, pid, port_open, newest_spawn_up) {
         if !running {
             info!(
-                "Restart of runner '{}': tracked running=false but pid={:?}, port_open={} — \
-                 stopping the live process before starting (S2 guard)",
-                runner_id, pid, port_open
+                "Restart of runner '{}': tracked running=false but pid={:?}, port_open={}, \
+                 newest_spawn_up={} — stopping the live process before starting (S2 guard)",
+                runner_id, pid, port_open, newest_spawn_up
             );
         }
         // `force: true` — NOT a bypass. The readiness verdict was already
@@ -6508,7 +6627,7 @@ async fn restart_after_gate(
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
-    start_managed_runner(state, managed, initiated_by).await?;
+    start_managed_runner(state, managed, initiated_by, StartAs::Restart).await?;
 
     Ok(build_duration)
 }
@@ -6637,7 +6756,7 @@ pub async fn rebuild_and_restart_by_id(
 
     // Step 3: start.
     let started_at = chrono::Utc::now();
-    start_managed_runner(state, &managed, None).await?;
+    start_managed_runner(state, &managed, None, StartAs::Restart).await?;
     state
         .logs
         .emit(

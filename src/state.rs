@@ -153,13 +153,14 @@ pub struct ManagedRunner {
     /// `Drop` on every exit path, including a cancelled future. Never held
     /// across an `.await`.
     pub spawn_in_flight: std::sync::Mutex<Option<std::time::Duration>>,
-    /// Orders this runner's starts, stops and max-age sweep against each other.
+    /// Orders this runner's starts, stops and removals against each other.
     ///
     /// `start_managed_runner` holds it from before its defensive re-insert
     /// through recording the spawn and spawning that spawn's exit monitor.
     /// `stop_runner_by_id` holds it from its latch through its reset and a
-    /// `test-*` runner's teardown. `reap_stale_test_runners` `try_lock`s it per
-    /// runner, skips on contention and holds it through the removal.
+    /// `test-*` runner's teardown. `reap_stale_test_runners`, the purge-stale
+    /// sweep and `DELETE /runners/{id}` `try_lock` it, skip or refuse on contention
+    /// and hold it through the removal.
     ///
     /// Not reentrant, so nothing holding it may call a start or a stop:
     /// `restart_after_gate` holds it around neither of its two calls. The exit

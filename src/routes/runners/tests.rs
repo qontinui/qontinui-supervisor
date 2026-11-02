@@ -3270,9 +3270,7 @@ async fn a_live_process_that_never_answers_reaches_the_unresponsive_arm() {
 
     let (config, _root) = crate::config::config_over_an_empty_runner_tree();
     let state: crate::state::SharedState = Arc::new(crate::state::SupervisorState::new(config));
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = probe.local_addr().unwrap().port();
-    drop(probe);
+    let dead_port = crate::test_ports::reserve_refused_port();
     let id = "named-never-answers";
     let mut config = crate::config::RunnerConfig::default_primary();
     config.id = id.to_string();
@@ -3301,6 +3299,77 @@ async fn a_live_process_that_never_answers_reaches_the_unresponsive_arm() {
             }
             ProbeOutcome::Healthy { .. } => panic!("nothing answers on port {dead_port}"),
         }
+    }
+}
+
+/// `DELETE /runners/{id}` and the purge-stale sweep never wait for a runner's
+/// lifecycle lock. Mid-start the entry reads as a stopped placeholder, so
+/// removing it would leave the start to spawn a process absent from the
+/// registry. Both leave it alone; once nothing holds the lock, both remove it.
+#[tokio::test]
+async fn a_runner_a_start_holds_is_neither_deleted_nor_purged() {
+    use axum::response::IntoResponse;
+
+    for (id, kind) in [
+        (
+            "named-held",
+            qontinui_types::wire::runner_kind::RunnerKind::Named {
+                name: "named-held".to_string(),
+            },
+        ),
+        (
+            "test-held",
+            qontinui_types::wire::runner_kind::RunnerKind::Temp {
+                id: "test-held".to_string(),
+            },
+        ),
+    ] {
+        let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+        let state: crate::state::SharedState = Arc::new(crate::state::SupervisorState::new(config));
+        let mut runner = crate::config::RunnerConfig::default_primary();
+        runner.id = id.to_string();
+        runner.name = id.to_string();
+        runner.port = crate::test_ports::reserve_refused_port();
+        runner.kind = kind;
+        let managed = Arc::new(crate::state::ManagedRunner::new(runner, false));
+        state
+            .runners
+            .write()
+            .await
+            .insert(id.to_string(), managed.clone());
+
+        let remove = || {
+            super::remove_runner(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(id.to_string()),
+            )
+        };
+        let start = managed.lifecycle.lock().await;
+        let err = match remove().await {
+            Ok(_) => panic!("{id}: DELETE removed a runner a start holds"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::CONFLICT,
+            "{id}"
+        );
+        assert!(
+            super::purge_stale_test_runners_core(&state, false, None)
+                .await
+                .is_empty(),
+            "{id}: the purge removed a runner a start holds"
+        );
+        assert!(state.get_runner(id).await.is_some(), "{id}: it was removed");
+        drop(start);
+
+        if id.starts_with("test-") {
+            let purged = super::purge_stale_test_runners_core(&state, false, None).await;
+            assert_eq!(purged.len(), 1, "{id}: nothing holds it now");
+        } else {
+            assert!(remove().await.is_ok(), "{id}: nothing holds it now");
+        }
+        assert!(state.get_runner(id).await.is_none(), "{id}: it stayed");
     }
 }
 

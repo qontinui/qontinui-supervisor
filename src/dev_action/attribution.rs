@@ -350,7 +350,7 @@ impl ClosedWindow {
 ///   the close, such as the one spawn-test's failed probe stored, which a
 ///   clean exit leaves in place.
 /// - The lifecycle lock (`ManagedRunner::lifecycle`) orders one runner's starts,
-///   stops and max-age sweep, so a stop arriving mid-start latches after the
+///   stops and removals, so a stop arriving mid-start latches after the
 ///   spawn is recorded and targets it, and a second start finds it recorded. The
 ///   exit monitor waits outside that lock, which leaves two lags in the stamp
 ///   this rule reads (`SpawnMarker::stop_requested_at`). A stop latched between
@@ -359,9 +359,8 @@ impl ClosedWindow {
 ///   does not count. A monitor that wakes after a later start recorded its spawn
 ///   reads that start's cleared flag, so the requested exit it stamps reads as
 ///   unrequested: the stopped spawn reads as a failed boot and its in-window
-///   panics count, under `Ran` too. `DELETE /runners/{id}` and the purge-stale
-///   sweep remove registry entries outside the lock. These are read from the
-///   code; none was reproduced on a running supervisor.
+///   panics count, under `Ran` too. These are read from the code; none was
+///   reproduced on a running supervisor.
 fn is_startup_panic_of(
     panic: &panic_log::RecentPanic,
     spawn: &SpawnMarker,

@@ -678,8 +678,7 @@ impl EnvForwarder for WindowPositionEnv {
             let runner_name = runner.config.name.as_str();
 
             // Count existing test-* runners EXCLUDING the one we're about to spawn.
-            // `start_managed_runner` pre-inserts the new runner into `state.runners`
-            // (defensive re-insertion against the spawn-test 404 race), so a naive
+            // The new runner is already in `state.runners` when it starts, so a naive
             // count would include the runner-to-be and shift every spawn one index
             // off — the first temp would land on index 1 instead of 0.
             let runners = state.runners.read().await;

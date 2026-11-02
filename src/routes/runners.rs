@@ -983,6 +983,12 @@ pub async fn remove_runner(
         ));
     }
 
+    // Held through the teardown below. Mid-start, `running` still reads false, so
+    // this would otherwise remove the entry of a process about to be spawned.
+    let Some(_lifecycle) = manager::try_lock_registered(&state, &managed).await else {
+        return Err(SupervisorError::RunnerLifecycleBusy(id));
+    };
+
     {
         let runner = managed.runner.read().await;
         if runner.running {
@@ -1153,6 +1159,18 @@ pub async fn purge_stale_test_runners_core(
                 continue;
             }
         }
+        // Ordered against this runner's starts and stops, through the removal
+        // below, as the max-age sweep is. Never waits: a runner a start or a stop
+        // holds is left for the next purge. `runners` is a snapshot, so this also
+        // skips an entry something removed since.
+        let Some(_lifecycle) = manager::try_lock_registered(state, managed).await else {
+            tracing::debug!(
+                "purge-stale: skipping temp runner '{}' — a start or a stop holds it, or it \
+                 is gone",
+                managed.config.id
+            );
+            continue;
+        };
         let is_running = {
             let runner = managed.runner.read().await;
             runner.running
@@ -4412,9 +4430,16 @@ async fn execute_spawn_build_inner(
     // the id-based lookup in `start_runner_by_id` which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
     // spawn's failed health probe, the reaper).
-    // `start_managed_runner` also re-inserts the Arc if the id went missing,
-    // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed, Some(action_id)).await {
+    // A start that finds the id gone by the time it holds the lifecycle lock
+    // fails `RunnerNotFound`: something tore this runner down.
+    if let Err(e) = manager::start_managed_runner(
+        state,
+        managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
         // Clean up on failure — the registry entry AND the instance dir the
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
@@ -5717,7 +5742,14 @@ pub async fn spawn_named(
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed, Some(action_id)).await {
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);

@@ -1523,9 +1523,10 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
 
-    const ALL_EVENTS: [ServingEvent; 6] = [
+    const ALL_EVENTS: [ServingEvent; 7] = [
         ServingEvent::Threshold,
         ServingEvent::NeverAnsweredSinceAdoption,
+        ServingEvent::NeverAnsweredSinceSpawn,
         ServingEvent::RestartTaken,
         ServingEvent::RestartRefusedSessionsLive,
         ServingEvent::RestartFailed,
