@@ -545,7 +545,8 @@ mod tests {
     }
 
     /// The ring's pid comes after the registry's and before the probes, which
-    /// are less specific. It is a candidate, not the registry's own record.
+    /// are less specific. The OS can have reused it, so unlike the registry's own
+    /// record it is held to the image check.
     #[test]
     fn a_ring_pid_outranks_the_probes_and_is_held_to_the_image_check() {
         assert_eq!(

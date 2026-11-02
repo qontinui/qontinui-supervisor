@@ -4401,6 +4401,14 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         );
     }
 
+    // The ring pid's two rules are table-tested as pure functions, so pin their calls.
+    for call in [
+        "publishes_discovered_pid(source)",
+        "source_names_the_spawn(source)",
+    ] {
+        assert!(stop.contains(call), "the stop must call {call}");
+    }
+
     // The DELETE route and the purge bind their guard by name, so a `let Some(_)`
     // that dropped it at once fails here.
     let routes = std::fs::read_to_string(
@@ -4421,9 +4429,8 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
 
 /// Every start a dev action asks for names that action, or the attribution
 /// watcher reads no boot for it and the window closes clean. Pinned at source
-/// level: a stub exe gets `start_managed_runner` to a recorded spawn, but a route
-/// test would mint first, and until the dev-action coord client is a config switch
-/// a mint reads whatever coord the box's profile names.
+/// level: a stub exe gets `start_managed_runner` to a recorded spawn at manager
+/// level, and a route test through one is yet to be built.
 #[test]
 fn every_minted_start_names_its_action() {
     let squeezed = |parts: &[&str]| -> String {

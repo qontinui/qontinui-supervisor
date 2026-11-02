@@ -5406,8 +5406,8 @@ pub(crate) fn publishes_discovered_pid(source: &PidSource) -> bool {
     !matches!(source, PidSource::SpawnRing)
 }
 
-/// Pick the graceful-exit signal. `pid_from_registry` says whether `pid` came
-/// from the registry (exact) or from a probe (a candidate). A handoff with no
+/// Pick the graceful-exit signal. `pid_names_the_spawn` says whether `pid` is the
+/// spawn's own (see [`source_names_the_spawn`]) or a probe's candidate. A handoff with no
 /// known PID falls back to [`GracefulExitSignal::RunningFlag`], and the caller
 /// logs that it did.
 pub(crate) fn graceful_exit_signal(
