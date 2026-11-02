@@ -4718,7 +4718,7 @@ fn runner_is_adopted(registry_pid: Option<u32>, spawns: &crate::state::SpawnRing
 /// after every observed exit of a supervisor-spawned runner. Evaluates
 /// [`decide_crash_restart`], does the `WatchdogState` bookkeeping, and — for
 /// a `Restart` — spawns a detached task that waits out the backoff and
-/// funnels through [`start_runner_by_id`] (so the provenance start gate
+/// funnels through [`start_managed_runner`] (so the provenance start gate
 /// applies). Never blocks the exit monitor.
 async fn maybe_crash_restart(
     state: &SharedState,
@@ -5071,7 +5071,7 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
 /// purpose: the crash-only watchdog makes this function transitively
 /// self-referential (`start_managed_runner` spawns this monitor → the
 /// monitor calls [`maybe_crash_restart`] → which spawns a task calling
-/// [`start_runner_by_id`] → which calls `start_managed_runner`). With an
+/// `start_managed_runner`). With an
 /// opaque `async fn` future the compiler cannot resolve the cyclic hidden
 /// type; boxing at this edge makes the spawn argument inside
 /// `start_managed_runner` a concrete `Send` type and breaks the cycle.
@@ -6623,7 +6623,7 @@ async fn restart_after_gate(
     // stopping a `test-*` runner auto-removes its id from `state.runners`, so
     // `start_runner_by_id(runner_id)` would 404 with "Runner not found" even
     // though we have the full config in hand. `start_managed_runner`
-    // re-inserts the id into the registry (its defensive `or_insert`), so a
+    // re-inserts the id into the registry (`StartAs::Restart`), so a
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
