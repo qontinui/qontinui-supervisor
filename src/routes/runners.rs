@@ -17,8 +17,8 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -95,6 +95,26 @@ pub struct RestartRunnerRequest {
     /// typecheck.
     #[serde(default)]
     pub from_working_tree: bool,
+    /// Restart with the HANDOFF intent: holder-backed panes are detached and
+    /// left running for the successor runner to adopt, instead of killed. Plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D7. Defaults to `false`, which is the restart this route always did.
+    ///
+    /// With `true` the supervisor only FORWARDS the intent — the runner decides
+    /// which panes survive:
+    ///
+    /// - the close-request it POSTs carries `{"handoff":"holders"}`;
+    /// - the readiness gate reads the runner's `safe_with_handoff` instead of
+    ///   `safe_to_restart`, and refuses with
+    ///   `409 restart_refused_unsafe_for_handoff` when it is `false` OR absent
+    ///   (an older runner is UNKNOWN, never safe);
+    /// - the graceful wait before the PID kill is extended to cover the
+    ///   runner's teardown budget.
+    ///
+    /// `force` keeps its meaning under either value. Read it through
+    /// [`RestartRunnerRequest::close_intent`].
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 impl RestartRunnerRequest {
@@ -102,6 +122,11 @@ impl RestartRunnerRequest {
     /// below the wire takes.
     pub fn build_tree(&self) -> manager::BuildTree {
         manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -134,7 +159,12 @@ pub struct PurgeStaleRequest {
 /// have to combine `POST /runners/{id}/stop` + a build + `POST .../start`
 /// manually. Refuses to operate on the primary; any other registered runner
 /// is accepted.
+///
+/// Unknown fields are REJECTED (422): a misspelled `handoff` must never
+/// silently become a kill-every-pane restart. No in-repo caller sends extra
+/// keys (the dashboard has no client for this route).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildAndRestartRequest {
     /// Optional source label, recorded in diagnostic events.
     #[serde(default)]
@@ -146,6 +176,12 @@ pub struct RebuildAndRestartRequest {
     /// gate existed to give it something to override.
     #[serde(default)]
     pub force: bool,
+    /// Stop with the HANDOFF intent — same meaning as
+    /// [`RestartRunnerRequest::handoff`]: the close-request carries
+    /// `{"handoff":"holders"}`, the gate reads `safe_with_handoff` (absent
+    /// refuses), and the graceful wait is extended. Defaults to `false`.
+    #[serde(default)]
+    pub handoff: bool,
     /// If true, after starting the runner block until its `/health` returns
     /// 200 OK or `wait_timeout_secs` elapses.
     #[serde(default)]
@@ -153,6 +189,13 @@ pub struct RebuildAndRestartRequest {
     /// Maximum seconds to wait when `wait` is true. Defaults to 120s.
     #[serde(default)]
     pub wait_timeout_secs: Option<u64>,
+}
+
+impl RebuildAndRestartRequest {
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
+    }
 }
 
 fn default_source_manual() -> String {
@@ -432,7 +475,29 @@ pub(crate) fn apply_spawn_paired_state(
     }
 }
 
-/// HTTP-level wrapper around [`apply_spawn_paired_state`] that resolves the
+/// [`apply_spawn_paired_state`], gated on the subject's device identity (plan
+/// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b): a
+/// [`crate::process::instance_root::DeviceIdentity::Fresh`] subject gets NO
+/// paired state — nothing is read from `profiles_root` or `primary_dir` and
+/// nothing is written to `dest_dir` — and the report says
+/// `status: "fresh_device_identity"`. The `Harness` arm is
+/// [`apply_spawn_paired_state`] unchanged.
+pub(crate) fn apply_spawn_paired_state_for_identity(
+    identity: crate::process::instance_root::DeviceIdentity,
+    paired_profile_id: Option<&str>,
+    profiles_root: &std::path::Path,
+    primary_dir: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
+    match identity {
+        crate::process::instance_root::DeviceIdentity::Fresh => Ok(fresh_identity_paired_state()),
+        crate::process::instance_root::DeviceIdentity::Harness => {
+            apply_spawn_paired_state(paired_profile_id, profiles_root, primary_dir, dest_dir)
+        }
+    }
+}
+
+/// HTTP-level wrapper around [`apply_spawn_paired_state_for_identity`] that resolves the
 /// production roots — `~/.qontinui/profiles`, the primary's secure-storage dir
 /// ([`crate::process::primary_paired_state_dir`]) and the destination from
 /// [`crate::process::instance_config_dir`] — and surfaces failures as
@@ -451,6 +516,7 @@ pub(crate) fn apply_spawn_paired_state(
 /// An unresolvable config dir FAILS the spawn. There is deliberately no
 /// fallback to the shared dir — a silent fallback is the original bug.
 fn apply_paired_state_for_spawn(
+    identity: crate::process::instance_root::DeviceIdentity,
     paired_profile_id: Option<&str>,
     runner_id: &str,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
@@ -481,7 +547,8 @@ fn apply_paired_state_for_spawn(
         })?;
     let profiles_root = home.join(".qontinui").join("profiles");
     let primary_dir = crate::process::primary_paired_state_dir();
-    apply_spawn_paired_state(
+    apply_spawn_paired_state_for_identity(
+        identity,
         paired_profile_id,
         &profiles_root,
         primary_dir.as_deref(),
@@ -648,7 +715,7 @@ pub async fn list_runners(
         // which is the honest answer.
         let liveness = runner.liveness(cached.runner_port_open, cached.runner_responding);
 
-        result.push(json!({
+        let mut entry = json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
@@ -701,7 +768,15 @@ pub async fn list_runners(
                 "last_serving_restart_at": watchdog.last_serving_restart_at.map(|t| t.to_rfc3339()),
                 "serving_disabled_reason": watchdog.serving_disabled_reason.clone(),
             }
-        }));
+        });
+        // Phase 8b: a `fresh_device_identity` runner's own device id, read
+        // lazily from `<root>/home/machine.json` — the observable for an id
+        // minted after the spawn response was sent. Absent for every
+        // unflagged runner, whose entry is unchanged.
+        if managed.config.fresh_device_identity {
+            entry["device_identity"] = device_identity_report(&managed.config.id);
+        }
+        result.push(entry);
     }
     drop(cached_snapshots);
 
@@ -857,6 +932,7 @@ pub async fn add_runner(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
 
         // External runners are never crash-auto-restarted (the supervisor
@@ -906,6 +982,12 @@ pub async fn remove_runner(
             "Cannot remove the primary runner".to_string(),
         ));
     }
+
+    // Held through the teardown below. Mid-start, `running` still reads false, so
+    // this would otherwise remove the entry of a process about to be spawned.
+    let Some(_lifecycle) = manager::try_lock_registered(&state, &managed).await else {
+        return Err(SupervisorError::RunnerLifecycleBusy(id));
+    };
 
     {
         let runner = managed.runner.read().await;
@@ -1077,6 +1159,18 @@ pub async fn purge_stale_test_runners_core(
                 continue;
             }
         }
+        // Ordered against this runner's starts and stops, through the removal
+        // below, as the max-age sweep is. Never waits: a runner a start or a stop
+        // holds is left for the next purge. `runners` is a snapshot, so this also
+        // skips an entry something removed since.
+        let Some(_lifecycle) = manager::try_lock_registered(state, managed).await else {
+            tracing::debug!(
+                "purge-stale: skipping temp runner '{}' — a start or a stop holds it, or it \
+                 is gone",
+                managed.config.id
+            );
+            continue;
+        };
         let is_running = {
             let runner = managed.runner.read().await;
             runner.running
@@ -1233,22 +1327,33 @@ pub async fn stop_runner(
     // Capture the early-log path BEFORE stopping — for test-* runners the
     // stop also removes them from the registry, after which we can no longer
     // look up the path. We delete the file AFTER stop succeeds because the
-    // stop is the explicit "user is done diagnosing" signal.
+    // stop is the explicit "user is done diagnosing" signal. It is also the
+    // file the stopped spawn's entry names in the runner's spawn ring, which
+    // the dev-action attribution watcher reads only at a window's close: a
+    // window still open over that spawn then reads no early-log signature
+    // for it and, with no other signature, closes it `Confirmed` under `Ran`
+    // or with no run result. A residual, unchanged from 5fd1ca62, whose reach
+    // `dev_action::attribution::scan_spawn_effects` states.
     let early_log_path = if let Some(managed) = state.get_runner(&id).await {
         managed.early_log_path.read().await.clone()
     } else {
         None
     };
 
-    manager::stop_runner_by_id(&state, &id, force).await?;
+    manager::stop_runner_by_id(&state, &id, force, manager::CloseIntent::Kill).await?;
 
     // Explicit user-facing /stop is the only path that deletes the
     // early-log file. The spawn-test failed-probe cleanup path also calls
     // stop_runner_by_id, but it does NOT route through here — it goes
     // directly through the manager — so the early-log file is preserved
     // there (which is what we want for post-mortem debugging). Files for
-    // runners that died on their own and were reaped also persist. Best
-    // effort: missing-file errors are silently swallowed by delete_early_log.
+    // runners that died on their own and were reaped also persist. This
+    // route is what the dashboard's Stop (named and temp runners) and
+    // spawn-test's `stop_url` call, so the delete reaches spawn windows; a
+    // restart's, a build's or a `rebuild_when_idle`'s window is reached only
+    // by a direct `POST /runners/primary/stop`. A restart's own stop and the
+    // legacy `/runner/stop` delete nothing. Best effort: missing-file errors
+    // are silently swallowed by delete_early_log.
     if let Some(path) = early_log_path {
         crate::process::early_log::delete_early_log(&path);
     }
@@ -1305,6 +1410,7 @@ pub async fn restart_runner(
         let exec_state = state.clone();
         let force = body.force;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
         // Echoed in the 202 so the build decision is visible before the build
         // runs. `null` when the id names no registered runner: the detached
         // restart fails on it, and a label would describe a build that never
@@ -1336,6 +1442,8 @@ pub async fn restart_runner(
                     source,
                     force,
                     build_tree,
+                    intent,
+                    None,
                 )
                 .await
                 {
@@ -1389,8 +1497,17 @@ pub async fn restart_runner(
     // threaded rather than passed as a literal so both call sites say the same
     // thing, and so a future change that starts building here cannot inherit a
     // hardcoded provenance.
-    manager::restart_runner_by_id(&state, &id, false, source, body.force, body.build_tree())
-        .await?;
+    manager::restart_runner_by_id(
+        &state,
+        &id,
+        false,
+        source,
+        body.force,
+        body.build_tree(),
+        body.close_intent(),
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({
         "status": "restarted",
@@ -1962,6 +2079,26 @@ pub struct SpawnTestRequest {
     #[serde(default)]
     pub paired_profile_id: Option<String>,
 
+    /// Run the subject under its OWN device identity (plan
+    /// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b).
+    /// Default `false`, which leaves the spawn exactly as it was.
+    ///
+    /// When `true` the supervisor projects NO `machine.json` and NO paired
+    /// state into the instance root — neither the primary's
+    /// `paired_user.json` / `auth_tokens.enc` snapshot nor a
+    /// `paired_profile_id` one — and removes `QONTINUI_MACHINE_ID` from the
+    /// child env. The runner then mints a new `device_id` into
+    /// `<root>/home/machine.json` at first start, and the response's
+    /// `device_identity` block reports it (`status: "pending"` until the file
+    /// exists; `GET /runners` re-reads it lazily). The response's
+    /// `paired_state` reads `status: "fresh_device_identity"`.
+    ///
+    /// Refused with `400 fresh_device_identity_conflict` together with a
+    /// `paired_profile_id` (a snapshot IS another device's paired state) or an
+    /// `extra_env` `QONTINUI_MACHINE_ID` (which would override the minted id).
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+
     /// Optional autonomous-dev work-unit id this spawn is a *preview* for
     /// (Track 2 UI-Bridge preview-verification). Pure passthrough correlation:
     /// the supervisor stores it on the spawned `ManagedRunner` and echoes it in
@@ -2038,6 +2175,100 @@ pub struct SpawnNamedRequest {
     /// build failures short-circuit with HTTP 500 and no spawn happens.
     #[serde(default)]
     pub allow_stale_fallback: bool,
+    /// Mirror of `SpawnTestRequest::fresh_device_identity`: the named runner
+    /// runs under its own device identity (no projected `machine.json`, no
+    /// `QONTINUI_MACHINE_ID`). Persisted with the runner's config, so a later
+    /// restart never re-projects the harness's identity. `spawn-named`
+    /// projects no paired state either way.
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+    /// Additional environment variables for the named runner — same contract
+    /// as `SpawnTestRequest::extra_env` (applied last), and persisted with the
+    /// runner's settings entry like every named runner's `extra_env`. A
+    /// `DISPLAY` here satisfies the Linux display preflight.
+    ///
+    /// PERSISTED IN PLAINTEXT: unlike a temp runner's, these values are written
+    /// to the supervisor's settings file and survive restarts. Never put a
+    /// token, secret, password or JWT here.
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
+}
+
+/// Refuse a `fresh_device_identity: true` spawn whose other fields would hand
+/// the subject a device identity anyway — the two contradict, and silently
+/// dropping either side would spawn something other than what was asked for.
+///
+/// - `paired_profile_id` — a snapshot IS another device's paired state;
+/// - `extra_env` naming `QONTINUI_MACHINE_ID` — it would override the id the
+///   runner mints.
+///
+/// Returns the typed `400` body, or `None` when the request is coherent
+/// (always `None` for an unflagged request). Pure, so every arm is tested
+/// without a live `SharedState`.
+pub(crate) fn fresh_device_identity_conflict(
+    fresh_device_identity: bool,
+    paired_profile_id: Option<&str>,
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    if !fresh_device_identity {
+        return None;
+    }
+    let mut conflicts = Vec::new();
+    if paired_profile_id.is_some() {
+        conflicts.push("paired_profile_id".to_string());
+    }
+    let machine_id_env = crate::process::instance_root::MACHINE_ID_ENV;
+    // Case-insensitively: Windows env names are, so `qontinui_machine_id`
+    // would still reach the runner's `QONTINUI_MACHINE_ID` read there.
+    for key in extra_env.keys() {
+        if key.eq_ignore_ascii_case(machine_id_env) {
+            conflicts.push(format!("extra_env.{key}"));
+        }
+    }
+    if conflicts.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "error": "fresh_device_identity_conflict",
+        "conflicts_with": conflicts,
+        "message": format!(
+            "fresh_device_identity: true asks for a subject with its OWN device identity, \
+             but {} would give it another one. Send one or the other.",
+            conflicts.join(" and ")
+        ),
+    }))
+}
+
+/// The `paired_state` report of a `fresh_device_identity` spawn: nothing was
+/// projected, by request.
+fn fresh_identity_paired_state() -> serde_json::Value {
+    json!({
+        "source": "none",
+        "status": "fresh_device_identity",
+        "applied": [],
+        "message": "fresh_device_identity: no paired state was projected; the runner \
+                    starts unpaired under the device id it mints",
+    })
+}
+
+/// The `device_identity` block of a `fresh_device_identity` runner — the
+/// `device_id` it minted into `<root>/home/machine.json`, read lazily
+/// ([`crate::process::instance_root::device_identity_json`]). Emitted by the
+/// spawn responses and `GET /runners` for FLAGGED runners only.
+pub(crate) fn device_identity_report(runner_id: &str) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        Some(root) => crate::process::instance_root::device_identity_json(
+            &root.home_dir(),
+            crate::process::instance_root::harness_qontinui_dir().as_deref(),
+        ),
+        None => json!({
+            "fresh": true,
+            "status": "unknown",
+            "device_id": null,
+            "differs_from_harness": null,
+            "message": "the instance root could not be resolved",
+        }),
+    }
 }
 
 /// Paths needed to tear down a prepared spawn container on a downstream
@@ -2391,20 +2622,28 @@ async fn wait_out_queue_timeout(
 /// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
 ///
 /// Evaluates the active dev-state set, stores the record, and spawns the
-/// attribution watcher targeting the spawned runner. The early-log is read
-/// lazily via the managed runner because its path is only set during the
-/// build, after mint.
+/// attribution watcher targeting the spawned runner. The watcher reads the
+/// runner's spawn ring, and each in-window spawn's early log and panic,
+/// lazily, at window close, because the spawn records them after the mint,
+/// once the build is done. A spawn that has not launched by the time its 30 s
+/// window closes (a `rebuild: true` build) has no spawn in the window, so the
+/// watcher reads neither file for it.
 ///
 /// Returns `(action_id, states_active, predicted, risk)` for stamping into the
 /// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
 /// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
-/// is unreachable / has no history (fail-open; never blocks the spawn).
+/// is unreachable / has no history (fail-open; never blocks the spawn). It is
+/// the ACK's cut, the top five by `posterior_mean`; the fetch itself reads
+/// coord's top 100 rows (its ceiling), and `risk` assesses all of them before
+/// the cut ([`assess_then_cut`]).
 ///
-/// "Act on predictions": `risk` is the pure [`assess_action_risk`] verdict over
-/// `predicted` + `states_active`. spawn-test/named is a *testing* surface, so we
-/// do NOT auto-route it to LKG — we only SURFACE the assessment (stamp it into
-/// the ACK + a loud warn) so the caller sees the risk before the spawn completes.
+/// "Act on predictions": `risk` is the pure
+/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk) verdict
+/// over that whole fetch + `states_active`. spawn-test/named is a *testing*
+/// surface, so we do NOT auto-route it to LKG — we only SURFACE the assessment
+/// (stamp it into the ACK + a loud warn) so the caller sees the risk before the
+/// spawn completes.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
@@ -2433,14 +2672,20 @@ async fn mint_spawn_action(
 
     // Phase 4: fetch coord's state-conditioned expectations for this
     // (spawn, states) so the ACK warns the agent before the spawn completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(ActionKind::Spawn.as_str(), &states_active, 5).await;
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
+    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
+    // pooled mean before cutting, which can drop the very row the exact-cell
+    // arm of the risk policy reads.
+    let coord = coord_base(&state.config.ambient_coord);
+    let fetched =
+        fetch_expectations(coord.as_deref(), ActionKind::Spawn.as_str(), &states_active).await;
 
-    // "Act on predictions" (surface-only for spawns): assess the prediction set
-    // and, when high-risk, warn loudly so the caller sees it before the spawn
-    // completes. spawn-test/named is a testing surface — we never auto-route it
-    // to LKG; the ACK `risk` field carries the advisory for the caller to act on.
-    let risk = assess_action_risk(&predicted, &states_active);
+    // "Act on predictions" (surface-only for spawns): assess the whole fetch,
+    // then cut the ACK's `predicted` to the top five by `posterior_mean`; when
+    // high-risk, warn loudly so the caller sees it before the spawn completes.
+    // spawn-test/named is a testing surface — we never auto-route it to LKG;
+    // the ACK `risk` field carries the advisory for the caller to act on.
+    let (predicted, risk) = assess_then_cut(fetched, &states_active);
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %action_id, kind = "spawn", "{warn}");
         state
@@ -2456,9 +2701,7 @@ async fn mint_spawn_action(
         state.clone(),
         arc,
         AttributionTargets {
-            early_log_path: None,
             managed: Some(managed),
-            panic_log_path: None,
             runner_id: Some(runner_id),
         },
         None,
@@ -2716,6 +2959,16 @@ pub async fn spawn_test(
         body.rebuild,
     )?;
 
+    // Phase 8b: a fresh device identity cannot also carry another device's
+    // identity. Before any port, slot or build is claimed.
+    if let Some(conflict) = fresh_device_identity_conflict(
+        body.fresh_device_identity,
+        body.paired_profile_id.as_deref(),
+        &body.extra_env,
+    ) {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
+
     // Single resolution of "which tree does this spawn compile?", threaded
     // through worktree materialization, provenance classification and the
     // response labels so they cannot disagree. Default (no selector +
@@ -2880,6 +3133,7 @@ pub async fn spawn_test(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -2983,8 +3237,16 @@ pub async fn spawn_test(
             // probe → wait pipeline; released when this future completes or
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
-            let (status, body_json, stderr_tail) =
-                execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
+            let (status, body_json, stderr_tail) = execute_spawn_build(
+                exec_state,
+                body,
+                exec_id,
+                port,
+                exec_managed,
+                no_wait,
+                action_id,
+            )
+            .await;
             // The build is over (succeeded or failed): free the key so the next
             // request for it starts a fresh build instead of joining a corpse.
             if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
@@ -3241,6 +3503,7 @@ async fn execute_spawn_build(
     port: u16,
     managed: Arc<ManagedRunner>,
     no_wait: bool,
+    action_id: uuid::Uuid,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let mut side = SpawnBuildSideChannel::default();
     // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
@@ -3255,7 +3518,11 @@ async fn execute_spawn_build(
     // without attribution and falsified `attach_build_slot_id`'s "always
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
-    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait, &mut side).await {
+    match execute_spawn_build_inner(
+        &state, body, &id, port, &managed, no_wait, action_id, &mut side,
+    )
+    .await
+    {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
             attach_spawn_identity(&mut body, &id, port);
@@ -3405,6 +3672,7 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
 /// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
 /// removal on the error paths below is unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn execute_spawn_build_inner(
     state: &SharedState,
     body: SpawnTestRequest,
@@ -3412,6 +3680,7 @@ async fn execute_spawn_build_inner(
     port: u16,
     managed: &Arc<ManagedRunner>,
     no_wait: bool,
+    action_id: uuid::Uuid,
     side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // Build-result tracking for the response. Populated by the rebuild
@@ -4119,7 +4388,17 @@ async fn execute_spawn_build_inner(
     //
     // Reported on the spawn-test response as `paired_state`, plus the legacy
     // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
-    let paired_state = match apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id) {
+    //
+    // A `fresh_device_identity` spawn (Phase 8b) projects NO paired state: the
+    // subject is a different device, and the primary's pairing (or a
+    // snapshot) would bind it to the harness's device.
+    let paired_state = match apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::from_fresh_flag(
+            managed.config.fresh_device_identity,
+        ),
+        body.paired_profile_id.as_deref(),
+        id,
+    ) {
         Ok(report) => {
             state
                 .logs
@@ -4151,9 +4430,16 @@ async fn execute_spawn_build_inner(
     // the id-based lookup in `start_runner_by_id` which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
     // spawn's failed health probe, the reaper).
-    // `start_managed_runner` also re-inserts the Arc if the id went missing,
-    // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed).await {
+    // A start that finds the id gone by the time it holds the lifecycle lock
+    // fails `RunnerNotFound`: something tore this runner down.
+    if let Err(e) = manager::start_managed_runner(
+        state,
+        managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
         // Clean up on failure — the registry entry AND the instance dir the
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
@@ -4265,7 +4551,8 @@ async fn execute_spawn_build_inner(
                 // probe just failed — there is no session on it to protect,
                 // and a readiness refusal here would leak the zombie this
                 // line exists to prevent.
-                let _ = manager::stop_runner_by_id(state, id, true).await;
+                let _ =
+                    manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
                 {
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
@@ -4446,7 +4733,7 @@ async fn execute_spawn_build_inner(
         // Stop the runner we just spawned — we will not ship a broken/stale
         // UI to the caller. `force: true` for the same reason as the
         // failed-probe teardown above: nothing has ever run on this runner.
-        let _ = manager::stop_runner_by_id(state, id, true).await;
+        let _ = manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(id);
@@ -4595,6 +4882,9 @@ async fn execute_spawn_build_inner(
         resp["paired_profile_id"] = paired_state["paired_profile_id"].clone();
     }
     resp["paired_state"] = paired_state;
+    if managed.config.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(id);
+    }
     resp["coord_credential"] = coord_credential_from_health(
         child_health_body.as_ref(),
         if child_health_body.is_some() {
@@ -5105,21 +5395,14 @@ async fn probe_runner_health(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Determine if the child process is still alive and capture its pid.
-    // try_wait() returns Ok(Some(_)) if the child has exited, Ok(None) if
-    // still running, Err(_) on a system error (treated as "unknown — assume
-    // dead" so we report the more honest 500).
-    let (child_alive, pid) = if let Some(managed) = state.get_runner(runner_id).await {
-        let mut runner = managed.runner.write().await;
-        let pid = runner.pid;
-        let alive = match runner.process.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(None)),
-            None => false,
-        };
-        (alive, pid)
-    } else {
-        (false, None)
+    // Determine if the child process is still alive and capture its pid. The
+    // exit monitor owns the child and clears the pid when it exits, so a pid
+    // that is still recorded and alive is the process that never answered.
+    let pid = match state.get_runner(runner_id).await {
+        Some(managed) => managed.runner.read().await.pid,
+        None => None,
     };
+    let child_alive = pid.is_some_and(crate::process::proc_kill::pid_alive);
 
     let recent_logs = recent_runner_log_lines(state, runner_id, 20).await;
 
@@ -5230,12 +5513,17 @@ pub async fn spawn_named(
     // Linux spawn with no display can only end in `no_display` too (plan
     // `2026-09-23-conductor-e2e-phase1-defects`, S-3). Refuse before a
     // `rebuild: true` build rather than after it; the spawn path's
-    // post-forwarder check stays the final authority. `spawn-named` takes no
-    // `extra_env`, so nothing here can supply DISPLAY that way.
+    // post-forwarder check stays the final authority. A `DISPLAY` in the
+    // request's `extra_env` satisfies it, exactly as for spawn-test.
+    if let Some(conflict) =
+        fresh_device_identity_conflict(body.fresh_device_identity, None, &body.extra_env)
+    {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
     if let Some(refusal) = crate::process::env_forwarders::display_preflight_refusal(
         cfg!(target_os = "linux"),
         "spawn-named",
-        &std::collections::HashMap::new(),
+        &body.extra_env,
         |k| std::env::var(k).ok(),
         state.config.temp_runner_display.as_deref(),
     ) {
@@ -5298,7 +5586,8 @@ pub async fn spawn_named(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
-            extra_env: Default::default(),
+            extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -5453,7 +5742,14 @@ pub async fn spawn_named(
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);
@@ -5578,7 +5874,7 @@ pub async fn spawn_named(
         // refusing to hand back because it embeds no frontend. It has never
         // hosted a session, and leaving it running while also returning 503
         // would leak it.
-        let _ = manager::stop_runner_by_id(&state, &id, true).await;
+        let _ = manager::stop_runner_by_id(&state, &id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(&id);
@@ -5639,6 +5935,12 @@ pub async fn spawn_named(
     if let Some(meta) = exe_meta {
         resp["binary_mtime"] = json!(meta.binary_mtime);
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
+    }
+    // Phase 8b: the device id the runner minted (or `pending` before its
+    // first start reaches `ensure_device_initialized` — `GET /runners`
+    // re-reads it). Flagged runners only.
+    if body.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(&id);
     }
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
     resp["action_id"] = json!(action_id.to_string());

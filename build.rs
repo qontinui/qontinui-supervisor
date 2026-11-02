@@ -1,58 +1,116 @@
 fn main() {
     // FIRST, unconditionally: the crate does `env!("QONTINUI_SUPERVISOR_GIT_SHA")`,
-    // which is a COMPILE error when the var was never emitted. The frontend
-    // block below has an early `return` on an npm failure, so emitting the
-    // provenance after it would turn a missing npm into "the supervisor crate
-    // does not compile".
+    // which is a COMPILE error when the var was never emitted, so nothing the
+    // frontend build does may come before it.
     emit_self_build_provenance();
 
-    // Only build frontend if dist/ is missing index.html or in release mode.
-    // During dev, run `cd frontend && npm run dev` separately for HMR.
-    let dist_index = std::path::Path::new("dist/index.html");
-    if !dist_index.exists() {
-        // Check if frontend/ directory exists with package.json
-        let frontend_pkg = std::path::Path::new("frontend/package.json");
-        if frontend_pkg.exists() {
-            // Check if node_modules exists, install if not
-            let node_modules = std::path::Path::new("frontend/node_modules");
-            if !node_modules.exists() {
-                let status = std::process::Command::new("npm")
-                    .args(["install"])
-                    .current_dir("frontend")
-                    .status();
-                if let Err(e) = status {
-                    println!("cargo:warning=Failed to run npm install: {}", e);
-                    println!("cargo:warning=SPA will not be embedded. Run `cd frontend && npm install && npm run build` manually.");
-                    return;
-                }
-            }
+    build_frontend_if_missing();
 
-            let status = std::process::Command::new("npm")
-                .args(["run", "build"])
-                .current_dir("frontend")
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!("cargo:warning=Frontend built successfully into dist/");
-                }
-                Ok(s) => {
-                    println!(
-                        "cargo:warning=Frontend build failed with status: {}. Dashboard will use legacy HTML fallback.",
-                        s
-                    );
-                }
-                Err(e) => {
-                    println!("cargo:warning=Failed to run npm build: {}. Dashboard will use legacy HTML fallback.", e);
-                }
-            }
-        }
-    }
-
-    // Rebuild if frontend source changes
+    // Re-run this script when the frontend's inputs change. That recompiles the
+    // crate against whatever `dist/` is on disk. It does NOT rebuild `dist/`,
+    // which this script builds only when `dist/index.html` is missing, so after
+    // a frontend edit run `npm run build` yourself. Emitted whatever the
+    // frontend build did. While `dist` does not exist the path is always stale,
+    // so every cargo build re-runs this script, retries npm and recompiles the
+    // crate until a `dist/` appears. That is the price of picking up a `dist/`
+    // built by hand without a `cargo clean`.
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/index.html");
     println!("cargo:rerun-if-changed=frontend/vite.config.ts");
     println!("cargo:rerun-if-changed=dist");
+}
+
+/// The npm launchers to try, in order. A standard Node.js install on Windows
+/// puts npm on PATH as a batch script, `npm.cmd`. The `npm` beside it is a
+/// shell script for Git Bash, and `std::process::Command` appends only `.exe`
+/// when it searches PATH, so a bare `npm` there is "program not found". A
+/// version manager whose shim is an `npm.exe` (Volta) has no `npm.cmd`,
+/// hence the fallback. `cfg!` in a build script reads the host, which is where
+/// npm runs.
+const NPM_LAUNCHERS: &[&str] = if cfg!(windows) {
+    &["npm.cmd", "npm"]
+} else {
+    &["npm"]
+};
+
+/// Build the SPA into `dist/` when `dist/index.html` is missing. During dev,
+/// run `cd frontend && npm run dev` separately for HMR.
+///
+/// Every failure is a warning, never a build error: the crate compiles without
+/// `dist/` (`routes::dashboard::Assets` is `allow_missing`) and serves the
+/// legacy `static/dashboard.html` instead.
+fn build_frontend_if_missing() {
+    if std::path::Path::new("dist/index.html").exists()
+        || !std::path::Path::new("frontend/package.json").exists()
+    {
+        return;
+    }
+    // `npm ci` installs the tracked lockfile as written and never rewrites it.
+    // `npm install` may rewrite it, which dirties the tree and stamps every
+    // later build `QONTINUI_SUPERVISOR_GIT_DIRTY=true`.
+    let install: &[&str] = if std::path::Path::new("frontend/package-lock.json").exists() {
+        &["ci"]
+    } else {
+        &["install"]
+    };
+    // npm 7+ writes `node_modules/.package-lock.json` only when an install
+    // completes, so a `node_modules` left half-installed by an interrupted
+    // install is installed again rather than built against. A `node_modules`
+    // that is a link (symlink or junction) is never installed into: `npm ci`
+    // first deletes its contents, which would empty the tree it points at.
+    let modules = std::path::Path::new("frontend/node_modules");
+    let installed = modules.join(".package-lock.json").exists();
+    let linked = modules
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    if linked && !installed {
+        println!(
+            "cargo:warning=frontend/node_modules is a link with no completed install \
+             behind it; building against it without installing into it"
+        );
+    }
+    let built = (installed || linked || run_npm(install)) && run_npm(&["run", "build"]);
+    if built {
+        println!("cargo:warning=Frontend built successfully into dist/");
+    } else {
+        println!(
+            "cargo:warning=SPA will not be embedded; the dashboard will use the legacy HTML \
+             fallback. Run `cd frontend && npm ci && npm run build` to embed it."
+        );
+    }
+}
+
+/// Run npm with `args` in `frontend/`, through the first of [`NPM_LAUNCHERS`]
+/// that exists. A spawn failure and a non-zero exit both return `false`, each
+/// with a warning that says which it was. npm's stdout goes to this script's
+/// stderr, because cargo reads this script's stdout for `cargo:` directives.
+fn run_npm(args: &[&str]) -> bool {
+    let mut not_found = Vec::new();
+    for launcher in NPM_LAUNCHERS {
+        let what = format!("{launcher} {}", args.join(" "));
+        match std::process::Command::new(launcher)
+            .args(args)
+            .current_dir("frontend")
+            .stdout(std::io::stderr())
+            .status()
+        {
+            Ok(status) if status.success() => return true,
+            Ok(status) => {
+                println!("cargo:warning=`{what}` failed with status: {status}");
+                return false;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => not_found.push(*launcher),
+            Err(e) => {
+                println!("cargo:warning=Failed to run `{what}`: {e}");
+                return false;
+            }
+        }
+    }
+    println!(
+        "cargo:warning=npm is not on PATH (tried {})",
+        not_found.join(", ")
+    );
+    false
 }
 
 // The pure classification rules (`UNKNOWN_STAMP`, `looks_like_sha`,

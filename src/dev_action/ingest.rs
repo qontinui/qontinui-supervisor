@@ -7,8 +7,8 @@
 //!
 //! This is **best-effort and fail-open**: the attribution watcher calls
 //! [`post_snapshot_to_coord`] after writing `record.outcome`, and a network
-//! failure / non-2xx / unresolvable coord base only logs a single `warn!` line.
-//! It NEVER blocks or fails the watcher (matching `fleet.rs::publish_budget`'s
+//! failure / non-2xx only logs a single `warn!` line; with no coord base the
+//! watcher does not call it at all. It NEVER blocks or fails the watcher (matching `fleet.rs::publish_budget`'s
 //! visibility-only posture).
 //!
 //! # Wire contract (authoritative — NOT `ActionRecord`'s own Serialize shape)
@@ -21,10 +21,12 @@
 //!
 //! # Resolution reuse
 //!
-//! - **coord base**: a local copy of the `COORD_HTTP_URL`-honoring resolver from
-//!   [`crate::routes::lineage`] (that one is module-private). The lineage variant
-//!   is preferred over `fleet.rs`'s because it honors the `COORD_HTTP_URL`
-//!   override; this duplicates ~20 lines rather than refactoring broadly.
+//! - **coord base**: [`coord_base`] answers from
+//!   [`crate::config::AmbientCoord`]. Its `Read` arm is a local copy of the
+//!   `COORD_HTTP_URL`-honoring resolver from [`crate::routes::lineage`] (that one
+//!   is module-private). The lineage variant is preferred over `fleet.rs`'s
+//!   because it honors the `COORD_HTTP_URL` override; this duplicates ~20 lines
+//!   rather than refactoring broadly.
 //! - **device_id**: read from `~/.qontinui/machine.json`'s `device_id`
 //!   (canonical), falling back to legacy `machine_id`.
 //! - **tenant_id**: best-effort from `~/.qontinui/machine.json`'s
@@ -37,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::config::AmbientCoord;
 use crate::dev_action::record::{ActionOutcome, ActionRecord};
 
 /// Timeout for the outbound coord ingest POST, matching
@@ -106,25 +109,53 @@ fn profiles_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
 }
 
-/// Resolve the coord HTTP base. `COORD_HTTP_URL` wins; otherwise the active
-/// profile's `coord_url` (`ws://…/ws` → `http://…`, `wss://` → `https://`).
+/// The coord HTTP base the dev-action client uses under `access`: `None` for
+/// [`AmbientCoord::Ignore`], the given URL for `At`, and for `Read` the ambient
+/// resolution, where `COORD_HTTP_URL` wins, then the active profile's `coord_url`
+/// (`ws://…/ws` → `http://…`, `wss://` → `https://`).
 ///
-/// Duplicated from [`crate::routes::lineage`]'s module-private `coord_http_base`
-/// (preferred over `fleet.rs`'s copy because that one ignores `COORD_HTTP_URL`).
-/// Kept local rather than refactoring both call sites into a shared helper.
+/// The `Read` arm is duplicated from [`crate::routes::lineage`]'s module-private
+/// `coord_http_base` (preferred over `fleet.rs`'s copy because that one ignores
+/// `COORD_HTTP_URL`). Kept local rather than refactoring both call sites into a
+/// shared helper.
 ///
-/// `pub(crate)` so the Phase-4 expectations fetcher
-/// ([`crate::dev_action::expectations`]) reuses this single resolver rather than
+/// Both mint sites and the attribution watcher resolve through this, rather than
 /// adding a third copy.
-pub(crate) fn coord_http_base() -> Option<String> {
-    if let Ok(env_url) = std::env::var("COORD_HTTP_URL") {
+pub fn coord_base(access: &AmbientCoord) -> Option<String> {
+    coord_base_with(
+        access,
+        || std::env::var("COORD_HTTP_URL").ok(),
+        || std::fs::read(profiles_path()?).ok(),
+    )
+}
+
+/// [`coord_base`] with its two ambient reads passed in, so a test can stand in
+/// for them without setting process-global state. Each is called only under
+/// [`AmbientCoord::Read`].
+pub(crate) fn coord_base_with(
+    access: &AmbientCoord,
+    read_env: impl FnOnce() -> Option<String>,
+    read_profiles: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<String> {
+    match access {
+        AmbientCoord::Ignore => None,
+        AmbientCoord::At(base) => Some(base.clone()),
+        AmbientCoord::Read => ambient_coord_base(read_env, read_profiles),
+    }
+}
+
+fn ambient_coord_base(
+    read_env: impl FnOnce() -> Option<String>,
+    read_profiles: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<String> {
+    if let Some(env_url) = read_env() {
         let trimmed = env_url.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.trim_end_matches('/').to_string());
         }
     }
 
-    let bytes = std::fs::read(profiles_path()?).ok()?;
+    let bytes = read_profiles()?;
     let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
     let active = pf.active.as_deref().unwrap_or("dev");
     let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
@@ -178,6 +209,31 @@ pub struct SnapshotIngestBody {
     metadata: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `text` with each NUL replaced by U+FFFD, for the body's three free-text
+/// fields (`requester_id`, `params_digest`, `evidence_ref`).
+///
+/// coord stores them as Postgres `text`, which cannot hold a NUL, and they can
+/// carry one: a startup panic's excerpt is the runner's payload verbatim (a
+/// `Display`-formatted, NUL-padded Win32 buffer, say), and the spawn routes
+/// take `requester_id` from the caller's body. A coord that hands the NUL to
+/// Postgres, as coord's main does before `clamp_snapshot_text`, fails the
+/// INSERT with a 500, and this fail-open ingest then drops the whole trial
+/// with one `warn!`, signatures included; a coord whose `clamp_snapshot_text`
+/// replaces the NUL itself keeps it. Replacing the NUL here keeps the trial
+/// whichever coord is listening.
+///
+/// A U+FFFD is 3 bytes against the NUL's 1 once decoded, and coord refuses no
+/// free-text field for its length (a coord with a text bound cuts the text to
+/// it). Its one length refusal is the route's body limit, a 413 counted in
+/// wire bytes (256 KiB on a coord with the text bound, axum's 2 MiB default
+/// before it), and on the wire the replacement is the shorter of the two:
+/// serde_json writes a NUL as the 6-byte `\u0000`. So the growth cannot cost
+/// the trial. A requester or git ref long enough to push the body past that
+/// limit does, NUL or not.
+fn without_nul(text: &str) -> String {
+    text.replace('\0', "\u{FFFD}")
+}
+
 impl SnapshotIngestBody {
     /// Build the wire body from a completed record + its folded outcome.
     pub fn from_record(
@@ -190,8 +246,8 @@ impl SnapshotIngestBody {
             action_id: record.action_id,
             kind: record.kind.as_str(),
             device_id,
-            requester_id: record.requester_id.clone(),
-            params_digest: record.params_digest.clone(),
+            requester_id: record.requester_id.as_deref().map(without_nul),
+            params_digest: without_nul(&record.params_digest),
             state_ids: record
                 .states_active
                 .iter()
@@ -206,7 +262,7 @@ impl SnapshotIngestBody {
             ended_at: Some(outcome.ended_at.to_rfc3339()),
             category: Some(outcome.category),
             duration_ms: Some(outcome.duration_ms),
-            evidence_ref: outcome.evidence_ref.clone(),
+            evidence_ref: outcome.evidence_ref.as_deref().map(without_nul),
             signatures: outcome.signatures.clone(),
             late_signatures: outcome.late_signatures.clone(),
             tenant_id,
@@ -219,28 +275,17 @@ impl SnapshotIngestBody {
 // POST
 // ---------------------------------------------------------------------------
 
-/// Best-effort POST of a completed snapshot to coord. Fail-open: any failure
-/// (unresolvable coord base, network error, non-2xx) logs a single `warn!` and
-/// returns. NEVER panics, NEVER propagates — safe to `await` or `tokio::spawn`
-/// from the attribution watcher without risk to the watcher.
+/// Best-effort POST of a completed snapshot to the coord at `base`. Fail-open:
+/// any failure (network error, non-2xx) logs a single `warn!` and returns. NEVER
+/// panics, NEVER propagates — safe to `await` or `tokio::spawn` from the
+/// attribution watcher without risk to the watcher.
 pub async fn post_snapshot_to_coord(
+    base: &str,
     record: &ActionRecord,
     outcome: &ActionOutcome,
     device_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
 ) {
-    let base = match coord_http_base() {
-        Some(b) => b,
-        None => {
-            debug!(
-                "dev_action::ingest: coord base unresolved (no COORD_HTTP_URL / \
-                 profiles.json coord_url) — skipping snapshot {} persistence.",
-                record.action_id
-            );
-            return;
-        }
-    };
-
     let body = SnapshotIngestBody::from_record(record, outcome, device_id, tenant_id);
     let url = format!("{base}/coord/dev-actions/snapshot");
 
@@ -287,6 +332,44 @@ mod tests {
     use super::*;
     use crate::dev_action::record::{ActionKind, D3Category, DevState, DevStateEval, Eval};
     use chrono::Utc;
+
+    /// Every rung of the ambient resolution comes through the two readers, and
+    /// the two switches that are not `Read` touch neither.
+    #[test]
+    fn ignoring_the_ambient_coord_drops_both_rungs() {
+        let profiles = br#"{"active":"production","profiles":{"production":{"coord_url":
+            "wss://coord.example/ws"}}}"#;
+        assert_eq!(
+            coord_base_with(
+                &AmbientCoord::Read,
+                || Some("https://coord.env.example/".to_string()),
+                || panic!("the env rung won, so profiles.json must not be read"),
+            )
+            .as_deref(),
+            Some("https://coord.env.example")
+        );
+        assert_eq!(
+            coord_base_with(&AmbientCoord::Read, || None, || Some(profiles.to_vec())).as_deref(),
+            Some("https://coord.example")
+        );
+        assert_eq!(
+            coord_base_with(
+                &AmbientCoord::Ignore,
+                || panic!("Ignore read COORD_HTTP_URL"),
+                || panic!("Ignore read profiles.json"),
+            ),
+            None
+        );
+        assert_eq!(
+            coord_base_with(
+                &AmbientCoord::At("http://127.0.0.1:1".to_string()),
+                || panic!("At read COORD_HTTP_URL"),
+                || panic!("At read profiles.json"),
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+    }
 
     /// The wire body must use the coord contract's field names + values — in
     /// particular `state_ids` (NOT `states_active`), snake_case `kind`,
@@ -376,5 +459,36 @@ mod tests {
         assert!(json["evidence_ref"].is_null());
         assert_eq!(json["category"], "confirmed");
         assert_eq!(json["state_ids"], serde_json::json!([]));
+    }
+
+    /// coord cannot store a NUL in text, and one NUL in any free-text field
+    /// used to cost the whole trial. Each reaches the wire as U+FFFD.
+    #[test]
+    fn a_nul_in_each_free_text_field_reaches_coord_as_the_replacement_character() {
+        let record = ActionRecord::new(
+            ActionKind::Spawn,
+            Some("agent-7\0\0".into()),
+            "rebuild=false\0".into(),
+            &[],
+        );
+        let outcome = ActionOutcome {
+            category: D3Category::Failure,
+            signatures: vec!["DEV-PANIC-STARTUP".into()],
+            ended_at: Utc::now(),
+            duration_ms: 30_000,
+            evidence_ref: Some("panic: open C:\\runner\0\0\0 failed".into()),
+            late_signatures: vec![],
+        };
+        let body = SnapshotIngestBody::from_record(&record, &outcome, None, None);
+        let wire = serde_json::to_string(&body).expect("serialize");
+        assert!(!wire.contains("\\u0000"), "a NUL reached the wire: {wire}");
+
+        let json: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        assert_eq!(json["requester_id"], "agent-7\u{FFFD}\u{FFFD}");
+        assert_eq!(json["params_digest"], "rebuild=false\u{FFFD}");
+        assert_eq!(
+            json["evidence_ref"],
+            "panic: open C:\\runner\u{FFFD}\u{FFFD}\u{FFFD} failed"
+        );
     }
 }

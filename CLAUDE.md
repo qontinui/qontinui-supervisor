@@ -14,14 +14,14 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Primary, named, and external runners** are user-owned, are assigned to no job at all, and survive every supervisor exit path. A non-assignment is logged (`Runner 'Primary' (PID N) NOT assigned to the kill-on-exit JobObject`) so the next incident has forensics.
 - The **startup orphan scan** (`process::orphan_scan`) then adopts the survivor back into the registry. It no longer kills an adoptable orphan for having a stale binary — staleness is reported as a `Warn` naming the gap and the remedy (`POST /runner/restart {"rebuild": true}`), and the operator decides.
 - **Known gap:** an adopted runner has no `tokio::process::Child` handle (we did not spawn it), so the crash-only watchdog's **exit observation** does not cover an inherited primary until this supervisor starts it itself. HTTP health polling is unaffected. A `Child` is deliberately not synthesized. **The serving watchdog DOES cover an adopted primary**: its census walks the OS process table from the runner's PID (or, when the registry has none, from the port's listener), so it needs no `Child` handle — which matters because the adopted primary is the case in all three recorded wedge occurrences.
-- **Stopping an adopted runner does NOT depend on that handle, and no longer depends on the registry PID either** (fixed 2026-07-31). `stop_runner_by_id` resolves its target up front through `process::stop_ledger::resolve_stop_target`, in order: the registry PID → the netstat listener probe on the runner's port → **image-path identity** (sysinfo: which live process is running this runner's deterministic `runner_exe_copy_path`). The third source needs no subprocess, no listening socket and no locale, so a stop still has a target when the first two are blind — which is exactly how `POST /runners/primary/stop` came to return 500 while PID 8872 sat alive on port 9876. An **ambiguous** exe match (two processes on the same image) is reported as unresolved rather than guessed at. Resolution is identification-only: the recovered PID goes through the normal `request_drain` → close-request → kill ladder instead of being hard-killed on the spot, so an adopted primary still gets its drain.
+- **Stopping an adopted runner does NOT depend on that handle, and no longer depends on the registry PID either** (fixed 2026-07-31). `stop_runner_by_id` resolves its target up front through `process::stop_ledger::resolve_stop_target`, in order: the registry PID → the newest spawn's ring entry, while that spawn is current and alive → the netstat listener probe on the runner's port → **image-path identity** (sysinfo: which live process is running this runner's deterministic `runner_exe_copy_path`). The third source needs no subprocess, no listening socket and no locale, so a stop still has a target when the first two are blind — which is exactly how `POST /runners/primary/stop` came to return 500 while PID 8872 sat alive on port 9876. An **ambiguous** exe match (two processes on the same image) is reported as unresolved rather than guessed at. Resolution is identification-only: the recovered PID goes through the normal `request_drain` → close-request → kill ladder instead of being hard-killed on the spot, so an adopted primary still gets its drain.
 
 **A failed stop reports what it ACTUALLY did.** The old message asserted a fixed "after PID kill, tree-kill, kill-by-port" regardless of whether any of those ran. The ladder now records each rung (`process::stop_ledger::StopLedger`) and derives the message from that record, with two distinct arms: a kill **ran and was refused** (a genuinely stubborn process) versus **no kill ever ran** ("the supervisor could not identify what to kill … NOT a process that resisted being killed"). The second arm names each rung's gap. Treat that wording as load-bearing — it is the difference between hunting an unkillable process and looking at the supervisor.
 
-**Crash-only ambient watchdog** (plan `2026-07-03-primary-runner-crash-resilience`, Phase 1). Under `--watchdog`, a supervisor-spawned runner whose process **crashes** (exits non-zero / dies unexpectedly) is auto-restarted through the same `start_runner_by_id` funnel (provenance start gate applies). Hard rules:
+**Crash-only ambient watchdog** (plan `2026-07-03-primary-runner-crash-resilience`, Phase 1). Under `--watchdog`, a supervisor-spawned runner whose process **crashes** (exits non-zero / dies unexpectedly) is auto-restarted through `start_managed_runner`, the funnel every start passes through (provenance start gate applies). It acts only on an exit the exit monitor observed through the spawn's `Child` handle, so an adopted runner (above) is not covered. The exit monitor owns that handle by value, so no reset on the registry can drop it. A start cancelled between its spawn and spawning the monitor does drop it, with no monitor, and that process runs on with its exit unobserved. Hard rules:
 
-- **Never restarts a *running* runner** — this is exit-observation only, not health-based resurrection.
-- **Never restarts on operator stop.** Every operator-facing stop path latches `stop_requested` before the kill; the exit monitor reads it when the exit is observed. The flag is cleared on the next *start* (not at stop completion), so the marker is race-free — a failed stop (`StillHeld`) whose process dies later still counts as operator-intended.
+- **Never restarts a *running* runner** — this is exit-observation only, not health-based resurrection. `running` alone cannot say so: for the primary, the health cache sets the flag from each `/health` probe (see "Liveness"), so it reads false while the primary boots or is wedged, with no stop involved. So the backoff task also compares identity (`crash_restart_backoff_skips`), and skips when `started_at` is no longer the exited spawn's, which means someone started the runner, or a stop reset it, during the backoff. It decides again once it holds the lifecycle lock (`StartAs::AfterCrash`), since a stop or a start can land while it waits there. And every start refuses `RunnerAlreadyRunning` when the newest spawn is current, has no exit stamped and its pid is alive, whatever `running` reads (`newest_spawn_is_up`). A restart reads that same signal as evidence of life, so it stops a primary booting or wedged before it binds and then starts another, and the stop finds its target in the spawn's ring entry when the health cache has cleared `pid`, held to the same pre-kill image check as a probe's candidate, so a reused pid is not killed.
+- **Never restarts on operator stop.** Every operator-facing stop path latches `stop_requested` before the kill; the exit monitor reads it when the exit is observed. The flag is cleared on the next *start* (not at stop completion), so a failed stop (`StillHeld`) whose process dies later still counts as operator-intended. **One runner's starts, stops and removals are ordered by a per-runner lifecycle lock** (`ManagedRunner::lifecycle`). `start_managed_runner` holds it through recording the spawn and spawning its exit monitor. `stop_runner_by_id` holds it from its latch through its reset and a `test-*` teardown, so a start can wait behind a stop: about 62 s for a kill stop and about 90 s for a handoff stop, plus unbounded directory removal in a `test-*` teardown. `reap_stale_test_runners`, the purge-stale sweep and `DELETE /runners/{id}` `try_lock` it and re-check the registry; the sweeps skip the runner and `DELETE` answers 409 `RunnerLifecycleBusy`. A stop that arrives mid-start latches after the spawn is recorded and targets it. What a start still requires once it holds the lock is its caller's to say (`StartAs`): a crash restart requires the entry still registered, the exited spawn and no latched stop, a restart re-inserts the entry its own stop removed, and every other start, the spawn routes included, requires the entry still registered, so a start queued behind a `test-*` teardown fails `RunnerNotFound` rather than spawn into the root it reaped. The lock is not reentrant, so `restart_after_gate` holds it around neither its stop nor its start, and a start that slips in between makes the restart fail `RunnerAlreadyRunning`. The exit monitor never takes it, because a stop's graceful wait is waiting for the monitor to clear `running`. Instead the monitor resets `running` and `pid` (and a primary's legacy state) only while `started_at` is still its own spawn's, so a late exit cannot reset a newer spawn, and it stamps the exit on that spawn's ring entry by `spawned_at`, not by pid. Only the current spawn's exit reaches the crash watchdog, so a replaced spawn's exit neither warns "crashed" nor takes a slot of the crash-loop budget, whose exhaustion would disarm the arm (see "Crash-loop guard"). **What this does not order:** the monitor waits outside the lock, so a stop latched between the real exit and the monitor's wake-up reads as that exit's request, and a monitor that wakes after a later start recorded its spawn reads that start's cleared flag, so the requested exit reads as unrequested on its ring entry. See the residual of `is_startup_panic_of` in `src/dev_action/attribution.rs`. Interleavings were staged in tests, on a stub exe where a real start is needed; none was reproduced on a running supervisor.
 - **Never restarts a clean exit** (code 0 — window close, internal shutdown).
 
 **Serving watchdog** (plan `2026-09-03-runner-zombie-serving-watchdog`). Liveness is **per-route serving**, not process-exists. The crash arm above is armed on process **exit**; three times in nine days the primary's `:9876` stopped answering while the process stayed alive and kept its outbound work going, for 12 hours to 5 days, with `crash_restart_armed: true, restart_attempts: 0` throughout. An armed watchdog is not a recovery path for a process that never crashes. Under `--watchdog`, a runner classified `RunnerLiveness::UnresponsiveSince` (port held, API silent, previously seen responding) for longer than the serving threshold is restarted through `restart_runner_by_id` with the internal-only `RestartSource::ServingWatchdog`. Hard rules:
@@ -32,7 +32,7 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Bounded**: 3 serving restarts per rolling 24 h, then the arm self-disarms with `serving restart loop — operator required` (`POST /runners/{id}/watchdog {"reset_attempts": true}` clears both arms). A refusal does not consume the budget.
 - **Alerted independently of any session** — `fleet::notify_serving_watchdog` posts to coord's `/coord/agent-notifications` with the device JWT, falling back to a `status` finding on 401/403. A coord failure never delays or blocks a restart.
 - `serving_restart_armed` is surfaced in `/health`, `/runners` and SSE beside `crash_restart_armed`, with a boot WARN when a primary is managed and the arm is off.
-- **Never restarts external/user-started runners** — restart requires the spawn provenance of a supervisor-held Child handle.
+- **Never restarts external/user-started runners** — only an exit monitor reaches this code, and only `start_managed_runner` spawns one, with the `Child` it spawned.
 - **Scope: primary only by default.** Under `--watchdog` the primary's per-runner `WatchdogState.enabled` defaults true; named/temp/external default false. Arm any runner explicitly via `POST /runners/{id}/watchdog {"enabled": true}`.
 - **Crash-loop guard:** exponential backoff 5s → 30s → 120s between attempts; max 3 auto-restarts per rolling 30 minutes, then the watchdog disarms itself (`disabled_reason: "crash loop — operator required"`, `enabled` left true so intent stays visible) with an ERROR log + diagnostics event. Reset via `POST /runners/{id}/watchdog {"enabled": true, "reset_attempts": true}`.
 - **Kill-switch:** env `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1` disables all crash auto-restarts without a rebuild.
@@ -61,7 +61,7 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
 | `QONTINUI_EMBEDDED_PG_DIR` | `<root>/embedded-pg` (a private cluster per runner) |
 | `WEBVIEW2_USER_DATA_FOLDER` | `<root>/webview`, exported on every OS but read only by the Windows runner — on Linux, WebKitGTK data is NOT isolated by it |
 | `QONTINUI_DISABLE_KEYCHAIN` | `1` |
-| every other root-confined key (`QONTINUI_PROMPTS_DIR`, `QONTINUI_SESSION_NAMES_DIR`, `QONTINUI_CAPABILITY_STATE_DIR`) | **removed**, so the supervisor's own value is never inherited |
+| every other root-confined key (`QONTINUI_PROMPTS_DIR`, `QONTINUI_SESSION_NAMES_DIR`, `QONTINUI_CAPABILITY_STATE_DIR`, `QONTINUI_TOUCH_LEDGER_DIR`) | **removed**, so the supervisor's own value is never inherited. The list is `process::instance_root::ROOT_CONFINED_ENV_KEYS`, a copy of the runner's that `tests/root_confined_env_keys.rs` holds to the runner's default branch |
 | the harness-store keys (`process::instance_root::HARNESS_STORE_ENV_KEYS`: `RUNNER_DATABASE_URL`, `DATABASE_URL`, `REDIS_URL`, `COORD_DEVICE_JWT`, …) | **removed**, so a subject cannot reach the harness's database, cache or credentials through inherited env (`extra_env` can put one back) |
 
 - **A runner under a root refuses to start (exit 78, `<root>/startup-refusal.log`)
@@ -98,6 +98,27 @@ Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env
   subject's loopback key, port breadcrumb and session names therefore live under
   `<root>/home` — the spawn-test and spawn-named responses name it as
   `instance_root.home`.
+- **`fresh_device_identity: true` makes the subject its own device** (plan
+  `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b; both
+  `spawn-test` and `spawn-named`, default `false`, which changes nothing). The
+  spawn projects NO `machine.json` (only the projected `profiles.json`) and NO
+  paired state — neither the primary's `paired_user.json` / `auth_tokens.enc`
+  snapshot nor a `paired_profile_id` one — and REMOVES `QONTINUI_MACHINE_ID`
+  from the child env (the runner's refresher prefers it over `machine.json`).
+  The runner mints its own `device_id` into `<root>/home/machine.json` at first
+  start (`pair::ensure_device_initialized`). **Where to read the id:** the
+  spawn response's `device_identity` block, and — because the runner may not
+  have minted it yet when the response is sent — the same block on that
+  runner's `GET /runners` entry, which re-reads `<root>/home/machine.json`
+  lazily on every call: `{fresh: true, status: "minted"|"pending"|"unreadable",
+  device_id, differs_from_harness, machine_json}`. `pending` means no file yet
+  (re-read later); `differs_from_harness` is `null` whenever either id is
+  unknown, never a default `true`. The block appears ONLY on flagged runners.
+  The flag is persisted with a named runner's config, so a restart never
+  re-projects the harness's identity; `POST /runners/pair-with-token` honours it
+  for its target too. Refused with `400 {error: "fresh_device_identity_conflict",
+  conflicts_with: [...]}` together with `paired_profile_id` or an `extra_env`
+  `QONTINUI_MACHINE_ID` — each would hand the subject another device's identity.
 - **Panic logs are read from `<root>/logs`** whatever `--log-dir` says (so
   `<log-dir>/runner-<id>/runner-panic.log` no longer outlives a temp runner), and
   `runner-last-panic.txt` is captured into the stopped-runner snapshot before
@@ -309,7 +330,7 @@ where `<instance-key>` = `<project-dir-basename>-<8-hex>`, the 8-hex being a sta
 ## Architecture
 
 Standalone Axum HTTP server:
-- **Parallel build pool** (3 concurrent cargo build slots, each with isolated `CARGO_TARGET_DIR`)
+- **Parallel build pool** (machine-derived slot count, capped at 3, each with isolated `CARGO_TARGET_DIR` and a per-slot `CARGO_BUILD_JOBS`)
 - **Temp runner spawning** for testing code changes
 - **Named runner spawning** for persistent runners from the latest build
 - **Runner lifecycle** start/stop/restart/protect for temp and named runners
@@ -658,15 +679,15 @@ unnecessary.
 |--------|------|-------------|
 | GET | `/runners` | List all runners with status. **Read `liveness`, not `running`** — see "Liveness" below. Each entry carries **commit-based build provenance** for the exe it is actually running: `build_sha` (full 40-char SHA), `build_source` (`live_tree`/`origin_main`/`override`), `build_source_root`, `build_built_at`. `null` = unknown provenance (never started by this supervisor, or a legacy artifact with no sidecar) — do NOT read it as "current". Prefer these over the adjacent `stale_binary`, which is an **mtime** comparison and is blind to commit staleness. |
 | POST | `/runners` | Add a runner config to the registry |
-| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?}`. **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
-| POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?}`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
+| POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?, paired_profile_id?, extra_env?, fresh_device_identity?}` (`fresh_device_identity: true` — no projected identity or pairing, a `device_identity` block in the response; see the instance-root section). **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
+| POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?, extra_env?, fresh_device_identity?}`. `extra_env` has spawn-test's contract (applied last; a `DISPLAY` there satisfies the Linux display preflight) and is persisted with the runner. `fresh_device_identity: true` spawns it under its own device id — see "`fresh_device_identity: true` makes the subject its own device" above; the response then carries `device_identity`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
 | GET | `/runners/spawn-test/in-flight` | The spawn-test builds running right now, each with the `id` + `port` reserved for it plus `build_id` / `logs_url` / `stop_url`. Optional `?requester_id=` narrows to one caller. **Recovery for a lost spawn-test answer** — see "A lost spawn-test answer" below. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive. Optional body `{requester_id?}` scopes the purge; a bodyless POST purges every stale test runner. |
-| DELETE | `/runners/{id}` | Remove a runner from the registry |
+| DELETE | `/runners/{id}` | Remove a runner from the registry. **409** `RunnerLifecycleBusy` while a start or a stop holds it. |
 | POST | `/runners/{id}/start` | Start a runner |
 | POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). **`force` is the restart-readiness override** — see "The restart-readiness gate". |
-| POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?, from_working_tree?}` — every field defaults but **the body itself is required** (this route takes `Json`, not `OptionalJson`, unlike `/runners/{id}/stop`), and unknown fields are **rejected** rather than ignored, so a misspelled `from_working_tree` is a **422** (axum's `JsonDataError`, not the hand-rolled 400 the spawn-test alias guard returns) and never a silent revert to origin/main. **`force` is the restart-readiness override** — see "The restart-readiness gate". **`from_working_tree` defaults to `false`**, so a rebuild of the PRIMARY through this route compiles a fresh `origin/main` worktree; it is inert for named/temp runners, which build the live tree regardless. The **build source** then matches `POST /runner/restart`, but the two doors are not otherwise equivalent: only the singular route mints a dev-action record with risk/prediction, optionally waits for the runner to bind its port, and attaches `origin_main_drift` to the recorded outcome — and that last one only on the **escape-hatch** (live-tree) rebuild, since an origin/main worktree is at origin/main by construction and the default path deliberately records `null`. The readiness gate is shared (it lives inside `restart_runner_by_id`), so the safety half is the same; the observability is not. `rebuild: true` returns **202** `{status:"rebuilding", build_id, poll, build_source}`; `build_source` (`origin_main` \| `live_tree`) names the tree the rebuild selects and is `null` when the id names no registered runner — see "The 202 says which tree". |
-| POST | `/runners/{id}/rebuild-and-restart` | Stop → build the **live tree** → start any **non-primary** runner, **detached**. Body `{source?, force?, wait?, wait_timeout_secs?}` — every field defaults but **the body itself is required** (`Json`, not `OptionalJson`), and unknown fields are ignored; `force` is the restart-readiness override. Refuses the primary. Returns **202** `{status:"rebuilding", build_id, submission_id, poll:"/builds", build_source}` — `build_source` is `live_tree`, or `null` when the id names no runner or the primary (see "The 202 says which tree"). Poll `GET /build/{id}/status` for the terminal outcome. |
+| POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?, from_working_tree?, handoff?}` — every field defaults but **the body itself is required** (this route takes `Json`, not `OptionalJson`, unlike `/runners/{id}/stop`), and unknown fields are **rejected** rather than ignored, so a misspelled `from_working_tree` is a **422** (axum's `JsonDataError`, not the hand-rolled 400 the spawn-test alias guard returns) and never a silent revert to origin/main. **`force` is the restart-readiness override** — see "The restart-readiness gate". **`handoff` (default `false`) forwards the handoff intent** — see "Handoff restarts". **`from_working_tree` defaults to `false`**, so a rebuild of the PRIMARY through this route compiles a fresh `origin/main` worktree; it is inert for named/temp runners, which build the live tree regardless. The **build source** then matches `POST /runner/restart`, but the two doors are not otherwise equivalent: only the singular route mints a dev-action record with risk/prediction, optionally waits for the runner to bind its port, and attaches `origin_main_drift` to the recorded outcome — and that last one only on the **escape-hatch** (live-tree) rebuild, since an origin/main worktree is at origin/main by construction and the default path deliberately records `null`. The readiness gate is shared (it lives inside `restart_runner_by_id`), so the safety half is the same; the observability is not. `rebuild: true` returns **202** `{status:"rebuilding", build_id, poll, build_source}`; `build_source` (`origin_main` \| `live_tree`) names the tree the rebuild selects and is `null` when the id names no registered runner — see "The 202 says which tree". |
+| POST | `/runners/{id}/rebuild-and-restart` | Stop → build the **live tree** → start any **non-primary** runner, **detached**. Body `{source?, force?, handoff?, wait?, wait_timeout_secs?}` — every field defaults but **the body itself is required** (`Json`, not `OptionalJson`), and unknown fields are **rejected** (422); `force` is the restart-readiness override, `handoff` the handoff intent (see "Handoff restarts"). Refuses the primary. Returns **202** `{status:"rebuilding", build_id, submission_id, poll:"/builds", build_source}` — `build_source` is `live_tree`, or `null` when the id names no runner or the primary (see "The 202 says which tree"). Poll `GET /build/{id}/status` for the terminal outcome. |
 | POST | `/runners/{id}/protect` | Toggle protection on a runner |
 | POST | `/runners/{id}/watchdog` | Control watchdog for a specific runner |
 | GET | `/runners/{id}/logs` | Log history for a specific runner |
@@ -839,6 +860,61 @@ has been sampled between 296 ms and 10120 ms, and `/restart-readiness` computes
 a fresh process-table cross-reference rather than serving the 600 s census
 cache. An under-sized timeout converts load into false refusals.
 
+### Handoff restarts — `handoff: true` forwards an intent, nothing more
+
+`POST /runners/{id}/restart`, `POST /runner/restart` and
+`POST /runners/{id}/rebuild-and-restart` take `handoff: bool` (default
+`false`). With `true` the runner detaches its holder-backed panes instead of
+killing them, so the successor runner can adopt them (plan
+`2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+D7). **The decision and the mechanism live in the runner; the supervisor only
+forwards the intent and gates on the runner's answer** — it is dev-only, and
+nothing a user has depends on it. Internally the flag is
+`manager::CloseIntent` (`Kill` / `HandoffHolders`). What changes, and
+only these:
+
+- **The close-request carries `{"handoff":"holders"}`** as JSON. Without
+  `handoff` it is the bodyless POST it always was.
+- **The readiness gate reads `safe_with_handoff` instead of
+  `safe_to_restart`.** Holder panes block `safe_to_restart` by design, so
+  before this the only way through was `force`, which skips the question.
+  `true` proceeds; `false` refuses `409 restart_refused_unsafe_for_handoff`
+  (`cause: handoff_unsafe`); **absent or `null` refuses the same way**
+  (`cause: handoff_verdict_absent`, `safe_with_handoff: null`) — an older
+  runner that does not serve the field would also ignore the handoff body and
+  kill every pane, so it is UNKNOWN, never safe. The UNKNOWN
+  arm is unchanged, and `force` overrides every refusal exactly as before.
+- **The `temp_runner` and `runner_not_protected` exemptions do NOT apply under
+  a handoff.** They answer "is there work to protect?"; a handoff asks "will
+  this runner honour the intent?", which only the runner can answer, so the
+  probe runs and the same refusals apply. `runner_not_running` still skips —
+  no runner process is there to receive the intent — and it does so for a
+  stopped temp or unprotected runner too (`decide_skip_for_intent` re-runs the
+  decision with the two work-to-protect exemptions off). A wedged door's **zero
+  census does not admit a handoff** either (`handoff_verdict_absent`,
+  `source: supervisor_census`): the runner could not be asked, and a holder
+  process need not sit in its process subtree.
+- **The graceful wait before the PID kill is 30 s instead of 3 s**
+  (`config::RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`), above the runner's own
+  teardown `FORCE_EXIT_BUDGET` (25 s = `WORKER_BUDGET` 22 s + 3 s margin,
+  `mod shutdown_budget` in qontinui-runner `src-tauri/src/main.rs`), so the
+  supervisor's kill never cuts a handoff teardown that is still inside its
+  budget. The wait ends when the **target PID is gone**, not when `running`
+  flips: for the primary `running` mirrors `/health`, so one failed probe
+  mid-teardown would end it early. A PID that came from a probe rather than
+  the registry is only a candidate, so the wait also ends on `running` false
+  **and** the port free together (never on the flag alone). With no known PID
+  it falls back to `running` and says so at `Warn`.
+- **The reap escalation never runs a tree or process-group kill** — both
+  escalation steps run only `proc_kill::kill_listeners_by_port`, a plain
+  per-PID kill of each listener. The normal ladder's `kill_by_pid_tree` and
+  `kill_by_port` (which on Unix tree-kills each listener, `-(pgid)`) would
+  signal the holders. The tree rung is recorded as skipped; the choice is the
+  `manager::reap_kills` table. A handoff close-request that does not land is logged at `Warn`
+  (a normal one stays at `Debug`).
+
+The serving watchdog and every other internal stop pass `CloseIntent::Kill`.
+
 ### Optional request bodies — `OptionalJson`, not `Option<Json<T>>`
 
 Three routes take a body every field of which defaults, so the body as a whole
@@ -879,7 +955,7 @@ the dashboard's own stop/start buttons were never affected either way.
 
 ### Parallel Build Pool
 
-The supervisor runs a fixed pool of **N concurrent cargo builds** (default 3, override via env `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is serialized behind a dedicated mutex since Tauri embeds a single `dist/`.
+The supervisor runs a fixed pool of **N concurrent cargo builds**. N is **derived from the machine** at startup (`src/build_sizing.rs`): `max(1, min(host_sizing::suggested_concurrent_builds(host), built_slots + (free_disk − disk_floor) / one_target, 3))` — the CPU+memory term is the shared `qontinui_types::host_sizing` rule; the disk term uses the one-target size and built-slot count the footprint refresh persists to `target-pool/one-target-estimate.json` (UNKNOWN → ignored), credits slots already built (their bytes are already out of `free_disk`), and subtracts the floor the guard will enforce (the env override when set). Slot dirs beyond a shrunk pool are named in a startup WARN, and the **cap of 3 is deliberate** (the shipped default; served policy `production-and-cost` `spawns-outrank-ci-and-builds` puts background builds last, and slot occupancy on `/health` is the evidence for a later raise). `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE` still sets N explicitly. **Every supervisor cargo invocation** (prewarm, slot build, sidecar build, `/build/submit`) carries `CARGO_BUILD_JOBS = host_sizing::build_jobs(host, N − 1)` — the per-slot share, so a full pool's jobs sum to at most the cores — unless the supervisor's own environment already carries `CARGO_BUILD_JOBS`. **The pre-permit disk floor follows the machine too**: `max(30, min(N × largest built slot target dir, 10% of the volume))` GB, from the cached footprint, else the persisted estimate until the first walk (UNKNOWN → exactly 30; `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB` overrides, `0` disables). `GET /health` → `build.pool` shows pool size + `source` (`derived`/`override`) + its derivation, the per-slot jobs + source, `slots_busy`/`queue_depth`, and `disk_floor` with its inputs and source (`derived`/`override`/`default_unknown`). Each slot has its own `CARGO_TARGET_DIR` at `qontinui-runner/target-pool/slot-{k}/` so concurrent builds do not contend on a shared `target/`. Frontend (`npm run build`) is serialized behind a dedicated mutex since Tauri embeds a single `dist/`.
 
 **Pre-permit memory guard (2026-07-31).** Before acquiring a permit, a build waits while free **commit** is below `QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB` (default 5). This mirrors `cargo-guard.sh`'s `MIN_FREE_GB` and `ci_node`'s `MIN_FREE_RAM_GB` — the supervisor was the only build lane without a memory floor, which is why it was the lane that OOM'd. It **defers, never rejects** (unlike the disk guard, which refuses with 507): memory pressure is transient, so failing the build would turn a recoverable condition into an error. After `QONTINUI_SUPERVISOR_MEM_WAIT_MAX_SECS` (900s) it builds anyway, and it fails open on an unreadable probe — a mis-measuring box degrades to the old behavior rather than wedging the lane. The wait happens **before** permit acquisition, so it never holds a slot.
 
@@ -1260,7 +1336,7 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 | GET/POST/DELETE | `/test-login` | Get/set/clear test login credentials for runner spawning |
 | GET | `/ws` | WebSocket endpoint |
 | POST/GET | `/runner/stop` | Stop runner (legacy single-runner endpoint, targets the primary). Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies"). `force` is the restart-readiness override — it reaches `manager::stop_runner`, where it used to be a dead `_force`. |
-| POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?, use_lkg?}` — every field defaults, and unknown fields are **rejected** (422, `#[serde(deny_unknown_fields)]`), so a stale caller sending `trigger_auto_continue` or `wait_timeout_seconds` fails loudly instead of being ignored. `use_lkg` is only meaningful on the `rebuild: false` restart: `null` lets the supervisor auto-bias toward the last-known-good exe when the risk assessment flags the restart as high-risk, `true` pins LKG, `false` opts out of the bias. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"submitted", build_id, poll:"/builds", build_source, action_id, …}` immediately — `build_source` (`origin_main` \| `live_tree`, `null` with no configured primary) names the tree the rebuild selects — and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
+| POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?, use_lkg?, handoff?}` (`handoff`: see "Handoff restarts") — every field defaults, and unknown fields are **rejected** (422, `#[serde(deny_unknown_fields)]`), so a stale caller sending `trigger_auto_continue` or `wait_timeout_seconds` fails loudly instead of being ignored. `use_lkg` is only meaningful on the `rebuild: false` restart: `null` lets the supervisor auto-bias toward the last-known-good exe when the risk assessment flags the restart as high-risk, `true` pins LKG, `false` opts out of the bias. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"submitted", build_id, poll:"/builds", build_source, action_id, …}` immediately — `build_source` (`origin_main` \| `live_tree`, `null` with no configured primary) names the tree the rebuild selects — and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll, build_source}` immediately (`build_source` is always `live_tree` — this route has no origin/main arm); the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
 
@@ -1284,7 +1360,9 @@ The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9
 - Velocity and evaluation dashboards
 - Confirmation dialogs for destructive actions
 
-**Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite. Production build output in `dist/` is embedded into the binary via `rust-embed`. Falls back to legacy `static/dashboard.html` if the SPA dist is missing.
+**Implementation:** React + TypeScript SPA in `frontend/` directory, built with Vite, and served through `rust-embed`. A release build embeds `dist/` in the binary; a debug build (which is how the supervisor is deployed) embeds nothing and reads the build tree's `dist/` from disk at run time. Falls back to legacy `static/dashboard.html` if the SPA dist is missing.
+
+**A tree with no `dist/` still builds.** When `dist/index.html` is missing, `build.rs` installs the frontend's dependencies and runs `npm run build`. A missing or failing npm is a build warning, not an error: `Assets` is `#[allow_missing = true]`, so the crate compiles and `/` serves the legacy dashboard. While `dist/` is missing, every cargo build re-runs `build.rs`, retries npm and recompiles the crate; `cd frontend && npm ci && npm run build` ends that. How npm is launched and installed is documented in `build.rs`, and the CI step *The crate compiles when npm fails and there is no dist/* holds the fallback.
 
 **Data flow:**
 - SSE `GET /health/stream` for real-time health data
@@ -1368,11 +1446,12 @@ CARGO_TARGET_DIR=../target-pool/slot-0 \
 #    terminal's PATH. --keep-going keeps one sidecar's compile error from
 #    costing the others.
 CARGO_TARGET_DIR=../target-pool/slot-0 \
-    cargo build --keep-going --bin qontinui-shim --bin qontinui-pr \
-        --bin qontinui_profile --features custom-protocol
+    cargo build --keep-going -p qontinui-runner -p qontinui-pty-holder \
+        --bin qontinui-shim --bin qontinui-pr --bin qontinui_profile \
+        --bin qontinui-pty-holder --features custom-protocol
 ```
 
-**The sidecar roster is `build_monitor::RUNNER_SIDECARS`, and `SIDECAR_BUILD_ARGS` names exactly it** (a unit test pins both). The supervisor passes only the roster bins the checked-out runner tree declares (`declared_bin_targets` reads its `src-tauri/Cargo.toml` `[[bin]]` names and `src/bin/` files; `sidecar_build_args` filters): `--keep-going` does **not** cover an unknown `--bin` — cargo rejects the whole invocation before compiling anything, so a `git_ref` spawn-test of a runner ref that predates `qontinui-pr` would otherwise lose the shim too. After cargo returns — on every outcome, not only success — each built sidecar is checked by name to exist AND be non-empty, with one WARN per sidecar that is missing or zero-length.
+**The sidecar roster is `build_monitor::RUNNER_SIDECARS`, and `SIDECAR_BUILD_ARGS` names exactly it** (a unit test pins both). `qontinui-pty-holder` is the odd one out: it is a bin of the workspace's `crates/pty-holder` package, not the runner package, so the invocation also names `-p qontinui-runner -p qontinui-pty-holder` (from a member dir cargo otherwise selects that package only), `declared_bin_targets` reads the workspace `members` as well, and `sidecar_build_args` drops `-p qontinui-pty-holder` for a ref that lacks the crate. The runner spawns the holder from `current_exe().parent()`; without it `terminal.pty_holder` falls back to an in-process PTY that dies with the runner. The supervisor passes only the roster bins the checked-out runner tree declares (`declared_bin_targets` reads its `src-tauri/Cargo.toml` `[[bin]]` names and `src/bin/` files; `sidecar_build_args` filters): `--keep-going` does **not** cover an unknown `--bin` — cargo rejects the whole invocation before compiling anything, so a `git_ref` spawn-test of a runner ref that predates `qontinui-pr` would otherwise lose the shim too. After cargo returns — on every outcome, not only success — each built sidecar is checked by name to exist AND be non-empty, with one WARN per sidecar that is missing or zero-length.
 
 **What holds about a zero-length sidecar, and when.** The LKG carry never carries one — it judges the bytes it actually copied, because the slot is released before LKG capture and a queued build can rewrite the file in between — and it removes a zero-length copy already in the LKG dir. `deploy_sidecar` never deploys one, and on **every** outcome (copied, source empty, source missing, copy failed, same directory) removes a zero-length copy already beside the runner exe. `resolve_qontinui_profile_path` skips one, and the pair route runs a private temp copy of what it resolved, never the build directory's file. That is true **at deploy (runner start) time**, not for the runner's lifetime: the primary's sidecar directory is the runner's own cargo `target/debug/`, and tauri-build refills it with 0-byte placeholder copies on any non-pool build-script run (a `dev-start.ps1` rebuild, a manual `cargo build`) until the runner half of the plan (Phase 1a) lands. Temp and named runners deploy into a directory of their own that nothing else writes. And the supervisor's refusal is load-bearing on its own: on runner `origin/main` the materializer publishes any `is_file()` beside its exe — its size/format check is the runner's Phase 1b, not yet landed. Why: the runner's `build.rs` writes 0-byte `binaries/<name>-<triple>` placeholders, tauri-build copies them over `<target>/<profile>/<name>` on every build-script run, and while this supervisor built only `--bin qontinui-shim` the 0-byte `qontinui-pr` copy was what sat beside every runner it started — so `qontinui-pr create` exited 0 having opened no PR (plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
 
@@ -1475,6 +1554,49 @@ the test simply measured the wrong code. Repointing the constant at
 `src-tauri/target` would have inverted the bug onto every environment that sets
 no override, hence the precedence ladder.
 
+**A unit-test build reads neither ambient rung.** `SupervisorConfig.ambient_target_dir`
+is `AmbientTargetDir::Read` in production and `Ignore` when `from_args` runs
+under `cfg(test)`, so the ladder is the workspace default alone: a test never
+resolves a runner exe through the developer's `CARGO_TARGET_DIR` or a
+`.cargo/config.toml` above the checkout. A session's `CARGO_TARGET_DIR` once
+named a runner target holding a real exe, and two restart tests started it; the
+runners outlived the suite (coord finding `46f09ce5`, #253). Two things it does
+not cover, and one test, `config::tests::no_test_config_is_rooted_at_the_working_directory`,
+holds both by scanning every `.rs` file under `src/` and `tests/`:
+
+- **The candidates under `project_dir` itself** (slots, LKG, workspace default).
+  A project dir of `.` makes `runner_npm_dir()` return `""`, so all of them
+  resolve against the working directory. A test state therefore roots its
+  config in an empty tempdir (`config::config_over_an_empty_runner_tree`), and
+  the scan fails on the literal working-directory spellings it lists
+  (`working_directory_needles`), split across lines or not: `--project-dir .`,
+  `--project-dir ./`, `--project-dir=.`, `-p .` and `-p.`, and a `project_dir`
+  field or assignment of `PathBuf::from(".")`, `PathBuf::new()`, `".".into()`
+  or `"".into()`. It matches spellings, not paths: a single-component relative
+  project dir (`src-tauri`, whose parent is also `""`) behaves the same and is
+  not caught.
+- **Integration tests under `tests/`**, which link the library without
+  `cfg(test)`: `from_args` gives them `Read`. So no file there calls
+  `from_args` (the scan fails on one that does); one that needs a config builds
+  a `SupervisorConfig` literal that sets `ambient_target_dir: AmbientTargetDir::Ignore`.
+
+**A unit-test build reaches no ambient coord either.** `SupervisorConfig.ambient_coord`
+decides where the dev-action client goes: the expectations GET at both mint sites
+and the attribution watcher's snapshot POST, all resolved by
+`dev_action::ingest::coord_base`. `AmbientCoord::Read` is production
+(`COORD_HTTP_URL`, else the active profile's `coord_url`); `from_args` picks
+`Ignore` under `cfg(test)`, which makes no request and reads none of the
+environment, `profiles.json` or `machine.json`; `At(<url>)` is how a test plants
+rows (`dev_action::test_support::serve_planted_expectations`). It replaced a
+`cfg!(test)` return in the POST that an integration test never took and that
+left the read open, so `restart_runner`'s `use_lkg: None` branch could turn on
+production rows (coord finding `ab7c97d7`). An integration test names `Ignore` in
+its struct literal, and `config::tests::no_test_config_reads_the_ambient_coord`
+fails on an `ambient_coord` field set to `Read` outside `from_args` (a source scan
+of field and binding forms, so a value passed through a local is not caught). It
+covers these paths only. `fleet::coord_http_base`, which ignores `COORD_HTTP_URL`, and the other
+coord resolvers have no such switch.
+
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
 construction, which is this gate's own allow condition.) A fallthrough artifact
@@ -1498,7 +1620,7 @@ unverified_warning}`. `origin` distinguishes `slot-N` /
 env-override-vs-workspace-default split is visible on the adoption path too. Nothing reported the path before, which is the whole
 reason the stale spawn survived a full manual-test iteration.
 
-Every runner start copies the resolved source exe to its `config::runner_exe_copy_path` — `target/debug/qontinui-runner-primary.exe` for the primary, `target/debug/runners/<pool-name>/qontinui-runner.exe` for temp/named runners — so the build artifact is never locked by a running process. The sidecar roster (`build_monitor::RUNNER_SIDECARS`: `qontinui-shim`, `qontinui-pr`, `qontinui_profile`) rides along: the supervisor builds all three into the same slot right after the runner build (one fail-open `--keep-going` invocation), preserves them in the LKG dir, and on every start copies the two the runner resolves beside its own exe — the `qontinui-shim` stub and the `qontinui-pr` session CLI — from next to the source exe to next to the exe copy (`deploy_sidecar` in `src/process/manager.rs`). `qontinui_profile` is built and carried but not deployed: nothing in the runner resolves it beside its exe; `POST /runners/pair-with-token` resolves it from the non-pool `target/debug/`, the slots and the LKG dir, and runs a private temp copy of it (with `kill_on_drop`), never the file in place. The `qontinui-git-credential` helper is deployed the same way (from the source exe's dir, else the non-pool `target/debug/`), because the runner also finds it only via `current_exe().parent()`. The runner materializes terminal identity shims and the session CLI from next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed sidecar build/copy logs a WARN naming the sidecar (e.g. "identity shims will be stale") but never fails the build or start. A **zero-length** sidecar is never deployed, and no zero-length copy survives a deploy beside the runner exe — at start time; the primary's `target/debug/` can be refilled with one by a later non-pool build until the runner's Phase 1a lands (see "Correct manual build command").
+Every runner start copies the resolved source exe to its `config::runner_exe_copy_path` — `target/debug/qontinui-runner-primary.exe` for the primary, `target/debug/runners/<pool-name>/qontinui-runner.exe` for temp/named runners — so the build artifact is never locked by a running process. The sidecar roster (`build_monitor::RUNNER_SIDECARS`: `qontinui-shim`, `qontinui-pr`, `qontinui_profile`, `qontinui-pty-holder`) rides along: the supervisor builds all four into the same slot right after the runner build (one fail-open `--keep-going` invocation), preserves them in the LKG dir, and on every start copies the three the runner resolves beside its own exe — the `qontinui-shim` stub, the `qontinui-pr` session CLI and the `qontinui-pty-holder` — from next to the source exe to next to the exe copy (`deploy_sidecar` in `src/process/manager.rs`). `qontinui_profile` is built and carried but not deployed: nothing in the runner resolves it beside its exe; `POST /runners/pair-with-token` resolves it from the non-pool `target/debug/`, the slots and the LKG dir, and runs a private temp copy of it (with `kill_on_drop`), never the file in place. The `qontinui-git-credential` helper is deployed the same way (from the source exe's dir, else the non-pool `target/debug/`), because the runner also finds it only via `current_exe().parent()`. The runner materializes terminal identity shims and the session CLI from next to its own exe (`current_exe().parent()`), so a missing/stale sidecar breaks pane claude launches — a failed sidecar build/copy logs a WARN naming the sidecar (e.g. "identity shims will be stale") but never fails the build or start. A **zero-length** sidecar is never deployed, and no zero-length copy survives a deploy beside the runner exe — at start time; the primary's `target/debug/` can be refilled with one by a later non-pool build until the runner's Phase 1a lands (see "Correct manual build command").
 
 ### Last-known-good (LKG) fallback for agents
 
@@ -1571,7 +1693,7 @@ curl -X POST localhost:9875/runners/spawn-test \
 
 1. **Port reservation** — atomically claims a free port (9877-9899) and inserts a placeholder.
 2. **Build** — acquires a build pool permit (blocks if all slots busy), runs `npm run build` (serialized via `npm_lock`), then `cargo build --bin qontinui-runner --features custom-protocol` with `CARGO_TARGET_DIR` set to the slot dir.
-3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; reported as `paired_state`), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read). Expect `posture: "unknown"` from a freshly booted child: its device-JWT refresher has usually not completed a pass by first `/health`, so re-read the child's own `/health` to judge the copied pairing. A Linux spawn-test or spawn-named that can only end in `no_display` is refused before the build starts. **The copy does not isolate the primary from a child built from the wrong source.** Every runner from qontinui-runner `c0f11c35a` on lists the primary's bare-default `paired_user.json` among its own binding-store candidates. One built from source containing qontinui-runner `c0f11c35a` but not the #1756 fix (`5e24b941c` + `90cc00b1d`) also renames that file to `paired_user.json.superseded-<date>`. The primary's refresher then idles on `runner not paired yet` until its device JWT expires. This happened three times on merytshost 2026-09-23..25. Default `rebuild:false` runs an existing exe whatever its age (the freshest slot exe, or the LKG under `use_lkg: true`), so it can spawn such a child. With `rebuild:true`, the source depends on the door:
+3. **Spawn** — snapshots the paired state into the runner's instance dir (a `paired_profile_id` snapshot, else the primary's live `paired_user.json` + `auth_tokens.enc`; nothing under `fresh_device_identity: true`), reported as `paired_state` (`status: "fresh_device_identity"` for a flagged spawn), copies the built exe to `target/debug/runners/<pool-name>/qontinui-runner.exe`, and launches the process. Once the child answers `/health`, its `coordCredential` block is relayed as `coord_credential` (a typed `unknown` when it could not be read). Expect `posture: "unknown"` from a freshly booted child: its device-JWT refresher has usually not completed a pass by first `/health`, so re-read the child's own `/health` to judge the copied pairing. A Linux spawn-test or spawn-named that can only end in `no_display` is refused before the build starts. **The copy does not isolate the primary from a child built from the wrong source.** Every runner from qontinui-runner `c0f11c35a` on lists the primary's bare-default `paired_user.json` among its own binding-store candidates. One built from source containing qontinui-runner `c0f11c35a` but not the #1756 fix (`5e24b941c` + `90cc00b1d`) also renames that file to `paired_user.json.superseded-<date>`. The primary's refresher then idles on `runner not paired yet` until its device JWT expires. This happened three times on merytshost 2026-09-23..25. Default `rebuild:false` runs an existing exe whatever its age (the freshest slot exe, or the LKG under `use_lkg: true`), so it can spawn such a child. With `rebuild:true`, the source depends on the door:
    - **spawn-test** builds `origin/main` by default, and `origin/main` carries the fix. That default comes from `resolve_spawn_build_source`, whose only two call sites are on the spawn-test path; see "Build provenance: spawn-test builds `origin/main` by DEFAULT" above. On this door, an explicit `from_working_tree: true`, or a `git_ref` / `worktree_path` naming an older tree, builds one that may lack the fix.
    - **spawn-named** has no source selector. Its rebuild goes through `build_monitor::run_cargo_build_with_requester`, which always compiles the shared live checkout (`BuildSourceKind::LiveTree`).
    - **`POST /runners/{id}/restart {rebuild: true}`** on a temp or named runner also compiles the live checkout, because `BuildTree::compiles_origin_main` is gated on `is_primary()`.
@@ -1694,7 +1816,8 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Retained rotated segments | 5 per log, live file excluded (override: `QONTINUI_SUPERVISOR_LOG_MAX_RETAINED`, clamped [1, 100]) |
 | Stopped-runners cache cap | 1000 entries (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_CAP`, clamped [100, 100000]) |
 | Stopped-runners cache TTL | 3600s / 60min (override: `QONTINUI_SUPERVISOR_STOPPED_CACHE_TTL_SECS`, clamped [60, 86400]) |
-| Build pool size | 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`) |
+| Build pool size | derived from the machine, capped at 3 (override: `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`); see `GET /health` `build.pool` |
+| Pre-permit disk floor | `max(30, min(pool × one-target GB, 10% of volume))`, UNKNOWN → 30 (override: `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`, `0` disables) |
 | Temp runner port range | 9877-9899 |
 | Temp runner max age | 24h (86400s) default, override `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` (clamped [3600, 604800]; **0 disables**). `RunnerKind::Temp` only; measured from `started_at`; `protected` does not exempt. |
 | First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |

@@ -41,10 +41,12 @@ fn config_under(base: &std::path::Path) -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 2 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(2),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

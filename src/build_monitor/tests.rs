@@ -14,8 +14,8 @@ use super::{
 use super::{
     carry_sidecar_into_lkg_via, declared_bin_targets, inspect_built_sidecars,
     remove_if_zero_length, sidecar_build_args, sidecar_build_verdict, SidecarFile,
-    PROFILE_CLI_EXE_FILENAME, RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME, SHIM_EXE_FILENAME,
-    SIDECAR_BUILD_ARGS,
+    PROFILE_CLI_EXE_FILENAME, PTY_HOLDER_EXE_FILENAME, RUNNER_SIDECARS, SESSION_CLI_EXE_FILENAME,
+    SHIM_EXE_FILENAME, SIDECAR_BUILD_ARGS,
 };
 use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
 use crate::error::SupervisorError;
@@ -1084,10 +1084,12 @@ fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     Arc::new(SupervisorState::new(config))
 }
@@ -1310,12 +1312,18 @@ fn sidecar_build_args_pin_the_roster() {
         &[
             "build",
             "--keep-going",
+            "-p",
+            "qontinui-runner",
+            "-p",
+            "qontinui-pty-holder",
             "--bin",
             "qontinui-shim",
             "--bin",
             "qontinui-pr",
             "--bin",
             "qontinui_profile",
+            "--bin",
+            "qontinui-pty-holder",
             "--features",
             "custom-protocol",
         ]
@@ -1334,17 +1342,23 @@ fn sidecar_build_args_pin_the_roster() {
         [
             SHIM_EXE_FILENAME,
             SESSION_CLI_EXE_FILENAME,
-            PROFILE_CLI_EXE_FILENAME
+            PROFILE_CLI_EXE_FILENAME,
+            PTY_HOLDER_EXE_FILENAME
         ]
     );
     // The runner resolves the shim and the session CLI beside its own exe
-    // (shim_materializer.rs); nothing in it resolves qontinui_profile.
+    // (shim_materializer.rs) and the holder beside it
+    // (pty_holder::spawn::resolve_holder_exe); nothing in it resolves
+    // qontinui_profile.
     let deployed: Vec<&str> = RUNNER_SIDECARS
         .iter()
         .filter(|s| s.deployed_beside_runner)
         .map(|s| s.bin)
         .collect();
-    assert_eq!(deployed, ["qontinui-shim", "qontinui-pr"]);
+    assert_eq!(
+        deployed,
+        ["qontinui-shim", "qontinui-pr", "qontinui-pty-holder"]
+    );
 }
 
 /// Write a runner-like `src-tauri` package: `manifest` as `Cargo.toml`,
@@ -1390,6 +1404,8 @@ fn sidecar_build_args_skip_a_bin_the_runner_tree_does_not_declare() {
         vec![
             "build",
             "--keep-going",
+            "-p",
+            "qontinui-runner",
             "--bin",
             "qontinui-shim",
             "--bin",
@@ -1400,12 +1416,59 @@ fn sidecar_build_args_skip_a_bin_the_runner_tree_does_not_declare() {
     );
 }
 
+/// The PTY holder is a bin of ANOTHER workspace package, so it is declared by
+/// the workspace's member list, not by the runner package's manifest; a tree
+/// whose workspace lacks it is not handed `-p qontinui-pty-holder`.
+#[test]
+fn the_pty_holder_is_declared_by_a_workspace_member() {
+    let tmp = TempDir::new().expect("tempdir");
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"src-tauri\", \"crates/pty-holder\", \"crates/*\"]\n",
+    )
+    .expect("workspace manifest");
+    let pkg = tmp.path().join("src-tauri");
+    stage_runner_package(
+        &pkg,
+        "[package]\nname = \"qontinui-runner\"\nversion = \"0.1.0\"\n",
+        &[
+            "src/bin/qontinui_shim.rs",
+            "src/bin/qontinui_cli.rs",
+            "src/bin/qontinui_profile.rs",
+        ],
+    );
+    let before = declared_bin_targets(&pkg).expect("readable");
+    assert!(!before.contains("qontinui-pty-holder"), "{before:?}");
+    assert!(!sidecar_build_args(Some(&before)).contains(&"qontinui-pty-holder"));
+
+    stage_runner_package(
+        &tmp.path().join("crates/pty-holder"),
+        "[package]\nname = \"qontinui-pty-holder\"\nversion = \"0.1.0\"\n\n\
+         [[bin]]\nname = \"qontinui-pty-holder\"\npath = \"src/main.rs\"\n",
+        &["src/main.rs"],
+    );
+    let after = declared_bin_targets(&pkg).expect("readable");
+    assert!(after.contains("qontinui-pty-holder"), "{after:?}");
+    assert!(sidecar_build_args(Some(&after)).contains(&"qontinui-pty-holder"));
+}
+
 /// A tree declaring the whole roster gets exactly [`SIDECAR_BUILD_ARGS`];
 /// an unreadable manifest (UNKNOWN) does too; a tree declaring none of the
 /// roster gets no `--bin` at all, which the caller treats as "skip cargo".
 #[test]
 fn sidecar_build_args_full_unknown_and_empty_rosters() {
     let tmp = TempDir::new().expect("tempdir");
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"src-tauri\", \"crates/pty-holder\"]\n",
+    )
+    .expect("workspace manifest");
+    stage_runner_package(
+        &tmp.path().join("crates/pty-holder"),
+        "[package]\nname = \"qontinui-pty-holder\"\nversion = \"0.1.0\"\n\n\
+         [[bin]]\nname = \"qontinui-pty-holder\"\npath = \"src/main.rs\"\n",
+        &["src/main.rs"],
+    );
     let pkg = tmp.path().join("src-tauri");
     stage_runner_package(
         &pkg,
@@ -1496,7 +1559,8 @@ fn sidecar_verdict_names_a_failed_build_whose_declared_sidecars_look_real() {
     fs::write(debug.join(PROFILE_CLI_EXE_FILENAME), b"profile").expect("profile");
 
     // qontinui-pr undeclared (a ref predating it): not checked, not named.
-    let verdict = sidecar_build_verdict(3, &debug, &["qontinui-pr"], Some("timed out after 600s"));
+    let undeclared = ["qontinui-pr", "qontinui-pty-holder"];
+    let verdict = sidecar_build_verdict(3, &debug, &undeclared, Some("timed out after 600s"));
     assert_eq!(verdict.built.len(), 2, "{verdict:?}");
     assert_eq!(verdict.warnings.len(), 1, "{verdict:?}");
     let warning = &verdict.warnings[0];
@@ -1511,7 +1575,7 @@ fn sidecar_verdict_names_a_failed_build_whose_declared_sidecars_look_real() {
     );
 
     // Success: nothing to warn about.
-    let clean = sidecar_build_verdict(3, &debug, &["qontinui-pr"], None);
+    let clean = sidecar_build_verdict(3, &debug, &undeclared, None);
     assert!(clean.warnings.is_empty(), "{clean:?}");
 }
 
@@ -1541,6 +1605,7 @@ fn inspect_built_sidecars_reports_each_sidecar_and_refuses_zero_length() {
             ("qontinui-shim", SidecarFile::Present { bytes: 9 }),
             ("qontinui-pr", SidecarFile::Empty),
             ("qontinui_profile", SidecarFile::Missing),
+            ("qontinui-pty-holder", SidecarFile::Missing),
         ]
     );
 }
@@ -1816,9 +1881,10 @@ fn stderr_submission_tail_caps_and_keeps_tail() {
 
 #[test]
 fn prewarm_cargo_check_carries_allow_placeholder_dist() {
-    let env = super::cargo_invocation_env(super::CargoInvocation::Prewarm);
+    let env = super::cargo_invocation_env(super::CargoInvocation::Prewarm, Some(4));
     assert!(
-        env.set.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST", "1")),
+        env.set
+            .contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST", "1".to_string())),
         "the pre-warm `cargo check` must keep working on a fresh tree with no dist/: {env:?}"
     );
     assert!(!env.remove.contains(&"QONTINUI_ALLOW_PLACEHOLDER_DIST"));
@@ -1831,7 +1897,7 @@ fn real_builds_never_carry_and_actively_remove_allow_placeholder_dist() {
         super::CargoInvocation::SidecarBuild,
         super::CargoInvocation::Submission,
     ] {
-        let env = super::cargo_invocation_env(kind);
+        let env = super::cargo_invocation_env(kind, Some(4));
         assert!(
             !env.set
                 .iter()
@@ -1850,12 +1916,73 @@ fn real_builds_never_carry_and_actively_remove_allow_placeholder_dist() {
 #[test]
 fn submission_command_removes_allow_placeholder_dist() {
     let mut cmd = tokio::process::Command::new("cargo");
-    super::apply_invocation_env(&mut cmd, super::CargoInvocation::Submission);
+    super::apply_invocation_env(&mut cmd, None, super::CargoInvocation::Submission);
     let removed = cmd
         .as_std()
         .get_envs()
         .any(|(k, v)| k == "QONTINUI_ALLOW_PLACEHOLDER_DIST" && v.is_none());
     assert!(removed, "submission build must env_remove the override");
+}
+
+// -----------------------------------------------------------------------------
+// CARGO_BUILD_JOBS: every supervisor cargo invocation carries the per-slot share
+// (plan 2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine)
+// -----------------------------------------------------------------------------
+
+const ALL_INVOCATION_KINDS: [super::CargoInvocation; 4] = [
+    super::CargoInvocation::Prewarm,
+    super::CargoInvocation::SlotBuild,
+    super::CargoInvocation::SidecarBuild,
+    super::CargoInvocation::Submission,
+];
+
+#[test]
+fn every_invocation_kind_carries_the_slot_jobs_value() {
+    for kind in ALL_INVOCATION_KINDS {
+        let env = super::cargo_invocation_env(kind, Some(16));
+        assert!(
+            env.set.contains(&("CARGO_BUILD_JOBS", "16".to_string())),
+            "{kind:?} must carry the per-slot CARGO_BUILD_JOBS: {env:?}"
+        );
+    }
+}
+
+/// An inherited CARGO_BUILD_JOBS (`jobs: None`) is left alone: neither set
+/// nor removed, so the child inherits the supervisor's value.
+#[test]
+fn an_inherited_cargo_build_jobs_is_not_overridden() {
+    for kind in ALL_INVOCATION_KINDS {
+        let env = super::cargo_invocation_env(kind, None);
+        assert!(
+            !env.set.iter().any(|(k, _)| *k == "CARGO_BUILD_JOBS"),
+            "{kind:?}"
+        );
+        assert!(!env.remove.contains(&"CARGO_BUILD_JOBS"), "{kind:?}");
+    }
+}
+
+/// The plain-Command path really sets it on the child.
+#[test]
+fn submission_command_sets_cargo_build_jobs() {
+    let mut cmd = tokio::process::Command::new("cargo");
+    super::apply_invocation_env(&mut cmd, Some(5), super::CargoInvocation::Submission);
+    let set = cmd
+        .as_std()
+        .get_envs()
+        .any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == Some(std::ffi::OsStr::new("5")));
+    assert!(set, "submission build must carry CARGO_BUILD_JOBS=5");
+}
+
+/// Every call site passes the pool's jobs setting, not a literal.
+#[test]
+fn every_cargo_call_site_passes_the_pool_jobs() {
+    let src = include_str!("../build_monitor.rs");
+    let prod = &src[..src
+        .find(&["#[cfg(test)]\nmod ", "tests;"].concat())
+        .expect("build_monitor.rs must still declare its tests module")];
+    assert_eq!(prod.matches("build_pool.jobs.to_set(),").count(), 3);
+    let subm = include_str!("../build_submissions.rs");
+    assert_eq!(subm.matches("build_pool.jobs.to_set(),").count(), 1);
 }
 
 /// The pure function is only half the rule: each call site must ask for its
@@ -1871,9 +1998,9 @@ fn each_cargo_call_site_applies_its_own_invocation_kind() {
     let count = |needle: &str| prod.matches(needle).count();
     // One use each, at the call site (the enum declaration and the match in
     // `cargo_invocation_env` spell `Prewarm =>` / `SlotBuild |` / `SidecarBuild =>`).
-    assert_eq!(count("CargoInvocation::Prewarm)"), 1);
-    assert_eq!(count("CargoInvocation::SlotBuild)"), 1);
-    assert_eq!(count("CargoInvocation::SidecarBuild)"), 1);
+    assert_eq!(count("CargoInvocation::Prewarm,"), 1);
+    assert_eq!(count("CargoInvocation::SlotBuild,"), 1);
+    assert_eq!(count("CargoInvocation::SidecarBuild,"), 1);
     let subm = include_str!("../build_submissions.rs");
     assert_eq!(
         subm.matches("CargoInvocation::Submission,").count(),
@@ -1881,7 +2008,7 @@ fn each_cargo_call_site_applies_its_own_invocation_kind() {
         "build_submissions.rs must apply the Submission env rules to its cargo command"
     );
     // The pre-warm site is the one that runs `cargo check`.
-    let at = prod.find("CargoInvocation::Prewarm)").unwrap();
+    let at = prod.find("CargoInvocation::Prewarm,").unwrap();
     let before = &prod[..at];
     let fn_start = before
         .rfind("\nasync fn ")

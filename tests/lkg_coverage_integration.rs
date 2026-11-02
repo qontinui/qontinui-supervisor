@@ -38,10 +38,12 @@ fn config_with_project_dir(dir: PathBuf) -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

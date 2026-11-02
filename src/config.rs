@@ -72,6 +72,59 @@ impl TargetDirSource {
     }
 }
 
+/// Whether [`SupervisorConfig::runner_target_dir_candidates`] consults the two
+/// AMBIENT sources of a target dir — the process's `CARGO_TARGET_DIR` (level 1)
+/// and the `.cargo/config.toml` hierarchy above the runner (level 2) — or only
+/// the workspace default (level 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientTargetDir {
+    /// Read both, on every call. Production.
+    Read,
+    /// Read neither. What [`SupervisorConfig::from_args`] picks in a unit-test
+    /// build, so a test never resolves a runner exe through the developer's
+    /// `CARGO_TARGET_DIR` or a config file above the checkout. When a session's
+    /// `CARGO_TARGET_DIR` named a runner target holding a real exe, two restart
+    /// tests resolved that exe and STARTED it, and the runners outlived the test
+    /// run (coord finding 46f09ce5).
+    ///
+    /// It does not cover the candidates under the project dir itself (slots,
+    /// LKG, the workspace default): a test controls those by rooting its config
+    /// in a tempdir rather than a relative path. And an integration test under
+    /// `tests/` links the library without `cfg(test)`, so `from_args` gives it
+    /// `Read`: it builds a struct literal that sets `Ignore` instead, and
+    /// `tests::no_test_config_is_rooted_at_the_working_directory` refuses a
+    /// `from_args` call there.
+    Ignore,
+}
+
+/// Whether and where the dev-action client reaches coord: the expectations GET
+/// at both mint sites and the attribution watcher's snapshot POST.
+/// [`crate::dev_action::ingest::coord_base`] turns it into a base URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbientCoord {
+    /// `COORD_HTTP_URL`, else the active profile's `coord_url` in
+    /// `~/.qontinui/profiles.json`. Production, and on a dev box that profile
+    /// is production coord.
+    Read,
+    /// No coord. A mint fetches nothing and a closed window posts nothing, and
+    /// neither the environment, `profiles.json` nor `machine.json` is read.
+    /// What [`SupervisorConfig::from_args`] picks in a unit-test build, so a
+    /// test's route never reads the expectations that decide its branch from
+    /// production, and a test's fabricated outcome never reaches the ledger the
+    /// LKG restart guard reads (coord finding ab7c97d7).
+    ///
+    /// An integration test under `tests/` links the library without
+    /// `cfg(test)`, so `from_args` gives it `Read`: it builds a struct literal
+    /// that sets `Ignore` instead, and
+    /// `tests::no_test_config_reads_the_ambient_coord` holds both halves.
+    Ignore,
+    /// This base URL, with no ambient read. How a test plants rows. Not
+    /// `#[cfg(test)]`, so an integration test can reach it too; production never
+    /// builds it, which the binary's own copy of this module would flag.
+    #[allow(dead_code)]
+    At(String),
+}
+
 /// Resolve `p` against `base` when it is relative. Cargo resolves a relative
 /// `CARGO_TARGET_DIR` against its own working directory and a relative
 /// `build.target-dir` against the directory *containing* the `.cargo` dir the
@@ -295,6 +348,16 @@ pub struct SupervisorConfig {
     /// has none (`--temp-runner-display`, else
     /// `QONTINUI_SUPERVISOR_TEMP_DISPLAY`). Blank counts as unset.
     pub temp_runner_display: Option<String>,
+    /// Whether the non-pool runner exe may resolve through `CARGO_TARGET_DIR`
+    /// and `.cargo/config.toml` ([`AmbientTargetDir`]): `Read` in production,
+    /// `Ignore` in a unit-test build. [`Self::from_args`] would give an
+    /// integration test `Read`, so one sets `Ignore` in a struct literal.
+    pub ambient_target_dir: AmbientTargetDir,
+    /// Whether and where the dev-action client reaches coord ([`AmbientCoord`]):
+    /// `Read` in production, `Ignore` in a unit-test build. [`Self::from_args`]
+    /// would give an integration test `Read`, so one sets `Ignore` in a struct
+    /// literal.
+    pub ambient_coord: AmbientCoord,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -302,41 +365,134 @@ pub struct SupervisorConfig {
 /// Each slot gets its own `CARGO_TARGET_DIR` so concurrent `cargo build`s do not
 /// contend on a shared `target/`. Source tree is shared (live working tree);
 /// callers accept the same source-mutation race that single-build today already has.
+///
+/// The pool size and each slot's `CARGO_BUILD_JOBS` are derived from the machine
+/// ([`crate::build_sizing`]); `source` / `derivation` / `jobs` record how, and
+/// `GET /health` `build.pool` serves them.
 #[derive(Debug, Clone)]
 pub struct BuildPoolConfig {
-    /// Number of concurrent cargo builds allowed. Default: 3.
-    /// Override via env var `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`.
+    /// Number of concurrent cargo builds allowed. Derived by
+    /// [`crate::build_sizing::derive_pool_size`] (capped at
+    /// [`crate::build_sizing::DERIVED_POOL_SIZE_CAP`]); override via env var
+    /// `QONTINUI_SUPERVISOR_BUILD_POOL_SIZE`.
     pub pool_size: usize,
+    /// Whether `pool_size` was derived or set explicitly.
+    pub source: crate::build_sizing::PoolSizeSource,
+    /// The derivation's inputs and terms (`None` for an explicit size).
+    pub derivation: Option<crate::build_sizing::PoolSizeDerivation>,
+    /// The `CARGO_BUILD_JOBS` every supervisor cargo invocation carries.
+    pub jobs: crate::build_sizing::SlotJobs,
+    /// The one-target estimate persisted by a previous footprint walk, read at
+    /// startup. The disk floor uses it whenever the cached footprint has
+    /// measured no built slot.
+    pub persisted_estimate: Option<crate::build_sizing::OneTargetEstimate>,
 }
 
-impl Default for BuildPoolConfig {
-    fn default() -> Self {
-        let pool_size = std::env::var("QONTINUI_SUPERVISOR_BUILD_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(3);
-        Self { pool_size }
+/// Fixed host for [`BuildPoolConfig::fixed`] (fixtures): deterministic, and no
+/// sysinfo probe per fixture.
+const FIXTURE_HOST: qontinui_types::host_sizing::HostCapacity =
+    qontinui_types::host_sizing::HostCapacity {
+        mem_bytes: Some(64 * 1024 * 1024 * 1024),
+        cpus: 16,
+    };
+
+impl BuildPoolConfig {
+    /// Resolve from explicit inputs (pure): the pool-size env text, the
+    /// supervisor's own `CARGO_BUILD_JOBS`, the host, and the disk readings for
+    /// the volume holding the pool root. A pool-size override that is not a
+    /// positive integer is ignored (the size is derived), as before.
+    pub fn resolve(
+        pool_size_env: Option<String>,
+        cargo_build_jobs_env: Option<String>,
+        host: qontinui_types::host_sizing::HostCapacity,
+        disk: &crate::build_sizing::DiskInputs,
+        persisted_estimate: Option<crate::build_sizing::OneTargetEstimate>,
+    ) -> Self {
+        use crate::build_sizing::{derive_pool_size, PoolSizeSource, SlotJobs};
+        let explicit = pool_size_env
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1);
+        let (pool_size, source, derivation) = match explicit {
+            Some(n) => (n, PoolSizeSource::Override, None),
+            None => {
+                let (n, d) = derive_pool_size(host, disk);
+                (n as usize, PoolSizeSource::Derived, Some(d))
+            }
+        };
+        let jobs = SlotJobs::resolve(
+            host,
+            pool_size.min(u32::MAX as usize) as u32,
+            cargo_build_jobs_env,
+        );
+        Self {
+            pool_size,
+            source,
+            derivation,
+            jobs,
+            persisted_estimate,
+        }
+    }
+
+    /// Resolve from the live process: env vars, a host probe, the disk holding
+    /// `pool_root` (or its nearest existing ancestor), and the one-target size
+    /// estimate persisted under `pool_root` by the footprint refresh.
+    pub fn for_pool_root(pool_root: &Path) -> Self {
+        let probe_path = pool_root
+            .ancestors()
+            .find(|p| p.exists())
+            .unwrap_or(pool_root);
+        let usage = crate::footprint::disk_usage_for(probe_path);
+        let estimate = crate::build_sizing::read_one_target_estimate(pool_root);
+        let disk = crate::build_sizing::DiskInputs {
+            free_bytes: usage.as_ref().map(|d| d.free_bytes),
+            total_bytes: usage.as_ref().map(|d| d.total_bytes),
+            one_target_bytes: estimate.as_ref().map(|e| e.bytes),
+            // Read on disk now (one stat per slot), not taken from the last
+            // walk, which saw only `0..pool_size` of that process.
+            built_slot_ids: crate::build_sizing::built_slot_ids(pool_root),
+            floor_override_gb: min_free_disk_gb_override(),
+        };
+        Self::resolve(
+            std::env::var(crate::build_sizing::BUILD_POOL_SIZE_ENV).ok(),
+            std::env::var(crate::build_sizing::CARGO_BUILD_JOBS_ENV).ok(),
+            qontinui_types::host_sizing::probe(),
+            &disk,
+            estimate,
+        )
+    }
+
+    /// An explicitly sized pool (tests and fixtures): `source: override`, jobs
+    /// derived for that size on a fixed 16-cpu / 64 GiB host.
+    pub fn fixed(pool_size: usize) -> Self {
+        Self::resolve(
+            Some(pool_size.to_string()),
+            None,
+            FIXTURE_HOST,
+            &crate::build_sizing::DiskInputs::default(),
+            None,
+        )
     }
 }
 
 /// Default minimum free disk (GB) below which the pre-permit disk guard
-/// refuses a build. See [`min_free_disk_gb`].
+/// refuses a build, and the floor of the derived floor: the effective value
+/// follows the machine (plan `2026-10-02-cargo-jobs-…` Phase 4,
+/// [`crate::build_sizing::derived_disk_floor_gb`]) and is never below this.
+/// See [`min_free_disk_gb_override`].
 pub const DEFAULT_MIN_FREE_DISK_GB: u64 = 30;
 
 /// Env var overriding the pre-permit disk guard threshold, in GB.
 pub const MIN_FREE_DISK_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB";
 
-/// Minimum free disk (in GB) required before a build may acquire a build-pool
-/// permit. Resolved from [`MIN_FREE_DISK_GB_ENV`], falling back to
-/// [`DEFAULT_MIN_FREE_DISK_GB`]. Parse-with-default exactly like
-/// [`BuildPoolConfig::default`]: a malformed value yields the default. A `0`
-/// disables the guard entirely (treat every disk state as sufficient).
-pub fn min_free_disk_gb() -> u64 {
+/// Explicit override of the pre-permit disk guard threshold, in GB, from
+/// [`MIN_FREE_DISK_GB_ENV`]. `None` (unset or malformed) means the floor is
+/// DERIVED from the machine ([`crate::build_sizing::effective_disk_floor`],
+/// which falls back to [`DEFAULT_MIN_FREE_DISK_GB`] on any UNKNOWN input). A
+/// `0` disables the guard entirely (treat every disk state as sufficient).
+pub fn min_free_disk_gb_override() -> Option<u64> {
     std::env::var(MIN_FREE_DISK_GB_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MIN_FREE_DISK_GB)
 }
 
 /// Default minimum free COMMIT (GB) below which the pre-permit memory guard
@@ -362,7 +518,7 @@ pub const MIN_FREE_RAM_GB_ENV: &str = "QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB";
 /// Minimum free commit (in GB) required before a build may acquire a build-pool
 /// permit. Resolved from [`MIN_FREE_RAM_GB_ENV`], falling back to
 /// [`DEFAULT_MIN_FREE_RAM_GB`]. Parse-with-default exactly like
-/// [`min_free_disk_gb`]. A `0` disables the guard entirely.
+/// [`min_free_disk_gb_override`]. A `0` disables the guard entirely.
 pub fn min_free_ram_gb() -> u64 {
     std::env::var(MIN_FREE_RAM_GB_ENV)
         .ok()
@@ -479,6 +635,22 @@ pub struct RunnerConfig {
     /// settings file.
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Plan `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b:
+    /// when true this subject runs under its OWN device identity. The spawn
+    /// projects no `machine.json` and no paired state (neither the primary's
+    /// `paired_user.json` / `auth_tokens.enc` nor a `paired_profile_id`
+    /// snapshot) into the instance root, and removes `QONTINUI_MACHINE_ID`
+    /// from the child env, so the runner mints a new `device_id` into
+    /// `<root>/home/machine.json` at first start
+    /// (`pair::ensure_device_initialized`).
+    ///
+    /// Persisted with the config (named runners), so a later restart of the
+    /// same runner never re-projects the harness's identity over the one it
+    /// minted. Omitted from the serialized form when false, so an unflagged
+    /// runner's settings entry is byte-for-byte what it was before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_device_identity: bool,
 }
 
 impl RunnerConfig {
@@ -512,6 +684,7 @@ impl RunnerConfig {
             external_restate_admin_url: None,
             external_restate_ingress_url: None,
             extra_env: std::collections::HashMap::new(),
+            fresh_device_identity: false,
         }
     }
 }
@@ -547,6 +720,37 @@ pub const EXPO_PORT: u16 = 8081;
 /// Gives the runner's WindowEvent::CloseRequested handler time to run
 /// teardown hooks (e.g. UsbTransport::release_all releasing adb forwards).
 pub const RUNNER_GRACEFUL_STOP_TIMEOUT_MS: u64 = 3000;
+/// The graceful wait used INSTEAD of [`RUNNER_GRACEFUL_STOP_TIMEOUT_MS`] when a
+/// restart carries the handoff intent (`{"handoff":"holders"}` on the
+/// close-request; plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7).
+///
+/// A handoff close only keeps a holder-backed pane alive if the runner's
+/// teardown gets to DETACH it, and the teardown writes its
+/// `handoff: N detached…` summary only once it finishes. The 3 s default is
+/// shorter than that teardown is allowed to take, so a slow-but-healthy
+/// teardown would be cut by the PID kill mid-detach — the panes the caller
+/// asked to keep would die the crash way, and the summary line that proves
+/// what happened would never be written.
+///
+/// Source: qontinui-runner `src-tauri/src/main.rs` `mod shutdown_budget`
+/// (read at qontinui-runner `origin/main` 1b59d9316): `WORKER_BUDGET` = 22 s
+/// (join 3 + drain 8 + terminal close 5 + AI kill 4 + misc 2) is the whole
+/// off-thread `run_teardown` sequence, and `FORCE_EXIT_BUDGET` = 25 s
+/// (`WORKER_BUDGET` + `FORCE_EXIT_MARGIN` 3 s) is the runner's own absolute
+/// watchdog. 30 s clears the runner's own hard exit, so the supervisor's kill
+/// is never the thing that ends a handoff teardown that is still within its
+/// budget. If the runner widens those budgets, widen this with them —
+/// `handoff_wait_clears_the_runner_force_exit_budget` pins the relation.
+pub const RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS: u64 = 30_000;
+/// The runner's `shutdown_budget::FORCE_EXIT_BUDGET` (25 s) as last read from
+/// qontinui-runner `origin/main` 1b59d9316, kept here only so the relation
+/// [`RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`] must hold is checked rather than
+/// restated. A copy of a value another repo owns — not an authority, and
+/// test-only for that reason: nothing at runtime may branch on it.
+#[cfg(test)]
+pub const RUNNER_TEARDOWN_FORCE_EXIT_BUDGET_MS: u64 = 25_000;
 /// Per-request timeout for the graceful close POST itself. Short because
 /// the endpoint returns as soon as the event is queued — if it hangs, the
 /// runner is already unhealthy and we want to fall through to kill quickly.
@@ -976,6 +1180,11 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 }
 
 impl SupervisorConfig {
+    /// Build the config from the command line. `ambient_target_dir` and
+    /// `ambient_coord` are `Ignore` in a unit-test build and `Read` everywhere
+    /// else, an integration test under `tests/` included, which is why no file
+    /// there calls this (see [`AmbientTargetDir::Ignore`] and
+    /// [`AmbientCoord::Ignore`]).
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1015,7 +1224,7 @@ impl SupervisorConfig {
             std::env::var(TEMP_RUNNER_DISPLAY_ENV).ok(),
         );
 
-        SupervisorConfig {
+        let mut config = SupervisorConfig {
             project_dir: args.project_dir,
             watchdog_enabled_at_start: args.watchdog,
             auto_start,
@@ -1029,11 +1238,25 @@ impl SupervisorConfig {
             expo_port: EXPO_PORT,
             // Default: single primary runner; settings may override later
             runners: vec![RunnerConfig::default_primary()],
-            build_pool: BuildPoolConfig::default(),
+            // Placeholder; derived just below once the pool root is known.
+            build_pool: BuildPoolConfig::fixed(1),
             no_prewarm,
             no_webview,
             temp_runner_display,
-        }
+            ambient_target_dir: if cfg!(test) {
+                AmbientTargetDir::Ignore
+            } else {
+                AmbientTargetDir::Read
+            },
+            ambient_coord: if cfg!(test) {
+                AmbientCoord::Ignore
+            } else {
+                AmbientCoord::Read
+            },
+        };
+        config.build_pool =
+            BuildPoolConfig::for_pool_root(&config.runner_npm_dir().join("target-pool"));
+        config
     }
 
     /// Target directory for a given build slot.
@@ -1094,11 +1317,26 @@ impl SupervisorConfig {
     /// call — deliberately, so an operator who exports a different
     /// `CARGO_TARGET_DIR` and rebuilds does not need to restart the supervisor
     /// for resolution to follow. Both reads are cheap and off any hot path
-    /// (resolution runs once per runner start).
+    /// (resolution runs once per runner start). With
+    /// [`AmbientTargetDir::Ignore`] (a unit-test build) neither is read, and the
+    /// workspace default is the only candidate.
     pub fn runner_target_dir_candidates(&self) -> Vec<(TargetDirSource, PathBuf)> {
+        self.runner_target_dir_candidates_with(|| std::env::var(CARGO_TARGET_DIR_ENV).ok())
+    }
+
+    /// [`Self::runner_target_dir_candidates`] with the `CARGO_TARGET_DIR` read
+    /// passed in, so a test can stand in for the environment without setting
+    /// process-global state. `read_env` is called only under
+    /// [`AmbientTargetDir::Read`].
+    fn runner_target_dir_candidates_with(
+        &self,
+        read_env: impl FnOnce() -> Option<String>,
+    ) -> Vec<(TargetDirSource, PathBuf)> {
         let cargo_cwd = self.runner_cargo_cwd();
-        let env_value = std::env::var(CARGO_TARGET_DIR_ENV).ok();
-        let config_value = read_cargo_config_target_dir(&cargo_cwd);
+        let (env_value, config_value) = match self.ambient_target_dir {
+            AmbientTargetDir::Read => (read_env(), read_cargo_config_target_dir(&cargo_cwd)),
+            AmbientTargetDir::Ignore => (None, None),
+        };
         target_dir_candidates(
             &cargo_cwd,
             &self.runner_npm_dir(),
@@ -1229,14 +1467,19 @@ impl SupervisorConfig {
 
     /// Path to the runner npm project root (parent of src-tauri).
     ///
-    /// Always returns an absolute path. When the supervisor was
-    /// launched with a relative `--project-dir` (e.g. `../qontinui-runner/src-tauri`),
-    /// the parent resolves to `../qontinui-runner` — still relative. If that
-    /// relative path is later passed to cargo via `CARGO_TARGET_DIR`, cargo
-    /// resolves it from its own CWD (`src-tauri`), producing a double-nested
-    /// path like `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
-    /// `canonicalize()` call prevents this by expanding to an absolute path
-    /// at the first call site.
+    /// Absolute whenever the parent exists on disk: `canonicalize` fails on a
+    /// path that does not, and the path is then returned as given. A project
+    /// dir of `.` has the parent `""`, so it returns `""`, and every slot, LKG
+    /// and target path built on it resolves against the working directory.
+    ///
+    /// When the supervisor was launched with a relative `--project-dir`
+    /// (e.g. `../qontinui-runner/src-tauri`), the parent resolves to
+    /// `../qontinui-runner` — still relative. If that relative path is later
+    /// passed to cargo via `CARGO_TARGET_DIR`, cargo resolves it from its own
+    /// CWD (`src-tauri`), producing a double-nested path like
+    /// `qontinui-runner/qontinui-runner/target-pool/slot-0/`. The
+    /// `canonicalize()` call prevents this by expanding to an absolute path at
+    /// the first call site.
     ///
     /// On Windows, `std::fs::canonicalize` returns verbatim paths with the
     /// `\\?\` UNC prefix. Third-party build scripts (notably `libusb1-sys`)
@@ -1279,9 +1522,47 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
+/// A config over a fresh, EMPTY runner tree in a tempdir: no build slot, no LKG
+/// and no workspace-default exe, so a runner start fails at exe resolution
+/// wherever the test process runs and whatever its environment holds. Hold the
+/// returned `TempDir` for the test's lifetime. A relative project dir (`.`)
+/// resolves those candidates against the working directory instead, which
+/// [`AmbientTargetDir::Ignore`] does not touch: a test binary run from a runner
+/// checkout would find that checkout's slot exe and start it. That is the
+/// incident class of coord finding 46f09ce5, which went through
+/// `CARGO_TARGET_DIR`.
+#[cfg(test)]
+pub(crate) fn config_over_an_empty_runner_tree() -> (SupervisorConfig, tempfile::TempDir) {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    let src_tauri = root.path().join("qontinui-runner").join("src-tauri");
+    std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
+    let project_dir = src_tauri.to_string_lossy().into_owned();
+    let config = SupervisorConfig::from_args(CliArgs::parse_from([
+        "test",
+        "--project-dir",
+        project_dir.as_str(),
+    ]));
+    (config, root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Handoff graceful wait ---
+
+    /// The handoff wait must outlast the runner's own hard exit, or the
+    /// supervisor's PID kill can end a handoff teardown that is still inside
+    /// its budget — killing the panes the caller asked to keep. And it must be
+    /// strictly longer than the default wait, or the handoff mode changes
+    /// nothing.
+    #[test]
+    fn handoff_wait_clears_the_runner_force_exit_budget() {
+        const {
+            assert!(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS > RUNNER_TEARDOWN_FORCE_EXIT_BUDGET_MS);
+            assert!(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS > RUNNER_GRACEFUL_STOP_TIMEOUT_MS);
+        }
+    }
 
     // --- Serving-restart threshold ---
 
@@ -1815,6 +2096,454 @@ mod tests {
                 TargetDirSource::WorkspaceDefault,
                 PathBuf::from("/ws/qontinui-runner/target")
             )
+        );
+    }
+
+    #[test]
+    fn a_test_build_resolves_no_runner_exe_through_the_ambient_target_dir() {
+        // Whatever this process's CARGO_TARGET_DIR or a config file above the
+        // checkout says, a test's config never consults them: the developer's
+        // environment must not hand a test a real runner exe to start.
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        assert_eq!(config.ambient_target_dir, AmbientTargetDir::Ignore);
+        let candidates = config
+            .runner_target_dir_candidates_with(|| panic!("a test build read CARGO_TARGET_DIR"));
+        assert_eq!(
+            candidates,
+            vec![(
+                TargetDirSource::WorkspaceDefault,
+                config.runner_npm_dir().join("target")
+            )]
+        );
+    }
+
+    #[test]
+    fn ignoring_the_ambient_target_dir_drops_the_cargo_target_dir_rung() {
+        // The environment is passed in, so this holds wherever the suite runs,
+        // CI included, where CARGO_TARGET_DIR is unset. `Read` takes the rung;
+        // `Ignore` never even reads it.
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+
+        config.ambient_target_dir = AmbientTargetDir::Read;
+        let read = config.runner_target_dir_candidates_with(|| Some("elsewhere".to_string()));
+        assert_eq!(read[0].0, TargetDirSource::CargoTargetDirEnv, "{read:?}");
+        assert!(read[0].1.ends_with("elsewhere"), "{read:?}");
+
+        config.ambient_target_dir = AmbientTargetDir::Ignore;
+        let ignored = config.runner_target_dir_candidates_with(|| panic!("Ignore read the env"));
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert_eq!(ignored[0].0, TargetDirSource::WorkspaceDefault);
+    }
+
+    #[test]
+    fn ignoring_the_ambient_target_dir_drops_the_cargo_config_rung() {
+        // The same checkout under a config file that names a target dir: `Read`
+        // takes that rung, `Ignore` does not. A file rather than the
+        // environment, so the test sets no process-global state.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tauri = tmp.path().join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cargo").join("config.toml"),
+            "[build]\ntarget-dir = \"shared-target\"\n",
+        )
+        .unwrap();
+        let mut config = SupervisorConfig::from_args(make_test_args(false, false));
+        config.project_dir = src_tauri;
+
+        config.ambient_target_dir = AmbientTargetDir::Read;
+        let read = config.runner_target_dir_candidates();
+        assert!(
+            read.iter()
+                .any(|(src, _)| *src == TargetDirSource::CargoConfigBuildTargetDir),
+            "{read:?}"
+        );
+
+        config.ambient_target_dir = AmbientTargetDir::Ignore;
+        let ignored = config.runner_target_dir_candidates();
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert_eq!(ignored[0].0, TargetDirSource::WorkspaceDefault);
+    }
+
+    /// Every `.rs` file under this crate's `src/` and `tests/`. A directory
+    /// that cannot be listed panics rather than being skipped: a silent skip
+    /// would let the scan below rot into a no-op.
+    fn crate_sources() -> Vec<PathBuf> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        let mut stack = vec![manifest.join("src"), manifest.join("tests")];
+        while let Some(dir) = stack.pop() {
+            let entries =
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {dir:?}: {e}"));
+            for entry in entries {
+                let path = entry
+                    .unwrap_or_else(|e| panic!("cannot read an entry of {dir:?}: {e}"))
+                    .path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The spellings of a test config rooted at the working directory, with
+    /// whitespace removed. Built here rather than written out, so this file
+    /// never contains them.
+    fn working_directory_needles() -> Vec<String> {
+        let (dot, empty) = (".", "");
+        let mut needles = vec![
+            format!("\"--project-dir\",\"{dot}\""),
+            format!("\"--project-dir\",\"{dot}/\""),
+            format!("\"--project-dir={dot}\""),
+            format!("\"-p\",\"{dot}\""),
+            format!("\"-p{dot}\""),
+        ];
+        let values = [
+            format!("PathBuf::from(\"{dot}\")"),
+            format!("std::path::PathBuf::from(\"{dot}\")"),
+            "PathBuf::new()".to_string(),
+            "std::path::PathBuf::new()".to_string(),
+            format!("\"{dot}\".into()"),
+            format!("\"{empty}\".into()"),
+        ];
+        // A struct-literal field, and an assignment (`config.project_dir = …`).
+        for bind in ["project_dir:", "project_dir="] {
+            needles.extend(values.iter().map(|value| format!("{bind}{value}")));
+        }
+        needles
+    }
+
+    /// A `from_args` call, whitespace removed. An integration test links the
+    /// library without `cfg(test)`, so this call hands it both ambient `Read`s.
+    fn from_args_needle() -> Vec<String> {
+        vec!["::from_args(".to_string()]
+    }
+
+    /// Source text with its whitespace removed, so a call split across lines
+    /// matches the same needle as one written on a single line, plus the line
+    /// each kept byte came from, so a match is reported where it is.
+    struct Squeezed {
+        text: String,
+        lines: Vec<usize>,
+    }
+
+    impl Squeezed {
+        fn new(source: &str) -> Self {
+            let mut text = String::with_capacity(source.len());
+            let mut lines = Vec::with_capacity(source.len());
+            for (idx, line) in source.lines().enumerate() {
+                for c in line.chars().filter(|c| !c.is_whitespace()) {
+                    text.push(c);
+                    lines.extend(std::iter::repeat_n(idx + 1, c.len_utf8()));
+                }
+            }
+            Self { text, lines }
+        }
+
+        /// The line of every match of any needle, in source order.
+        fn lines_matching(&self, needles: &[String]) -> Vec<usize> {
+            let mut at: Vec<usize> = needles
+                .iter()
+                .flat_map(|n| self.text.match_indices(n.as_str()).map(|(i, _)| i))
+                .collect();
+            at.sort_unstable();
+            at.into_iter().map(|i| self.lines[i]).collect()
+        }
+    }
+
+    #[test]
+    fn the_working_directory_scan_flags_each_spelling_and_nothing_else() {
+        // The needles prove nothing unless they match real source, so each
+        // one is checked against a sample written the way a test would write
+        // it, with its whitespace, the split-across-lines form included. The
+        // samples are built here for the same reason the needles are, and
+        // written out separately from them, so a broken escape in a needle
+        // shows up as a needle no sample matches.
+        let needles = working_directory_needles();
+        let (dot, empty) = (".", "");
+        let mut flagged = vec![
+            (
+                format!(
+                    "let a = 1;\nlet args = CliArgs::parse_from([\n    \"test\",\n    \
+                     \"--project-dir\",\n    \"{dot}\",\n]);\n"
+                ),
+                vec![4],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"--project-dir\", \"{dot}/\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"--project-dir={dot}\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"-p\", \"{dot}\"]);\n"),
+                vec![1],
+            ),
+            (
+                format!("CliArgs::parse_from([\"test\", \"-p{dot}\"]);\n"),
+                vec![1],
+            ),
+        ];
+        let values = [
+            format!("PathBuf::from(\"{dot}\")"),
+            format!("std::path::PathBuf::from(\"{dot}\")"),
+            "PathBuf::new()".to_string(),
+            "std::path::PathBuf::new()".to_string(),
+            format!("\"{dot}\".into()"),
+            format!("\"{empty}\".into()"),
+        ];
+        for value in &values {
+            flagged.push((
+                format!("SupervisorConfig {{\n    project_dir: {value},\n}}\n"),
+                vec![2],
+            ));
+            flagged.push((format!("\n\nconfig.project_dir = {value};\n"), vec![3]));
+        }
+        for (sample, lines) in &flagged {
+            assert_eq!(
+                Squeezed::new(sample).lines_matching(&needles),
+                *lines,
+                "{sample}"
+            );
+        }
+        for needle in &needles {
+            assert!(
+                flagged
+                    .iter()
+                    .any(|(sample, _)| Squeezed::new(sample).text.contains(needle.as_str())),
+                "no sample exercises the needle {needle}"
+            );
+        }
+
+        // Near misses are not flagged: the helper's own form, an assignment
+        // from a variable, an absolute root, and a `.` that is not a project
+        // dir (`symbol_watcher`'s watch roots).
+        let clean = format!(
+            "let config = SupervisorConfig::from_args(CliArgs::parse_from([\n    \
+             \"test\",\n    \"--project-dir\",\n    project_dir.as_str(),\n]));\n\
+             config.project_dir = src_tauri;\n\
+             SupervisorConfig {{ project_dir: PathBuf::from(\"/tmp/x\") }};\n\
+             WatcherConfig::build(vec![PathBuf::from(\"{dot}\")], None);\n"
+        );
+        assert_eq!(
+            Squeezed::new(&clean).lines_matching(&needles),
+            Vec::<usize>::new(),
+            "{clean}"
+        );
+    }
+
+    #[test]
+    fn no_test_config_is_rooted_at_the_working_directory() {
+        // A project dir of `.` resolves the slot, LKG and workspace-default
+        // candidates against the working directory (see `runner_npm_dir`),
+        // which `AmbientTargetDir::Ignore` does not cover: run from a runner
+        // checkout, a test that reaches a runner start finds that checkout's
+        // exe and starts it. #253 moved the two states that reach a start onto
+        // `config_over_an_empty_runner_tree`; this keeps the pattern from
+        // coming back at another. It also holds the half `Ignore` cannot
+        // reach: an integration test links the library without `cfg(test)`,
+        // so `from_args` gives it `Read`. No file under `tests/` calls it;
+        // they build a struct literal that names `Ignore`.
+        let needles = working_directory_needles();
+        let helper_call = format!("{}()", "config_over_an_empty_runner_tree");
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+
+        let mut offenders = Vec::new();
+        let mut reading_the_ambient_target_dir = Vec::new();
+        let mut files_scanned = 0usize;
+        let mut integration_files_scanned = 0usize;
+        let mut helper_call_sites = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            let squeezed = Squeezed::new(&source);
+            helper_call_sites += squeezed.text.matches(helper_call.as_str()).count()
+                - squeezed.text.matches(&format!("fn{helper_call}")).count();
+            for line in squeezed.lines_matching(&needles) {
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+            if path.starts_with(&tests_dir) {
+                integration_files_scanned += 1;
+                for line in squeezed.lines_matching(&from_args_needle()) {
+                    reading_the_ambient_target_dir.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+
+        // Vacuity guards: a scan that read almost nothing, or that missed the
+        // integration tests, would pass while asserting nothing about them.
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            integration_files_scanned > 0,
+            "scanned no file under tests/ — the scan no longer covers the integration tests"
+        );
+        assert!(
+            helper_call_sites > 0,
+            "no test state builds its config through `{helper_call}` — either the scan \
+             is broken or the states stopped using it"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these test configs use the working directory as the runner project dir; \
+             build them with `config::config_over_an_empty_runner_tree` (or another \
+             tempdir root) instead:\n  {}",
+            offenders.join("\n  ")
+        );
+        assert!(
+            reading_the_ambient_target_dir.is_empty(),
+            "these integration tests call `from_args`, which gives them \
+             `AmbientTargetDir::Read` (`cfg(test)` is not set for the library they \
+             link); build a `SupervisorConfig` literal with \
+             `ambient_target_dir: AmbientTargetDir::Ignore` instead:\n  {}",
+            reading_the_ambient_target_dir.join("\n  ")
+        );
+    }
+
+    /// Where `squeezed` initialises or assigns the `ambient_coord` field to an
+    /// expression naming the `Read` variant, however the path is qualified, as
+    /// byte offsets into its text. The expression ends at the next `,` or `;`,
+    /// so `from_args`' `if cfg!(test) { … } else { … }` counts as one, and a
+    /// bare mention of the variant passed as a value (the resolver's own tests)
+    /// does not.
+    fn ambient_coord_read_sites(squeezed: &Squeezed) -> Vec<usize> {
+        let field = "ambient_coord";
+        let read = format!("AmbientCoord::{}", "Read");
+        let mut at = Vec::new();
+        for bind in [":", "="] {
+            let needle = format!("{field}{bind}");
+            for (i, _) in squeezed.text.match_indices(needle.as_str()) {
+                let value = &squeezed.text[i + needle.len()..];
+                let end = value.find([',', ';']).unwrap_or(value.len());
+                if value[..end].contains(read.as_str()) {
+                    at.push(i);
+                }
+            }
+        }
+        at.sort_unstable();
+        at
+    }
+
+    #[test]
+    fn a_test_build_reads_no_ambient_coord() {
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        assert_eq!(config.ambient_coord, AmbientCoord::Ignore);
+        assert_eq!(
+            crate::dev_action::ingest::coord_base_with(
+                &config.ambient_coord,
+                || panic!("read COORD_HTTP_URL"),
+                || panic!("read profiles.json"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn no_test_config_reads_the_ambient_coord() {
+        // `AmbientCoord::Read` in a test config would send that test's mint to
+        // whatever the box's `COORD_HTTP_URL` or `profiles.json` names, and its
+        // closed window into the ledger the LKG restart guard reads. The one
+        // field init that names the variant is `from_args`' production arm.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_rs = manifest.join("src").join("config.rs");
+        let tests_dir = manifest.join("tests");
+
+        // The scan proves nothing unless it matches the forms a config would
+        // write. Built here, so this file holds none of them outside `from_args`.
+        let (field, read) = ("ambient_coord", format!("AmbientCoord::{}", "Read"));
+        for flagged in [
+            format!("SupervisorConfig {{\n    {field}: {read},\n}}"),
+            format!("SupervisorConfig {{ {field}: crate::config::{read} }};"),
+            format!("{field}: qontinui_supervisor::config::{read},"),
+            format!("config.{field} = {read};"),
+        ] {
+            assert_eq!(
+                ambient_coord_read_sites(&Squeezed::new(&flagged)).len(),
+                1,
+                "{flagged}"
+            );
+        }
+        for clean in [
+            format!("coord_base_with(&{read}, env, profiles)"),
+            format!("{field}: AmbientCoord::Ignore,\nlet a = {read};"),
+            format!("{field}: AmbientCoord::At(stub.base.clone()),"),
+            format!("pub {field}: AmbientCoord,"),
+        ] {
+            assert_eq!(
+                ambient_coord_read_sites(&Squeezed::new(&clean)),
+                Vec::<usize>::new(),
+                "{clean}"
+            );
+        }
+
+        let mut outside_from_args = Vec::new();
+        let mut calling_from_args = Vec::new();
+        let mut inside_from_args = 0usize;
+        let mut files_scanned = 0usize;
+        let mut integration_files_scanned = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            let squeezed = Squeezed::new(&source);
+            let from_args_span = (path == config_rs).then(|| {
+                let start = squeezed
+                    .text
+                    .find("pubfnfrom_args(")
+                    .expect("config.rs defines from_args");
+                let len = squeezed.text[start + 1..]
+                    .find("pubfn")
+                    .expect("a function follows from_args");
+                start..start + 1 + len
+            });
+            for at in ambient_coord_read_sites(&squeezed) {
+                if from_args_span.as_ref().is_some_and(|s| s.contains(&at)) {
+                    inside_from_args += 1;
+                } else {
+                    outside_from_args.push(format!("{}:{}", path.display(), squeezed.lines[at]));
+                }
+            }
+            if path.starts_with(&tests_dir) {
+                integration_files_scanned += 1;
+                for line in squeezed.lines_matching(&from_args_needle()) {
+                    calling_from_args.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            integration_files_scanned > 0,
+            "scanned no file under tests/ — the scan no longer covers the integration tests"
+        );
+        assert_eq!(
+            inside_from_args, 1,
+            "`from_args` must pick the ambient coord for production exactly once"
+        );
+        assert!(
+            outside_from_args.is_empty(),
+            "these configs read the ambient coord; name `AmbientCoord::Ignore`, or \
+             `AmbientCoord::At` to plant rows:\n  {}",
+            outside_from_args.join("\n  ")
+        );
+        assert!(
+            calling_from_args.is_empty(),
+            "these integration tests call `from_args`, which gives them the ambient coord \
+             (`cfg(test)` is not set for the library they link); build a `SupervisorConfig` \
+             literal that names `AmbientCoord::Ignore` instead:\n  {}",
+            calling_from_args.join("\n  ")
         );
     }
 

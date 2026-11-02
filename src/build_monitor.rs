@@ -200,7 +200,9 @@ pub fn disk_guard_allows_for(
                 let free = other.unwrap_or(0);
                 Err(format!(
                     "Pre-permit disk guard: refusing build — {} GB free, need at least \
-                     {min_free_gb} GB (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
+                     {min_free_gb} GB (the effective floor — GET /health \
+                     build.pool.disk_floor names its source and inputs; override \
+                     QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
                     free / (1024 * 1024 * 1024)
                 ))
             }
@@ -809,7 +811,10 @@ impl BuildPhase {
 /// cached (may be `None` if no refresh has run yet — the caller still gets the
 /// numeric free/required bytes and the prune-endpoint hints).
 pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError> {
-    let min_free_gb = crate::config::min_free_disk_gb();
+    // The floor follows the machine (plan `2026-10-02-cargo-jobs-…` Phase 4):
+    // derived from the CACHED footprint's largest built slot and volume size —
+    // never a tree walk on the gate — UNKNOWN → 30, env override wins.
+    let min_free_gb = effective_disk_floor(state).await.gb;
     if min_free_gb == 0 {
         return Ok(());
     }
@@ -855,6 +860,21 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
         required_bytes,
         footprint: Box::new(footprint),
     })
+}
+
+/// The effective pre-permit disk floor for this supervisor: the env override
+/// when set, else [`crate::build_sizing::derived_disk_floor_gb`] over the pool
+/// size and the cached footprint snapshot — or, whenever that snapshot has
+/// measured no built slot, the estimate an earlier walk persisted (UNKNOWN →
+/// 30 when neither has).
+pub async fn effective_disk_floor(state: &SharedState) -> crate::build_sizing::DiskFloor {
+    let footprint = state.footprint.read().await;
+    crate::build_sizing::effective_disk_floor(
+        crate::config::min_free_disk_gb_override(),
+        state.config.build_pool.pool_size.min(u32::MAX as usize) as u32,
+        footprint.as_ref(),
+        state.config.build_pool.persisted_estimate.as_ref(),
+    )
 }
 
 /// RAII guard that clears a `BuildSlot::busy` field on drop AND reconciles
@@ -1869,7 +1889,11 @@ async fn run_build_inner(
             .progress_probe(artifact_progress_probe(&slot.target_dir));
     // No QONTINUI_ALLOW_PLACEHOLDER_DIST here: this build produces the exe a
     // runner starts from, so build.rs must be free to refuse a placeholder dist.
-    let guarded = with_invocation_env(guarded, CargoInvocation::SlotBuild);
+    let guarded = with_invocation_env(
+        guarded,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::SlotBuild,
+    );
 
     let outcome = guarded.run().await;
     // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
@@ -2217,6 +2241,17 @@ pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile.exe";
 #[cfg(not(windows))]
 pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile";
 
+/// Filename of the per-pane PTY holder (`[[bin]] name = "qontinui-pty-holder"`
+/// of the runner workspace's `crates/pty-holder` package, NOT of the runner
+/// package). The runner spawns it from `current_exe().parent()`
+/// (`pty_holder::spawn::resolve_holder_exe`), so it is deployed beside every
+/// runner exe. Without it, `terminal.pty_holder` (default ON on Linux) falls
+/// back to an in-process PTY and the pane dies with the runner.
+#[cfg(windows)]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder.exe";
+#[cfg(not(windows))]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder";
+
 /// One helper binary built from the runner workspace alongside the runner exe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerSidecar {
@@ -2239,7 +2274,7 @@ pub struct RunnerSidecar {
 /// these bins (pinned by a test), and the LKG carry and the per-runner deploy
 /// both iterate this list, so adding a sidecar here reaches every step of the
 /// placement contract.
-pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
+pub const RUNNER_SIDECARS: [RunnerSidecar; 4] = [
     RunnerSidecar {
         bin: "qontinui-shim",
         filename: SHIM_EXE_FILENAME,
@@ -2259,6 +2294,13 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
         consequence: "POST /runners/pair-with-token cannot use this build's qontinui_profile",
         deployed_beside_runner: false,
     },
+    RunnerSidecar {
+        bin: "qontinui-pty-holder",
+        filename: PTY_HOLDER_EXE_FILENAME,
+        consequence: "terminal panes fall back to an in-process PTY and will NOT survive a \
+                      runner exit",
+        deployed_beside_runner: true,
+    },
 ];
 
 /// Args of the fail-open sidecar build. ONE invocation over the whole roster,
@@ -2277,12 +2319,20 @@ pub const RUNNER_SIDECARS: [RunnerSidecar; 3] = [
 pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
     "build",
     "--keep-going",
+    // `qontinui-pty-holder` lives in another workspace package, and from a
+    // member directory cargo selects THAT package only, so both are named.
+    "-p",
+    "qontinui-runner",
+    "-p",
+    "qontinui-pty-holder",
     "--bin",
     "qontinui-shim",
     "--bin",
     "qontinui-pr",
     "--bin",
     "qontinui_profile",
+    "--bin",
+    "qontinui-pty-holder",
     "--features",
     "custom-protocol",
 ];
@@ -2299,6 +2349,34 @@ pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
 pub(crate) fn declared_bin_targets(
     cargo_cwd: &std::path::Path,
 ) -> Option<std::collections::BTreeSet<String>> {
+    let mut declared = package_bin_targets(cargo_cwd)?;
+    // Bins of the other workspace members (the PTY holder is one): the roster
+    // names bins by `--bin`, which cargo resolves across the selected packages.
+    if let Some(root) = cargo_cwd.parent() {
+        let members = std::fs::read_to_string(root.join("Cargo.toml"))
+            .ok()
+            .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+            .and_then(|m| {
+                m.get("workspace")?.get("members")?.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        for member in members.iter().filter(|m| !m.contains('*')) {
+            if let Some(bins) = package_bin_targets(&root.join(member)) {
+                declared.extend(bins);
+            }
+        }
+    }
+    Some(declared)
+}
+
+/// The bin targets of the single package at `dir/Cargo.toml` (see
+/// [`declared_bin_targets`]); `None` when it has no readable `[package]`.
+fn package_bin_targets(dir: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    let cargo_cwd = dir;
     let text = std::fs::read_to_string(cargo_cwd.join("Cargo.toml")).ok()?;
     let manifest: toml::Value = toml::from_str(&text).ok()?;
     let package = manifest.get("package")?.as_table()?;
@@ -2348,6 +2426,14 @@ pub(crate) fn sidecar_build_args(
             let bin = SIDECAR_BUILD_ARGS[i + 1];
             if declared.is_none_or(|d| d.contains(bin)) {
                 args.extend([arg, bin]);
+            }
+            i += 2;
+        } else if arg == "-p" {
+            // `-p <pkg>` for a package the tree lacks is an unknown-package
+            // error that costs the whole invocation, like an unknown `--bin`.
+            let pkg = SIDECAR_BUILD_ARGS[i + 1];
+            if pkg != "qontinui-pty-holder" || declared.is_none_or(|d| d.contains(pkg)) {
+                args.extend([arg, pkg]);
             }
             i += 2;
         } else {
@@ -2402,7 +2488,7 @@ pub(crate) fn remove_if_zero_length(path: &std::path::Path) -> bool {
 /// main runner build succeeded on the SAME warm `CARGO_TARGET_DIR` with the
 /// SAME feature set, so every shared dependency — the runner lib crate
 /// included — is already compiled; what remains is compiling and linking
-/// three small bins. 10 minutes is a generous ceiling for a heavily contended
+/// four small bins. 10 minutes is a generous ceiling for a heavily contended
 /// machine.
 const SIDECAR_BUILD_TIMEOUT_SECS: u64 = 600;
 
@@ -2495,7 +2581,11 @@ async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &
         .current_dir(cargo_cwd)
         .env("CARGO_TARGET_DIR", &slot.target_dir)
         .job_guarded(true);
-        let guarded = with_invocation_env(guarded, CargoInvocation::SidecarBuild);
+        let guarded = with_invocation_env(
+            guarded,
+            state.config.build_pool.jobs.to_set(),
+            CargoInvocation::SidecarBuild,
+        );
 
         match guarded.run().await {
             Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
@@ -4288,8 +4378,13 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
                 );
                 // Temp runner (the arm is gated on `is_temp`), which the
                 // readiness gate exempts; `false` is the honest value.
-                if let Err(e) =
-                    crate::process::manager::stop_runner_by_id(state, &runner_id, false).await
+                if let Err(e) = crate::process::manager::stop_runner_by_id(
+                    state,
+                    &runner_id,
+                    false,
+                    crate::process::manager::CloseIntent::Kill,
+                )
+                .await
                 {
                     warn!(
                         "stop_runner_by_id('{}') failed: {} — escalating to direct kill",
@@ -4437,8 +4532,13 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
                 "Stopping temp runner '{}' (PID {}) running from slot exe {:?} before build",
                 managed.config.name, pid, exe_path
             );
-            if let Err(e) =
-                crate::process::manager::stop_runner_by_id(state, &managed.config.id, false).await
+            if let Err(e) = crate::process::manager::stop_runner_by_id(
+                state,
+                &managed.config.id,
+                false,
+                crate::process::manager::CloseIntent::Kill,
+            )
+            .await
             {
                 warn!(
                     "Failed to stop temp runner '{}' before build: {}",
@@ -4502,10 +4602,11 @@ pub(crate) enum CargoInvocation {
 }
 
 /// The env a supervisor cargo invocation SETS and REMOVES, by kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InvocationEnv {
-    /// Variables set on the child.
-    pub set: &'static [(&'static str, &'static str)],
+    /// Variables set on the child. Owned, because `CARGO_BUILD_JOBS` is
+    /// computed from the machine at runtime.
+    pub set: Vec<(&'static str, String)>,
     /// Variables removed from what the child would inherit from the supervisor.
     pub remove: &'static [&'static str],
 }
@@ -4525,28 +4626,48 @@ pub(crate) struct InvocationEnv {
 /// in the supervisor's OWN environment (an operator shell, a dev script)
 /// would be inherited by every real build and silently bypass the refusal.
 /// Plan `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
-pub(crate) fn cargo_invocation_env(kind: CargoInvocation) -> InvocationEnv {
+///
+/// **`CARGO_BUILD_JOBS` on all four kinds** (plan
+/// `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`,
+/// Phase 2). `jobs` is the pool's per-slot share
+/// ([`crate::build_sizing::SlotJobs::to_set`]): every kind holds a pool permit
+/// (the pre-warm runs once per slot, `/build/submit` shares `build_pool.permits`),
+/// so a full pool's jobs sum to at most the machine's cores instead of
+/// `pool_size × cores`. `None` means the supervisor's own environment already
+/// carries `CARGO_BUILD_JOBS`, which the child then inherits untouched.
+pub(crate) fn cargo_invocation_env(kind: CargoInvocation, jobs: Option<u32>) -> InvocationEnv {
+    let mut set: Vec<(&'static str, String)> = Vec::new();
+    if let Some(j) = jobs {
+        set.push((
+            crate::build_sizing::CARGO_BUILD_JOBS_ENV,
+            j.max(1).to_string(),
+        ));
+    }
     match kind {
-        CargoInvocation::Prewarm => InvocationEnv {
-            set: &[(ALLOW_PLACEHOLDER_DIST_ENV, "1")],
-            remove: &[],
-        },
+        CargoInvocation::Prewarm => {
+            set.push((ALLOW_PLACEHOLDER_DIST_ENV, "1".to_string()));
+            InvocationEnv { set, remove: &[] }
+        }
         CargoInvocation::SlotBuild
         | CargoInvocation::SidecarBuild
         | CargoInvocation::Submission => InvocationEnv {
-            set: &[],
+            set,
             remove: &[ALLOW_PLACEHOLDER_DIST_ENV],
         },
     }
 }
 
 /// Apply [`cargo_invocation_env`] for `kind` to a guarded command.
-fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> GuardedCommand {
-    let env = cargo_invocation_env(kind);
+fn with_invocation_env(
+    mut cmd: GuardedCommand,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) -> GuardedCommand {
+    let env = cargo_invocation_env(kind, jobs);
     for k in env.remove {
         cmd = cmd.env_remove(k);
     }
-    for (k, v) in env.set {
+    for (k, v) in &env.set {
         cmd = cmd.env(k, v);
     }
     cmd
@@ -4554,12 +4675,16 @@ fn with_invocation_env(mut cmd: GuardedCommand, kind: CargoInvocation) -> Guarde
 
 /// Apply [`cargo_invocation_env`] for `kind` to a plain tokio command (the
 /// `/build/submit` path, which is not a [`GuardedCommand`]).
-pub(crate) fn apply_invocation_env(cmd: &mut tokio::process::Command, kind: CargoInvocation) {
-    let env = cargo_invocation_env(kind);
+pub(crate) fn apply_invocation_env(
+    cmd: &mut tokio::process::Command,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) {
+    let env = cargo_invocation_env(kind, jobs);
     for k in env.remove {
         cmd.env_remove(k);
     }
-    for (k, v) in env.set {
+    for (k, v) in &env.set {
         cmd.env(k, v);
     }
 }
@@ -4847,11 +4972,15 @@ async fn prewarm_single_slot(
     // `cargo_invocation_env`): this `cargo check` must keep working on a fresh
     // tree with no `dist/`, and the runner's build.rs `rerun-if-env-changed`
     // makes the next real build re-check without it.
-    let outcome = with_invocation_env(cmd, CargoInvocation::Prewarm)
-        .job_guarded(true)
-        .stream_lines(line_tx)
-        .run()
-        .await;
+    let outcome = with_invocation_env(
+        cmd,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::Prewarm,
+    )
+    .job_guarded(true)
+    .stream_lines(line_tx)
+    .run()
+    .await;
 
     // Map the GuardedOutcome back onto the legacy match shape: `Ok(Ok(status))`
     // for a clean exit, the timeout arm for TimedOut/Cancelled, and a process

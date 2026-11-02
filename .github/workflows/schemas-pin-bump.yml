@@ -41,9 +41,14 @@ name: schemas pin bump
 #   - touch an OPEN bump PR. Once proposed, the PR may be an in-flight merge
 #     candidate, and moving a branch tip out from under a proposal is a known
 #     wedge class (the runner's sibling-pin-bump.yml refuses it for the same
-#     reason). It comments ONCE naming the newer schemas head and waits; the
-#     first run after that PR lands bumps against the new main. With a pin,
-#     lagging a run cannot red main.
+#     reason). The one exception is a bump PR that is CONFLICTING and carries
+#     only this workflow's commits: it cannot land, so it is closed with a
+#     comment and rebuilt (see the decide step). A CONFLICTING PR holding anyone
+#     else's commit is left for its owner and named in a warning. Otherwise it
+#     comments ONCE
+#     naming the newer schemas head and waits; the first run after that PR
+#     lands bumps against the new main. With a pin, lagging a run cannot red
+#     main.
 #   - move a pin that is not an ancestor of schemas main (a deliberate hand pin):
 #     it warns and leaves it.
 #   - overwrite commits on the branch it did not author (merge commits aside):
@@ -80,6 +85,17 @@ jobs:
       SCHEMAS: qontinui/qontinui-schemas
       BOT_NAME: github-actions[bot]
       BOT_EMAIL: 41898283+github-actions[bot]@users.noreply.github.com
+      # The jq `select`s that keep only the commits holding someone's work, shared
+      # by the decide and guard steps so they cannot disagree about what is safe
+      # to replace. Everything else was both authored and committed by BOT_EMAIL
+      # with no Co-authored-by trailer, or is the merge train's freshen: a merge of
+      # main that GitHub commits (update-branch) with the merge-train app as author.
+      FOREIGN_COMMIT_SELECT: >-
+        select(((.parents | length) > 1 and .commit.committer.email == "noreply@github.com"
+        and .commit.author.email == "287205177+qontinui-merge-orchestrator[bot]@users.noreply.github.com") | not)
+        | select(.commit.author.email != "41898283+github-actions[bot]@users.noreply.github.com"
+        or .commit.committer.email != "41898283+github-actions[bot]@users.noreply.github.com"
+        or (.commit.message | test("(?im)^co-authored-by:")))
       PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
@@ -113,10 +129,48 @@ jobs:
           fi
           # An open bump PR is never touched (see header). Errors propagate:
           # an unreadable PR list must not read as "no PR".
-          open_pr="$(gh pr list -R "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          # Same-repo PRs only: `--head` matches a fork's branch of this name too,
+          # and a fork PR must neither close nor unblock anything here.
+          open_pr="$(gh pr list -R "$REPO" --head "$BRANCH" --base main --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')"
+          # ONE exception: an open bump PR that is CONFLICTING and carries only
+          # this workflow's own commits is dead, not in flight. It cannot land
+          # (coord does not resolve conflicts) and, left open, it blocks every
+          # later bump, because the branch below is never moved while a PR is
+          # open. The measured case: #231 went CONFLICTING when main's pin was
+          # moved by hand (c294349, 2026-10-22), and every 6-hourly run then
+          # exited green and bumped nothing while the pin fell 91 schemas commits
+          # behind. Same exception as qontinui-coord's copy of this workflow,
+          # which was wedged the same way by its #2650.
+          # Close it, say why, and rebuild. UNKNOWN mergeability (GitHub still
+          # computing) is NOT conflicting: leave the PR alone this run.
+          # "Only this workflow's commits" is FOREIGN_COMMIT_SELECT finding none. A
+          # page that may be truncated counts as foreign. The head is re-read just
+          # before the close so a push landing in between leaves the PR open.
+          # A foreign PR that conflicts is still dead until someone acts, so it
+          # says so rather than promising a bump "after it lands".
+          if [ -n "$open_pr" ]; then
+            read -r mergeable head_before < <(gh pr view "$open_pr" -R "$REPO" --json mergeable,headRefOid --jq '"\(.mergeable) \(.headRefOid)"')
+            foreign="$(gh api "repos/$REPO/pulls/$open_pr/commits?per_page=100" --jq "if length >= 100 then length else ([.[] | $FOREIGN_COMMIT_SELECT] | length) end")"
+            comments="$(gh pr view "$open_pr" -R "$REPO" --json comments --jq '.comments[].body')"
+            if [ "$mergeable" = "CONFLICTING" ] && [ "$foreign" != "0" ]; then
+              msg="Bump PR #$open_pr is CONFLICTING with main and carries commits this workflow did not make, so it cannot land and every later bump waits behind it. Resolve the conflict and land this PR, or close it, then delete its branch if it is still there; the next run after that bumps against qontinui-schemas main."
+              echo "::warning::$msg"
+              if ! grep -qF "is CONFLICTING with main and carries commits" <<< "$comments"; then
+                gh pr comment "$open_pr" -R "$REPO" --body "$msg"
+              fi
+              exit 0
+            fi
+            if [ "$mergeable" = "CONFLICTING" ]; then
+              head_now="$(gh pr view "$open_pr" -R "$REPO" --json headRefOid --jq .headRefOid)"
+              if [ "$head_now" = "$head_before" ]; then
+                gh pr close "$open_pr" -R "$REPO" --comment "Closed by the \`schemas pin bump\` workflow: this bump is CONFLICTING with \`main\` (main moved under it since it was opened) and carries only this workflow's commits, so it can never land and would block every later bump. Rebuilding against qontinui-schemas main \`$head\`."
+                open_pr=""
+              fi
+            fi
+          fi
           if [ -n "$open_pr" ]; then
             echo "Bump PR #$open_pr is open; not moving its branch."
-            if ! gh pr view "$open_pr" -R "$REPO" --json comments --jq '.comments[].body' | grep -qF "$head"; then
+            if ! grep -qF "$head" <<< "$comments"; then
               gh pr comment "$open_pr" -R "$REPO" --body "qontinui-schemas main has moved to \`$head\` since this bump was opened. The pin-bump workflow does not move an open PR's branch (it may be an in-flight merge candidate); the first run after this PR lands will bump against the new main."
             fi
             exit 0
@@ -145,12 +199,12 @@ jobs:
           fi
           echo "lease=$observed" >> "$GITHUB_OUTPUT"
           [ -z "$observed" ] && { echo "No existing $BRANCH branch."; exit 0; }
-          # Merge commits (e.g. a GitHub update-branch) do not count as authored
-          # work; any other commit not by this workflow is someone's adaptation.
-          foreign="$(gh api "repos/$REPO/compare/main...$observed" --jq "[.commits[] | select((.parents | length) == 1 and .commit.author.email != \"$BOT_EMAIL\")] | length")"
+          # Anything but this workflow's own commits and the merge train's freshen
+          # is someone's adaptation (FOREIGN_COMMIT_SELECT).
+          foreign="$(gh api "repos/$REPO/compare/main...$observed" --jq "[.commits[] | $FOREIGN_COMMIT_SELECT] | length")"
           if [ "$foreign" != "0" ]; then
             echo "blocked=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::$BRANCH carries $foreign commit(s) not authored by this workflow and has no open PR. Not overwriting it; open a PR from it or delete the branch to let this job rebuild it."
+            echo "::warning::$BRANCH carries $foreign commit(s) this workflow did not both author and commit, and has no open PR. Not overwriting it; open a PR from it or delete the branch to let this job rebuild it."
           fi
 
       - name: Install the pinned Rust toolchain

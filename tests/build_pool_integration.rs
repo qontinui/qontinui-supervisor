@@ -27,10 +27,12 @@ fn pool_test_config(pool_size: usize) -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size },
+        build_pool: BuildPoolConfig::fixed(pool_size),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

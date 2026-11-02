@@ -6,9 +6,15 @@ use rust_embed::Embed;
 
 use crate::state::SharedState;
 
-// Embedded SPA assets from frontend build output
+// SPA assets from the frontend build output. A release build embeds them. A
+// debug build embeds nothing: `get` reads the build tree's `dist/` from disk
+// at run time. `allow_missing`: a tree with no `dist/` (build.rs could not run
+// npm) still compiles, `get` answers `None` and `index` serves the legacy
+// dashboard. Without it the derive fails on the missing folder, `Assets::get`
+// does not exist (E0599), and the fallback below is unreachable.
 #[derive(Embed)]
 #[folder = "dist/"]
+#[allow_missing = true]
 pub struct Assets;
 
 // Fallback: the original self-contained HTML dashboard

@@ -24,10 +24,12 @@ fn test_config_from_fields() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     };
 
     assert!(!config.watchdog_enabled_at_start);
@@ -54,10 +56,12 @@ fn test_config_runner_exe_path() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     };
 
     let exe_path = config.runner_exe_path();
@@ -86,10 +90,12 @@ fn test_config_runner_npm_dir() {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     };
 
     let npm_dir = config.runner_npm_dir();

@@ -9,8 +9,8 @@
 //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
 //! state as `None`.
 use super::{
-    attach_build_slot_id, attach_spawn_identity, check_dist_freshness, spawn_abandoned_body,
-    wait_out_queue_timeout, FrontendStaleReason,
+    attach_build_slot_id, attach_spawn_identity, check_dist_freshness, probe_runner_health,
+    spawn_abandoned_body, wait_out_queue_timeout, FrontendStaleReason, ProbeOutcome,
 };
 use crate::build_monitor::BuildPhase;
 use crate::source_scan::production_span;
@@ -489,14 +489,18 @@ fn sync_spawn_test_wait_is_shutdown_aware() {
 /// S-4 at the route: the spawn path hands `paired_profile_id` to the
 /// paired-state decision UNCONDITIONALLY (so an absent id reaches the
 /// primary-snapshot arm, which `no_paired_profile_id_applies_the_primary_snapshot`
-/// pins), and surfaces both new response fields. Re-wrapping the call in
+/// pins), and surfaces both new response fields. The identity argument
+/// (Phase 8b) precedes it; only a `fresh_device_identity` runner skips the copy. Re-wrapping the call in
 /// `if let Some(..)` — the pre-S-4 shape, under which a default spawn came
 /// up unpaired — fails here.
 #[test]
 fn spawn_path_applies_paired_state_even_without_a_profile_id() {
     let body = fn_source("async fn execute_spawn_build_inner(");
     assert!(
-        body.contains("apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id)"),
+        body.split_whitespace()
+            .collect::<String>()
+            .contains("body.paired_profile_id.as_deref(),id,){")
+            && body.contains("let paired_state = match apply_paired_state_for_spawn("),
         "execute_spawn_build_inner must pass the OPTIONAL paired_profile_id straight to \
              apply_paired_state_for_spawn, so an absent id snapshots the primary"
     );
@@ -849,8 +853,12 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02")
         .expect("write auth_tokens.enc");
 
-    let report =
-        super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
+    let report = super::apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::Harness,
+        Some(&unique),
+        &runner_id,
+    )
+    .expect("must succeed");
 
     assert_eq!(report["source"], "paired_profile");
     assert_eq!(
@@ -928,6 +936,7 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
         external_restate_admin_url: None,
         external_restate_ingress_url: None,
         extra_env: Default::default(),
+        fresh_device_identity: false,
     };
     let mut cmd = tokio::process::Command::new("cargo");
     crate::process::manager::apply_non_primary_instance_env_with(&mut cmd, &config, 9876, None)
@@ -942,7 +951,12 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
     let child_secure = env("QONTINUI_SECURE_STORAGE_DIR").expect("secure dir exported");
     let child_root = env("QONTINUI_INSTANCE_ROOT").expect("instance root exported");
 
-    super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
+    super::apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::Harness,
+        Some(&unique),
+        &runner_id,
+    )
+    .expect("must succeed");
 
     assert!(
         child_secure.join("paired_user.json").is_file(),
@@ -1416,6 +1430,44 @@ fn restart_runner_request_honours_explicit_from_working_tree() {
     assert!(opted.from_working_tree);
 }
 
+/// `handoff` on the per-runner restart (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7): omitted means today's kill-every-pane restart; `true` selects the
+/// handoff intent. Same on `rebuild-and-restart`, whose body is lenient.
+#[test]
+fn restart_runner_request_handoff_defaults_off_and_selects_the_intent() {
+    let omitted: super::RestartRunnerRequest =
+        serde_json::from_str(r#"{"rebuild":false}"#).expect("deserialize");
+    assert!(!omitted.handoff);
+    assert_eq!(
+        omitted.close_intent(),
+        crate::process::manager::CloseIntent::Kill
+    );
+
+    let opted: super::RestartRunnerRequest =
+        serde_json::from_str(r#"{"handoff":true,"force":false}"#).expect("deserialize");
+    assert_eq!(
+        opted.close_intent(),
+        crate::process::manager::CloseIntent::HandoffHolders
+    );
+    assert!(!opted.force, "handoff must not imply force");
+
+    // The route keeps `deny_unknown_fields`: a misspelled handoff is a 422,
+    // never a silent kill-every-pane restart.
+    assert!(serde_json::from_str::<super::RestartRunnerRequest>(r#"{"hand_off":true}"#).is_err());
+
+    let rr: super::RebuildAndRestartRequest =
+        serde_json::from_str(r#"{"handoff":true}"#).expect("deserialize");
+    assert_eq!(
+        rr.close_intent(),
+        crate::process::manager::CloseIntent::HandoffHolders
+    );
+    assert_eq!(
+        super::RebuildAndRestartRequest::default().close_intent(),
+        crate::process::manager::CloseIntent::Kill
+    );
+}
+
 /// `from_working_tree` must round-trip through serde and default to
 /// `false` — a body that omits it gets the safe origin/main default.
 #[test]
@@ -1643,10 +1695,12 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         expo_dir: None,
         expo_port: 19000,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1832,10 +1886,12 @@ fn make_state() -> crate::state::SharedState {
         expo_dir: None,
         expo_port: 19000,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -2141,7 +2197,7 @@ async fn every_runner_row_carries_a_liveness_object_with_a_state_string() {
 async fn list_builds_emits_the_pool_size_the_harness_refuses_to_run_without() {
     use axum::extract::{Query, State};
     use axum::response::IntoResponse;
-    let state = make_state(); // BuildPoolConfig { pool_size: 1 }
+    let state = make_state(); // BuildPoolConfig::fixed(1)
 
     let resp = super::list_builds(State(state.clone()), Query(Default::default()))
         .await
@@ -2682,6 +2738,46 @@ fn spawn_dedup_key_distinguishes_every_build_target() {
     );
 }
 
+/// The spawn mint reads the coord its config names, and its `risk` reads every
+/// row that coord served before the ACK cuts `predicted` to five. For a spawn
+/// `route_lkg` is advice only. The empty runner tree has no exe, so the detached
+/// spawn behind the 202 ends without starting anything.
+#[tokio::test]
+async fn spawn_202_risk_reads_every_planted_row() {
+    use crate::dev_action::test_support::{
+        assert_the_ack_read_every_planted_row, five_rows_and_a_sixth_boot_row,
+        serve_planted_expectations,
+    };
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+    config.temp_runner_display = Some(":99".to_string());
+    let state = Arc::new(crate::state::SupervisorState::new(config));
+
+    let resp = super::spawn_test(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({
+            "requester_id": "t2-5",
+            "rebuild": false,
+            "async": true,
+        })),
+    )
+    .await
+    .expect("handler ok")
+    .into_response();
+
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    assert_eq!(status, 202, "{body}");
+    assert_the_ack_read_every_planted_row(&coord, "spawn", &body);
+}
+
 /// End-to-end through the handler: a second `spawn-test` for a key whose
 /// build is still running returns 202 + `deduplicated: true` carrying the
 /// EXISTING `build_id`, runner id and port — and starts no build, so the
@@ -3054,4 +3150,516 @@ fn stated_defaults_reads_each_doc_spelling() {
     );
     assert_eq!(stated_defaults("Defaults to sixty."), vec![(None, None)]);
     assert_eq!(stated_defaults("no default stated"), vec![]);
+}
+
+// ── Handoff restart through the route (plan
+//    2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them, D7)
+
+/// A fake runner: serves `/restart-readiness` with `readiness`, records every
+/// close-request body, and — like a real runner finishing its teardown — on
+/// the close-request kills `child` (the runner's stand-in process) and stops
+/// listening, so the stop's PID wait and port reap both resolve without
+/// any kill landing on this test process.
+#[cfg(unix)]
+async fn spawn_fake_runner(
+    readiness: &'static str,
+    child: Option<tokio::process::Child>,
+) -> (u16, Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>) {
+    use axum::routing::{get, post};
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let child = Arc::new(tokio::sync::Mutex::new(child));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sink = seen.clone();
+    let app = axum::Router::new()
+        .route(
+            crate::restart_readiness::READINESS_PATH,
+            get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    readiness,
+                )
+            }),
+        )
+        .route(
+            crate::process::manager::CLOSE_REQUEST_PATH,
+            post(move |body: axum::body::Bytes| {
+                let sink = sink.clone();
+                let child = child.clone();
+                let stop_tx = stop_tx.clone();
+                async move {
+                    sink.lock().await.push(body.to_vec());
+                    if let Some(mut c) = child.lock().await.take() {
+                        let _ = c.kill().await; // kill + reap
+                    }
+                    let _ = stop_tx.send(true);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut rx = stop_rx;
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.wait_for(|v| *v).await;
+            })
+            .await;
+    });
+    (port, seen)
+}
+
+/// A registered, protected, responding named runner on `port`, with `pid` as
+/// its registry PID.
+#[cfg(unix)]
+async fn register_live_named_runner(
+    state: &crate::state::SharedState,
+    id: &str,
+    port: u16,
+    pid: Option<u32>,
+) {
+    let config = crate::config::RunnerConfig {
+        id: id.to_string(),
+        name: format!("Runner {id}"),
+        port,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: id.to_string(),
+        },
+        protected: true,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: Default::default(),
+        fresh_device_identity: false,
+    };
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    {
+        let mut h = managed.cached_health.write().await;
+        h.runner_port_open = true;
+        h.runner_responding = true;
+    }
+    {
+        let mut r = managed.runner.write().await;
+        r.running = true;
+        r.pid = pid;
+        r.last_seen_responding_at = Some(chrono::Utc::now());
+    }
+    state.runners.write().await.insert(id.to_string(), managed);
+}
+
+/// `probe_runner_health` over a port nothing answers on reports the process
+/// alive from the entry's pid, which is what reaches spawn-test's 502
+/// `runner_started_but_unresponsive` arm. The exit monitor owns the child, so
+/// the pid is the only thing left to ask. A pid that has exited, and no pid at
+/// all, report it dead (spawn-test's 500 `runner_died_during_startup`).
+#[tokio::test]
+async fn a_live_process_that_never_answers_reaches_the_unresponsive_arm() {
+    let mut exited = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+        .args(if cfg!(windows) {
+            &["/C", "exit 0"][..]
+        } else {
+            &[][..]
+        })
+        .spawn()
+        .expect("spawn a child that exits");
+    let exited_pid = exited.id();
+    exited.wait().expect("reap it");
+
+    let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+    let state: crate::state::SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let dead_port = crate::test_ports::reserve_refused_port();
+    let id = "named-never-answers";
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.id = id.to_string();
+    config.port = dead_port;
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+
+    for (pid, expected_alive) in [
+        (Some(std::process::id()), true),
+        (Some(exited_pid), false),
+        (None, false),
+    ] {
+        managed.runner.write().await.pid = pid;
+        match probe_runner_health(&state, id, dead_port, 0).await {
+            ProbeOutcome::Failed {
+                child_alive,
+                pid: reported,
+                ..
+            } => {
+                assert_eq!(child_alive, expected_alive, "pid {pid:?}");
+                assert_eq!(reported, pid);
+            }
+            ProbeOutcome::Healthy { .. } => panic!("nothing answers on port {dead_port}"),
+        }
+    }
+}
+
+/// `DELETE /runners/{id}` and the purge-stale sweep never wait for a runner's
+/// lifecycle lock. Mid-start the entry reads as a stopped placeholder, so
+/// removing it would leave the start to spawn a process absent from the
+/// registry. Both leave it alone; once nothing holds the lock, both remove it.
+#[tokio::test]
+async fn a_runner_a_start_holds_is_neither_deleted_nor_purged() {
+    use axum::response::IntoResponse;
+
+    for (id, kind) in [
+        (
+            "named-held",
+            qontinui_types::wire::runner_kind::RunnerKind::Named {
+                name: "named-held".to_string(),
+            },
+        ),
+        (
+            "test-held",
+            qontinui_types::wire::runner_kind::RunnerKind::Temp {
+                id: "test-held".to_string(),
+            },
+        ),
+    ] {
+        let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+        let state: crate::state::SharedState = Arc::new(crate::state::SupervisorState::new(config));
+        let mut runner = crate::config::RunnerConfig::default_primary();
+        runner.id = id.to_string();
+        runner.name = id.to_string();
+        runner.port = crate::test_ports::reserve_refused_port();
+        runner.kind = kind;
+        let managed = Arc::new(crate::state::ManagedRunner::new(runner, false));
+        state
+            .runners
+            .write()
+            .await
+            .insert(id.to_string(), managed.clone());
+
+        let remove = || {
+            super::remove_runner(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(id.to_string()),
+            )
+        };
+        let start = managed.lifecycle.lock().await;
+        let err = match remove().await {
+            Ok(_) => panic!("{id}: DELETE removed a runner a start holds"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::CONFLICT,
+            "{id}"
+        );
+        assert!(
+            super::purge_stale_test_runners_core(&state, false, None)
+                .await
+                .is_empty(),
+            "{id}: the purge removed a runner a start holds"
+        );
+        assert!(state.get_runner(id).await.is_some(), "{id}: it was removed");
+        drop(start);
+
+        if id.starts_with("test-") {
+            let purged = super::purge_stale_test_runners_core(&state, false, None).await;
+            assert_eq!(purged.len(), 1, "{id}: nothing holds it now");
+        } else {
+            assert!(remove().await.is_ok(), "{id}: nothing holds it now");
+        }
+        assert!(state.get_runner(id).await.is_none(), "{id}: it stayed");
+    }
+}
+
+/// A supervisor state over an empty runner tree
+/// ([`crate::config::config_over_an_empty_runner_tree`]), so the restart route
+/// fails at the start half wherever the test process runs. Hold the returned
+/// `TempDir` for the test's lifetime.
+#[cfg(unix)]
+fn handoff_route_state() -> (crate::state::SharedState, TempDir) {
+    let (config, root) = crate::config::config_over_an_empty_runner_tree();
+    (Arc::new(crate::state::SupervisorState::new(config)), root)
+}
+
+#[cfg(unix)]
+async fn call_restart_route(
+    state: crate::state::SharedState,
+    id: &str,
+    body: serde_json::Value,
+) -> axum::http::StatusCode {
+    use axum::response::IntoResponse;
+    let req: super::RestartRunnerRequest = serde_json::from_value(body).expect("request");
+    match super::restart_runner(
+        axum::extract::State(state),
+        axum::extract::Path(id.to_string()),
+        axum::Json(req),
+    )
+    .await
+    {
+        Ok(resp) => resp.status(),
+        Err(e) => e.into_response().status(),
+    }
+}
+
+/// Entry-level: `POST /runners/{id}/restart {"handoff":true}` against a runner
+/// reporting `safe_with_handoff: true` passes the gate and the runner receives
+/// `{"handoff":"holders"}` on its close-request. Enters through the route
+/// handler `routes::runners::restart_runner` (no rebuild); the restart then
+/// fails at the START half, since this state has no runner exe — which is
+/// past everything this test asserts.
+#[cfg(unix)]
+#[tokio::test]
+async fn handoff_restart_route_forwards_the_intent_to_the_runner() {
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn stand-in runner process");
+    let child_pid = child.id().expect("pid");
+    let (port, seen) = spawn_fake_runner(
+        r#"{"safe_to_restart": false, "safe_with_handoff": true,
+            "terminal_sessions": {"count": 2}}"#,
+        Some(child),
+    )
+    .await;
+    let (state, _root) = handoff_route_state();
+    register_live_named_runner(&state, "named-handoff-route", port, Some(child_pid)).await;
+
+    let started = std::time::Instant::now();
+    let status = call_restart_route(
+        state,
+        "named-handoff-route",
+        serde_json::json!({ "handoff": true }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "the gate admitted it"
+    );
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1, "exactly one close-request");
+    let body: serde_json::Value = serde_json::from_slice(&seen[0]).expect("JSON body");
+    assert_eq!(body, serde_json::json!({ "handoff": "holders" }));
+    // The stand-in exited on the close-request, so the PID wait ended well
+    // inside the 30 s handoff window rather than timing out.
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(!crate::process::proc_kill::pid_alive(child_pid));
+}
+
+/// Entry-level: the same request against a runner reporting
+/// `safe_with_handoff: false` is refused 409, and no close-request is sent.
+#[cfg(unix)]
+#[tokio::test]
+async fn handoff_restart_route_refuses_when_the_runner_says_unsafe() {
+    let (port, seen) = spawn_fake_runner(
+        r#"{"safe_to_restart": false, "safe_with_handoff": false,
+            "terminal_sessions": {"count": 2}}"#,
+        None,
+    )
+    .await;
+    let (state, _root) = handoff_route_state();
+    register_live_named_runner(&state, "named-handoff-refused", port, None).await;
+
+    let status = call_restart_route(
+        state,
+        "named-handoff-refused",
+        serde_json::json!({ "handoff": true }),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert!(seen.lock().await.is_empty(), "no close-request may be sent");
+}
+
+// ---- Phase 8b: fresh_device_identity -------------------------------------
+
+/// A fresh-identity spawn projects NO paired state: with a paired primary
+/// AND a matching profile on disk, the destination stays empty and the report
+/// says `fresh_device_identity`. The harness arm still copies.
+#[test]
+fn fresh_identity_spawn_projects_no_paired_state() {
+    use crate::process::instance_root::DeviceIdentity;
+    let profiles = tempfile::tempdir().unwrap();
+    let primary = tempfile::tempdir().unwrap();
+    std::fs::write(
+        primary.path().join("paired_user.json"),
+        r#"{"user_id":"op"}"#,
+    )
+    .unwrap();
+    std::fs::write(primary.path().join("auth_tokens.enc"), b"\x01").unwrap();
+    let snap = profiles.path().join("ci");
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::write(snap.join("paired_user.json"), r#"{"user_id":"ci"}"#).unwrap();
+
+    for profile in [None, Some("ci")] {
+        let dest = tempfile::tempdir().unwrap();
+        let report = super::apply_spawn_paired_state_for_identity(
+            DeviceIdentity::Fresh,
+            profile,
+            profiles.path(),
+            Some(primary.path()),
+            dest.path(),
+        )
+        .expect("fresh identity never fails on paired state");
+        assert_eq!(report["status"], "fresh_device_identity", "{profile:?}");
+        assert_eq!(report["applied"], serde_json::json!([]));
+        assert!(
+            !dest.path().join("paired_user.json").exists(),
+            "{profile:?}"
+        );
+        assert!(!dest.path().join("auth_tokens.enc").exists(), "{profile:?}");
+    }
+
+    let dest = tempfile::tempdir().unwrap();
+    let report = super::apply_spawn_paired_state_for_identity(
+        DeviceIdentity::Harness,
+        None,
+        profiles.path(),
+        Some(primary.path()),
+        dest.path(),
+    )
+    .unwrap();
+    assert_eq!(report["status"], "paired");
+    assert!(dest.path().join("paired_user.json").is_file());
+    assert!(dest.path().join("auth_tokens.enc").is_file());
+}
+
+/// Every arm of the contradiction guard: unflagged never refuses; flagged
+/// refuses a `paired_profile_id`, an `extra_env` `QONTINUI_MACHINE_ID`, and
+/// names both when both are present; any other `extra_env` is fine.
+#[test]
+fn fresh_identity_contradictions_are_refused_with_a_typed_body() {
+    use std::collections::HashMap;
+    let none: HashMap<String, String> = HashMap::new();
+    let mut machine = HashMap::new();
+    machine.insert("QONTINUI_MACHINE_ID".to_string(), "x".to_string());
+    let mut other = HashMap::new();
+    other.insert("QONTINUI_API_URL".to_string(), "https://api".to_string());
+
+    assert!(super::fresh_device_identity_conflict(false, Some("ci"), &machine).is_none());
+    assert!(super::fresh_device_identity_conflict(true, None, &none).is_none());
+    assert!(super::fresh_device_identity_conflict(true, None, &other).is_none());
+
+    let body = super::fresh_device_identity_conflict(true, Some("ci"), &none).expect("refused");
+    assert_eq!(body["error"], "fresh_device_identity_conflict");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["paired_profile_id"])
+    );
+
+    let body = super::fresh_device_identity_conflict(true, None, &machine).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["extra_env.QONTINUI_MACHINE_ID"])
+    );
+
+    let body = super::fresh_device_identity_conflict(true, Some("ci"), &machine).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["paired_profile_id", "extra_env.QONTINUI_MACHINE_ID"])
+    );
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("paired_profile_id"));
+
+    // Case-insensitively: Windows env names are, so a lowercase key would
+    // still reach the runner's `QONTINUI_MACHINE_ID` read there.
+    let mut lower = HashMap::new();
+    lower.insert("qontinui_machine_id".to_string(), "x".to_string());
+    let body = super::fresh_device_identity_conflict(true, None, &lower).expect("refused");
+    assert_eq!(
+        body["conflicts_with"],
+        serde_json::json!(["extra_env.qontinui_machine_id"])
+    );
+}
+
+/// Both spawn bodies default the flag to false (and spawn-named's new
+/// `extra_env` to empty), and accept it set.
+#[test]
+fn spawn_bodies_default_fresh_device_identity_to_false() {
+    let t: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(!t.fresh_device_identity);
+    let t: super::SpawnTestRequest =
+        serde_json::from_value(serde_json::json!({"fresh_device_identity": true})).unwrap();
+    assert!(t.fresh_device_identity);
+
+    let n: super::SpawnNamedRequest =
+        serde_json::from_value(serde_json::json!({"name": "v"})).unwrap();
+    assert!(!n.fresh_device_identity);
+    assert!(n.extra_env.is_empty());
+    let n: super::SpawnNamedRequest = serde_json::from_value(serde_json::json!({
+        "name": "v",
+        "fresh_device_identity": true,
+        "extra_env": {"QONTINUI_API_URL": "https://api.qontinui.io"},
+    }))
+    .unwrap();
+    assert!(n.fresh_device_identity);
+    assert_eq!(n.extra_env["QONTINUI_API_URL"], "https://api.qontinui.io");
+}
+
+/// An unflagged runner config serializes WITHOUT the new key, so a named
+/// runner's settings entry is byte-for-byte what it was; a flagged one keeps
+/// the flag across a settings round-trip (a restart re-projects nothing).
+#[test]
+fn runner_config_persists_the_flag_only_when_set() {
+    let mut cfg = crate::config::RunnerConfig::default_primary();
+    let unflagged = serde_json::to_value(&cfg).unwrap();
+    assert!(
+        unflagged.get("fresh_device_identity").is_none(),
+        "{unflagged}"
+    );
+    let back: crate::config::RunnerConfig = serde_json::from_value(unflagged).unwrap();
+    assert!(!back.fresh_device_identity);
+
+    cfg.fresh_device_identity = true;
+    let flagged = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(flagged["fresh_device_identity"], true);
+    let back: crate::config::RunnerConfig = serde_json::from_value(flagged).unwrap();
+    assert!(back.fresh_device_identity);
+}
+
+/// The handlers themselves need a live `SharedState`, so their wiring is
+/// pinned by source: each spawn route guards the contradiction BEFORE it
+/// reserves anything, threads the request flag into the `RunnerConfig` it
+/// builds (the only thing the env block and the paired-state decision read),
+/// and reports `device_identity`; spawn-named forwards its `extra_env`; and
+/// `GET /runners` re-reads the id for a flagged runner.
+#[test]
+fn spawn_routes_wire_fresh_device_identity_end_to_end() {
+    for sig in ["pub async fn spawn_test(", "pub async fn spawn_named("] {
+        let body = fn_source(sig);
+        let guard = body
+            .find("fresh_device_identity_conflict(")
+            .unwrap_or_else(|| panic!("{sig} must refuse the contradiction"));
+        let reserve = body
+            .find("state.runners.write().await")
+            .unwrap_or_else(|| panic!("{sig} reserves a port under the registry lock"));
+        assert!(
+            guard < reserve,
+            "{sig}: the guard must run before a port is reserved"
+        );
+        assert!(
+            body.contains("fresh_device_identity: body.fresh_device_identity,"),
+            "{sig} must thread the request flag into the RunnerConfig it builds"
+        );
+    }
+    let named = fn_source("pub async fn spawn_named(");
+    assert!(named.contains("extra_env: body.extra_env.clone(),"));
+    assert!(named.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
+    let exec = fn_source("async fn execute_spawn_build_inner(");
+    assert!(exec.contains("resp[\"device_identity\"] = device_identity_report(id)"));
+    assert!(exec.contains("managed.config.fresh_device_identity"));
+    let list = fn_source("pub async fn list_runners(");
+    assert!(
+        list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
+    );
 }

@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{
     TargetDirSource, RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS, RUNNER_GRACEFUL_STOP_TIMEOUT_MS,
+    RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS,
 };
 use crate::diagnostics::{DiagnosticEventKind, RestartSource};
 use crate::error::SupervisorError;
@@ -1096,8 +1097,10 @@ pub fn evaluate_local_build_adoption(
 ///
 /// Separated so the composition — finding, sidecar read, freshness rule,
 /// adoption verdict — is testable against a `tempfile` tree without mutating
-/// `CARGO_TARGET_DIR`, which `runner_exe_path_resolved` reads at level-1
-/// precedence and which no test may set without breaking its neighbours.
+/// `CARGO_TARGET_DIR`, which no test may set without breaking its neighbours.
+/// (`runner_exe_path_resolved` reads it at level-1 precedence in production;
+/// a unit-test build's config does not read it at all, see
+/// [`crate::config::AmbientTargetDir`].)
 pub fn evaluate_local_build_adoption_at(
     legacy_exe: &std::path::Path,
     target_dir_source: TargetDirSource,
@@ -1805,6 +1808,18 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             if managed.created_at.elapsed() < Duration::from_secs(120) {
                 continue;
             }
+            // One runner's starts, stops and this sweep are ordered by its
+            // lifecycle lock, held from here through the removal below. The
+            // sweep never waits for it: a runner a start or a stop holds is
+            // left for the next sweep.
+            let Some(_lifecycle) = try_lock_registered(&state, managed).await else {
+                debug!(
+                    "reaper: skipping temp runner '{}' — a start or a stop holds it, or it \
+                     is gone",
+                    managed.config.id
+                );
+                continue;
+            };
             // Max-age bound. Measured from when the runner actually STARTED,
             // not from when `spawn-test` reserved its placeholder — see
             // `resolve_temp_runner_age`. A cold `spawn-test {rebuild:true}`
@@ -1904,8 +1919,8 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                     // child with a live `Child` handle, so `start_managed_runner`
                     // has a `monitor_runner_process_exit` watching it; without
                     // the flag the age-kill exit reaches `decide_crash_restart`
-                    // as `had_child_handle = true, stop_requested = false,
-                    // clean_exit = false` — a textbook crash — and a runner
+                    // as `stop_requested = false, clean_exit = false` — a
+                    // textbook crash — and a runner
                     // armed via `POST /runners/{id}/watchdog {"enabled": true}`
                     // gets auto-restarted for a death the supervisor itself
                     // caused.
@@ -1922,9 +1937,15 @@ pub async fn reap_stale_test_runners(state: SharedState) {
                     //
                     // No unwind is needed on the `continue` path: the flag's
                     // lifecycle is "latched on stop request, cleared on the next
-                    // start", so a retry simply re-latches and a legitimate
-                    // operator restart clears it.
-                    managed.runner.write().await.stop_requested = true;
+                    // start", so a retry simply re-latches (keeping the first
+                    // request's time) and a legitimate operator restart clears
+                    // it. The flag makes the exit monitor stamp this spawn's
+                    // exit as requested.
+                    managed
+                        .runner
+                        .write()
+                        .await
+                        .latch_stop_request(chrono::Utc::now());
                 } else {
                     // Port free but state says running — crashed
                     let mut runner = managed.runner.write().await;
@@ -2263,20 +2284,66 @@ pub async fn start_runner_by_id(
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
-    start_managed_runner(state, &managed).await
+    start_managed_runner(state, &managed, None, StartAs::Registered).await
+}
+
+/// Whether the registry still holds this very entry under its id. A caller
+/// that waited for the entry's lifecycle lock asks before acting on it: the
+/// holder may have been a `test-*` stop, which removes the entry and whose port
+/// a later spawn may have taken.
+async fn is_registered(state: &SharedState, managed: &Arc<ManagedRunner>) -> bool {
+    state
+        .get_runner(&managed.config.id)
+        .await
+        .is_some_and(|current| Arc::ptr_eq(&current, managed))
+}
+
+/// The lifecycle lock for a caller that removes a runner and must not wait for
+/// it, as the sweeps and `DELETE /runners/{id}` must not. `None` when a start or
+/// a stop holds it, or when the registry no longer holds this entry: such a
+/// caller often works from a snapshot, so a later spawn may hold its port by now.
+pub(crate) async fn try_lock_registered<'a>(
+    state: &SharedState,
+    managed: &'a Arc<ManagedRunner>,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    let guard = managed.lifecycle.try_lock().ok()?;
+    is_registered(state, managed).await.then_some(guard)
+}
+
+/// What a start must still find once it holds the runner's lifecycle lock. It
+/// may have waited there behind a stop or a teardown, so what its caller decided
+/// before the wait can be out of date, and only the caller knows what it asked.
+#[derive(Clone, Copy, Debug)]
+pub enum StartAs {
+    /// Proceed only while the registry still holds this entry. A start queued
+    /// behind a `test-*` teardown must not spawn into the root it reaped.
+    Registered,
+    /// The start half of a restart. Its own stop removes a `test-*` entry, so
+    /// this start puts it back.
+    Restart,
+    /// The crash watchdog answering the exit of the spawn recorded at
+    /// `exited_spawned_at`. Proceed only while the registry still holds this
+    /// entry, that is still the runner's spawn and no stop has latched.
+    AfterCrash {
+        exited_spawned_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Start a runner given a direct `Arc<ManagedRunner>` reference.
 ///
 /// Used by `spawn_test` / `spawn_named` to avoid a re-lookup race: the
-/// registry insertion and the start must use the same ManagedRunner, even if
-/// another task concurrently removes the id from the map. If the id is
-/// missing from the registry when we start (which shouldn't normally happen,
-/// but has been observed as a transient 404 under load), we re-insert the Arc
-/// so downstream health / monitoring can find it by id.
+/// registry insertion and the start must use the same ManagedRunner. What
+/// happens when the id has gone from the registry by the time this start holds
+/// the lifecycle lock is `start_as`'s to say.
+///
+/// `initiated_by` is the dev action this start belongs to, recorded on the
+/// spawn's ring entry (`SpawnMarker::initiated_by`). `None` for a start nothing
+/// minted.
 pub async fn start_managed_runner(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
+    initiated_by: Option<uuid::Uuid>,
+    start_as: StartAs,
 ) -> Result<(), SupervisorError> {
     // With the parallel build pool, a concurrent build on one slot does not
     // prevent us from starting a runner from a previously-built exe in
@@ -2286,22 +2353,59 @@ pub async fn start_managed_runner(
 
     let runner_id = managed.config.id.clone();
 
-    // Defensive re-insertion: if something removed our id between placeholder
-    // insertion and start, put it back. This fixes the ~1-in-10 spawn-test
-    // 404 "Runner not found" race observed in smoke tests. Using `entry` +
-    // `or_insert` instead of unconditional insert preserves any other Arc
-    // that may have replaced ours (so we don't clobber a different managed
-    // runner sharing the same id, which would itself indicate a bug).
-    {
-        let mut runners = state.runners.write().await;
-        runners
-            .entry(runner_id.clone())
-            .or_insert_with(|| managed.clone());
+    // Ordered against this runner's stops and the max-age sweep, from before
+    // the checks below through recording the spawn and spawning its exit monitor.
+    // A stop that arrives mid-start latches after the spawn is recorded and
+    // targets it; a second start finds that spawn below. Before the re-insert,
+    // because a restart that re-inserted first could then wait behind a `test-*`
+    // stop that removes the entry and reaps its dirs, and spawn a process absent
+    // from the registry. See `ManagedRunner::lifecycle`.
+    let _lifecycle = managed.lifecycle.lock().await;
+
+    match start_as {
+        StartAs::Registered => {
+            if !is_registered(state, managed).await {
+                return Err(SupervisorError::RunnerNotFound(runner_id));
+            }
+        }
+        // `entry` + `or_insert` rather than an unconditional insert preserves
+        // any other Arc that replaced ours, which would itself indicate a bug.
+        StartAs::Restart => {
+            let mut runners = state.runners.write().await;
+            runners
+                .entry(runner_id.clone())
+                .or_insert_with(|| managed.clone());
+        }
+        StartAs::AfterCrash { exited_spawned_at } => {
+            // A removal writes none of the fields below, and this start holds its
+            // own Arc rather than looking the id up.
+            let registered = is_registered(state, managed).await;
+            let runner = managed.runner.read().await;
+            if !registered
+                || crash_restart_backoff_skips(
+                    runner.running,
+                    runner.stop_requested,
+                    runner.started_at,
+                    exited_spawned_at,
+                )
+            {
+                return Err(SupervisorError::StartSuperseded(format!(
+                    "runner '{runner_id}' changed since the exit (registered={registered}, \
+                     running={}, stop_requested={}, started_at={:?}, exited \
+                     spawn={exited_spawned_at})",
+                    runner.running, runner.stop_requested, runner.started_at
+                )));
+            }
+        }
     }
 
+    // `running` alone misses a primary still booting: the health cache lowers it
+    // until the primary answers `/health`, and before the primary binds its port
+    // the port guard below passes too.
     {
         let runner = managed.runner.read().await;
-        if runner.running {
+        let spawns = managed.recent_spawns.read().await;
+        if runner.running || newest_spawn_is_up(runner.started_at, &spawns) {
             return Err(SupervisorError::RunnerAlreadyRunning);
         }
     }
@@ -2440,32 +2544,35 @@ pub async fn start_managed_runner(
     // spawn time, so this must precede them. If the file can't be opened
     // (out of disk space, perms, etc.) the runner still starts — early-log
     // capture is strictly best-effort. Drops any path stored from a prior
-    // start of this runner id.
+    // start of this runner id. `early_log_path` ends as the file this spawn
+    // opened, `None` when it opened none; its spawn-ring entry carries it.
     let early_log_path = crate::process::early_log::early_log_dir()
         .map(|dir| crate::process::early_log::early_log_path_for(&dir, &runner_id));
-    if let Some(ref path) = early_log_path {
-        match crate::process::early_log::EarlyLogWriter::open(path) {
+    let early_log_path = match early_log_path {
+        Some(path) => match crate::process::early_log::EarlyLogWriter::open(&path) {
             Some(writer) => {
                 managed.logs.set_early_log_writer(Some(writer));
-                let mut slot = managed.early_log_path.write().await;
-                *slot = Some(path.clone());
                 debug!(
                     "Early-log capture enabled for runner '{}' at {:?}",
                     runner_name, path
                 );
+                Some(path)
             }
+            // Couldn't open the file — clear any prior path below so we
+            // don't surface a stale value via the API.
             None => {
-                // Couldn't open the file — clear any prior path so we don't
-                // surface a stale value via the API.
                 managed.logs.set_early_log_writer(None);
-                let mut slot = managed.early_log_path.write().await;
-                *slot = None;
+                None
             }
+        },
+        None => {
+            managed.logs.set_early_log_writer(None);
+            None
         }
-    } else {
-        managed.logs.set_early_log_writer(None);
+    };
+    {
         let mut slot = managed.early_log_path.write().await;
-        *slot = None;
+        *slot = early_log_path.clone();
     }
 
     // Capture stdout/stderr to the managed runner's logs. Pass the managed
@@ -2486,19 +2593,12 @@ pub async fn start_managed_runner(
         );
     }
 
-    // Update per-runner state. Clearing `stop_requested` HERE (rather than
-    // at stop completion) makes the operator-stop marker race-free for the
-    // exit monitor: the flag can only transition true→false through a
-    // subsequent start, so any process exit observed after a stop request
-    // always reads `stop_requested == true`.
-    {
-        let mut runner = managed.runner.write().await;
-        runner.process = Some(child);
-        runner.running = true;
-        runner.started_at = Some(chrono::Utc::now());
-        runner.pid = pid;
-        runner.stop_requested = false;
-    }
+    // Record the spawn on the registry entry, and its entry in the spawn ring
+    // the dev-action attribution watcher reads at window close. After this
+    // spawn re-pointed the panic-log dir, the stored panic and the early log
+    // above; before the exit monitor is spawned below, so the entry exists
+    // before that monitor can attempt a stamp for it.
+    let spawned_at = record_spawn_in_registry(managed, pid, early_log_path, initiated_by).await;
 
     // If this is the primary runner, also update legacy state for backward compat
     if is_primary {
@@ -2506,9 +2606,18 @@ pub async fn start_managed_runner(
         runner.running = true;
         runner.started_at = Some(chrono::Utc::now());
         runner.pid = pid;
-        runner.stop_requested = false;
-        // process stays None in legacy — managed runner owns it
+        runner.clear_stop_request();
     }
+
+    // Spawn a task to monitor the process exit. It owns the child, so nothing
+    // that happens to the registry can drop it unobserved. After the legacy
+    // update above, whose write would otherwise overwrite the reset of a child
+    // that has already exited.
+    let state_clone = state.clone();
+    let managed_clone = managed.clone();
+    tokio::spawn(async move {
+        monitor_runner_process_exit(state_clone, managed_clone, child, spawned_at).await;
+    });
 
     state
         .logs
@@ -2525,13 +2634,6 @@ pub async fn start_managed_runner(
     state.notify_health_change();
     managed.health_cache_notify.notify_one();
 
-    // Spawn a task to monitor the process exit
-    let state_clone = state.clone();
-    let managed_clone = managed.clone();
-    tokio::spawn(async move {
-        monitor_runner_process_exit(state_clone, managed_clone, runner_id).await;
-    });
-
     // Spawn the first-healthy watchdog so a child that spawns but never
     // binds its HTTP API is killed instead of lingering as a zombie.
     if let Some(pid_val) = pid {
@@ -2543,6 +2645,76 @@ pub async fn start_managed_runner(
     }
 
     Ok(())
+}
+
+/// Whether the runner's newest spawn is still its current one and still up:
+/// no stop has reset it (`started_at` is still its `spawned_at`), its exit
+/// monitor has stamped no exit, and its pid is alive.
+fn newest_spawn_is_up(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    spawns: &crate::state::SpawnRing,
+) -> bool {
+    pid_of_newest_spawn_if_up(started_at, spawns).is_some()
+}
+
+/// The pid behind [`newest_spawn_is_up`].
+fn pid_of_newest_spawn_if_up(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    spawns: &crate::state::SpawnRing,
+) -> Option<u32> {
+    let spawn = spawns.newest()?;
+    (started_at == Some(spawn.spawned_at) && spawn.exited_at.is_none())
+        .then_some(spawn.pid)
+        .flatten()
+        .filter(|pid| crate::process::proc_kill::pid_alive(*pid))
+}
+
+/// Record a spawn on the runner's registry entry: its pid and start time,
+/// `running`, the previous process's stop request cleared, and this spawn's
+/// entry in the spawn ring (`ManagedRunner::recent_spawns`), dated at the same
+/// instant as `started_at`, naming this spawn's own early log and the action
+/// that initiated it. Returns that instant, the spawn's identity, which
+/// `start_managed_runner` hands to the exit monitor with the child.
+///
+/// The stop request is cleared HERE, at the next start, rather than when a
+/// stop completes, so a completing stop cannot unset it before the exit
+/// monitor reads it: the flag and its time go back to unset only through a
+/// later start, and the monitor reads the flag as it stands when the monitor
+/// reads it (a failed stop's flag included), with the time of the earliest
+/// request. Under the lifecycle lock this call clears only requests latched
+/// before the start began: a stop arriving mid-start waits, and latches after
+/// it. The monitor of an EARLIER spawn that wakes after this call reads the
+/// cleared flag (see `SpawnMarker::stop_requested_at`).
+///
+/// A stop clears `started_at` and `pid` again, and an exit clears `pid`;
+/// neither removes the ring entry. `start_managed_runner` calls this once its
+/// spawn has re-pointed the panic-log dir, the stored panic and the early log,
+/// and before it spawns the exit monitor that stamps the entry.
+async fn record_spawn_in_registry(
+    managed: &ManagedRunner,
+    pid: Option<u32>,
+    early_log_path: Option<std::path::PathBuf>,
+    initiated_by: Option<uuid::Uuid>,
+) -> chrono::DateTime<chrono::Utc> {
+    let spawned_at = chrono::Utc::now();
+    {
+        let mut runner = managed.runner.write().await;
+        runner.running = true;
+        runner.started_at = Some(spawned_at);
+        runner.pid = pid;
+        runner.clear_stop_request();
+    }
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            pid,
+            early_log_path,
+            initiated_by,
+        ));
+    spawned_at
 }
 
 /// Outcome of a fail-open sidecar deploy step in
@@ -3042,7 +3214,9 @@ struct SpawnResult {
 ///   root-honouring runner implies it, an older one needs it said.
 ///
 /// It then provisions the harness's `machine.json` / `profiles.json` into
-/// `<root>/home` ([`instance_root::provision_instance_home`]). A provisioning
+/// `<root>/home` ([`instance_root::provision_instance_home`]) — only
+/// `profiles.json` for a [`instance_root::DeviceIdentity::Fresh`] subject,
+/// which also has `QONTINUI_MACHINE_ID` removed. A provisioning
 /// failure is a WARN, not a refusal: the subject then runs as a box with no
 /// device identity, which is a degraded subject, not a leak.
 ///
@@ -3062,6 +3236,7 @@ fn apply_instance_root_env(
     cmd: &mut Command,
     runner_id: &str,
     home_source: Option<&std::path::Path>,
+    identity: instance_root::DeviceIdentity,
 ) -> Result<InstanceRoot, SupervisorError> {
     let root = InstanceRoot::for_runner(runner_id).ok_or_else(|| {
         SupervisorError::Process(format!(
@@ -3072,7 +3247,7 @@ fn apply_instance_root_env(
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
     })?;
-    let copied = root.apply_env(cmd, home_source).map_err(|e| {
+    let copied = root.apply_env(cmd, home_source, identity).map_err(|e| {
         SupervisorError::Process(format!(
             "{e} (instance root of runner '{runner_id}'). Refusing to spawn — the child would be \
              told to use a directory that does not exist, or fall back to the shared \
@@ -3080,8 +3255,8 @@ fn apply_instance_root_env(
         ))
     })?;
     debug!(
-        "Runner '{}' instance home provisioned from {:?}: {:?}",
-        runner_id, home_source, copied
+        "Runner '{}' instance home provisioned from {:?} ({:?} device identity): {:?}",
+        runner_id, home_source, identity, copied
     );
     Ok(root)
 }
@@ -3183,7 +3358,14 @@ pub(crate) fn apply_non_primary_instance_env_with(
     // not read and the reaper removes everything the child wrote. Failures here
     // abort the spawn rather than letting the child fall back to the shared
     // data dir.
-    let root = apply_instance_root_env(cmd, &config.id, home_source)?;
+    // `fresh_device_identity` (Phase 8b): no harness `machine.json`, no
+    // inherited `QONTINUI_MACHINE_ID` — the subject mints its own device id.
+    let root = apply_instance_root_env(
+        cmd,
+        &config.id,
+        home_source,
+        instance_root::DeviceIdentity::from_fresh_flag(config.fresh_device_identity),
+    )?;
     info!(
         "Runner '{}' using instance root {:?}",
         config.name,
@@ -3687,6 +3869,124 @@ enum StopReapOutcome {
     StillHeld,
 }
 
+/// One kill primitive the stop reap can run. Named so the ladder's choice is
+/// a value a test can read, not only code it has to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapKill {
+    /// `kill_by_pid_tree` on the tracked PID: its child tree / process group.
+    TrackedPidTree,
+    /// `kill_by_pid_tree` on a listener the registry never tracked.
+    UntrackedListenerTree,
+    /// `kill_by_port`: on Unix it tree-kills each listener (`-(pgid)`).
+    PortTree,
+    /// `kill_listeners_by_port`: a plain per-PID kill of each listener,
+    /// never a group or tree kill.
+    ListenersOnly,
+}
+
+impl ReapKill {
+    /// Does this primitive signal anything beyond the listener itself?
+    #[cfg(test)]
+    pub(crate) fn reaches_beyond_the_listener(self) -> bool {
+        !matches!(self, ReapKill::ListenersOnly)
+    }
+}
+
+/// Why the tree rung records itself as not run under a handoff.
+const HANDOFF_TREE_KILL_SKIPPED: &str = "skipped under handoff: a tree / process-group kill \
+                                          would signal the holder processes the handoff keeps \
+                                          alive";
+
+/// The kill primitives an escalation step runs. Under a handoff only the
+/// listener-only kill runs, at BOTH escalation steps: every other primitive
+/// can reach the holder processes the handoff exists to keep.
+fn reap_kills(outcome: StopReapOutcome, intent: CloseIntent) -> &'static [ReapKill] {
+    match (outcome, intent) {
+        (
+            StopReapOutcome::EscalateTree | StopReapOutcome::EscalatePort,
+            CloseIntent::HandoffHolders,
+        ) => &[ReapKill::ListenersOnly],
+        (StopReapOutcome::EscalateTree, CloseIntent::Kill) => {
+            &[ReapKill::TrackedPidTree, ReapKill::UntrackedListenerTree]
+        }
+        (StopReapOutcome::EscalatePort, CloseIntent::Kill) => &[ReapKill::PortTree],
+        _ => &[],
+    }
+}
+
+/// Run one [`ReapKill`] and record what it actually did on the ledger.
+async fn run_reap_kill(
+    kill: ReapKill,
+    port: u16,
+    pid_to_kill: Option<u32>,
+    no_target_why: &str,
+    runner_name: &str,
+    ledger: &mut StopLedger,
+) {
+    match kill {
+        ReapKill::TrackedPidTree => match pid_to_kill {
+            Some(pid) => {
+                let killed = crate::process::proc_kill::kill_by_pid_tree(pid)
+                    .await
+                    .unwrap_or(false);
+                ledger.ran(
+                    StopStrategy::TreeKill,
+                    format!("PID {} (+ child tree)", pid),
+                    killed,
+                );
+            }
+            None => ledger.no_target(StopStrategy::TreeKill, no_target_why.to_string()),
+        },
+        // Also catch a survivor whose PID we never tracked (orphan adopted on
+        // a port we knew but no PID for). A probe that could not RUN is
+        // UNKNOWN — never a kill; the next escalation step re-confirms anyway.
+        ReapKill::UntrackedListenerTree => {
+            match crate::process::proc_kill::find_pid_on_port(port).await {
+                Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
+                    let killed = crate::process::proc_kill::kill_by_pid_tree(live_pid)
+                        .await
+                        .unwrap_or(false);
+                    ledger.ran(
+                        StopStrategy::TreeKill,
+                        format!("untracked listener PID {}", live_pid),
+                        killed,
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "Stop-reap escalation for runner '{}': listener probe on port {} failed \
+                     ({}) — skipping the untracked-survivor kill",
+                    runner_name, port, e
+                ),
+            }
+        }
+        // The listener probe could not answer, so the port-level kill had
+        // nothing to aim at. Recording this as a NON-RUN is the whole point:
+        // it is exactly the case the old fixed failure sentence misreported as
+        // an attempted kill.
+        ReapKill::PortTree => match crate::process::proc_kill::kill_by_port(port).await {
+            Ok(killed) => ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed),
+            Err(e) => ledger.no_target(
+                StopStrategy::KillByPort,
+                format!("listener probe could not answer: {}", e),
+            ),
+        },
+        ReapKill::ListenersOnly => {
+            match crate::process::proc_kill::kill_listeners_by_port(port).await {
+                Ok(killed) => ledger.ran(
+                    StopStrategy::KillByPort,
+                    format!("port {} (listeners only, no group kill)", port),
+                    killed,
+                ),
+                Err(e) => ledger.no_target(
+                    StopStrategy::KillByPort,
+                    format!("listener probe could not answer: {}", e),
+                ),
+            }
+        }
+    }
+}
+
 /// Extra bounded wait before the final re-confirmation of the stop reap
 /// (see [`StopReapOutcome::RetryAfterBackoff`]).
 const STOP_REAP_BACKOFF_SECS: u64 = 4;
@@ -3766,9 +4066,6 @@ enum CrashRestartDecision {
     /// Crash budget exhausted for the rolling window — set
     /// [`CRASH_LOOP_DISABLED_REASON`] and stop restarting.
     Disarm,
-    /// No Child handle was ever held — the supervisor did not spawn this
-    /// process, so it has no provenance to restart it.
-    SkipNoChildHandle,
     /// The exit followed an operator stop request (`stop_requested` latched
     /// true) — never restart.
     SkipOperatorStop,
@@ -3790,7 +4087,6 @@ enum CrashRestartDecision {
 /// arming state, and the crash-loop guard is evaluated last so `Disarm`
 /// only fires for an exit that would otherwise have restarted.
 fn decide_crash_restart(
-    had_child_handle: bool,
     stop_requested: bool,
     clean_exit: bool,
     globally_armed: bool,
@@ -3798,9 +4094,6 @@ fn decide_crash_restart(
     already_disarmed: bool,
     restarts_in_window: usize,
 ) -> CrashRestartDecision {
-    if !had_child_handle {
-        return CrashRestartDecision::SkipNoChildHandle;
-    }
     if stop_requested {
         return CrashRestartDecision::SkipOperatorStop;
     }
@@ -3997,6 +4290,13 @@ async fn emit_serving_event(
             detail: detail.clone(),
         });
 
+    // A test drives `maybe_serving_restart` directly, and this would post its
+    // alert to whatever coord the box's profile names, which is production on
+    // the operator box.
+    if cfg!(test) {
+        return;
+    }
+
     let notice = crate::fleet::ServingWatchdogNotice {
         runner_id: runner_id.to_string(),
         event,
@@ -4050,28 +4350,37 @@ pub async fn maybe_serving_restart(
         _ => 0,
     };
 
-    let (pid, started_at, stop_requested, restart_requested, adopted) = {
+    let (pid, started_at, stop_requested, restart_requested) = {
         let r = managed.runner.read().await;
-        (
-            r.pid,
-            r.started_at,
-            r.stop_requested,
-            r.restart_requested,
-            r.process.is_none(),
-        )
+        (r.pid, r.started_at, r.stop_requested, r.restart_requested)
     };
+    let adopted = runner_is_adopted(pid, &*managed.recent_spawns.read().await);
 
-    // Design decision 4: an ADOPTED runner that holds its port and has NEVER
-    // answered reads `Unknown` forever (adoption stamps `running`/`pid` from a
-    // port probe and never stamps `last_seen_responding_at`). That shape is
-    // occurrence 1's, and it is never restarted — the supervisor cannot back
-    // the classification — but it is never SILENT again either.
+    // Design decision 4: a runner that holds its port and has NEVER answered
+    // reads `Unknown` forever (adoption stamps `running`/`pid` from a port probe
+    // and never stamps `last_seen_responding_at`, and a spawn the first-healthy
+    // watchdog could not kill stays there too). That shape is occurrence 1's, and
+    // it is never restarted — the supervisor cannot back the classification — but
+    // it is never SILENT again either.
     if matches!(liveness, crate::state::RunnerLiveness::Unknown) {
-        if adopted && should_alert {
+        if should_alert {
+            let (whose, event, detail) = if adopted {
+                (
+                    format!("adopted runner '{runner_name}'"),
+                    ServingEvent::NeverAnsweredSinceAdoption,
+                    "never-answered-since-adoption",
+                )
+            } else {
+                (
+                    format!("runner '{runner_name}', which this supervisor started,"),
+                    ServingEvent::NeverAnsweredSinceSpawn,
+                    "never-answered-since-spawn",
+                )
+            };
             let msg = format!(
-                "serving watchdog: adopted runner '{runner_name}' (port {port}, pid {pid:?}) \
-                 holds its port and has NEVER answered its HTTP API. Alerting, not restarting — \
-                 the supervisor cannot classify this as a wedge, so it will not act on it."
+                "serving watchdog: {whose} (port {port}, pid {pid:?}) holds its port and has \
+                 NEVER answered its HTTP API. Alerting, not restarting — the supervisor cannot \
+                 classify this as a wedge, so it will not act on it."
             );
             warn!("{}", msg);
             state
@@ -4084,9 +4393,9 @@ pub async fn maybe_serving_restart(
                 port,
                 pid,
                 silent_for_secs,
-                ServingEvent::NeverAnsweredSinceAdoption,
+                event,
                 None,
-                Some("never-answered-since-adoption".to_string()),
+                Some(detail.to_string()),
             )
             .await;
         }
@@ -4227,6 +4536,10 @@ pub async fn maybe_serving_restart(
                             // `rebuild: false` — nothing is compiled, so the
                             // tree is inert. Name the policy default anyway.
                             BuildTree::OriginMain,
+                            // The watchdog never asks for a handoff: it acts
+                            // only on a zero census, so there is nothing to keep.
+                            CloseIntent::Kill,
+                            None,
                         )
                         .await
                     }
@@ -4378,18 +4691,47 @@ pub async fn maybe_serving_restart(
     }
 }
 
+/// Whether the crash watchdog's backoff task must not restart the runner.
+///
+/// `running` alone cannot say so: for a primary it mirrors `/health`, so it is
+/// false while a primary someone started during the backoff boots. `started_at`
+/// can: only a start, an adoption and a stop's reset write it, so it is still
+/// the exited spawn's `spawned_at` only if nobody did any of those since.
+fn crash_restart_backoff_skips(
+    running: bool,
+    stop_requested: bool,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    exited_spawned_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    running || stop_requested || started_at != Some(exited_spawned_at)
+}
+
+/// Whether the runner's current process is one this supervisor did not spawn:
+/// it has no spawn yet, or the registry names a pid that is not the newest
+/// spawn's. A cleared pid says neither: the health cache clears a booting
+/// primary's, and PID recovery is Windows-only, so off Windows it stays cleared
+/// for that process's life and must not turn a spawned runner into an adopted
+/// one.
+fn runner_is_adopted(registry_pid: Option<u32>, spawns: &crate::state::SpawnRing) -> bool {
+    match (spawns.newest(), registry_pid) {
+        (None, _) => true,
+        (Some(spawn), Some(pid)) => spawn.pid != Some(pid),
+        (Some(_), None) => false,
+    }
+}
+
 /// Crash-only ambient watchdog hook, called by `monitor_runner_process_exit`
 /// after every observed exit of a supervisor-spawned runner. Evaluates
 /// [`decide_crash_restart`], does the `WatchdogState` bookkeeping, and — for
 /// a `Restart` — spawns a detached task that waits out the backoff and
-/// funnels through [`start_runner_by_id`] (so the provenance start gate
+/// funnels through [`start_managed_runner`] (so the provenance start gate
 /// applies). Never blocks the exit monitor.
 async fn maybe_crash_restart(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
-    had_child_handle: bool,
     stop_requested_at_exit: bool,
     clean_exit: bool,
+    exited_spawned_at: chrono::DateTime<chrono::Utc>,
 ) {
     let runner_id = managed.config.id.clone();
     let runner_name = managed.config.name.clone();
@@ -4405,7 +4747,6 @@ async fn maybe_crash_restart(
         wd.crash_history
             .retain(|t| (now - *t).num_seconds() < CRASH_RESTART_WINDOW_SECS);
         let decision = decide_crash_restart(
-            had_child_handle,
             stop_requested_at_exit,
             clean_exit,
             globally_armed,
@@ -4450,14 +4791,26 @@ async fn maybe_crash_restart(
 
                 // Re-check intent right before starting: the operator may
                 // have stopped, started, or disabled the runner during the
-                // backoff window.
+                // backoff window. The start below re-checks once it holds the
+                // lifecycle lock: a start or a stop running right now holds that
+                // lock, and has not written what this reads yet.
                 {
                     let runner = managed.runner.read().await;
-                    if runner.running || runner.stop_requested {
+                    if crash_restart_backoff_skips(
+                        runner.running,
+                        runner.stop_requested,
+                        runner.started_at,
+                        exited_spawned_at,
+                    ) {
                         info!(
                             "crash-only watchdog: skipping restart of runner '{}' — \
-                             state changed during backoff (running={}, stop_requested={})",
-                            runner_name, runner.running, runner.stop_requested
+                             state changed during backoff (running={}, stop_requested={}, \
+                             started_at={:?}, exited spawn={})",
+                            runner_name,
+                            runner.running,
+                            runner.stop_requested,
+                            runner.started_at,
+                            exited_spawned_at
                         );
                         return;
                     }
@@ -4483,7 +4836,8 @@ async fn maybe_crash_restart(
                         rebuild: false,
                     });
                 let started = std::time::Instant::now();
-                match start_runner_by_id(&state, &runner_id).await {
+                let start_as = StartAs::AfterCrash { exited_spawned_at };
+                match start_managed_runner(&state, &managed, None, start_as).await {
                     Ok(()) => {
                         let msg = format!(
                             "crash-only watchdog restarted runner '{}' (attempt {}/{})",
@@ -4502,6 +4856,19 @@ async fn maybe_crash_restart(
                                 build_duration_secs: None,
                             },
                         );
+                    }
+                    // A correct skip, not a failure. The event pairs with the
+                    // `RestartStarted` above, and its detail says superseded.
+                    Err(superseded @ SupervisorError::StartSuperseded(_)) => {
+                        info!("crash-only watchdog: not restarting: {superseded}");
+                        state
+                            .diagnostics
+                            .write()
+                            .await
+                            .emit(DiagnosticEventKind::RestartFailed {
+                                source: RestartSource::Watchdog,
+                                error: superseded.to_string(),
+                            });
                     }
                     Err(e) => {
                         let msg = format!(
@@ -4560,7 +4927,7 @@ async fn maybe_crash_restart(
         // the supervisor was up but launched without `--watchdog`, and the skip
         // was swallowed at `debug!`.
         skip @ (CrashRestartDecision::SkipNotArmed | CrashRestartDecision::SkipDisarmed)
-            if had_child_handle && !clean_exit && !stop_requested_at_exit =>
+            if !clean_exit && !stop_requested_at_exit =>
         {
             let reason = if matches!(skip, CrashRestartDecision::SkipNotArmed) {
                 "not armed (started without --watchdog)"
@@ -4590,7 +4957,7 @@ async fn maybe_crash_restart(
         // an ordinary shutdown, so nothing surfaced and it stayed down ~6 hours.
         // Same lesson as the 2026-07-20 breadcrumb above: an exit nobody asked
         // for is a reportable event even when not restarting it is correct.
-        CrashRestartDecision::SkipCleanExit if had_child_handle && !stop_requested_at_exit => {
+        CrashRestartDecision::SkipCleanExit if !stop_requested_at_exit => {
             let msg = format!(
                 "runner '{}' exited cleanly (code 0) but NO stop was requested. Not restarting \
                  (crash-only watchdog: code 0 is indistinguishable from an operator closing the \
@@ -4703,82 +5070,102 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
     }
 }
 
-/// Monitor a specific runner's process for exit.
+/// Monitor one spawn's process for exit. It owns the spawn's `Child`, handed
+/// over by value by `start_managed_runner`, the only place that holds one, so an
+/// exit it observes is always of a process this supervisor spawned; `spawned_at`
+/// is that spawn's identity.
 ///
 /// Returns a concrete `BoxFuture` (not an `async fn` opaque type) on
 /// purpose: the crash-only watchdog makes this function transitively
 /// self-referential (`start_managed_runner` spawns this monitor → the
 /// monitor calls [`maybe_crash_restart`] → which spawns a task calling
-/// [`start_runner_by_id`] → which calls `start_managed_runner`). With an
+/// `start_managed_runner`). With an
 /// opaque `async fn` future the compiler cannot resolve the cyclic hidden
 /// type; boxing at this edge makes the spawn argument inside
 /// `start_managed_runner` a concrete `Send` type and breaks the cycle.
 fn monitor_runner_process_exit(
     state: SharedState,
     managed: Arc<ManagedRunner>,
-    runner_id: String,
+    child: tokio::process::Child,
+    spawned_at: chrono::DateTime<chrono::Utc>,
 ) -> futures::future::BoxFuture<'static, ()> {
-    Box::pin(monitor_runner_process_exit_inner(state, managed, runner_id))
+    Box::pin(monitor_runner_process_exit_inner(
+        state, managed, child, spawned_at,
+    ))
 }
 
+/// Never takes the lifecycle lock: a stop holds it through its graceful wait,
+/// which is waiting for this function to clear `running`.
 async fn monitor_runner_process_exit_inner(
     state: SharedState,
     managed: Arc<ManagedRunner>,
-    _runner_id: String,
+    mut child: tokio::process::Child,
+    spawned_at: chrono::DateTime<chrono::Utc>,
 ) {
     let is_primary = managed.config.kind().is_primary();
     let runner_name = managed.config.name.clone();
 
-    // Take the child out of state so we can await without holding the lock.
-    let child = {
-        let mut runner = managed.runner.write().await;
-        runner.process.take()
-    };
-
-    // Provenance: a Some(child) here means WE spawned this process via
-    // `start_managed_runner` — the only place that stores a Child. The
-    // crash-only watchdog must never restart a runner the supervisor didn't
-    // spawn, so this is threaded into the restart decision.
-    let had_child_handle = child.is_some();
-
-    let exit_status = if let Some(mut child) = child {
-        match child.wait().await {
-            Ok(status) => Some(status),
-            Err(e) => {
-                error!("Error waiting for runner '{}' process: {}", runner_name, e);
-                None
-            }
+    let exit_status = match child.wait().await {
+        Ok(status) => Some(status),
+        Err(e) => {
+            error!("Error waiting for runner '{}' process: {}", runner_name, e);
+            None
         }
-    } else {
-        None
     };
+    let exited_at = chrono::Utc::now();
 
-    // Update per-runner state. Latch `stop_requested` in the same critical
-    // section, BEFORE publishing `running = false`: the operator stop path
-    // (`stop_runner_by_id`) only proceeds past its graceful-wait once it
-    // observes `running == false`, and the flag is only ever cleared by a
-    // subsequent start — so the value read here is exactly the operator's
-    // intent for THIS exit, race-free.
-    let stop_requested_at_exit = {
+    // Update per-runner state, but only while `started_at` is still this
+    // spawn's: a newer spawn, or a stop's reset, may have landed while this
+    // monitor waited, and its `running` and `pid` are not this exit's to clear.
+    // `started_at` is the key because only a start, an adoption and a stop's
+    // reset write it; the health cache clears a booting primary's `pid`.
+    //
+    // Read `stop_requested`, and the time of the earliest request with it, in
+    // the same critical section, before publishing `running = false`. They are
+    // only ever cleared by a subsequent start, so the values read here are the
+    // stop flag as it stands when this monitor reads it, a failed stop's flag
+    // included. A monitor that wakes after a later start read that start's
+    // cleared flag (see `SpawnMarker::stop_requested_at`).
+    let (is_current_spawn, stop_requested_at_exit, stop_request_time) = {
         let mut runner = managed.runner.write().await;
-        let latched = runner.stop_requested;
-        runner.running = false;
-        runner.process = None;
-        runner.pid = None;
-        latched
+        let is_current_spawn = runner.started_at == Some(spawned_at);
+        let latched = (runner.stop_requested, runner.stop_requested_at);
+        if is_current_spawn {
+            runner.running = false;
+            runner.pid = None;
+        }
+        (is_current_spawn, latched.0, latched.1)
     };
 
-    // Update legacy state for primary
-    if is_primary {
+    // Stamp the exit on this spawn's ring entry at once: before the legacy-state
+    // update, the log emit and the panic-log parse below, which would otherwise
+    // widen the lag in which the dev-action attribution watcher reads a process
+    // that has exited as still up. It still lags the exit by the wait's wake-up
+    // and the critical section above. When the stop flag read above was latched,
+    // the entry carries the request's time, or the exit's when the flag was
+    // latched with none, unless the request is dated after this exit
+    // (`SpawnRing::stamp_exit`). Only stamped, never removed; the panic parsed at
+    // this exit is attached below to the same entry.
+    let exit_requested_at =
+        stop_requested_at_exit.then_some(stop_request_time.unwrap_or(exited_at));
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .stamp_exit(spawned_at, exited_at, exit_requested_at);
+
+    // Update legacy state for primary. Gated on the compare above, not on a
+    // compare of its own: the legacy `started_at` is a separate clock read, so
+    // it never equals `spawned_at`.
+    if is_primary && is_current_spawn {
         let mut runner = state.runner.write().await;
         runner.running = false;
-        runner.process = None;
         runner.pid = None;
     }
 
     state.notify_health_change();
 
-    if let Some(status) = exit_status {
+    let exit_panic = if let Some(status) = exit_status {
         let msg = if status.success() {
             format!("Runner '{}' process exited normally", runner_name)
         } else {
@@ -4799,8 +5186,10 @@ async fn monitor_runner_process_exit_inner(
         // axum router construction) doesn't flow through stderr in a
         // shape our buffered reader can latch onto, so this file is the
         // only place the panic payload actually lives.
-        if !status.success() {
-            check_and_record_panic_log(&state, &managed, &runner_name).await;
+        if status.success() {
+            None
+        } else {
+            check_and_record_panic_log(&state, &managed, &runner_name).await
         }
     } else {
         let msg = format!("Runner '{}' process terminated unexpectedly", runner_name);
@@ -4812,30 +5201,56 @@ async fn monitor_runner_process_exit_inner(
         // Also check on unexpected termination — the child is gone either
         // way, and if a panic log exists within the freshness window it's
         // almost certainly the cause.
-        check_and_record_panic_log(&state, &managed, &runner_name).await;
+        check_and_record_panic_log(&state, &managed, &runner_name).await
+    };
+
+    // Attach the panic parsed at this exit to the entry stamped above, named
+    // by this spawn's identity, so never to another spawn that reused the pid.
+    // A watcher that closes between the stamp and this attach
+    // sees the exit without the panic, and still finds it in `recent_panic`,
+    // which `check_and_record_panic_log` stored, or in the file. Both ring
+    // writes run BEFORE the crash watchdog below can schedule a restart, whose
+    // spawn pushes the next entry and clears `recent_panic`; the next panic
+    // then overwrites the file.
+    if let Some(panic) = exit_panic {
+        managed
+            .recent_spawns
+            .write()
+            .await
+            .attach_exit_panic(spawned_at, panic);
     }
 
     // Crash-only ambient watchdog: if this exit was a crash (not an
     // operator stop, not a clean exit) and the watchdog is armed for this
     // runner, schedule an auto-restart with exponential backoff + a
-    // crash-loop guard. A wait() error (exit_status == None) on a child we
-    // actually spawned is treated as a crash — the process is gone and we
-    // can't prove it exited cleanly.
+    // crash-loop guard. A wait() error (exit_status == None) is treated as a
+    // crash — the process is gone and we can't prove it exited cleanly. The
+    // hook reads the latch whatever the stamp above kept: a stop latched just
+    // after an exit still means the operator was stopping this runner anyway.
+    //
+    // Only the current spawn's exit reaches it. Another spawn or a stop's reset
+    // has replaced this one, so this exit is no crash of the runner, and what
+    // the latch says belongs to that later start. It must not warn "crashed" or
+    // take a crash-loop budget slot, since one exit too many disarms the arm.
     let clean_exit = exit_status.map(|s| s.success()).unwrap_or(false);
-    maybe_crash_restart(
-        &state,
-        &managed,
-        had_child_handle,
-        stop_requested_at_exit,
-        clean_exit,
-    )
-    .await;
+    if is_current_spawn {
+        maybe_crash_restart(
+            &state,
+            &managed,
+            stop_requested_at_exit,
+            clean_exit,
+            spawned_at,
+        )
+        .await;
+    }
 }
 
 /// Look for `<panic_log_dir>/runner-panic.log`; if it exists and its
 /// timestamp is within [`PANIC_LOG_FRESHNESS_SECS`] of now, parse it and
 /// stash it on the managed runner so `GET /runners` can surface it. Also
 /// emit a tagged `[runner-panic]` ERROR into the supervisor log buffer.
+/// Returns the panic it stashed, which the exit monitor also attaches to the
+/// ring entry it stamped for that exit, if it stamped one.
 ///
 /// All errors are swallowed at debug level — panic telemetry is strictly
 /// best-effort and must never interfere with normal process-exit handling.
@@ -4843,7 +5258,7 @@ async fn check_and_record_panic_log(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
     runner_name: &str,
-) {
+) -> Option<crate::process::panic_log::RecentPanic> {
     let dir_opt = managed.panic_log_dir.read().await.clone();
     let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
 
@@ -4852,7 +5267,7 @@ async fn check_and_record_panic_log(
             "No panic log found for runner '{}' at {:?}",
             runner_name, path
         );
-        return;
+        return None;
     };
 
     // Freshness gate — a stale file from a previous boot shouldn't be
@@ -4863,7 +5278,7 @@ async fn check_and_record_panic_log(
             "Panic log at {:?} is stale (timestamp {} vs now {}) — ignoring",
             path, parsed.timestamp, now
         );
-        return;
+        return None;
     }
 
     let location_str = parsed.location.as_deref().unwrap_or("<unknown>");
@@ -4884,7 +5299,8 @@ async fn check_and_record_panic_log(
     // passing `?include_stopped=true` to the logs endpoint see the
     // panic via the stopped-cache snapshot once we extend that path.
     let mut slot = managed.recent_panic.write().await;
-    *slot = Some(parsed);
+    *slot = Some(parsed.clone());
+    Some(parsed)
 }
 
 /// POST to the runner's UI Bridge close-request endpoint so that
@@ -4958,25 +5374,127 @@ async fn request_drain(state: &SharedState, port: u16, runner_name: &str) {
     }
 }
 
-async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str) {
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/control/page/close-request",
-        port
-    );
-    let result = state
-        .http_client
-        .post(&url)
-        .timeout(Duration::from_millis(
-            RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS,
-        ))
-        .send()
-        .await;
+/// What the stop's graceful poll treats as "the runner has exited".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GracefulExitSignal {
+    /// The registry's `running` flag went false — today's signal, used for
+    /// every non-handoff stop.
+    RunningFlag,
+    /// This PID is no longer alive. Used under a handoff when the target PID
+    /// came from the registry, because `running` can flip on one failed
+    /// `/health` probe while the runner is still mid-teardown.
+    PidGone(u32),
+    /// As [`GracefulExitSignal::PidGone`], OR `running` is false AND the port
+    /// is free. Used under a handoff when the PID came from a probe (listener
+    /// or image identity): that PID is only a candidate, so the runner's own
+    /// exit is also accepted on the joint evidence of a cleared flag and a
+    /// released port — the flag alone is never enough.
+    PidGoneOrStoppedAndPortFree(u32),
+}
+
+/// Whether a stop target's pid names this runner's own spawn rather than a
+/// candidate a probe turned up. The ring's pid does: the stop has just read that
+/// spawn as current and its pid as alive.
+pub(crate) fn source_names_the_spawn(source: &PidSource) -> bool {
+    matches!(source, PidSource::Registry | PidSource::SpawnRing)
+}
+
+/// Whether a stop publishes the pid it identified to `RunnerState::pid`. Not the
+/// ring's: the registry's pid is exempt from the image check, so a ring pid the OS
+/// has reused, refused here, would be killed by a retried stop that read it back.
+pub(crate) fn publishes_discovered_pid(source: &PidSource) -> bool {
+    !matches!(source, PidSource::SpawnRing)
+}
+
+/// Pick the graceful-exit signal. `pid_names_the_spawn` says whether `pid` is the
+/// spawn's own (see [`source_names_the_spawn`]) or a probe's candidate. A handoff with no
+/// known PID falls back to [`GracefulExitSignal::RunningFlag`], and the caller
+/// logs that it did.
+pub(crate) fn graceful_exit_signal(
+    intent: CloseIntent,
+    pid: Option<u32>,
+    pid_names_the_spawn: bool,
+) -> GracefulExitSignal {
+    match (intent, pid) {
+        (CloseIntent::HandoffHolders, Some(pid)) if pid_names_the_spawn => {
+            GracefulExitSignal::PidGone(pid)
+        }
+        (CloseIntent::HandoffHolders, Some(pid)) => {
+            GracefulExitSignal::PidGoneOrStoppedAndPortFree(pid)
+        }
+        _ => GracefulExitSignal::RunningFlag,
+    }
+}
+
+/// Has the runner exited, by `signal`? `pid_alive` and `port_held` are
+/// injected so the decision is testable without a process or a socket;
+/// `port_held` is consulted only by the arm that needs it.
+pub(crate) fn graceful_exit_observed(
+    signal: GracefulExitSignal,
+    running: bool,
+    pid_alive: impl Fn(u32) -> bool,
+    port_held: impl Fn() -> bool,
+) -> bool {
+    match signal {
+        GracefulExitSignal::RunningFlag => !running,
+        GracefulExitSignal::PidGone(pid) => !pid_alive(pid),
+        GracefulExitSignal::PidGoneOrStoppedAndPortFree(pid) => {
+            !pid_alive(pid) || (!running && !port_held())
+        }
+    }
+}
+
+/// Path of the runner's close-request door (`mcp/ui_bridge/page.rs`).
+pub(crate) const CLOSE_REQUEST_PATH: &str = "/ui-bridge/control/page/close-request";
+
+/// POST the close-request to `base_url`, carrying the intent's body.
+///
+/// [`CloseIntent::Kill`] sends no body and no `Content-Type` — the exact
+/// request this supervisor has always sent. [`CloseIntent::HandoffHolders`]
+/// sends `{"handoff":"holders"}` as JSON. Split out from
+/// [`request_graceful_stop`] so the wire shape is testable against a real HTTP
+/// server without a runner or a `SharedState`.
+pub(crate) async fn post_close_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    intent: CloseIntent,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), CLOSE_REQUEST_PATH);
+    let mut req = client.post(&url).timeout(Duration::from_millis(
+        RUNNER_GRACEFUL_STOP_REQUEST_TIMEOUT_MS,
+    ));
+    if let Some(body) = intent.close_request_body() {
+        req = req.json(&body);
+    }
+    req.send().await
+}
+
+async fn request_graceful_stop(
+    state: &SharedState,
+    port: u16,
+    runner_name: &str,
+    intent: CloseIntent,
+) {
+    let result = post_close_request(
+        &state.http_client,
+        &format!("http://127.0.0.1:{}", port),
+        intent,
+    )
+    .await;
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let msg = format!(
-                "Requested graceful stop for runner '{}' via close-request (port {})",
-                runner_name, port
-            );
+            let msg = if intent.is_handoff() {
+                format!(
+                    "Requested graceful HANDOFF stop for runner '{}' via close-request \
+                     {{\"handoff\":\"holders\"}} (port {})",
+                    runner_name, port
+                )
+            } else {
+                format!(
+                    "Requested graceful stop for runner '{}' via close-request (port {})",
+                    runner_name, port
+                )
+            };
             info!("{}", msg);
             state
                 .logs
@@ -4990,23 +5508,39 @@ async fn request_graceful_stop(state: &SharedState, port: u16, runner_name: &str
                 port,
                 resp.status()
             );
-            debug!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
-                .await;
+            emit_close_request_fallthrough(state, intent, msg).await;
         }
         Err(e) => {
             let msg = format!(
                 "Graceful close-request for runner '{}' (port {}) failed: {} — falling through to kill",
                 runner_name, port, e
             );
-            debug!("{}", msg);
-            state
-                .logs
-                .emit(LogSource::Supervisor, LogLevel::Debug, msg)
-                .await;
+            emit_close_request_fallthrough(state, intent, msg).await;
         }
+    }
+}
+
+/// Log a close-request that did not land. Debug for a normal stop, as it always
+/// was. For a handoff it is a Warn: the runner never received the intent, so
+/// the PID kill that follows takes the holder panes down with it — the outcome
+/// the caller asked to avoid — and that must be readable in the operator log.
+async fn emit_close_request_fallthrough(state: &SharedState, intent: CloseIntent, msg: String) {
+    if intent.is_handoff() {
+        let msg = format!(
+            "{msg} — the runner may NOT have received the HANDOFF intent; if it did not, \
+             holder-backed panes are killed with the runner"
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+            .await;
+    } else {
+        debug!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Debug, msg)
+            .await;
     }
 }
 
@@ -5024,11 +5558,12 @@ async fn resolve_stop_target_for(
     managed: &ManagedRunner,
     port: u16,
     registry_pid: Option<u32>,
+    spawn_ring_pid: Option<u32>,
 ) -> StopTarget {
-    // Short-circuit: the registry already knows, so neither probe is worth
-    // paying for.
-    if let Some(pid) = registry_pid {
-        return resolve_stop_target(Some(pid), Ok(None), &[]);
+    // Short-circuit: the registry or the ring already knows, so neither probe is
+    // worth paying for.
+    if registry_pid.is_some() || spawn_ring_pid.is_some() {
+        return resolve_stop_target(registry_pid, spawn_ring_pid, Ok(None), &[]);
     }
 
     // Both probes go through the cross-platform `proc_kill` facade. They used
@@ -5041,7 +5576,7 @@ async fn resolve_stop_target_for(
         .map_err(|e| e.to_string());
     let exe_copy = state.config.runner_exe_copy_path(&managed.config);
     let by_exe = crate::process::proc_kill::find_pids_holding_exe(&exe_copy).await;
-    resolve_stop_target(None, listener, &by_exe)
+    resolve_stop_target(None, None, listener, &by_exe)
 }
 
 /// Adapter for [`verify_target_image`]: read the target's live image path and
@@ -5080,10 +5615,15 @@ async fn verify_kill_target(
 /// it parsed one and threw it away. See [`crate::restart_readiness`] for the
 /// exemptions (temp runners, explicitly-unprotected runners, and runners the
 /// supervisor has no evidence are alive).
+///
+/// `intent` is forwarded on the close-request and sizes the graceful wait —
+/// see [`CloseIntent`]. Every caller but a handoff restart passes
+/// [`CloseIntent::Kill`], which is byte-for-byte the stop this always was.
 pub async fn stop_runner_by_id(
     state: &SharedState,
     runner_id: &str,
     force: bool,
+    intent: CloseIntent,
 ) -> Result<(), SupervisorError> {
     let managed = state
         .get_runner(runner_id)
@@ -5098,6 +5638,7 @@ pub async fn stop_runner_by_id(
         &managed,
         crate::restart_readiness::GateAction::Stop,
         force,
+        intent,
     )
     .await?;
 
@@ -5105,9 +5646,23 @@ pub async fn stop_runner_by_id(
     let port = managed.config.port;
     let is_primary = managed.config.kind().is_primary();
 
+    // Ordered against this runner's starts, other stops and the max-age sweep,
+    // from the latch through the reset and a `test-*` runner's teardown. A start
+    // queues behind the drain, graceful wait and reap below; the exit monitor
+    // does not take this lock, so the graceful wait still sees `running` fall.
+    // See `ManagedRunner::lifecycle`. Waiting here may have let another stop
+    // remove the entry and a later spawn take its port.
+    let _lifecycle = managed.lifecycle.lock().await;
+    if !is_registered(state, &managed).await {
+        return Err(SupervisorError::RunnerNotFound(runner_id.to_string()));
+    }
+
+    // Latch the stop intent, and the time of the earliest request still
+    // latched, before any kill rung. The exit monitor stamps that time on the
+    // exited spawn's ring entry; this function never touches the ring.
     {
         let mut runner = managed.runner.write().await;
-        runner.stop_requested = true;
+        runner.latch_stop_request(chrono::Utc::now());
     }
 
     state
@@ -5120,19 +5675,24 @@ pub async fn stop_runner_by_id(
         .await;
 
     // The Child handle is owned by the `monitor_runner_process_exit` task that
-    // was spawned when the runner started — it calls `runner.process.take()`
-    // immediately so it can await `child.wait()` without holding the lock. So
-    // by the time we get here, `managed.runner.process` is always None, and
-    // we have to work via (a) the graceful HTTP close endpoint, (b) an
-    // identified PID, and (c) the `running` flag that the monitor task flips
-    // to false when the process exits.
+    // was spawned when the runner started, so we have to work via (a) the
+    // graceful HTTP close endpoint, (b) an identified PID, and (c) the `running`
+    // flag that the monitor task flips to false when the process exits.
     //
     // For an ADOPTED runner there is no monitor task and no Child at all, and
     // the stored PID can be None indefinitely — so (b) is resolved below from
     // three independent sources rather than read straight out of the registry.
-    let registry_pid = {
+    //
+    // A pid the health cache cleared from a primary still booting is still in the
+    // newest spawn's ring entry. It goes in as its own source, not as the
+    // registry's, since the OS can have reused it: it gets the image check below.
+    let (registry_pid, spawn_ring_pid) = {
         let runner = managed.runner.read().await;
-        runner.pid
+        let spawns = managed.recent_spawns.read().await;
+        (
+            runner.pid,
+            pid_of_newest_spawn_if_up(runner.started_at, &spawns),
+        )
     };
 
     // Ledger of what this stop ACTUALLY does, so a failure can say which rungs
@@ -5161,7 +5721,8 @@ pub async fn stop_runner_by_id(
     // `request_graceful_stop` entirely — a hard kill of the operator's primary
     // with no chance to flush in-flight AI turns or stash dirty worktrees.
     // Identify now, kill through the normal ladder below.
-    let stop_target = resolve_stop_target_for(state, &managed, port, registry_pid).await;
+    let stop_target =
+        resolve_stop_target_for(state, &managed, port, registry_pid, spawn_ring_pid).await;
 
     // `mut` because the pre-kill identity re-check below can retract the
     // target.
@@ -5180,7 +5741,7 @@ pub async fn stop_runner_by_id(
                     .await;
                 // Publish it so the dashboard, the exit monitor and any racing
                 // health probe all see the same process we are about to stop.
-                {
+                if publishes_discovered_pid(source) {
                     let mut runner = managed.runner.write().await;
                     if runner.pid.is_none() {
                         runner.pid = Some(*pid);
@@ -5221,16 +5782,48 @@ pub async fn stop_runner_by_id(
     //    hooks run (notably UsbTransport::release_all, which removes adb
     //    forwards — see qontinui-runner §1.6a). Best-effort: on any failure
     //    we fall through to the PID kill below.
-    request_graceful_stop(state, port, &runner_name).await;
+    request_graceful_stop(state, port, &runner_name, intent).await;
 
-    // 2. Poll the monitor's `running` flag for up to
-    //    RUNNER_GRACEFUL_STOP_TIMEOUT_MS. When the runner exits, the monitor
-    //    task sets running=false — that's our signal that graceful worked.
-    let graceful_deadline =
-        std::time::Instant::now() + Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS);
+    // 2. Poll the monitor's `running` flag for up to the intent's graceful
+    //    wait — RUNNER_GRACEFUL_STOP_TIMEOUT_MS normally, extended to cover
+    //    the runner's teardown budget for a handoff (see
+    //    `CloseIntent::graceful_stop_timeout`). When the runner exits, the
+    //    monitor task sets running=false — that's our signal that graceful
+    //    worked.
+    //
+    //    Under a handoff the signal is the target PID being GONE, not the
+    //    `running` flag: for a user-managed runner `running` mirrors the last
+    //    `/health` probe, so one probe the tearing-down runner fails to answer
+    //    would end the wait early and the PID kill below would cut the detach.
+    //    See `graceful_exit_signal`.
+    let graceful_timeout = intent.graceful_stop_timeout();
+    let pid_names_the_spawn = matches!(
+        &stop_target,
+        StopTarget::Found { source, .. } if source_names_the_spawn(source)
+    );
+    let exit_signal = graceful_exit_signal(intent, pid_to_kill, pid_names_the_spawn);
+    if intent.is_handoff() && exit_signal == GracefulExitSignal::RunningFlag {
+        let msg = format!(
+            "Runner '{}' handoff stop: no target PID was identified, so the graceful wait \
+             falls back to the `running` flag, which a failed /health probe can end early",
+            runner_name
+        );
+        warn!("{}", msg);
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+            .await;
+    }
+    let graceful_deadline = std::time::Instant::now() + graceful_timeout;
     let mut exited_gracefully = false;
     while std::time::Instant::now() < graceful_deadline {
-        if !managed.runner.read().await.running {
+        let running = managed.runner.read().await.running;
+        if graceful_exit_observed(
+            exit_signal,
+            running,
+            crate::process::proc_kill::pid_alive,
+            || crate::process::port::is_port_listening(port),
+        ) {
             let msg = format!(
                 "Runner '{}' exited gracefully after close-request",
                 runner_name
@@ -5249,7 +5842,8 @@ pub async fn stop_runner_by_id(
     if !exited_gracefully {
         let msg = format!(
             "Graceful stop timed out for runner '{}' after {}ms, falling through to taskkill",
-            runner_name, RUNNER_GRACEFUL_STOP_TIMEOUT_MS
+            runner_name,
+            graceful_timeout.as_millis()
         );
         info!("{}", msg);
         state
@@ -5332,70 +5926,41 @@ pub async fn stop_runner_by_id(
             // Confirm-first: poll the port for up to 5s. A graceful exit or a
             // prior kill that lands late resolves here without escalation.
             let port_free = wait_for_port_free(port, 5).await;
-            match decide_stop_reap(attempt, !port_free) {
+            let outcome = decide_stop_reap(attempt, !port_free);
+            match outcome {
                 StopReapOutcome::Confirmed => break,
-                StopReapOutcome::EscalateTree => {
+                StopReapOutcome::EscalateTree | StopReapOutcome::EscalatePort => {
+                    // WHICH kill primitives run is decided by `reap_kills`, a
+                    // pure table, so the handoff guarantee — no tree or
+                    // process-group kill, which would signal the holder
+                    // processes the handoff keeps alive — is tested on the
+                    // decision rather than on this loop's text.
+                    let kills = reap_kills(outcome, intent);
                     warn!(
-                        "Port {} still in use after stopping runner '{}', \
-                         escalating to tree-kill (attempt {})",
-                        port, runner_name, attempt
+                        "Port {} still in use for runner '{}' (attempt {}), escalating: {:?}{}",
+                        port,
+                        runner_name,
+                        attempt,
+                        kills,
+                        if intent.is_handoff() {
+                            " — handoff: listener-only kills, no tree / process-group kill"
+                        } else {
+                            ""
+                        }
                     );
-                    {
-                        match pid_to_kill {
-                            Some(pid) => {
-                                let killed = crate::process::proc_kill::kill_by_pid_tree(pid)
-                                    .await
-                                    .unwrap_or(false);
-                                ledger.ran(
-                                    StopStrategy::TreeKill,
-                                    format!("PID {} (+ child tree)", pid),
-                                    killed,
-                                );
-                            }
-                            None => ledger.no_target(StopStrategy::TreeKill, no_target_why.clone()),
-                        }
-                        // Also catch a survivor whose PID we never tracked
-                        // (orphan adopted on a port we knew but no PID for).
-                        // A probe that could not RUN is UNKNOWN — never a
-                        // kill; the next escalation step re-confirms anyway.
-                        match crate::process::proc_kill::find_pid_on_port(port).await {
-                            Ok(Some(live_pid)) if Some(live_pid) != pid_to_kill => {
-                                let killed = crate::process::proc_kill::kill_by_pid_tree(live_pid)
-                                    .await
-                                    .unwrap_or(false);
-                                ledger.ran(
-                                    StopStrategy::TreeKill,
-                                    format!("untracked listener PID {}", live_pid),
-                                    killed,
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => warn!(
-                                "Stop-reap escalation for runner '{}': listener probe on port \
-                                 {} failed ({}) — skipping the untracked-survivor kill",
-                                runner_name, port, e
-                            ),
-                        }
+                    if intent.is_handoff() && outcome == StopReapOutcome::EscalateTree {
+                        ledger.no_target(StopStrategy::TreeKill, HANDOFF_TREE_KILL_SKIPPED);
                     }
-                }
-                StopReapOutcome::EscalatePort => {
-                    warn!(
-                        "Port {} STILL in use for runner '{}' after tree-kill, \
-                         escalating to kill-by-port (attempt {})",
-                        port, runner_name, attempt
-                    );
-                    match crate::process::proc_kill::kill_by_port(port).await {
-                        Ok(killed) => {
-                            ledger.ran(StopStrategy::KillByPort, format!("port {}", port), killed)
-                        }
-                        // The listener probe could not answer, so kill-by-port
-                        // had nothing to aim at. Recording this as a NON-RUN is
-                        // the whole point: it is exactly the case the old fixed
-                        // failure sentence misreported as an attempted kill.
-                        Err(e) => ledger.no_target(
-                            StopStrategy::KillByPort,
-                            format!("listener probe could not answer: {}", e),
-                        ),
+                    for kill in kills {
+                        run_reap_kill(
+                            *kill,
+                            port,
+                            pid_to_kill,
+                            &no_target_why,
+                            &runner_name,
+                            &mut ledger,
+                        )
+                        .await;
                     }
                 }
                 StopReapOutcome::RetryAfterBackoff => {
@@ -5469,7 +6034,6 @@ pub async fn stop_runner_by_id(
     // runner the operator deliberately stopped.
     {
         let mut runner = managed.runner.write().await;
-        runner.process = None;
         runner.running = false;
         runner.started_at = None;
         runner.pid = None;
@@ -5478,7 +6042,6 @@ pub async fn stop_runner_by_id(
     // Update legacy state for primary
     if is_primary {
         let mut runner = state.runner.write().await;
-        runner.process = None;
         runner.running = false;
         runner.started_at = None;
         runner.pid = None;
@@ -5612,8 +6175,18 @@ pub fn automated_restart_blocked(is_temp: bool, source: &RestartSource) -> bool 
 /// port-level fact the liveness classifier derives `UnresponsiveSince` from).
 /// `stop_runner_by_id` already copes with a runner it has no `Child` for; this
 /// predicate is what gets it *reached*.
-pub fn restart_should_stop(running: bool, pid: Option<u32>, port_open: bool) -> bool {
-    running || pid.is_some() || port_open
+///
+/// `newest_spawn_up` ([`newest_spawn_is_up`]) is the fourth signal. A primary
+/// booting or wedged before it binds has all three of the others false, since
+/// the health cache clears `running` and `pid` and its port is closed, and the
+/// start then refuses it as already running for as long as it lives.
+pub fn restart_should_stop(
+    running: bool,
+    pid: Option<u32>,
+    port_open: bool,
+    newest_spawn_up: bool,
+) -> bool {
+    running || pid.is_some() || port_open || newest_spawn_up
 }
 
 /// Pure half of [`refuse_if_port_held_by_live_runner`]: refuse only on
@@ -5679,6 +6252,70 @@ pub async fn refuse_if_port_held_by_live_runner(port: u16) -> Result<(), Supervi
         port, pid
     );
     Ok(())
+}
+
+/// What a stop or restart asks the runner to do with its holder-backed panes
+/// when it POSTs the close-request (plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D7).
+///
+/// **The supervisor only forwards this intent.** The decision of which panes
+/// survive, and the mechanism that detaches them, live in the runner; the
+/// supervisor is dev-only and nothing a user has depends on it. This type
+/// carries the operator's request to the runner, selects which readiness field
+/// gates it, and sizes the graceful wait — and nothing else.
+///
+/// The wire spelling on every restart door is `handoff: bool` (default
+/// `false`); read it through [`CloseIntent::from_handoff`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseIntent {
+    /// Today's close: the close-request carries NO body, every pane is killed,
+    /// and the readiness gate reads `safe_to_restart`.
+    #[default]
+    Kill,
+    /// The close-request carries `{"handoff":"holders"}`: the runner detaches
+    /// holder-backed panes instead of killing them. The readiness gate reads
+    /// `safe_with_handoff` instead (absent = UNKNOWN = refuse), and the
+    /// graceful wait is extended to cover the runner's teardown budget.
+    HandoffHolders,
+}
+
+impl CloseIntent {
+    /// The typed value for a wire `handoff` flag. The one place that bool's
+    /// polarity is interpreted.
+    pub fn from_handoff(handoff: bool) -> Self {
+        if handoff {
+            CloseIntent::HandoffHolders
+        } else {
+            CloseIntent::Kill
+        }
+    }
+
+    pub fn is_handoff(self) -> bool {
+        matches!(self, CloseIntent::HandoffHolders)
+    }
+
+    /// The close-request body. `None` for [`CloseIntent::Kill`], so a
+    /// non-handoff stop sends exactly the bodyless POST it always has.
+    pub fn close_request_body(self) -> Option<serde_json::Value> {
+        match self {
+            CloseIntent::Kill => None,
+            CloseIntent::HandoffHolders => Some(serde_json::json!({ "handoff": "holders" })),
+        }
+    }
+
+    /// How long the stop waits for the runner to exit on its own after the
+    /// close-request, before the PID kill. See
+    /// [`RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS`] for why the handoff wait is
+    /// longer and where its value comes from.
+    pub fn graceful_stop_timeout(self) -> Duration {
+        match self {
+            CloseIntent::Kill => Duration::from_millis(RUNNER_GRACEFUL_STOP_TIMEOUT_MS),
+            CloseIntent::HandoffHolders => {
+                Duration::from_millis(RUNNER_HANDOFF_GRACEFUL_STOP_TIMEOUT_MS)
+            }
+        }
+    }
 }
 
 /// Which tree a rebuild compiles **for the primary runner**.
@@ -5760,6 +6397,16 @@ impl BuildTree {
 /// reads that flag, so its first failed attempt would have silenced it for
 /// good (plan `2026-09-03-runner-zombie-serving-watchdog`, Phase 3 vet
 /// finding).
+///
+/// `intent` ([`CloseIntent`]) is the restart's handoff option. With
+/// [`CloseIntent::HandoffHolders`] the readiness gate reads the runner's
+/// `safe_with_handoff` instead of `safe_to_restart` (absent refuses), the
+/// close-request carries `{"handoff":"holders"}`, and the graceful wait is
+/// extended. `force` keeps exactly its existing meaning under either intent.
+///
+/// `initiated_by` is the dev action this restart belongs to, `None` when nothing
+/// minted one; see [`start_managed_runner`].
+#[allow(clippy::too_many_arguments)]
 pub async fn restart_runner_by_id(
     state: &SharedState,
     runner_id: &str,
@@ -5767,6 +6414,8 @@ pub async fn restart_runner_by_id(
     source: RestartSource,
     force: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
+    initiated_by: Option<uuid::Uuid>,
 ) -> Result<(), SupervisorError> {
     if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
@@ -5825,6 +6474,7 @@ pub async fn restart_runner_by_id(
         &managed,
         crate::restart_readiness::GateAction::Restart,
         force,
+        intent,
     )
     .await
     {
@@ -5846,7 +6496,16 @@ pub async fn restart_runner_by_id(
 
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
-    let outcome = restart_after_gate(state, &managed, runner_id, rebuild, build_tree).await;
+    let outcome = restart_after_gate(
+        state,
+        &managed,
+        runner_id,
+        rebuild,
+        build_tree,
+        intent,
+        initiated_by,
+    )
+    .await;
 
     {
         let mut runner = managed.runner.write().await;
@@ -5909,12 +6568,18 @@ pub(crate) fn orphaned_by_failed_restart(is_temp: bool, still_registered: bool) 
 /// Kept as a separate function so the caller can clear `restart_requested`
 /// exactly once regardless of which step failed — every `?` here lands on the
 /// same clearing line in the wrapper.
+///
+/// Holds the lifecycle lock around neither its stop nor its start: each takes
+/// it itself, and the mutex is not reentrant. A start that slips in between
+/// makes this one fail `RunnerAlreadyRunning`: ordered, and reported.
 async fn restart_after_gate(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
     runner_id: &str,
     rebuild: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
+    initiated_by: Option<uuid::Uuid>,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -5924,17 +6589,22 @@ async fn restart_after_gate(
     // The port-level fact comes from the per-runner `CachedPortHealth`
     // (`managed.cached_health`), the same snapshot the liveness classifier
     // reads — never from the SSE `CachedRunnerHealth` vector.
-    let (running, pid) = {
+    let (running, pid, newest_spawn_up) = {
         let runner = managed.runner.read().await;
-        (runner.running, runner.pid)
+        let spawns = managed.recent_spawns.read().await;
+        (
+            runner.running,
+            runner.pid,
+            newest_spawn_is_up(runner.started_at, &spawns),
+        )
     };
     let port_open = managed.cached_health.read().await.runner_port_open;
-    if restart_should_stop(running, pid, port_open) {
+    if restart_should_stop(running, pid, port_open, newest_spawn_up) {
         if !running {
             info!(
-                "Restart of runner '{}': tracked running=false but pid={:?}, port_open={} — \
-                 stopping the live process before starting (S2 guard)",
-                runner_id, pid, port_open
+                "Restart of runner '{}': tracked running=false but pid={:?}, port_open={}, \
+                 newest_spawn_up={} — stopping the live process before starting (S2 guard)",
+                runner_id, pid, port_open, newest_spawn_up
             );
         }
         // `force: true` — NOT a bypass. The readiness verdict was already
@@ -5942,7 +6612,9 @@ async fn restart_after_gate(
         // re-probing here would pay a second HTTP round trip and, worse,
         // could refuse a restart the caller was already granted because a
         // session appeared in between. One decision per operator request.
-        stop_runner_by_id(state, runner_id, true).await?;
+        // `intent` rides along so a handoff restart's close-request carries
+        // the handoff body and gets the extended graceful wait.
+        stop_runner_by_id(state, runner_id, true, intent).await?;
     }
 
     // Rebuild if requested (global — single binary).
@@ -5973,11 +6645,11 @@ async fn restart_after_gate(
     // stopping a `test-*` runner auto-removes its id from `state.runners`, so
     // `start_runner_by_id(runner_id)` would 404 with "Runner not found" even
     // though we have the full config in hand. `start_managed_runner`
-    // re-inserts the id into the registry (its defensive `or_insert`), so a
+    // re-inserts the id into the registry (`StartAs::Restart`), so a
     // restart of a *running* temp runner re-spawns on the SAME port instead
     // of stranding it. For non-temp runners the id was never removed, so this
     // is equivalent to the by-id path.
-    start_managed_runner(state, managed).await?;
+    start_managed_runner(state, managed, initiated_by, StartAs::Restart).await?;
 
     Ok(build_duration)
 }
@@ -5992,7 +6664,7 @@ pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), Supervi
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    stop_runner_by_id(state, &primary.config.id, force).await
+    stop_runner_by_id(state, &primary.config.id, force, CloseIntent::Kill).await
 }
 
 /// Legacy restart wrapper — targets the primary runner.
@@ -6010,6 +6682,8 @@ pub async fn restart_runner(
     source: RestartSource,
     force: bool,
     build_tree: BuildTree,
+    intent: CloseIntent,
+    initiated_by: Option<uuid::Uuid>,
 ) -> Result<(), SupervisorError> {
     let primary = state
         .get_primary()
@@ -6023,6 +6697,8 @@ pub async fn restart_runner(
         source,
         force,
         build_tree,
+        intent,
+        initiated_by,
     )
     .await
 }
@@ -6081,7 +6757,7 @@ pub async fn rebuild_and_restart_by_id(
     // semantics. Currently a no-op" and carried `#[allow(dead_code)]`. It is
     // no longer a no-op: it is the readiness-gate override, same meaning as on
     // `/runners/{id}/stop` and `/runners/{id}/restart`.
-    match stop_runner_by_id(state, runner_id, body.force).await {
+    match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
         Ok(()) | Err(SupervisorError::RunnerNotRunning) => {}
         Err(e) => return Err(e),
     }
@@ -6102,7 +6778,7 @@ pub async fn rebuild_and_restart_by_id(
 
     // Step 3: start.
     let started_at = chrono::Utc::now();
-    start_managed_runner(state, &managed).await?;
+    start_managed_runner(state, &managed, None, StartAs::Restart).await?;
     state
         .logs
         .emit(

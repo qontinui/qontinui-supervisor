@@ -5,8 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
     SlotResolution,
 };
 use crate::diagnostics::RestartSource;
@@ -111,9 +111,13 @@ fn run_result_for(err: &SupervisorError) -> ActionRunResult {
 /// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the action completes. An empty vec when
 /// coord is unreachable / has no history (fail-open; never blocks the action).
+/// It is the ACK's cut, the top five by `posterior_mean`; the fetch itself
+/// reads coord's top 100 rows (its ceiling), and `risk` assesses all of them
+/// before the cut ([`assess_then_cut`]).
 ///
 /// "Act on predictions": `risk` is the pure
-/// [`assess_action_risk`] verdict over `predicted` + `states_active`. It is
+/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
+/// verdict over that whole fetch + `states_active`. It is
 /// [`ActionRisk::none`] in the common healthy / no-history case (behavior
 /// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
 /// signature clears the threshold. The caller decides what to do with it
@@ -147,16 +151,21 @@ async fn mint_primary_action(
 
     // Phase 4: fetch coord's state-conditioned expectations for this
     // (kind, states) so the ACK warns the agent before the action completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(kind.as_str(), &states_active, 5).await;
+    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
+    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
+    // pooled mean before cutting, which can drop the very row the exact-cell
+    // arm of the risk policy reads.
+    let coord = coord_base(&state.config.ambient_coord);
+    let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
 
-    // "Act on predictions": assess the prediction set against the active states.
+    // "Act on predictions": assess the whole fetch against the active states,
+    // then cut the ACK's `predicted` to the top five by `posterior_mean`.
     // Pure + fail-open — `none()` in the healthy case. `route_lkg` + `warn` only
     // when a boot-failure-class signature clears the threshold. Emit the warning
     // here (loud `tracing::warn!` + a Supervisor log entry) so the risk is
     // visible BEFORE the action's outcome lands, regardless of how the caller
     // uses the advice.
-    let risk = assess_action_risk(&predicted, &states_active);
+    let (predicted, risk) = assess_then_cut(fetched, &states_active);
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
         state
@@ -166,31 +175,35 @@ async fn mint_primary_action(
     }
 
     let arc = state.dev_actions.write().await.insert(record);
-
-    // The watcher targets the primary's early-log + cached health. The
-    // early-log path is read at window close (it may not be set until the
-    // restart spawns the runner); capture the runner id now so the health scan
-    // can find the right cached snapshot.
-    let (early_log_path, runner_id) = match state.get_primary().await {
-        Some(primary) => (
-            primary.early_log_path.read().await.clone(),
-            Some(primary.config.id.clone()),
-        ),
-        None => (None, None),
-    };
     spawn_attribution_watcher(
         state.clone(),
         arc.clone(),
-        AttributionTargets {
-            early_log_path,
-            managed: None,
-            panic_log_path: None,
-            runner_id,
-        },
+        primary_attribution_targets(state).await,
         build_duration,
     );
 
     (arc, states_active, predicted, risk)
+}
+
+/// Where the watcher of a primary-runner action looks for its effects.
+///
+/// It is handed the primary's registry entry, the same `Arc` the restart
+/// starts again in place, so at window close it reads the entry's spawn ring
+/// and, for every spawn inside the window, that spawn's early log and startup
+/// panic (under `--log-dir` the panic log is in `<log-dir>/runner-primary`).
+/// It used to be handed no entry, and so read the runner default panic log
+/// whatever the supervisor's flags, and the early log of the boot that was
+/// running at the mint. The runner id is captured now so the health scan can
+/// find the right cached snapshot. With no primary registered there is
+/// nothing to read.
+async fn primary_attribution_targets(state: &SharedState) -> AttributionTargets {
+    match state.get_primary().await {
+        Some(primary) => AttributionTargets {
+            runner_id: Some(primary.config.id.clone()),
+            managed: Some(primary),
+        },
+        None => AttributionTargets::default(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -218,10 +231,11 @@ pub struct RestartRequest {
     ///
     /// - `None` (DEFAULT) — no explicit operator choice. The supervisor is free
     ///   to AUTO-bias toward the last-known-good binary when
-    ///   [`assess_action_risk`] flags this restart as high-risk (a
-    ///   boot-failure-class prediction under the active states), instead of the
-    ///   freshest slot exe that history says white-screens. The restart is never
-    ///   refused — only biased — and the risk is warned loudly.
+    ///   [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
+    ///   flags this restart as high-risk (a boot-failure-class prediction under
+    ///   the active states), instead of the freshest slot exe that history says
+    ///   white-screens. The restart is never refused — only biased — and the
+    ///   risk is warned loudly.
     /// - `Some(true)` — explicitly pin this restart to the LKG binary (same
     ///   effect the auto-bias would apply, but operator-requested).
     /// - `Some(false)` — explicitly OPT OUT of the auto-LKG bias: run the
@@ -233,6 +247,15 @@ pub struct RestartRequest {
     /// compiles a fresh exe, so an LKG pin would be self-defeating).
     #[serde(default)]
     pub use_lkg: Option<bool>,
+    /// Restart the primary with the HANDOFF intent — same contract as
+    /// `POST /runners/{id}/restart`'s `handoff`
+    /// ([`crate::routes::runners::RestartRunnerRequest::handoff`]): the
+    /// close-request carries `{"handoff":"holders"}`, the readiness gate reads
+    /// `safe_with_handoff` (false or absent refuses with
+    /// `409 restart_refused_unsafe_for_handoff`), and the graceful wait is
+    /// extended. Defaults to `false`, the restart this route always did.
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +279,11 @@ impl RestartRequest {
     /// representation is an enum and not this bool.
     pub fn build_tree(&self) -> manager::BuildTree {
         manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -526,6 +554,8 @@ pub async fn rebuild_when_idle(
                 RestartSource::Manual,
                 false,
                 REBUILD_WHEN_IDLE_TREE,
+                manager::CloseIntent::Kill,
+                Some(exec_record.action_id),
             )
             .await
             {
@@ -610,7 +640,13 @@ pub async fn restart_runner(
     let (action_record, states_active, predicted, risk) = mint_primary_action(
         &state,
         action_kind,
-        format!("rebuild={};force={}", rebuild, body.force),
+        // `;handoff=true` only when set, so a non-handoff action's label is
+        // unchanged.
+        if body.handoff {
+            format!("rebuild={};force={};handoff=true", rebuild, body.force)
+        } else {
+            format!("rebuild={};force={}", rebuild, body.force)
+        },
         None,
         None,
     )
@@ -643,6 +679,7 @@ pub async fn restart_runner(
         let force = body.force;
         let from_working_tree = body.from_working_tree;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
         let build_source = if state.get_primary().await.is_some() {
             serde_json::json!(build_tree.build_source(true))
         } else {
@@ -664,6 +701,8 @@ pub async fn restart_runner(
                     RestartSource::Manual,
                     force,
                     build_tree,
+                    intent,
+                    Some(exec_record.action_id),
                 )
                 .await
                 {
@@ -925,6 +964,8 @@ pub async fn restart_runner(
         RestartSource::Manual,
         body.force,
         body.build_tree(),
+        body.close_intent(),
+        Some(action_record.action_id),
     )
     .await;
 
@@ -1463,6 +1504,16 @@ mod tests {
         assert!(err.to_string().contains("trigger_auto_continue"), "{err}");
         let ok: RestartRequest = serde_json::from_str(r#"{"rebuild":true,"force":true}"#).unwrap();
         assert!(ok.rebuild && ok.force);
+        assert_eq!(ok.close_intent(), manager::CloseIntent::Kill);
+    }
+
+    /// The legacy primary restart door carries the same `handoff` option as
+    /// `POST /runners/{id}/restart`, default off.
+    #[test]
+    fn restart_request_handoff_selects_the_intent() {
+        let opted: RestartRequest = serde_json::from_str(r#"{"handoff":true}"#).unwrap();
+        assert_eq!(opted.close_intent(), manager::CloseIntent::HandoffHolders);
+        assert!(!opted.force);
     }
     use crate::build_submissions::{BuildKind, BuildStatus, BuildSubmission};
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
@@ -1509,9 +1560,13 @@ mod tests {
     }
 
     fn test_state_on_port(root: &std::path::Path, runner_port: u16) -> SharedState {
+        Arc::new(SupervisorState::new(test_config(root, runner_port)))
+    }
+
+    fn test_config(root: &std::path::Path, runner_port: u16) -> SupervisorConfig {
         let mut primary = RunnerConfig::default_primary();
         primary.port = runner_port;
-        let config = SupervisorConfig {
+        SupervisorConfig {
             project_dir: root.join("src-tauri"),
             watchdog_enabled_at_start: false,
             auto_start: false,
@@ -1524,12 +1579,13 @@ mod tests {
             expo_dir: None,
             expo_port: 8081,
             runners: vec![primary],
-            build_pool: BuildPoolConfig { pool_size: 1 },
+            build_pool: BuildPoolConfig::fixed(1),
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
-        };
-        Arc::new(SupervisorState::new(config))
+            ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+            ambient_coord: crate::config::AmbientCoord::Ignore,
+        }
     }
 
     fn queued_submission(id: uuid::Uuid) -> BuildSubmission {
@@ -1566,6 +1622,76 @@ mod tests {
         (status, v)
     }
 
+    /// The primary mint site hands the watcher the primary's registry entry:
+    /// the same `Arc` the restart starts again in place, which is where the
+    /// restart's spawn records its ring entry, its early log and its panic-log
+    /// dir. Handed `None` (or another entry), the watcher would never see that
+    /// spawn and would read no boot of it at all.
+    #[tokio::test]
+    async fn the_primary_mint_site_hands_the_watcher_the_primarys_registry_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let primary = state
+            .get_primary()
+            .await
+            .expect("the test state registers a primary");
+
+        let targets = primary_attribution_targets(&state).await;
+        let managed = targets
+            .managed
+            .expect("the primary's registry entry, not None");
+        assert!(
+            Arc::ptr_eq(&managed, &primary),
+            "the watcher must read the entry the restart starts"
+        );
+        assert_eq!(
+            targets.runner_id.as_deref(),
+            Some(primary.config.id.as_str())
+        );
+
+        state.runners.write().await.clear();
+        let targets = primary_attribution_targets(&state).await;
+        assert!(targets.managed.is_none() && targets.runner_id.is_none());
+    }
+
+    /// The mint reads the coord its config names, and its `risk` reads every row
+    /// that coord served before the ACK cuts `predicted` to five. `risk` is null
+    /// when the fetch goes anywhere else, or when the cut comes first and drops
+    /// the sixth-ranked boot row. The dead port and the closed pool keep the
+    /// detached restart from reaching a runner or a build.
+    #[tokio::test]
+    async fn restart_202_risk_reads_every_planted_row_and_the_ack_keeps_five() {
+        use crate::dev_action::test_support::{
+            assert_the_ack_read_every_planted_row, five_rows_and_a_sixth_boot_row,
+            serve_planted_expectations,
+        };
+        let _building = BUILDING_TESTS.lock().await;
+        let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+        config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+        let state = Arc::new(SupervisorState::new(config));
+        state.build_pool.permits.close();
+
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+                from_working_tree: true,
+                use_lkg: None,
+                handoff: false,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202, "{body}");
+        assert_the_ack_read_every_planted_row(&coord, "build", &body);
+    }
+
     /// With no primary registered the ACK names no tree: the detached restart
     /// fails on the missing primary at once, and a label would describe a
     /// build that never runs.
@@ -1586,6 +1712,7 @@ mod tests {
                 force: false,
                 from_working_tree: false,
                 use_lkg: None,
+                handoff: false,
             }),
         )
         .await
@@ -1703,6 +1830,7 @@ mod tests {
                     // origin/main worktree materialization in the sandbox.
                     from_working_tree: true,
                     use_lkg: None,
+                    handoff: false,
                 }),
             ),
         )
@@ -1906,6 +2034,7 @@ mod tests {
                 force: false,
                 from_working_tree: false,
                 use_lkg: None,
+                handoff: false,
             }),
         )
         .await;

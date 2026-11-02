@@ -45,7 +45,7 @@ const TERM_GRACE_MS: u64 = 1500;
 
 /// Return true if `pid` refers to a live process. Uses `kill(pid, 0)` which
 /// performs the permission/existence check without sending a signal.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 only probes for existence/permission and
     // never delivers a signal. `pid` is a plain integer; no memory is touched.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -183,6 +183,24 @@ async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
 /// [`find_pids_on_port`] for why `Err` is not `Ok(None)`.
 pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
     Ok(find_pids_on_port(port).await?.into_iter().next())
+}
+
+/// Kill every process listening on `port` with a plain per-PID
+/// [`kill_by_pid`] — NEVER a process-group or tree kill. Used by a handoff
+/// stop, where the group would include holder processes the handoff exists to
+/// keep. Same `Err` contract as [`kill_by_port`].
+pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
+    let mut killed_any = false;
+    for pid in find_pids_on_port(port).await? {
+        info!(
+            "kill_listeners_by_port: killing listener PID {} on port {} (no group kill)",
+            pid, port
+        );
+        if kill_by_pid(pid).await.unwrap_or(false) {
+            killed_any = true;
+        }
+    }
+    Ok(killed_any)
 }
 
 /// Kill every process listening on a specific port. Returns true if at least

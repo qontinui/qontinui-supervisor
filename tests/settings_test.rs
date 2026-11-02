@@ -76,10 +76,12 @@ fn make_config(project_dir: PathBuf, dev_logs_dir: PathBuf) -> SupervisorConfig 
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 1 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(1),
         no_prewarm: false,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

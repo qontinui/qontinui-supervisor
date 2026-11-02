@@ -52,10 +52,9 @@
 //! *temp* runners as orphans holding slot binaries. The next build fails
 //! with "Access is denied." This scan resolves that on every cold start.
 //!
-//! **Known gap for adopted runners:** `adopt_pid_into_registry` leaves
-//! `process: Option<Child>` as `None` — we never had a
+//! **Known gap for adopted runners:** we never had a
 //! `tokio::process::Child` handle for a process we did not spawn, and one
-//! cannot be synthesized. So the crash-only watchdog's *exit observation*
+//! cannot be synthesized, so no exit monitor watches it. So the crash-only watchdog's *exit observation*
 //! does not cover an adopted (inherited) primary until this supervisor
 //! starts it itself. HTTP health polling — the surface the operator actually
 //! watches — is unaffected.
@@ -618,10 +617,9 @@ async fn apply_registered_orphan(
         };
 
     // User-owned registered runner. Adopt: stuff this PID into the runner's
-    // RunnerState so the rest of the supervisor sees it as healthy.
-    // `process: Option<Child>` stays None — we never had a
-    // `tokio::process::Child` handle for an orphan, and downstream code that
-    // polls health via HTTP is unaffected.
+    // RunnerState so the rest of the supervisor sees it as healthy. We never
+    // had a `tokio::process::Child` handle for an orphan, and downstream code
+    // that polls health via HTTP is unaffected.
     if adopt_pid_into_registry(managed, pid).await {
         let msg = format!(
             "Adopted orphan runner '{}' (PID {}, matched by {}) into registry at startup",
@@ -732,14 +730,12 @@ async fn listening_port_for_pid(pid: u32, runners: &[Arc<ManagedRunner>]) -> Por
 /// "uptime" displays. Marking "now" is the clearest "we just adopted
 /// this" signal.
 ///
-/// Note: `process: Option<Child>` is intentionally left as `None`. We
-/// don't have the `tokio::process::Child` handle from
-/// `tokio::process::Command::spawn` because we didn't spawn this child
-/// — an orphan, by definition, is a process whose parent (the previous
-/// supervisor) is gone. Any code path that calls `child.wait()` on the
-/// adopted runner will not work; the rest of the codebase polls health
-/// via HTTP (which is unaffected) and only the spawn flow holds onto
-/// `Child` directly.
+/// Note: no exit monitor watches an adopted runner. We don't have the
+/// `tokio::process::Child` handle from `tokio::process::Command::spawn`
+/// because we didn't spawn this child — an orphan, by definition, is a
+/// process whose parent (the previous supervisor) is gone. The rest of the
+/// codebase polls health via HTTP (which is unaffected) and only the spawn
+/// flow holds onto `Child` directly.
 async fn adopt_pid_into_registry(managed: &ManagedRunner, pid: u32) -> bool {
     let mut runner = managed.runner.write().await;
     if runner.pid.is_some() && runner.running {
@@ -750,7 +746,7 @@ async fn adopt_pid_into_registry(managed: &ManagedRunner, pid: u32) -> bool {
     if runner.started_at.is_none() {
         runner.started_at = Some(Utc::now());
     }
-    runner.stop_requested = false;
+    runner.clear_stop_request();
     runner.restart_requested = false;
     true
 }

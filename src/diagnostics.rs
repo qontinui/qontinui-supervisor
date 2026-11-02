@@ -342,6 +342,10 @@ pub enum ServingEvent {
     /// threshold. Alert-only by Design decision 4 — the supervisor cannot
     /// back a restart on a classification it has never confirmed.
     NeverAnsweredSinceAdoption,
+    /// A runner this supervisor started has held its port and read
+    /// `RunnerLiveness::Unknown` for at least the threshold. Alert-only, for
+    /// the same reason.
+    NeverAnsweredSinceSpawn,
     /// The census found zero live `claude` sessions and the restart was
     /// issued. The only irreversible event in the set.
     RestartTaken,
@@ -363,6 +367,7 @@ impl ServingEvent {
         match self {
             Self::Threshold => "threshold",
             Self::NeverAnsweredSinceAdoption => "never_answered_since_adoption",
+            Self::NeverAnsweredSinceSpawn => "never_answered_since_spawn",
             Self::RestartTaken => "restart_taken",
             Self::RestartRefusedSessionsLive => "restart_refused_sessions_live",
             Self::RestartFailed => "restart_failed",
@@ -808,6 +813,10 @@ mod tests {
             (
                 ServingEvent::NeverAnsweredSinceAdoption,
                 "never_answered_since_adoption",
+            ),
+            (
+                ServingEvent::NeverAnsweredSinceSpawn,
+                "never_answered_since_spawn",
             ),
             (ServingEvent::RestartTaken, "restart_taken"),
             (

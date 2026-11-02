@@ -65,7 +65,7 @@ dirs = "6"
 # harmless; `MockActionExecutor` is a non-test public item so this must be a
 # normal dependency, not dev-only.
 rand = "0.9"
-qontinui-types = { path = "../qontinui-schemas/rust" }
+qontinui-types = { path = "../qontinui-schemas/rust", features = ["host-probe"] }
 qontinui-runner-client = { path = "../qontinui-schemas/rust-runner-client" }
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
 # report CPU/RAM/disk + build-slot capacity on startup. `system` is
