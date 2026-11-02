@@ -4284,8 +4284,6 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
             .split_whitespace()
             .collect()
     };
-    // `_lifecycle` binds the guard to the rest of its scope; a bare `_` or a
-    // temporary would drop it at once.
     let in_order = |sig: &str, body: &str, marks: &[&str]| {
         let mut last = 0;
         for mark in marks {
@@ -4296,12 +4294,59 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         }
     };
 
+    // The guard is bound by this exact spelling, so `let _ = ...lock().await`, a bare
+    // statement or another name fails to find it. That name appears once, so nothing
+    // drops, moves or rebinds it. And no brace closes its scope before the last
+    // thing it must span, so no block releases it early.
+    //
+    // What this cannot see: `managed` shadowed to another runner, a helper that took
+    // the guard's mutex some other way, and anything at run time. A cancelled future
+    // does release the guard, wherever it was.
+    let guard_spans = |sig: &str, body: &str, lock: &str, last: &str| {
+        assert_eq!(
+            body.matches("_lifecycle").count(),
+            1,
+            "{sig} must bind its lifecycle guard once and not touch it again"
+        );
+        let from = body
+            .find(lock)
+            .unwrap_or_else(|| panic!("{sig}: no {lock}"))
+            + lock.len();
+        let to = body
+            .rfind(last)
+            .unwrap_or_else(|| panic!("{sig}: no {last}"));
+        assert!(from < to, "{sig}: {last} must come after the guard");
+        let mut depth = 0i32;
+        for c in body[from..to].chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "{sig}: the guard's scope closes before {last}");
+        }
+    };
+
     const LOCK: &str = "let_lifecycle=managed.lifecycle.lock().await;";
-    // The start's span is pinned by behaviour, on a stub exe:
-    // `a_stop_queued_mid_start_targets_the_recorded_spawn`,
-    // `a_start_queued_behind_a_start_finds_its_spawn` and
-    // `a_restart_re_inserts_only_once_it_holds_the_lock`.
     let start = body_of("pub async fn start_managed_runner(");
+    assert_eq!(start.matches(LOCK).count(), 1, "the start takes it once");
+    in_order(
+        "start_managed_runner",
+        &start,
+        &[
+            LOCK,
+            ".or_insert_with(",
+            "ifrunner.running||newest_spawn_is_up(",
+            "record_spawn_in_registry(",
+            "monitor_runner_process_exit(",
+        ],
+    );
+    guard_spans(
+        "start_managed_runner",
+        &start,
+        LOCK,
+        "monitor_runner_process_exit(",
+    );
 
     let stop = body_of("pub async fn stop_runner_by_id(");
     assert_eq!(stop.matches(LOCK).count(), 1, "the stop takes it once");
@@ -4316,6 +4361,7 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
             "remove_runner_exe_copy(",
         ],
     );
+    guard_spans("stop_runner_by_id", &stop, LOCK, "remove_runner_exe_copy(");
 
     let sweep = body_of("pub async fn reap_stale_test_runners(");
     in_order(
@@ -4333,13 +4379,12 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         !sweep.contains(".lifecycle.lock()"),
         "the sweep must never wait for a runner's lifecycle lock"
     );
-    // A guard released early leaves every check above reading green.
-    for (name, body) in [("start", &start), ("stop", &stop), ("sweep", &sweep)] {
-        assert!(
-            !body.contains("drop(_lifecycle)"),
-            "the {name} must hold its lifecycle guard to the end of its scope"
-        );
-    }
+    guard_spans(
+        "reap_stale_test_runners",
+        &sweep,
+        "letSome(_lifecycle)=try_lock_registered(&state,managed).await",
+        "remove_runner_exe_copy(",
+    );
 
     for sig in [
         "async fn monitor_runner_process_exit_inner(",
@@ -4439,21 +4484,36 @@ fn every_minted_start_names_its_action() {
 
 /// An armed primary on `port`, for a test that drives the crash watchdog.
 async fn armed_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+    let (state, root) = armed_state();
+    let managed = register_armed_primary(&state, port, Default::default()).await;
+    (state, managed, root)
+}
+
+/// A state whose crash watchdog is armed.
+fn armed_state() -> (SharedState, tempfile::TempDir) {
     assert!(
         !crash_restart_env_disabled(),
         "QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1 leaves this test nothing to observe"
     );
     let (mut config, root) = crate::config::config_over_an_empty_runner_tree();
     config.watchdog_enabled_at_start = true;
-    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    (Arc::new(crate::state::SupervisorState::new(config)), root)
+}
+
+async fn register_armed_primary(
+    state: &SharedState,
+    port: u16,
+    extra_env: std::collections::HashMap<String, String>,
+) -> Arc<ManagedRunner> {
     let mut runner = crate::config::RunnerConfig::default_primary();
     runner.port = free_fixed_port(port);
     runner.protected = false;
+    runner.extra_env = extra_env;
     let id = runner.id.clone();
     let managed = Arc::new(ManagedRunner::new(runner, false));
     managed.watchdog.write().await.enabled = true;
     state.runners.write().await.insert(id, managed.clone());
-    (state, managed, root)
+    managed
 }
 
 /// How many times the crash watchdog began a restart.
@@ -4516,11 +4576,13 @@ async fn the_backoff_task_begins_no_restart_of_a_runner_that_changed_during_it()
 async fn a_crash_restart_that_waited_on_the_lock_finds_what_landed_meanwhile() {
     let exited = chrono::Utc::now();
     let newer = exited + chrono::Duration::seconds(1);
-    for (started_at, stop_latched, superseded) in [
-        (Some(exited), false, false),
-        (Some(newer), false, true),
-        (None, true, true),
-        (Some(exited), true, true),
+    for (started_at, stop_latched, removed, superseded) in [
+        (Some(exited), false, false, false),
+        (Some(newer), false, false, true),
+        (None, true, false, true),
+        (Some(exited), true, false, true),
+        // A `DELETE`, a sweep or a purge during the backoff writes none of those.
+        (Some(exited), false, true, true),
     ] {
         let (state, managed, _root) = restart_test_state_with_runner().await;
         managed.runner.write().await.started_at = Some(exited);
@@ -4542,6 +4604,9 @@ async fn a_crash_restart_that_waited_on_the_lock_finds_what_landed_meanwhile() {
                 runner.latch_stop_request(chrono::Utc::now());
             }
         }
+        if removed {
+            state.runners.write().await.remove(&managed.config.id);
+        }
         drop(holder);
 
         let err = start
@@ -4550,9 +4615,58 @@ async fn a_crash_restart_that_waited_on_the_lock_finds_what_landed_meanwhile() {
         assert_eq!(
             matches!(err, SupervisorError::StartSuperseded(_)),
             superseded,
-            "started_at={started_at:?} stop_latched={stop_latched}: {err}"
+            "started_at={started_at:?} stop_latched={stop_latched} removed={removed}: {err}"
         );
     }
+}
+
+/// A crash restart that a stop overtook while it waited on the lock is a correct
+/// skip. The event pairing with `RestartStarted` says superseded, and nothing logs
+/// the restart as failed.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_crash_restart_says_so_and_logs_no_failure() {
+    let (state, managed, _root) = armed_primary(29_878).await;
+    let exited = chrono::Utc::now();
+    managed.runner.write().await.started_at = Some(exited);
+
+    let holder = managed.lifecycle.lock().await;
+    maybe_crash_restart(&state, &managed, false, false, exited).await;
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(
+        restarts_begun(&state).await,
+        1,
+        "the backoff task's re-check passes: nothing has changed yet"
+    );
+    managed
+        .runner
+        .write()
+        .await
+        .latch_stop_request(chrono::Utc::now());
+    drop(holder);
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+
+    let details: Vec<String> = state
+        .diagnostics
+        .read()
+        .await
+        .events(usize::MAX, None)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            DiagnosticEventKind::RestartFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert!(details[0].contains("superseded"), "{details:?}");
+    let failed: Vec<String> = state
+        .logs
+        .history()
+        .await
+        .into_iter()
+        .map(|entry| entry.message)
+        .filter(|message| message.contains("FAILED"))
+        .collect();
+    assert_eq!(failed, Vec::<String>::new());
 }
 
 /// A registered, dead named runner, for a test that holds its lock.
@@ -4688,11 +4802,11 @@ async fn a_runner_that_never_answered_is_alerted_and_called_adopted_only_when_it
     use crate::log_capture::LogLevel;
 
     const SPAWN_PID: u32 = 4242;
-    for (spawned, pid, alerted, called_adopted) in [
-        (false, Some(77), true, true),
-        (true, Some(SPAWN_PID), true, false),
-        (true, None, true, false),
-        (true, Some(77), true, true),
+    for (spawned, pid, called_adopted) in [
+        (false, Some(77), true),
+        (true, Some(SPAWN_PID), false),
+        (true, None, false),
+        (true, Some(77), true),
     ] {
         for should_alert in [true, false] {
             let (state, _root) = restart_test_state();
@@ -4731,7 +4845,7 @@ async fn a_runner_that_never_answered_is_alerted_and_called_adopted_only_when_it
                 })
                 .collect();
             let row = format!("spawned={spawned} pid={pid:?} should_alert={should_alert}");
-            if !(alerted && should_alert) {
+            if !should_alert {
                 assert_eq!(events, [], "{row}");
                 continue;
             }
@@ -4760,43 +4874,96 @@ async fn a_runner_that_never_answered_is_alerted_and_called_adopted_only_when_it
     }
 }
 
-/// A primary whose exe is a stub, so a test drives a real successful start. It
-/// stays up for a bounded minute, so a failed test leaks nothing for long.
+/// What a stub process runs: a builtin wait, so its image stays the stub's own and
+/// its process satisfies a stop's image check. It ends itself after a minute, so a
+/// failed test leaks nothing for long.
+#[cfg(unix)]
+const STUB_ENV_SCRIPT: &str = "read -t 60 <> <(:)\nexit 0\n";
+
+/// A primary whose exe is a stub, so a test drives a real successful start. The
+/// stub is a copy of bash, with `BASH_ENV` holding the script, since a runner is
+/// spawned with no arguments. A script with a shebang would not do: its image is
+/// the interpreter, which no stop's image check can match with the runner's copy.
 #[cfg(unix)]
 async fn stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
-    use std::os::unix::fs::PermissionsExt;
-    let (state, managed, root) = armed_primary(port).await;
-    let stub = root.path().join("stub-runner.sh");
-    std::fs::write(&stub, "#!/bin/sh\nexec sleep 60\n").expect("write the stub");
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let (state, root) = armed_state();
+    let stub = root.path().join("stub-runner");
+    std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
+    let script = root.path().join("stub-runner.env");
+    std::fs::write(&script, STUB_ENV_SCRIPT).expect("write the stub's script");
+    let env = [("BASH_ENV".to_string(), script.display().to_string())];
+    let managed = register_armed_primary(&state, port, env.into_iter().collect()).await;
     *managed.source_exe_override.write().await = Some(stub);
     (state, managed, root)
 }
 
-/// Run `attempt` again when the kernel refuses to exec the stub copy with
-/// ETXTBSY: a concurrent test's fork can inherit the copy's write descriptor for
-/// the instant before its exec. Any other result is the attempt's own.
+/// Whether this error is the kernel refusing to exec the stub copy with ETXTBSY: a
+/// concurrent test's fork can inherit the copy's write descriptor until its exec.
+#[cfg(unix)]
+fn is_text_file_busy(err: &SupervisorError) -> bool {
+    matches!(err, SupervisorError::Process(msg) if msg.contains("Text file busy"))
+}
+
+/// Wait out that fork, for at most two seconds in all. Every attempt copies the file
+/// again and opens a new descriptor, so it pays to wait. This sleep orders nothing
+/// a test asserts: it only lets a concurrent exec happen.
 #[cfg(unix)]
 async fn past_text_file_busy<F, Fut, T>(mut attempt: F) -> Result<T, SupervisorError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, SupervisorError>>,
 {
-    for _ in 0..20 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
         match attempt().await {
-            Err(SupervisorError::Process(msg)) if msg.contains("Text file busy") => {
-                tokio::task::yield_now().await;
+            Err(err) if is_text_file_busy(&err) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             other => return other,
         }
     }
-    attempt().await
 }
 
-/// Stop what a stub test left running, so it does not outlive the test by its minute.
+/// Stop what a stub test left running and remove the early logs its starts opened.
+/// A stop reaches only the current spawn, so also end any older stub process still
+/// up, checked by image in case its pid has been reused.
 #[cfg(unix)]
 async fn stop_the_stub(state: &SharedState, managed: &Arc<ManagedRunner>) {
     let _ = stop_runner_by_id(state, &managed.config.id, true, CloseIntent::Kill).await;
+    let copy = state.config.runner_exe_copy_path(&managed.config);
+    let spawns: Vec<crate::state::SpawnMarker> =
+        managed.recent_spawns.read().await.iter().cloned().collect();
+    for spawn in spawns {
+        if let Some(pid) = spawn.pid {
+            if crate::process::proc_kill::pid_exe_path(pid)
+                .await
+                .as_deref()
+                == Some(copy.as_path())
+            {
+                let _ = crate::process::proc_kill::kill_by_pid(pid).await;
+            }
+        }
+        if let Some(log) = spawn.early_log_path.as_deref() {
+            crate::process::early_log::delete_early_log(log);
+        }
+    }
+}
+
+/// Run a stub test's body, then stop the stub on every exit path, a failed assertion
+/// included, and only then let that failure through.
+#[cfg(unix)]
+async fn with_the_stub_stopped_after<Fut>(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    body: Fut,
+) where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let outcome = tokio::spawn(body).await;
+    stop_the_stub(state, managed).await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
 }
 
 /// How long a test gives an exit monitor to observe a kill it already issued.
@@ -4818,7 +4985,7 @@ async fn wait_for_exit_stamp(managed: &ManagedRunner) -> crate::state::SpawnMark
             std::time::Instant::now() < deadline,
             "no exit was stamped: the process is still running, or its monitor is gone"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -4831,97 +4998,122 @@ async fn wait_for_exit_stamp(managed: &ManagedRunner) -> crate::state::SpawnMark
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_queued_mid_start_targets_the_recorded_spawn() {
     let (state, managed, _root) = stub_primary(29_875).await;
-    let id = managed.config.id.clone();
-
-    let outcome = past_text_file_busy(|| {
-        let (state, managed, id) = (state.clone(), managed.clone(), id.clone());
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
         async move {
-            let holder = managed.lifecycle.lock().await;
-            let mut start = {
-                let (state, managed) = (state.clone(), managed.clone());
-                Box::pin(async move {
-                    start_managed_runner(&state, &managed, None, StartAs::Registered).await
-                })
-            };
-            assert!(futures::poll!(&mut start).is_pending());
-            let mut stop = {
-                let state = state.clone();
-                Box::pin(
-                    async move { stop_runner_by_id(&state, &id, false, CloseIntent::Kill).await },
-                )
-            };
-            assert!(futures::poll!(&mut stop).is_pending());
-            drop(holder);
-            let start = tokio::spawn(start);
-            let stop = tokio::spawn(stop);
-            let (start, stop) = (
-                start.await.expect("the start"),
-                stop.await.expect("the stop"),
-            );
-            start?;
-            stop
-        }
-    })
-    .await;
-    outcome.expect("the start and the stop succeed");
+            let id = managed.config.id.clone();
+            let outcome = past_text_file_busy(|| {
+                let (state, managed, id) = (state.clone(), managed.clone(), id.clone());
+                async move {
+                    let holder = managed.lifecycle.lock().await;
+                    let mut start = {
+                        let (state, managed) = (state.clone(), managed.clone());
+                        Box::pin(async move {
+                            start_managed_runner(&state, &managed, None, StartAs::Registered).await
+                        })
+                    };
+                    assert!(futures::poll!(&mut start).is_pending());
+                    let mut stop = {
+                        let state = state.clone();
+                        Box::pin(async move {
+                            stop_runner_by_id(&state, &id, false, CloseIntent::Kill).await
+                        })
+                    };
+                    assert!(futures::poll!(&mut stop).is_pending());
+                    drop(holder);
+                    let start = tokio::spawn(start);
+                    let stop = tokio::spawn(stop);
+                    let (start, stop) = (
+                        start.await.expect("the start"),
+                        stop.await.expect("the stop"),
+                    );
+                    start?;
+                    stop
+                }
+            })
+            .await;
+            outcome.expect("the start and the stop succeed");
 
-    let entry = wait_for_exit_stamp(&managed).await;
-    let runner = managed.runner.read().await;
-    assert!(
-        runner.stop_requested,
-        "the start's record cleared a stop that overlapped it"
-    );
-    assert_eq!(runner.started_at, None, "the stop's reset is the last word");
-    assert!(
-        entry.stop_requested_at.is_some(),
-        "the stop did not target the recorded spawn: {entry:?}"
-    );
-    assert!(
-        !crate::process::proc_kill::pid_alive(entry.pid.expect("the spawn's pid")),
-        "the recorded spawn survived its stop"
-    );
+            let entry = wait_for_exit_stamp(&managed).await;
+            let runner = managed.runner.read().await;
+            assert!(
+                runner.stop_requested,
+                "the start's record cleared a stop that overlapped it"
+            );
+            assert_eq!(runner.started_at, None, "the stop's reset is the last word");
+            assert!(
+                entry.stop_requested_at.is_some(),
+                "the stop did not target the recorded spawn: {entry:?}"
+            );
+            assert!(
+                !crate::process::proc_kill::pid_alive(entry.pid.expect("the spawn's pid")),
+                "the recorded spawn survived its stop"
+            );
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
 }
 
 /// Two real starts queued on the lock: the second finds the first's spawn. One
-/// process, whatever `running` said when each was asked for.
+/// process, whatever `running` said when each was asked for. An attempt either start
+/// of which hit ETXTBSY proves nothing about the queue, so it is cleaned up and run
+/// again, and only the last attempt's outcomes and spawns are read.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_queued_behind_a_start_finds_its_spawn() {
     let (state, managed, _root) = stub_primary(29_876).await;
-
-    let second = past_text_file_busy(|| {
+    let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
-            let holder = managed.lifecycle.lock().await;
-            let start = || {
-                let (state, managed) = (state.clone(), managed.clone());
-                Box::pin(async move {
-                    start_managed_runner(&state, &managed, None, StartAs::Registered).await
-                })
-            };
-            let (mut first, mut second) = (start(), start());
-            assert!(futures::poll!(&mut first).is_pending());
-            assert!(futures::poll!(&mut second).is_pending());
-            drop(holder);
-            let (first, second) = (tokio::spawn(first), tokio::spawn(second));
-            let (first, second) = (
-                first.await.expect("the first start"),
-                second.await.expect("the second start"),
-            );
-            first?;
-            Ok(second)
-        }
-    })
-    .await
-    .expect("the first start succeeds");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let spawns_before = managed.recent_spawns.read().await.iter().count();
+                let holder = managed.lifecycle.lock().await;
+                let start = || {
+                    let (state, managed) = (state.clone(), managed.clone());
+                    Box::pin(async move {
+                        start_managed_runner(&state, &managed, None, StartAs::Registered).await
+                    })
+                };
+                let (mut first, mut second) = (start(), start());
+                assert!(futures::poll!(&mut first).is_pending());
+                assert!(futures::poll!(&mut second).is_pending());
+                drop(holder);
+                let (first, second) = (tokio::spawn(first), tokio::spawn(second));
+                let outcomes = [
+                    first.await.expect("the first start"),
+                    second.await.expect("the second start"),
+                ];
+                let spawned = managed.recent_spawns.read().await.iter().count() - spawns_before;
 
-    let spawns = managed.recent_spawns.read().await.iter().count();
-    stop_the_stub(&state, &managed).await;
-    assert!(
-        matches!(second, Err(SupervisorError::RunnerAlreadyRunning)),
-        "{second:?}"
-    );
-    assert_eq!(spawns, 1, "a second process of a live runner");
+                let busy = outcomes
+                    .iter()
+                    .any(|outcome| outcome.as_ref().is_err_and(is_text_file_busy));
+                if busy && std::time::Instant::now() < deadline {
+                    stop_the_stub(&state, &managed).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let [first, second] = outcomes;
+                assert!(first.is_ok(), "{first:?}");
+                assert!(
+                    matches!(second, Err(SupervisorError::RunnerAlreadyRunning)),
+                    "{second:?}"
+                );
+                assert_eq!(spawned, 1, "a second process of a live runner");
+                return;
+            }
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A health-cache tick before the primary answers.
+#[cfg(unix)]
+async fn the_health_cache_clears_a_booting_primary(managed: &ManagedRunner) -> u32 {
+    let mut runner = managed.runner.write().await;
+    runner.running = false;
+    runner.pid.take().expect("the stub's pid")
 }
 
 /// A real restart of a primary booting before it binds. The health cache has
@@ -4933,42 +5125,117 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
 async fn a_restart_replaces_a_primary_booting_before_it_binds() {
     use crate::diagnostics::RestartSource;
     let (state, managed, _root) = stub_primary(29_877).await;
-    let id = managed.config.id.clone();
-    past_text_file_busy(|| start_managed_runner(&state, &managed, None, StartAs::Registered))
-        .await
-        .expect("the stub starts");
-    let booting = managed.runner.read().await.pid.expect("the stub's pid");
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            let id = managed.config.id.clone();
+            past_text_file_busy(|| {
+                start_managed_runner(&state, &managed, None, StartAs::Registered)
+            })
+            .await
+            .expect("the stub starts");
+            let booting = the_health_cache_clears_a_booting_primary(&managed).await;
+
+            past_text_file_busy(|| {
+                restart_runner_by_id(
+                    &state,
+                    &id,
+                    false,
+                    RestartSource::Manual,
+                    false,
+                    BuildTree::OriginMain,
+                    CloseIntent::Kill,
+                    None,
+                )
+            })
+            .await
+            .expect("the restart replaces it");
+
+            let current = managed.runner.read().await.pid;
+            assert!(current.is_some(), "the restart started nothing new");
+            assert_ne!(current, Some(booting), "the restart started nothing new");
+            let ring = managed.recent_spawns.read().await;
+            assert_eq!(ring.iter().count(), 2, "the restart started nothing new");
+            let deadline = std::time::Instant::now() + MONITOR_BUDGET;
+            while crate::process::proc_kill::pid_alive(booting) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the booting process survived its restart"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// The ring's pid is what settles a stop when image identity cannot: here a second
+/// process runs the same exe copy, so identity alone refuses to guess. The spawn the
+/// ring names is stopped, and the other process is left alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
+    let (state, managed, root) = stub_primary(29_879).await;
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        let script = root.path().join("stub-runner.env");
+        async move {
+            let id = managed.config.id.clone();
+            past_text_file_busy(|| {
+                start_managed_runner(&state, &managed, None, StartAs::Registered)
+            })
+            .await
+            .expect("the stub starts");
+            the_health_cache_clears_a_booting_primary(&managed).await;
+
+            let copy = state.config.runner_exe_copy_path(&managed.config);
+            let mut bystander = tokio::process::Command::new(&copy)
+                .env("BASH_ENV", &script)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn a second process of the exe copy");
+
+            stop_runner_by_id(&state, &id, false, CloseIntent::Kill)
+                .await
+                .expect("the stop succeeds");
+
+            let entry = wait_for_exit_stamp(&managed).await;
+            assert!(entry.stop_requested_at.is_some(), "{entry:?}");
+            assert!(
+                matches!(bystander.try_wait(), Ok(None)),
+                "the stop ended a process it was not asked to"
+            );
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A pid from the ring can have been reused, so the stop checks its image first. A
+/// process running anything but the runner's exe copy is left alone, where the same
+/// pid from the registry, which is trusted, would be killed.
+#[tokio::test]
+async fn a_stop_leaves_a_ring_pid_that_runs_another_image_alone() {
+    let (state, managed, _root) = armed_primary(29_880).await;
+    let (mut child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
+    let _stdin = child.stdin.take().expect("the child's stdin");
+    record_spawn_in_registry(&managed, Some(pid), None, None).await;
     {
-        // A health-cache tick before the primary answers.
         let mut runner = managed.runner.write().await;
         runner.running = false;
         runner.pid = None;
     }
 
-    let restart = past_text_file_busy(|| {
-        restart_runner_by_id(
-            &state,
-            &id,
-            false,
-            RestartSource::Manual,
-            false,
-            BuildTree::OriginMain,
-            CloseIntent::Kill,
-            None,
-        )
-    })
-    .await;
+    stop_runner_by_id(&state, &managed.config.id, false, CloseIntent::Kill)
+        .await
+        .expect("nothing holds the port, so the stop confirms");
 
-    let booting_alive = crate::process::proc_kill::pid_alive(booting);
-    let current = managed.runner.read().await.pid;
-    stop_the_stub(&state, &managed).await;
-    if booting_alive {
-        let _ = crate::process::proc_kill::kill_by_pid(booting).await;
-    }
-    restart.expect("the restart replaces it");
-    assert!(!booting_alive, "the booting process survived its restart");
-    assert_ne!(current, Some(booting), "the restart started nothing new");
-    assert!(current.is_some(), "the restart started nothing new");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .is_err(),
+        "the stop killed a pid whose image is not the runner's exe copy"
+    );
 }
 
 /// The wire `watchdog` source is still refused for a non-temp runner, and

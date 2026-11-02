@@ -176,6 +176,10 @@ impl StopLedger {
 pub enum PidSource {
     /// The registry already tracked it.
     Registry,
+    /// The newest spawn's ring entry named it, with the spawn still current and
+    /// the pid alive, after the health cache cleared the registry's copy. A pid
+    /// the OS can have reused since, so it is held to the image check.
+    SpawnRing,
     /// The netstat listener probe on the runner's port named it.
     ListenerProbe,
     /// Resolved by image path: the process is running the runner's own
@@ -188,6 +192,7 @@ impl fmt::Display for PidSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             PidSource::Registry => "the registry",
+            PidSource::SpawnRing => "the newest spawn's ring entry",
             PidSource::ListenerProbe => "the netstat listener probe",
             PidSource::ExeIdentity => "image-path identity (sysinfo)",
         };
@@ -205,14 +210,16 @@ pub enum StopTarget {
     NotFound { why: String },
 }
 
-/// Decide the stop target from the three identification sources, in
+/// Decide the stop target from the identification sources, in
 /// preference order, accumulating the reason each one came up empty.
 ///
 /// Pure so the precedence and the "why" accounting are covered by CI. The
-/// arguments mirror the three sources exactly:
+/// arguments mirror the sources exactly:
 ///
 /// * `registry_pid` — what the registry tracks (`None` for an ADOPTED runner
 ///   whose PID recovery never succeeded — the 2026-07-31 case);
+/// * `spawn_ring_pid` — the newest spawn's pid while that spawn is current and
+///   alive. It settles what image identity cannot: two processes on one image;
 /// * `listener_pid` — `Ok(Some)`/`Ok(None)`/`Err` from the port probe, where
 ///   `Err` is UNKNOWN and must never read as "nothing there";
 /// * `exe_identity_pids` — PIDs whose image is the runner's exe copy.
@@ -224,6 +231,7 @@ pub enum StopTarget {
 /// we refuse rather than guess which of the operator's processes to kill.
 pub fn resolve_stop_target(
     registry_pid: Option<u32>,
+    spawn_ring_pid: Option<u32>,
     listener_pid: Result<Option<u32>, String>,
     exe_identity_pids: &[u32],
 ) -> StopTarget {
@@ -236,6 +244,14 @@ pub fn resolve_stop_target(
         };
     }
     gaps.push("the registry tracks no PID for this runner".to_string());
+
+    if let Some(pid) = spawn_ring_pid {
+        return StopTarget::Found {
+            pid,
+            source: PidSource::SpawnRing,
+        };
+    }
+    gaps.push("the newest spawn is not current and alive".to_string());
 
     match listener_pid {
         Ok(Some(pid)) => {
@@ -341,7 +357,7 @@ mod tests {
     #[test]
     fn registry_pid_wins() {
         assert_eq!(
-            resolve_stop_target(Some(42), Ok(Some(99)), &[7]),
+            resolve_stop_target(Some(42), Some(43), Ok(Some(99)), &[7]),
             StopTarget::Found {
                 pid: 42,
                 source: PidSource::Registry
@@ -352,7 +368,7 @@ mod tests {
     #[test]
     fn listener_probe_is_second() {
         assert_eq!(
-            resolve_stop_target(None, Ok(Some(99)), &[7]),
+            resolve_stop_target(None, None, Ok(Some(99)), &[7]),
             StopTarget::Found {
                 pid: 99,
                 source: PidSource::ListenerProbe
@@ -366,7 +382,7 @@ mod tests {
     #[test]
     fn exe_identity_rescues_an_adopted_runner_with_a_blind_probe() {
         assert_eq!(
-            resolve_stop_target(None, Err("locale-blind probe".into()), &[8872]),
+            resolve_stop_target(None, None, Err("locale-blind probe".into()), &[8872]),
             StopTarget::Found {
                 pid: 8872,
                 source: PidSource::ExeIdentity
@@ -379,7 +395,7 @@ mod tests {
     #[test]
     fn exe_identity_rescues_when_probe_is_empty() {
         assert_eq!(
-            resolve_stop_target(None, Ok(None), &[8872]),
+            resolve_stop_target(None, None, Ok(None), &[8872]),
             StopTarget::Found {
                 pid: 8872,
                 source: PidSource::ExeIdentity
@@ -391,7 +407,7 @@ mod tests {
     /// image means we cannot say which is the operator's runner.
     #[test]
     fn ambiguous_exe_identity_refuses_to_guess() {
-        let target = resolve_stop_target(None, Ok(None), &[100, 200]);
+        let target = resolve_stop_target(None, None, Ok(None), &[100, 200]);
         match target {
             StopTarget::NotFound { why } => {
                 assert!(why.contains("refusing to guess"), "got: {why}");
@@ -408,7 +424,7 @@ mod tests {
     /// itself rather than asserting three kills that never happened.
     #[test]
     fn not_found_accumulates_every_gap() {
-        let target = resolve_stop_target(None, Err("netstat exploded".into()), &[]);
+        let target = resolve_stop_target(None, None, Err("netstat exploded".into()), &[]);
         match target {
             StopTarget::NotFound { why } => {
                 assert!(why.contains("registry tracks no PID"), "got: {why}");
@@ -423,8 +439,8 @@ mod tests {
     /// conflating them is the original sin this whole change is about.
     #[test]
     fn probe_error_and_probe_empty_read_differently() {
-        let err = resolve_stop_target(None, Err("boom".into()), &[]);
-        let empty = resolve_stop_target(None, Ok(None), &[]);
+        let err = resolve_stop_target(None, None, Err("boom".into()), &[]);
+        let empty = resolve_stop_target(None, None, Ok(None), &[]);
         assert_ne!(err, empty);
     }
 
@@ -531,6 +547,32 @@ mod tests {
     /// A registry PID keeps the pre-existing behaviour unconditionally — the
     /// new check may only ever remove a kill that was already unsafe, never
     /// one that already worked.
+    /// The ring's pid comes after the registry's and before the probes, which
+    /// are less specific. It is a candidate, not the registry's own record.
+    #[test]
+    fn a_ring_pid_outranks_the_probes_and_is_held_to_the_image_check() {
+        assert_eq!(
+            resolve_stop_target(None, Some(43), Ok(Some(99)), &[7, 8]),
+            StopTarget::Found {
+                pid: 43,
+                source: PidSource::SpawnRing
+            }
+        );
+        let expected = Path::new("/runners/qontinui-runner-primary");
+        assert_eq!(
+            verify_target_image(&PidSource::SpawnRing, Some(expected), expected),
+            TargetVerification::Proceed { note: None }
+        );
+        assert!(matches!(
+            verify_target_image(
+                &PidSource::SpawnRing,
+                Some(Path::new("/usr/bin/some-other-program")),
+                expected
+            ),
+            TargetVerification::Refuse { .. }
+        ));
+    }
+
     #[test]
     fn registry_pid_is_never_refused() {
         let v = verify_target_image(

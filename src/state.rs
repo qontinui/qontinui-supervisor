@@ -155,8 +155,9 @@ pub struct ManagedRunner {
     pub spawn_in_flight: std::sync::Mutex<Option<std::time::Duration>>,
     /// Orders this runner's starts, stops and removals against each other.
     ///
-    /// `start_managed_runner` holds it from before its defensive re-insert
-    /// through recording the spawn and spawning that spawn's exit monitor.
+    /// `start_managed_runner` holds it from before what its `StartAs` requires,
+    /// a restart's re-insert included, until it returns, so through recording the
+    /// spawn and spawning that spawn's exit monitor.
     /// `stop_runner_by_id` holds it from its latch through its reset and a
     /// `test-*` runner's teardown. `reap_stale_test_runners`, the purge-stale
     /// sweep and `DELETE /runners/{id}` `try_lock` it, skip or refuse on contention

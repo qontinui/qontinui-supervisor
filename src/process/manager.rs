@@ -2322,8 +2322,8 @@ pub enum StartAs {
     /// this start puts it back.
     Restart,
     /// The crash watchdog answering the exit of the spawn recorded at
-    /// `exited_spawned_at`. Proceed only while that is still the runner's spawn
-    /// and no stop has latched.
+    /// `exited_spawned_at`. Proceed only while the registry still holds this
+    /// entry, that is still the runner's spawn and no stop has latched.
     AfterCrash {
         exited_spawned_at: chrono::DateTime<chrono::Utc>,
     },
@@ -2377,16 +2377,22 @@ pub async fn start_managed_runner(
                 .or_insert_with(|| managed.clone());
         }
         StartAs::AfterCrash { exited_spawned_at } => {
+            // A removal writes none of the fields below, and this start holds its
+            // own Arc rather than looking the id up.
+            let registered = is_registered(state, managed).await;
             let runner = managed.runner.read().await;
-            if crash_restart_backoff_skips(
-                runner.running,
-                runner.stop_requested,
-                runner.started_at,
-                exited_spawned_at,
-            ) {
+            if !registered
+                || crash_restart_backoff_skips(
+                    runner.running,
+                    runner.stop_requested,
+                    runner.started_at,
+                    exited_spawned_at,
+                )
+            {
                 return Err(SupervisorError::StartSuperseded(format!(
-                    "runner '{runner_id}' changed while this start waited (running={}, \
-                     stop_requested={}, started_at={:?}, exited spawn={exited_spawned_at})",
+                    "runner '{runner_id}' changed since the exit (registered={registered}, \
+                     running={}, stop_requested={}, started_at={:?}, exited \
+                     spawn={exited_spawned_at})",
                     runner.running, runner.stop_requested, runner.started_at
                 )));
             }
@@ -4851,15 +4857,17 @@ async fn maybe_crash_restart(
                             },
                         );
                     }
-                    Err(SupervisorError::StartSuperseded(why)) => {
-                        info!("crash-only watchdog: not restarting: {why}");
+                    // A correct skip, not a failure. The event pairs with the
+                    // `RestartStarted` above, and its detail says superseded.
+                    Err(superseded @ SupervisorError::StartSuperseded(_)) => {
+                        info!("crash-only watchdog: not restarting: {superseded}");
                         state
                             .diagnostics
                             .write()
                             .await
                             .emit(DiagnosticEventKind::RestartFailed {
                                 source: RestartSource::Watchdog,
-                                error: why,
+                                error: superseded.to_string(),
                             });
                     }
                     Err(e) => {
@@ -5536,11 +5544,12 @@ async fn resolve_stop_target_for(
     managed: &ManagedRunner,
     port: u16,
     registry_pid: Option<u32>,
+    spawn_ring_pid: Option<u32>,
 ) -> StopTarget {
-    // Short-circuit: the registry already knows, so neither probe is worth
-    // paying for.
-    if let Some(pid) = registry_pid {
-        return resolve_stop_target(Some(pid), Ok(None), &[]);
+    // Short-circuit: the registry or the ring already knows, so neither probe is
+    // worth paying for.
+    if registry_pid.is_some() || spawn_ring_pid.is_some() {
+        return resolve_stop_target(registry_pid, spawn_ring_pid, Ok(None), &[]);
     }
 
     // Both probes go through the cross-platform `proc_kill` facade. They used
@@ -5553,7 +5562,7 @@ async fn resolve_stop_target_for(
         .map_err(|e| e.to_string());
     let exe_copy = state.config.runner_exe_copy_path(&managed.config);
     let by_exe = crate::process::proc_kill::find_pids_holding_exe(&exe_copy).await;
-    resolve_stop_target(None, listener, &by_exe)
+    resolve_stop_target(None, None, listener, &by_exe)
 }
 
 /// Adapter for [`verify_target_image`]: read the target's live image path and
@@ -5661,14 +5670,15 @@ pub async fn stop_runner_by_id(
     // three independent sources rather than read straight out of the registry.
     //
     // A pid the health cache cleared from a primary still booting is still in the
-    // newest spawn's ring entry. Without it this stop could find no target, confirm
-    // on the free port, and leave that process running beside the next start.
-    let registry_pid = {
+    // newest spawn's ring entry. It goes in as its own source, not as the
+    // registry's, since the OS can have reused it: it gets the image check below.
+    let (registry_pid, spawn_ring_pid) = {
         let runner = managed.runner.read().await;
         let spawns = managed.recent_spawns.read().await;
-        runner
-            .pid
-            .or_else(|| pid_of_newest_spawn_if_up(runner.started_at, &spawns))
+        (
+            runner.pid,
+            pid_of_newest_spawn_if_up(runner.started_at, &spawns),
+        )
     };
 
     // Ledger of what this stop ACTUALLY does, so a failure can say which rungs
@@ -5697,7 +5707,8 @@ pub async fn stop_runner_by_id(
     // `request_graceful_stop` entirely — a hard kill of the operator's primary
     // with no chance to flush in-flight AI turns or stash dirty worktrees.
     // Identify now, kill through the normal ladder below.
-    let stop_target = resolve_stop_target_for(state, &managed, port, registry_pid).await;
+    let stop_target =
+        resolve_stop_target_for(state, &managed, port, registry_pid, spawn_ring_pid).await;
 
     // `mut` because the pre-kill identity re-check below can retract the
     // target.
