@@ -46,6 +46,7 @@ fn config_under(base: &std::path::Path) -> SupervisorConfig {
         no_webview: true,
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

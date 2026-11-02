@@ -97,6 +97,34 @@ pub enum AmbientTargetDir {
     Ignore,
 }
 
+/// Whether and where the dev-action client reaches coord: the expectations GET
+/// at both mint sites and the attribution watcher's snapshot POST.
+/// [`crate::dev_action::ingest::coord_base`] turns it into a base URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbientCoord {
+    /// `COORD_HTTP_URL`, else the active profile's `coord_url` in
+    /// `~/.qontinui/profiles.json`. Production, and on a dev box that profile
+    /// is production coord.
+    Read,
+    /// No coord. A mint fetches nothing and a closed window posts nothing, and
+    /// neither the environment, `profiles.json` nor `machine.json` is read.
+    /// What [`SupervisorConfig::from_args`] picks in a unit-test build, so a
+    /// test's route never reads the expectations that decide its branch from
+    /// production, and a test's fabricated outcome never reaches the ledger the
+    /// LKG restart guard reads (coord finding ab7c97d7).
+    ///
+    /// An integration test under `tests/` links the library without
+    /// `cfg(test)`, so `from_args` gives it `Read`: it builds a struct literal
+    /// that sets `Ignore` instead, and
+    /// `tests::no_test_config_reads_the_ambient_coord` holds both halves.
+    Ignore,
+    /// This base URL, with no ambient read. How a test plants rows. Not
+    /// `#[cfg(test)]`, so an integration test can reach it too; production never
+    /// builds it, which the binary's own copy of this module would flag.
+    #[allow(dead_code)]
+    At(String),
+}
+
 /// Resolve `p` against `base` when it is relative. Cargo resolves a relative
 /// `CARGO_TARGET_DIR` against its own working directory and a relative
 /// `build.target-dir` against the directory *containing* the `.cargo` dir the
@@ -325,6 +353,11 @@ pub struct SupervisorConfig {
     /// `Ignore` in a unit-test build. [`Self::from_args`] would give an
     /// integration test `Read`, so one sets `Ignore` in a struct literal.
     pub ambient_target_dir: AmbientTargetDir,
+    /// Whether and where the dev-action client reaches coord ([`AmbientCoord`]):
+    /// `Read` in production, `Ignore` in a unit-test build. [`Self::from_args`]
+    /// would give an integration test `Read`, so one sets `Ignore` in a struct
+    /// literal.
+    pub ambient_coord: AmbientCoord,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -1147,10 +1180,11 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 }
 
 impl SupervisorConfig {
-    /// Build the config from the command line. `ambient_target_dir` is
-    /// [`AmbientTargetDir::Ignore`] in a unit-test build and `Read` everywhere
+    /// Build the config from the command line. `ambient_target_dir` and
+    /// `ambient_coord` are `Ignore` in a unit-test build and `Read` everywhere
     /// else, an integration test under `tests/` included, which is why no file
-    /// there calls this (see [`AmbientTargetDir::Ignore`]).
+    /// there calls this (see [`AmbientTargetDir::Ignore`] and
+    /// [`AmbientCoord::Ignore`]).
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1213,6 +1247,11 @@ impl SupervisorConfig {
                 AmbientTargetDir::Ignore
             } else {
                 AmbientTargetDir::Read
+            },
+            ambient_coord: if cfg!(test) {
+                AmbientCoord::Ignore
+            } else {
+                AmbientCoord::Read
             },
         };
         config.build_pool =
@@ -2178,6 +2217,12 @@ mod tests {
         needles
     }
 
+    /// A `from_args` call, whitespace removed. An integration test links the
+    /// library without `cfg(test)`, so this call hands it both ambient `Read`s.
+    fn from_args_needle() -> Vec<String> {
+        vec!["::from_args(".to_string()]
+    }
+
     /// Source text with its whitespace removed, so a call split across lines
     /// matches the same needle as one written on a single line, plus the line
     /// each kept byte came from, so a match is reported where it is.
@@ -2306,7 +2351,6 @@ mod tests {
         // so `from_args` gives it `Read`. No file under `tests/` calls it;
         // they build a struct literal that names `Ignore`.
         let needles = working_directory_needles();
-        let from_args = ["::from_args(".to_string()];
         let helper_call = format!("{}()", "config_over_an_empty_runner_tree");
         let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
 
@@ -2327,7 +2371,7 @@ mod tests {
             }
             if path.starts_with(&tests_dir) {
                 integration_files_scanned += 1;
-                for line in squeezed.lines_matching(&from_args) {
+                for line in squeezed.lines_matching(&from_args_needle()) {
                     reading_the_ambient_target_dir.push(format!("{}:{line}", path.display()));
                 }
             }
@@ -2362,6 +2406,144 @@ mod tests {
              link); build a `SupervisorConfig` literal with \
              `ambient_target_dir: AmbientTargetDir::Ignore` instead:\n  {}",
             reading_the_ambient_target_dir.join("\n  ")
+        );
+    }
+
+    /// Where `squeezed` initialises or assigns the `ambient_coord` field to an
+    /// expression naming the `Read` variant, however the path is qualified, as
+    /// byte offsets into its text. The expression ends at the next `,` or `;`,
+    /// so `from_args`' `if cfg!(test) { … } else { … }` counts as one, and a
+    /// bare mention of the variant passed as a value (the resolver's own tests)
+    /// does not.
+    fn ambient_coord_read_sites(squeezed: &Squeezed) -> Vec<usize> {
+        let field = "ambient_coord";
+        let read = format!("AmbientCoord::{}", "Read");
+        let mut at = Vec::new();
+        for bind in [":", "="] {
+            let needle = format!("{field}{bind}");
+            for (i, _) in squeezed.text.match_indices(needle.as_str()) {
+                let value = &squeezed.text[i + needle.len()..];
+                let end = value.find([',', ';']).unwrap_or(value.len());
+                if value[..end].contains(read.as_str()) {
+                    at.push(i);
+                }
+            }
+        }
+        at.sort_unstable();
+        at
+    }
+
+    #[test]
+    fn a_test_build_reads_no_ambient_coord() {
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        assert_eq!(config.ambient_coord, AmbientCoord::Ignore);
+        assert_eq!(
+            crate::dev_action::ingest::coord_base_with(
+                &config.ambient_coord,
+                || panic!("read COORD_HTTP_URL"),
+                || panic!("read profiles.json"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn no_test_config_reads_the_ambient_coord() {
+        // `AmbientCoord::Read` in a test config would send that test's mint to
+        // whatever the box's `COORD_HTTP_URL` or `profiles.json` names, and its
+        // closed window into the ledger the LKG restart guard reads. The one
+        // field init that names the variant is `from_args`' production arm.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_rs = manifest.join("src").join("config.rs");
+        let tests_dir = manifest.join("tests");
+
+        // The scan proves nothing unless it matches the forms a config would
+        // write. Built here, so this file holds none of them outside `from_args`.
+        let (field, read) = ("ambient_coord", format!("AmbientCoord::{}", "Read"));
+        for flagged in [
+            format!("SupervisorConfig {{\n    {field}: {read},\n}}"),
+            format!("SupervisorConfig {{ {field}: crate::config::{read} }};"),
+            format!("{field}: qontinui_supervisor::config::{read},"),
+            format!("config.{field} = {read};"),
+        ] {
+            assert_eq!(
+                ambient_coord_read_sites(&Squeezed::new(&flagged)).len(),
+                1,
+                "{flagged}"
+            );
+        }
+        for clean in [
+            format!("coord_base_with(&{read}, env, profiles)"),
+            format!("{field}: AmbientCoord::Ignore,\nlet a = {read};"),
+            format!("{field}: AmbientCoord::At(stub.base.clone()),"),
+            format!("pub {field}: AmbientCoord,"),
+        ] {
+            assert_eq!(
+                ambient_coord_read_sites(&Squeezed::new(&clean)),
+                Vec::<usize>::new(),
+                "{clean}"
+            );
+        }
+
+        let mut outside_from_args = Vec::new();
+        let mut calling_from_args = Vec::new();
+        let mut inside_from_args = 0usize;
+        let mut files_scanned = 0usize;
+        let mut integration_files_scanned = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            let squeezed = Squeezed::new(&source);
+            let from_args_span = (path == config_rs).then(|| {
+                let start = squeezed
+                    .text
+                    .find("pubfnfrom_args(")
+                    .expect("config.rs defines from_args");
+                let len = squeezed.text[start + 1..]
+                    .find("pubfn")
+                    .expect("a function follows from_args");
+                start..start + 1 + len
+            });
+            for at in ambient_coord_read_sites(&squeezed) {
+                if from_args_span.as_ref().is_some_and(|s| s.contains(&at)) {
+                    inside_from_args += 1;
+                } else {
+                    outside_from_args.push(format!("{}:{}", path.display(), squeezed.lines[at]));
+                }
+            }
+            if path.starts_with(&tests_dir) {
+                integration_files_scanned += 1;
+                for line in squeezed.lines_matching(&from_args_needle()) {
+                    calling_from_args.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            integration_files_scanned > 0,
+            "scanned no file under tests/ — the scan no longer covers the integration tests"
+        );
+        assert_eq!(
+            inside_from_args, 1,
+            "`from_args` must pick the ambient coord for production exactly once"
+        );
+        assert!(
+            outside_from_args.is_empty(),
+            "these configs read the ambient coord; name `AmbientCoord::Ignore`, or \
+             `AmbientCoord::At` to plant rows:\n  {}",
+            outside_from_args.join("\n  ")
+        );
+        assert!(
+            calling_from_args.is_empty(),
+            "these integration tests call `from_args`, which gives them the ambient coord \
+             (`cfg(test)` is not set for the library they link); build a `SupervisorConfig` \
+             literal that names `AmbientCoord::Ignore` instead:\n  {}",
+            calling_from_args.join("\n  ")
         );
     }
 

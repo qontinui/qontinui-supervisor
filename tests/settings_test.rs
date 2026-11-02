@@ -81,6 +81,7 @@ fn make_config(project_dir: PathBuf, dev_logs_dir: PathBuf) -> SupervisorConfig 
         no_webview: true,
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
     }
 }
 

@@ -1700,6 +1700,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         no_webview: true,
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1890,6 +1891,7 @@ fn make_state() -> crate::state::SharedState {
         no_webview: true,
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+        ambient_coord: crate::config::AmbientCoord::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -2740,6 +2742,46 @@ fn spawn_dedup_key_distinguishes_every_build_target() {
 /// build is still running returns 202 + `deduplicated: true` carrying the
 /// EXISTING `build_id`, runner id and port — and starts no build, so the
 /// test is deterministic (this path returns before any port reservation).
+/// The spawn mint reads the coord its config names, and its `risk` reads every
+/// row that coord served before the ACK cuts `predicted` to five. For a spawn
+/// `route_lkg` is advice only. The empty runner tree has no exe, so the detached
+/// spawn behind the 202 ends without starting anything.
+#[tokio::test]
+async fn spawn_202_risk_reads_every_planted_row() {
+    use crate::dev_action::test_support::{
+        assert_the_ack_read_every_planted_row, five_rows_and_a_sixth_boot_row,
+        serve_planted_expectations,
+    };
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+    config.temp_runner_display = Some(":99".to_string());
+    let state = Arc::new(crate::state::SupervisorState::new(config));
+
+    let resp = super::spawn_test(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({
+            "requester_id": "t2-5",
+            "rebuild": false,
+            "async": true,
+        })),
+    )
+    .await
+    .expect("handler ok")
+    .into_response();
+
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    assert_eq!(status, 202, "{body}");
+    assert_the_ack_read_every_planted_row(&coord, "spawn", &body);
+}
+
 #[tokio::test]
 async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot() {
     use axum::extract::State;

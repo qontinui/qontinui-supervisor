@@ -5,8 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
     SlotResolution,
 };
 use crate::diagnostics::RestartSource;
@@ -155,7 +155,8 @@ async fn mint_primary_action(
     // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
     // pooled mean before cutting, which can drop the very row the exact-cell
     // arm of the risk policy reads.
-    let fetched = fetch_expectations(kind.as_str(), &states_active).await;
+    let coord = coord_base(&state.config.ambient_coord);
+    let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
 
     // "Act on predictions": assess the whole fetch against the active states,
     // then cut the ACK's `predicted` to the top five by `posterior_mean`.
@@ -1556,9 +1557,13 @@ mod tests {
     }
 
     fn test_state_on_port(root: &std::path::Path, runner_port: u16) -> SharedState {
+        Arc::new(SupervisorState::new(test_config(root, runner_port)))
+    }
+
+    fn test_config(root: &std::path::Path, runner_port: u16) -> SupervisorConfig {
         let mut primary = RunnerConfig::default_primary();
         primary.port = runner_port;
-        let config = SupervisorConfig {
+        SupervisorConfig {
             project_dir: root.join("src-tauri"),
             watchdog_enabled_at_start: false,
             auto_start: false,
@@ -1576,8 +1581,8 @@ mod tests {
             no_webview: true,
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
-        };
-        Arc::new(SupervisorState::new(config))
+            ambient_coord: crate::config::AmbientCoord::Ignore,
+        }
     }
 
     fn queued_submission(id: uuid::Uuid) -> BuildSubmission {
@@ -1644,6 +1649,44 @@ mod tests {
         state.runners.write().await.clear();
         let targets = primary_attribution_targets(&state).await;
         assert!(targets.managed.is_none() && targets.runner_id.is_none());
+    }
+
+    /// The mint reads the coord its config names, and its `risk` reads every row
+    /// that coord served before the ACK cuts `predicted` to five. `risk` is null
+    /// when the fetch goes anywhere else, or when the cut comes first and drops
+    /// the sixth-ranked boot row. The dead port and the closed pool keep the
+    /// detached restart from reaching a runner or a build.
+    #[tokio::test]
+    async fn restart_202_risk_reads_every_planted_row_and_the_ack_keeps_five() {
+        use crate::dev_action::test_support::{
+            assert_the_ack_read_every_planted_row, five_rows_and_a_sixth_boot_row,
+            serve_planted_expectations,
+        };
+        let _building = BUILDING_TESTS.lock().await;
+        let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+        config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+        let state = Arc::new(SupervisorState::new(config));
+        state.build_pool.permits.close();
+
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+                from_working_tree: true,
+                use_lkg: None,
+                handoff: false,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202, "{body}");
+        assert_the_ack_read_every_planted_row(&coord, "build", &body);
     }
 
     /// With no primary registered the ACK names no tree: the detached restart

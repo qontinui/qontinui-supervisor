@@ -1580,6 +1580,22 @@ holds both by scanning every `.rs` file under `src/` and `tests/`:
   `from_args` (the scan fails on one that does); one that needs a config builds
   a `SupervisorConfig` literal that sets `ambient_target_dir: AmbientTargetDir::Ignore`.
 
+**A unit-test build reaches no ambient coord either.** `SupervisorConfig.ambient_coord`
+decides where the dev-action client goes: the expectations GET at both mint sites
+and the attribution watcher's snapshot POST, all resolved by
+`dev_action::ingest::coord_base`. `AmbientCoord::Read` is production
+(`COORD_HTTP_URL`, else the active profile's `coord_url`); `from_args` picks
+`Ignore` under `cfg(test)`, which makes no request and reads none of the
+environment, `profiles.json` or `machine.json`; `At(<url>)` is how a test plants
+rows (`dev_action::test_support::serve_planted_expectations`). It replaced a
+`cfg!(test)` return in the POST that an integration test never compiled and that
+left the read open, so `restart_runner`'s `use_lkg: None` branch could turn on
+production rows (coord finding `ab7c97d7`). An integration test names `Ignore` in
+its struct literal, and `config::tests::no_test_config_reads_the_ambient_coord`
+fails on any config outside `from_args` that names `Read`. It covers these paths
+only. `fleet::coord_http_base`, which ignores `COORD_HTTP_URL`, and the other
+coord resolvers have no such switch.
+
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
 construction, which is this gate's own allow condition.) A fallthrough artifact
