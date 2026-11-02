@@ -555,6 +555,7 @@ pub async fn rebuild_when_idle(
                 false,
                 REBUILD_WHEN_IDLE_TREE,
                 manager::CloseIntent::Kill,
+                Some(exec_record.action_id),
             )
             .await
             {
@@ -701,6 +702,7 @@ pub async fn restart_runner(
                     force,
                     build_tree,
                     intent,
+                    Some(exec_record.action_id),
                 )
                 .await
                 {
@@ -963,6 +965,7 @@ pub async fn restart_runner(
         body.force,
         body.build_tree(),
         body.close_intent(),
+        Some(action_record.action_id),
     )
     .await;
 

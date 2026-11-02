@@ -826,7 +826,7 @@ fn stop_reap_ladder_terminates() {
 #[test]
 fn crash_restart_first_crash_restarts_after_5s() {
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, false, 0),
+        decide_crash_restart(false, false, true, true, false, 0),
         CrashRestartDecision::Restart {
             attempt: 1,
             delay_secs: 5
@@ -838,14 +838,14 @@ fn crash_restart_first_crash_restarts_after_5s() {
 #[test]
 fn crash_restart_backoff_is_exponential() {
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, false, 1),
+        decide_crash_restart(false, false, true, true, false, 1),
         CrashRestartDecision::Restart {
             attempt: 2,
             delay_secs: 30
         }
     );
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, false, 2),
+        decide_crash_restart(false, false, true, true, false, 2),
         CrashRestartDecision::Restart {
             attempt: 3,
             delay_secs: 120
@@ -857,12 +857,12 @@ fn crash_restart_backoff_is_exponential() {
 #[test]
 fn crash_restart_window_exhausted_disarms() {
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, false, 3),
+        decide_crash_restart(false, false, true, true, false, 3),
         CrashRestartDecision::Disarm
     );
     // Even further past the budget it stays Disarm, never Restart.
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, false, 7),
+        decide_crash_restart(false, false, true, true, false, 7),
         CrashRestartDecision::Disarm
     );
 }
@@ -872,12 +872,12 @@ fn crash_restart_window_exhausted_disarms() {
 #[test]
 fn crash_restart_operator_stop_never_restarts() {
     assert_eq!(
-        decide_crash_restart(true, true, false, true, true, false, 0),
+        decide_crash_restart(true, false, true, true, false, 0),
         CrashRestartDecision::SkipOperatorStop
     );
     // Even a non-clean exit after a stop request (taskkill path) skips.
     assert_eq!(
-        decide_crash_restart(true, true, true, true, true, false, 0),
+        decide_crash_restart(true, true, true, true, false, 0),
         CrashRestartDecision::SkipOperatorStop
     );
 }
@@ -887,18 +887,8 @@ fn crash_restart_operator_stop_never_restarts() {
 #[test]
 fn crash_restart_clean_exit_skips() {
     assert_eq!(
-        decide_crash_restart(true, false, true, true, true, false, 0),
+        decide_crash_restart(false, true, true, true, false, 0),
         CrashRestartDecision::SkipCleanExit
-    );
-}
-
-/// No Child handle → the supervisor never spawned this process; no
-/// provenance to restart it.
-#[test]
-fn crash_restart_requires_spawn_provenance() {
-    assert_eq!(
-        decide_crash_restart(false, false, false, true, true, false, 0),
-        CrashRestartDecision::SkipNoChildHandle
     );
 }
 
@@ -906,7 +896,7 @@ fn crash_restart_requires_spawn_provenance() {
 #[test]
 fn crash_restart_global_arm_gates() {
     assert_eq!(
-        decide_crash_restart(true, false, false, false, true, false, 0),
+        decide_crash_restart(false, false, false, true, false, 0),
         CrashRestartDecision::SkipNotArmed
     );
 }
@@ -915,7 +905,7 @@ fn crash_restart_global_arm_gates() {
 #[test]
 fn crash_restart_per_runner_enabled_gates() {
     assert_eq!(
-        decide_crash_restart(true, false, false, true, false, false, 0),
+        decide_crash_restart(false, false, true, false, false, 0),
         CrashRestartDecision::SkipDisabled
     );
 }
@@ -925,17 +915,16 @@ fn crash_restart_per_runner_enabled_gates() {
 #[test]
 fn crash_restart_disarmed_latch_holds() {
     assert_eq!(
-        decide_crash_restart(true, false, false, true, true, true, 0),
+        decide_crash_restart(false, false, true, true, true, 0),
         CrashRestartDecision::SkipDisarmed
     );
 }
 
 /// The two CRASH WARN-worthy skip variants (`SkipNotArmed` /
 /// `SkipDisarmed`, promoted to `warn!` + persisted emit in
-/// `maybe_crash_restart`) are ONLY reachable for a genuine crash — a held
-/// Child handle, no operator stop, and an unclean exit. The benign skips
-/// for the same crash inputs (clean exit, operator stop, no child handle)
-/// classify away from the WARN set, so the CRASH promotion never fires on
+/// `maybe_crash_restart`) are ONLY reachable for a genuine crash — no
+/// operator stop and an unclean exit. The benign skips for the same crash
+/// inputs (clean exit, operator stop) classify away from the WARN set, so the CRASH promotion never fires on
 /// a benign exit.
 ///
 /// Note `SkipCleanExit` carries its OWN, separate warn arm for the
@@ -946,20 +935,19 @@ fn crash_restart_disarmed_latch_holds() {
 #[test]
 fn crash_restart_warn_worthy_skips_are_genuine_crash_only() {
     // Genuine crash, global arm off → WARN-worthy SkipNotArmed.
-    let not_armed = decide_crash_restart(true, false, false, false, true, false, 0);
+    let not_armed = decide_crash_restart(false, false, false, true, false, 0);
     assert_eq!(not_armed, CrashRestartDecision::SkipNotArmed);
     assert!(matches!(
         not_armed,
         CrashRestartDecision::SkipNotArmed | CrashRestartDecision::SkipDisarmed
     ));
     // Genuine crash, armed+enabled but disarmed latch → WARN-worthy SkipDisarmed.
-    let disarmed = decide_crash_restart(true, false, false, true, true, true, 0);
+    let disarmed = decide_crash_restart(false, false, true, true, true, 0);
     assert_eq!(disarmed, CrashRestartDecision::SkipDisarmed);
     // Benign skips for the SAME arm state must NOT be in the WARN-worthy set.
     for benign in [
-        decide_crash_restart(true, false, true, false, true, false, 0), // clean exit
-        decide_crash_restart(true, true, false, false, true, false, 0), // operator stop
-        decide_crash_restart(false, false, false, false, true, false, 0), // no child handle
+        decide_crash_restart(false, true, false, true, false, 0), // clean exit
+        decide_crash_restart(true, false, false, true, false, 0), // operator stop
     ] {
         assert!(
             !matches!(
@@ -3406,6 +3394,7 @@ async fn failed_restart_clears_restart_requested() {
         false,
         BuildTree::OriginMain,
         CloseIntent::Kill,
+        None,
     )
     .await
     .expect_err("no exe can be resolved from an empty project dir");
@@ -3445,6 +3434,7 @@ async fn restart_stops_on_held_port_evidence_even_when_running_is_false() {
         false,
         BuildTree::OriginMain,
         CloseIntent::Kill,
+        None,
     )
     .await
     .expect_err("the start still fails at exe resolution");
@@ -3477,6 +3467,7 @@ async fn a_stop_leaves_the_spawn_ring_as_it_found_it() {
         chrono::Utc::now() - chrono::Duration::seconds(30),
         Some(4242),
         None,
+        None,
     );
     managed.recent_spawns.write().await.push(entry.clone());
 
@@ -3488,6 +3479,7 @@ async fn a_stop_leaves_the_spawn_ring_as_it_found_it() {
         false,
         BuildTree::OriginMain,
         CloseIntent::Kill,
+        None,
     )
     .await
     .expect_err("the start still fails at exe resolution");
@@ -3530,10 +3522,9 @@ enum StopAtExit {
 /// the registry's stop-request time, `Some` when the stop flag was latched as
 /// the monitor read it (a failed stop's flag included), and then attaches
 /// the panic it parsed at the exit to that same entry. It removes no
-/// entry. It names the entry by the pid it read from the child before the
-/// wait: tokio's `Child::id` is `None` once the child has been polled to
-/// completion, and the registry's pid is no key either, since the health
-/// cache clears a booting primary's, as it is cleared here.
+/// entry. It names the entry by the spawn's `spawned_at`, handed to it with
+/// the child: the registry's pid is no key, since the health cache clears a
+/// booting primary's, as it is cleared here.
 #[tokio::test]
 async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its_panic() {
     let requested_at = chrono::Utc::now() - chrono::Duration::seconds(2);
@@ -3571,17 +3562,23 @@ async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its
             spawned_at - chrono::Duration::seconds(60),
             Some(pid.wrapping_add(1)),
             None,
+            None,
         );
         managed.recent_spawns.write().await.push(earlier.clone());
         managed
             .recent_spawns
             .write()
             .await
-            .push(crate::state::SpawnMarker::new(spawned_at, Some(pid), None));
+            .push(crate::state::SpawnMarker::new(
+                spawned_at,
+                Some(pid),
+                None,
+                None,
+            ));
         {
             let mut runner = managed.runner.write().await;
-            runner.process = Some(child);
             runner.running = true;
+            runner.started_at = Some(spawned_at);
             // A health-cache tick before the port bound.
             runner.pid = None;
             match stop {
@@ -3591,7 +3588,7 @@ async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its
             }
         }
 
-        monitor_runner_process_exit_inner(state.clone(), managed.clone(), id.to_string()).await;
+        monitor_runner_process_exit_inner(state.clone(), managed.clone(), child, spawned_at).await;
 
         let ring: Vec<crate::state::SpawnMarker> =
             managed.recent_spawns.read().await.iter().cloned().collect();
@@ -3628,10 +3625,10 @@ async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its
 }
 
 /// `start_managed_runner` records each spawn through
-/// `record_spawn_in_registry`: the registry entry gets the live process, its
-/// pid and start time, and the previous process's stop request is cleared;
-/// the ring's newest entry is exactly `SpawnMarker::new(started_at, pid,
-/// early_log_path)`, dated at that same instant, which is now.
+/// `record_spawn_in_registry`: the registry entry gets its pid and start time,
+/// and the previous process's stop request is cleared; the ring's newest entry
+/// is exactly `SpawnMarker::new(started_at, pid, early_log_path, initiated_by)`,
+/// dated at that same instant, which is now and which the call returns.
 #[tokio::test]
 async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instant() {
     let (state, root) = restart_test_state();
@@ -3646,20 +3643,21 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
         chrono::Utc::now() - chrono::Duration::seconds(60),
         Some(1),
         None,
+        None,
     );
     managed.recent_spawns.write().await.push(earlier.clone());
-    let child = spawn_a_child_that_exits_3();
-    let pid = child.id().expect("a child not yet waited on has a pid");
+    let pid = 4242;
     let early_log = root.path().join("early.log");
+    let action = uuid::Uuid::new_v4();
 
     let before = chrono::Utc::now();
-    record_spawn_in_registry(&managed, child, Some(early_log.clone())).await;
+    let spawned_at =
+        record_spawn_in_registry(&managed, Some(pid), Some(early_log.clone()), Some(action)).await;
     let after = chrono::Utc::now();
 
     let started_at = {
         let runner = managed.runner.read().await;
         assert!(runner.running);
-        assert!(runner.process.is_some(), "the registry holds the child");
         assert_eq!(runner.pid, Some(pid));
         assert!(
             !runner.stop_requested,
@@ -3671,6 +3669,7 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
         );
         runner.started_at.expect("the spawn's start time")
     };
+    assert_eq!(spawned_at, started_at, "the identity the monitor is handed");
     assert!(
         before <= started_at && started_at <= after,
         "the spawn is dated {started_at}, not between {before} and {after}"
@@ -3681,7 +3680,7 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
         ring,
         [
             earlier,
-            crate::state::SpawnMarker::new(started_at, Some(pid), Some(early_log)),
+            crate::state::SpawnMarker::new(started_at, Some(pid), Some(early_log), Some(action)),
         ],
         "the ring's newest entry is not this spawn as the registry records it"
     );
@@ -3795,7 +3794,8 @@ fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry
             .split_whitespace()
             .collect()
     };
-    const RECORD: &str = "record_spawn_in_registry(managed,child,early_log_path).await;";
+    const RECORD: &str =
+        "letspawned_at=record_spawn_in_registry(managed,pid,early_log_path,initiated_by).await;";
 
     let start = body_of("pub async fn start_managed_runner(");
     assert_eq!(
@@ -3804,7 +3804,7 @@ fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry
         "one recorded spawn per start"
     );
     assert!(
-        !start.contains("recent_spawns"),
+        !start.contains("recent_spawns.write()"),
         "the start writes the ring only through record_spawn_in_registry"
     );
     let record = start.find(RECORD).expect("the call");
@@ -3864,6 +3864,436 @@ fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry
     );
 }
 
+/// A child that stays up until its stdin closes, killed if the test drops it.
+fn spawn_a_child_that_exits_when_its_stdin_closes() -> (tokio::process::Child, u32) {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "set /p unused="]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "read unused"]);
+        command
+    };
+    let child = command
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn a child that waits on its stdin");
+    let pid = child.id().expect("a child not yet waited on has a pid");
+    (child, pid)
+}
+
+/// The primary, registered on a port nothing listens on.
+async fn register_dead_primary(state: &SharedState) -> Arc<ManagedRunner> {
+    let mut config = crate::config::RunnerConfig::default_primary();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config.port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let id = config.id.clone();
+    let managed = Arc::new(ManagedRunner::new(config, false));
+    state.runners.write().await.insert(id, managed.clone());
+    managed
+}
+
+/// M10's root: the exit monitor of an old spawn reaches its critical section
+/// after a new spawn of the runner was recorded. It leaves that spawn's
+/// `running`, `pid` and `started_at`, and a primary's legacy state, alone, and
+/// stamps its own entry. B's child is B's monitor's, so nothing A's monitor does
+/// can drop it: B's exit is still observed. And the monitor of the current spawn
+/// does reset both, the legacy state too, whose `started_at` is a separate clock
+/// read that never equals `spawned_at`.
+#[tokio::test]
+async fn a_late_exit_monitor_leaves_a_newer_spawn_running() {
+    for is_primary in [false, true] {
+        let (state, _root) = restart_test_state();
+        let managed = if is_primary {
+            register_dead_primary(&state).await
+        } else {
+            register_dead_named_runner(&state, "named-late-exit").await
+        };
+
+        // Spawn A, and its monitor, waiting on A's child.
+        let (mut child_a, pid_a) = spawn_a_child_that_exits_when_its_stdin_closes();
+        let stdin_a = child_a.stdin.take().expect("A's stdin");
+        let spawned_a = record_spawn_in_registry(&managed, Some(pid_a), None, None).await;
+        let monitor_a = tokio::spawn(monitor_runner_process_exit_inner(
+            state.clone(),
+            managed.clone(),
+            child_a,
+            spawned_a,
+        ));
+
+        // Spawn B, which stays up. The ring keys the two apart, so make sure
+        // the clock moved.
+        while chrono::Utc::now() == spawned_a {
+            tokio::task::yield_now().await;
+        }
+        let (mut child_b, pid_b) = spawn_a_child_that_exits_when_its_stdin_closes();
+        let stdin_b = child_b.stdin.take().expect("B's stdin");
+        let spawned_b = record_spawn_in_registry(&managed, Some(pid_b), None, None).await;
+        let legacy_b = spawned_b + chrono::Duration::milliseconds(1);
+        if is_primary {
+            let mut legacy = state.runner.write().await;
+            legacy.running = true;
+            legacy.pid = Some(pid_b);
+            legacy.started_at = Some(legacy_b);
+        }
+
+        // Only now does A exit.
+        drop(stdin_a);
+        monitor_a.await.expect("A's monitor");
+
+        {
+            let runner = managed.runner.read().await;
+            assert_eq!(
+                (runner.running, runner.pid, runner.started_at),
+                (true, Some(pid_b), Some(spawned_b)),
+                "primary={is_primary}: A's monitor reset the newer spawn B"
+            );
+        }
+        if is_primary {
+            let legacy = state.runner.read().await;
+            assert_eq!(
+                (legacy.running, legacy.pid, legacy.started_at),
+                (true, Some(pid_b), Some(legacy_b)),
+                "A's monitor reset the legacy primary state of the newer spawn B"
+            );
+        }
+        {
+            let ring = managed.recent_spawns.read().await;
+            let entries: Vec<&crate::state::SpawnMarker> = ring.iter().collect();
+            assert!(
+                entries[0].exited_at.is_some(),
+                "primary={is_primary}: A's exit was not stamped on A: {entries:?}"
+            );
+            assert_eq!(
+                entries[1].exited_at, None,
+                "primary={is_primary}: A's exit was stamped on B: {entries:?}"
+            );
+        }
+
+        // B's own exit is observed, and resets both.
+        let monitor_b = tokio::spawn(monitor_runner_process_exit_inner(
+            state.clone(),
+            managed.clone(),
+            child_b,
+            spawned_b,
+        ));
+        drop(stdin_b);
+        monitor_b.await.expect("B's monitor");
+        {
+            let runner = managed.runner.read().await;
+            assert_eq!(
+                (runner.running, runner.pid),
+                (false, None),
+                "primary={is_primary}: the current spawn's monitor did not reset it"
+            );
+        }
+        if is_primary {
+            let legacy = state.runner.read().await;
+            assert_eq!(
+                (legacy.running, legacy.pid),
+                (false, None),
+                "the current spawn's monitor did not reset the legacy primary state"
+            );
+        }
+        let ring = managed.recent_spawns.read().await;
+        assert!(
+            ring.newest().expect("B's entry").exited_at.is_some(),
+            "primary={is_primary}: B's exit was not observed"
+        );
+    }
+}
+
+/// The crash watchdog's backoff re-check: someone starting the runner during
+/// the backoff stops the restart, even when `running` reads false, as it does
+/// for a primary that has not answered `/health` yet.
+#[test]
+fn the_crash_watchdog_skips_a_restart_when_the_runner_was_started_during_its_backoff() {
+    let exited = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let newer = exited + chrono::Duration::seconds(10);
+    // (running, stop_requested, started_at, skip)
+    let table = [
+        (false, false, Some(exited), false),
+        (true, false, Some(exited), true),
+        (false, true, Some(exited), true),
+        (false, false, Some(newer), true),
+        (true, false, Some(newer), true),
+        (false, false, None, true),
+    ];
+    for (running, stop_requested, started_at, skip) in table {
+        assert_eq!(
+            crash_restart_backoff_skips(running, stop_requested, started_at, exited),
+            skip,
+            "running={running} stop_requested={stop_requested} started_at={started_at:?}"
+        );
+    }
+}
+
+/// A second start of a primary still booting is refused although `running`
+/// reads false, as the health cache leaves it until `/health` answers and its
+/// port guard passes before the primary binds. Only a spawn that is current and
+/// up counts: past a stop's reset, a stamped exit or a dead pid, the start goes
+/// on, here to fail at exe resolution.
+#[tokio::test]
+async fn a_second_start_of_a_primary_still_booting_is_refused() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Newest {
+        UpAndCurrent,
+        ResetByAStop,
+        ExitStamped,
+        PidDead,
+    }
+    for newest in [
+        Newest::UpAndCurrent,
+        Newest::ResetByAStop,
+        Newest::ExitStamped,
+        Newest::PidDead,
+    ] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        let (mut child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
+        if newest == Newest::PidDead {
+            drop(child.stdin.take());
+            child.wait().await.expect("reap the child");
+        }
+        let spawned_at = record_spawn_in_registry(&managed, Some(pid), None, None).await;
+        // A health-cache tick before the primary answers.
+        managed.runner.write().await.running = false;
+        match newest {
+            Newest::ResetByAStop => managed.runner.write().await.started_at = None,
+            Newest::ExitStamped => {
+                managed.recent_spawns.write().await.stamp_exit(
+                    spawned_at,
+                    chrono::Utc::now(),
+                    None,
+                );
+            }
+            Newest::UpAndCurrent | Newest::PidDead => {}
+        }
+
+        let err = start_managed_runner(&state, &managed, None)
+            .await
+            .expect_err("nothing can be started from an empty runner tree");
+        assert_eq!(
+            matches!(err, SupervisorError::RunnerAlreadyRunning),
+            newest == Newest::UpAndCurrent,
+            "{newest:?}: {err}"
+        );
+    }
+}
+
+/// A stop arriving mid-start latches only after that start has finished. The
+/// test's guard stands in for a start; the paused clock runs out with nothing
+/// else to do once the stop has blocked as far as it can.
+#[tokio::test(start_paused = true)]
+async fn a_stop_waits_for_a_start_to_record_its_spawn() {
+    let (state, _root) = restart_test_state();
+    let id = "named-stop-waits";
+    let managed = register_dead_named_runner(&state, id).await;
+
+    let start = managed.lifecycle.lock().await;
+    let stop = {
+        let state = state.clone();
+        tokio::spawn(async move { stop_runner_by_id(&state, id, false, CloseIntent::Kill).await })
+    };
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert!(
+        !managed.runner.read().await.stop_requested,
+        "the stop latched while a start held the lifecycle lock"
+    );
+
+    drop(start);
+    stop.await.expect("the stop").expect("a dead runner stops");
+    assert!(managed.runner.read().await.stop_requested);
+}
+
+/// A stop that waited behind a `test-*` teardown finds the entry gone and acts
+/// on nothing: a later spawn may hold that port by now.
+#[tokio::test(start_paused = true)]
+async fn a_stop_that_waited_behind_a_teardown_acts_on_nothing() {
+    let (state, _root) = restart_test_state();
+    let id = "named-stop-gone";
+    let managed = register_dead_named_runner(&state, id).await;
+
+    let teardown = managed.lifecycle.lock().await;
+    let stop = {
+        let state = state.clone();
+        tokio::spawn(async move { stop_runner_by_id(&state, id, false, CloseIntent::Kill).await })
+    };
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    state.runners.write().await.remove(id);
+    drop(teardown);
+
+    let err = stop
+        .await
+        .expect("the stop")
+        .expect_err("the entry is gone");
+    assert!(matches!(err, SupervisorError::RunnerNotFound(_)), "{err}");
+    assert!(
+        !managed.runner.read().await.stop_requested,
+        "the stop latched on a removed entry"
+    );
+}
+
+/// The monitor hands `maybe_crash_restart` the latch whatever the stamp kept. A
+/// stop dated after the exit leaves the entry's `stop_requested_at` `None`, and
+/// the armed watchdog still skips the restart, as it does for an exit the
+/// operator was stopping anyway; with no latch the same exit is a crash.
+#[tokio::test]
+async fn the_exit_monitor_hands_the_crash_watchdog_a_latch_the_stamp_dropped() {
+    if crash_restart_env_disabled() {
+        panic!("QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1 leaves this test nothing to observe");
+    }
+    for latched in [true, false] {
+        let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+        config.watchdog_enabled_at_start = true;
+        let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+        let managed = register_dead_named_runner(&state, "named-late-latch").await;
+        managed.watchdog.write().await.enabled = true;
+
+        let child = spawn_a_child_that_exits_3();
+        let pid = child.id().expect("a child not yet waited on has a pid");
+        let spawned_at = record_spawn_in_registry(&managed, Some(pid), None, None).await;
+        if latched {
+            managed
+                .runner
+                .write()
+                .await
+                .latch_stop_request(chrono::Utc::now() + chrono::Duration::hours(1));
+        }
+
+        monitor_runner_process_exit_inner(state.clone(), managed.clone(), child, spawned_at).await;
+
+        let ring = managed.recent_spawns.read().await;
+        let entry = ring.newest().expect("the spawn");
+        assert!(entry.exited_at.is_some());
+        assert_eq!(
+            entry.stop_requested_at, None,
+            "latched={latched}: a stop dated after the exit was stamped as its request"
+        );
+        assert_eq!(
+            managed.watchdog.read().await.restart_attempts,
+            u32::from(!latched),
+            "latched={latched}: the watchdog must read the latch, not the stamp"
+        );
+    }
+}
+
+/// A runner whose pid is not the newest spawn's is one this supervisor did not
+/// start. `RunnerState::process` used to answer this, and read `None` for every
+/// runner, since the exit monitor took the child at once.
+#[test]
+fn a_runner_is_adopted_when_its_pid_is_not_the_newest_spawns() {
+    let mut ring = crate::state::SpawnRing::default();
+    assert!(runner_is_adopted(Some(7), &ring), "no spawn yet");
+    assert!(runner_is_adopted(None, &ring), "no spawn yet, no pid");
+
+    let at = chrono::Utc::now();
+    ring.push(crate::state::SpawnMarker::new(at, Some(1), None, None));
+    ring.push(crate::state::SpawnMarker::new(at, Some(7), None, None));
+    assert!(!runner_is_adopted(Some(7), &ring), "the newest spawn's pid");
+    assert!(runner_is_adopted(Some(1), &ring), "an older spawn's pid");
+    assert!(runner_is_adopted(Some(9), &ring), "nobody's pid");
+    assert!(runner_is_adopted(None, &ring), "a cleared pid");
+}
+
+/// Every stretch that must hold a runner's lifecycle lock, at source level: no
+/// unit test can start a real runner (#253), and the sweep is an endless loop.
+#[test]
+fn the_lifecycle_lock_spans_the_start_and_the_stop() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let body_of = |sig: &str| -> String {
+        crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect()
+    };
+    // `_lifecycle` binds the guard to the rest of its scope; a bare `_` or a
+    // temporary would drop it at once.
+    let in_order = |sig: &str, body: &str, marks: &[&str]| {
+        let mut last = 0;
+        for mark in marks {
+            let at = body[last..]
+                .find(mark)
+                .unwrap_or_else(|| panic!("{sig}: no {mark} after byte {last}"));
+            last += at + mark.len();
+        }
+    };
+
+    const LOCK: &str = "let_lifecycle=managed.lifecycle.lock().await;";
+    let start = body_of("pub async fn start_managed_runner(");
+    assert_eq!(start.matches(LOCK).count(), 1, "the start takes it once");
+    in_order(
+        "start_managed_runner",
+        &start,
+        &[
+            LOCK,
+            ".or_insert_with(",
+            "ifrunner.running||newest_spawn_is_up(",
+            "record_spawn_in_registry(",
+            "monitor_runner_process_exit(",
+        ],
+    );
+
+    let stop = body_of("pub async fn stop_runner_by_id(");
+    assert_eq!(stop.matches(LOCK).count(), 1, "the stop takes it once");
+    in_order(
+        "stop_runner_by_id",
+        &stop,
+        &[
+            LOCK,
+            ".latch_stop_request(",
+            "runner.started_at=None;",
+            "reap_instance_state_on_stop(",
+            "remove_runner_exe_copy(",
+        ],
+    );
+
+    let sweep = body_of("pub async fn reap_stale_test_runners(");
+    in_order(
+        "reap_stale_test_runners",
+        &sweep,
+        &[
+            "letOk(_lifecycle)=managed.lifecycle.try_lock()else{",
+            "continue;",
+            ".latch_stop_request(",
+            "runners_map.remove(&id);",
+            "remove_runner_exe_copy(",
+        ],
+    );
+    assert!(
+        !sweep.contains(".lifecycle.lock()"),
+        "the sweep must never wait for a runner's lifecycle lock"
+    );
+
+    for sig in [
+        "async fn monitor_runner_process_exit_inner(",
+        "async fn restart_after_gate(",
+        "pub async fn restart_runner_by_id(",
+        "async fn maybe_crash_restart(",
+    ] {
+        assert!(
+            !body_of(sig).contains("lifecycle."),
+            "{sig} must not take the lifecycle lock: the monitor would stall a stop's \
+             graceful wait, and the restart path takes it through its start and stop, \
+             which are not reentrant"
+        );
+    }
+}
+
 /// The wire `watchdog` source is still refused for a non-temp runner, and
 /// the refusal happens BEFORE anything is latched or emitted.
 #[tokio::test]
@@ -3880,6 +4310,7 @@ async fn wire_watchdog_source_is_still_blocked_for_non_temp_runners() {
         false,
         BuildTree::OriginMain,
         CloseIntent::Kill,
+        None,
     )
     .await
     .expect_err("wire watchdog must be blocked");

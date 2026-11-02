@@ -9,8 +9,8 @@
 //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
 //! state as `None`.
 use super::{
-    attach_build_slot_id, attach_spawn_identity, check_dist_freshness, spawn_abandoned_body,
-    wait_out_queue_timeout, FrontendStaleReason,
+    attach_build_slot_id, attach_spawn_identity, check_dist_freshness, probe_runner_health,
+    spawn_abandoned_body, wait_out_queue_timeout, FrontendStaleReason, ProbeOutcome,
 };
 use crate::build_monitor::BuildPhase;
 use crate::source_scan::production_span;
@@ -3248,6 +3248,60 @@ async fn register_live_named_runner(
         r.last_seen_responding_at = Some(chrono::Utc::now());
     }
     state.runners.write().await.insert(id.to_string(), managed);
+}
+
+/// `probe_runner_health` over a port nothing answers on reports the process
+/// alive from the entry's pid, which is what reaches spawn-test's 502
+/// `runner_started_but_unresponsive` arm. The exit monitor owns the child, so
+/// the pid is the only thing left to ask. A pid that has exited, and no pid at
+/// all, report it dead (spawn-test's 500 `runner_died_during_startup`).
+#[tokio::test]
+async fn a_live_process_that_never_answers_reaches_the_unresponsive_arm() {
+    let mut exited = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+        .args(if cfg!(windows) {
+            &["/C", "exit 0"][..]
+        } else {
+            &[][..]
+        })
+        .spawn()
+        .expect("spawn a child that exits");
+    let exited_pid = exited.id();
+    exited.wait().expect("reap it");
+
+    let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+    let state: crate::state::SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let id = "named-never-answers";
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.id = id.to_string();
+    config.port = dead_port;
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+
+    for (pid, expected_alive) in [
+        (Some(std::process::id()), true),
+        (Some(exited_pid), false),
+        (None, false),
+    ] {
+        managed.runner.write().await.pid = pid;
+        match probe_runner_health(&state, id, dead_port, 0).await {
+            ProbeOutcome::Failed {
+                child_alive,
+                pid: reported,
+                ..
+            } => {
+                assert_eq!(child_alive, expected_alive, "pid {pid:?}");
+                assert_eq!(reported, pid);
+            }
+            ProbeOutcome::Healthy { .. } => panic!("nothing answers on port {dead_port}"),
+        }
+    }
 }
 
 /// A supervisor state over an empty runner tree

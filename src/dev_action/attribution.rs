@@ -5,8 +5,8 @@
 //! impossible — the watcher sleeps the per-kind attribution window, then scans
 //! the effect surfaces and folds a verdict into the action's [`ActionOutcome`]:
 //!
-//! 1. the early log of each spawn of the acted-on runner made inside the
-//!    window, for `DEV-TAURI-ASSET-MISSING` / `DEV-WEBVIEW-CONN-REFUSED` /
+//! 1. the early log of each spawn this action initiated on the acted-on runner
+//!    inside the window, for `DEV-TAURI-ASSET-MISSING` / `DEV-WEBVIEW-CONN-REFUSED` /
 //!    `DEV-PORT-BIND-FAIL` signatures,
 //! 2. each such spawn's startup panic for `DEV-PANIC-STARTUP` (see
 //!    [`scan_panic`] for where it is read from and which panics count),
@@ -14,7 +14,7 @@
 //!    `DEV-UI-ERROR-BOUNDARY`.
 //!
 //! The first two describe one boot, so they are read per spawn, and only for
-//! the acted-on runner's spawns made inside the window
+//! the spawns this action initiated on the acted-on runner inside the window
 //! ([`scan_spawn_effects`]): an action that starts nothing inside its window
 //! has no boot of its own to judge. The third is not gated by spawns.
 //!
@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use qontinui_types::dev_signatures::DevSignature;
+use uuid::Uuid;
 
 use crate::dev_action::record::{
     ActionKind, ActionOutcome, ActionRecord, ActionRunResult, D3Category,
@@ -348,33 +349,19 @@ impl ClosedWindow {
 ///   before the request then counts only if a copy of it is still held at
 ///   the close, such as the one spawn-test's failed probe stored, which a
 ///   clean exit leaves in place.
-/// - Starts and stops of one runner are not ordered against each other. No
-///   per-runner lock serialises `start_managed_runner`, `stop_runner_by_id`
-///   and the old process's exit monitor: a start clears every stop request
-///   latched before it records its spawn (`record_spawn_in_registry`); a stop
-///   picks its target only after its latch and resets the registry only after
-///   its reap; and the exit monitor reads the stop flag and resets `running`,
-///   `process` and `pid` as soon as its wait on the child returns. So when a
-///   stop, or a restart's stop and start, overlaps a start of the same runner,
-///   the stop request, the stop's kill, the stop's reset and the monitor's
-///   reset can each land on the other spawn, and this rule's reading of that
-///   window is not reliable. For example: a requested exit can read as
-///   unrequested, so the stopped spawn reads as a failed boot and its
-///   in-window panics count, under `Ran` too; a stop can be lost, answering
-///   "stopped" while the runner comes up; a stop's kill or reset can land on
-///   the new spawn (for a `test-*` runner, its teardown of the registry entry,
-///   the instance root and the exe copy too); the crash watchdog may then act
-///   on what it reads, even trying to start a runner that is running; and a
-///   spawn whose child a reset dropped is never stamped with its own exit, so
-///   it reads as up until another spawn's exit lands on its entry: while that
-///   entry is still in the ring, a later spawn of the runner that gets the
-///   same pid from the OS has its exit, and the panic parsed at it, stamped on
-///   that entry instead (stamp_exit takes the oldest entry of the pid with no
-///   exit yet), and that later spawn then reads as up, in its own window too,
-///   even where no stop overlaps a start. A per-runner lifecycle lock, a
-///   recorded follow-up, would order these; until then they are disclosed
-///   here, not modelled. These examples are read from the code; none was
-///   reproduced on a running supervisor.
+/// - The lifecycle lock (`ManagedRunner::lifecycle`) orders one runner's starts,
+///   stops and max-age sweep, so a stop arriving mid-start latches after the
+///   spawn is recorded and targets it, and a second start finds it recorded. The
+///   exit monitor waits outside that lock, which leaves two lags in the stamp
+///   this rule reads (`SpawnMarker::stop_requested_at`). A stop latched between
+///   the process's real exit and the monitor's wake-up dates before `exited_at`,
+///   so a crash in that lag reads as a requested stop and, under `Ran`, its panic
+///   does not count. A monitor that wakes after a later start recorded its spawn
+///   reads that start's cleared flag, so the requested exit it stamps reads as
+///   unrequested: the stopped spawn reads as a failed boot and its in-window
+///   panics count, under `Ran` too. `DELETE /runners/{id}` and the purge-stale
+///   sweep remove registry entries outside the lock. These are read from the
+///   code; none was reproduced on a running supervisor.
 fn is_startup_panic_of(
     panic: &panic_log::RecentPanic,
     spawn: &SpawnMarker,
@@ -498,22 +485,22 @@ async fn scan_panic(
     }
 }
 
-/// The early-log and startup-panic signatures of every spawn of the acted-on
-/// runner made inside the window, read at window close, oldest spawn first.
+/// The early-log and startup-panic signatures of every spawn `action_id`
+/// initiated on the acted-on runner inside the window, read at window close,
+/// oldest spawn first.
 ///
 /// Both surfaces describe one boot, so they are read per spawn: each spawn's
-/// own early log and its own startup panic ([`scan_panic`]). Every spawn the
-/// runner's ring ([`ManagedRunner::recent_spawns`]) recorded from the mint to
-/// the close is judged, not only the last. The crash watchdog can restart a
-/// boot that died inside a window, after a first backoff of 5 seconds, and its
-/// respawn must not hide the action's own crashed boot. A later restart or
-/// stop of the runner inside the window ends a spawn too, and that requested
-/// exit does not make a boot that came up a failed one, the residuals
-/// [`is_startup_panic_of`] lists excepted. Nothing ties a spawn to the action
-/// that asked for it, so any spawn inside the window, a crash-watchdog
-/// respawn included, is read as the action's.
+/// own early log and its own startup panic ([`scan_panic`]). Only the entries of
+/// the runner's ring ([`ManagedRunner::recent_spawns`]) this action initiated
+/// ([`SpawnMarker::initiated_by`]) are judged. A crash-watchdog respawn or
+/// another action's spawn inside the window is not this action's boot, and
+/// neither is read. The action's own entry still carries its crashed boot, with
+/// the exit and panic stamped on it, so a respawn cannot hide that boot. A later
+/// restart or stop of the runner inside the window ends a spawn too, and that
+/// requested exit does not make a boot that came up a failed one, the residuals
+/// [`is_startup_panic_of`] lists excepted.
 ///
-/// An action with no spawn inside its window reads neither surface:
+/// An action that initiated no spawn inside its window reads neither surface:
 /// `fix_and_rebuild`, which only builds; a refused restart or rebuild, or one
 /// whose build failed; a spawn that lands after its window has closed. What
 /// those files hold then describes a boot the action did not cause. With no
@@ -533,6 +520,7 @@ async fn scan_panic(
 async fn scan_spawn_effects(
     state: &SharedState,
     managed: Option<&ManagedRunner>,
+    action_id: Uuid,
     window: ClosedWindow,
     run: Option<&ActionRunResult>,
 ) -> (Vec<DevSignature>, Option<String>) {
@@ -543,15 +531,17 @@ async fn scan_spawn_effects(
         .recent_spawns
         .read()
         .await
-        .spawned_between(window.open_at, window.close_at);
+        .spawned_between(window.open_at, window.close_at)
+        .into_iter()
+        .filter(|spawn| spawn.initiated_by == Some(action_id));
     let (mut signatures, mut evidence) = (Vec::new(), None);
-    for spawn in &spawns {
+    for spawn in spawns {
         // Early logs are per-spawn files: this is the one the spawn opened.
         // `None` when it could not open one: that boot then has no early log,
         // and no other boot's file is read in its place.
         let (log_sigs, log_ev) = scan_early_log(spawn.early_log_path.as_deref());
         merge(&mut signatures, &mut evidence, log_sigs, log_ev);
-        let (panic_sigs, panic_ev) = scan_panic(state, managed, spawn, window, run).await;
+        let (panic_sigs, panic_ev) = scan_panic(state, managed, &spawn, window, run).await;
         merge(&mut signatures, &mut evidence, panic_sigs, panic_ev);
     }
     (signatures, evidence)
@@ -754,6 +744,7 @@ pub fn spawn_attribution_watcher_with_timing(
         let (mut signatures, mut evidence) = scan_spawn_effects(
             &state,
             targets.managed.as_deref(),
+            record.action_id,
             window,
             run_result.as_ref(),
         )
@@ -990,26 +981,30 @@ mod tests {
         ))
     }
 
-    /// Record a spawn of `runner` at `at`, child `pid`, panic log under
-    /// `panic_log_dir`, with no early log of its own
+    /// Record a spawn of `runner` that `record` initiated, at `at`, child `pid`,
+    /// panic log under `panic_log_dir`, with no early log of its own
     /// ([`record_spawn_with_early_log`]).
     async fn record_spawn(
         runner: &ManagedRunner,
+        record: &ActionRecord,
         at: DateTime<Utc>,
         pid: u32,
         panic_log_dir: &Path,
     ) {
-        record_spawn_with_early_log(runner, at, pid, panic_log_dir, None).await;
+        record_spawn_with_early_log(runner, Some(record.action_id), at, pid, panic_log_dir, None)
+            .await;
     }
 
-    /// Record a spawn of `runner` at `at`, child `pid`, as
-    /// `start_managed_runner` leaves the runner: the panic-log dir re-pointed
-    /// to `panic_log_dir`, the stored panic cleared, the early log re-pointed
-    /// to `early_log`, the live process, and the spawn's entry in the ring.
+    /// Record a spawn of `runner` at `at`, child `pid`, that `initiated_by`
+    /// asked for, as `start_managed_runner` leaves the runner: the panic-log
+    /// dir re-pointed to `panic_log_dir`, the stored panic cleared, the early
+    /// log re-pointed to `early_log`, the live process, and the spawn's entry
+    /// in the ring.
     /// The process stays live until a test records its exit
     /// ([`record_exit`]).
     async fn record_spawn_with_early_log(
         runner: &ManagedRunner,
+        initiated_by: Option<Uuid>,
         at: DateTime<Utc>,
         pid: u32,
         panic_log_dir: &Path,
@@ -1023,11 +1018,12 @@ mod tests {
             process.started_at = Some(at);
             process.pid = Some(pid);
         }
-        runner
-            .recent_spawns
-            .write()
-            .await
-            .push(SpawnMarker::new(at, Some(pid), early_log));
+        runner.recent_spawns.write().await.push(SpawnMarker::new(
+            at,
+            Some(pid),
+            early_log,
+            initiated_by,
+        ));
     }
 
     /// Record an exit nobody asked for (a crash, an unrequested clean exit)
@@ -1060,14 +1056,19 @@ mod tests {
             process.running = false;
             process.pid = None;
         }
-        assert!(
-            runner
-                .recent_spawns
-                .write()
-                .await
-                .stamp_exit(pid, at, requested_at),
-            "no spawn of pid {pid} is waiting for its exit stamp"
-        );
+        let spawned_at = runner
+            .recent_spawns
+            .read()
+            .await
+            .iter()
+            .find(|spawn| spawn.pid == Some(pid) && spawn.exited_at.is_none())
+            .unwrap_or_else(|| panic!("no spawn of pid {pid} is waiting for its exit stamp"))
+            .spawned_at;
+        assert!(runner
+            .recent_spawns
+            .write()
+            .await
+            .stamp_exit(spawned_at, at, requested_at));
         if let Some(panic) = exit_panic {
             *runner.recent_panic.write().await = Some(panic.clone());
             assert!(
@@ -1075,7 +1076,7 @@ mod tests {
                     .recent_spawns
                     .write()
                     .await
-                    .attach_exit_panic(pid, at, panic),
+                    .attach_exit_panic(spawned_at, panic),
                 "no exit of pid {pid} was stamped at {at}"
             );
         }
@@ -1360,6 +1361,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1415,7 +1417,14 @@ mod tests {
         watch_on_a_fast_build_window(state, &record, &runner);
 
         let logs = tmp.path().join("instances").join(id).join("logs");
-        record_spawn(&runner, spawned_after_the_mint(&record), SPAWNED_PID, &logs).await;
+        record_spawn(
+            &runner,
+            &record,
+            spawned_after_the_mint(&record),
+            SPAWNED_PID,
+            &logs,
+        )
+        .await;
         let path = write_panic_log(
             &logs,
             id,
@@ -1465,6 +1474,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             record.started_at - chrono::Duration::seconds(60),
             SPAWNED_PID,
             &log_dir,
@@ -1531,6 +1541,7 @@ mod tests {
         // The old process, spawned a minute before the mint.
         record_spawn(
             &primary,
+            &record,
             record.started_at - chrono::Duration::seconds(60),
             OLD_PID,
             &log_dir,
@@ -1544,7 +1555,7 @@ mod tests {
             "cannot move state from Destroyed",
         );
         let new_spawn_at = inside_the_window(&record) + chrono::Duration::milliseconds(1);
-        record_spawn(&primary, new_spawn_at, SPAWNED_PID, &log_dir).await;
+        record_spawn(&primary, &record, new_spawn_at, SPAWNED_PID, &log_dir).await;
         // The old process's exit monitor stamps its exit, then attaches and
         // stores the teardown panic, after the new spawn cleared the slot. The
         // exit is recorded as one nobody asked for, so the stop-request check
@@ -1594,6 +1605,7 @@ mod tests {
         .unwrap();
         record_spawn_with_early_log(
             &primary,
+            Some(record.action_id),
             record.started_at - chrono::Duration::minutes(10),
             SPAWNED_PID,
             &log_dir,
@@ -1648,6 +1660,7 @@ mod tests {
             let log_dir = tmp.path().join("dev-logs").join("runner-primary");
             record_spawn(
                 &primary,
+                &record,
                 spawned_after_the_mint(&record),
                 SPAWNED_PID,
                 &log_dir,
@@ -1705,6 +1718,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1762,6 +1776,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1779,7 +1794,9 @@ mod tests {
         record_exit(&primary, SPAWNED_PID, crashed_at, Some(crash)).await;
 
         let respawned_at = crashed_at + chrono::Duration::milliseconds(1);
-        record_spawn(&primary, respawned_at, RESPAWNED_PID, &log_dir).await;
+        // The watchdog's respawn: no action initiated it.
+        record_spawn_with_early_log(&primary, None, respawned_at, RESPAWNED_PID, &log_dir, None)
+            .await;
         if respawn_panics {
             write_panic_log(
                 &log_dir,
@@ -1798,9 +1815,8 @@ mod tests {
         .await
     }
 
-    /// Every spawn inside the window is judged, not only the last: the crash
-    /// watchdog's respawn, live and up at the close, does not hide the
-    /// action's own boot, which panicked and exited inside the window.
+    /// The crash watchdog's respawn, live and up at the close, does not hide
+    /// the action's own boot, which panicked and exited inside the window.
     #[tokio::test]
     async fn a_crashed_boot_the_crash_watchdog_respawned_inside_the_window_is_attributed() {
         let outcome = crashed_boot_then_crash_watchdog_respawn(false).await;
@@ -1845,6 +1861,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1889,6 +1906,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1940,6 +1958,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -1966,6 +1985,7 @@ mod tests {
         .await;
         record_spawn(
             &primary,
+            &record,
             exited_at + chrono::Duration::milliseconds(1),
             NEXT_PID,
             &log_dir,
@@ -2064,6 +2084,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -2089,6 +2110,7 @@ mod tests {
         .await;
         record_spawn(
             &primary,
+            &record,
             exited_at + chrono::Duration::milliseconds(1),
             NEXT_PID,
             &log_dir,
@@ -2118,6 +2140,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn(
             &primary,
+            &record,
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -2151,6 +2174,82 @@ mod tests {
         );
     }
 
+    /// D13: only the entries this action initiated are its boots. A spawn nobody
+    /// initiated (a watchdog's respawn) and another action's spawn, each with a
+    /// white screen in its early log and inside this action's window, are not
+    /// read. The action's own crashed entry still is.
+    #[tokio::test]
+    async fn a_spawn_this_action_did_not_initiate_is_not_read_as_its_boot() {
+        for own_boot_crashes in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = watcher_test_state(tmp.path());
+            let primary = test_primary();
+            let record = bare_record(ActionKind::Build);
+            watch_on_a_fast_build_window(state, &record, &primary);
+
+            let log_dir = tmp.path().join("dev-logs").join("runner-primary");
+            let white = tmp.path().join("white-early.log");
+            std::fs::write(&white, format!("{WHITE_SCREEN_LINE}\n")).unwrap();
+
+            record_spawn(
+                &primary,
+                &record,
+                spawned_after_the_mint(&record),
+                SPAWNED_PID,
+                &log_dir,
+            )
+            .await;
+            let exited_at = inside_the_window(&record);
+            if own_boot_crashes {
+                let crash = write_panic_log(
+                    &log_dir,
+                    "primary",
+                    SPAWNED_PID,
+                    exited_at,
+                    "the action's own boot panicked",
+                );
+                let crash = panic_log::parse_panic_file(&crash).expect("the fixture parses");
+                record_exit(&primary, SPAWNED_PID, exited_at, Some(crash)).await;
+            }
+            for (at_ms, pid, initiated_by) in [(1, 4343, None), (2, 4444, Some(Uuid::new_v4()))] {
+                record_spawn_with_early_log(
+                    &primary,
+                    initiated_by,
+                    exited_at + chrono::Duration::milliseconds(at_ms),
+                    pid,
+                    &log_dir,
+                    Some(white.clone()),
+                )
+                .await;
+            }
+            record.record_run_result(ActionRunResult::Ran);
+
+            let outcome = await_outcome(
+                &record,
+                crate::test_clock::poll_budget(Duration::from_secs(30)),
+            )
+            .await;
+            assert!(
+                !outcome
+                    .signatures
+                    .iter()
+                    .any(|signature| signature == "DEV-TAURI-ASSET-MISSING"),
+                "own_boot_crashes={own_boot_crashes}: another spawn's early log was read: \
+                 {outcome:?}"
+            );
+            if own_boot_crashes {
+                assert_eq!(outcome.signatures, ["DEV-PANIC-STARTUP"]);
+                assert_eq!(
+                    outcome.evidence_ref.as_deref(),
+                    Some("panic: the action's own boot panicked")
+                );
+            } else {
+                assert_eq!(outcome.signatures, Vec::<String>::new());
+                assert_eq!(outcome.category, D3Category::Confirmed);
+            }
+        }
+    }
+
     /// The early-log line of the 2026-06-07 white screen.
     const WHITE_SCREEN_LINE: &str = "ERROR tauri::manager: asset not found: index.html";
 
@@ -2179,6 +2278,7 @@ mod tests {
         let log_dir = tmp.path().join("dev-logs").join("runner-primary");
         record_spawn_with_early_log(
             &primary,
+            Some(record.action_id),
             spawned_after_the_mint(&record),
             SPAWNED_PID,
             &log_dir,
@@ -2189,6 +2289,7 @@ mod tests {
         record_requested_exit(&primary, SPAWNED_PID, Some(stopped_at), stopped_at, None).await;
         record_spawn_with_early_log(
             &primary,
+            Some(record.action_id),
             stopped_at + chrono::Duration::milliseconds(1),
             NEXT_PID,
             &log_dir,
@@ -2240,7 +2341,12 @@ mod tests {
         // on its own at 20 s, before the close; stamped after the close,
         // which the close does not see; and stamped exited at 20 s by a stop
         // requested at 15 s.
-        let live = SpawnMarker::new(open + chrono::Duration::seconds(5), Some(SPAWNED_PID), None);
+        let live = SpawnMarker::new(
+            open + chrono::Duration::seconds(5),
+            Some(SPAWNED_PID),
+            None,
+            None,
+        );
         let gone = SpawnMarker {
             exited_at: Some(open + chrono::Duration::seconds(20)),
             ..live.clone()

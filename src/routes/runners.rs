@@ -1425,6 +1425,7 @@ pub async fn restart_runner(
                     force,
                     build_tree,
                     intent,
+                    None,
                 )
                 .await
                 {
@@ -1486,6 +1487,7 @@ pub async fn restart_runner(
         body.force,
         body.build_tree(),
         body.close_intent(),
+        None,
     )
     .await?;
 
@@ -3217,8 +3219,16 @@ pub async fn spawn_test(
             // probe → wait pipeline; released when this future completes or
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
-            let (status, body_json, stderr_tail) =
-                execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
+            let (status, body_json, stderr_tail) = execute_spawn_build(
+                exec_state,
+                body,
+                exec_id,
+                port,
+                exec_managed,
+                no_wait,
+                action_id,
+            )
+            .await;
             // The build is over (succeeded or failed): free the key so the next
             // request for it starts a fresh build instead of joining a corpse.
             if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
@@ -3475,6 +3485,7 @@ async fn execute_spawn_build(
     port: u16,
     managed: Arc<ManagedRunner>,
     no_wait: bool,
+    action_id: uuid::Uuid,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let mut side = SpawnBuildSideChannel::default();
     // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
@@ -3489,7 +3500,11 @@ async fn execute_spawn_build(
     // without attribution and falsified `attach_build_slot_id`'s "always
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
-    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait, &mut side).await {
+    match execute_spawn_build_inner(
+        &state, body, &id, port, &managed, no_wait, action_id, &mut side,
+    )
+    .await
+    {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
             attach_spawn_identity(&mut body, &id, port);
@@ -3639,6 +3654,7 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
 /// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
 /// removal on the error paths below is unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn execute_spawn_build_inner(
     state: &SharedState,
     body: SpawnTestRequest,
@@ -3646,6 +3662,7 @@ async fn execute_spawn_build_inner(
     port: u16,
     managed: &Arc<ManagedRunner>,
     no_wait: bool,
+    action_id: uuid::Uuid,
     side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // Build-result tracking for the response. Populated by the rebuild
@@ -4397,7 +4414,7 @@ async fn execute_spawn_build_inner(
     // spawn's failed health probe, the reaper).
     // `start_managed_runner` also re-inserts the Arc if the id went missing,
     // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed).await {
+    if let Err(e) = manager::start_managed_runner(state, managed, Some(action_id)).await {
         // Clean up on failure — the registry entry AND the instance dir the
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
@@ -5353,21 +5370,14 @@ async fn probe_runner_health(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Determine if the child process is still alive and capture its pid.
-    // try_wait() returns Ok(Some(_)) if the child has exited, Ok(None) if
-    // still running, Err(_) on a system error (treated as "unknown — assume
-    // dead" so we report the more honest 500).
-    let (child_alive, pid) = if let Some(managed) = state.get_runner(runner_id).await {
-        let mut runner = managed.runner.write().await;
-        let pid = runner.pid;
-        let alive = match runner.process.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(None)),
-            None => false,
-        };
-        (alive, pid)
-    } else {
-        (false, None)
+    // Determine if the child process is still alive and capture its pid. The
+    // exit monitor owns the child and clears the pid when it exits, so a pid
+    // that is still recorded and alive is the process that never answered.
+    let pid = match state.get_runner(runner_id).await {
+        Some(managed) => managed.runner.read().await.pid,
+        None => None,
     };
+    let child_alive = pid.is_some_and(crate::process::proc_kill::pid_alive);
 
     let recent_logs = recent_runner_log_lines(state, runner_id, 20).await;
 
@@ -5707,7 +5717,7 @@ pub async fn spawn_named(
     // Start the runner using the Arc captured at insertion time (race-free
     // — no re-lookup of `id` which could fail transiently under concurrent
     // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    if let Err(e) = manager::start_managed_runner(&state, &managed, Some(action_id)).await {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);

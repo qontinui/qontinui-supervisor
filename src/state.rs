@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
+use uuid::Uuid;
 
 pub type SharedState = Arc<SupervisorState>;
 
@@ -54,17 +55,17 @@ pub struct ManagedRunner {
     /// bounded ring ([`SpawnRing`]). `start_managed_runner` pushes one entry
     /// per spawn (through `record_spawn_in_registry`), after it has re-pointed
     /// `panic_log_dir`, `recent_panic` and `early_log_path` for that spawn. The
-    /// exit monitor stamps the entry whose child exited with its exit time
-    /// and, when a stop requested that exit, the time of the request (except
-    /// as the residual of `dev_action::attribution::is_startup_panic_of` that
-    /// says starts and stops are not ordered against each other describes);
-    /// once it has parsed the panic log it attaches the panic it parsed at
-    /// that exit. Both land before that monitor hands the exit to the crash
-    /// watchdog. No stop and no exit removes an entry.
+    /// exit monitor stamps the entry of the spawn it watches with the exit
+    /// time and, when a stop requested that exit before it happened, the time
+    /// of the request (the lag [`SpawnMarker::stop_requested_at`] states
+    /// excepted); once it has parsed the panic log it attaches the panic it
+    /// parsed at that exit. Both land before that monitor hands the exit to
+    /// the crash watchdog. No stop and no exit removes an entry.
     ///
     /// The dev-action attribution watcher reads it at window close
     /// (`dev_action::attribution::scan_spawn_effects`): which spawns the
-    /// action's window holds, which process each started, and, as those
+    /// action's window holds, which of them that action initiated, which
+    /// process each started, and, as those
     /// stamps record them, whether that process had exited and whether a stop
     /// had asked it to. `RunnerState::pid` cannot say whether the process had
     /// exited: a stop and an exit clear it, a later spawn overwrites it, and
@@ -152,6 +153,19 @@ pub struct ManagedRunner {
     /// `Drop` on every exit path, including a cancelled future. Never held
     /// across an `.await`.
     pub spawn_in_flight: std::sync::Mutex<Option<std::time::Duration>>,
+    /// Orders this runner's starts, stops and max-age sweep against each other.
+    ///
+    /// `start_managed_runner` holds it from before its defensive re-insert
+    /// through recording the spawn and spawning that spawn's exit monitor.
+    /// `stop_runner_by_id` holds it from its latch through its reset and a
+    /// `test-*` runner's teardown. `reap_stale_test_runners` `try_lock`s it per
+    /// runner, skips on contention and holds it through the removal.
+    ///
+    /// Not reentrant, so nothing holding it may call a start or a stop:
+    /// `restart_after_gate` holds it around neither of its two calls. The exit
+    /// monitor never takes it: a stop's graceful wait, under this lock, is
+    /// waiting for the monitor to clear `running`.
+    pub lifecycle: tokio::sync::Mutex<()>,
 }
 
 /// One spawn of a managed runner, as [`ManagedRunner::recent_spawns`] keeps
@@ -159,7 +173,9 @@ pub struct ManagedRunner {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnMarker {
     /// When the spawn was recorded: the instant `start_managed_runner` wrote
-    /// into `RunnerState::started_at`.
+    /// into `RunnerState::started_at`. This is the spawn's identity: the
+    /// lifecycle lock serialises one runner's spawns, and the exit monitor
+    /// keys both its reset and its ring writes on it.
     pub spawned_at: DateTime<Utc>,
     /// The child's pid, as the OS reported it at the spawn.
     pub pid: Option<u32>,
@@ -172,25 +188,28 @@ pub struct SpawnMarker {
     /// section once its wait on the child returns, before it logs the exit or
     /// parses the panic log. So an exit reaches this field after a short lag,
     /// the wait's wake-up and that critical section, and a reader inside the
-    /// lag sees the process as still up. An exit monitor that finds no child
-    /// to wait on stamps nothing (see the residual of
-    /// `dev_action::attribution::is_startup_panic_of` that says starts and
-    /// stops are not ordered against each other).
+    /// lag sees the process as still up.
     pub exited_at: Option<DateTime<Utc>>,
     /// When the stop request the exit monitor read for that exit was made: the
     /// earliest request still latched on the runner
     /// ([`RunnerState::stop_requested_at`]) when the monitor read the flag
     /// after the exit, or the exit's own time when the flag was latched with
     /// no time. `Some` when the stop flag was latched as the exit monitor read
-    /// it, a failed stop's flag included, as it is for an exit an operator
-    /// stop, a later restart or stop of the same runner, or the over-age kill
-    /// asked for. `None` when it was not: an exit nobody asked for, a crash, an
-    /// unrequested clean exit, or the first-healthy watchdog's kill of a wedged
-    /// boot, which latches no stop. Starts and stops of one runner are not
-    /// ordered against each other, so where a stop overlaps a start this stamp
-    /// is not reliable (see the residual of
-    /// `dev_action::attribution::is_startup_panic_of` that says so). And
-    /// `None` while no exit is stamped.
+    /// it and the request is dated at or before the exit, a failed stop's flag
+    /// included, as it is for an exit an operator stop, a later restart or stop
+    /// of the same runner, or the over-age kill asked for. `None` when it was
+    /// not: an exit nobody asked for, a crash, an unrequested clean exit, the
+    /// first-healthy watchdog's kill of a wedged boot, which latches no stop,
+    /// or an exit that had already happened when the stop was latched
+    /// ([`SpawnRing::stamp_exit`]). And `None` while no exit is stamped.
+    ///
+    /// Two lags the lifecycle lock cannot close, since the monitor waits
+    /// outside it. `exited_at` is read after the wait's wake-up, so a stop
+    /// latched between the real exit and that wake-up still dates before it
+    /// and reads as the exit's request. And a monitor that wakes only after a
+    /// later start recorded its spawn reads that start's cleared flag, so a
+    /// requested exit read that late stamps `None` (see the residual of
+    /// `dev_action::attribution::is_startup_panic_of`).
     pub stop_requested_at: Option<DateTime<Utc>>,
     /// The panic the exit monitor parsed from the runner's panic log at that
     /// exit, the one it also stored as `recent_panic`, when it parsed a fresh
@@ -200,6 +219,13 @@ pub struct SpawnMarker {
     /// included, overwrites the file. It need not be this spawn's own panic:
     /// a reader holds it to the same checks as either of those.
     pub exit_panic: Option<RecentPanic>,
+    /// The dev action that started this spawn (`ActionRecord::action_id`).
+    /// `None` for a start nothing minted: the crash and serving watchdogs,
+    /// `POST /runners/{id}/start` and `/restart`, the boot auto-start. At
+    /// window close the attribution watcher judges only the entries its own
+    /// action initiated, so a watchdog's respawn inside a long window is not
+    /// read as that action's boot.
+    pub initiated_by: Option<Uuid>,
 }
 
 impl SpawnMarker {
@@ -208,6 +234,7 @@ impl SpawnMarker {
         spawned_at: DateTime<Utc>,
         pid: Option<u32>,
         early_log_path: Option<PathBuf>,
+        initiated_by: Option<Uuid>,
     ) -> Self {
         Self {
             spawned_at,
@@ -216,6 +243,7 @@ impl SpawnMarker {
             exited_at: None,
             stop_requested_at: None,
             exit_panic: None,
+            initiated_by,
         }
     }
 }
@@ -253,28 +281,28 @@ impl SpawnRing {
         self.entries.push_back(spawn);
     }
 
-    /// Stamp the exit of the spawn whose child `pid` exited: when, and when a
-    /// stop requested it (`None` for an exit nobody asked for), except as the
-    /// residual of `dev_action::attribution::is_startup_panic_of` that says
-    /// starts and stops are not ordered against each other describes. The
-    /// entry is the oldest with that pid and no exit yet, so a later spawn
-    /// that reused the pid is never stamped with an earlier one's exit.
-    /// Returns `false`, and changes nothing, when no entry matches: the ring
-    /// dropped that spawn.
+    /// Stamp the exit of the spawn recorded at `spawned_at`: when it exited,
+    /// and when a stop requested that exit. The monitor names the spawn it
+    /// watches rather than a pid, so an exit cannot land on another spawn that
+    /// got the same pid from the OS. A request dated after `exited_at` is
+    /// dropped: that exit had already happened, so that stop did not ask for
+    /// it. Returns `false`, and changes nothing, when no entry matches: the
+    /// ring dropped that spawn.
     pub fn stamp_exit(
         &mut self,
-        pid: u32,
+        spawned_at: DateTime<Utc>,
         exited_at: DateTime<Utc>,
         stop_requested_at: Option<DateTime<Utc>>,
     ) -> bool {
-        let unstamped = self
+        match self
             .entries
             .iter_mut()
-            .find(|spawn| spawn.pid == Some(pid) && spawn.exited_at.is_none());
-        match unstamped {
+            .find(|spawn| spawn.spawned_at == spawned_at)
+        {
             Some(spawn) => {
                 spawn.exited_at = Some(exited_at);
-                spawn.stop_requested_at = stop_requested_at;
+                spawn.stop_requested_at =
+                    stop_requested_at.filter(|requested| *requested <= exited_at);
                 true
             }
             None => false,
@@ -282,28 +310,27 @@ impl SpawnRing {
     }
 
     /// Attach the panic the exit monitor parsed at an exit it has already
-    /// stamped: to the entry with that `pid` whose exit [`Self::stamp_exit`]
-    /// stamped at `exited_at`. An entry still waiting for its exit never
-    /// matches, and neither does another exit of a spawn that reused the pid,
-    /// so the panic lands on the exit it was parsed at. Returns `false`, and
-    /// changes nothing, when no entry matches: the ring dropped that spawn.
-    pub fn attach_exit_panic(
-        &mut self,
-        pid: u32,
-        exited_at: DateTime<Utc>,
-        panic: RecentPanic,
-    ) -> bool {
-        let stamped = self
+    /// stamped, to the spawn recorded at `spawned_at`. An entry still waiting
+    /// for its exit never matches. Returns `false`, and changes nothing, when
+    /// no entry matches: the ring dropped that spawn.
+    pub fn attach_exit_panic(&mut self, spawned_at: DateTime<Utc>, panic: RecentPanic) -> bool {
+        match self
             .entries
             .iter_mut()
-            .find(|spawn| spawn.pid == Some(pid) && spawn.exited_at == Some(exited_at));
-        match stamped {
+            .find(|spawn| spawn.spawned_at == spawned_at && spawn.exited_at.is_some())
+        {
             Some(spawn) => {
                 spawn.exit_panic = Some(panic);
                 true
             }
             None => false,
         }
+    }
+
+    /// The newest spawn recorded, `None` until this supervisor starts the
+    /// runner.
+    pub fn newest(&self) -> Option<&SpawnMarker> {
+        self.entries.back()
     }
 
     /// The spawns recorded from `from` to `to`, both included, oldest first.
@@ -407,6 +434,7 @@ impl ManagedRunner {
             resolved_exe: RwLock::new(None),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -739,7 +767,6 @@ impl Drop for SseConnectionGuard {
 }
 
 pub struct RunnerState {
-    pub process: Option<Child>,
     /// Whether the runner's HTTP API answered on the most recent probe.
     ///
     /// **This is a two-state answer to a three-state question**, which is why
@@ -754,18 +781,17 @@ pub struct RunnerState {
     /// [`Self::latch_stop_request`] before any kill, cleared only by the next
     /// start ([`Self::clear_stop_request`]), so the exit monitor reads the
     /// flag as it stands when the monitor reads it, a failed stop's flag
-    /// included. Starts and stops of one runner are not ordered against each
-    /// other, and a start clears every request latched before it records its
-    /// spawn (see the residual of
-    /// `dev_action::attribution::is_startup_panic_of` that says so).
+    /// included. The lifecycle lock ([`ManagedRunner::lifecycle`]) orders the
+    /// latch against a start: a stop arriving mid-start latches after that
+    /// start recorded its spawn, and so targets it. It does not order the
+    /// monitor's read, which happens outside that lock (see
+    /// [`SpawnMarker::stop_requested_at`]).
     pub stop_requested: bool,
     /// When the earliest stop request still latched in `stop_requested` was
     /// made: set with the flag by [`Self::latch_stop_request`], which a later
     /// request leaves alone, and cleared with it by the next start. The exit
-    /// monitor copies it onto the exited spawn's ring entry
-    /// ([`SpawnMarker::stop_requested_at`]), except as the residual of
-    /// `dev_action::attribution::is_startup_panic_of` that says starts and
-    /// stops are not ordered against each other describes.
+    /// monitor copies it onto the exited spawn's ring entry when it is dated
+    /// at or before the exit ([`SpawnMarker::stop_requested_at`]).
     pub stop_requested_at: Option<DateTime<Utc>>,
     pub pid: Option<u32>,
     /// When the API was last observed responding.
@@ -2022,7 +2048,6 @@ impl Default for RunnerState {
 impl RunnerState {
     pub fn new() -> Self {
         Self {
-            process: None,
             running: false,
             started_at: None,
             restart_requested: false,
@@ -2048,9 +2073,8 @@ impl RunnerState {
     /// Clear the stop request, flag and time together. Only a start (or an
     /// adoption, which is the supervisor taking a live runner on) does this:
     /// clearing it when a stop completes would race the exit monitor's read.
-    /// A start's clear can race that read too (see the residual of
-    /// `dev_action::attribution::is_startup_panic_of` that says starts and
-    /// stops are not ordered against each other).
+    /// A start's clear can race that read too, when the monitor of an earlier
+    /// spawn wakes after the start (see [`SpawnMarker::stop_requested_at`]).
     pub fn clear_stop_request(&mut self) {
         self.stop_requested = false;
         self.stop_requested_at = None;
@@ -2246,7 +2270,6 @@ mod tests {
     fn test_runner_state_new_defaults() {
         let state = RunnerState::new();
         assert!(!state.running);
-        assert!(state.process.is_none());
         assert!(state.started_at.is_none());
         assert!(!state.restart_requested);
         assert!(!state.stop_requested);
@@ -3287,7 +3310,7 @@ mod tests {
     }
 
     fn spawn_of(secs: i64, pid: u32) -> SpawnMarker {
-        SpawnMarker::new(ring_time(secs), Some(pid), None)
+        SpawnMarker::new(ring_time(secs), Some(pid), None, None)
     }
 
     /// A full ring drops its OLDEST entry to make room for a spawn, and
@@ -3304,12 +3327,12 @@ mod tests {
         assert_eq!(pids, (1002..1000 + pushed).collect::<Vec<u32>>());
 
         assert!(
-            !ring.stamp_exit(1000, ring_time(100), None),
+            !ring.stamp_exit(ring_time(0), ring_time(100), None),
             "the ring dropped pid 1000's spawn"
         );
         assert!(ring.iter().all(|spawn| spawn.exited_at.is_none()));
 
-        assert!(ring.stamp_exit(1005, ring_time(100), None));
+        assert!(ring.stamp_exit(ring_time(5), ring_time(100), None));
         assert_eq!(ring.iter().count(), SPAWN_RING_CAPACITY);
         let stamped: Vec<Option<u32>> = ring
             .iter()
@@ -3333,37 +3356,55 @@ mod tests {
         }
     }
 
-    /// A pid the OS reused is stamped oldest first: an exit lands on the
-    /// earliest entry of that pid still waiting for one, never on a later
-    /// spawn that reused the pid. The stamp carries the stop-request time it
-    /// is given, `None` included.
+    /// The exit lands on the spawn its monitor watches, named by `spawned_at`,
+    /// not on the oldest unstamped entry of the pid: here an earlier spawn of
+    /// pid 7 whose child was dropped, so it is never stamped, sits ahead of
+    /// the later spawn that got pid 7 from the OS. The stamp carries the
+    /// stop-request time it is given, `None` included.
     #[test]
-    fn the_spawn_ring_stamps_the_oldest_entry_of_the_pid_still_waiting_for_its_exit() {
+    fn an_exit_is_stamped_on_the_spawn_its_monitor_watches() {
         let mut ring = SpawnRing::default();
         ring.push(spawn_of(0, 7));
         ring.push(spawn_of(10, 7));
 
-        assert!(ring.stamp_exit(7, ring_time(5), Some(ring_time(4))));
+        assert!(ring.stamp_exit(ring_time(10), ring_time(15), Some(ring_time(12))));
         let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
-        assert_eq!(entries[0].exited_at, Some(ring_time(5)));
-        assert_eq!(entries[0].stop_requested_at, Some(ring_time(4)));
-        assert_eq!(entries[0].exit_panic, None, "a stamp attaches no panic");
-        assert_eq!(entries[1], spawn_of(10, 7), "the later spawn was stamped");
-
-        assert!(ring.stamp_exit(7, ring_time(15), None));
-        let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
+        assert_eq!(entries[0], spawn_of(0, 7), "the dropped spawn was stamped");
         assert_eq!(entries[1].exited_at, Some(ring_time(15)));
-        assert_eq!(entries[1].stop_requested_at, None);
+        assert_eq!(entries[1].stop_requested_at, Some(ring_time(12)));
+        assert_eq!(entries[1].exit_panic, None, "a stamp attaches no panic");
+
+        assert!(ring.stamp_exit(ring_time(0), ring_time(20), None));
+        let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
+        assert_eq!(entries[0].exited_at, Some(ring_time(20)));
+        assert_eq!(entries[0].stop_requested_at, None);
         assert!(
-            !ring.stamp_exit(7, ring_time(20), None),
-            "no spawn of pid 7 is waiting for its exit"
+            !ring.stamp_exit(ring_time(5), ring_time(20), None),
+            "no spawn was recorded at 5"
         );
     }
 
-    /// The panic parsed at an exit lands on the entry that exit stamped,
-    /// matched by pid AND exit time: not on another pid's entry stamped at the
-    /// same instant, not on a later spawn that reused the pid and is still
-    /// waiting for its exit, and not on that later spawn's own exit.
+    /// D12: a stop latched after the exit did not ask for that exit, so the
+    /// entry does not carry it. One dated at or before the exit is kept.
+    #[test]
+    fn a_stop_latched_after_the_exit_is_not_stamped_as_its_request() {
+        for (requested, kept) in [
+            (ring_time(19), Some(ring_time(19))),
+            (ring_time(20), Some(ring_time(20))),
+            (ring_time(21), None),
+        ] {
+            let mut ring = SpawnRing::default();
+            ring.push(spawn_of(0, 7));
+            assert!(ring.stamp_exit(ring_time(0), ring_time(20), Some(requested)));
+            let entry = ring.newest().expect("the spawn");
+            assert_eq!(entry.exited_at, Some(ring_time(20)));
+            assert_eq!(entry.stop_requested_at, kept, "requested at {requested}");
+        }
+    }
+
+    /// The panic parsed at an exit lands on the spawn that exit was stamped
+    /// on, named by `spawned_at`: not on another spawn of the pid, and not on
+    /// a spawn still waiting for its exit.
     #[test]
     fn a_panic_is_attached_to_the_exit_it_was_parsed_at_and_to_no_reuse_of_the_pid() {
         let mut ring = SpawnRing::default();
@@ -3371,28 +3412,27 @@ mod tests {
         ring.push(spawn_of(0, 7));
         ring.push(spawn_of(10, 7));
         // Pid 8 and pid 7's first spawn exit at the same instant.
-        assert!(ring.stamp_exit(8, ring_time(5), None));
-        assert!(ring.stamp_exit(7, ring_time(5), None));
+        assert!(ring.stamp_exit(ring_time(-5), ring_time(5), None));
+        assert!(ring.stamp_exit(ring_time(0), ring_time(5), None));
         let first = panic_at(4, 7, "the first boot's panic");
 
         assert!(
-            !ring.attach_exit_panic(7, ring_time(6), first.clone()),
-            "no exit of pid 7 was stamped at 6"
+            !ring.attach_exit_panic(ring_time(3), first.clone()),
+            "no spawn was recorded at 3"
         );
-        assert!(ring.attach_exit_panic(7, ring_time(5), first.clone()));
+        assert!(ring.attach_exit_panic(ring_time(0), first.clone()));
         let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
         assert_eq!(entries[0].exit_panic, None, "another pid's entry");
         assert_eq!(entries[1].exit_panic, Some(first.clone()));
         assert_eq!(entries[2], spawn_of(10, 7), "the reuse of the pid");
 
-        // The reuse has not exited: a panic dated at its exit time to come
-        // finds nothing to attach to.
+        // The reuse has not exited, so a panic finds nothing to attach to.
         let second = panic_at(14, 7, "the second boot's panic");
-        assert!(!ring.attach_exit_panic(7, ring_time(15), second.clone()));
+        assert!(!ring.attach_exit_panic(ring_time(10), second.clone()));
         assert_eq!(ring.iter().nth(2), Some(&spawn_of(10, 7)));
 
-        assert!(ring.stamp_exit(7, ring_time(15), Some(ring_time(12))));
-        assert!(ring.attach_exit_panic(7, ring_time(15), second.clone()));
+        assert!(ring.stamp_exit(ring_time(10), ring_time(15), Some(ring_time(12))));
+        assert!(ring.attach_exit_panic(ring_time(10), second.clone()));
         let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
         assert_eq!(entries[1].exit_panic, Some(first), "the first exit's panic");
         assert_eq!(entries[2].exit_panic, Some(second));
