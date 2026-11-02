@@ -2738,10 +2738,6 @@ fn spawn_dedup_key_distinguishes_every_build_target() {
     );
 }
 
-/// End-to-end through the handler: a second `spawn-test` for a key whose
-/// build is still running returns 202 + `deduplicated: true` carrying the
-/// EXISTING `build_id`, runner id and port — and starts no build, so the
-/// test is deterministic (this path returns before any port reservation).
 /// The spawn mint reads the coord its config names, and its `risk` reads every
 /// row that coord served before the ACK cuts `predicted` to five. For a spawn
 /// `route_lkg` is advice only. The empty runner tree has no exe, so the detached
@@ -2782,6 +2778,10 @@ async fn spawn_202_risk_reads_every_planted_row() {
     assert_the_ack_read_every_planted_row(&coord, "spawn", &body);
 }
 
+/// End-to-end through the handler: a second `spawn-test` for a key whose
+/// build is still running returns 202 + `deduplicated: true` carrying the
+/// EXISTING `build_id`, runner id and port — and starts no build, so the
+/// test is deterministic (this path returns before any port reservation).
 #[tokio::test]
 async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot() {
     use axum::extract::State;
