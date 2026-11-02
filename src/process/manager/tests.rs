@@ -18,11 +18,14 @@ fn startup_test_runner(port: u16) -> ManagedRunner {
 /// shares): exercised directly because the sweep itself is an endless loop.
 #[tokio::test]
 async fn skip_for_startup_window_decisions() {
-    // Unbound port: bind ephemeral, read, drop.
-    let dead_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").port()
-    };
+    // A port nothing listens on, below every OS's ephemeral range. A dropped
+    // ephemeral port can be handed to a concurrent test's listener, which then
+    // reads as "the runner bound its port".
+    let dead_port: u16 = 29_871;
+    assert!(
+        !crate::process::port::is_port_listening(dead_port),
+        "something on this box listens on {dead_port}, which this test needs free"
+    );
     let now = chrono::Utc::now();
     let budget = Some(Duration::from_secs(240));
 
