@@ -4301,7 +4301,8 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
     //
     // What this cannot see: `managed` shadowed to another runner, a helper that took
     // the guard's mutex some other way, and anything at run time. A cancelled future
-    // does release the guard, wherever it was.
+    // does release the guard, wherever it was. The DELETE route and the purge are
+    // checked for their binding at the end of this test, not for their span.
     let guard_spans = |sig: &str, body: &str, lock: &str, last: &str| {
         assert_eq!(
             body.matches("_lifecycle").count(),
@@ -4399,6 +4400,23 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
              which are not reentrant"
         );
     }
+
+    // The DELETE route and the purge bind their guard by name, so a `let Some(_)`
+    // that dropped it at once fails here.
+    let routes = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("routes")
+            .join("runners.rs"),
+    )
+    .expect("read routes/runners.rs");
+    assert_eq!(
+        routes
+            .matches("let Some(_lifecycle) = manager::try_lock_registered(")
+            .count(),
+        2,
+        "DELETE and the purge each hold their guard through their removal"
+    );
 }
 
 /// Every start a dev action asks for names that action, or the attribution
@@ -5236,6 +5254,25 @@ async fn a_stop_leaves_a_ring_pid_that_runs_another_image_alone() {
             .is_err(),
         "the stop killed a pid whose image is not the runner's exe copy"
     );
+}
+
+/// A ring pid names the spawn, so a handoff waits for that process to go, and a
+/// probe's candidate does not. It is never published: the registry's pid is exempt
+/// from the image check, so a reused ring pid the check refused would be killed by
+/// a retried stop that read it back.
+#[test]
+fn a_ring_pid_names_the_spawn_and_is_never_published() {
+    use crate::process::manager::{publishes_discovered_pid, source_names_the_spawn};
+    use crate::process::stop_ledger::PidSource;
+    for (source, names_the_spawn, published) in [
+        (PidSource::Registry, true, true),
+        (PidSource::SpawnRing, true, false),
+        (PidSource::ListenerProbe, false, true),
+        (PidSource::ExeIdentity, false, true),
+    ] {
+        assert_eq!(source_names_the_spawn(&source), names_the_spawn, "{source}");
+        assert_eq!(publishes_discovered_pid(&source), published, "{source}");
+    }
 }
 
 /// The wire `watchdog` source is still refused for a non-temp runner, and

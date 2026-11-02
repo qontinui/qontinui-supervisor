@@ -544,9 +544,6 @@ mod tests {
         assert_eq!(v, TargetVerification::Proceed { note: None });
     }
 
-    /// A registry PID keeps the pre-existing behaviour unconditionally — the
-    /// new check may only ever remove a kill that was already unsafe, never
-    /// one that already worked.
     /// The ring's pid comes after the registry's and before the probes, which
     /// are less specific. It is a candidate, not the registry's own record.
     #[test]
@@ -573,6 +570,9 @@ mod tests {
         ));
     }
 
+    /// A registry PID keeps the pre-existing behaviour unconditionally — the
+    /// new check may only ever remove a kill that was already unsafe, never
+    /// one that already worked.
     #[test]
     fn registry_pid_is_never_refused() {
         let v = verify_target_image(

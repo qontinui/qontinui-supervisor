@@ -5392,6 +5392,20 @@ pub(crate) enum GracefulExitSignal {
     PidGoneOrStoppedAndPortFree(u32),
 }
 
+/// Whether a stop target's pid names this runner's own spawn rather than a
+/// candidate a probe turned up. The ring's pid does: the stop has just read that
+/// spawn as current and its pid as alive.
+pub(crate) fn source_names_the_spawn(source: &PidSource) -> bool {
+    matches!(source, PidSource::Registry | PidSource::SpawnRing)
+}
+
+/// Whether a stop publishes the pid it identified to `RunnerState::pid`. Not the
+/// ring's: the registry's pid is exempt from the image check, so a ring pid the OS
+/// has reused, refused here, would be killed by a retried stop that read it back.
+pub(crate) fn publishes_discovered_pid(source: &PidSource) -> bool {
+    !matches!(source, PidSource::SpawnRing)
+}
+
 /// Pick the graceful-exit signal. `pid_from_registry` says whether `pid` came
 /// from the registry (exact) or from a probe (a candidate). A handoff with no
 /// known PID falls back to [`GracefulExitSignal::RunningFlag`], and the caller
@@ -5399,10 +5413,10 @@ pub(crate) enum GracefulExitSignal {
 pub(crate) fn graceful_exit_signal(
     intent: CloseIntent,
     pid: Option<u32>,
-    pid_from_registry: bool,
+    pid_names_the_spawn: bool,
 ) -> GracefulExitSignal {
     match (intent, pid) {
-        (CloseIntent::HandoffHolders, Some(pid)) if pid_from_registry => {
+        (CloseIntent::HandoffHolders, Some(pid)) if pid_names_the_spawn => {
             GracefulExitSignal::PidGone(pid)
         }
         (CloseIntent::HandoffHolders, Some(pid)) => {
@@ -5727,7 +5741,7 @@ pub async fn stop_runner_by_id(
                     .await;
                 // Publish it so the dashboard, the exit monitor and any racing
                 // health probe all see the same process we are about to stop.
-                {
+                if publishes_discovered_pid(source) {
                     let mut runner = managed.runner.write().await;
                     if runner.pid.is_none() {
                         runner.pid = Some(*pid);
@@ -5783,14 +5797,11 @@ pub async fn stop_runner_by_id(
     //    would end the wait early and the PID kill below would cut the detach.
     //    See `graceful_exit_signal`.
     let graceful_timeout = intent.graceful_stop_timeout();
-    let pid_from_registry = matches!(
+    let pid_names_the_spawn = matches!(
         &stop_target,
-        StopTarget::Found {
-            source: PidSource::Registry,
-            ..
-        }
+        StopTarget::Found { source, .. } if source_names_the_spawn(source)
     );
-    let exit_signal = graceful_exit_signal(intent, pid_to_kill, pid_from_registry);
+    let exit_signal = graceful_exit_signal(intent, pid_to_kill, pid_names_the_spawn);
     if intent.is_handoff() && exit_signal == GracefulExitSignal::RunningFlag {
         let msg = format!(
             "Runner '{}' handoff stop: no target PID was identified, so the graceful wait \
