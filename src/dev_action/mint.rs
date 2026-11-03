@@ -60,8 +60,32 @@ impl AttributionTargets {
     }
 }
 
+/// A trial evaluated but not yet stored: [`prepare_action`]'s result, which
+/// [`commit_action`] stores. Dropping one leaves no ledger row and spawns no
+/// watcher, which is what a door whose act is refused before it starts wants.
+pub struct PreparedAction {
+    record: ActionRecord,
+    states_active: Vec<&'static str>,
+    predicted: Vec<PredictedSignature>,
+    risk: ActionRisk,
+}
+
 /// Mint a dev-action trial of `kind` and spawn its attribution watcher over
-/// `targets`.
+/// `targets`: [`prepare_action`] then [`commit_action`], for a door with no
+/// admission step between them.
+pub async fn mint_action(
+    state: &SharedState,
+    kind: ActionKind,
+    params_digest: String,
+    requester_id: Option<String>,
+    targets: AttributionTargets,
+    backstop_override: Option<Duration>,
+) -> MintedAction {
+    let prepared = prepare_action(state, kind, params_digest, requester_id).await;
+    commit_action(state, prepared, targets, backstop_override).await
+}
+
+/// Evaluate a dev-action trial of `kind` without storing it.
 ///
 /// State evaluation includes `LEGACY_EXE_FALLBACK` through a cheap
 /// `resolve_source_exe_with_origin` probe of the slot a start WOULD deploy; a
@@ -76,26 +100,23 @@ impl AttributionTargets {
 /// reads coord's top 100 rows, because coord ranks by its pooled mean before
 /// cutting and could otherwise drop the very row the exact-cell arm of the risk
 /// policy reads; `risk` assesses all of them, then `predicted` is cut to five
-/// ([`assess_then_cut`]). A high risk is warned here, loudly, whatever the door
-/// does with the advice.
+/// ([`assess_then_cut`]).
 ///
-/// `backstop_override` replaces the kind's backstop on the watcher's window,
-/// for an act that can outlast it.
-pub async fn mint_action(
+/// The slow half of a mint lives here so a door can run it BEFORE an admission
+/// step and keep the step-to-act window as short as it was without a trial
+/// (`manager::serving_watchdog_restart`).
+pub async fn prepare_action(
     state: &SharedState,
     kind: ActionKind,
     params_digest: String,
     requester_id: Option<String>,
-    targets: AttributionTargets,
-    backstop_override: Option<Duration>,
-) -> MintedAction {
+) -> PreparedAction {
     let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
         Ok((origin, _)) => SlotResolution::Resolved(origin),
         Err(_) => SlotResolution::NotEvaluated,
     };
     let states = evaluate_all(state, slot_resolution).await;
     let record = ActionRecord::new(kind, requester_id, params_digest, &states);
-    let action_id = record.action_id;
     // The record stores typed `DevState`s; the ACK's wire form is their
     // canonical-id array.
     let states_active: Vec<&'static str> =
@@ -104,8 +125,37 @@ pub async fn mint_action(
     let coord = coord_base(&state.config.ambient_coord);
     let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
     let (predicted, risk) = assess_then_cut(fetched, &states_active);
+
+    PreparedAction {
+        record,
+        states_active,
+        predicted,
+        risk,
+    }
+}
+
+/// Store a prepared trial and spawn its attribution watcher over `targets`.
+///
+/// A high risk is warned here, loudly, whatever the door does with the advice:
+/// here rather than in [`prepare_action`], so an act refused before it is
+/// committed warns about nothing it did.
+///
+/// `backstop_override` replaces the kind's backstop on the watcher's window,
+/// for an act that can outlast it.
+pub async fn commit_action(
+    state: &SharedState,
+    prepared: PreparedAction,
+    targets: AttributionTargets,
+    backstop_override: Option<Duration>,
+) -> MintedAction {
+    let PreparedAction {
+        record,
+        states_active,
+        predicted,
+        risk,
+    } = prepared;
     if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
+        tracing::warn!(action_id = %record.action_id, kind = record.kind.as_str(), "{warn}");
         state
             .logs
             .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())

@@ -4697,16 +4697,20 @@ pub async fn maybe_serving_restart(
 }
 
 /// The serving watchdog's restart of `managed`: a `restart` dev-action trial
-/// with requester `watchdog`, minted once the readiness gate has admitted it.
+/// with requester `watchdog`, stored once the readiness gate has admitted it.
 ///
-/// Minted AFTER the gate ([`admit_restart`]), not before it: a refusal gives
+/// Stored AFTER the gate ([`admit_restart`]), not before it: a refusal gives
 /// its attempt back and the arm decides again on the next escalating tick, so
 /// a wedged runner with live sessions is refused every few seconds for as long
-/// as the wedge lasts, and a mint per refusal would flood the ledger with
-/// trials of a restart that never ran. An admitted restart is minted, threads
-/// its action id into the start (so the spawn's ring entry names it), and
-/// records its terminal result: the error on failure, the detached health
-/// wait's verdict on success.
+/// as the wedge lasts, and a stored trial per refusal would flood the ledger
+/// with trials of a restart that never ran. The trial is PREPARED before the
+/// gate, though ([`crate::dev_action::prepare_action`]): its state evaluation
+/// and coord fetch take up to seconds, and run between the gate's census and
+/// the kill they would widen the window in which a session can start under a
+/// runner the census found empty. Committing is an in-memory insert. An
+/// admitted restart threads its action id into the start (so the spawn's ring
+/// entry names it) and records its terminal result: the error on failure, the
+/// detached health wait's verdict on success.
 async fn serving_watchdog_restart(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -4716,6 +4720,14 @@ async fn serving_watchdog_restart(
     // The watchdog never asks for a handoff: it acts only on a zero census, so
     // there is nothing to keep.
     let intent = CloseIntent::Kill;
+    let prepared = crate::dev_action::prepare_action(
+        state,
+        crate::dev_action::ActionKind::Restart,
+        format!("serving_watchdog;runner={runner_id};attempt={attempt}"),
+        Some(SERVING_WATCHDOG_INITIATOR.to_string()),
+    )
+    .await;
+    // A refusal drops `prepared`: no ledger row, no watcher.
     let admitted = admit_restart(
         state,
         &runner_id,
@@ -4725,11 +4737,9 @@ async fn serving_watchdog_restart(
         intent,
     )
     .await?;
-    let minted = crate::dev_action::mint_action(
+    let minted = crate::dev_action::commit_action(
         state,
-        crate::dev_action::ActionKind::Restart,
-        format!("serving_watchdog;runner={runner_id};attempt={attempt}"),
-        Some(SERVING_WATCHDOG_INITIATOR.to_string()),
+        prepared,
         crate::dev_action::AttributionTargets::for_runner(managed.clone()),
         None,
     )

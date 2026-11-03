@@ -1336,7 +1336,8 @@ pub async fn start_runner(
                 .await;
             minted.record.record_run_result(ActionRunResult::Errored {
                 reason: format!(
-                    "runner_unhealthy_after_start: runner '{}' did not become healthy within                      {}ms of the start",
+                    "runner_unhealthy_after_start: runner '{}' did not become healthy within \
+                     {}ms of the start",
                     id, failure.elapsed_ms
                 ),
             });
@@ -1774,7 +1775,7 @@ pub async fn rebuild_and_restart_runner(
         .into_response())
 }
 
-// POST /runners/{id}/watchdog — control per-runner watchdog.
+/// POST /runners/{id}/watchdog — control per-runner watchdog.
 pub async fn control_runner_watchdog(
     State(state): State<SharedState>,
     Path(id): Path<String>,

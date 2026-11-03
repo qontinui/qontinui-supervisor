@@ -4204,9 +4204,17 @@ async fn per_runner_restart_rebuild_202_carries_action_id() {
     assert_eq!(record.action_id, action_id);
     assert_eq!(record.kind, crate::dev_action::ActionKind::Build);
 
-    // The closed pool fails the detached build; that reaches the action.
+    // The closed pool fails the detached build; that reaches the action as the
+    // build's own error, not as the guard's drop record (also `Errored`).
     let run = await_action_result(&state, action_id).await;
     assert!(run.is_failure(), "{run:?}");
+    match &run {
+        crate::dev_action::ActionRunResult::Errored { reason } => assert!(
+            !reason.starts_with(crate::dev_action::record::ACTION_ABANDONED),
+            "the trial carries the abandoned-guard record, not the build's error: {reason}"
+        ),
+        other => panic!("expected the build's Errored, got {other:?}"),
+    }
 
     let unknown = restart_202_body(&state, "no-such-runner", false).await;
     assert!(unknown["action_id"].is_null(), "{unknown}");
@@ -4255,6 +4263,38 @@ async fn per_runner_start_mints_spawn() {
         "{missing}"
     );
     assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}
+
+/// `POST /runners/{id}/start` on a runner that is already up records its
+/// `spawn` trial `Refused`: the start refused before it touched anything, so
+/// the trial is a refusal and not a failed start.
+#[tokio::test]
+async fn per_runner_start_on_a_running_runner_records_refused() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let id = "named-d2-start-running";
+    let managed = register_dead_unprotected_named_runner(&state, id).await;
+    managed.runner.write().await.running = true;
+
+    let err = super::start_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+        axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: false }),
+    )
+    .await
+    .expect_err("the runner is already running");
+    assert!(
+        matches!(err, crate::error::SupervisorError::RunnerAlreadyRunning),
+        "{err}"
+    );
+
+    let record = only_action(&state).await;
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(
+        record.run_result(),
+        Some(crate::dev_action::ActionRunResult::Refused {
+            reason: err.to_string()
+        })
+    );
 }
 
 /// A rebuild-and-restart of a non-primary runner names its `build` trial in
