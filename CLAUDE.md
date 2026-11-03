@@ -1081,7 +1081,9 @@ Publishing is **best-effort and silent on failure**: the coord base comes from
 publishes nothing and reads nothing), machine identity from
 `~/.qontinui/machine.json` exactly as `fleet::publish_budget` reads it, a device
 bearer is attached when `$COORD_DEVICE_JWT`, `~/.qontinui/coord-device-jwt` or a
-mint from the primary runner yields one, and every failure
+mint from the primary runner yields one — identity and bearer under `Read` only;
+under `At(<stub>)` no identity is read and the sample skips for want of a device
+id — and every failure
 path returns after one WARN (subsequent ones DEBUG). A coord outage must never
 touch the build lane.
 
@@ -1607,7 +1609,8 @@ The identity follows the same value: a device-authed publish takes its
 only. Under `At(<stub>)` it reads none of them, so the budget and the resource
 sample skip for want of a device id and the serving-watchdog alert goes to the
 stub with no identity; a test that wants one passes `DeviceSources::fixture`
-through the `_from` seams.
+through the `_from` seams. The dev-action snapshot POST follows the same rule:
+it reads `ingest::resolve_device_id` / `resolve_tenant_id` under `Read` only.
 `config::tests::no_ambient_coord_resolver_outside_coord_base` is a source scan
 with an exact per-file count for each spelling: a `COORD_HTTP_URL` literal, a
 literal ending in `profiles.json`, a `"coord_url"` literal, a `coord_url:`
@@ -1618,6 +1621,10 @@ into a subject's home; `symbol_watcher/`, a separate CLI subcommand outside the
 switch by design with its own `QONTINUI_COORD_URL`; `fleet.rs`; and
 `dev_action/ingest.rs`'s private machine-file reader — and a count that moves
 in a sanctioned file fails the scan as surely as a match anywhere else.
+It matches spellings, not behaviour: a path assembled another way
+(`concat!("profiles", ".json")`, `.with_extension("json")`), or a
+`DeviceSources { .. }` struct literal built by hand from its `pub(crate)` fields,
+is not caught.
 
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
