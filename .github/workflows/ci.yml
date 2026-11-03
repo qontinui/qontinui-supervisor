@@ -157,9 +157,9 @@ jobs:
 
     steps:
       # persist-credentials: false because no later step needs git auth, and
-      # on the pool .git/config outlives the job in a home every
-      # registration on the host shares. The same holds for every checkout
-      # in the four routed jobs.
+      # on the pool, while the job runs, a persisted token would sit in a
+      # .git/config every other registration's job can read (one account,
+      # one home). The same holds for every checkout in the four routed jobs.
       - name: Checkout code
         uses: actions/checkout@v5
         with:
