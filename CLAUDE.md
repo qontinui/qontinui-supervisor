@@ -1587,7 +1587,7 @@ holds both by scanning every `.rs` file under `src/` and `tests/`:
 
 **A unit-test build reaches no ambient coord either.** `SupervisorConfig.ambient_coord`
 decides where every supervisor path that reaches coord goes: the dev-action
-client (the expectations GET at every mint, `dev_action::mint_action`, and the
+client (the expectations GET at every mint, `dev_action::prepare_action`, and the
 attribution watcher's snapshot POST), the fleet budget publish, the serving-watchdog alert, the
 resource sample, the CI-runner registration-token fetch and the lineage proxy,
 all resolved by the one resolver, `coord_client::coord_base`. The publishes that
