@@ -71,6 +71,15 @@ pub struct RecentCrashSummary {
     pub panic_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// The pid of the process that wrote the dump: the CRASHED process, not
+    /// the one reporting it (a runner reports the dump it found at startup,
+    /// so the reporter is always a later process). `None` from a runner that
+    /// does not emit it yet (plan
+    /// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+    /// Phase 6). When present, the attribution watcher keys a crash to a
+    /// spawn on it (`dev_action::attribution::is_crash_of_spawn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// Raw /health response body shape we care about. Uses `serde(default)` so
@@ -1435,6 +1444,7 @@ mod tests {
                 panic_location: Some("src-tauri/src/foo.rs:42:9".to_string()),
                 panic_message: Some("no reactor running".to_string()),
                 thread: Some("main".to_string()),
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1462,6 +1472,7 @@ mod tests {
                 panic_location: None,
                 panic_message: None,
                 thread: None,
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1496,6 +1507,7 @@ mod tests {
                 panic_location: None,
                 panic_message: Some("stale crash".to_string()),
                 thread: None,
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1525,6 +1537,20 @@ mod tests {
         let crash = body.recent_crash.expect("recent_crash present");
         assert_eq!(crash.panic_message.as_deref(), Some("boom"));
         assert_eq!(crash.thread.as_deref(), Some("main"));
+        assert_eq!(crash.pid, None, "a runner that emits no pid parses as None");
+
+        let with_pid = r#"{
+            "recent_crash": {
+                "filePath": "D:/.dev-logs/crash_2.txt",
+                "reportedAt": "2026-04-22T10:15:30Z",
+                "pid": 4242
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(with_pid).expect("should parse");
+        assert_eq!(
+            body.recent_crash.expect("recent_crash present").pid,
+            Some(4242)
+        );
     }
 
     #[test]

@@ -4077,7 +4077,11 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     let in_margin = aged("test-in-margin.log", Duration::from_secs(140 * 60));
     let old = aged("test-old.log", Duration::from_secs(3 * 60 * 60));
     assert_eq!(
-        crate::process::early_log::prune_stale_early_logs(&dir, now),
+        crate::process::early_log::prune_stale_early_logs(
+            &dir,
+            now,
+            &std::collections::HashSet::new()
+        ),
         1
     );
     assert!(

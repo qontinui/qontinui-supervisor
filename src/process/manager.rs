@@ -1725,6 +1725,39 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
 // Periodic Stale Test Runner Reaper
 // =============================================================================
 
+/// The early-log paths of every registered runner's live spawns, the snapshot
+/// the early-log prune skips: each spawn in a runner's ring whose exit the
+/// exit monitor has not stamped, and the runner's current early log while its
+/// process reads as running. Read under each runner's short-lived ring and
+/// state read locks, one at a time, never under its lifecycle lock.
+pub(crate) async fn live_early_log_paths(
+    state: &SharedState,
+) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut live = std::collections::HashSet::new();
+    for managed in state.get_all_runners().await {
+        live.extend(
+            managed
+                .recent_spawns
+                .read()
+                .await
+                .spawned_between(
+                    chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                    chrono::DateTime::<chrono::Utc>::MAX_UTC,
+                )
+                .into_iter()
+                .filter(|spawn| spawn.exited_at.is_none())
+                .filter_map(|spawn| spawn.early_log_path),
+        );
+        let running = managed.runner.read().await.running;
+        if running {
+            if let Some(path) = managed.early_log_path.read().await.clone() {
+                live.insert(path);
+            }
+        }
+    }
+    live
+}
+
 /// Background task that periodically detects and removes stopped/crashed test
 /// runners from the in-memory registry. Runs every 5 minutes.
 ///
@@ -1798,13 +1831,17 @@ pub async fn reap_stale_test_runners(state: SharedState) {
         // Early logs outlive their runner's stop (the stop route keeps them, so
         // an attribution window still open over that spawn can read them), and
         // this sweep is what bounds them: each file not written for
-        // `early_log::EARLY_LOG_RETENTION` is pruned. A pure age prune of the
-        // directory listing, off the async worker, under no lifecycle lock.
+        // `early_log::EARLY_LOG_RETENTION` is pruned, except a live spawn's
+        // (a runner alive but silent that long). The live paths are
+        // snapshotted first; the prune itself is an age prune of the directory
+        // listing, off the async worker, under no lifecycle lock.
+        let live_early_logs = live_early_log_paths(&state).await;
         let early_log_dir = std::env::temp_dir().join(crate::process::early_log::EARLY_LOG_SUBDIR);
         let pruned = tokio::task::spawn_blocking(move || {
             crate::process::early_log::prune_stale_early_logs(
                 &early_log_dir,
                 std::time::SystemTime::now(),
+                &live_early_logs,
             )
         })
         .await
