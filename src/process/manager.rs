@@ -4311,9 +4311,11 @@ async fn emit_serving_event(
             detail: detail.clone(),
         });
 
-    // A test drives `maybe_serving_restart` directly; its config's
-    // `ambient_coord` is `Ignore` (or `At` a stub), so the alert below reaches
-    // neither the coord the box's profile names nor the runner's JWT mint.
+    // The alert follows the config's `ambient_coord`. A test drives
+    // `maybe_serving_restart` directly with `Ignore`, so nothing is sent or
+    // read; under `At` a stub, the base is the stub and
+    // `DeviceSources::for_access` reads no `machine.json`, no seeded JWT and
+    // mints nothing, so the alert carries no device identity.
     let access = state.config.ambient_coord.clone();
     let notice = crate::fleet::ServingWatchdogNotice {
         runner_id: runner_id.to_string(),

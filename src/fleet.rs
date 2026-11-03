@@ -272,8 +272,9 @@ fn looks_like_jwt(token: &str) -> bool {
 /// Consulted only AFTER [`crate::coord_client::coord_base`] resolved a base, so
 /// under [`crate::config::AmbientCoord::Ignore`] none of these is read. Every
 /// publish takes one, so a test can point the identity and the mint at fixtures
-/// and count what each path touches; production passes
-/// [`DeviceSources::ambient`].
+/// and count what each path touches. Production entry points take theirs from
+/// [`DeviceSources::for_access`], so the identity follows the same
+/// [`crate::config::AmbientCoord`] value the base came from.
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceSources {
     /// Reads the device identity (`~/.qontinui/machine.json` in production).
@@ -281,11 +282,37 @@ pub(crate) struct DeviceSources {
     /// Whether the operator-seedable rungs (`$COORD_DEVICE_JWT`,
     /// `~/.qontinui/coord-device-jwt`) are consulted before the mint.
     pub(crate) read_seeded: bool,
-    /// The runner whose UI Bridge mints a device JWT.
-    pub(crate) mint_base: String,
+    /// The runner whose UI Bridge mints a device JWT; `None` mints nothing.
+    pub(crate) mint_base: Option<String>,
 }
 
 impl DeviceSources {
+    /// The sources a production entry point uses under `access`.
+    ///
+    /// Only [`AmbientCoord::Read`] reads this box's identity
+    /// ([`DeviceSources::ambient`]). Under [`AmbientCoord::At`] the base is a
+    /// planted coord, so the box's `machine.json`, its seeded JWT rungs and the
+    /// primary runner's mint are all foreign to it: none is read, and a path
+    /// that needs an identity skips (a test that wants one passes
+    /// [`DeviceSources`] explicitly). Under [`AmbientCoord::Ignore`] no base
+    /// resolves, so the sources are never consulted; they are the same empty
+    /// set.
+    pub(crate) fn for_access(access: &AmbientCoord) -> Self {
+        match access {
+            AmbientCoord::Read => Self::ambient(),
+            AmbientCoord::At(_) | AmbientCoord::Ignore => Self::none(),
+        }
+    }
+
+    /// No identity, no seeded rungs, no mint.
+    fn none() -> Self {
+        Self {
+            machine: no_machine,
+            read_seeded: false,
+            mint_base: None,
+        }
+    }
+
     /// This box: `machine.json`, both seeded rungs, and a mint from the
     /// **primary** runner.
     ///
@@ -306,14 +333,17 @@ impl DeviceSources {
     /// Fixed to `RUNNER_API_PORT` on purpose: the credential being asked for is
     /// the MACHINE's device identity, and the primary is the instance that owns
     /// machine-scoped state. Temp runners on 9877-9899 are not asked.
-    pub(crate) fn ambient() -> Self {
+    fn ambient() -> Self {
         // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
         // first and the runner binds the IPv4 loopback only, so the name form
         // pays a doomed IPv6 connect before the socket that answers.
         Self {
             machine: load_machine_file,
             read_seeded: true,
-            mint_base: format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT),
+            mint_base: Some(format!(
+                "http://127.0.0.1:{}",
+                crate::config::RUNNER_API_PORT
+            )),
         }
     }
 }
@@ -327,9 +357,14 @@ impl DeviceSources {
         Self {
             machine: fixture_machine,
             read_seeded: false,
-            mint_base: mint_base.to_string(),
+            mint_base: Some(mint_base.to_string()),
         }
     }
+}
+
+/// The machine reader of [`DeviceSources::for_access`] off [`AmbientCoord::Read`].
+fn no_machine() -> Option<MachineFile> {
+    None
 }
 
 /// Test-only: the `machine.json` [`DeviceSources::fixture`] reads.
@@ -507,7 +542,7 @@ pub(crate) const SOURCE_RUNNER_MINT: &str = "runner UI Bridge mint";
 /// primary runner, rung 3 is the one that resolves.
 ///
 /// Rungs 1 and 2 are read only when `sources.read_seeded`; rung 3 asks
-/// `sources.mint_base`.
+/// `sources.mint_base`, and is skipped when that is `None`.
 ///
 /// Private on purpose: every caller goes through [`resolve_device_bearer_for`],
 /// which applies the transport guard first, so no publish can put a device
@@ -527,7 +562,8 @@ async fn resolve_device_bearer(sources: &DeviceSources) -> Option<(String, &'sta
             return Some(seeded);
         }
     }
-    mint_device_jwt_at(&sources.mint_base)
+    let mint_base = sources.mint_base.as_deref()?;
+    mint_device_jwt_at(mint_base)
         .await
         .map(|token| (token, SOURCE_RUNNER_MINT))
 }
@@ -913,7 +949,15 @@ pub(crate) async fn publish_budget(
 /// publish settles in the background.
 pub async fn publish_on_startup(access: &AmbientCoord) {
     let resources = detect_resources();
-    if let Err(e) = publish_budget(access, &DeviceSources::ambient(), ROLE, resources, 0).await {
+    if let Err(e) = publish_budget(
+        access,
+        &DeviceSources::for_access(access),
+        ROLE,
+        resources,
+        0,
+    )
+    .await
+    {
         warn!("fleet::publish_on_startup failed (non-fatal): {e}");
     }
 }
@@ -1151,7 +1195,7 @@ pub async fn notify_serving_watchdog(
     access: &AmbientCoord,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    notify_serving_watchdog_from(access, &DeviceSources::ambient(), notice).await
+    notify_serving_watchdog_from(access, &DeviceSources::for_access(access), notice).await
 }
 
 /// [`notify_serving_watchdog`] with its identity sources passed in — the seam
@@ -2353,12 +2397,46 @@ mod tests {
         assert!(!transport_may_carry_bearer("not a url"));
     }
 
+    /// Only `Read` reads this box's identity: under `At` a stub the base is
+    /// planted, so the box's `machine.json`, its seeded JWT rungs and the
+    /// primary runner's mint must not ride along to it.
+    #[test]
+    fn device_sources_follow_the_ambient_coord() {
+        for access in [
+            AmbientCoord::At("http://127.0.0.1:1".to_string()),
+            AmbientCoord::Ignore,
+        ] {
+            let sources = DeviceSources::for_access(&access);
+            assert!(!sources.read_seeded, "{access:?} reads the seeded rungs");
+            assert_eq!(sources.mint_base, None, "{access:?} mints");
+            assert!((sources.machine)().is_none(), "{access:?} has an identity");
+        }
+        let read = DeviceSources::for_access(&AmbientCoord::Read);
+        assert!(read.read_seeded);
+        assert_eq!(
+            read.mint_base.as_deref(),
+            Some(format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT).as_str())
+        );
+    }
+
+    /// Under `At` no bearer resolves: no seeded rung is read and nothing is
+    /// minted from this box's runner, even on a loopback base.
+    #[tokio::test]
+    async fn no_bearer_resolves_under_at() {
+        let none = DeviceSources::for_access(&AmbientCoord::At("http://127.0.0.1:1".into()));
+        let (bearer, _) = resolve_device_bearer_for("http://127.0.0.1:1", &none).await;
+        assert!(bearer.is_none());
+    }
+
     /// The withheld arm never reaches the resolver (no env, file or mint is
     /// consulted), and its label says why nothing was sent.
     #[tokio::test]
     async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
-        let (bearer, source) =
-            resolve_device_bearer_for("http://coord.example.com", &DeviceSources::ambient()).await;
+        let (bearer, source) = resolve_device_bearer_for(
+            "http://coord.example.com",
+            &DeviceSources::fixture("http://127.0.0.1:1"),
+        )
+        .await;
         assert!(bearer.is_none());
         assert_eq!(source, SOURCE_WITHHELD);
     }
@@ -2430,7 +2508,7 @@ mod tests {
         assert_eq!(
             runner.connections(),
             1,
-            "the mint asks the stub runner once"
+            "the mint connects to the stub runner once"
         );
         assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
     }
@@ -2479,7 +2557,7 @@ mod tests {
         assert_eq!(
             runner.connections(),
             1,
-            "the mint asks the stub runner once"
+            "the mint connects to the stub runner once"
         );
         assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
     }
