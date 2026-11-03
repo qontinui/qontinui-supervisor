@@ -100,9 +100,8 @@ pub enum AmbientTargetDir {
 /// Whether and where the supervisor reaches coord — every path that does: the
 /// dev-action client (the expectations GET at every mint,
 /// `dev_action::prepare_action`, and the attribution watcher's snapshot POST),
-/// the fleet budget publish, the
-/// serving-watchdog alert, the resource sample, the CI-runner registration-token
-/// fetch and the lineage proxy. [`crate::coord_client::coord_base`] turns it into
+/// the fleet budget publish, the serving-watchdog alert, the resource sample,
+/// the CI-runner registration-token fetch and the lineage proxy. [`crate::coord_client::coord_base`] turns it into
 /// a base URL, and is the only resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmbientCoord {
