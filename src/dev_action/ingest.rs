@@ -63,7 +63,7 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// D3.
 ///
 /// Epoch 3 follows #272, which attributes `recent_crash` only to the spawn it can
-/// be tied to, reads an undated `derived_status: Errored` as `Inconclusive` unless
+/// be tied to, emits no signature for an undated `derived_status: Errored` unless
 /// the API answered after the spawn, and measures the window's tail cap on the
 /// tokio clock. #272 landed still stamping 2, so a row stamped 2 can carry either
 /// semantics; a row stamped 3 carries #272's.

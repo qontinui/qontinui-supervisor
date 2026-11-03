@@ -3758,7 +3758,7 @@ async fn synchronous_spawn_test_failure_carries_its_action_fields() {
     .expect("the synchronous path renders the stored outcome")
     .into_response();
     let (status, body) = json_body(resp).await;
-    assert_ne!(status, 202, "{body}");
+    assert!(status >= 400, "{status} {body}");
     crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     assert_eq!(
         body["action_id"],
@@ -3783,6 +3783,7 @@ async fn spawn_named_records_a_failure_run_result_on_the_action() {
     .expect("spawn-named renders its failure");
     let (status, body) = json_body(resp).await;
     assert!(status >= 400, "{status} {body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     let action_id = body["action_id"]
         .as_str()
         .expect("the failed response names its action");
@@ -4338,6 +4339,7 @@ async fn rebuild_and_restart_202_carries_action_id_only_when_a_build_can_run() {
     register_dead_unprotected_named_runner(&state, id).await;
 
     let body = rebuild_and_restart_202_body(&state, id).await;
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     let action_id = body["action_id"]
         .as_str()
         .unwrap_or_else(|| panic!("the 202 names its action: {body}"))

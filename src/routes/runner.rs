@@ -2163,6 +2163,7 @@ mod tests {
         let (status, body) = body_json(resp).await;
         assert_eq!(status, 202);
         assert_eq!(body["build_source"], "live_tree", "{body}");
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
         let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
             .expect("action_id is a uuid");
 
