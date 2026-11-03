@@ -21,7 +21,10 @@
 //! has no boot of its own to judge. The third is gated the same way: what of
 //! it can be dated is held to the span from the action's earliest such spawn
 //! to the close, a recent crash to the crash of one of those spawns, and the
-//! undated self-report to an API seen answering after that spawn.
+//! undated self-report to an API seen answering after that spawn. A self-report
+//! it cannot place after the spawn is an unknown: it emits no signature, and a
+//! verdict that would otherwise read `Confirmed` closes
+//! [`D3Category::Partial`] ([`classify_close`]).
 //!
 //! The verdict closes at window end. Late observations append to
 //! `late_signatures` flagged `late: true` and update statistics only — they
@@ -157,6 +160,11 @@ impl WindowTiming {
 /// The evidence a window carries when it closed on its backstop with no
 /// terminal result and no signature (D8).
 pub const BACKSTOP_CLOSED_NO_RESULT: &str = "backstop_closed_no_result";
+
+/// The `evidence_ref` of a window closed [`D3Category::Partial`] because the
+/// runner's undated `derived_status: errored` could not be placed after the
+/// action's spawn ([`HealthScan::errored_not_placed`]).
+pub const ERRORED_NOT_PLACED: &str = "derived_status_errored_not_placed_after_spawn";
 
 /// Classify a verdict from the action's own terminal result and the observed
 /// signatures.
@@ -605,6 +613,30 @@ async fn scan_spawn_effects(
     (signatures, evidence)
 }
 
+/// What [`scan_health`] read on the acted-on runner's cached health.
+#[derive(Debug, Default)]
+struct HealthScan {
+    signatures: Vec<DevSignature>,
+    evidence: Option<String>,
+    /// The snapshot holds an undated `derived_status: Errored` it cannot place
+    /// after the action's spawn. That neither attributes the report nor clears
+    /// it, so it is no signature, and [`classify_close`] does not let the
+    /// verdict read as a clean `Confirmed` either. A pre-spawn snapshot reading
+    /// healthy does not set it: nothing in it needs placing, and the action's
+    /// own result stands.
+    errored_not_placed: bool,
+}
+
+impl HealthScan {
+    fn signature(evidence: String) -> Self {
+        Self {
+            signatures: vec![DevSignature::DevUiErrorBoundary],
+            evidence: Some(evidence),
+            errored_not_placed: false,
+        }
+    }
+}
+
 /// The `DEV-UI-ERROR-BOUNDARY` signature of the acted-on runner's cached health,
 /// read only for an action that initiated a spawn of it inside the window, as
 /// [`scan_spawn_effects`] reads its early logs and panics.
@@ -629,8 +661,16 @@ async fn scan_spawn_effects(
 ///   self-report, and it counts only when the snapshot shows the API
 ///   answering at a time after the action's earliest spawn
 ///   (`api_responding` with `last_seen_responding_at` past that spawn):
-///   otherwise nothing places the report after the action's boot and the arm
-///   is inconclusive, so it emits nothing.
+///   otherwise nothing places the report after the action's boot, so the arm
+///   emits no signature and reports [`HealthScan::errored_not_placed`].
+///
+/// The health cache derives `Errored` only on a tick whose API answered, and
+/// that tick stamps `last_seen_responding_at`. So an unplaced `Errored` is a
+/// snapshot from before the spawn: the refresher has published nothing newer by
+/// the close, which sits [`RESULT_TAIL_WINDOW`] after an ordinary result. It
+/// publishes once per sweep of every runner, serially, so that takes a sweep
+/// stalled or still in flight since before the spawn. How often that happens is
+/// unmeasured.
 ///
 /// **Residual:** an undated `Errored` that does pass that check is still read
 /// as this action's even if the runner, answering after the spawn, carried
@@ -642,9 +682,9 @@ async fn scan_health(
     runner_id: Option<&str>,
     action_id: Uuid,
     window: ClosedWindow,
-) -> (Vec<DevSignature>, Option<String>) {
+) -> HealthScan {
     let (Some(managed), Some(runner_id)) = (managed, runner_id) else {
-        return (Vec::new(), None);
+        return HealthScan::default();
     };
     let (initiated, ring_to_close) = {
         let ring = managed.recent_spawns.read().await;
@@ -659,23 +699,20 @@ async fn scan_health(
         )
     };
     let Some(earliest_spawn) = initiated.iter().map(|spawn| spawn.spawned_at).min() else {
-        return (Vec::new(), None);
+        return HealthScan::default();
     };
     let in_span = |at: DateTime<Utc>| earliest_spawn <= at && at <= window.close_at;
 
     let snapshots = state.cached_runner_health.read().await;
     let Some(snap) = snapshots.iter().find(|snap| snap.id == runner_id) else {
-        return (Vec::new(), None);
+        return HealthScan::default();
     };
     if let Some(ui_err) = snap.ui_error.as_ref() {
         if in_span(ui_err.first_seen) {
-            return (
-                vec![DevSignature::DevUiErrorBoundary],
-                Some(format!(
-                    "ui_error: {}",
-                    ui_err.message.chars().take(160).collect::<String>()
-                )),
-            );
+            return HealthScan::signature(format!(
+                "ui_error: {}",
+                ui_err.message.chars().take(160).collect::<String>()
+            ));
         }
     }
     if let Some(crash) = snap.recent_crash.as_ref() {
@@ -688,13 +725,10 @@ async fn scan_health(
                 .panic_message
                 .as_deref()
                 .unwrap_or(crash.file_path.as_str());
-            return (
-                vec![DevSignature::DevUiErrorBoundary],
-                Some(format!(
-                    "recent_crash: {}",
-                    what.chars().take(160).collect::<String>()
-                )),
-            );
+            return HealthScan::signature(format!(
+                "recent_crash: {}",
+                what.chars().take(160).collect::<String>()
+            ));
         }
     }
     let undated_errored = snap.ui_error.is_none()
@@ -703,17 +737,20 @@ async fn scan_health(
             snap.derived_status,
             crate::health_cache::RunnerStatus::Errored { .. }
         );
+    if !undated_errored {
+        return HealthScan::default();
+    }
     let api_answered_after_spawn = snap.api_responding
         && snap
             .last_seen_responding_at
             .is_some_and(|seen| seen > earliest_spawn);
-    if undated_errored && api_answered_after_spawn {
-        return (
-            vec![DevSignature::DevUiErrorBoundary],
-            Some("derived_status=errored".to_string()),
-        );
+    if api_answered_after_spawn {
+        return HealthScan::signature("derived_status=errored".to_string());
     }
-    (Vec::new(), None)
+    HealthScan {
+        errored_not_placed: true,
+        ..HealthScan::default()
+    }
 }
 
 /// Whether `crash`, the dump a runner reported on its `/health`, is the crash
@@ -847,9 +884,19 @@ async fn await_attribution_window(
 /// window that reaches its backstop has no evidence of what happened, and an
 /// unknown must not render as a success. A signature the window did observe
 /// is evidence, and keeps its own category.
-pub fn classify_close(run: Option<&ActionRunResult>, signatures: &[DevSignature]) -> D3Category {
+///
+/// A window that holds an `Errored` self-report it cannot place after the
+/// action's spawn (`errored_not_placed`, [`scan_health`]) closes `Partial` for
+/// the same reason. Coord counts signatures, not this category, so it costs the
+/// trial none of its statistics. A failed result or an observed signature still
+/// decides the verdict.
+pub fn classify_close(
+    run: Option<&ActionRunResult>,
+    signatures: &[DevSignature],
+    errored_not_placed: bool,
+) -> D3Category {
     match classify(run, signatures) {
-        D3Category::Confirmed if run.is_none() => D3Category::Partial,
+        D3Category::Confirmed if run.is_none() || errored_not_placed => D3Category::Partial,
         category => category,
     }
 }
@@ -903,7 +950,11 @@ pub fn spawn_attribution_watcher_with_timing(
             run_result.as_ref(),
         )
         .await;
-        let (health_sigs, health_ev) = scan_health(
+        let HealthScan {
+            signatures: health_sigs,
+            evidence: health_ev,
+            errored_not_placed,
+        } = scan_health(
             &state,
             targets.managed.as_deref(),
             targets.runner_id.as_deref(),
@@ -913,7 +964,7 @@ pub fn spawn_attribution_watcher_with_timing(
         .await;
         merge(&mut signatures, &mut evidence, health_sigs, health_ev);
 
-        let category = classify_close(run_result.as_ref(), &signatures);
+        let category = classify_close(run_result.as_ref(), &signatures, errored_not_placed);
         let ended_at = Utc::now();
         let duration_ms = (ended_at - record.started_at).num_milliseconds();
 
@@ -921,10 +972,15 @@ pub fn spawn_attribution_watcher_with_timing(
         // sixth `D3Category`. A `DEV-*` signature's own excerpt wins when there
         // is one (it names an observed effect); otherwise the action's terminal
         // reason is the only evidence there is — and for a refusal it is the
-        // ONLY evidence there ever could be, since nothing ran.
+        // ONLY evidence there ever could be, since nothing ran. A result with no
+        // reason leaves the unplaced `Errored`, when there is one, to say why
+        // the verdict is not `Confirmed`.
         if evidence.is_none() {
             evidence = match run_result.as_ref() {
-                Some(r) => r.reason().map(|r| r.chars().take(400).collect::<String>()),
+                Some(r) => r
+                    .reason()
+                    .map(|r| r.chars().take(400).collect::<String>())
+                    .or_else(|| errored_not_placed.then(|| ERRORED_NOT_PLACED.to_string())),
                 // D8: a backstop close with no result says so.
                 None => Some(BACKSTOP_CLOSED_NO_RESULT.to_string()),
             };
@@ -1000,18 +1056,27 @@ pub fn spawn_attribution_watcher_with_timing(
             },
             None => String::new(),
         };
+        // A `Partial` that nothing else on this line would explain. A backstop
+        // close is `Partial` with or without it, and its evidence says so.
+        let health_note =
+            if errored_not_placed && category == D3Category::Partial && run_result.is_some() {
+                format!(" health={ERRORED_NOT_PLACED}")
+            } else {
+                String::new()
+            };
         state
             .logs
             .emit(
                 LogSource::Supervisor,
                 level,
                 format!(
-                    "dev-action {} ({}) verdict={:?} signatures={:?}{}",
+                    "dev-action {} ({}) verdict={:?} signatures={:?}{}{}",
                     record.action_id,
                     kind.as_str(),
                     category,
                     signature_ids,
-                    run_note
+                    run_note,
+                    health_note
                 ),
             )
             .await;
@@ -1881,10 +1946,9 @@ mod tests {
 
     /// A build-kind window closes on the action's own result, which can land
     /// minutes after the boot it judges: a rebuild-restart's health wait runs
-    /// 30 s past a runner that died at startup before the 30 s tail, and
-    /// `rebuild_when_idle` records no result on success, so its window runs to
-    /// the backstop. The panic is held to the window, not to a freshness slack
-    /// measured back from the close.
+    /// 30 s past a runner that died at startup before the 30 s tail. The panic
+    /// is held to the window, not to a freshness slack measured back from the
+    /// close.
     #[tokio::test]
     async fn a_startup_panic_long_before_a_build_window_closes_is_attributed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3181,15 +3245,15 @@ mod tests {
         }
     }
 
-    /// The signatures `scan_health` reads for `action_id` with the primary's
-    /// cached health set to `snap`.
-    async fn scan_health_with(
+    /// What `scan_health` reads for `action_id` with the primary's cached
+    /// health set to `snap`.
+    async fn full_scan_health_with(
         state: &SharedState,
         runner: &ManagedRunner,
         action_id: Uuid,
         window: ClosedWindow,
         snap: crate::health_cache::CachedRunnerHealth,
-    ) -> Vec<DevSignature> {
+    ) -> HealthScan {
         *state.cached_runner_health.write().await = vec![snap];
         scan_health(
             state,
@@ -3199,7 +3263,19 @@ mod tests {
             window,
         )
         .await
-        .0
+    }
+
+    /// The signatures [`full_scan_health_with`] reads.
+    async fn scan_health_with(
+        state: &SharedState,
+        runner: &ManagedRunner,
+        action_id: Uuid,
+        window: ClosedWindow,
+        snap: crate::health_cache::CachedRunnerHealth,
+    ) -> Vec<DevSignature> {
+        full_scan_health_with(state, runner, action_id, window, snap)
+            .await
+            .signatures
     }
 
     /// The primary's cached health reporting `crash`, folded into `Errored`.
@@ -3384,7 +3460,7 @@ mod tests {
                 "the API is not answering on this snapshot",
             ),
         ] {
-            let sigs = scan_health_with(
+            let scan = full_scan_health_with(
                 &state,
                 &primary,
                 action_id,
@@ -3392,10 +3468,15 @@ mod tests {
                 errored(api_responding, last_seen),
             )
             .await;
-            assert!(sigs.is_empty(), "{why}, yet it was attributed: {sigs:?}");
+            assert!(
+                scan.signatures.is_empty(),
+                "{why}, yet it was attributed: {:?}",
+                scan.signatures
+            );
+            assert!(scan.errored_not_placed, "{why}, yet it was not reported");
         }
 
-        let answered_after = scan_health_with(
+        let answered_after = full_scan_health_with(
             &state,
             &primary,
             action_id,
@@ -3403,6 +3484,211 @@ mod tests {
             errored(true, Some(at(window, 20))),
         )
         .await;
-        assert_eq!(answered_after, [DevSignature::DevUiErrorBoundary]);
+        assert_eq!(
+            answered_after.signatures,
+            [DevSignature::DevUiErrorBoundary]
+        );
+        assert!(!answered_after.errored_not_placed);
+
+        // A crash dated out of the span is known to be another process's, not
+        // an unknown, so the `Errored` it folds into is not reported either.
+        let other_process = full_scan_health_with(
+            &state,
+            &primary,
+            action_id,
+            window,
+            crashed_health(recent_crash(at(window, 5), None)),
+        )
+        .await;
+        assert!(other_process.signatures.is_empty());
+        assert!(!other_process.errored_not_placed);
+    }
+
+    /// The verdict half of
+    /// [`scan_health_undated_errored_without_post_spawn_api_is_inconclusive`],
+    /// through the watcher: an `Errored` the snapshot cannot place keeps a
+    /// clean result from closing `Confirmed`, and says why, while a failed
+    /// result and an observed signature still decide the verdict and keep
+    /// their own evidence.
+    #[tokio::test]
+    async fn an_errored_report_not_placed_after_the_spawn_closes_partial() {
+        const FAST: WindowTiming = WindowTiming {
+            tail: Duration::from_millis(10),
+            backstop: Duration::from_secs(20),
+        };
+        const NO_RESULT: WindowTiming = WindowTiming {
+            tail: Duration::from_millis(10),
+            backstop: Duration::from_millis(50),
+        };
+
+        /// One window over a runner whose cached health is `health`, with the
+        /// action's spawn in it and `run` recorded on it (none: a backstop
+        /// close). `answered_after_spawn` dates the snapshot's API answer, and
+        /// `early_log` is what the spawn's own early log says.
+        async fn close_window(
+            health: crate::health_cache::RunnerStatus,
+            answered_after_spawn: bool,
+            run: Option<ActionRunResult>,
+            early_log: Option<&str>,
+        ) -> ActionOutcome {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = watcher_test_state(tmp.path());
+            let primary = test_primary();
+            let record = bare_record(ActionKind::Spawn);
+            let spawned_at = spawned_after_the_mint(&record);
+            let early_log = early_log.map(|text| {
+                let path = tmp.path().join("early.log");
+                std::fs::write(&path, text).unwrap();
+                path
+            });
+            record_spawn_with_early_log(
+                &primary,
+                Some(record.action_id),
+                spawned_at,
+                SPAWNED_PID,
+                &tmp.path().join("dev-logs").join("runner-primary"),
+                early_log,
+            )
+            .await;
+
+            let mut snap = cached_health(None, health);
+            let offset = chrono::Duration::seconds(if answered_after_spawn { 1 } else { -1 });
+            snap.last_seen_responding_at = Some(spawned_at + offset);
+            *state.cached_runner_health.write().await = vec![snap];
+
+            let timing = if run.is_some() { FAST } else { NO_RESULT };
+            let runner_id = Some(primary.config.id.clone());
+            spawn_attribution_watcher_with_timing(
+                state,
+                record.clone(),
+                AttributionTargets {
+                    managed: Some(primary),
+                    runner_id,
+                },
+                timing,
+            );
+            if let Some(run) = run {
+                record.record_run_result(run);
+            }
+            await_outcome(
+                &record,
+                crate::test_clock::poll_budget(Duration::from_secs(30)),
+            )
+            .await
+        }
+        let errored = || crate::health_cache::RunnerStatus::Errored {
+            reason: "runner reported derived_status=errored".to_string(),
+        };
+
+        let ran = || Some(ActionRunResult::Ran);
+
+        let unplaced = close_window(errored(), false, ran(), None).await;
+        assert_eq!(unplaced.category, D3Category::Partial);
+        assert!(unplaced.signatures.is_empty(), "{:?}", unplaced.signatures);
+        assert_eq!(
+            unplaced.evidence_ref.as_deref(),
+            Some("derived_status_errored_not_placed_after_spawn")
+        );
+
+        // The control: the same window with nothing errored is still clean.
+        let clean = close_window(
+            crate::health_cache::RunnerStatus::Healthy,
+            false,
+            ran(),
+            None,
+        )
+        .await;
+        assert_eq!(clean.category, D3Category::Confirmed);
+        assert_eq!(clean.evidence_ref, None);
+
+        // A failed result decides, and keeps its reason.
+        let failed = close_window(
+            errored(),
+            false,
+            Some(ActionRunResult::Errored {
+                reason: "cargo exited with status 101".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(failed.category, D3Category::Failure);
+        assert_eq!(
+            failed.evidence_ref.as_deref(),
+            Some("cargo exited with status 101")
+        );
+
+        // A signature from another surface decides too, beside the unknown,
+        // and keeps its excerpt.
+        let observed = close_window(
+            errored(),
+            false,
+            ran(),
+            Some("ERROR webview: net::ERR_CONNECTION_REFUSED at http://localhost:1420\n"),
+        )
+        .await;
+        assert_eq!(observed.category, D3Category::Contradiction);
+        assert_eq!(observed.signatures, ["DEV-WEBVIEW-CONN-REFUSED"]);
+        assert!(
+            observed
+                .evidence_ref
+                .as_deref()
+                .is_some_and(|ev| ev.contains("ERR_CONNECTION_REFUSED")),
+            "{:?}",
+            observed.evidence_ref
+        );
+
+        // A report the snapshot does place is a signature, not an unknown.
+        let placed = close_window(errored(), true, ran(), None).await;
+        assert_eq!(placed.category, D3Category::Contradiction);
+        assert_eq!(
+            placed.evidence_ref.as_deref(),
+            Some("derived_status=errored")
+        );
+
+        // A backstop close keeps saying it was one.
+        let no_result = close_window(errored(), false, None, None).await;
+        assert_eq!(no_result.category, D3Category::Partial);
+        assert_eq!(
+            no_result.evidence_ref.as_deref(),
+            Some("backstop_closed_no_result")
+        );
+    }
+
+    /// Every row [`classify_close`]'s fold can reach: only a verdict that would
+    /// otherwise read `Confirmed` becomes `Partial`, on no result or an unplaced
+    /// `Errored`, and a failed result or an observed signature still decides.
+    #[test]
+    fn classify_close_only_downgrades_a_clean_verdict() {
+        let ran = ActionRunResult::Ran;
+        let errored = ActionRunResult::Errored {
+            reason: "boom".to_string(),
+        };
+        let refused = ActionRunResult::Refused {
+            reason: "unsafe".to_string(),
+        };
+        let contradiction = [DevSignature::DevUiErrorBoundary];
+        let failure = [DevSignature::DevPortBindFail];
+        for (run, signatures, unplaced, expected) in [
+            (Some(&ran), &[][..], false, D3Category::Confirmed),
+            (Some(&ran), &[][..], true, D3Category::Partial),
+            (None, &[][..], false, D3Category::Partial),
+            (None, &[][..], true, D3Category::Partial),
+            (
+                Some(&ran),
+                &contradiction[..],
+                true,
+                D3Category::Contradiction,
+            ),
+            (Some(&ran), &failure[..], true, D3Category::Failure),
+            (None, &contradiction[..], true, D3Category::Contradiction),
+            (Some(&errored), &[][..], true, D3Category::Failure),
+            (Some(&refused), &[][..], true, D3Category::Failure),
+        ] {
+            assert_eq!(
+                classify_close(run, signatures, unplaced),
+                expected,
+                "run={run:?} signatures={signatures:?} unplaced={unplaced}"
+            );
+        }
     }
 }
