@@ -3854,5 +3854,17 @@ async fn probe_stores_a_panic_from_this_spawn_however_long_the_probe_ran() {
             stored,
             "header pid {header_pid}"
         );
+        // D14: the stored panic is also kept on the spawn's ring entry, where
+        // the teardown panic of the stop that follows cannot overwrite it.
+        assert_eq!(
+            managed
+                .recent_spawns
+                .read()
+                .await
+                .newest()
+                .and_then(|spawn| spawn.probe_panic.clone()),
+            managed.recent_panic.read().await.clone(),
+            "header pid {header_pid}"
+        );
     }
 }

@@ -1325,39 +1325,12 @@ pub async fn stop_runner(
 ) -> Result<impl IntoResponse, SupervisorError> {
     let force = body.into_inner_or_default().force;
 
-    // Capture the early-log path BEFORE stopping — for test-* runners the
-    // stop also removes them from the registry, after which we can no longer
-    // look up the path. We delete the file AFTER stop succeeds because the
-    // stop is the explicit "user is done diagnosing" signal. It is also the
-    // file the stopped spawn's entry names in the runner's spawn ring, which
-    // the dev-action attribution watcher reads only at a window's close: a
-    // window still open over that spawn then reads no early-log signature
-    // for it and, with no other signature, closes it `Confirmed` under `Ran`.
-    // A residual, unchanged from 5fd1ca62, whose reach
-    // `dev_action::attribution::scan_spawn_effects` states.
-    let early_log_path = if let Some(managed) = state.get_runner(&id).await {
-        managed.early_log_path.read().await.clone()
-    } else {
-        None
-    };
-
+    // The stopped spawn's early log is NOT deleted here. Its entry in the
+    // runner's spawn ring names it, and the dev-action attribution watcher
+    // reads it only when a window over that spawn closes, which can be long
+    // after this stop. `manager::reap_stale_test_runners` prunes early logs by
+    // age (`early_log::EARLY_LOG_RETENTION`), past the longest window.
     manager::stop_runner_by_id(&state, &id, force, manager::CloseIntent::Kill).await?;
-
-    // Explicit user-facing /stop is the only path that deletes the
-    // early-log file. The spawn-test failed-probe cleanup path also calls
-    // stop_runner_by_id, but it does NOT route through here — it goes
-    // directly through the manager — so the early-log file is preserved
-    // there (which is what we want for post-mortem debugging). Files for
-    // runners that died on their own and were reaped also persist. This
-    // route is what the dashboard's Stop (named and temp runners) and
-    // spawn-test's `stop_url` call, so the delete reaches spawn windows; a
-    // restart's, a build's or a `rebuild_when_idle`'s window is reached only
-    // by a direct `POST /runners/primary/stop`. A restart's own stop and the
-    // legacy `/runner/stop` delete nothing. Best effort: missing-file errors
-    // are silently swallowed by delete_early_log.
-    if let Some(path) = early_log_path {
-        crate::process::early_log::delete_early_log(&path);
-    }
 
     Ok(Json(json!({
         "status": "stopped",
@@ -5448,8 +5421,19 @@ async fn probe_runner_health(
             } else {
                 // Stash on the managed runner so subsequent callers of
                 // GET /runners see the same record.
-                let mut slot = managed.recent_panic.write().await;
-                *slot = Some(p.clone());
+                *managed.recent_panic.write().await = Some(p.clone());
+                // And keep it on the spawn's ring entry. The stop that follows a
+                // failed probe provokes a teardown panic that overwrites the log
+                // and, on an exit that is not clean, `recent_panic` and the
+                // entry's `exit_panic`; the attribution watcher reads this copy
+                // first at the window's close.
+                if let Some(spawn) = newest.as_ref() {
+                    managed
+                        .recent_spawns
+                        .write()
+                        .await
+                        .attach_probe_panic(spawn.spawned_at, p.clone());
+                }
                 Some(p.clone())
             }
         } else {

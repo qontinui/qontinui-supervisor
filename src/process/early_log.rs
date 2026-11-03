@@ -22,15 +22,13 @@
 //! Files live in `<TEMP_DIR>/qontinui-supervisor-spawn-logs/<runner_id>-<rfc3339-millis>.log`.
 //! The directory is created lazily on first use. There is no rotation — the
 //! file is hard-capped at [`EARLY_LOG_BYTE_CAP`] bytes via inline truncation
-//! so a runaway runner can't fill the disk. Files are deleted when the
-//! runner is explicitly stopped via `POST /runners/{id}/stop`; files for
-//! runners that died unexpectedly are preserved (the whole point of this
-//! capture). That delete runs as soon as the stop succeeds, and the dev-action
-//! attribution watcher reads each spawn's early log only when its window
-//! closes, so a window still open over the stopped spawn reads no early-log
-//! signature for it and, with no other signature, closes it `Confirmed` under
-//! `Ran` or with no run result (a residual, unchanged from 5fd1ca62, whose
-//! reach `dev_action::attribution::scan_spawn_effects` states).
+//! so a runaway runner can't fill the disk. No stop deletes a file: the
+//! dev-action attribution watcher reads each spawn's early log only when its
+//! window closes, which can be long after the stop. The stale temp-runner
+//! sweep (`manager::reap_stale_test_runners`) instead prunes every file older
+//! than [`EARLY_LOG_RETENTION`] (the longest attribution backstop plus a
+//! margin), sparing each registered runner's current spawn's file
+//! ([`prune_early_logs`]).
 //!
 //! # Best-effort
 //!
@@ -253,15 +251,70 @@ fn truncate_file_in_place(file: &mut File, keep_bytes: u64) -> std::io::Result<(
     Ok(())
 }
 
-/// Delete an early-log file. Best-effort: a missing file is fine, and any
-/// other IO error is logged at debug level (the file lives under temp_dir
-/// and will be cleaned up by OS-level temp sweeps eventually).
-pub fn delete_early_log(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => debug!("Removed early-log file {:?}", path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => debug!("Failed to remove early-log file {:?}: {}", path, e),
+/// How long an early-log file is kept after its last write before
+/// [`prune_early_logs`] removes it: the longest attribution backstop
+/// (`dev_action::attribution::LONGEST_BACKSTOP`) plus a margin for the
+/// sweep's interval and a watcher's close running late. A window over a spawn
+/// reads that spawn's early log at its close, which no stop may pre-empt.
+pub const EARLY_LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(
+    crate::dev_action::attribution::LONGEST_BACKSTOP.as_secs() + EARLY_LOG_RETENTION_MARGIN_SECS,
+);
+
+/// The margin [`EARLY_LOG_RETENTION`] keeps past the longest backstop: 30 min.
+const EARLY_LOG_RETENTION_MARGIN_SECS: u64 = 30 * 60;
+
+/// Remove the `.log` files directly under `dir` whose last write is older than
+/// `retention` at `now`, sparing every path in `keep` (the early logs of the
+/// registered runners' current spawns, which `GET /runners/{id}/early-log`
+/// serves). Returns how many it removed. Best-effort: an unreadable directory,
+/// entry or mtime removes nothing for that entry, and a failed removal is
+/// logged at debug level.
+///
+/// Age is the file's mtime, not its name's timestamp: a runner keeps appending
+/// to its early log while it lives, so a file still written to is never old.
+///
+/// The directory is shared by every supervisor this user runs, and `keep`
+/// names only this supervisor's runners. So another supervisor's runner whose
+/// early log has had no write for longer than `retention` loses it to this
+/// sweep (the open handle keeps writing to an unnamed file, and that
+/// supervisor's `GET /runners/{id}/early-log` answers unavailable).
+pub fn prune_early_logs(
+    dir: &Path,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+    keep: &std::collections::HashSet<PathBuf>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") || keep.contains(&path) {
+            continue;
+        }
+        // The file's own record, not the directory listing's copy
+        // (`DirEntry::metadata`), which Windows refreshes lazily while a
+        // handle is still being appended to.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let old = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > retention);
+        if old && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        } else if old {
+            debug!("Failed to prune early-log file {:?}", path);
+        }
     }
+    removed
 }
 
 #[cfg(test)]
@@ -344,17 +397,55 @@ mod tests {
         }
     }
 
+    /// T4-2 (D15), the sweep half. The retention is the 2 h longest backstop
+    /// plus 30 min, pinned by literal; a file younger than it is kept, an older
+    /// one pruned, a kept path spared however old, and a non-log file ignored.
     #[test]
-    fn delete_is_idempotent_and_swallows_missing() {
+    fn the_sweep_prunes_only_early_logs_older_than_the_longest_window() {
+        assert_eq!(
+            crate::dev_action::attribution::LONGEST_BACKSTOP,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+        assert_eq!(
+            EARLY_LOG_RETENTION,
+            std::time::Duration::from_secs(150 * 60)
+        );
+
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("doomed.log");
-        let writer = EarlyLogWriter::open(&path).expect("open");
-        writer.write_line(LogLevel::Info, "soon to die");
-        assert!(path.exists());
-        delete_early_log(&path);
-        assert!(!path.exists());
-        // Calling again on a missing file does not panic or warn.
-        delete_early_log(&path);
+        let young = dir.path().join("test-young.log");
+        let old = dir.path().join("test-old.log");
+        let old_kept = dir.path().join("test-old-kept.log");
+        let not_a_log = dir.path().join("notes.txt");
+        for path in [&young, &old, &old_kept, &not_a_log] {
+            std::fs::write(path, "line\n").unwrap();
+        }
+        // Age by moving `now` forward rather than back-dating mtimes.
+        let written = std::time::SystemTime::now();
+        let set_mtime = |path: &Path, at: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        let past = written - std::time::Duration::from_secs(151 * 60);
+        set_mtime(&old, past);
+        set_mtime(&old_kept, past);
+        set_mtime(&not_a_log, past);
+        set_mtime(&young, written - std::time::Duration::from_secs(149 * 60));
+
+        let keep = std::collections::HashSet::from([old_kept.clone()]);
+        let removed = prune_early_logs(dir.path(), EARLY_LOG_RETENTION, written, &keep);
+
+        assert_eq!(removed, 1);
+        assert!(
+            young.exists(),
+            "a file younger than the retention was pruned"
+        );
+        assert!(!old.exists(), "a file older than the retention was kept");
+        assert!(old_kept.exists(), "a kept path was pruned");
+        assert!(not_a_log.exists(), "a non-log file was pruned");
     }
 
     #[test]

@@ -3691,6 +3691,33 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
     );
 }
 
+/// T4-2 (D15), the route half. `POST /runners/{id}/stop` leaves the stopped
+/// spawn's early log in place: a dev-action window still open over that spawn
+/// reads it at its close. The age sweep is what removes it.
+#[tokio::test]
+async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
+    let (state, root) = restart_test_state();
+    let id = "named-stop-keeps-early-log";
+    let managed = register_dead_named_runner(&state, id).await;
+    let early_log = root.path().join("named-stop-keeps-early-log.log");
+    std::fs::write(&early_log, "a boot line\n").unwrap();
+    *managed.early_log_path.write().await = Some(early_log.clone());
+
+    crate::routes::runners::stop_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+        crate::routes::optional_json::OptionalJson(None),
+    )
+    .await
+    .map(|_| ())
+    .expect("a dead runner stops");
+
+    assert!(
+        early_log.exists(),
+        "the stop route deleted the stopped spawn's early log"
+    );
+}
+
 /// `stop_runner_by_id`, through which every restart passes, latches the stop
 /// with the time of the request; a second request keeps the first's time,
 /// the earliest. A dead, unprotected named runner stops at once.
@@ -4969,7 +4996,7 @@ async fn stop_the_stub(state: &SharedState, managed: &Arc<ManagedRunner>) {
             }
         }
         if let Some(log) = spawn.early_log_path.as_deref() {
-            crate::process::early_log::delete_early_log(log);
+            let _ = std::fs::remove_file(log);
         }
     }
 }

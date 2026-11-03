@@ -221,6 +221,18 @@ pub struct SpawnMarker {
     /// included, overwrites the file. It need not be this spawn's own panic:
     /// a reader holds it to the same checks as either of those.
     pub exit_panic: Option<RecentPanic>,
+    /// The boot panic spawn-test's failed health probe stored for this spawn
+    /// (`routes::runners::probe_runner_health`), attached when the probe
+    /// stored it ([`SpawnRing::attach_probe_panic`]). The first one is kept.
+    ///
+    /// Kept apart from `exit_panic` and `recent_panic` because each of those
+    /// holds only the runner's latest panic: a probe failure stops the runner,
+    /// and the teardown panic that stop provokes overwrites the log, the stored
+    /// copy and, on an exit that is not clean, the attached one. The probe
+    /// holds the panic to `dev_action::attribution::is_panic_of_spawn` before
+    /// storing it, so it is this spawn's; a reader still holds it to every
+    /// check it holds the other copies to.
+    pub probe_panic: Option<RecentPanic>,
     /// The dev action that started this spawn (`ActionRecord::action_id`).
     /// `None` for a start nothing minted: the crash and serving watchdogs,
     /// `POST /runners/{id}/start` and `/restart`, the boot auto-start. At
@@ -245,6 +257,7 @@ impl SpawnMarker {
             exited_at: None,
             stop_requested_at: None,
             exit_panic: None,
+            probe_panic: None,
             initiated_by,
         }
     }
@@ -328,6 +341,25 @@ impl SpawnRing {
         {
             Some(spawn) => {
                 spawn.exit_panic = Some(panic);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Attach the boot panic spawn-test's failed probe stored to the spawn
+    /// recorded at `spawned_at`, exited or not. The first panic attached is
+    /// kept: a later probe of the same spawn reads the same log, and by then
+    /// the log may hold that spawn's teardown panic. Returns `false`, and
+    /// changes nothing, when no entry matches or the entry already holds one.
+    pub fn attach_probe_panic(&mut self, spawned_at: DateTime<Utc>, panic: RecentPanic) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .find(|spawn| spawn.spawned_at == spawned_at && spawn.probe_panic.is_none())
+        {
+            Some(spawn) => {
+                spawn.probe_panic = Some(panic);
                 true
             }
             None => false,
@@ -3444,6 +3476,30 @@ mod tests {
         assert_eq!(entries[1].exit_panic, Some(first), "the first exit's panic");
         assert_eq!(entries[2].exit_panic, Some(second));
         assert_eq!(entries[2].stop_requested_at, Some(ring_time(12)));
+    }
+
+    /// D14: the probe's boot panic lands on the spawn named by `spawned_at`,
+    /// exited or not, and the first one is kept: a later probe of the same
+    /// spawn can read that spawn's teardown panic from the log.
+    #[test]
+    fn a_probe_panic_is_kept_on_its_spawn_and_the_first_one_wins() {
+        let mut ring = SpawnRing::default();
+        ring.push(spawn_of(0, 7));
+        ring.push(spawn_of(10, 8));
+        let boot = panic_at(12, 8, "the boot panicked before its API bound");
+        let teardown = panic_at(14, 8, "cannot move state from Destroyed");
+
+        assert!(!ring.attach_probe_panic(ring_time(3), boot.clone()));
+        assert!(ring.attach_probe_panic(ring_time(10), boot.clone()));
+        assert!(!ring.attach_probe_panic(ring_time(10), teardown));
+        let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
+        assert_eq!(entries[0].probe_panic, None, "another spawn's entry");
+        assert_eq!(
+            entries[1].probe_panic,
+            Some(boot),
+            "the first panic is kept"
+        );
+        assert_eq!(entries[1].exited_at, None, "a probe panic stamps no exit");
     }
 
     /// The spawns of a window run from its open to its close, both included.

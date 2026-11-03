@@ -2076,6 +2076,40 @@ pub async fn reap_stale_test_runners(state: SharedState) {
         // This is the safety net for the D7 orphan leak — even if a record was
         // dropped without a kill, the next sweep frees the port.
         reconcile_orphaned_temp_runners(&state).await;
+
+        prune_stale_early_logs(&state).await;
+    }
+}
+
+/// Remove early-log files older than [`early_log::EARLY_LOG_RETENTION`],
+/// sparing the current spawn's file of every registered runner. No stop deletes
+/// an early log, because a dev-action window still open over the stopped spawn
+/// reads it at its close; this sweep is what bounds them, the logs of runners
+/// that died on their own included, and a supervisor restart does not reset it.
+///
+/// [`early_log::EARLY_LOG_RETENTION`]: crate::process::early_log::EARLY_LOG_RETENTION
+async fn prune_stale_early_logs(state: &SharedState) {
+    let Some(dir) = crate::process::early_log::early_log_dir() else {
+        return;
+    };
+    let mut keep = std::collections::HashSet::new();
+    for managed in state.get_all_runners().await {
+        if let Some(path) = managed.early_log_path.read().await.clone() {
+            keep.insert(path);
+        }
+    }
+    let pruned = tokio::task::spawn_blocking(move || {
+        crate::process::early_log::prune_early_logs(
+            &dir,
+            crate::process::early_log::EARLY_LOG_RETENTION,
+            std::time::SystemTime::now(),
+            &keep,
+        )
+    })
+    .await
+    .unwrap_or(0);
+    if pruned > 0 {
+        debug!("Reaper: pruned {} early-log file(s)", pruned);
     }
 }
 

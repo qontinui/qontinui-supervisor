@@ -364,17 +364,19 @@ impl ClosedWindow {
 ///   critical section after its wait on the child, so a process whose exit
 ///   falls in that short lag before the close reads as up, exactly like an
 ///   exit just after the close, and under `Ran` its panic does not count.
-/// - Each of the three places the watcher reads holds only the runner's
+/// - Three of the four places the watcher reads hold only the runner's
 ///   latest panic, and a stop can empty them before the close: a teardown
 ///   panic overwrites `runner-panic.log`, and on an exit that is not clean
 ///   (a non-zero exit, or a wait on the child that returned no exit status,
 ///   the only exits on which the exit monitor parses the log) the stored and
 ///   attached copies too, and check 4 then turns it away; a plain stop of a
 ///   `test-*` runner reaps its instance root, `runner-panic.log` included,
-///   and a clean exit attaches and stores nothing. A panic the spawn logged
-///   before the request then counts only if a copy of it is still held at
-///   the close, such as the one spawn-test's failed probe stored, which a
-///   clean exit leaves in place.
+///   and a clean exit attaches and stores nothing. The fourth,
+///   `SpawnMarker::probe_panic`, keeps the boot panic spawn-test's failed
+///   probe stored, whatever follows. A caught boot panic on a path with no
+///   probe failure has no such copy and still counts only if one of the
+///   other three holds it at the close: keeping more than the latest panic
+///   needs a runner-side change.
 /// - The lifecycle lock (`ManagedRunner::lifecycle`) orders one runner's starts,
 ///   stops and removals, so a stop arriving mid-start latches after the
 ///   spawn is recorded and targets it, and a second start finds it recorded. The
@@ -463,16 +465,20 @@ fn spawn_panic_log_path(
 /// to `<log-dir>/runner-<id>`, not to the runner default path. Read, in order,
 /// each held to [`is_startup_panic_of`] for this spawn:
 ///
-/// 1. the panic the exit monitor attached to this spawn's ring entry when its
+/// 1. the boot panic spawn-test's failed probe kept on this spawn's ring entry
+///    ([`SpawnMarker::probe_panic`]). It is the copy that survives the
+///    teardown panic the probe's own stop provokes, which overwrites the file
+///    and, on an exit that is not clean, the two copies below;
+/// 2. the panic the exit monitor attached to this spawn's ring entry when its
 ///    process exited ([`SpawnMarker::exit_panic`]). The next spawn clears the
 ///    stored panic and the runner's next panic, a caught one included,
 ///    overwrites the file, so for a boot the crash watchdog restarted this is
 ///    the copy that survives to the close;
-/// 2. the panic the supervisor parsed and stored on the runner
+/// 3. the panic the supervisor parsed and stored on the runner
 ///    (`recent_panic`). spawn-test's probe-failure path stores it and then
 ///    stops the runner, and that stop reaps a `test-*` runner's instance root,
 ///    `runner-panic.log` included, possibly before the window closes;
-/// 3. the panic log the spawn set up ([`spawn_panic_log_path`]), read at
+/// 4. the panic log the spawn set up ([`spawn_panic_log_path`]), read at
 ///    window close because the spawn, which comes after the mint, is what
 ///    records its dir. Every spawn of one runner sets up the same dir.
 ///
@@ -485,12 +491,13 @@ fn spawn_panic_log_path(
 /// or for a primary the health cache, can publish it before the monitor
 /// does), but it clears the stored panic only after its exe copy and spawn,
 /// and the monitor's own store rewrites it after any earlier clear.
-/// Each place holds only the runner's latest panic, so a teardown panic of a
-/// spawn a stop ended replaces a panic that spawn logged before the request in
-/// the file, and on an exit that is not clean (a non-zero exit, or a wait on
-/// the child that returned no exit status, the only exits on which the exit
-/// monitor parses the log) in the stored and attached copies too, and is
-/// itself turned away (see the residuals of [`is_startup_panic_of`]).
+/// Places 2 to 4 each hold only the runner's latest panic, so a teardown panic
+/// of a spawn a stop ended replaces a panic that spawn logged before the
+/// request in the file, and on an exit that is not clean (a non-zero exit, or
+/// a wait on the child that returned no exit status, the only exits on which
+/// the exit monitor parses the log) in the stored and attached copies too, and
+/// is itself turned away (see the residuals of [`is_startup_panic_of`]). Only a
+/// probe-kept panic (place 1) survives that.
 async fn scan_panic(
     state: &SharedState,
     managed: &ManagedRunner,
@@ -500,7 +507,10 @@ async fn scan_panic(
 ) -> (Vec<DevSignature>, Option<String>) {
     let counts = |panic: &panic_log::RecentPanic| is_startup_panic_of(panic, spawn, window, run);
 
-    let mut panic = spawn.exit_panic.clone().filter(|panic| counts(panic));
+    let mut panic = spawn.probe_panic.clone().filter(|panic| counts(panic));
+    if panic.is_none() {
+        panic = spawn.exit_panic.clone().filter(|panic| counts(panic));
+    }
     if panic.is_none() {
         let stored = managed.recent_panic.read().await.clone();
         panic = stored.filter(|panic| counts(panic));
@@ -546,17 +556,11 @@ async fn scan_panic(
 /// those files hold then describes a boot the action did not cause. With no
 /// managed runner there is no spawn to read.
 ///
-/// Residual, documented and not changed: an explicit
-/// `POST /runners/{id}/stop` deletes the stopped runner's early-log file as
-/// soon as the stop succeeds, so a window still open over that spawn reads no
-/// early-log signature for it (`DEV-TAURI-ASSET-MISSING`,
-/// `DEV-WEBVIEW-CONN-REFUSED`, `DEV-PORT-BIND-FAIL`) and, with no other
-/// signature, closes it `Confirmed` under `Ran`. The
-/// dashboard's Stop (named and temp runners) and spawn-test's `stop_url`
-/// reach spawn windows; a restart's, a build's or a `rebuild_when_idle`'s
-/// window is reached only by a direct `POST /runners/primary/stop`. A
-/// restart's own stop and the legacy `/runner/stop` delete nothing. Unchanged
-/// from 5fd1ca62.
+/// A spawn's early log outlives its stop: no stop deletes it, and the stale
+/// temp-runner sweep prunes it only once it is older than
+/// [`crate::process::early_log::EARLY_LOG_RETENTION`], which exceeds
+/// [`LONGEST_BACKSTOP`], so a window still open over a stopped spawn still reads
+/// its early-log signatures.
 async fn scan_spawn_effects(
     state: &SharedState,
     managed: Option<&ManagedRunner>,
@@ -2257,6 +2261,66 @@ mod tests {
         );
     }
 
+    /// T4-1 (D14). spawn-test's probe failure keeps the boot panic on the
+    /// spawn's ring entry. The stop that follows provokes a teardown panic of
+    /// the same pid, dated after the request, which overwrites the log, the
+    /// stored copy and the attached exit panic. With no run result the kept
+    /// boot panic is still attributed.
+    #[tokio::test]
+    async fn a_boot_panic_survives_the_teardown_panic_that_overwrote_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let primary = test_primary();
+        let record = bare_record(ActionKind::Build);
+
+        let log_dir = tmp.path().join("dev-logs").join("runner-primary");
+        let spawned_at = spawned_after_the_mint(&record);
+        record_spawn(&primary, &record, spawned_at, SPAWNED_PID, &log_dir).await;
+        let panicked_at = inside_the_window(&record);
+        let boot = write_panic_log(
+            &log_dir,
+            "primary",
+            SPAWNED_PID,
+            panicked_at,
+            "the boot panicked before its API bound",
+        );
+        let boot = panic_log::parse_panic_file(&boot).expect("the fixture parses");
+        // What the probe does when it gives up: store, then keep on the entry.
+        *primary.recent_panic.write().await = Some(boot.clone());
+        assert!(primary
+            .recent_spawns
+            .write()
+            .await
+            .attach_probe_panic(spawned_at, boot));
+
+        let requested_at = panicked_at + chrono::Duration::milliseconds(1);
+        let teardown = write_panic_log(
+            &log_dir,
+            "primary",
+            SPAWNED_PID,
+            requested_at + chrono::Duration::milliseconds(1),
+            "cannot move state from Destroyed",
+        );
+        let teardown = panic_log::parse_panic_file(&teardown).expect("the fixture parses");
+        *primary.recent_panic.write().await = Some(teardown.clone());
+        record_requested_exit(
+            &primary,
+            SPAWNED_PID,
+            Some(requested_at),
+            requested_at + chrono::Duration::milliseconds(2),
+            Some(teardown),
+        )
+        .await;
+
+        let outcome = outcome_with_no_run_result(state, &record, &primary).await;
+        assert_eq!(outcome.signatures, ["DEV-PANIC-STARTUP"]);
+        assert_eq!(outcome.category, D3Category::Failure);
+        assert_eq!(
+            outcome.evidence_ref.as_deref(),
+            Some("panic: the boot panicked before its API bound")
+        );
+    }
+
     /// D13: only the entries this action initiated are its boots. A spawn nobody
     /// initiated (a watchdog's respawn) and another action's spawn, each with a
     /// white screen in its early log and inside this action's window, are not
@@ -2950,6 +3014,50 @@ mod tests {
                     },
                 )
             },
+        )
+        .await;
+        assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);
+        assert_eq!(earlier.category, D3Category::Confirmed);
+    }
+
+    /// D3, the `recent_crash` arm: a crash report counts only when its
+    /// `reported_at` lies between the action's spawn and the close, and the
+    /// `derived_status` fold does not re-admit one its date dropped.
+    #[tokio::test]
+    async fn a_recent_crash_counts_only_when_reported_after_the_actions_spawn() {
+        use crate::health_cache::RunnerStatus;
+
+        let crash_at = |at: DateTime<Utc>| {
+            let mut health = cached_health(
+                None,
+                RunnerStatus::Errored {
+                    reason: "recent_crash".to_string(),
+                },
+            );
+            health.recent_crash = Some(crate::health_cache::RecentCrashSummary {
+                file_path: "crash-dump.json".to_string(),
+                reported_at: at,
+                panic_location: None,
+                panic_message: Some("the webview crashed".to_string()),
+                thread: None,
+            });
+            health
+        };
+
+        let its_boot = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| crash_at(inside_the_window(record)),
+        )
+        .await;
+        assert_eq!(its_boot.signatures, ["DEV-UI-ERROR-BOUNDARY"]);
+        assert_eq!(
+            its_boot.evidence_ref.as_deref(),
+            Some("recent_crash: the webview crashed")
+        );
+
+        let earlier = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| crash_at(record.started_at - chrono::Duration::seconds(5)),
         )
         .await;
         assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);

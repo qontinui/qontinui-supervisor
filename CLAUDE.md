@@ -1846,7 +1846,7 @@ When a temp runner dies during startup (`spawn-test` returns `error: runner_died
 | Endpoint | Returns |
 |----------|---------|
 | spawn-test response itself | `recent_logs` (last ~10 lines) + `early_log_path` |
-| `GET /runners/{id}/early-log` | Full early-log file content (capped at 1 MB tail) — survives in `stopped_runners` cache after the runner is purged |
+| `GET /runners/{id}/early-log` | Full early-log file content (capped at 1 MB tail) — survives in `stopped_runners` cache after the runner is purged. No stop deletes the file; the stale temp-runner sweep prunes early logs with no write for 150 min (`early_log::EARLY_LOG_RETENTION`, the 2 h longest attribution backstop + 30 min), sparing each registered runner's current one, so a cache entry can outlive its file (`early_log_unavailable`) |
 | `GET /runners/{id}/crash-summary` | `{exit_code, duration_alive_ms, last_phase_log, panic_excerpt}` for already-stopped runners |
 
 **Recurring pattern: runner hangs in PG bootstrap.** Force-killing runners (with `Stop-Process` or `taskkill /F`) leaves PG backend connections holding row-level locks for ~2 minutes until PG's idle-in-transaction sweeper times them out. The next runner's `apply_canonical_schema` / `run_migrations` hits these locks and hangs. The runner now has 30s per-stage timeouts (commit on `qontinui-runner` adds `PG bootstrap: <stage>...` bracketed logs + a `pg_stat_activity` dump on timeout). If a fresh runner spawn hangs at "applying canonical schema" within the first 6s, check for stuck PG sessions:
