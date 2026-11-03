@@ -4106,3 +4106,63 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     .expect("the sweep exists");
     assert!(sweep.contains("prune_stale_early_logs("));
 }
+
+/// `GET /runners/{id}/early-log` answers each of its outcomes with its own
+/// shape. The file-not-found 404 is the one #266 changed: since the max-age
+/// sweep prunes early logs, it names that retention (`retention_secs`) so a
+/// pruned file is distinguishable from a lost one. Pinned beside it: an
+/// unknown id, a registered runner with no captured path, and a file under
+/// the tail cap. Not covered here: the stopped-cache lookup, a non-NotFound
+/// read error, and truncation past the 1 MB cap.
+#[tokio::test]
+async fn early_log_route_names_each_outcome() {
+    use axum::extract::{Path, State};
+    async fn call(state: &crate::state::SharedState, id: &str) -> (u16, serde_json::Value) {
+        let resp = super::runner_early_log(State(state.clone()), Path(id.to_string())).await;
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        (status, serde_json::from_slice(&bytes).expect("JSON body"))
+    }
+
+    let state = make_state();
+    let primary = crate::config::RunnerConfig::default_primary().id;
+    let managed = state
+        .get_runner(&primary)
+        .await
+        .expect("primary registered");
+
+    // Unknown id: neither live nor in the stopped cache.
+    let (status, body) = call(&state, "no-such-runner").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "runner_not_found");
+
+    // Registered, but no early log was ever captured: no retention claim.
+    *managed.early_log_path.write().await = None;
+    let (status, body) = call(&state, &primary).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "early_log_unavailable");
+    assert!(body.get("retention_secs").is_none());
+
+    // A captured path whose file is gone: names the prune and its retention.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("early.log");
+    *managed.early_log_path.write().await = Some(path.clone());
+    let (status, body) = call(&state, &primary).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "early_log_unavailable");
+    let retention = crate::process::early_log::EARLY_LOG_RETENTION.as_secs();
+    assert_eq!(body["retention_secs"], serde_json::json!(retention));
+    let reason = body["reason"].as_str().expect("reason is a string");
+    assert!(reason.contains("max-age sweep prunes"), "{reason}");
+    assert!(reason.contains(&format!("{retention} s")), "{reason}");
+
+    // The file exists: 200 with its content, untruncated.
+    fs::write(&path, "boot line\n").unwrap();
+    let (status, body) = call(&state, &primary).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["content"], "boot line\n");
+    assert_eq!(body["size_bytes"], 10);
+    assert_eq!(body["truncated"], false);
+}
