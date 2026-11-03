@@ -41,7 +41,6 @@ pub use mint::{commit_action, mint_action, prepare_action, risk_ack_json, Minted
 pub use policy::ActionRisk;
 pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore, RunResultGuard};
 pub use run_result::{
-    record_failure_after_stop, record_start_verdict, run_result_for, spawn_run_result,
-    start_verdict, StartVerdict, SyncProbe,
+    record_start_verdict, run_result_for, spawn_run_result, start_verdict, StartVerdict, SyncProbe,
 };
 pub use states::{evaluate_all, SlotResolution};

@@ -3354,6 +3354,15 @@ async fn register_dead_named_runner(state: &SharedState, id: &str) -> Arc<Manage
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
+    register_named_runner_on_port(state, id, port).await
+}
+
+/// [`register_dead_named_runner`] on a port the caller chose.
+async fn register_named_runner_on_port(
+    state: &SharedState,
+    id: &str,
+    port: u16,
+) -> Arc<ManagedRunner> {
     let config = crate::config::RunnerConfig {
         id: id.to_string(),
         name: format!("Runner {id}"),
@@ -4495,7 +4504,7 @@ fn every_minted_start_names_its_action() {
         (
             "pub async fn run_admitted_restart(",
             "restart_after_gate(",
-            "initiated_by,&mutstop_ran,)",
+            "initiated_by,&mutacted,)",
         ),
         (
             "async fn restart_after_gate(",
@@ -6030,23 +6039,26 @@ async fn mint_test_restart(
     .record
 }
 
-/// A restart whose stop RAN records its failure `Errored` before it returns,
-/// so the door's later `run_result_for` (which reads a precondition refusal as
-/// `Refused`, "nothing ran") cannot close the attribution window on the stop's
-/// effects unobserved. A cached open port is evidence of life, so the stop
-/// runs (on a port nothing listens on, so it kills nothing); the start then
-/// fails.
+/// A restart whose stop RAN returns its failure marked
+/// [`SupervisorError::AfterAct`], so the door's `run_result_for` records it
+/// `Errored` on the door's own record (no store lookup), while the door's HTTP
+/// answer is the wrapped error's, unchanged. A cached open port is evidence of
+/// life, so the stop runs; the runner's port is reserved bound and never
+/// listening for the whole test, so the stop finds nothing to kill and no
+/// other process can take the port. The start then fails.
 #[tokio::test]
 async fn a_restart_that_fails_after_its_stop_records_errored() {
     use crate::diagnostics::RestartSource;
     let (state, _root) = restart_test_state();
-    let managed = register_dead_named_runner(&state, "named-after-stop").await;
+    let id = "named-after-stop";
+    let managed =
+        register_named_runner_on_port(&state, id, crate::test_ports::reserve_refused_port()).await;
     managed.cached_health.write().await.runner_port_open = true;
     let record = mint_test_restart(&state, &managed).await;
 
     let err = restart_runner_by_id(
         &state,
-        "named-after-stop",
+        id,
         false,
         RestartSource::Manual,
         false,
@@ -6060,27 +6072,29 @@ async fn a_restart_that_fails_after_its_stop_records_errored() {
         managed.runner.read().await.stop_requested,
         "the stop must have run for this test to say anything"
     );
+    let SupervisorError::AfterAct(inner) = &err else {
+        panic!("a failure after the stop must be marked AfterAct: {err:?}");
+    };
+    assert_eq!(err.to_string(), inner.to_string());
+    assert_eq!(err.to_status_body(), inner.to_status_body());
+    assert!(record.record_run_result(crate::dev_action::run_result_for(&err)));
     assert_eq!(
         record.run_result(),
         Some(crate::dev_action::ActionRunResult::Errored {
-            reason: err.to_string()
-        }),
-        "the restart body records a post-stop failure itself"
+            reason: inner.to_string()
+        })
     );
-    // The door's own mapping comes second and loses.
-    assert!(!record.record_run_result(crate::dev_action::run_result_for(&err)));
 }
 
-/// The same restart with NO evidence of life skips its stop, so nothing ran
-/// and the body records nothing: the door's `run_result_for` decides.
+/// The same restart with NO evidence of life skips its stop, so nothing ran:
+/// the error is not marked and the door's `run_result_for` maps it as it is.
 #[tokio::test]
-async fn a_restart_that_fails_without_a_stop_leaves_the_result_to_the_door() {
+async fn a_restart_that_fails_without_a_stop_is_not_marked() {
     use crate::diagnostics::RestartSource;
     let (state, _root) = restart_test_state();
     let managed = register_dead_named_runner(&state, "named-no-stop").await;
-    let record = mint_test_restart(&state, &managed).await;
 
-    restart_runner_by_id(
+    let err = restart_runner_by_id(
         &state,
         "named-no-stop",
         false,
@@ -6088,24 +6102,25 @@ async fn a_restart_that_fails_without_a_stop_leaves_the_result_to_the_door() {
         false,
         BuildTree::OriginMain,
         CloseIntent::Kill,
-        Some(record.action_id),
+        None,
     )
     .await
     .expect_err("no exe can be resolved from an empty project dir");
     assert!(!managed.runner.read().await.stop_requested);
-    assert_eq!(record.run_result(), None);
+    assert!(
+        !matches!(err, SupervisorError::AfterAct(_)),
+        "nothing ran, so nothing is marked: {err:?}"
+    );
 }
 
-/// The precondition refusals a restart's START can hit after its stop ran
+/// The precondition refusals a start can hit after its restart acted
 /// (`RunnerAlreadyRunning` when a start slipped in, the non-primary port
-/// `Validation`) end the trial `Errored`: the body's post-stop record is
-/// written first, and the door's `Refused` mapping of the same error loses.
-/// Producing either for real needs a live runner process, so this drives the
-/// two writes in the order the restart door makes them.
-#[tokio::test]
-async fn a_post_stop_precondition_refusal_is_errored_not_refused() {
-    let (state, _root) = restart_test_state();
-    let managed = register_dead_named_runner(&state, "named-post-stop-refusal").await;
+/// `Validation`) map to `Refused` bare and to `Errored` once marked, carrying
+/// the refusal's own message; the marker changes neither the message nor the
+/// HTTP answer, and marking twice wraps once. Producing either refusal from a
+/// real restart needs a live runner process.
+#[test]
+fn a_marked_precondition_refusal_is_errored_not_refused() {
     for err in [
         SupervisorError::RunnerAlreadyRunning,
         SupervisorError::Validation(
@@ -6113,28 +6128,57 @@ async fn a_post_stop_precondition_refusal_is_errored_not_refused() {
                 .to_string(),
         ),
     ] {
-        let record = mint_test_restart(&state, &managed).await;
-        assert!(
-            crate::dev_action::record_failure_after_stop(&state, Some(record.action_id), &err)
-                .await
-        );
-        assert!(!record.record_run_result(crate::dev_action::run_result_for(&err)));
+        let reason = err.to_string();
+        let bare = err.to_status_body();
         assert_eq!(
-            record.run_result(),
-            Some(crate::dev_action::ActionRunResult::Errored {
-                reason: err.to_string()
-            }),
-            "{err:?}"
+            crate::dev_action::run_result_for(&err),
+            crate::dev_action::ActionRunResult::Refused {
+                reason: reason.clone()
+            }
         );
+        let marked = SupervisorError::after_act(SupervisorError::after_act(err));
+        let SupervisorError::AfterAct(inner) = &marked else {
+            panic!("after_act marks: {marked:?}");
+        };
+        assert!(
+            !matches!(**inner, SupervisorError::AfterAct(_)),
+            "marked twice: {marked:?}"
+        );
+        assert_eq!(
+            crate::dev_action::run_result_for(&marked),
+            crate::dev_action::ActionRunResult::Errored {
+                reason: reason.clone()
+            }
+        );
+        assert_eq!(marked.to_string(), reason);
+        assert_eq!(marked.to_status_body(), bare);
     }
-    // No action, nothing to record.
+}
+
+/// `rebuild_and_restart_by_id` builds before it starts, so its start failing
+/// is a failure after the body acted: the start's error must leave marked.
+/// Pinned at source level because a real build cannot run in a unit test.
+#[test]
+fn rebuild_and_restart_marks_a_failed_start_as_after_act() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("process")
+        .join("manager.rs");
+    let manager: String = std::fs::read_to_string(&path)
+        .expect("manager.rs")
+        .split_whitespace()
+        .collect();
+    let sig = "pubasyncfnrebuild_and_restart_by_id(";
+    let body = &manager[manager.find(sig).expect("rebuild_and_restart_by_id exists")..];
+    let body = body.split_once('{').expect("a body").1;
+    let start = body
+        .find("start_managed_runner(")
+        .expect("rebuild_and_restart_by_id starts the runner");
+    let after = &body[start..];
+    let call = after.split_once(';').expect("the start statement ends").0;
     assert!(
-        !crate::dev_action::record_failure_after_stop(
-            &state,
-            None,
-            &SupervisorError::RunnerAlreadyRunning
-        )
-        .await
+        call.contains(".map_err(SupervisorError::after_act)?"),
+        "rebuild_and_restart_by_id's start failure is not marked after_act: {call}"
     );
 }
 

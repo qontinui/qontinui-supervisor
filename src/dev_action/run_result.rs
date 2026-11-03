@@ -47,19 +47,22 @@ pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
 /// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner).
 /// Each refuses the step it guards before that step touches anything, which is
 /// what `Refused` asserts: nothing ran. That holds for a start door and for a
-/// restart refused before its stop. It does NOT hold for a restart's start
-/// refused AFTER its stop ran (a start slipped in between them, or the port
+/// restart refused before it acted. It does NOT hold for a restart's start
+/// refused AFTER its stop or build ran (a start slipped in between them, or the port
 /// `apply_non_primary_instance_env_with` refuses): the stop is an effect, and a
-/// `Refused` would close the attribution window on it unobserved. Those exits
-/// never reach this map: the restart body records them `Errored` itself
-/// through [`record_failure_after_stop`] before it returns, and the first write
-/// wins over the door's later `run_result_for`.
+/// `Refused` would close the attribution window on it unobserved. The body
+/// that acted marks such an exit [`SupervisorError::AfterAct`], which this map
+/// reads as `Errored` whatever it wraps; the door's own record takes it, so no
+/// store lookup (which the store's eviction cap could miss) is involved.
 ///
 /// The map is not widened for spawns: a restart's `PortHeldByLiveRunner`
 /// follows a stop that already ran, so `Errored` is right there.
 /// [`spawn_run_result`] handles the spawn-only arms and delegates the rest here.
 pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
     match err {
+        SupervisorError::AfterAct(inner) => ActionRunResult::Errored {
+            reason: inner.to_string(),
+        },
         SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
             reason: detail.message.clone(),
         },
@@ -72,28 +75,6 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
             reason: other.to_string(),
         },
     }
-}
-
-/// Record `err` as `Errored` on the action `initiated_by` names, for a
-/// lifecycle body that failed after it had already acted (a restart's stop, a
-/// rebuild-and-restart's build), so a precondition refusal of a later step is
-/// not taken for "nothing ran" by the door's [`run_result_for`]. A no-op with
-/// no action, and for an action that already has a terminal result (first
-/// write wins). Returns whether this call wrote the result.
-pub async fn record_failure_after_stop(
-    state: &SharedState,
-    initiated_by: Option<uuid::Uuid>,
-    err: &SupervisorError,
-) -> bool {
-    let Some(action_id) = initiated_by else {
-        return false;
-    };
-    let Some(record) = state.dev_actions.read().await.get(&action_id) else {
-        return false;
-    };
-    record.record_run_result(ActionRunResult::Errored {
-        reason: err.to_string(),
-    })
 }
 
 /// What a start knew about its runner's health when it answered.
