@@ -103,7 +103,7 @@ pub async fn mint_action(
 /// ([`assess_then_cut`]).
 ///
 /// The slow half of a mint lives here so a door can run it BEFORE an admission
-/// step and keep the step-to-act window as short as it was without a trial
+/// step, so the step-to-act window grows only by [`commit_action`]'s in-memory insert
 /// (`manager::serving_watchdog_restart`).
 pub async fn prepare_action(
     state: &SharedState,
@@ -136,7 +136,7 @@ pub async fn prepare_action(
 
 /// Store a prepared trial and spawn its attribution watcher over `targets`.
 ///
-/// A high risk is warned here, loudly, whatever the door does with the advice:
+/// The record's `started_at` is re-stamped here. A high risk is warned here, loudly, whatever the door does with the advice:
 /// here rather than in [`prepare_action`], so an act refused before it is
 /// committed warns about nothing it did.
 ///
@@ -149,11 +149,15 @@ pub async fn commit_action(
     backstop_override: Option<Duration>,
 ) -> MintedAction {
     let PreparedAction {
-        record,
+        mut record,
         states_active,
         predicted,
         risk,
     } = prepared;
+    // The trial starts when it is committed, not when it was evaluated: a door
+    // that prepares before an admission step (the serving watchdog's readiness
+    // gate) must not date its act before that step.
+    record.started_at = chrono::Utc::now();
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %record.action_id, kind = record.kind.as_str(), "{warn}");
         state

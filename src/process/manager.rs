@@ -6644,6 +6644,7 @@ pub async fn run_admitted_restart(
 
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
+    let mut stop_ran = false;
     let outcome = restart_after_gate(
         state,
         &managed,
@@ -6652,8 +6653,16 @@ pub async fn run_admitted_restart(
         build_tree,
         intent,
         initiated_by,
+        &mut stop_ran,
     )
     .await;
+    // A failure after the stop ran is never "nothing ran", whatever the error:
+    // record it before the door maps the error (first write wins).
+    if let Err(e) = &outcome {
+        if stop_ran {
+            crate::dev_action::record_failure_after_stop(state, initiated_by, e).await;
+        }
+    }
 
     {
         let mut runner = managed.runner.write().await;
@@ -6720,6 +6729,10 @@ pub(crate) fn orphaned_by_failed_restart(is_temp: bool, still_registered: bool) 
 /// Holds the lifecycle lock around neither its stop nor its start: each takes
 /// it itself, and the mutex is not reentrant. A start that slips in between
 /// makes this one fail `RunnerAlreadyRunning`: ordered, and reported.
+///
+/// `stop_ran` is set before the stop is attempted, so the caller can tell a
+/// failure that acted on the runner from one that did not.
+#[allow(clippy::too_many_arguments)]
 async fn restart_after_gate(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -6728,6 +6741,7 @@ async fn restart_after_gate(
     build_tree: BuildTree,
     intent: CloseIntent,
     initiated_by: Option<uuid::Uuid>,
+    stop_ran: &mut bool,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -6762,6 +6776,7 @@ async fn restart_after_gate(
         // session appeared in between. One decision per operator request.
         // `intent` rides along so a handoff restart's close-request carries
         // the handoff body and gets the extended graceful wait.
+        *stop_ran = true;
         stop_runner_by_id(state, runner_id, true, intent).await?;
     }
 
@@ -6928,9 +6943,13 @@ pub async fn rebuild_and_restart_by_id(
             Err(e) => return Err(e),
         };
 
-    // Step 3: start.
+    // Step 3: start. The stop and the build already ran, so a refused start
+    // is a failure of the action, not "nothing ran".
     let started_at = chrono::Utc::now();
-    start_managed_runner(state, &managed, initiated_by, StartAs::Restart).await?;
+    if let Err(e) = start_managed_runner(state, &managed, initiated_by, StartAs::Restart).await {
+        crate::dev_action::record_failure_after_stop(state, initiated_by, &e).await;
+        return Err(e);
+    }
     state
         .logs
         .emit(
