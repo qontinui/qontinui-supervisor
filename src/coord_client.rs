@@ -4,8 +4,9 @@
 //! [`coord_base`] turns [`AmbientCoord`] into a base URL: `None` under
 //! [`AmbientCoord::Ignore`], the given URL under `At`, and under `Read` the
 //! ambient resolution — `COORD_HTTP_URL` first, then the active profile's
-//! `coord_url` in `~/.qontinui/profiles.json`. The dev-action client (both mint
-//! sites and the attribution watcher), the fleet budget publish, the
+//! `coord_url` in `~/.qontinui/profiles.json`. The dev-action client (the
+//! expectations GET at every mint, `dev_action::prepare_action`, and the
+//! attribution watcher's snapshot POST), the fleet budget publish, the
 //! serving-watchdog alert, the resource sample, the CI-runner registration
 //! token fetch and the lineage proxy all resolve here, so one config field
 //! decides whether a process reaches coord at all.
