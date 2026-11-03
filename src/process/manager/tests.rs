@@ -6202,6 +6202,7 @@ async fn a_committed_trial_is_dated_at_its_commit() {
     // equal one taken at the commit.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let before_commit = chrono::Utc::now();
+    let instant_before_commit = tokio::time::Instant::now();
     let minted = crate::dev_action::commit_action(
         &state,
         prepared,
@@ -6213,6 +6214,10 @@ async fn a_committed_trial_is_dated_at_its_commit() {
         minted.record.started_at >= before_commit,
         "{} predates the commit at {before_commit}",
         minted.record.started_at
+    );
+    assert!(
+        minted.record.started_instant >= instant_before_commit,
+        "the watcher's window must start at the commit, not at preparation"
     );
 }
 
