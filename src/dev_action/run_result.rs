@@ -177,6 +177,10 @@ pub fn record_start_verdict(
             guard.record().record_run_result(result);
         }
         StartVerdict::AfterHealthWait => {
+            if let Some(result) = no_health_wait_target(runner_id) {
+                guard.record().record_run_result(result);
+                return;
+            }
             let state = state.clone();
             let runner_id = runner_id.to_string();
             tokio::spawn(async move {
@@ -196,10 +200,42 @@ pub fn record_start_verdict(
     }
 }
 
+/// The reason token of a start that left no runner to wait on.
+pub const NO_RUNNER_TO_WAIT_ON: &str = "no_runner_to_wait_on";
+
+/// The result to record instead of a health wait when there is no runner to
+/// wait on. A restart resolves the primary's id after its start and passes
+/// `""` when no primary is registered by then; probing `""` would only time
+/// out and record `runner_unhealthy_after_start` about a runner that does not
+/// exist. Say what happened instead.
+fn no_health_wait_target(runner_id: &str) -> Option<ActionRunResult> {
+    runner_id
+        .trim()
+        .is_empty()
+        .then(|| ActionRunResult::Errored {
+            reason: format!(
+                "{NO_RUNNER_TO_WAIT_ON}: the start answered without waiting and no runner \
+             was registered to run its health wait on"
+            ),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_start_with_no_runner_to_wait_on_records_that_instead_of_a_health_wait() {
+        match no_health_wait_target("") {
+            Some(ActionRunResult::Errored { reason }) => {
+                assert!(reason.starts_with("no_runner_to_wait_on:"), "{reason}");
+            }
+            other => panic!("an empty runner id must record Errored, got {other:?}"),
+        }
+        assert!(no_health_wait_target("  ").is_some());
+        assert_eq!(no_health_wait_target("primary"), None);
+    }
 
     fn verdict_of(status: u16, body: serde_json::Value) -> StartVerdict {
         spawn_run_result(&Ok((StatusCode::from_u16(status).unwrap(), body)))

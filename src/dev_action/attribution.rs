@@ -602,6 +602,11 @@ async fn scan_spawn_effects(
 /// returns `Errored` for either), so its `Errored` arm counts only when both are
 /// absent: otherwise a `ui_error` dated out of the span would fall through to it
 /// and still emit the signature.
+///
+/// **Residual:** that undated `Errored` arm can also come from the runner's own
+/// self-reported status, which carries no date. With an initiated spawn in the
+/// window it is read as this action's, even if the runner reported it about an
+/// earlier boot. It is the one health signal the span cannot bound.
 async fn scan_health(
     state: &SharedState,
     managed: Option<&ManagedRunner>,
