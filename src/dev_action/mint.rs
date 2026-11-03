@@ -37,10 +37,8 @@ pub struct MintedAction {
 }
 
 impl MintedAction {
-    /// The fields a lifecycle door's ACK carries about its action. The spawn doors
-    /// stamp a failed spawn's response too. The start and restart doors' refusals
-    /// and errors, their 503 after a start, and an abandoned spawn name no
-    /// `action_id` and carry none of these.
+    /// The fields a lifecycle door's ACK carries about its action. A response with
+    /// no `action_id` was not stamped and carries none of them.
     pub fn ack_fields(&self) -> serde_json::Value {
         let action_id = self.record.action_id;
         serde_json::json!({

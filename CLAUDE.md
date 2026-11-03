@@ -944,10 +944,11 @@ counted without another reset.
 empty expectations list, so `risk: null` beside `predicted: []` reads the same whether
 coord has no rows or never answered. `expectations_basis` separates them. It is coord's
 top-level `evidence_basis` for that kind and state set, verbatim. It travels with
-`action_id`: `MintedAction::ack_fields` renders both on a door's ACK. The spawn doors stamp
-a failed spawn's response too; the start and restart doors' refusals and errors, their 503
-after a start, and an abandoned spawn name no `action_id` and carry neither.
-`GET /actions/{id}/outcome` serves it as `action.expectations_basis`.
+`action_id`: `MintedAction::ack_fields` renders both, so a response with no `action_id`
+has no `expectations_basis` either. That absence means the door did not stamp that
+response (it answered before its mint, joined an in-flight build, or returned a refusal or
+error), not that coord gave no answer. `GET /actions/{id}/outcome` serves the field as
+`action.expectations_basis`.
 
 | `expectations_basis` | Meaning |
 |---|---|
