@@ -888,13 +888,11 @@ pub fn spawn_attribution_watcher_with_timing(
         // sends this machine's device id to a planted coord.
         let access = &state.config.ambient_coord;
         if let Some(base) = crate::coord_client::coord_base(access) {
-            let ambient = matches!(access, crate::config::AmbientCoord::Read);
-            let device_id = ambient
-                .then(crate::dev_action::ingest::resolve_device_id)
-                .flatten();
-            let tenant_id = ambient
-                .then(crate::dev_action::ingest::resolve_tenant_id)
-                .flatten();
+            let (device_id, tenant_id) = snapshot_identity(
+                access,
+                crate::dev_action::ingest::resolve_device_id,
+                crate::dev_action::ingest::resolve_tenant_id,
+            );
             let ingest_record = Arc::clone(&record);
             tokio::spawn(async move {
                 crate::dev_action::post_snapshot_to_coord(
@@ -978,6 +976,22 @@ fn merge(
     }
     if primary_ev.is_none() {
         *primary_ev = extra_ev;
+    }
+}
+
+/// The device and tenant ids a dev-action snapshot carries to coord: the
+/// machine's own, read through `device` / `tenant`, under `AmbientCoord::Read`
+/// only. Any other access sends none, and never calls either reader, so a test's
+/// planted coord never receives this machine's identity.
+fn snapshot_identity(
+    access: &crate::config::AmbientCoord,
+    device: impl FnOnce() -> Option<uuid::Uuid>,
+    tenant: impl FnOnce() -> Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, Option<uuid::Uuid>) {
+    if matches!(access, crate::config::AmbientCoord::Read) {
+        (device(), tenant())
+    } else {
+        (None, None)
     }
 }
 
@@ -2968,5 +2982,29 @@ mod tests {
         .await;
         assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);
         assert_eq!(earlier.category, D3Category::Confirmed);
+    }
+    #[test]
+    fn snapshot_identity_is_read_under_read_only() {
+        use crate::config::AmbientCoord;
+        let id = uuid::Uuid::from_u128(7);
+        assert_eq!(
+            snapshot_identity(&AmbientCoord::Read, || Some(id), || Some(id)),
+            (Some(id), Some(id)),
+            "under Read the snapshot carries this machine's identity"
+        );
+        for access in [
+            AmbientCoord::Ignore,
+            AmbientCoord::At("http://127.0.0.1:1".into()),
+        ] {
+            assert_eq!(
+                snapshot_identity(
+                    &access,
+                    || panic!("{access:?} read the device id"),
+                    || panic!("{access:?} read the tenant id"),
+                ),
+                (None, None),
+                "{access:?} must send no identity and read none"
+            );
+        }
     }
 }
