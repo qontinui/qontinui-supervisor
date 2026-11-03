@@ -156,8 +156,14 @@ jobs:
     runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     steps:
+      # persist-credentials: false because no later step needs git auth, and
+      # on the pool .git/config outlives the job in a home every
+      # registration on the host shares. The same holds for every checkout
+      # in the four routed jobs.
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # SELF-HOSTED ONLY (`route` put this job on the pool). What a hosted VM
       # hands every job and a persistent host has to be told:
@@ -167,14 +173,18 @@ jobs:
       #      the change's, and a re-run goes hosted. lsof and python3 are what
       #      the orphan-kill suite below exercises the kill primitives with;
       #      without them it would fail ~10 minutes in.
-      #   2. A HOME of its own. Every registration on the host runs as ONE
-      #      account with ONE home, so the job gets HOME and TMPDIR under
-      #      $RUNNER_TEMP, which the runner empties per job. CARGO_HOME and
-      #      RUSTUP_HOME stay on the account's persistent toolchain and
-      #      registry. cargo locks its package cache; every job's toolchain
-      #      step also rewrites rustup's settings there, always with the same
-      #      value. This runs before the toolchain step, which finds rustup
-      #      through CARGO_HOME.
+      #   2. A HOME of its own, and a rustup of the registration's own. Every
+      #      registration on the host runs as ONE account with ONE home, so
+      #      the job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
+      #      empties per job. CARGO_HOME stays on the account's persistent
+      #      registry, which cargo locks itself. RUSTUP_HOME does not: the
+      #      toolchain step runs `rustup default`, which on the account's
+      #      shared RUSTUP_HOME rewrites the settings every other job on the
+      #      host reads. One registration runs one job at a time, so a
+      #      RUSTUP_HOME per registration, beside its target below, has no
+      #      concurrent writer; it downloads 1.95.0 once per registration.
+      #      This runs before the toolchain step, which finds rustup through
+      #      CARGO_HOME.
       #   3. A PERSISTED SIBLING. The runner keeps $GITHUB_WORKSPACE/..
       #      between jobs, and the sibling checkout below reuses the
       #      ../qontinui-schemas there: re-cloning it would reset the mtimes
@@ -205,7 +215,7 @@ jobs:
       #      frontend/node_modules stay in the workspace, so the clean still
       #      hands the no-dist step below the fresh tree it requires, and
       #      build.rs reruns for an absent dist/.
-      - name: "Self-hosted: host check, own HOME, compile caps and the persistent target"
+      - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
         if: runner.environment == 'self-hosted'
         shell: bash
         run: |
@@ -220,8 +230,9 @@ jobs:
           fi
 
           pool_home="$HOME"
+          state="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME"
           job_home="$RUNNER_TEMP/home"
-          mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
+          mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
 
           budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
           cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
@@ -243,16 +254,16 @@ jobs:
 
           {
             echo "CARGO_HOME=${CARGO_HOME:-$pool_home/.cargo}"
-            echo "RUSTUP_HOME=${RUSTUP_HOME:-$pool_home/.rustup}"
+            echo "RUSTUP_HOME=$state/rustup"
             echo "HOME=$job_home"
             echo "TMPDIR=$RUNNER_TEMP/tmp"
             echo "CARGO_BUILD_JOBS=$jobs"
             echo "RUST_TEST_THREADS=$threads"
           } >> "$GITHUB_ENV"
-          echo "HOME -> $job_home (persistent home $pool_home kept for CARGO_HOME, RUSTUP_HOME and the target)"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this registration's, under $state"
           echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
 
-          cache="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME/target"
+          cache="$state/target"
           mkdir -p "$cache"
           if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
             echo "::notice title=persistent target reset::du could not read $cache: starting cold"
@@ -392,6 +403,7 @@ jobs:
             src-tauri/src/instance_env.rs
           sparse-checkout-cone-mode: false
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Check formatting
         run: cargo fmt --check
@@ -941,6 +953,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # SELF-HOSTED ONLY: a HOME and TMPDIR of the job's own, as in Rust Check
       # (every registration on the host shares one account and one home).
       - name: "Self-hosted: own HOME and TMPDIR"
@@ -1004,12 +1018,14 @@ jobs:
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # SELF-HOSTED ONLY. The same step as Rust Check's, which says why each
       # part exists; keep the two identical. The persistent target is keyed by
       # registration, not by job, so whichever of the two jobs a registration
       # ran last left it warm for the other.
-      - name: "Self-hosted: host check, own HOME, compile caps and the persistent target"
+      - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
         if: runner.environment == 'self-hosted'
         shell: bash
         run: |
@@ -1024,8 +1040,9 @@ jobs:
           fi
 
           pool_home="$HOME"
+          state="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME"
           job_home="$RUNNER_TEMP/home"
-          mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
+          mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
 
           budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
           cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
@@ -1047,16 +1064,16 @@ jobs:
 
           {
             echo "CARGO_HOME=${CARGO_HOME:-$pool_home/.cargo}"
-            echo "RUSTUP_HOME=${RUSTUP_HOME:-$pool_home/.rustup}"
+            echo "RUSTUP_HOME=$state/rustup"
             echo "HOME=$job_home"
             echo "TMPDIR=$RUNNER_TEMP/tmp"
             echo "CARGO_BUILD_JOBS=$jobs"
             echo "RUST_TEST_THREADS=$threads"
           } >> "$GITHUB_ENV"
-          echo "HOME -> $job_home (persistent home $pool_home kept for CARGO_HOME, RUSTUP_HOME and the target)"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this registration's, under $state"
           echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
 
-          cache="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME/target"
+          cache="$state/target"
           mkdir -p "$cache"
           if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
             echo "::notice title=persistent target reset::du could not read $cache: starting cold"
@@ -1184,6 +1201,8 @@ jobs:
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # SELF-HOSTED ONLY: a HOME and TMPDIR of the job's own, as in Rust Check
       # (every registration on the host shares one account and one home). npm's
