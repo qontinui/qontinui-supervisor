@@ -2446,7 +2446,7 @@ mod tests {
             crate::coord_client::coord_base_with(
                 &config.ambient_coord,
                 || panic!("read COORD_HTTP_URL"),
-                || panic!("read profiles.json"),
+                || panic!("read the profiles file"),
             ),
             None
         );
@@ -2552,83 +2552,151 @@ mod tests {
         );
     }
 
-    /// The spellings of an ambient coord-base resolution, whitespace removed:
-    /// any literal naming the `COORD_HTTP_URL` variable (an `env::var` read, or
-    /// a constant it would read through), any literal naming `profiles.json`,
-    /// and the serde field a profiles parser declares to read a profile's coord
-    /// URL. Built here, so this file holds none of them.
-    fn ambient_coord_resolver_needles() -> Vec<String> {
-        let env_var = ["COORD", "HTTP", "URL"].join("_");
-        let file = ["profiles", "json"].join(".");
+    /// One spelling of an ambient coord resolution (whitespace removed), and
+    /// the exact number of times each sanctioned file may carry it. Every
+    /// other file under `src/` and `tests/` must carry it zero times.
+    struct CoordNeedle {
+        needle: String,
+        allowed: Vec<(PathBuf, usize)>,
+    }
+
+    /// The spellings of an ambient coord resolution, built here so this file
+    /// holds none of them. In order:
+    ///
+    /// - a string literal of the coord HTTP-URL variable the resolver reads;
+    /// - a literal ENDING in the profiles file name, with or without a
+    ///   directory before it;
+    /// - the profile's coord-URL key as a string literal (a serde rename, a
+    ///   JSON key, a projection list);
+    /// - a field of that name followed by its colon, whatever its type;
+    /// - a literal ending in the generic coord-URL variable suffix, so the
+    ///   QONTINUI-prefixed variable and a bare one both match;
+    /// - the name of `fleet`'s machine-file reader, called or passed as a
+    ///   reader (the box's device identity);
+    /// - a path call of the ambient `DeviceSources` constructor (the box's
+    ///   seeded JWTs and the primary runner's mint), through the type or
+    ///   through `Self`.
+    ///
+    /// The counts are exact, so a second resolver added to a sanctioned file
+    /// fails the scan as surely as one added anywhere else.
+    fn ambient_coord_needles() -> Vec<CoordNeedle> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let resolver = src.join("coord_client.rs");
+        let instance_root = src.join("process").join("instance_root.rs");
+        let symbol_watcher = src.join("symbol_watcher");
+        let fleet = src.join("fleet.rs");
+        let ingest = src.join("dev_action").join("ingest.rs");
+        let coord_url = ["coord", "url"].join("_");
+        let needle =
+            |needle: String, allowed: Vec<(PathBuf, usize)>| CoordNeedle { needle, allowed };
         vec![
-            format!("\"{env_var}\""),
-            format!("\"{file}\""),
-            format!("{}:Option<String>", ["coord", "url"].join("_")),
+            // The one resolver reads the variable.
+            needle(
+                format!("\"{}\"", ["COORD", "HTTP", "URL"].join("_")),
+                vec![(resolver.clone(), 1)],
+            ),
+            // The resolver joins the path (and names it in two test panics);
+            // `instance_root` projects the file into a spawned runner's home,
+            // never to resolve a base for the supervisor.
+            needle(
+                format!("{}\"", ["profiles", "json"].join(".")),
+                vec![(resolver.clone(), 3), (instance_root.clone(), 11)],
+            ),
+            // JSON keys in the resolver's tests; `instance_root`'s projected
+            // keys and their tests.
+            needle(
+                format!("\"{coord_url}\""),
+                vec![(resolver.clone(), 2), (instance_root, 5)],
+            ),
+            // The resolver's profile subset; `symbol_watcher`'s own config.
+            needle(
+                format!("{coord_url}:"),
+                vec![(resolver, 1), (symbol_watcher.join("mod.rs"), 1)],
+            ),
+            // `symbol_watcher` is a separate CLI subcommand outside the
+            // switch, with its own variable (and a test that sets it).
+            needle(
+                format!("{}\"", ["COORD", "URL"].join("_")),
+                vec![
+                    (symbol_watcher.join("mod.rs"), 1),
+                    (symbol_watcher.join("tests.rs"), 2),
+                ],
+            ),
+            // `fleet`: the definition, `DeviceSources::ambient`'s reader and
+            // one doc mention. `dev_action::ingest`: its own private reader
+            // (definition and two calls), reached only after
+            // `coord_client::coord_base` resolved a base.
+            needle(
+                ["load", "machine", "file"].join("_"),
+                vec![(fleet.clone(), 3), (ingest, 3)],
+            ),
+            // `DeviceSources::for_access`, under `AmbientCoord::Read` only.
+            needle(format!("::{}(", ["amb", "ient"].concat()), vec![(fleet, 1)]),
         ]
     }
 
     #[test]
     fn no_ambient_coord_resolver_outside_coord_base() {
         // Every path that reaches coord resolves its base through
-        // `coord_client::coord_base`, so `AmbientCoord::Ignore` keeps a test off
-        // production coord on all of them. A second resolver would read the
-        // environment or the profile with no switch, which is how the fleet
-        // budget, the serving-watchdog alert, the resource sample and the
-        // CI-runner and lineage routes did until plan
+        // `coord_client::coord_base`, and every device-authed publish takes
+        // its identity from `fleet::DeviceSources::for_access`, so
+        // `AmbientCoord::Ignore` (and `At`) keep a test off production coord
+        // and off this box's identity on all of them. A second resolver would
+        // read the environment, the profile or `machine.json` with no switch,
+        // which is how the fleet budget, the serving-watchdog alert, the
+        // resource sample and the CI-runner and lineage routes did until plan
         // `2026-11-03-supervisor-dev-action-residuals-…` Phase 2.
-        //
-        // One allowlisted file: `process::instance_root` reads `profiles.json`
-        // to PROJECT it into a spawned runner's home, never to resolve a coord
-        // base for the supervisor itself.
-        let needles = ambient_coord_resolver_needles();
-        let (env_var, file, field) = (&needles[0], &needles[1], &needles[2]);
+        let needles = ambient_coord_needles();
 
         // The needles prove nothing unless they match the forms a resolver
-        // would write, split across lines or not.
-        for (sample, needle) in [
-            (
-                format!("let u = std::env::var(\n    {env_var},\n);"),
-                env_var,
+        // would write, split across lines or not. One sample per needle, in
+        // order.
+        let coord_url = ["coord", "url"].join("_");
+        let samples = [
+            format!(
+                "let u = std::env::var(\n    \"{}\",\n);",
+                ["COORD", "HTTP", "URL"].join("_")
             ),
-            (format!("const ENV: &str = {env_var};"), env_var),
-            (format!("home.join(\".qontinui\").join({file})"), file),
-            (
-                format!(
-                    "struct P {{\n    {}: Option<String>,\n}}",
-                    ["coord", "url"].join("_")
-                ),
-                field,
+            format!(
+                "home.join(\".qontinui/{}\")",
+                ["profiles", "json"].join(".")
             ),
-        ] {
+            format!("#[serde(rename = \"{coord_url}\")]"),
+            format!("pub {coord_url}:\n    String,"),
+            format!(
+                "const ENV: &str = \"{}\";",
+                ["QONTINUI", "COORD", "URL"].join("_")
+            ),
+            format!("machine: {},", ["load", "machine", "file"].join("_")),
+            format!("fleet::DeviceSources::{}()", ["amb", "ient"].concat()),
+        ];
+        assert_eq!(samples.len(), needles.len(), "one sample per needle");
+        for (sample, n) in samples.iter().zip(&needles) {
             assert!(
-                Squeezed::new(&sample).text.contains(needle.as_str()),
-                "{needle} does not match {sample}"
+                Squeezed::new(sample).text.contains(n.needle.as_str()),
+                "{} does not match {sample}",
+                n.needle
             );
         }
 
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let resolver = src.join("coord_client.rs");
-        let allowlisted = [src.join("process").join("instance_root.rs")];
-
         let mut offenders = Vec::new();
-        let mut in_resolver = vec![0usize; needles.len()];
+        let mut seen: Vec<Vec<usize>> = needles.iter().map(|n| vec![0; n.allowed.len()]).collect();
         let mut files_scanned = 0usize;
         for path in crate_sources() {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
             files_scanned += 1;
             let squeezed = Squeezed::new(&source);
-            if path == resolver {
-                for (count, needle) in in_resolver.iter_mut().zip(&needles) {
-                    *count = squeezed.text.matches(needle.as_str()).count();
+            for (n, seen) in needles.iter().zip(seen.iter_mut()) {
+                let found = squeezed.lines_matching(std::slice::from_ref(&n.needle));
+                match n.allowed.iter().position(|(p, _)| *p == path) {
+                    Some(i) => seen[i] = found.len(),
+                    None => offenders.extend(
+                        found
+                            .into_iter()
+                            .map(|line| format!("{}:{line} ({})", path.display(), n.needle)),
+                    ),
                 }
-                continue;
-            }
-            if allowlisted.contains(&path) {
-                continue;
-            }
-            for line in squeezed.lines_matching(&needles) {
-                offenders.push(format!("{}:{line}", path.display()));
             }
         }
 
@@ -2637,15 +2705,30 @@ mod tests {
             "scanned only {files_scanned} source file(s)"
         );
         assert!(
-            in_resolver.iter().all(|n| *n > 0),
-            "the scan no longer matches the one resolver in coord_client.rs \
-             (matches per needle: {in_resolver:?}) — the needles have drifted from it"
-        );
-        assert!(
             offenders.is_empty(),
-            "these files resolve a coord base outside `coord_client::coord_base`; \
-             call it with the config's `ambient_coord` instead:\n  {}",
+            "these files resolve a coord base or this box's identity outside \
+             `coord_client::coord_base` / `fleet::DeviceSources::for_access`; \
+             call them with the config's `ambient_coord` instead:\n  {}",
             offenders.join("\n  ")
+        );
+        let drifted: Vec<String> = needles
+            .iter()
+            .zip(&seen)
+            .flat_map(|(n, seen)| {
+                n.allowed
+                    .iter()
+                    .zip(seen)
+                    .filter(|((_, want), got)| want != *got)
+                    .map(move |((p, want), got)| {
+                        format!("{} in {}: {got}, allowed {want}", n.needle, p.display())
+                    })
+            })
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "a sanctioned file no longer carries exactly its allowed count — a second \
+             resolver was added there, or one moved and the table must follow it:\n  {}",
+            drifted.join("\n  ")
         );
     }
 

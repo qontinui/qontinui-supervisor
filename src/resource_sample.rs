@@ -347,7 +347,7 @@ fn resolve_target(
 /// and telemetry must not be able to disturb builds. Under
 /// [`AmbientCoord::Ignore`] it returns having read nothing ambient.
 pub async fn publish(access: &AmbientCoord, snapshot: &FootprintSnapshot) {
-    publish_from(access, &DeviceSources::ambient(), snapshot).await
+    publish_from(access, &DeviceSources::for_access(access), snapshot).await
 }
 
 /// [`publish`] with its identity sources passed in — the seam the counting
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(
             runner.connections(),
             1,
-            "the mint asks the stub runner once"
+            "the mint connects to the stub runner once"
         );
         assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
     }

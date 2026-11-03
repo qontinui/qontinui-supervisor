@@ -1601,12 +1601,23 @@ production rows (coord finding `ab7c97d7`). An integration test names `Ignore` i
 its struct literal, and `config::tests::no_test_config_reads_the_ambient_coord`
 fails on an `ambient_coord` field set to `Read` outside `from_args` (a source scan
 of field and binding forms, so a value passed through a local is not caught).
-`config::tests::no_ambient_coord_resolver_outside_coord_base` fails on a
-`COORD_HTTP_URL` or `profiles.json` literal, or a profiles `coord_url` field,
-anywhere but `coord_client.rs` (allowlisted: `process/instance_root.rs`, which
-projects `profiles.json` into a subject's home). `symbol_watcher` is outside the
-switch by design: it is a separate CLI subcommand with its own
-`QONTINUI_COORD_URL`.
+The identity follows the same value: a device-authed publish takes its
+`fleet::DeviceSources` from `DeviceSources::for_access`, which reads
+`machine.json`, the seeded JWT rungs and the primary runner's mint under `Read`
+only. Under `At(<stub>)` it reads none of them, so the budget and the resource
+sample skip for want of a device id and the serving-watchdog alert goes to the
+stub with no identity; a test that wants one passes `DeviceSources::fixture`
+through the `_from` seams.
+`config::tests::no_ambient_coord_resolver_outside_coord_base` is a source scan
+with an exact per-file count for each spelling: a `COORD_HTTP_URL` literal, a
+literal ending in `profiles.json`, a `"coord_url"` literal, a `coord_url:`
+field, a literal ending in `COORD_URL`, `load_machine_file`, and a
+`::ambient(` call. Each is allowed only in its sanctioned files —
+`coord_client.rs`; `process/instance_root.rs`, which projects `profiles.json`
+into a subject's home; `symbol_watcher/`, a separate CLI subcommand outside the
+switch by design with its own `QONTINUI_COORD_URL`; `fleet.rs`; and
+`dev_action/ingest.rs`'s private machine-file reader — and a count that moves
+in a sanctioned file fails the scan as surely as a match anywhere else.
 
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
