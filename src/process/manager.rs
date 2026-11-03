@@ -4311,13 +4311,10 @@ async fn emit_serving_event(
             detail: detail.clone(),
         });
 
-    // A test drives `maybe_serving_restart` directly, and this would post its
-    // alert to whatever coord the box's profile names, which is production on
-    // the operator box.
-    if cfg!(test) {
-        return;
-    }
-
+    // A test drives `maybe_serving_restart` directly; its config's
+    // `ambient_coord` is `Ignore` (or `At` a stub), so the alert below reaches
+    // neither the coord the box's profile names nor the runner's JWT mint.
+    let access = state.config.ambient_coord.clone();
     let notice = crate::fleet::ServingWatchdogNotice {
         runner_id: runner_id.to_string(),
         event,
@@ -4328,7 +4325,7 @@ async fn emit_serving_event(
         detail,
     };
     tokio::spawn(async move {
-        match crate::fleet::notify_serving_watchdog(&notice).await {
+        match crate::fleet::notify_serving_watchdog(&access, &notice).await {
             Ok(outcome) => {
                 debug!("serving watchdog alert delivered to coord: {outcome:?}");
             }

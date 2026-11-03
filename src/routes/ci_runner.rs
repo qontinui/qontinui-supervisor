@@ -15,52 +15,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::ci_runner_lifecycle;
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
 use crate::state::SharedState;
 
 /// Reject absurdly large `Authorization` header values before touching reqwest.
 /// Mirrors the bound used by the web-fleet proxy.
 const MAX_HEADER_VALUE_LEN: usize = 4096;
-
-// ---------------------------------------------------------------------------
-// Coord integration: resolve coord base URL from ~/.qontinui/profiles.json
-// ---------------------------------------------------------------------------
-
-/// Minimal subset of `~/.qontinui/profiles.json` — duplicated from
-/// `fleet.rs` to keep this module self-contained.
-#[derive(Debug, Clone, Deserialize)]
-struct ProfilesFile {
-    active: Option<String>,
-    profiles: std::collections::HashMap<String, ProfileSubset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfileSubset {
-    coord_url: Option<String>,
-}
-
-fn profiles_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
-}
-
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
-fn coord_http_base() -> Option<String> {
-    let bytes = std::fs::read(profiles_path()?).ok()?;
-    let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
-}
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -176,13 +137,21 @@ impl FetchTokenError {
     }
 }
 
-/// Fetch a CI runner registration token from coord, forwarding the caller's
-/// `Authorization` value verbatim. The supervisor adds no credential of its own.
-async fn fetch_registration_token(auth: &HeaderValue) -> Result<String, FetchTokenError> {
-    let base = coord_http_base().ok_or_else(|| {
-        FetchTokenError::Unreachable(
-            "could not resolve coord URL from ~/.qontinui/profiles.json".to_string(),
-        )
+/// Fetch a CI runner registration token from the coord `access` resolves to
+/// ([`coord_base`]), forwarding the caller's `Authorization` value verbatim.
+/// The supervisor adds no credential of its own. With no coord (`Ignore`, or no
+/// configured URL) it makes no request.
+async fn fetch_registration_token(
+    access: &AmbientCoord,
+    auth: &HeaderValue,
+) -> Result<String, FetchTokenError> {
+    let base = coord_base(access).ok_or_else(|| {
+        FetchTokenError::Unreachable(match access {
+            AmbientCoord::Ignore => "no coord: the ambient coord is Ignore".to_string(),
+            _ => "could not resolve coord URL: COORD_HTTP_URL unset and \
+                  ~/.qontinui/profiles.json missing or the active profile has no coord_url"
+                .to_string(),
+        })
     })?;
 
     let url = format!("{base}/coord/ci-runner/registration-token");
@@ -266,7 +235,7 @@ fn resolve_runner_name() -> String {
 /// 3. Configures the runner with the token + labels.
 /// 4. Installs and starts the systemd service.
 pub async fn enable(
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Json(body): Json<EnableRequest>,
 ) -> Response {
@@ -280,7 +249,7 @@ pub async fn enable(
     };
 
     // 1. Get registration token from coord, forwarding the device credential.
-    let token = match fetch_registration_token(&auth).await {
+    let token = match fetch_registration_token(&state.config.ambient_coord, &auth).await {
         Ok(t) => t,
         Err(e) => {
             match &e {
@@ -320,7 +289,7 @@ pub async fn enable(
 
 /// `POST /ci-runner/disable` — Stop and deregister the CI runner.
 pub async fn disable(
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Json(body): Json<DisableRequest>,
 ) -> Response {
@@ -335,7 +304,7 @@ pub async fn disable(
 
     let token = match body.token {
         Some(t) => t,
-        None => match fetch_registration_token(&auth).await {
+        None => match fetch_registration_token(&state.config.ambient_coord, &auth).await {
             Ok(t) => t,
             Err(e) => {
                 match &e {
@@ -501,5 +470,34 @@ mod tests {
             body.contains("failed to get registration token from coord"),
             "distinct unreachable message, got: {body}"
         );
+    }
+
+    /// The registration-token fetch obeys the ambient-coord switch: no
+    /// connection under `Ignore`, one under `At`, forwarding the caller's
+    /// credential.
+    #[tokio::test]
+    async fn registration_token_fetch_reaches_coord_only_under_at() {
+        use crate::coord_client::counting_listener;
+        let coord = counting_listener::serve().await;
+        let auth = HeaderValue::from_static("Bearer device-jwt-token");
+
+        match fetch_registration_token(&AmbientCoord::Ignore, &auth).await {
+            Err(FetchTokenError::Unreachable(detail)) => {
+                assert!(detail.contains("Ignore"), "{detail}")
+            }
+            Err(FetchTokenError::CredentialRejected(d)) => panic!("rejected under Ignore: {d}"),
+            Ok(t) => panic!("Ignore fetched a token: {t}"),
+        }
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+
+        let token =
+            match fetch_registration_token(&AmbientCoord::At(coord.base.clone()), &auth).await {
+                Ok(t) => t,
+                Err(FetchTokenError::Unreachable(d) | FetchTokenError::CredentialRejected(d)) => {
+                    panic!("the stub answers 200: {d}")
+                }
+            };
+        assert_eq!(token, "stub-token");
+        assert_eq!(coord.connections(), 1);
     }
 }

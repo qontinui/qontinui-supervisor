@@ -40,6 +40,9 @@ use std::time::Duration;
 use serde::Serialize;
 use tracing::{debug, warn};
 
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
+use crate::fleet::DeviceSources;
 use crate::footprint::{BuildPoolOccupancy, FootprintSnapshot, MemorySnapshot};
 
 /// Per-request HTTP timeout. Short on purpose: this runs on the footprint
@@ -284,16 +287,32 @@ fn failure_message(
     )
 }
 
-/// Resolve machine identity, coord URL and CPU count.
+/// Resolve coord URL, machine identity and CPU count.
 ///
-/// Every step here touches the filesystem (`machine.json`, `profiles.json`),
+/// Every step here can touch the filesystem (`profiles.json`, `machine.json`),
 /// so it runs inside `spawn_blocking` — a stalled volume must
 /// not park a tokio worker, and the surrounding code already knows this (the
 /// footprint walk is `spawn_blocking`-hosted for the same reason).
 ///
-/// `Err` carries a ready-to-log reason.
-fn resolve_target() -> Result<PublishTarget, String> {
-    let machine = crate::fleet::load_machine_file().ok_or_else(|| {
+/// The coord base is resolved FIRST, through the one resolver: `Ok(None)` under
+/// [`AmbientCoord::Ignore`], before `machine` is read. `Err` carries a
+/// ready-to-log reason.
+fn resolve_target(
+    access: &AmbientCoord,
+    machine: fn() -> Option<crate::fleet::MachineFile>,
+) -> Result<Option<PublishTarget>, String> {
+    let base = match coord_base(access) {
+        Some(base) => base,
+        None if *access == AmbientCoord::Ignore => return Ok(None),
+        None => {
+            return Err(
+                "no coord base: COORD_HTTP_URL unset and ~/.qontinui/profiles.json \
+                        missing or its active profile has no coord_url"
+                    .to_string(),
+            )
+        }
+    };
+    let machine = machine().ok_or_else(|| {
         "~/.qontinui/machine.json missing — run `qontinui_profile machine init` on this host"
             .to_string()
     })?;
@@ -307,9 +326,6 @@ fn resolve_target() -> Result<PublishTarget, String> {
     let device_id = uuid::Uuid::parse_str(raw.trim())
         .map_err(|e| format!("machine.json device_id is not a UUID ({e})"))?
         .to_string();
-    let base = crate::fleet::coord_http_base().ok_or_else(|| {
-        "~/.qontinui/profiles.json missing or its active profile has no coord_url".to_string()
-    })?;
     // Same probe `fleet::detect_resources` uses for `cpu_cores`, without its
     // disk enumeration + memory refresh — this module must not re-sample what
     // the footprint snapshot already carries.
@@ -317,21 +333,39 @@ fn resolve_target() -> Result<PublishTarget, String> {
         .map(|n| n.get() as u32)
         .unwrap_or(1)
         .max(1);
-    Ok(PublishTarget {
+    Ok(Some(PublishTarget {
         url: format!("{base}/coord/devices/{device_id}/resource-sample"),
         device_id,
         base,
         cpu_cores,
-    })
+    }))
 }
 
 /// Best-effort publish of one `lane='host'`, `source='supervisor'` sample.
 ///
 /// Never returns an error and never panics: the caller is the footprint timer,
-/// and telemetry must not be able to disturb builds.
-pub async fn publish(snapshot: &FootprintSnapshot) {
-    let target = match tokio::task::spawn_blocking(resolve_target).await {
-        Ok(Ok(t)) => t,
+/// and telemetry must not be able to disturb builds. Under
+/// [`AmbientCoord::Ignore`] it returns having read nothing ambient.
+pub async fn publish(access: &AmbientCoord, snapshot: &FootprintSnapshot) {
+    publish_from(access, &DeviceSources::ambient(), snapshot).await
+}
+
+/// [`publish`] with its identity sources passed in — the seam the counting
+/// tests drive.
+pub(crate) async fn publish_from(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
+    snapshot: &FootprintSnapshot,
+) {
+    let (access_owned, machine) = (access.clone(), sources.machine);
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_target(&access_owned, machine)).await;
+    let target = match resolved {
+        Ok(Ok(Some(t))) => t,
+        Ok(Ok(None)) => {
+            debug!("resource_sample: ambient coord is Ignore — not publishing");
+            return;
+        }
         Ok(Err(reason)) => {
             note_failure(&reason);
             return;
@@ -349,7 +383,7 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     } = target;
     // The shared resolver is async (file read + runner mint), so the bearer
     // is resolved here rather than inside the blocking identity hop.
-    let (bearer, bearer_source) = crate::fleet::resolve_device_bearer_for(&base).await;
+    let (bearer, bearer_source) = crate::fleet::resolve_device_bearer_for(&base, sources).await;
 
     // sysfs reads are blocking I/O: keep them off the async worker.
     let cpu_temp_c = tokio::task::spawn_blocking(cpu_package_temp_c)
@@ -401,6 +435,45 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
 mod tests {
     use super::*;
     use crate::footprint::{ExeCopiesFootprint, SpawnContainersFootprint};
+
+    /// Under `Ignore` the sample reaches neither coord nor the runner's mint and
+    /// reads no `machine.json`; under `At` it connects to each once.
+    #[tokio::test]
+    async fn resource_sample_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::AtomicUsize;
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<crate::fleet::MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            crate::fleet::fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let snapshot = snapshot_fixture();
+
+        publish_from(&AmbientCoord::Ignore, &sources, &snapshot).await;
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        publish_from(&AmbientCoord::At(coord.base.clone()), &sources, &snapshot).await;
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint asks the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
+    }
 
     fn snapshot_fixture() -> FootprintSnapshot {
         FootprintSnapshot {

@@ -15,9 +15,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::coord_client::coord_base;
 use crate::dev_action::{
-    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
-    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
+    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;

@@ -120,7 +120,7 @@ struct ExpectationsResponse {
 
 /// Fetch state-conditioned expectations from the coord at `base` for
 /// `(action_kind, state_ids)`. `base` comes from
-/// [`crate::dev_action::ingest::coord_base`]; `None` makes no request.
+/// [`crate::coord_client::coord_base`]; `None` makes no request.
 /// Best-effort and fail-open: returns an EMPTY `Vec` on any failure (no base,
 /// network, non-2xx, parse) after a single `debug!`/`warn!`. NEVER blocks beyond
 /// `EXPECTATIONS_TIMEOUT_SECS`, NEVER panics. Safe to `await` directly on the

@@ -14,6 +14,7 @@ mod cache_telemetry;
 mod ci_runner_lifecycle;
 mod ci_runner_probe;
 mod config;
+mod coord_client;
 mod dev_action;
 mod diagnostics;
 mod error;
@@ -331,8 +332,9 @@ async fn main() -> anyhow::Result<()> {
     // max_concurrent_builds derived from CPU + RAM per §3.2) to coord on
     // startup. Fire-and-forget — supervisor never blocks on coord
     // availability. See `fleet.rs::publish_on_startup`.
+    let coord_access = state.config.ambient_coord.clone();
     tokio::spawn(async move {
-        fleet::publish_on_startup().await;
+        fleet::publish_on_startup(&coord_access).await;
     });
 
     // Phase 3b: CI runner health probe loop. Probes WSL-based GitHub
@@ -669,7 +671,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 let snapshot = state_for_footprint.refresh_footprint().await;
-                resource_sample::publish(&snapshot).await;
+                resource_sample::publish(&state_for_footprint.config.ambient_coord, &snapshot)
+                    .await;
             }
         });
     }

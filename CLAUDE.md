@@ -1076,10 +1076,12 @@ sysfs outside `1..=150000` millidegrees is rejected). It is NULL on Windows and
 anywhere no sensor exists — unmeasured, never zero — and is display only: it must
 not feed any pressure or headroom ranking.
 
-Publishing is **best-effort and silent on failure**: machine identity and coord
-URL resolve exactly as `fleet::publish_budget`'s do (`~/.qontinui/machine.json`,
-`~/.qontinui/profiles.json`), a device bearer is attached when
-`$COORD_DEVICE_JWT` or `~/.qontinui/coord-device-jwt` exists, and every failure
+Publishing is **best-effort and silent on failure**: the coord base comes from
+`coord_client::coord_base` under the config's `ambient_coord` (so `Ignore`
+publishes nothing and reads nothing), machine identity from
+`~/.qontinui/machine.json` exactly as `fleet::publish_budget` reads it, a device
+bearer is attached when `$COORD_DEVICE_JWT`, `~/.qontinui/coord-device-jwt` or a
+mint from the primary runner yields one, and every failure
 path returns after one WARN (subsequent ones DEBUG). A coord outage must never
 touch the build lane.
 
@@ -1582,9 +1584,13 @@ holds both by scanning every `.rs` file under `src/` and `tests/`:
   a `SupervisorConfig` literal that sets `ambient_target_dir: AmbientTargetDir::Ignore`.
 
 **A unit-test build reaches no ambient coord either.** `SupervisorConfig.ambient_coord`
-decides where the dev-action client goes: the expectations GET at every mint (`dev_action::mint_action`)
-and the attribution watcher's snapshot POST, all resolved by
-`dev_action::ingest::coord_base`. `AmbientCoord::Read` is production
+decides where every supervisor path that reaches coord goes: the dev-action
+client (the expectations GET at every mint, `dev_action::mint_action`, and the
+attribution watcher's snapshot POST), the fleet budget publish, the serving-watchdog alert, the
+resource sample, the CI-runner registration-token fetch and the lineage proxy,
+all resolved by the one resolver, `coord_client::coord_base`. The publishes that
+attach a device JWT resolve the base FIRST, so under `Ignore` they read no
+`machine.json` and mint nothing from the runner. `AmbientCoord::Read` is production
 (`COORD_HTTP_URL`, else the active profile's `coord_url`); `from_args` picks
 `Ignore` under `cfg(test)`, which makes no request and reads none of the
 environment, `profiles.json` or `machine.json`; `At(<url>)` is how a test plants
@@ -1594,9 +1600,13 @@ left the read open, so `restart_runner`'s `use_lkg: None` branch could turn on
 production rows (coord finding `ab7c97d7`). An integration test names `Ignore` in
 its struct literal, and `config::tests::no_test_config_reads_the_ambient_coord`
 fails on an `ambient_coord` field set to `Read` outside `from_args` (a source scan
-of field and binding forms, so a value passed through a local is not caught). It
-covers these paths only. `fleet::coord_http_base`, which ignores `COORD_HTTP_URL`, and the other
-coord resolvers have no such switch.
+of field and binding forms, so a value passed through a local is not caught).
+`config::tests::no_ambient_coord_resolver_outside_coord_base` fails on a
+`COORD_HTTP_URL` or `profiles.json` literal, or a profiles `coord_url` field,
+anywhere but `coord_client.rs` (allowlisted: `process/instance_root.rs`, which
+projects `profiles.json` into a subject's home). `symbol_watcher` is outside the
+switch by design: it is a separate CLI subcommand with its own
+`QONTINUI_COORD_URL`.
 
 **The preference-3 FALLTHROUGH refuses rather than spawning silently.** (An
 adopted local build is unaffected — it carries a vouched sidecar by
