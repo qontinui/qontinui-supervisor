@@ -7309,8 +7309,9 @@ pub async fn runner_early_log(
                 Json(json!({
                     "error": "early_log_unavailable",
                     "reason": format!(
-                        "file not found at {} (the max-age sweep prunes an exited spawn's early log \
-                         once it has not been written for {} s; a live spawn's log is kept)",
+                        "file not found at {} (the max-age sweep prunes an early log once it has not been \
+                         written for {} s, unless it belongs to a spawn the supervisor still \
+                         tracks as live)",
                         path.display(),
                         crate::process::early_log::EARLY_LOG_RETENTION.as_secs()
                     ),
