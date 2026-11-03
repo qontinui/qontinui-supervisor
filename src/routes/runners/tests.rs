@@ -4222,6 +4222,75 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     assert!(prune.contains("prune_stale_early_logs("));
 }
 
+/// A spawn-test build that panics still names the runner it reserved, so a
+/// caller can follow or stop a process that may already be running, and every
+/// other outcome passes through untouched. The exec future runs it BEFORE it
+/// frees the dedup key, so a panic cannot leave a dead build listed in flight.
+#[tokio::test]
+async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
+    let (status, body, stderr_tail) = super::spawn_build_or_panicked(
+        async {
+            if true {
+                panic!("the build blew up");
+            }
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({}),
+                Vec::new(),
+            )
+        },
+        "test-abc",
+        9877,
+    )
+    .await;
+    assert_eq!(status, 500);
+    assert_eq!(body["status"], "panicked");
+    assert_eq!(
+        body["error"],
+        "the submission's task panicked: the build blew up"
+    );
+    assert_eq!(body["id"], "test-abc");
+    assert_eq!(body["port"], 9877);
+    assert_eq!(body["logs_url"], "/runners/test-abc/logs");
+    assert_eq!(body["stop_url"], "/runners/test-abc/stop");
+    let obj = body.as_object().expect("the body is an object");
+    assert!(obj.contains_key("build_slot_id"), "{body}");
+    assert_eq!(obj["build_slot_id"], serde_json::Value::Null);
+    assert!(stderr_tail.is_empty());
+
+    let (status, body, stderr_tail) = super::spawn_build_or_panicked(
+        async {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": "cargo failed"}),
+                vec!["error[E0277]".to_string()],
+            )
+        },
+        "test-abc",
+        9877,
+    )
+    .await;
+    assert_eq!(status, 502);
+    assert_eq!(body, serde_json::json!({"error": "cargo failed"}));
+    assert_eq!(stderr_tail, ["error[E0277]"]);
+
+    let handler = crate::source_scan::fn_body(
+        production_span(include_str!("../runners.rs")),
+        "pub async fn spawn_test(",
+    )
+    .expect("spawn_test exists");
+    let caught_at = handler
+        .find("spawn_build_or_panicked(")
+        .expect("the exec future catches a panicked build");
+    let released_at = handler
+        .find("release_spawn_inflight(")
+        .expect("the exec future frees the key");
+    assert!(
+        caught_at < released_at,
+        "the key must be freed after the catch, or a panic skips it"
+    );
+}
+
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-
 //    door-and-pre-fix-ledger-rows` Phase 1 (D2): every lifecycle door mints ──
 

@@ -1815,6 +1815,9 @@ failed could not read why or clean up after itself.
 `ui_bridge_url` / `logs_url` / `stop_url` into **both** arms of
 `execute_spawn_build` — the same uniformity contract `attach_build_slot_id`
 already has, and pinned by the same style of test.
+A build that panics answers the same way, with `status: "panicked"`: `spawn_build_or_panicked`
+catches it where the reservation is known, and frees the dedup key behind it. Without that a
+panic left the submission `Running` for good and a synchronous caller blocked on it.
 
 ### A lost spawn-test answer
 

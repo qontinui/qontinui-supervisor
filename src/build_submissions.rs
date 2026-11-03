@@ -93,7 +93,7 @@ pub enum BuildStatus {
         finished_at: DateTime<Utc>,
         duration_secs: f64,
     },
-    /// Cargo returned non-zero exit code or failed to spawn.
+    /// Cargo returned non-zero exit code or failed to spawn, or the work panicked.
     Failed {
         started_at: DateTime<Utc>,
         finished_at: DateTime<Utc>,
@@ -332,7 +332,7 @@ pub async fn submit(
 /// forever, and [`await_terminal`], which a synchronous spawn-test blocks on,
 /// would never return. `tokio::spawn` catches the unwind the same way, so
 /// catching it here exposes nothing new to the state the task shares.
-async fn caught<F: std::future::Future>(work: F) -> Result<F::Output, String> {
+pub(crate) async fn caught<F: std::future::Future>(work: F) -> Result<F::Output, String> {
     std::panic::AssertUnwindSafe(work)
         .catch_unwind()
         .await
@@ -350,7 +350,7 @@ async fn caught<F: std::future::Future>(work: F) -> Result<F::Output, String> {
 
 /// The `(http_status, body)` a panicked [`submit_spawn`] / [`submit_detached`]
 /// records. The body's `error` is what reaches the terminal status.
-fn panicked_outcome(reason: String) -> (u16, serde_json::Value) {
+pub(crate) fn panicked_outcome(reason: String) -> (u16, serde_json::Value) {
     (
         500,
         serde_json::json!({"status": "panicked", "error": reason}),
@@ -358,13 +358,18 @@ fn panicked_outcome(reason: String) -> (u16, serde_json::Value) {
 }
 
 /// Run a `/build/submit` submission's work, which sets the submission's status
-/// itself, and fail the submission if the work panics.
+/// itself, and fail the submission if the work panics before it reached a
+/// terminal status. The work goes on after recording one (cache population,
+/// telemetry), and a panic there must not rewrite how the build ended.
 async fn run_guarded<F>(sub: Arc<RwLock<BuildSubmission>>, work: F)
 where
     F: std::future::Future<Output = ()>,
 {
     if let Err(reason) = caught(work).await {
         let mut sub = sub.write().await;
+        if sub.status.is_terminal() {
+            return;
+        }
         let finished_at = Utc::now();
         let started_at = match sub.status {
             BuildStatus::Running { started_at } => started_at,
@@ -1544,8 +1549,9 @@ mod tests {
     }
 
     /// The same for a spawn-test build, whose synchronous caller blocks on
-    /// `await_terminal`: a panic must answer it, with its reserved port, and a
-    /// `String` payload (`panic!` with arguments) reads as well as a `&str` one.
+    /// `await_terminal`: a panic that reaches this backstop still releases it,
+    /// and the stored outcome keeps the reserved port. What that caller is told
+    /// is `routes::runners::spawn_build_or_panicked`'s, which catches first.
     #[tokio::test]
     async fn submit_spawn_panic_records_failed_and_releases_the_waiter() {
         let store = Arc::new(BuildSubmissionStore::new(100));
@@ -1557,7 +1563,7 @@ mod tests {
             9877,
             async {
                 if true {
-                    panic!("slot {} blew up", 2);
+                    panic!("slot 2 blew up");
                 }
                 (200, serde_json::json!({}), Vec::new())
             },
@@ -1577,9 +1583,46 @@ mod tests {
         assert_eq!(outcome.body["status"], "panicked");
     }
 
+    /// [`caught`] reads every payload a panic carries: a literal, a formatted
+    /// `String` (what `unwrap` and `expect` raise, and `panic!` with a runtime
+    /// argument), and anything else.
+    #[tokio::test]
+    async fn caught_names_every_panic_payload() {
+        assert_eq!(caught(async { 7 }).await, Ok(7));
+
+        let literal = caught(async {
+            panic!("a literal");
+        })
+        .await;
+        assert_eq!(
+            literal,
+            Err("the submission's task panicked: a literal".to_string())
+        );
+
+        let formatted = caught(async {
+            let slot = std::hint::black_box(2);
+            panic!("slot {slot} blew up");
+        })
+        .await;
+        assert_eq!(
+            formatted,
+            Err("the submission's task panicked: slot 2 blew up".to_string())
+        );
+
+        let other = caught(async {
+            std::panic::panic_any(42);
+        })
+        .await;
+        assert_eq!(
+            other,
+            Err("the submission's task panicked: a panic with a non-string payload".to_string())
+        );
+    }
+
     /// A panic in a `/build/submit` run, whose status it set itself, moves it
-    /// from `Running` to `Failed` with the run's own start time; a run that
-    /// finished is left alone.
+    /// from `Running` to `Failed` with the run's own start time. A panic after
+    /// the run recorded how it ended leaves that alone, and a run that does not
+    /// panic is not touched at all.
     #[tokio::test]
     async fn run_guarded_turns_a_panic_into_failed() {
         let submission_at = |status: BuildStatus| {
@@ -1635,9 +1678,32 @@ mod tests {
             BuildStatus::Failed { .. }
         ));
 
-        let finished = submission_at(BuildStatus::Queued);
-        run_guarded(finished.clone(), async {}).await;
-        assert!(matches!(finished.read().await.status, BuildStatus::Queued));
+        // `run_submission` records `Succeeded`, then populates the cache.
+        let finished_at = Utc::now();
+        let succeeded = submission_at(BuildStatus::Succeeded {
+            started_at,
+            finished_at,
+            duration_secs: 5.0,
+        });
+        run_guarded(succeeded.clone(), async {
+            panic!("the cache write blew up");
+        })
+        .await;
+        match succeeded.read().await.status {
+            BuildStatus::Succeeded {
+                started_at: recorded,
+                duration_secs,
+                ..
+            } => {
+                assert_eq!(recorded, started_at);
+                assert_eq!(duration_secs, 5.0);
+            }
+            ref other => panic!("a finished build was rewritten: {other:?}"),
+        }
+
+        let untouched = submission_at(BuildStatus::Queued);
+        run_guarded(untouched.clone(), async {}).await;
+        assert!(matches!(untouched.read().await.status, BuildStatus::Queued));
     }
 
     /// The whole point of detachment: the exec future runs to completion even

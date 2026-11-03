@@ -666,9 +666,10 @@ impl HealthScan {
 ///
 /// The health cache derives `Errored` only on a tick whose API answered, and
 /// that tick stamps `last_seen_responding_at`. So an unplaced `Errored` is a
-/// snapshot from before the spawn: the refresher has published nothing newer by
-/// the close, which sits [`RESULT_TAIL_WINDOW`] after an ordinary result. It
-/// publishes once per sweep of every runner, serially, so that takes a sweep
+/// snapshot whose answer predates the spawn (the same tick can read its body just
+/// after it, which errs toward the unknown): the refresher has published nothing
+/// newer by the close, which sits [`RESULT_TAIL_WINDOW`] after an ordinary result.
+/// It publishes once per sweep of every runner, serially, so that takes a sweep
 /// stalled or still in flight since before the spawn. How often that happens is
 /// unmeasured.
 ///
@@ -1056,14 +1057,7 @@ pub fn spawn_attribution_watcher_with_timing(
             },
             None => String::new(),
         };
-        // A `Partial` that nothing else on this line would explain. A backstop
-        // close is `Partial` with or without it, and its evidence says so.
-        let health_note =
-            if errored_not_placed && category == D3Category::Partial && run_result.is_some() {
-                format!(" health={ERRORED_NOT_PLACED}")
-            } else {
-                String::new()
-            };
+        let health_note = health_note(errored_not_placed, category, run_result.as_ref());
         state
             .logs
             .emit(
@@ -1088,6 +1082,21 @@ pub fn spawn_attribution_watcher_with_timing(
 }
 
 /// Stable log token for an [`ActionRunResult`] variant.
+/// The operator line's note on a `Partial` nothing else on the line would
+/// explain: the unplaced `Errored` that made it one. A backstop close is
+/// `Partial` with or without one, and its evidence says so.
+fn health_note(
+    errored_not_placed: bool,
+    category: D3Category,
+    run: Option<&ActionRunResult>,
+) -> String {
+    if errored_not_placed && category == D3Category::Partial && run.is_some() {
+        format!(" health={ERRORED_NOT_PLACED}")
+    } else {
+        String::new()
+    }
+}
+
 fn run_kind(r: &ActionRunResult) -> &'static str {
     match r {
         ActionRunResult::Refused { .. } => "refused",
@@ -3652,6 +3661,22 @@ mod tests {
             no_result.evidence_ref.as_deref(),
             Some("backstop_closed_no_result")
         );
+    }
+
+    /// The operator line names the unplaced `Errored` only on the `Partial` it
+    /// caused.
+    #[test]
+    fn health_note_names_only_the_partial_it_caused() {
+        let ran = ActionRunResult::Ran;
+        assert_eq!(
+            health_note(true, D3Category::Partial, Some(&ran)),
+            " health=derived_status_errored_not_placed_after_spawn"
+        );
+        // A backstop close is `Partial` regardless; its evidence says why.
+        assert_eq!(health_note(true, D3Category::Partial, None), "");
+        // A verdict something else decided.
+        assert_eq!(health_note(true, D3Category::Failure, Some(&ran)), "");
+        assert_eq!(health_note(false, D3Category::Partial, Some(&ran)), "");
     }
 
     /// Every row [`classify_close`]'s fold can reach: only a verdict that would

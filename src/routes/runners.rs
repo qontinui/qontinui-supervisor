@@ -3341,22 +3341,29 @@ pub async fn spawn_test(
             // probe → wait pipeline; released when this future completes or
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
-            let (status, body_json, stderr_tail) = execute_spawn_build(
-                exec_state,
-                body,
-                exec_id,
+            let runner_id = exec_id.clone();
+            let outcome = spawn_build_or_panicked(
+                execute_spawn_build(
+                    exec_state,
+                    body,
+                    exec_id,
+                    port,
+                    exec_managed,
+                    no_wait,
+                    run_guard,
+                ),
+                &runner_id,
                 port,
-                exec_managed,
-                no_wait,
-                run_guard,
             )
             .await;
-            // The build is over (succeeded or failed): free the key so the next
-            // request for it starts a fresh build instead of joining a corpse.
+            // The build is over (succeeded, failed or panicked): free the key so
+            // the next request for it starts a fresh build instead of joining a
+            // corpse.
             if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
                 exec_release_state.release_spawn_inflight(&key, id).await;
             }
-            (status.as_u16(), exec_minted.stamp(body_json), stderr_tail)
+            let (status, body_json, stderr_tail) = outcome;
+            (status, exec_minted.stamp(body_json), stderr_tail)
         },
     );
     let _ = release_id.set(submission_id);
@@ -3735,6 +3742,31 @@ struct SpawnBuildSideChannel {
 fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usize>) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("build_slot_id".to_string(), json!(build_slot_id));
+    }
+}
+
+/// Await `build`, the spawn-test's build, as the `(http_status, body,
+/// stderr_tail)` its submission stores. A panic skips everything
+/// `execute_spawn_build` would have attached, so it is caught here, where the
+/// reservation is known: it answers `panicked` naming the runner, which a caller
+/// needs to follow or stop it, since the process may already be running. A
+/// placeholder that never started is left to the stale sweep.
+async fn spawn_build_or_panicked<F>(
+    build: F,
+    id: &str,
+    port: u16,
+) -> (u16, serde_json::Value, Vec<String>)
+where
+    F: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value, Vec<String>)>,
+{
+    match crate::build_submissions::caught(build).await {
+        Ok((status, body, stderr_tail)) => (status.as_u16(), body, stderr_tail),
+        Err(reason) => {
+            let (status, mut body) = crate::build_submissions::panicked_outcome(reason);
+            attach_spawn_identity(&mut body, id, port);
+            attach_build_slot_id(&mut body, None);
+            (status, body, Vec::new())
+        }
     }
 }
 

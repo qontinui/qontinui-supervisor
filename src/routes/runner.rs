@@ -383,7 +383,8 @@ async fn primary_health_after_start(
 /// rebuild ran and the primary never answered), `gave_up_waiting` (408: nothing
 /// rebuilt, nothing stopped), `aborted` (404: the primary left the registry) or
 /// `error` (500: the restart failed, or the readiness gate refused it at fire
-/// time; the `error` text says which). Only `rebuilt` reads as `succeeded`.
+/// time; the `error` text says which), or `panicked` (500) if its task panicked.
+/// Only `rebuilt` reads as `succeeded`.
 pub async fn rebuild_when_idle(
     State(state): State<SharedState>,
     body: OptionalJson<RebuildWhenIdleRequest>,
@@ -2039,8 +2040,9 @@ mod tests {
             "rebuild_when_idle's success path must answer from its recorded verdict"
         );
         assert!(
-            route.contains("unhealthy_rebuild_log(&result, &exec_runner_name)"),
-            "an unhealthy rebuild must reach the operator log, as its error sibling does"
+            route.contains("unhealthy_rebuild_log(&result, &exec_runner_name)")
+                && route.contains(".emit(LogSource::Supervisor, LogLevel::Error, line)"),
+            "an unhealthy rebuild must reach the operator log at Error, as its error sibling does"
         );
         assert!(
             !route.contains("\"status\": \"rebuilt\""),
