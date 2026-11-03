@@ -199,7 +199,7 @@ pub struct ActionRecord {
     pub run_result: RwLock<Option<ActionRunResult>>,
     /// Signalled once when [`Self::record_run_result`] takes the first write, so
     /// the attribution watcher can wait for the action's real end instead of a
-    /// flat 30-second guess. Not part of the wire form.
+    /// flat guess. Not part of the wire form.
     #[serde(skip)]
     pub run_signal: tokio::sync::Notify,
 }
@@ -330,6 +330,53 @@ impl ActionRecord {
     }
 }
 
+/// The reason token a [`RunResultGuard`] records when the future that owned it
+/// ended with no terminal result. Not `spawn_abandoned`, which already names
+/// spawn-test's answered shutdown (`routes::runners::spawn_abandoned_body`).
+pub const ACTION_ABANDONED: &str = "action_abandoned";
+
+/// Records `Errored { "action_abandoned: <context>" }` on its action when it is
+/// dropped, so a minted action whose executing future ends with no terminal
+/// result (a panic in the exec task, a handler future dropped when its client
+/// disconnects) still closes on a recorded result instead of its backstop.
+///
+/// [`ActionRecord::record_run_result`] is first-write-wins, so once the
+/// executing path has recorded its own result the guard's write loses and
+/// changes nothing: there is no disarm. Hand the guard to whatever records last
+/// (the detached health wait, when the verdict is deferred to it) so it drops
+/// after that write. It reaches the ledger as `Failure` with the reason as its
+/// evidence, which coord can discount; dropping the minted row instead would
+/// be a silent absence. Modelled on `SpawnInFlightGuard`.
+#[must_use = "a guard dropped at once records the action abandoned"]
+pub struct RunResultGuard {
+    record: Arc<ActionRecord>,
+    context: &'static str,
+}
+
+impl RunResultGuard {
+    /// Arm a guard over `record`. `context` names the future it guards, for
+    /// the reason it records.
+    pub fn arm(record: Arc<ActionRecord>, context: &'static str) -> Self {
+        Self { record, context }
+    }
+
+    /// The action this guard covers.
+    pub fn record(&self) -> &Arc<ActionRecord> {
+        &self.record
+    }
+}
+
+impl Drop for RunResultGuard {
+    fn drop(&mut self) {
+        self.record.record_run_result(ActionRunResult::Errored {
+            reason: format!(
+                "{ACTION_ABANDONED}: {} ended with no terminal result",
+                self.context
+            ),
+        });
+    }
+}
+
 /// In-memory capped store of action records, held on `SupervisorState`.
 ///
 /// Mirrors [`crate::diagnostics::DiagnosticsState`]'s ring discipline: a cap of
@@ -449,6 +496,38 @@ mod tests {
             }
             other => panic!("the first write must survive, got {other:?}"),
         }
+    }
+
+    /// T1-6. A guard dropped with no result recorded records the action
+    /// abandoned; one dropped after the executing path recorded leaves that
+    /// result alone (first write wins).
+    #[test]
+    fn a_dropped_run_result_guard_records_abandoned_and_never_overwrites() {
+        let abandoned = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "p".to_string(),
+            &[],
+        ));
+        drop(RunResultGuard::arm(abandoned.clone(), "the test future"));
+        match abandoned.run_result() {
+            Some(ActionRunResult::Errored { reason }) => {
+                assert!(reason.contains(ACTION_ABANDONED), "{reason}");
+                assert!(reason.contains("the test future"), "{reason}");
+            }
+            other => panic!("an armed guard dropped must record abandoned, got {other:?}"),
+        }
+
+        let ran = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "p".to_string(),
+            &[],
+        ));
+        let guard = RunResultGuard::arm(ran.clone(), "the test future");
+        assert!(guard.record().record_run_result(ActionRunResult::Ran));
+        drop(guard);
+        assert_eq!(ran.run_result(), Some(ActionRunResult::Ran));
     }
 
     /// The record's wire form gains `run_result` — `null` while the action has

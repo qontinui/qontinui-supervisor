@@ -3654,7 +3654,8 @@ fn spawn_routes_wire_fresh_device_identity_end_to_end() {
     }
     let named = fn_source("pub async fn spawn_named(");
     assert!(named.contains("extra_env: body.extra_env.clone(),"));
-    assert!(named.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
+    let named_inner = fn_source("async fn spawn_named_inner(");
+    assert!(named_inner.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
     let exec = fn_source("async fn execute_spawn_build_inner(");
     assert!(exec.contains("resp[\"device_identity\"] = device_identity_report(id)"));
     assert!(exec.contains("managed.config.fresh_device_identity"));
@@ -3662,4 +3663,196 @@ fn spawn_routes_wire_fresh_device_identity_end_to_end() {
     assert!(
         list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
     );
+}
+
+// ── Plan `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-dev-action-
+//    coord` Phase 2 (PR-B): a spawn records its terminal result ────────────────
+
+/// A state over an empty runner tree (so no runner exe resolves anywhere and no
+/// test can start one), with `AmbientCoord::Ignore` from `from_args` under
+/// `cfg(test)`, and a display so a Linux spawn passes its preflight.
+fn state_over_an_empty_runner_tree() -> (crate::state::SharedState, TempDir) {
+    let (mut config, root) = crate::config::config_over_an_empty_runner_tree();
+    assert!(matches!(
+        config.ambient_coord,
+        crate::config::AmbientCoord::Ignore
+    ));
+    config.temp_runner_display = Some(":99".to_string());
+    (Arc::new(crate::state::SupervisorState::new(config)), root)
+}
+
+/// Wait on the action store for `action_id`'s terminal result, as the
+/// restart route tests do.
+async fn await_action_result(
+    state: &crate::state::SharedState,
+    action_id: uuid::Uuid,
+) -> crate::dev_action::ActionRunResult {
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(rec) = state.dev_actions.read().await.get(&action_id) {
+            if let Some(r) = rec.run_result() {
+                return r;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no terminal result was recorded for action {action_id} within {budget:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn json_body(resp: axum::response::Response) -> (u16, serde_json::Value) {
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+}
+
+/// T1-4. spawn-test's chokepoint records the spawn's own failure on its
+/// action: a `rebuild: false` spawn over a tree with no runner exe.
+#[tokio::test]
+async fn spawn_test_records_a_failure_run_result_on_the_action() {
+    use axum::response::IntoResponse;
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let resp = super::spawn_test(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({"async": true, "rebuild": false})),
+    )
+    .await
+    .expect("the async path answers 202")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, 202, "{body}");
+    let action_id: uuid::Uuid = body["action_id"]
+        .as_str()
+        .expect("the 202 names its action")
+        .parse()
+        .expect("a uuid");
+
+    let run = await_action_result(&state, action_id).await;
+    assert!(run.is_failure(), "{run:?}");
+    assert!(
+        run.reason()
+            .is_some_and(|r| r.contains("Runner binary not found")),
+        "{run:?}"
+    );
+}
+
+/// T1-5. spawn-named records its failure on its action too, and its failed
+/// response now names that action so the caller can reach the verdict.
+#[tokio::test]
+async fn spawn_named_records_a_failure_run_result_on_the_action() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let request: super::SpawnNamedRequest =
+        serde_json::from_value(serde_json::json!({"name": "pr-b", "rebuild": false}))
+            .expect("a spawn-named body");
+    let resp = super::spawn_named(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(request),
+    )
+    .await
+    .expect("spawn-named renders its failure");
+    let (status, body) = json_body(resp).await;
+    assert!(status >= 400, "{status} {body}");
+    let action_id = body["action_id"]
+        .as_str()
+        .expect("the failed response names its action");
+
+    let recent = state.dev_actions.read().await.recent(10);
+    let record = recent
+        .first()
+        .cloned()
+        .expect("spawn-named mints a dev-action");
+    assert_eq!(record.action_id.to_string(), action_id);
+    let run = record
+        .run_result()
+        .expect("the failure is recorded before the response");
+    assert!(run.is_failure(), "{run:?}");
+    assert!(
+        run.reason()
+            .is_some_and(|r| r.contains("Runner binary not found")),
+        "{run:?}"
+    );
+    assert!(
+        state
+            .runners
+            .read()
+            .await
+            .keys()
+            .all(|id| !id.starts_with("named-")),
+        "the failed spawn left its reservation behind"
+    );
+}
+
+/// T1-10 (D4). The probe stores a startup panic of the runner's newest spawn
+/// however long the probe ran, by its pid, and not another process's.
+#[tokio::test]
+async fn probe_stores_a_panic_from_this_spawn_however_long_the_probe_ran() {
+    for (header_pid, stored) in [(4242u32, true), (4343u32, false)] {
+        let (state, root) = state_over_an_empty_runner_tree();
+        let dead_port = crate::test_ports::reserve_refused_port();
+        let id = "test-probe-panic";
+        let mut config = crate::config::RunnerConfig::default_primary();
+        config.id = id.to_string();
+        config.port = dead_port;
+        config.kind = super::RunnerKind::Temp { id: id.to_string() };
+        let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+        state
+            .runners
+            .write()
+            .await
+            .insert(id.to_string(), managed.clone());
+
+        let now = chrono::Utc::now();
+        managed
+            .recent_spawns
+            .write()
+            .await
+            .push(crate::state::SpawnMarker::new(
+                now - chrono::Duration::seconds(95),
+                Some(4242),
+                None,
+                None,
+            ));
+        let dir = root.path().join("instance-logs");
+        fs::create_dir_all(&dir).unwrap();
+        let stamp = (now - chrono::Duration::seconds(90))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        fs::write(
+            crate::process::panic_log::resolve_panic_log_path(Some(&dir)),
+            format!(
+                "[{stamp}] PANIC runner-id={id} pid={header_pid} version=1.0.0\n\
+                 location: src/main.rs:10:5\n\
+                 thread: main\n\
+                 payload:\n\
+                 the boot panicked before its API bound\n\
+                 \n\
+                 backtrace:\n\
+                 0: qontinui_runner::main\n"
+            ),
+        )
+        .unwrap();
+        *managed.panic_log_dir.write().await = Some(dir);
+
+        match probe_runner_health(&state, id, dead_port, 50).await {
+            ProbeOutcome::Failed { recent_panic, .. } => {
+                assert_eq!(
+                    recent_panic.is_some(),
+                    stored,
+                    "header pid {header_pid}: {recent_panic:?}"
+                );
+            }
+            ProbeOutcome::Healthy { .. } => panic!("nothing answers on {dead_port}"),
+        }
+        assert_eq!(
+            managed.recent_panic.read().await.is_some(),
+            stored,
+            "header pid {header_pid}"
+        );
+    }
 }

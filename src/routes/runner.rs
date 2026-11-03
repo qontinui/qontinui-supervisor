@@ -5,9 +5,10 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
-    ActionKind, ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
-    SlotResolution,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, record_start_verdict,
+    run_result_for, spawn_attribution_watcher, start_verdict, ActionKind, ActionRecord, ActionRisk,
+    ActionRunResult, AttributionTargets, PredictedSignature, RunResultGuard, SlotResolution,
+    SyncProbe,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -23,7 +24,8 @@ use crate::state::SharedState;
 /// Default is `wait=true` (poll up to 30s for the runner's `/health` to come
 /// up before returning 200). Pass `?wait=false` to get the legacy
 /// fire-and-forget behavior (200 the moment the OS process spawns, even if
-/// it's hung).
+/// it's hung); the minted action's result then comes from a detached health
+/// wait, not from the response (`dev_action::record_start_verdict`).
 #[derive(Deserialize, Default)]
 pub struct StartWaitQuery {
     #[serde(default = "default_wait_true")]
@@ -66,31 +68,6 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
     })
 }
 
-/// Map an error that ended a primary-runner action to the action's own terminal
-/// result.
-///
-/// [`SupervisorError::RestartUnsafe`] is the readiness gate REFUSING — nothing
-/// ran, so no effect surface was touched and a clean attribution window carries
-/// no information about it. Everything else ran and failed. Both classify to
-/// `D3Category::Failure` (plan §5 rejects a sixth category); the distinction is
-/// carried on the record and surfaces in the outcome's `evidence_ref`.
-///
-/// The refusal's `message` already begins with the gate's own code —
-/// `restart_refused_unsafe: …` when the runner reported live work,
-/// `restart_refused_unknown: …` when no verdict could be obtained — which is
-/// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
-/// verbatim rather than re-worded here.
-fn run_result_for(err: &SupervisorError) -> ActionRunResult {
-    match err {
-        SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
-            reason: detail.message.clone(),
-        },
-        other => ActionRunResult::Errored {
-            reason: other.to_string(),
-        },
-    }
-}
-
 /// Mint a dev-action snapshot for a primary-runner action (restart / build),
 /// evaluate the active dev-state set at execution time, store the record, and
 /// spawn the detached attribution watcher.
@@ -122,12 +99,15 @@ fn run_result_for(err: &SupervisorError) -> ActionRunResult {
 /// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
 /// signature clears the threshold. The caller decides what to do with it
 /// (the restart path biases toward LKG + warns; never refuses).
+///
+/// `backstop_override` replaces the kind's backstop on the watcher's window
+/// (`WindowTiming::with_backstop_override`), for an action that can outlast it.
 async fn mint_primary_action(
     state: &SharedState,
     kind: ActionKind,
     params_digest: String,
     requester_id: Option<String>,
-    build_duration: Option<std::time::Duration>,
+    backstop_override: Option<std::time::Duration>,
 ) -> (
     std::sync::Arc<ActionRecord>,
     Vec<&'static str>,
@@ -179,7 +159,7 @@ async fn mint_primary_action(
         state.clone(),
         arc.clone(),
         primary_attribution_targets(state).await,
-        build_duration,
+        backstop_override,
     );
 
     (arc, states_active, predicted, risk)
@@ -345,6 +325,57 @@ impl Default for RebuildWhenIdleRequest {
 /// cannot disagree.
 const REBUILD_WHEN_IDLE_TREE: manager::BuildTree = manager::BuildTree::OriginMain;
 
+/// The backstop of a `rebuild_when_idle` action's window: its wait's deadline
+/// plus a whole build's backstop, since it mints at arm time and builds only
+/// once the primary drains. The kind's own 2-hour backstop could expire inside
+/// a `deadline_secs` of up to 24 h and close the window before the rebuild ran.
+/// It records a result on every exit, so this bounds only a dead task's row.
+fn rebuild_when_idle_backstop(deadline_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(deadline_secs)
+        .saturating_add(crate::dev_action::attribution::LONG_BACKSTOP_WINDOW)
+}
+
+/// The terminal result of `rebuild_when_idle`'s rebuild once the primary
+/// drained: the error's when the restart failed ([`run_result_for`]), else the
+/// verdict of the health wait that followed it ([`start_verdict`]), so a
+/// rebuilt primary that never binds its API is not `Ran`. With no health check
+/// at all (no primary to probe once the restart returned) it is `Errored`.
+fn rebuild_when_idle_result(
+    restart: &Result<(), SupervisorError>,
+    health: SyncProbe,
+) -> ActionRunResult {
+    match restart {
+        Err(e) => run_result_for(e),
+        Ok(()) => match start_verdict(health) {
+            crate::dev_action::StartVerdict::Now(result) => result,
+            crate::dev_action::StartVerdict::AfterHealthWait => ActionRunResult::Errored {
+                reason: "runner_unhealthy_after_start: the primary was gone when its \
+                         post-rebuild health check ran"
+                    .to_string(),
+            },
+        },
+    }
+}
+
+/// The primary's health after a restart, by the default health wait. Not
+/// probed when no primary is registered.
+async fn primary_health_after_start(state: &SharedState, after: &str) -> SyncProbe {
+    let Some(primary) = state.get_primary().await else {
+        return SyncProbe::NotProbed;
+    };
+    let runner_id = primary.config.id.clone();
+    match wait_for_runner_healthy_default(state, &runner_id).await {
+        Ok(()) => SyncProbe::Healthy,
+        Err(failure) => SyncProbe::Unhealthy {
+            reason: format!(
+                "runner_unhealthy_after_start: runner '{runner_id}' did not become healthy \
+                 within {}ms of {after}",
+                failure.elapsed_ms
+            ),
+        },
+    }
+}
+
 /// `POST /runner/rebuild-when-idle` — watch the primary until its Claude
 /// sessions drain, then rebuild it from `origin/main`.
 ///
@@ -407,7 +438,8 @@ pub async fn rebuild_when_idle(
 
     // A rebuild-restart is a `build`-kind action, exactly as the rebuild arm of
     // `restart_runner` mints it — the outcome lands after the build, not after
-    // this 202.
+    // this 202. It mints now, at arm time, so its window's backstop covers the
+    // wait's deadline as well as the build.
     let (action_record, _states_active, _predicted, risk) = mint_primary_action(
         &state,
         ActionKind::Build,
@@ -416,7 +448,7 @@ pub async fn rebuild_when_idle(
             poll_secs, deadline_secs
         ),
         None,
-        None,
+        Some(rebuild_when_idle_backstop(deadline_secs)),
     )
     .await;
     let action_id = action_record.action_id;
@@ -424,6 +456,8 @@ pub async fn rebuild_when_idle(
 
     let exec_state = state.clone();
     let exec_record = action_record.clone();
+    let exec_guard =
+        RunResultGuard::arm(action_record.clone(), "rebuild-when-idle's detached task");
     // The detached future outlives this handler, so it gets its own copy of the
     // name rather than borrowing the one the 202 body still needs.
     let exec_runner_name = runner_name.clone();
@@ -432,6 +466,7 @@ pub async fn rebuild_when_idle(
         state.config.project_dir.clone(),
         None,
         async move {
+            let _run_guard = exec_guard;
             let started = std::time::Instant::now();
             let deadline = std::time::Duration::from_secs(deadline_secs);
             let poll = std::time::Duration::from_secs(poll_secs);
@@ -548,7 +583,7 @@ pub async fn rebuild_when_idle(
             // from origin/main, then restart.
             // `force: false` keeps the readiness gate armed inside — it is the
             // authoritative check, and a refusal here is a real refusal.
-            if let Err(e) = manager::restart_runner(
+            let restart = manager::restart_runner(
                 &exec_state,
                 true,
                 RestartSource::Manual,
@@ -557,9 +592,15 @@ pub async fn rebuild_when_idle(
                 manager::CloseIntent::Kill,
                 Some(exec_record.action_id),
             )
-            .await
-            {
-                exec_record.record_run_result(run_result_for(&e));
+            .await;
+            // Success records its verdict too, so the window closes a tail
+            // after the rebuild instead of on its backstop.
+            let health = match &restart {
+                Ok(()) => primary_health_after_start(&exec_state, "rebuild-when-idle").await,
+                Err(_) => SyncProbe::NotProbed,
+            };
+            exec_record.record_run_result(rebuild_when_idle_result(&restart, health));
+            if let Err(e) = restart {
                 exec_state
                     .logs
                     .emit(
@@ -653,6 +694,10 @@ pub async fn restart_runner(
     .await;
     let action_id = action_record.action_id;
     let risk_json = risk_ack_json(&risk);
+    // Every exit below records a result; this covers the ones that cannot: the
+    // handler future dropped mid-restart when its client disconnects, or a
+    // panic in the detached rebuild task, which the rebuild arm moves it into.
+    let run_guard = RunResultGuard::arm(action_record.clone(), "POST /runner/restart");
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     //
@@ -686,6 +731,7 @@ pub async fn restart_runner(
             serde_json::Value::Null
         };
         let do_health_wait = wait_q.wait;
+        let exec_guard = run_guard;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
             state.config.project_dir.clone(),
@@ -729,7 +775,14 @@ pub async fn restart_runner(
 
                 // Port-bind verification (the manager call returns once the OS
                 // process spawns; the runner may still be pre-bind or hung).
-                // `wait=false` opts out (legacy behavior).
+                // `wait=false` answers without it, and the detached health
+                // wait below records the verdict instead (D9).
+                let primary_id = exec_state
+                    .get_primary()
+                    .await
+                    .map(|p| p.config.id.clone())
+                    .unwrap_or_default();
+                let mut probe = SyncProbe::NotProbed;
                 if do_health_wait {
                     if let Some(primary) = exec_state.get_primary().await {
                         let runner_id = primary.config.id.clone();
@@ -768,6 +821,7 @@ pub async fn restart_runner(
                                 }),
                             );
                         }
+                        probe = SyncProbe::Healthy;
                     }
                 }
 
@@ -839,11 +893,13 @@ pub async fn restart_runner(
                     None => serde_json::Value::Null,
                 };
 
-                // The build + restart completed. `Ran` leaves the effect
-                // surfaces in charge of the verdict (existing precedence) and,
-                // critically, CLOSES the window here rather than at the
-                // backstop — the window is now a measurement of the action.
-                exec_record.record_run_result(ActionRunResult::Ran);
+                // The build + restart completed. `Ran` once the runner
+                // answered (now, or from the detached health wait) leaves the
+                // effect surfaces in charge of the verdict (existing
+                // precedence) and, critically, CLOSES the window then rather
+                // than at the backstop — the window is a measurement of the
+                // action.
+                record_start_verdict(&exec_state, &primary_id, start_verdict(probe), exec_guard);
 
                 (
                     StatusCode::OK.as_u16(),
@@ -988,7 +1044,14 @@ pub async fn restart_runner(
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
     // Poll its `/health` for up to 30s so callers can distinguish a healthy
-    // restart from a wedged one. `wait=false` opts out (legacy behavior).
+    // restart from a wedged one. `wait=false` answers without it, and the
+    // detached health wait records the verdict instead (D9).
+    let primary_id = state
+        .get_primary()
+        .await
+        .map(|p| p.config.id.clone())
+        .unwrap_or_default();
+    let mut probe = SyncProbe::NotProbed;
     if wait_q.wait {
         // Look up the primary runner id so the probe targets the right
         // managed entry. The legacy endpoint always restarts the primary,
@@ -1016,10 +1079,11 @@ pub async fn restart_runner(
                     .await;
                 return Ok(unhealthy_after_start_response(&runner_id, failure));
             }
+            probe = SyncProbe::Healthy;
         }
     }
 
-    action_record.record_run_result(ActionRunResult::Ran);
+    record_start_verdict(&state, &primary_id, start_verdict(probe), run_guard);
 
     Ok(Json(serde_json::json!({
         "status": "restarted",
@@ -1264,11 +1328,9 @@ pub async fn fix_and_rebuild(
         )
         .await;
 
-    // Mint a `build`-kind dev-action snapshot at submission. The window is
-    // build-duration + 30s; the exact build duration isn't known at submission
-    // time, so the watcher uses the 30s tail (the build's own time is bounded
-    // by the build-submissions state machine — Phase 3's coord ingest will
-    // thread the precise duration). State eval captures the cause-side context
+    // Mint a `build`-kind dev-action snapshot at submission. The window stays
+    // open until the build records its result below, then a 30s tail, capped
+    // by the build backstop. State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
     let (action_record, states_active, predicted, risk) = mint_primary_action(
         &state,
@@ -1289,11 +1351,13 @@ pub async fn fix_and_rebuild(
     // so a failing `run_cargo_build` returned 500 into the submission while the
     // action closed `Confirmed`.
     let exec_record = action_record.clone();
+    let exec_guard = RunResultGuard::arm(action_record.clone(), "fix-and-rebuild's detached task");
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
         state.build_submissions.clone(),
         state.config.project_dir.clone(),
         None,
         async move {
+            let _run_guard = exec_guard;
             match crate::build_monitor::run_cargo_build(&exec_state).await {
                 Ok(()) => {
                     exec_record.record_run_result(ActionRunResult::Ran);
@@ -1962,41 +2026,71 @@ mod tests {
         }
     }
 
-    /// The readiness gate's refusal maps to `Refused`, carrying the
-    /// `restart_refused_unsafe` token verbatim — everything else to `Errored`.
-    /// Both classify to `Failure`; §5 rejects a sixth `D3Category`.
-    #[test]
-    fn run_result_for_maps_the_readiness_refusal_to_refused() {
-        let detail = crate::restart_readiness::RefusalDetail {
-            cause: "sessions_live",
-            message: "restart_refused_unsafe: runner 'primary' (port 9876) reports it is NOT \
-                      safe to restart."
-                .to_string(),
-            payload: serde_json::json!({"error": "restart_refused_unsafe"}),
-        };
-        let refused = run_result_for(&SupervisorError::RestartUnsafe(Box::new(detail)));
-        match &refused {
-            crate::dev_action::ActionRunResult::Refused { reason } => {
-                assert!(
-                    reason.contains("restart_refused_unsafe"),
-                    "reason: {reason}"
-                );
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
+    /// T1-15 (D16). `rebuild_when_idle` records its rebuild's verdict on
+    /// success too (`Ran` once the rebuilt primary answered), and its window's
+    /// backstop covers a 24-hour deadline: still open past the 2-hour build
+    /// backstop.
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_when_idle_records_ran_and_its_backstop_covers_its_deadline() {
         assert_eq!(
-            crate::dev_action::attribution::classify(Some(&refused), &[]),
-            crate::dev_action::record::D3Category::Failure
+            rebuild_when_idle_result(&Ok(()), SyncProbe::Healthy),
+            ActionRunResult::Ran
+        );
+        assert!(matches!(
+            rebuild_when_idle_result(
+                &Ok(()),
+                SyncProbe::Unhealthy {
+                    reason: "runner_unhealthy_after_start: x".to_string()
+                }
+            ),
+            ActionRunResult::Errored { .. }
+        ));
+        assert!(matches!(
+            rebuild_when_idle_result(
+                &Err(SupervisorError::RunnerNotRunning),
+                SyncProbe::NotProbed
+            ),
+            ActionRunResult::Errored { .. }
+        ));
+        // The detached task records whatever the restart did, success included.
+        let body = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn rebuild_when_idle(",
+        )
+        .expect("rebuild_when_idle exists")
+        .to_string();
+        // A statement of its own, not under an `if`: every outcome records.
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(
+                &"exec_record.record_run_result(rebuild_when_idle_result(&restart, health));"
+            ),
+            "rebuild_when_idle must record its rebuild's result on every outcome"
+        );
+        // And the mint hands the watcher the deadline-sized backstop.
+        assert!(
+            lines.contains(&"Some(rebuild_when_idle_backstop(deadline_secs)),"),
+            "rebuild_when_idle must mint with its deadline's backstop"
         );
 
-        let errored = run_result_for(&SupervisorError::RunnerNotRunning);
-        assert!(matches!(
-            errored,
-            crate::dev_action::ActionRunResult::Errored { .. }
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let record = state.dev_actions.write().await.insert(ActionRecord::new(
+            ActionKind::Build,
+            None,
+            "rebuild_when_idle".to_string(),
+            &[],
         ));
-        assert_eq!(
-            crate::dev_action::attribution::classify(Some(&errored), &[]),
-            crate::dev_action::record::D3Category::Failure
+        crate::dev_action::spawn_attribution_watcher(
+            state.clone(),
+            record.clone(),
+            AttributionTargets::default(),
+            Some(rebuild_when_idle_backstop(24 * 60 * 60)),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 60 * 60 + 60)).await;
+        assert!(
+            record.outcome.read().unwrap().is_none(),
+            "a 24-hour wait's window closed on the 2-hour build backstop"
         );
     }
 
@@ -2058,7 +2152,7 @@ mod tests {
             // no verdict could be obtained (this test's arm — and the arm the
             // gate's "every unknown refuses" rule exists for). Both are
             // `RestartUnsafe`; the verbatim carry of the `_unsafe` spelling is
-            // pinned by `run_result_for_maps_the_readiness_refusal_to_refused`.
+            // pinned by `dev_action::run_result`'s `run_result_for_maps_the_readiness_refusal_to_refused`.
             crate::dev_action::ActionRunResult::Refused { reason } => assert!(
                 reason.starts_with("restart_refused_"),
                 "the gate's refusal must be carried verbatim; got {reason}"

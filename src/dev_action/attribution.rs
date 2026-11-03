@@ -2,21 +2,25 @@
 //!
 //! Dev actions emit effects on a delay (the 2026-06-07 asset error landed at
 //! t+5s after a "restarted successfully" ACK), so a synchronous verdict is
-//! impossible — the watcher sleeps the per-kind attribution window, then scans
-//! the effect surfaces and folds a verdict into the action's [`ActionOutcome`]:
+//! impossible — the watcher holds the action's attribution window open until the
+//! action records its own terminal result, plus a tail (capped by a per-kind
+//! backstop: [`WindowTiming::for_kind`]), then scans the effect surfaces and
+//! folds a verdict into the action's [`ActionOutcome`]:
 //!
 //! 1. the early log of each spawn this action initiated on the acted-on runner
 //!    inside the window, for `DEV-TAURI-ASSET-MISSING` / `DEV-WEBVIEW-CONN-REFUSED` /
 //!    `DEV-PORT-BIND-FAIL` signatures,
 //! 2. each such spawn's startup panic for `DEV-PANIC-STARTUP` (see
 //!    [`scan_panic`] for where it is read from and which panics count),
-//! 3. the cached `derived_status` / `ui_error` transition for
-//!    `DEV-UI-ERROR-BOUNDARY`.
+//! 3. the acted-on runner's cached `ui_error` / `recent_crash` /
+//!    `derived_status` for `DEV-UI-ERROR-BOUNDARY` ([`scan_health`]).
 //!
 //! The first two describe one boot, so they are read per spawn, and only for
 //! the spawns this action initiated on the acted-on runner inside the window
 //! ([`scan_spawn_effects`]): an action that starts nothing inside its window
-//! has no boot of its own to judge. The third is not gated by spawns.
+//! has no boot of its own to judge. The third is gated the same way, and what
+//! of it can be dated is held to the span from the action's earliest such spawn
+//! to the close.
 //!
 //! The verdict closes at window end. Late observations append to
 //! `late_signatures` flagged `late: true` and update statistics only — they
@@ -33,11 +37,11 @@
 //! stopped through `POST /runners/{id}/stop` does not: that route deletes the
 //! stopped runner's early-log file as soon as the stop succeeds, so a window
 //! still open over the stopped spawn reads no early-log signature for it and,
-//! with no other signature, closes it `Confirmed` under `Ran` or with no run
-//! result (a residual, unchanged from 5fd1ca62, whose reach
-//! [`scan_spawn_effects`] states). The panic log does not survive cleanup: a
-//! `test-*` runner writes it inside its instance root, which a stop reaps,
-//! and the runner's next panic overwrites it. So the watcher first takes the
+//! with no other signature, closes it `Confirmed` under `Ran` (a residual,
+//! unchanged from 5fd1ca62, whose reach [`scan_spawn_effects`] states). The
+//! panic log does not survive cleanup: a `test-*` runner writes it inside its
+//! instance root, which a stop reaps, and the runner's next panic overwrites
+//! it. So the watcher first takes the
 //! panic the exit monitor attached to the spawn's entry, then the one the
 //! supervisor stored on the runner, and only then reads the file.
 
@@ -62,33 +66,50 @@ use crate::state::{ManagedRunner, SharedState, SpawnMarker};
 //    matcher below produces a `DevSignature`; the outcome stores its canonical
 //    `as_str()` so the wire form (`Vec<String>` of `DEV-*` codes) is unchanged.
 
-// ── Per-kind attribution windows (Q6). Read from this const map so they are ──
-//    tunable without a schema change.
+// ── Per-kind attribution windows (Q6). Every kind's window stays open until ──
+//    the action records its own terminal result, then adds a tail; the
+//    backstop bounds a window whose result never arrives. Read from these
+//    consts so they are tunable without a schema change.
 
-/// Restart window: 30s.
-pub const RESTART_WINDOW: Duration = Duration::from_secs(30);
-/// Spawn window: 30s.
-pub const SPAWN_WINDOW: Duration = Duration::from_secs(30);
-/// Build tail added on top of the build's own duration: 30s.
-pub const BUILD_TAIL_WINDOW: Duration = Duration::from_secs(30);
-/// Hard upper bound on a `build`-kind attribution window when the build's real
-/// duration is not known up front (which is EVERY caller today — both
-/// `mint_primary_action` sites pass `build_duration: None`).
+/// The tail added after an action's terminal result, during which delayed
+/// effects (the 2026-06-07 asset error landed at t+5s) still count: 30s.
+pub const RESULT_TAIL_WINDOW: Duration = Duration::from_secs(30);
+
+/// The backstop of a `spawn` and a `build` window: 2 h.
 ///
-/// Before this existed, `window_for(Build, None)` resolved to a flat
-/// [`BUILD_TAIL_WINDOW`] and every rebuild-restart's verdict was stamped 30
-/// seconds after submission — typically 10-20 minutes before the build it was
-/// judging had finished
-/// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md` §1-§2).
-/// The window now stays open until the action records its own terminal result
-/// ([`ActionRunResult`]); this is the backstop for the case where no path ever
-/// records one, so a watcher can never park forever. Sized well above the
-/// observed 10-20 minute runner rebuild.
-pub const BUILD_BACKSTOP_WINDOW: Duration = Duration::from_secs(45 * 60);
+/// A spawn mints before its build (`mint_spawn_action` precedes the build in
+/// both spawn routes) and a build mints at submission, so either window covers
+/// queue wait (`queue_timeout_secs` defaults to unbounded), a cold build (20-50
+/// min), spawn-test's 60 s probe and its 120 s wait. A rebuild restart uses the
+/// same pool and the same cold-build time, and a backstop fires only when no
+/// result arrives, so one constant serves both and loses nothing. It replaced a
+/// 45-minute build backstop, which could be shorter than a cold build.
+pub const LONG_BACKSTOP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// The two timing knobs of a build attribution window, injectable so the
+/// The backstop of a `restart` window: 10 min.
+///
+/// A synchronous restart records `runner_unhealthy_after_start` only after the
+/// readiness gate (15 s), the stop (a drain of up to 30 s, a 0.5 s close
+/// request, a 30 s handoff wait, about 24 s of reap), the start and the 30 s
+/// health wait: about 160 s before the start's exe copy with the tail, and about
+/// 330 s for a restart queued behind two stops under the lifecycle lock. The
+/// window closes on the result, so a longer backstop costs only a dead
+/// handler's row.
+pub const RESTART_BACKSTOP_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The longest per-kind backstop: how long after a spawn a window can still be
+/// reading that spawn's evidence when nothing records a result. A caller's
+/// backstop override (`rebuild_when_idle`'s deadline) can be longer, but that
+/// path records a result on every exit, and its spawn comes after its wait, so
+/// its window closes a tail after the result. Sizes anything that must keep a
+/// spawn's evidence until its window has closed.
+pub const LONGEST_BACKSTOP: Duration = LONG_BACKSTOP_WINDOW;
+const _: () = assert!(LONGEST_BACKSTOP.as_secs() >= RESTART_BACKSTOP_WINDOW.as_secs());
+
+/// The two timing knobs of an attribution window, injectable so the
 /// regression tests can exercise the real waiting logic in milliseconds rather
-/// than minutes. Production always uses [`WindowTiming::default`].
+/// than minutes. Production takes [`WindowTiming::for_kind`], with the mint's
+/// optional backstop override ([`WindowTiming::with_backstop_override`]).
 #[derive(Debug, Clone, Copy)]
 pub struct WindowTiming {
     /// Grace period added AFTER the action's terminal result, during which
@@ -98,30 +119,36 @@ pub struct WindowTiming {
     pub backstop: Duration,
 }
 
-impl Default for WindowTiming {
-    fn default() -> Self {
+impl WindowTiming {
+    /// The production timing of a `kind` window: [`RESULT_TAIL_WINDOW`], and
+    /// [`LONG_BACKSTOP_WINDOW`] for a spawn or a build or
+    /// [`RESTART_BACKSTOP_WINDOW`] for a restart.
+    pub fn for_kind(kind: ActionKind) -> Self {
+        let backstop = match kind {
+            ActionKind::Spawn | ActionKind::Build => LONG_BACKSTOP_WINDOW,
+            ActionKind::Restart => RESTART_BACKSTOP_WINDOW,
+        };
         Self {
-            tail: BUILD_TAIL_WINDOW,
-            backstop: BUILD_BACKSTOP_WINDOW,
+            tail: RESULT_TAIL_WINDOW,
+            backstop,
+        }
+    }
+
+    /// This timing with its backstop replaced by `backstop`, when the mint
+    /// supplied one: a path whose action can legitimately outlast the kind's
+    /// backstop (`rebuild_when_idle` waits up to its `deadline_secs` before it
+    /// even builds).
+    pub fn with_backstop_override(self, backstop: Option<Duration>) -> Self {
+        Self {
+            backstop: backstop.unwrap_or(self.backstop),
+            ..self
         }
     }
 }
 
-/// The attribution window for an action kind. `build` is `duration + 30s`
-/// keyed off the build-submission time; restart/spawn are flat 30s.
-///
-/// **`build_duration` is `None` at every live call site**, which is what made
-/// this a flat 30s window for builds. [`await_attribution_window`] is what the
-/// watcher actually waits on now: it holds a build's window open until the
-/// action's own terminal result lands. This function stays as the declared
-/// per-kind window (and the flat window restart/spawn still use verbatim).
-pub fn window_for(kind: ActionKind, build_duration: Option<Duration>) -> Duration {
-    match kind {
-        ActionKind::Restart => RESTART_WINDOW,
-        ActionKind::Spawn => SPAWN_WINDOW,
-        ActionKind::Build => build_duration.unwrap_or_default() + BUILD_TAIL_WINDOW,
-    }
-}
+/// The evidence a window carries when it closed on its backstop with no
+/// terminal result and no signature (D8).
+pub const BACKSTOP_CLOSED_NO_RESULT: &str = "backstop_closed_no_result";
 
 /// Classify a verdict from the action's own terminal result and the observed
 /// signatures.
@@ -315,20 +342,19 @@ impl ClosedWindow {
 /// So, except as the residuals below say: a later restart or stop
 /// inside the window does not turn a boot that came up into a
 /// failed one; a teardown panic never counts under `Ran`; and
-/// with no run result, as a spawn has, or one other than `Ran`, a
-/// teardown panic is turned away once the exit its stop asked for is
-/// stamped by the close. Spawns, and a `rebuild_when_idle` that succeeds,
-/// record no run result, so a panic of a runner they started that is dated
-/// before any stop request still counts while one of the three places the
-/// watcher reads ([`scan_panic`]) still holds it at the close, a caught panic
-/// of a runner that stays up included.
+/// with no run result (a window closed on its backstop) or one other than
+/// `Ran`, a teardown panic is turned away once the exit its stop asked for is
+/// stamped by the close, and a panic of a runner the action started that is
+/// dated before any stop request counts while one of the three places the
+/// watcher reads ([`scan_panic`]) still holds it at the close.
+///
+/// `Ran` is what a start records once its runner has answered a health check:
+/// the restart routes' wait, spawn-test's probe or wait, spawn-named's wait,
+/// or, when the route answered without one, the detached health wait
+/// (`dev_action::run_result::record_start_verdict`). So `Ran` never stands for
+/// a boot whose API never bound.
 ///
 /// Residuals, documented and not changed:
-/// - `Ran` is what the restart routes record once the runner has answered its
-///   health probe. Under `?wait=false` they record it right after the spawn,
-///   before any probe, so there a boot whose process stays up with its API
-///   never bound, and whose early log matches nothing, closes `Confirmed`: its
-///   panic reads as a caught one. No caller passes `wait=false`.
 /// - A stop requested but not finished at the close leaves the entry with no
 ///   request time yet, so with no run result or one other than `Ran` a
 ///   teardown panic logged between that request and the close counts.
@@ -367,13 +393,6 @@ fn is_startup_panic_of(
     window: ClosedWindow,
     run: Option<&ActionRunResult>,
 ) -> bool {
-    let its_pid = match panic.pid {
-        Some(pid) => spawn.pid == Some(pid),
-        None => panic.timestamp >= spawn.spawned_at,
-    };
-    let before_its_exit = spawn
-        .exited_at
-        .is_none_or(|exited| panic.timestamp <= exited);
     let exited_on_its_own = spawn.stop_requested_at.is_none()
         && spawn
             .exited_at
@@ -383,10 +402,32 @@ fn is_startup_panic_of(
         .stop_requested_at
         .is_none_or(|requested| panic.timestamp < requested);
     window.contains(panic.timestamp)
-        && its_pid
-        && before_its_exit
+        && is_panic_of_spawn(panic, spawn)
         && (exited_on_its_own || !came_up)
         && before_any_stop
+}
+
+/// Check 2 of [`is_startup_panic_of`]: `panic` was logged by `spawn`'s own
+/// process. The header's pid is the spawn's pid, or, with no pid in the header,
+/// the panic is dated at or after the spawn; and when the spawn's exit is
+/// stamped, the panic is dated at or before it (Windows reuses pids). The pid,
+/// not a date, does the work: the spawn's `spawned_at` is read after the child
+/// was spawned, so a very early panic can be dated before it.
+///
+/// spawn-test's failed probe holds the panic it stores to this rule against the
+/// runner's newest spawn (`routes::runners::probe_runner_health`), so a boot
+/// panic is kept however long the probe ran, and an older process's panic
+/// still in the file is not: the runner rewrites `runner-panic.log` on every
+/// panic and never truncates it at start.
+pub(crate) fn is_panic_of_spawn(panic: &panic_log::RecentPanic, spawn: &SpawnMarker) -> bool {
+    let its_pid = match panic.pid {
+        Some(pid) => spawn.pid == Some(pid),
+        None => panic.timestamp >= spawn.spawned_at,
+    };
+    let before_its_exit = spawn
+        .exited_at
+        .is_none_or(|exited| panic.timestamp <= exited);
+    its_pid && before_its_exit
 }
 
 /// Where the acted-on runner's spawn sent its panic log: the dir that spawn
@@ -510,7 +551,7 @@ async fn scan_panic(
 /// soon as the stop succeeds, so a window still open over that spawn reads no
 /// early-log signature for it (`DEV-TAURI-ASSET-MISSING`,
 /// `DEV-WEBVIEW-CONN-REFUSED`, `DEV-PORT-BIND-FAIL`) and, with no other
-/// signature, closes it `Confirmed` under `Ran` or with no run result. The
+/// signature, closes it `Confirmed` under `Ran`. The
 /// dashboard's Stop (named and temp runners) and spawn-test's `stop_url`
 /// reach spawn windows; a restart's, a build's or a `rebuild_when_idle`'s
 /// window is reached only by a direct `POST /runners/primary/stop`. A
@@ -546,38 +587,86 @@ async fn scan_spawn_effects(
     (signatures, evidence)
 }
 
-/// Check the cached health for a UI-error / errored transition on the target
-/// runner. Returns `DEV-UI-ERROR-BOUNDARY` when the runner's cached
-/// `derived_status` is errored or it reports a `ui_error`.
+/// The `DEV-UI-ERROR-BOUNDARY` signature of the acted-on runner's cached health,
+/// read only for an action that initiated a spawn of it inside the window, as
+/// [`scan_spawn_effects`] reads its early logs and panics.
+///
+/// A build-only `fix_and_rebuild`, a refused restart, a failed build and a
+/// `rebuild_when_idle` still waiting start nothing, so the runner's current
+/// `ui_error` describes a boot they did not perform, and none is read for them.
+///
+/// What can be dated is held to the span from the action's earliest in-window
+/// spawn to the close: a `ui_error` counts only if its `first_seen` lies in it,
+/// a `recent_crash` only if its `reported_at` does. `derived_status` is the
+/// supervisor's own fold of those two (`health_cache::derive_runner_status`
+/// returns `Errored` for either), so its `Errored` arm counts only when both are
+/// absent: otherwise a `ui_error` dated out of the span would fall through to it
+/// and still emit the signature.
 async fn scan_health(
     state: &SharedState,
+    managed: Option<&ManagedRunner>,
     runner_id: Option<&str>,
+    action_id: Uuid,
+    window: ClosedWindow,
 ) -> (Vec<DevSignature>, Option<String>) {
-    let Some(runner_id) = runner_id else {
+    let (Some(managed), Some(runner_id)) = (managed, runner_id) else {
         return (Vec::new(), None);
     };
+    let earliest_spawn = managed
+        .recent_spawns
+        .read()
+        .await
+        .spawned_between(window.open_at, window.close_at)
+        .into_iter()
+        .filter(|spawn| spawn.initiated_by == Some(action_id))
+        .map(|spawn| spawn.spawned_at)
+        .min();
+    let Some(earliest_spawn) = earliest_spawn else {
+        return (Vec::new(), None);
+    };
+    let in_span = |at: DateTime<Utc>| earliest_spawn <= at && at <= window.close_at;
+
     let snapshots = state.cached_runner_health.read().await;
-    for snap in snapshots.iter() {
-        if snap.id == runner_id {
-            if let Some(ui_err) = snap.ui_error.as_ref() {
-                return (
-                    vec![DevSignature::DevUiErrorBoundary],
-                    Some(format!(
-                        "ui_error: {}",
-                        ui_err.message.chars().take(160).collect::<String>()
-                    )),
-                );
-            }
-            if matches!(
-                snap.derived_status,
-                crate::health_cache::RunnerStatus::Errored { .. }
-            ) {
-                return (
-                    vec![DevSignature::DevUiErrorBoundary],
-                    Some("derived_status=errored".to_string()),
-                );
-            }
+    let Some(snap) = snapshots.iter().find(|snap| snap.id == runner_id) else {
+        return (Vec::new(), None);
+    };
+    if let Some(ui_err) = snap.ui_error.as_ref() {
+        if in_span(ui_err.first_seen) {
+            return (
+                vec![DevSignature::DevUiErrorBoundary],
+                Some(format!(
+                    "ui_error: {}",
+                    ui_err.message.chars().take(160).collect::<String>()
+                )),
+            );
         }
+    }
+    if let Some(crash) = snap.recent_crash.as_ref() {
+        if in_span(crash.reported_at) {
+            let what = crash
+                .panic_message
+                .as_deref()
+                .unwrap_or(crash.file_path.as_str());
+            return (
+                vec![DevSignature::DevUiErrorBoundary],
+                Some(format!(
+                    "recent_crash: {}",
+                    what.chars().take(160).collect::<String>()
+                )),
+            );
+        }
+    }
+    let undated_errored = snap.ui_error.is_none()
+        && snap.recent_crash.is_none()
+        && matches!(
+            snap.derived_status,
+            crate::health_cache::RunnerStatus::Errored { .. }
+        );
+    if undated_errored {
+        return (
+            vec![DevSignature::DevUiErrorBoundary],
+            Some("derived_status=errored".to_string()),
+        );
     }
     (Vec::new(), None)
 }
@@ -622,70 +711,42 @@ async fn wait_for_run_result(record: &ActionRecord, cap: Duration) -> Option<Act
 /// Wait out the attribution window, and report the action's terminal result if
 /// one landed inside it.
 ///
-/// **This is the framing fix** (plan §6 Phase 2). `window_for(Build, None)` —
-/// a flat 30s — used to be the window for every rebuild-restart, so a build
-/// that fails at t+12min closed `Confirmed` at t+30s and the ledger's
-/// never-re-open rule made that permanent. Now:
+/// **This is the framing fix** (plan §6 Phase 2; plan
+/// `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-dev-action-coord`
+/// D1, D6). A flat 30s window from the mint used to be the window for every
+/// rebuild-restart, every spawn and every restart, so a build that fails at
+/// t+12min, a spawn whose build and boot take longer than 30s, and a restart
+/// whose stop and health wait outlast 30s all closed `Confirmed` before their
+/// result existed, and the ledger's never-re-open rule made that permanent.
+/// Now every kind holds the window open until the action records its own
+/// terminal result, then adds [`WindowTiming::tail`] so delayed effects still
+/// count, still clamped by [`WindowTiming::backstop`]. A path that never records
+/// a result closes on the backstop instead of parking forever.
 ///
-/// - **`build`**: hold the window open until the action records its own
-///   terminal result, then add [`WindowTiming::tail`] so delayed effects still
-///   count. Capped at `build_duration + tail` when the real duration IS known,
-///   else at [`WindowTiming::backstop`] — so a path that never records a result
-///   still closes, exactly as it did before, instead of parking forever.
-/// - **`restart` / `spawn`**: the flat per-kind window, unchanged.
-///
-/// **[`ActionRunResult::Refused`] closes the window immediately, for every
-/// kind.** A refused action never ran, so no effect surface was touched and
-/// there is nothing left for the window to observe; waiting out the remainder
-/// would only delay a verdict that is already known.
+/// **[`ActionRunResult::Refused`] closes the window immediately.** A refused
+/// action never ran, so no effect surface was touched and there is nothing left
+/// for the window to observe; waiting out the tail would only delay a verdict
+/// that is already known.
 ///
 /// The watcher only ever READS the result, so the never-re-open invariant
 /// (module docs; the ledger plan §3.2) is untouched: the verdict is still
 /// composed exactly once, at window close.
 async fn await_attribution_window(
     record: &ActionRecord,
-    kind: ActionKind,
-    build_duration: Option<Duration>,
     timing: WindowTiming,
 ) -> Option<ActionRunResult> {
-    match kind {
-        ActionKind::Restart | ActionKind::Spawn => {
-            let flat = window_for(kind, build_duration);
-            match wait_for_run_result(record, flat).await {
-                // Nothing ran — close now.
-                Some(r @ ActionRunResult::Refused { .. }) => Some(r),
-                // Ran (well or badly): the effect surfaces still need the rest
-                // of the flat window to produce their signatures.
-                Some(other) => {
-                    tokio::time::sleep(remaining(record, flat)).await;
-                    Some(other)
-                }
-                None => record.run_result(),
-            }
+    match wait_for_run_result(record, timing.backstop).await {
+        // Nothing ran — close now.
+        Some(r @ ActionRunResult::Refused { .. }) => Some(r),
+        Some(other) => {
+            // Tail measured from the action's REAL end, and still clamped by
+            // the backstop so the window is bounded either way.
+            let room = timing.backstop.saturating_sub(elapsed_since_start(record));
+            tokio::time::sleep(timing.tail.min(room)).await;
+            Some(other)
         }
-        ActionKind::Build => {
-            let cap = build_duration
-                .map(|d| d + timing.tail)
-                .unwrap_or(timing.backstop);
-            match wait_for_run_result(record, cap).await {
-                Some(r @ ActionRunResult::Refused { .. }) => Some(r),
-                Some(other) => {
-                    // Tail measured from the action's REAL end, and still
-                    // clamped by the cap so the window is bounded either way.
-                    let elapsed = elapsed_since_start(record);
-                    let room = cap.saturating_sub(elapsed);
-                    tokio::time::sleep(timing.tail.min(room)).await;
-                    Some(other)
-                }
-                None => record.run_result(),
-            }
-        }
+        None => record.run_result(),
     }
-}
-
-/// How much of `window` is left, measured from the record's `started_at`.
-fn remaining(record: &ActionRecord, window: Duration) -> Duration {
-    window.saturating_sub(elapsed_since_start(record))
 }
 
 /// Wall-clock elapsed since the action was minted. A clock that has gone
@@ -697,43 +758,55 @@ fn elapsed_since_start(record: &ActionRecord) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// The verdict of a closed window: [`classify`], except that a window that
+/// closed on its backstop with no terminal result and no signature is
+/// [`D3Category::Partial`], not `Confirmed` (D8). Every minting path records a
+/// result on every exit, a dropped future included (`RunResultGuard`), so a
+/// window that reaches its backstop has no evidence of what happened, and an
+/// unknown must not render as a success. A signature the window did observe
+/// is evidence, and keeps its own category.
+pub fn classify_close(run: Option<&ActionRunResult>, signatures: &[DevSignature]) -> D3Category {
+    match classify(run, signatures) {
+        D3Category::Confirmed if run.is_none() => D3Category::Partial,
+        category => category,
+    }
+}
+
 /// Spawn the detached attribution watcher for a minted action.
 ///
-/// Sleeps the per-kind window, scans the effect surfaces, folds the verdict
-/// into `record.outcome`, and logs the verdict to the supervisor log buffer.
-/// Triggers `notify_health_change()` so connected dashboards refresh (Phase 1
-/// has no dedicated `events.*` WS channel — that arrives with coord in Phase 3;
-/// see the plan's §6.1 watcher note). Best-effort throughout: any scan failure
-/// degrades to "no signal", never a panic.
+/// Holds the window open per [`await_attribution_window`] on the kind's
+/// production timing ([`WindowTiming::for_kind`]), its backstop replaced by
+/// `backstop_override` when the mint supplies one, scans the effect surfaces,
+/// folds the verdict into `record.outcome`, and logs the verdict to the
+/// supervisor log buffer. Triggers `notify_health_change()` so connected
+/// dashboards refresh (Phase 1 has no dedicated `events.*` WS channel — that
+/// arrives with coord in Phase 3; see the plan's §6.1 watcher note).
+/// Best-effort throughout: any scan failure degrades to "no signal", never a
+/// panic.
 pub fn spawn_attribution_watcher(
     state: SharedState,
     record: Arc<ActionRecord>,
     targets: AttributionTargets,
-    build_duration: Option<Duration>,
+    backstop_override: Option<Duration>,
 ) {
-    spawn_attribution_watcher_with_timing(
-        state,
-        record,
-        targets,
-        build_duration,
-        WindowTiming::default(),
-    );
+    let timing = WindowTiming::for_kind(record.kind).with_backstop_override(backstop_override);
+    spawn_attribution_watcher_with_timing(state, record, targets, timing);
 }
 
 /// [`spawn_attribution_watcher`] with the window timing supplied explicitly.
-/// Production uses the `Default`; the regression tests use millisecond values
-/// so they exercise the real waiting logic without a 30-second sleep.
+/// Production uses [`WindowTiming::for_kind`]; the regression tests use
+/// millisecond values so they exercise the real waiting logic without a
+/// 30-second sleep.
 pub fn spawn_attribution_watcher_with_timing(
     state: SharedState,
     record: Arc<ActionRecord>,
     targets: AttributionTargets,
-    build_duration: Option<Duration>,
     timing: WindowTiming,
 ) {
     tokio::spawn(async move {
         let kind = record.kind;
 
-        let run_result = await_attribution_window(&record, kind, build_duration, timing).await;
+        let run_result = await_attribution_window(&record, timing).await;
         let window = ClosedWindow {
             open_at: record.started_at,
             close_at: Utc::now(),
@@ -748,10 +821,17 @@ pub fn spawn_attribution_watcher_with_timing(
             run_result.as_ref(),
         )
         .await;
-        let (health_sigs, health_ev) = scan_health(&state, targets.runner_id.as_deref()).await;
+        let (health_sigs, health_ev) = scan_health(
+            &state,
+            targets.managed.as_deref(),
+            targets.runner_id.as_deref(),
+            record.action_id,
+            window,
+        )
+        .await;
         merge(&mut signatures, &mut evidence, health_sigs, health_ev);
 
-        let category = classify(run_result.as_ref(), &signatures);
+        let category = classify_close(run_result.as_ref(), &signatures);
         let ended_at = Utc::now();
         let duration_ms = (ended_at - record.started_at).num_milliseconds();
 
@@ -761,10 +841,11 @@ pub fn spawn_attribution_watcher_with_timing(
         // reason is the only evidence there is — and for a refusal it is the
         // ONLY evidence there ever could be, since nothing ran.
         if evidence.is_none() {
-            evidence = run_result
-                .as_ref()
-                .and_then(ActionRunResult::reason)
-                .map(|r| r.chars().take(400).collect::<String>());
+            evidence = match run_result.as_ref() {
+                Some(r) => r.reason().map(|r| r.chars().take(400).collect::<String>()),
+                // D8: a backstop close with no result says so.
+                None => Some(BACKSTOP_CLOSED_NO_RESULT.to_string()),
+            };
         }
 
         // The outcome's wire form carries the canonical `DEV-*` id strings.
@@ -1115,7 +1196,6 @@ mod tests {
                 managed: Some(runner.clone()),
                 runner_id: None,
             },
-            None,
             FAST_BUILD_WINDOW,
         );
     }
@@ -1172,7 +1252,8 @@ mod tests {
     ///
     /// Drives the real watcher. A `Refused` closes the window immediately
     /// (nothing ran, so there is no effect window to wait out), which is also
-    /// what keeps this test sub-second against the flat 30s restart window.
+    /// what keeps this test sub-second against the restart's 10-minute
+    /// backstop.
     #[tokio::test]
     async fn refused_restart_outcome_is_not_confirmed_and_names_the_refusal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1187,7 +1268,7 @@ mod tests {
                 .to_string(),
         });
 
-        // Well inside RESTART_WINDOW: the refusal closes the window early.
+        // Well inside the restart tail: the refusal closes the window early.
         let outcome = await_outcome(
             &record,
             crate::test_clock::poll_budget(Duration::from_secs(30)),
@@ -1253,8 +1334,8 @@ mod tests {
     /// still be judged on that result.
     ///
     /// `tail` here plays the role the flat 30s played in production: under the
-    /// old code the window was exactly `window_for(Build, None) == tail` and
-    /// closed `Confirmed` before the failure existed. The failure is recorded
+    /// old code a build's window with no known duration was exactly the tail
+    /// and closed `Confirmed` before the failure existed. The failure is recorded
     /// at ~4x `tail`, so this fails against the old sleep-the-window watcher
     /// and passes against the hold-open one.
     #[tokio::test]
@@ -1267,17 +1348,11 @@ mod tests {
             tail: Duration::from_millis(50),
             backstop: Duration::from_secs(20),
         };
-        assert_eq!(
-            window_for(ActionKind::Build, None),
-            BUILD_TAIL_WINDOW,
-            "the pre-fix window for a build with no known duration was the flat tail"
-        );
 
         spawn_attribution_watcher_with_timing(
             state,
             record.clone(),
             AttributionTargets::default(),
-            None,
             timing,
         );
 
@@ -1314,7 +1389,10 @@ mod tests {
 
     /// A build that never records a terminal result still closes — on the
     /// backstop. Without this the watcher (and the coord ingest behind it)
-    /// would park forever on any path that forgets to report.
+    /// would park forever on any path that forgets to report. Every build mint
+    /// site records a result on every exit now (a `RunResultGuard` covers a
+    /// dropped one), so such a close has no evidence of what happened: it is
+    /// `Partial`, not `Confirmed` (D8).
     #[tokio::test]
     async fn build_with_no_terminal_result_closes_on_the_backstop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1325,7 +1403,6 @@ mod tests {
             state,
             record.clone(),
             AttributionTargets::default(),
-            None,
             WindowTiming {
                 tail: Duration::from_millis(10),
                 backstop: Duration::from_millis(150),
@@ -1337,9 +1414,12 @@ mod tests {
             crate::test_clock::poll_budget(Duration::from_secs(30)),
         )
         .await;
-        // No terminal result and no signatures: the pre-existing meaning of a
-        // clean window is unchanged for an action that reported nothing.
-        assert_eq!(outcome.category, D3Category::Confirmed);
+        // No terminal result and no signatures: nothing says what happened.
+        assert_eq!(outcome.category, D3Category::Partial);
+        assert_eq!(
+            outcome.evidence_ref.as_deref(),
+            Some(BACKSTOP_CLOSED_NO_RESULT)
+        );
     }
 
     /// The watcher reads the startup panic of the spawn the action made, in the
@@ -1759,8 +1839,8 @@ mod tests {
 
     /// The crash-watchdog timeline: the action's own boot panics at startup
     /// and exits, its exit monitor stamps that exit with the panic it parsed,
-    /// and the crash watchdog's respawn (5 s later in production, inside a
-    /// restart's 30 s window) clears the stored panic, comes up and is still
+    /// and the crash watchdog's respawn (5 s later in production, inside the
+    /// action's window) clears the stored panic, comes up and is still
     /// live at the close, where the action records `Ran`. With
     /// `respawn_panics` the respawn also logs a caught panic of its own, which
     /// overwrites `runner-panic.log`. Returns the action's outcome.
@@ -2029,9 +2109,8 @@ mod tests {
     }
 
     /// The timing of a build-kind window whose action records no run result,
-    /// as a spawn records none and a `rebuild_when_idle` that succeeds records
-    /// none: it closes on the backstop. The panic clauses read only the run
-    /// result, not the kind, and a spawn window is a flat 30 s.
+    /// as a dead executing task records none: it closes on the backstop. The
+    /// panic clauses read only the run result, not the kind.
     const NO_RESULT_WINDOW: WindowTiming = WindowTiming {
         tail: Duration::from_millis(10),
         backstop: Duration::from_millis(300),
@@ -2053,7 +2132,6 @@ mod tests {
                 managed: Some(runner.clone()),
                 runner_id: None,
             },
-            None,
             NO_RESULT_WINDOW,
         );
         let outcome = await_outcome(
@@ -2122,7 +2200,8 @@ mod tests {
             "a teardown panic was attributed: {:?}",
             outcome.signatures
         );
-        assert_eq!(outcome.category, D3Category::Confirmed);
+        // No signature and no result: a backstop close says nothing (D8).
+        assert_eq!(outcome.category, D3Category::Partial);
     }
 
     /// spawn-test's probe failure: the spawned runner's boot panics and never
@@ -2549,22 +2628,40 @@ mod tests {
         );
     }
 
+    /// Every kind holds its window open for its result; only the backstop
+    /// differs, and an override replaces it.
     #[test]
-    fn window_for_build_is_duration_plus_tail() {
-        let dur = Duration::from_secs(120);
+    fn window_timing_is_per_kind_and_the_override_replaces_the_backstop() {
+        for kind in [ActionKind::Spawn, ActionKind::Build, ActionKind::Restart] {
+            assert_eq!(WindowTiming::for_kind(kind).tail, Duration::from_secs(30));
+        }
         assert_eq!(
-            window_for(ActionKind::Build, Some(dur)),
-            dur + BUILD_TAIL_WINDOW
+            WindowTiming::for_kind(ActionKind::Spawn).backstop,
+            Duration::from_secs(2 * 60 * 60)
         );
-        assert_eq!(window_for(ActionKind::Restart, None), RESTART_WINDOW);
-        assert_eq!(window_for(ActionKind::Spawn, None), SPAWN_WINDOW);
-        // Build with no known duration falls back to just the tail.
-        assert_eq!(window_for(ActionKind::Build, None), BUILD_TAIL_WINDOW);
+        assert_eq!(
+            WindowTiming::for_kind(ActionKind::Build).backstop,
+            Duration::from_secs(2 * 60 * 60)
+        );
+        assert_eq!(
+            WindowTiming::for_kind(ActionKind::Restart).backstop,
+            Duration::from_secs(10 * 60)
+        );
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            WindowTiming::for_kind(ActionKind::Build)
+                .with_backstop_override(Some(day))
+                .backstop,
+            day
+        );
+        assert_eq!(
+            WindowTiming::for_kind(ActionKind::Build)
+                .with_backstop_override(None)
+                .backstop,
+            LONG_BACKSTOP_WINDOW
+        );
     }
 
-    /// Scanning a fixture early-log FILE (not just a string) → Contradiction +
-    /// the asset-missing signature, exercising the `scan_early_log` file IO
-    /// path against a `tempfile`. Env-free.
     #[test]
     fn fixture_early_log_file_scans_to_contradiction() {
         let dir = tempfile::tempdir().unwrap();
@@ -2618,5 +2715,239 @@ mod tests {
             "late observation must not re-open the closed verdict"
         );
         assert_eq!(outcome.late_signatures.len(), 1);
+    }
+
+    // ── Plan `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-
+    //    dev-action-coord` Phase 2 (PR-B) ──
+
+    /// Whether the watcher has folded an outcome into `record` yet.
+    fn outcome_of(record: &ActionRecord) -> Option<ActionOutcome> {
+        record.outcome.read().ok().and_then(|g| g.clone())
+    }
+
+    /// T1-1 (D1). A spawn's window, on production timing, stays open past the
+    /// flat 30 s it used to close at, until the spawn records its result.
+    #[tokio::test(start_paused = true)]
+    async fn a_spawn_window_stays_open_past_thirty_seconds_until_the_run_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Spawn);
+        spawn_attribution_watcher(state, record.clone(), AttributionTargets::default(), None);
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(
+            outcome_of(&record).is_none(),
+            "the spawn window closed before the spawn recorded its result"
+        );
+
+        record.record_run_result(ActionRunResult::Errored {
+            reason: "runner_died_during_startup: the spawned runner exited".to_string(),
+        });
+        let outcome = await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await;
+        assert_eq!(outcome.category, D3Category::Failure);
+        assert!(
+            outcome
+                .evidence_ref
+                .as_deref()
+                .is_some_and(|e| e.contains("runner_died_during_startup")),
+            "{:?}",
+            outcome.evidence_ref
+        );
+    }
+
+    /// T1-2 (D1, D8). A spawn that records no result is still open past the
+    /// old 45-minute build backstop, closes on the 2-hour spawn backstop, and
+    /// says it closed with no result rather than `Confirmed`. Literals, not the
+    /// constant, so changing the constant turns this red.
+    #[tokio::test(start_paused = true)]
+    async fn a_spawn_with_no_terminal_result_closes_on_the_spawn_backstop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Spawn);
+        spawn_attribution_watcher(state, record.clone(), AttributionTargets::default(), None);
+
+        let past_the_old_backstop = Duration::from_secs(45 * 60 + 1);
+        tokio::time::sleep(past_the_old_backstop).await;
+        assert!(
+            outcome_of(&record).is_none(),
+            "the spawn window closed on the old 45-minute build backstop"
+        );
+
+        let past_the_spawn_backstop = Duration::from_secs(2 * 60 * 60) + Duration::from_secs(30);
+        tokio::time::sleep(past_the_spawn_backstop - past_the_old_backstop).await;
+        let outcome = outcome_of(&record).expect("the spawn window outlived its 2-hour backstop");
+        assert!(record.run_result().is_none());
+        assert_eq!(outcome.category, D3Category::Partial);
+        assert_eq!(
+            outcome.evidence_ref.as_deref(),
+            Some("backstop_closed_no_result")
+        );
+    }
+
+    /// T1-11 (D6). A restart's window waits for the
+    /// `runner_unhealthy_after_start` its route records after its stop, start
+    /// and 30 s health wait, all past the flat 30 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_window_waits_for_an_unhealthy_after_start_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Restart);
+        spawn_attribution_watcher(state, record.clone(), AttributionTargets::default(), None);
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(
+            outcome_of(&record).is_none(),
+            "the restart window closed before its result"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        record.record_run_result(ActionRunResult::Errored {
+            reason: "runner_unhealthy_after_start: runner 'primary' did not become healthy \
+                     within 30000ms of the restart"
+                .to_string(),
+        });
+        let outcome = await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await;
+        assert_eq!(outcome.category, D3Category::Failure);
+        assert!(outcome
+            .evidence_ref
+            .as_deref()
+            .is_some_and(|e| e.contains("runner_unhealthy_after_start")));
+    }
+
+    /// The primary's cached health snapshot, with `ui_error` and
+    /// `derived_status` as given and every other field neutral.
+    fn cached_health(
+        ui_error: Option<crate::health_cache::UiErrorSummary>,
+        derived_status: crate::health_cache::RunnerStatus,
+    ) -> crate::health_cache::CachedRunnerHealth {
+        crate::health_cache::CachedRunnerHealth {
+            id: crate::config::RunnerConfig::default_primary().id,
+            name: "Primary".to_string(),
+            port: 9876,
+            kind: qontinui_types::wire::runner_kind::RunnerKind::Primary,
+            running: true,
+            pid: Some(SPAWNED_PID),
+            api_responding: true,
+            ui_error,
+            recent_crash: None,
+            derived_status,
+            watchdog: crate::routes::health::WatchdogHealth::unavailable(),
+            liveness: crate::state::RunnerLiveness::Responding,
+            last_seen_responding_at: None,
+            port_open: true,
+            frontend_ready: None,
+            frontend_state: None,
+            frontend_not_ready_since: None,
+        }
+    }
+
+    fn ui_error_first_seen(at: DateTime<Utc>) -> crate::health_cache::UiErrorSummary {
+        crate::health_cache::UiErrorSummary {
+            message: "TypeError: cannot read properties of undefined".to_string(),
+            digest: None,
+            stack: None,
+            component_stack: None,
+            first_seen: at,
+            reported_at: at,
+            count: 1,
+        }
+    }
+
+    /// Run a `Build` action that records `Ran` against the primary, with the
+    /// cached health `health` builds from its record, and, when `spawn_at`
+    /// gives a time, a spawn it initiated then. Returns the outcome.
+    async fn build_outcome_over_cached_health(
+        spawn_at: impl Fn(&ActionRecord) -> Option<DateTime<Utc>>,
+        health: impl Fn(&ActionRecord) -> crate::health_cache::CachedRunnerHealth,
+    ) -> ActionOutcome {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let primary = test_primary();
+        let record = bare_record(ActionKind::Build);
+        spawn_attribution_watcher_with_timing(
+            state.clone(),
+            record.clone(),
+            AttributionTargets {
+                runner_id: Some(primary.config.id.clone()),
+                managed: Some(primary.clone()),
+            },
+            FAST_BUILD_WINDOW,
+        );
+        if let Some(at) = spawn_at(&record) {
+            let log_dir = tmp.path().join("dev-logs").join("runner-primary");
+            record_spawn(&primary, &record, at, SPAWNED_PID, &log_dir).await;
+        }
+        *state.cached_runner_health.write().await = vec![health(&record)];
+        record.record_run_result(ActionRunResult::Ran);
+        await_outcome(
+            &record,
+            crate::test_clock::poll_budget(Duration::from_secs(30)),
+        )
+        .await
+    }
+
+    /// T1-13 (D3). The cached-health surface is read only for an action that
+    /// initiated a spawn inside its window, and its `ui_error` only when first
+    /// seen after that spawn; the `derived_status` fold does not re-admit a
+    /// `ui_error` its date dropped.
+    #[tokio::test]
+    async fn a_build_only_action_reads_no_cached_health() {
+        use crate::health_cache::RunnerStatus;
+
+        // A build that started nothing: the runner's ui_error is not its.
+        let build_only = build_outcome_over_cached_health(
+            |_| None,
+            |record| {
+                cached_health(
+                    Some(ui_error_first_seen(inside_the_window(record))),
+                    RunnerStatus::Healthy,
+                )
+            },
+        )
+        .await;
+        assert!(
+            build_only.signatures.is_empty(),
+            "{:?}",
+            build_only.signatures
+        );
+        assert_eq!(build_only.category, D3Category::Confirmed);
+
+        // A boot it initiated, then a ui_error first seen after that boot.
+        let its_boot = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| {
+                cached_health(
+                    Some(ui_error_first_seen(inside_the_window(record))),
+                    RunnerStatus::Healthy,
+                )
+            },
+        )
+        .await;
+        assert_eq!(its_boot.signatures, ["DEV-UI-ERROR-BOUNDARY"]);
+
+        // A ui_error first seen before that boot, folded into `Errored`.
+        let earlier = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| {
+                cached_health(
+                    Some(ui_error_first_seen(
+                        record.started_at - chrono::Duration::seconds(5),
+                    )),
+                    RunnerStatus::Errored {
+                        reason: "ui_error".to_string(),
+                    },
+                )
+            },
+        )
+        .await;
+        assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);
+        assert_eq!(earlier.category, D3Category::Confirmed);
     }
 }

@@ -252,17 +252,22 @@ impl SpawnMarker {
 
 /// How many spawns [`ManagedRunner::recent_spawns`] keeps.
 ///
-/// The attribution watcher judges every spawn made inside an action's window,
-/// so the ring must hold every spawn one window can see. The longest window is
-/// a build's 45-minute backstop. The crash watchdog makes at most three
-/// restarts in any 30 minutes before it disarms itself, so at most six in 45
-/// minutes. A window therefore sees the action's own spawn, at most six
-/// crash-watchdog restarts, and whatever other actions start the runner
-/// meanwhile; sixteen leaves room for nine of those. If more spawns than that
-/// ever land inside one window, the ring drops the oldest before the window
-/// closes: the watcher never judges those boots, and the exit monitor's stamp
-/// for a dropped spawn finds no entry and is discarded.
-pub const SPAWN_RING_CAPACITY: usize = 16;
+/// The attribution watcher judges every spawn its action made inside the
+/// action's window, so the ring must hold every spawn one window can see. The
+/// longest per-kind window is the 2-hour spawn and build backstop
+/// (`dev_action::attribution::LONGEST_BACKSTOP`). The crash watchdog makes at
+/// most three restarts in any rolling 30 minutes before it disarms itself, so
+/// about twelve in 2 hours, fifteen counting a burst at each end. A window
+/// therefore sees the action's own spawn, at most fifteen crash-watchdog
+/// restarts, and whatever other actions start the runner meanwhile;
+/// thirty-two leaves room for sixteen of those, about the margin sixteen left
+/// against the old 45-minute backstop (nine). A backstop override
+/// (`rebuild_when_idle`'s deadline) can hold a window longer, but its own spawn
+/// comes after its wait and its window closes a tail after its result. If more
+/// spawns than that ever land inside one window, the ring drops the oldest
+/// before the window closes: the watcher never judges those boots, and the exit
+/// monitor's stamp for a dropped spawn finds no entry and is discarded.
+pub const SPAWN_RING_CAPACITY: usize = 32;
 
 /// A runner's recent spawns, oldest first, at most [`SPAWN_RING_CAPACITY`].
 ///

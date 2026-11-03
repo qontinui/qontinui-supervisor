@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -17,8 +17,9 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
-    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, record_start_verdict,
+    spawn_attribution_watcher, spawn_run_result, ActionKind, ActionRecord, ActionRisk,
+    AttributionTargets, PredictedSignature, RunResultGuard, SlotResolution,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1331,8 +1332,8 @@ pub async fn stop_runner(
     // file the stopped spawn's entry names in the runner's spawn ring, which
     // the dev-action attribution watcher reads only at a window's close: a
     // window still open over that spawn then reads no early-log signature
-    // for it and, with no other signature, closes it `Confirmed` under `Ran`
-    // or with no run result. A residual, unchanged from 5fd1ca62, whose reach
+    // for it and, with no other signature, closes it `Confirmed` under `Ran`.
+    // A residual, unchanged from 5fd1ca62, whose reach
     // `dev_action::attribution::scan_spawn_effects` states.
     let early_log_path = if let Some(managed) = state.get_runner(&id).await {
         managed.early_log_path.read().await.clone()
@@ -2625,11 +2626,13 @@ async fn wait_out_queue_timeout(
 /// attribution watcher targeting the spawned runner. The watcher reads the
 /// runner's spawn ring, and each in-window spawn's early log and panic,
 /// lazily, at window close, because the spawn records them after the mint,
-/// once the build is done. A spawn that has not launched by the time its 30 s
-/// window closes (a `rebuild: true` build) has no spawn in the window, so the
-/// watcher reads neither file for it.
+/// once the build is done. The window stays open until the spawn route records
+/// the spawn's own terminal result (`spawn_run_result`, at the route's one
+/// chokepoint), then a 30 s tail, capped by the 2-hour spawn backstop, so a
+/// `rebuild: true` spawn's build and boot land inside it.
 ///
-/// Returns `(action_id, states_active, predicted, risk)` for stamping into the
+/// Returns `(record, states_active, predicted, risk)`: the record so the route
+/// can record the spawn's terminal result on it, the rest for stamping into the
 /// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
 /// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
 /// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
@@ -2650,7 +2653,7 @@ async fn mint_spawn_action(
     requester_id: Option<String>,
     managed: Arc<ManagedRunner>,
 ) -> (
-    uuid::Uuid,
+    Arc<ActionRecord>,
     Vec<&'static str>,
     Vec<PredictedSignature>,
     ActionRisk,
@@ -2699,7 +2702,7 @@ async fn mint_spawn_action(
     let runner_id = managed.config.id.clone();
     spawn_attribution_watcher(
         state.clone(),
-        arc,
+        arc.clone(),
         AttributionTargets {
             managed: Some(managed),
             runner_id: Some(runner_id),
@@ -2707,7 +2710,7 @@ async fn mint_spawn_action(
         None,
     );
 
-    (action_id, states_active, predicted, risk)
+    (arc, states_active, predicted, risk)
 }
 
 /// Render an [`ActionRisk`] as the spawn ACK's `risk` field: `null` when there
@@ -3178,12 +3181,13 @@ pub async fn spawn_test(
 
     // Mint a `spawn`-kind dev-action snapshot. State eval captures the
     // cause-side context (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at
-    // spawn time; the attribution watcher (30s window) folds the verdict in by
-    // scanning the SPAWNED runner's early-log (read lazily via the managed
-    // runner — its path is set during the build, after this mint) + cached
-    // health. Reuses the request's `requester_id` as the snapshot requester
-    // (Q8 — no new identity system).
-    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    // spawn time; the attribution watcher holds its window open until
+    // `execute_spawn_build` records the spawn's result (then a 30 s tail), and
+    // folds the verdict in by scanning the SPAWNED runner's early-log (read
+    // lazily via the managed runner — its path is set during the build, after
+    // this mint) + cached health. Reuses the request's `requester_id` as the
+    // snapshot requester (Q8 — no new identity system).
+    let (action_record, action_states_active, action_predicted, action_risk) = mint_spawn_action(
         &state,
         format!(
             "rebuild={};use_lkg={};git_ref={:?}",
@@ -3193,7 +3197,12 @@ pub async fn spawn_test(
         managed.clone(),
     )
     .await;
+    let action_id = action_record.action_id;
     let action_risk_json = spawn_risk_ack_json(&action_risk);
+    // Moved into the exec future and from there into `execute_spawn_build`,
+    // which records the spawn's result; it records the action abandoned if
+    // that future ends first (a panic in the exec task).
+    let run_guard = RunResultGuard::arm(action_record, "spawn-test's exec future");
 
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
@@ -3244,7 +3253,7 @@ pub async fn spawn_test(
                 port,
                 exec_managed,
                 no_wait,
-                action_id,
+                run_guard,
             )
             .await;
             // The build is over (succeeded or failed): free the key so the next
@@ -3496,6 +3505,13 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 ///
 /// `no_wait` mirrors the `X-Queue-Mode: no-wait` header semantics for the
 /// build-pool-full short-circuit.
+///
+/// **The chokepoint of a spawn-test's terminal result.** It is the only caller
+/// of `execute_spawn_build_inner`, so it maps the inner result with
+/// [`spawn_run_result`], before an `Err` is rendered to a body while it still
+/// holds the typed `SupervisorError`, and records it on the action `run_guard`
+/// covers, or hands the guard to the detached health wait when nothing checked
+/// the runner's health ([`record_start_verdict`]).
 async fn execute_spawn_build(
     state: SharedState,
     body: SpawnTestRequest,
@@ -3503,8 +3519,9 @@ async fn execute_spawn_build(
     port: u16,
     managed: Arc<ManagedRunner>,
     no_wait: bool,
-    action_id: uuid::Uuid,
+    run_guard: RunResultGuard,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
+    let action_id = run_guard.record().action_id;
     let mut side = SpawnBuildSideChannel::default();
     // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
     // placeholder insert and moves its guard into the future that awaits this
@@ -3518,11 +3535,12 @@ async fn execute_spawn_build(
     // without attribution and falsified `attach_build_slot_id`'s "always
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
-    match execute_spawn_build_inner(
+    let result = execute_spawn_build_inner(
         &state, body, &id, port, &managed, no_wait, action_id, &mut side,
     )
-    .await
-    {
+    .await;
+    record_start_verdict(&state, &id, spawn_run_result(&result), run_guard);
+    match result {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
             attach_spawn_identity(&mut body, &id, port);
@@ -5415,10 +5433,17 @@ async fn probe_runner_health(
         let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
         let parsed = crate::process::panic_log::parse_panic_file(&path);
         if let Some(p) = parsed.as_ref() {
-            // Freshness: a panic log from a prior boot of a re-used runner
-            // id would lie here. Match the same 60s window the exit-
-            // monitor uses.
-            if !crate::process::panic_log::is_fresh(p, chrono::Utc::now()) {
+            // The panic must be this spawn's: the runner's newest ring entry,
+            // which `start_managed_runner` pushed before this probe ran. Its
+            // pid decides, not the panic's age, so a boot panic is kept
+            // however long the probe ran, and a panic of an older process
+            // still in the file (the runner never truncates it) is not. An
+            // empty ring stores nothing.
+            let newest = managed.recent_spawns.read().await.newest().cloned();
+            let this_spawns = newest
+                .as_ref()
+                .is_some_and(|spawn| crate::dev_action::attribution::is_panic_of_spawn(p, spawn));
+            if !this_spawns {
                 None
             } else {
                 // Stash on the managed runner so subsequent callers of
@@ -5484,7 +5509,7 @@ pub async fn spawn_named(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(body): Json<SpawnNamedRequest>,
-) -> Result<impl IntoResponse, SupervisorError> {
+) -> Result<Response, SupervisorError> {
     // Validate name
     let name = body.name.trim().to_string();
     if name.is_empty() {
@@ -5604,15 +5629,80 @@ pub async fn spawn_named(
     }
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
-    // as spawn-test). Stamped into the success response below.
-    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    // as spawn-test). Stamped into the response below, failed or not.
+    let (action_record, action_states_active, action_predicted, action_risk) = mint_spawn_action(
         &state,
         format!("named={};rebuild={}", name, body.rebuild),
         body.requester_id.clone(),
         managed.clone(),
     )
     .await;
+    let action_id = action_record.action_id;
     let action_risk_json = spawn_risk_ack_json(&action_risk);
+    // The inner future runs inside this handler, so a client disconnect drops
+    // it: the guard records the action abandoned then.
+    let run_guard = RunResultGuard::arm(action_record, "spawn-named's handler future");
+
+    let result = spawn_named_inner(
+        state.clone(),
+        &body,
+        &name,
+        &id,
+        port,
+        managed.clone(),
+        no_wait,
+        action_id,
+    )
+    .await;
+    // The one chokepoint of a spawn-named's terminal result, read before an
+    // `Err` is rendered to a body.
+    record_start_verdict(&state, &id, spawn_run_result(&result), run_guard);
+
+    let (status, mut resp) = match result {
+        Ok(ok) => ok,
+        Err(e) => e.to_status_body(),
+    };
+    // Dev-action snapshot fields (in-place ACK enrichment per §6.1), on a
+    // failed response too, so its caller can reach the verdict.
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("action_id".to_string(), json!(action_id.to_string()));
+        obj.insert("states_active".to_string(), json!(action_states_active));
+        obj.insert("predicted".to_string(), json!(action_predicted));
+        obj.insert("risk".to_string(), action_risk_json);
+        obj.insert(
+            "outcome_url".to_string(),
+            json!(format!("/actions/{}/outcome", action_id)),
+        );
+    }
+    let frontend_stale = resp
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut response = (status, Json(resp)).into_response();
+    if status == axum::http::StatusCode::OK && frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+    }
+    Ok(response)
+}
+
+/// spawn-named from "Item A" on: build, start, wait, assemble. Returns the
+/// `(status, body)` [`spawn_run_result`] maps, so the handler records the
+/// spawn's terminal result before it renders an `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_named_inner(
+    state: SharedState,
+    body: &SpawnNamedRequest,
+    name: &str,
+    id: &str,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+    action_id: uuid::Uuid,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
+    let name = name.to_string();
+    let id = id.to_string();
 
     // Item A — build_result tracking (mirror of spawn_test).
     let mut build_attempted = false;
@@ -5893,7 +5983,7 @@ pub async fn spawn_named(
             "frontend_stale_reason": reason_str,
             "stale_slot_id": stale_slot_id,
         });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
     }
 
     // Item A: assemble build_result alongside the existing top-level
@@ -5942,13 +6032,6 @@ pub async fn spawn_named(
     if body.fresh_device_identity {
         resp["device_identity"] = device_identity_report(&id);
     }
-    // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
-    resp["action_id"] = json!(action_id.to_string());
-    resp["states_active"] = json!(action_states_active);
-    resp["predicted"] = json!(action_predicted);
-    resp["risk"] = action_risk_json;
-    resp["outcome_url"] = json!(format!("/actions/{}/outcome", action_id));
-
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a
     // diagnostic `frontend_stale_reason` when set. (Named runners don't get
     // the `frontend_strict` opt-out yet — they're long-lived, so callers who
@@ -5970,15 +6053,11 @@ pub async fn spawn_named(
             None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
         };
         resp["warnings"] = json!([stale_msg]);
-
-        let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
-        response
-            .headers_mut()
-            .insert("X-Frontend-Stale", "1".parse().unwrap());
-        return Ok(response);
+        // The handler adds the `X-Frontend-Stale: 1` header for this body.
+        return Ok((axum::http::StatusCode::OK, resp));
     }
 
-    Ok(Json(resp).into_response())
+    Ok((axum::http::StatusCode::OK, resp))
 }
 
 // --- Build pool visibility ---

@@ -23,18 +23,22 @@ pub mod ingest;
 pub mod mock;
 pub mod policy;
 pub mod record;
+pub mod run_result;
 pub mod states;
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // `spawn_attribution_watcher_with_timing` / `WindowTiming` are deliberately NOT
-// re-exported: production always takes the `Default` timing through
+// re-exported: production always takes `WindowTiming::for_kind` through
 // `spawn_attribution_watcher`, and the explicit-timing form exists so the
 // regression tests can run the real waiting logic in milliseconds. Reach it
 // at `crate::dev_action::attribution::…` from a test.
 pub use expectations::{assess_then_cut, fetch_expectations, PredictedSignature};
 pub use ingest::{coord_base, post_snapshot_to_coord};
 pub use policy::ActionRisk;
-pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore};
+pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore, RunResultGuard};
+pub use run_result::{
+    record_start_verdict, run_result_for, spawn_run_result, start_verdict, StartVerdict, SyncProbe,
+};
 pub use states::{evaluate_all, SlotResolution};
