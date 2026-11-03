@@ -3488,8 +3488,9 @@ mod tests {
         let boot = panic_at(2, 7, "the boot panic");
         let teardown = panic_at(6, 7, "the teardown panic");
 
+        let stray = panic_at(3, 7, "a panic for no recorded spawn");
         assert!(
-            !ring.attach_boot_panic(ring_time(3), boot.clone()),
+            !ring.attach_boot_panic(ring_time(3), stray),
             "no spawn was recorded at 3"
         );
         // Not exited yet: a boot panic still attaches.
@@ -3511,6 +3512,7 @@ mod tests {
             "a boot panic is not an exit panic"
         );
         assert_eq!(entries[1].boot_panic, Some(other));
+        assert_eq!(entries[1].exit_panic, None, "nor on an exited spawn");
     }
 
     /// The spawns of a window run from its open to its close, both included.
