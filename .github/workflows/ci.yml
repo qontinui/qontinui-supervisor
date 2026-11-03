@@ -171,14 +171,16 @@ jobs:
       #      account with ONE home, so the job gets HOME and TMPDIR under
       #      $RUNNER_TEMP, which the runner empties per job. CARGO_HOME and
       #      RUSTUP_HOME stay on the account's persistent toolchain and
-      #      registry. cargo locks its package cache; rustup takes no lock,
-      #      and every job's toolchain step rewrites its settings with the same
+      #      registry. cargo locks its package cache; every job's toolchain
+      #      step also rewrites rustup's settings there, always with the same
       #      value. This runs before the toolchain step, which finds rustup
       #      through CARGO_HOME.
-      #   3. A FRESH SIBLING. The runner keeps $GITHUB_WORKSPACE/.. between
-      #      jobs, so the previous job's ../qontinui-schemas is removed. A job
-      #      killed mid-fetch would otherwise leave a git lock there that
-      #      fails every later job on this registration.
+      #   3. A PERSISTED SIBLING. The runner keeps $GITHUB_WORKSPACE/..
+      #      between jobs, and the sibling checkout below reuses the
+      #      ../qontinui-schemas there: re-cloning it would reset the mtimes
+      #      of its two path-dependency crates and rebuild both on every job.
+      #      A checkout that fails, e.g. on a git lock left by a job killed
+      #      mid-fetch, is retried once from an empty directory.
       #   4. A MEMORY-DERIVED COMPILE CAP. cargo's default parallelism is
       #      nproc, 128 rustc on nawa. CARGO_BUILD_JOBS is the smallest of
       #      MemTotal and every cgroup memory.max/memory.high above this job,
@@ -194,9 +196,10 @@ jobs:
       #      it: the clean removes the link, never the tree behind it.
       #      CARGO_TARGET_DIR is deliberately not set. It saves CPU on a
       #      shared host, not wall time. Warm (run 41699811297), this job
-      #      compiled 6 crates where a cold run compiled 583, but it took as
-      #      long: this crate's own lib, bin and test binaries rebuild every
-      #      run, and the tests' execution dominates. Bounded: a target over
+      #      compiled 6 units, all of them this crate, where a cold run
+      #      compiled 583, but it took as long: this crate's own lib, bin and
+      #      test binaries rebuild every run, and the tests' execution
+      #      dominates. Bounded: a target over
       #      40 GiB (a full Rust Check leaves about 7 GiB), under 60 GiB free
       #      on its filesystem, or unreadable, starts cold. dist/ and
       #      frontend/node_modules stay in the workspace, so the clean still
@@ -208,7 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for tool in cc git python3 lsof npm; do
+          for tool in cc git curl python3 lsof npm; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           if [ -n "$missing" ]; then
@@ -219,12 +222,6 @@ jobs:
           pool_home="$HOME"
           job_home="$RUNNER_TEMP/home"
           mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
-
-          sibling="$(cd "$GITHUB_WORKSPACE/.." && pwd)/qontinui-schemas"
-          if [ -e "$sibling" ]; then
-            rm -rf "${sibling:?}"
-            echo "removed the previous job's $sibling"
-          fi
 
           budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
           cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
@@ -281,12 +278,20 @@ jobs:
       # fail with "failed to read ../qontinui-schemas/rust/Cargo.toml".
       # PINNED: the commit comes from .github/sibling-pins.conf, not schemas main
       # (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3b).
-      # On the pool the self-hosted step above has removed the previous job's
-      # copy, so this materialises it fresh, as on a hosted VM.
+      # On the pool the previous job's copy persists at $GITHUB_WORKSPACE/..
+      # and is reused (schemas-pin.sh fetches by sha, force-checks-out and
+      # cleans it), so cargo keeps its path-dependency crates fresh. If that
+      # fails, e.g. on a git lock left by a job killed mid-fetch, the copy is
+      # removed and the checkout retried once; a pin refusal fails again.
       - name: Checkout sibling repos
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+        run: |
+          if ! bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."; then
+            echo "::warning title=schemas sibling re-cloned::checking out the persisted ../qontinui-schemas failed; removing it and retrying once"
+            rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
+            bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+          fi
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
@@ -1005,7 +1010,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for tool in cc git python3 lsof npm; do
+          for tool in cc git curl python3 lsof npm; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           if [ -n "$missing" ]; then
@@ -1016,12 +1021,6 @@ jobs:
           pool_home="$HOME"
           job_home="$RUNNER_TEMP/home"
           mkdir -p "$job_home" "$RUNNER_TEMP/tmp"
-
-          sibling="$(cd "$GITHUB_WORKSPACE/.." && pwd)/qontinui-schemas"
-          if [ -e "$sibling" ]; then
-            rm -rf "${sibling:?}"
-            echo "removed the previous job's $sibling"
-          fi
 
           budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
           cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
@@ -1076,11 +1075,17 @@ jobs:
       # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
       # at ../qontinui-schemas/rust. Without the sibling checkout, the build
       # fails with "failed to read ../qontinui-schemas/rust/Cargo.toml".
-      # PINNED to .github/sibling-pins.conf, same as rust-check.
+      # PINNED to .github/sibling-pins.conf, same as rust-check, and on the
+      # pool reused and retried the same way (see Rust Check's step).
       - name: Checkout sibling repos
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+        run: |
+          if ! bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."; then
+            echo "::warning title=schemas sibling re-cloned::checking out the persisted ../qontinui-schemas failed; removing it and retrying once"
+            rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
+            bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+          fi
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation.
@@ -1187,7 +1192,8 @@ jobs:
           echo "HOME -> $RUNNER_TEMP/home"
 
       # On the pool setup-node takes Node 20 from the host's shared tool cache
-      # (downloaded there once; the host's own /usr/bin/node is 22). The npm
+      # (downloaded there once; the host's own /usr/bin/node is v22.23.4,
+      # `node --version` on nawa 2026-11-03). The npm
       # CACHE is hosted-only: on the pool a restore would land in a per-job
       # HOME nobody keeps, and a save would put a pool-built entry into this
       # repo's Actions cache. `package-manager-cache` is pinned too, so a
