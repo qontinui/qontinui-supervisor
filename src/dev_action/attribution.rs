@@ -2916,7 +2916,8 @@ mod tests {
 
     /// Phase 4.7 (plan `2026-11-03-supervisor-dev-action-residuals-…`). The
     /// tail after a result is capped by the backstop, and the cap is measured
-    /// on the tokio clock from the mint ([`ActionRecord::started_instant`]),
+    /// on the tokio clock from the trial's start ([`ActionRecord::started_instant`],
+    /// re-stamped at the commit for a committed trial),
     /// the clock the backstop deadline runs on. A result at t+90 s under a
     /// 60 s tail and a 100 s backstop closes at t+100 s. Measured from the
     /// wall clock, as it was, a paused tokio clock reads ~0 s elapsed and the

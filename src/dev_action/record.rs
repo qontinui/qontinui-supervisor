@@ -185,7 +185,8 @@ pub struct ActionRecord {
     #[serde(serialize_with = "serialize_states_as_ids")]
     pub states_unknown: Vec<DevState>,
     pub started_at: DateTime<Utc>,
-    /// The mint instant on the tokio clock, the one the attribution window's
+    /// The trial's start on the tokio clock (the commit, for a committed
+    /// trial), the one the attribution window's
     /// deadlines run on. The window's tail cap is measured from it rather
     /// than from the wall-clock [`Self::started_at`], so both ends of that
     /// subtraction read the same clock (a paused test clock included). Not
