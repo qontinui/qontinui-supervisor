@@ -280,15 +280,20 @@ jobs:
       # (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3b).
       # On the pool the previous job's copy persists at $GITHUB_WORKSPACE/..
       # and is reused (schemas-pin.sh fetches by sha, force-checks-out and
-      # cleans it), so cargo keeps its path-dependency crates fresh. If that
-      # fails, e.g. on a git lock left by a job killed mid-fetch, the copy is
-      # removed and the checkout retried once; a pin refusal fails again.
+      # cleans it), so cargo keeps its path-dependency crates fresh. A pin
+      # the script refuses fails first, leaving the copy alone. A checkout
+      # that fails, e.g. on a git lock left by a job killed mid-fetch, has
+      # the copy removed and is retried once.
       - name: Checkout sibling repos
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."; then
-            echo "::warning title=schemas sibling re-cloned::checking out the persisted ../qontinui-schemas failed; removing it and retrying once"
+          # A refusal of the pin itself fails here, with the copy untouched.
+          bash .github/scripts/schemas-pin.sh read > /dev/null
+          rc=0
+          bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.." || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=schemas sibling checkout failed::exit $rc; removing ../qontinui-schemas and retrying once"
             rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
             bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
           fi
@@ -1081,8 +1086,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."; then
-            echo "::warning title=schemas sibling re-cloned::checking out the persisted ../qontinui-schemas failed; removing it and retrying once"
+          # A refusal of the pin itself fails here, with the copy untouched.
+          bash .github/scripts/schemas-pin.sh read > /dev/null
+          rc=0
+          bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.." || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=schemas sibling checkout failed::exit $rc; removing ../qontinui-schemas and retrying once"
             rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
             bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
           fi
