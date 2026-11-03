@@ -1808,7 +1808,10 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             )
         })
         .await
-        .unwrap_or(0);
+        .unwrap_or_else(|e| {
+            warn!("reaper: the early-log prune task did not finish: {e}");
+            0
+        });
         if pruned > 0 {
             debug!("reaper: pruned {pruned} early-log file(s) past their retention");
         }
