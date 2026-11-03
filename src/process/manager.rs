@@ -4777,6 +4777,66 @@ async fn serving_watchdog_restart(
 /// The requester the serving watchdog's restart trials are minted under.
 pub const SERVING_WATCHDOG_INITIATOR: &str = "watchdog";
 
+/// The requester the crash-only watchdog's restart trials are minted under.
+pub const CRASH_WATCHDOG_INITIATOR: &str = "crash_watchdog";
+
+/// The crash-only watchdog's start of `managed` after its spawn exited: a
+/// `spawn` dev-action trial with requester [`CRASH_WATCHDOG_INITIATOR`].
+///
+/// `spawn`, not `restart`: the runner is already down, so nothing is stopped,
+/// and the act is the same start `POST /runners/{id}/start` measures as a
+/// `spawn`. It mints before it acts, as every lifecycle door does, threads the
+/// action id into the start (so the spawn's ring entry names it) and records
+/// the terminal result: the start's error, or the detached health wait's
+/// verdict on success. A start that finds the runner changed since the exit
+/// ([`SupervisorError::StartSuperseded`]) records `Refused`: nothing ran.
+///
+/// Unlike the serving watchdog, nothing here needs to keep a refusal out of
+/// the ledger: the arm acts at most three times per rolling 30 minutes and does
+/// not retry a superseded start.
+async fn crash_watchdog_start(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    exited_spawned_at: chrono::DateTime<chrono::Utc>,
+    attempt: u32,
+) -> Result<(), SupervisorError> {
+    let runner_id = managed.config.id.clone();
+    let minted = crate::dev_action::mint_action(
+        state,
+        crate::dev_action::ActionKind::Spawn,
+        format!("crash_watchdog;runner={runner_id};attempt={attempt}"),
+        Some(CRASH_WATCHDOG_INITIATOR.to_string()),
+        crate::dev_action::AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await;
+    let guard = crate::dev_action::RunResultGuard::arm(
+        minted.record.clone(),
+        "the crash-only watchdog's restart task",
+    );
+    let result = start_managed_runner(
+        state,
+        managed,
+        Some(minted.record.action_id),
+        StartAs::AfterCrash { exited_spawned_at },
+    )
+    .await;
+    match &result {
+        Ok(()) => crate::dev_action::record_start_verdict(
+            state,
+            &runner_id,
+            crate::dev_action::StartVerdict::AfterHealthWait,
+            guard,
+        ),
+        Err(e) => {
+            minted
+                .record
+                .record_run_result(crate::dev_action::run_result_for(e));
+        }
+    }
+    result
+}
+
 /// Whether the crash watchdog's backoff task must not restart the runner.
 ///
 /// `running` alone cannot say so: for a primary it mirrors `/health`, so it is
@@ -4922,8 +4982,7 @@ async fn maybe_crash_restart(
                         rebuild: false,
                     });
                 let started = std::time::Instant::now();
-                let start_as = StartAs::AfterCrash { exited_spawned_at };
-                match start_managed_runner(&state, &managed, None, start_as).await {
+                match crash_watchdog_start(&state, &managed, exited_spawned_at, attempt).await {
                     Ok(()) => {
                         let msg = format!(
                             "crash-only watchdog restarted runner '{}' (attempt {}/{})",
