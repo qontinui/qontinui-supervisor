@@ -729,8 +729,9 @@ pub(crate) fn is_crash_of_spawn(
     spawn: &SpawnMarker,
     ring: &[SpawnMarker],
 ) -> bool {
-    // Strict, unlike `is_panic_of_spawn`'s no-pid `>=`: a dump is reported by
-    // a LATER process, so one dated at the spawn instant cannot be its crash.
+    // Strict, unlike `is_panic_of_spawn`'s no-pid `>=`: `reported_at` is the
+    // dump's mtime, written by the crashing process itself, so one dated at or
+    // before this spawn's start was written before this process could run.
     let after_its_spawn = crash.reported_at > spawn.spawned_at;
     let before_its_exit = spawn
         .exited_at
@@ -2953,7 +2954,8 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let outcome = outcome_of(&record).expect(
-            "the tail ran past the 100 s backstop: the cap was not measured on the tokio \n             clock from the mint",
+            "the tail ran past the 100 s backstop: the cap was not measured on the tokio \
+             clock from the mint",
         );
         assert_eq!(outcome.category, D3Category::Confirmed);
     }
