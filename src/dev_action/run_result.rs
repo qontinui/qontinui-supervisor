@@ -40,11 +40,13 @@ pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
 /// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
 /// verbatim rather than re-worded here.
 ///
-/// Three precondition refusals map to `Refused` too, carried as their own
+/// Four precondition refusals map to `Refused` too, carried as their own
 /// message: [`SupervisorError::RunnerAlreadyRunning`] (a start found the
 /// runner up), [`SupervisorError::Validation`] (a request or configuration the
-/// step will not act on, e.g. `manager::automated_restart_blocked`) and
-/// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner).
+/// step will not act on, e.g. `manager::automated_restart_blocked`),
+/// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner)
+/// and [`SupervisorError::StartSuperseded`] (a crash-watchdog start that found
+/// the runner started, stopped or removed since the exit it answers).
 /// Each refuses the step it guards before that step touches anything, which is
 /// what `Refused` asserts: nothing ran. That holds for a start door and for a
 /// restart refused before it acted. It does NOT hold for a restart's start
@@ -68,7 +70,8 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
         },
         e @ (SupervisorError::RunnerAlreadyRunning
         | SupervisorError::Validation(_)
-        | SupervisorError::RunnerLifecycleBusy(_)) => ActionRunResult::Refused {
+        | SupervisorError::RunnerLifecycleBusy(_)
+        | SupervisorError::StartSuperseded(_)) => ActionRunResult::Refused {
             reason: e.to_string(),
         },
         other => ActionRunResult::Errored {
@@ -418,6 +421,7 @@ mod tests {
             SupervisorError::RunnerAlreadyRunning,
             SupervisorError::Validation("automated restart blocked".to_string()),
             SupervisorError::RunnerLifecycleBusy("named-a".to_string()),
+            SupervisorError::StartSuperseded("runner 'primary' changed".to_string()),
         ] {
             let reason = precondition.to_string();
             assert_eq!(

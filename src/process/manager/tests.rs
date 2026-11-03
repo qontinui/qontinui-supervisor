@@ -4722,6 +4722,99 @@ async fn serving_watchdog_refusal_mints_no_trial() {
     );
 }
 
+/// The one completed trial in `state`'s ledger, waited for: a start that fails
+/// records synchronously, but a success defers to the detached health wait.
+async fn the_completed_trial(state: &SharedState) -> Arc<crate::dev_action::ActionRecord> {
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let done = state
+            .dev_actions
+            .read()
+            .await
+            .recent(10)
+            .into_iter()
+            .find(|record| record.run_result().is_some());
+        if let Some(record) = done {
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no trial recorded a result within {budget:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The crash watchdog's start is a `spawn` trial under the `crash_watchdog`
+/// requester, and a start that fails lands its own error on the trial. A dead
+/// primary whose `started_at` is still the exited spawn's passes the
+/// supersession check and fails at exe resolution, so nothing is started.
+#[tokio::test]
+async fn crash_watchdog_start_mints_a_spawn_with_crash_watchdog_initiator() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let exited_spawned_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+    managed.runner.write().await.started_at = Some(exited_spawned_at);
+
+    let result = crash_watchdog_start(&state, &managed, exited_spawned_at, 2).await;
+    assert!(
+        matches!(&result, Err(SupervisorError::Process(m)) if m.contains("exe not found")),
+        "the start must fail at exe resolution, past the supersession check: {result:?}"
+    );
+
+    let record = the_completed_trial(&state).await;
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(
+        record.requester_id.as_deref(),
+        Some(CRASH_WATCHDOG_INITIATOR)
+    );
+    assert_eq!(CRASH_WATCHDOG_INITIATOR, "crash_watchdog");
+    assert!(
+        record.params_digest.contains(&managed.config.id)
+            && record.params_digest.contains("attempt=2"),
+        "{}",
+        record.params_digest
+    );
+    match record.run_result().expect("checked above") {
+        crate::dev_action::ActionRunResult::Errored { reason } => assert!(
+            !reason.starts_with(crate::dev_action::record::ACTION_ABANDONED),
+            "the trial carries the abandoned-guard record, not the start's error: {reason}"
+        ),
+        other => panic!("the failed start must reach the trial as Errored: {other:?}"),
+    }
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}
+
+/// A crash-watchdog start that finds the runner changed since the exit (a
+/// latched operator stop here) ran nothing, so its trial records `Refused`.
+#[tokio::test]
+async fn a_superseded_crash_watchdog_start_records_refused() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let exited_spawned_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+    {
+        let mut runner = managed.runner.write().await;
+        runner.started_at = Some(exited_spawned_at);
+        runner.stop_requested = true;
+    }
+
+    let result = crash_watchdog_start(&state, &managed, exited_spawned_at, 1).await;
+    assert!(
+        matches!(result, Err(SupervisorError::StartSuperseded(_))),
+        "{result:?}"
+    );
+    let record = the_completed_trial(&state).await;
+    assert!(
+        matches!(
+            record.run_result(),
+            Some(crate::dev_action::ActionRunResult::Refused { .. })
+        ),
+        "{:?}",
+        record.run_result()
+    );
+}
+
 /// An armed primary on `port`, for a test that drives the crash watchdog.
 async fn armed_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
     let (state, root) = armed_state();
