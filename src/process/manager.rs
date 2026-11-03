@@ -6927,10 +6927,13 @@ pub async fn rebuild_and_restart_by_id(
     // semantics. Currently a no-op" and carried `#[allow(dead_code)]`. It is
     // no longer a no-op: it is the readiness-gate override, same meaning as on
     // `/runners/{id}/stop` and `/runners/{id}/restart`.
-    match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
-        Ok(()) | Err(SupervisorError::RunnerNotRunning) => {}
+    // `stopped` is whether this call actually stopped a running runner: a build
+    // or start failure after that has acted on the runner (see `AfterAct`).
+    let stopped = match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
+        Ok(()) => true,
+        Err(SupervisorError::RunnerNotRunning) => false,
         Err(e) => return Err(e),
-    }
+    };
 
     // Step 2: rebuild.
     let rebuilt_at = chrono::Utc::now();
@@ -6943,6 +6946,7 @@ pub async fn rebuild_and_restart_by_id(
     let (build_attempted, build_succeeded, build_error): (bool, Option<bool>, Option<String>) =
         match build_outcome {
             Ok(()) => (true, Some(true), None),
+            Err(e) if stopped => return Err(SupervisorError::after_act(e)),
             Err(e) => return Err(e),
         };
 
