@@ -67,7 +67,12 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// the API answered after the spawn, and measures the window's tail cap on the
 /// tokio clock. #272 landed still stamping 2, so a row stamped 2 can carry either
 /// semantics; a row stamped 3 carries #272's.
-pub const ATTRIBUTION_EPOCH: u32 = 3;
+///
+/// Epoch 4: a verdict the detached health wait decides is its own boot's, not
+/// whichever spawn answered the port, and the wait runs to the first-healthy budget
+/// (`process::health_probe::wait_for_action_boot_healthy`), so a boot answering
+/// after 30 s no longer reads as failed and a crashed one no longer reads as up.
+pub const ATTRIBUTION_EPOCH: u32 = 4;
 
 /// The snapshot `metadata` this build stamps on every row, so a row names the
 /// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
@@ -315,9 +320,10 @@ mod tests {
         .expect("serialize");
 
         assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
-        // Epoch 1 is the unstamped pre-fix rows, and 2 can carry semantics from
-        // before #272. A constant, so it is checked at compile time.
-        const _: () = assert!(ATTRIBUTION_EPOCH >= 3);
+        // Epoch 1 is the unstamped pre-fix rows, 2 can carry semantics from before
+        // #272, and 3 reads a detached verdict off the port. A constant, so it is
+        // checked at compile time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 4);
         assert_eq!(
             json["metadata"]["supervisor_build_sha"],
             serde_json::Value::from(crate::self_provenance::built_from_sha()),

@@ -12,7 +12,9 @@ use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
-use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
+use crate::process::health_probe::{
+    wait_for_action_boot_healthy, wait_for_runner_healthy_default, HealthProbeFailure,
+};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::state::SharedState;
@@ -20,7 +22,8 @@ use crate::state::SharedState;
 /// Query string for endpoints that opt-OUT of the post-spawn health wait.
 ///
 /// Default is `wait=true` (poll up to 30s for the runner's `/health` to come
-/// up before returning 200). Pass `?wait=false` to get the legacy
+/// up before returning 200; a `rebuild: true` restart has already answered 202,
+/// so it polls longer, for its own boot). Pass `?wait=false` to get the legacy
 /// fire-and-forget behavior (200 the moment the OS process spawns, even if
 /// it's hung); the minted action's result then comes from a detached health
 /// wait, not from the response (`dev_action::record_start_verdict`).
@@ -309,14 +312,18 @@ fn rebuilt_body(
     }
 }
 
-/// The primary's health after a restart, by the default health wait. Not
-/// probed when no primary is registered.
-async fn primary_health_after_start(state: &SharedState, after: &str) -> SyncProbe {
+/// The health of the primary's boot `action_id` started, by the wait for a
+/// start nobody is held open on. Not probed when no primary is registered.
+async fn primary_health_after_start(
+    state: &SharedState,
+    after: &str,
+    action_id: uuid::Uuid,
+) -> SyncProbe {
     let Some(primary) = state.get_primary().await else {
         return SyncProbe::NotProbed;
     };
     let runner_id = primary.config.id.clone();
-    match wait_for_runner_healthy_default(state, &runner_id).await {
+    match wait_for_action_boot_healthy(state, &runner_id, action_id).await {
         Ok(()) => SyncProbe::Healthy,
         Err(failure) => SyncProbe::Unhealthy {
             reason: format!(
@@ -546,7 +553,14 @@ pub async fn rebuild_when_idle(
             // Success records its verdict too, so the window closes a tail
             // after the rebuild instead of on its backstop.
             let health = match &restart {
-                Ok(()) => primary_health_after_start(&exec_state, "rebuild-when-idle").await,
+                Ok(()) => {
+                    primary_health_after_start(
+                        &exec_state,
+                        "rebuild-when-idle",
+                        exec_record.action_id,
+                    )
+                    .await
+                }
                 Err(_) => SyncProbe::NotProbed,
             };
             let result = rebuild_when_idle_result(&restart, health);
@@ -726,8 +740,13 @@ pub async fn restart_runner(
                 if do_health_wait {
                     if let Some(primary) = exec_state.get_primary().await {
                         let runner_id = primary.config.id.clone();
-                        if let Err(failure) =
-                            wait_for_runner_healthy_default(&exec_state, &runner_id).await
+                        // The 202 has gone, so nobody is held open on this wait.
+                        if let Err(failure) = wait_for_action_boot_healthy(
+                            &exec_state,
+                            &runner_id,
+                            exec_record.action_id,
+                        )
+                        .await
                         {
                             exec_state
                                 .logs

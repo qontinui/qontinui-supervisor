@@ -3871,7 +3871,7 @@ async fn start_exe_mode_for_runner(
 const DEFAULT_FIRST_HEALTHY_TIMEOUT_SECS: u64 = 90;
 const FIRST_HEALTHY_POLL_INTERVAL_SECS: u64 = 3;
 
-fn first_healthy_timeout_secs() -> u64 {
+pub(crate) fn first_healthy_timeout_secs() -> u64 {
     std::env::var("QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

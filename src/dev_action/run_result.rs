@@ -20,22 +20,27 @@ use futures::future::BoxFuture;
 
 use crate::dev_action::record::{ActionRunResult, RunResultGuard};
 use crate::error::SupervisorError;
-use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
+use crate::process::health_probe::{wait_for_action_boot_healthy, HealthProbeFailure};
 use crate::state::SharedState;
 
-/// The health wait [`record_start_verdict_with`] runs for a deferred verdict:
-/// `Ok` once the runner answered, else the failure. Production passes
-/// [`default_health_wait`] ([`wait_for_runner_healthy_default`]); a test
-/// passes a wait it controls, so the detached half runs without a runner.
-pub type HealthWait =
-    for<'a> fn(&'a SharedState, &'a str) -> BoxFuture<'a, Result<(), HealthProbeFailure>>;
+/// The health wait [`record_start_verdict_with`] runs for a deferred verdict, on
+/// the runner's id and the action's: `Ok` once that action's boot answered, else
+/// the failure. Production passes [`default_health_wait`]
+/// ([`wait_for_action_boot_healthy`]); a test passes a wait it controls, so the
+/// detached half runs without a runner.
+pub type HealthWait = for<'a> fn(
+    &'a SharedState,
+    &'a str,
+    uuid::Uuid,
+) -> BoxFuture<'a, Result<(), HealthProbeFailure>>;
 
-/// The production [`HealthWait`]: [`wait_for_runner_healthy_default`].
+/// The production [`HealthWait`]: [`wait_for_action_boot_healthy`].
 pub fn default_health_wait<'a>(
     state: &'a SharedState,
     runner_id: &'a str,
+    action_id: uuid::Uuid,
 ) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
-    Box::pin(wait_for_runner_healthy_default(state, runner_id))
+    Box::pin(wait_for_action_boot_healthy(state, runner_id, action_id))
 }
 
 /// The reason token of a start whose runner never answered its health check.
@@ -234,7 +239,8 @@ pub fn record_start_verdict_with(
             let state = state.clone();
             let runner_id = runner_id.to_string();
             tokio::spawn(async move {
-                let result = match health_wait(&state, &runner_id).await {
+                let action_id = guard.record().action_id;
+                let result = match health_wait(&state, &runner_id, action_id).await {
                     Ok(()) => ActionRunResult::Ran,
                     Err(failure) => ActionRunResult::Errored {
                         reason: format!(
@@ -325,10 +331,11 @@ mod tests {
     }
 
     /// A [`HealthWait`] that never sees the runner answer: it gives up after
-    /// the production wait's 30 s budget, on the tokio clock.
+    /// 30 s, on the tokio clock.
     fn never_healthy<'a>(
         _: &'a SharedState,
         _: &'a str,
+        _: uuid::Uuid,
     ) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
         Box::pin(async {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -343,6 +350,7 @@ mod tests {
     fn healthy_at_once<'a>(
         _: &'a SharedState,
         _: &'a str,
+        _: uuid::Uuid,
     ) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
         Box::pin(async { Ok(()) })
     }

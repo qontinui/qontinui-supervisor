@@ -100,7 +100,9 @@ pub const LONG_BACKSTOP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 /// health wait: about 160 s before the start's exe copy with the tail, and about
 /// 330 s for a restart queued behind two stops under the lifecycle lock. The
 /// window closes on the result, so a longer backstop costs only a dead
-/// handler's row.
+/// handler's row. A restart no caller is held open on waits longer, up to
+/// `process::health_probe`'s `ACTION_BOOT_WAIT_CEILING`, which is asserted below
+/// this.
 pub const RESTART_BACKSTOP_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// The longest per-kind backstop: how long after a spawn a window can still be
@@ -357,8 +359,10 @@ impl ClosedWindow {
 /// `Ran` is what a start records once its runner has answered a health check:
 /// the restart routes' wait, spawn-test's probe or wait, spawn-named's wait,
 /// or, when the route answered without one, the detached health wait
-/// (`dev_action::run_result::record_start_verdict`). So `Ran` never stands for
-/// a boot whose API never bound.
+/// (`dev_action::run_result::record_start_verdict`). So `Ran` stands for a boot
+/// whose API bound, with one residual: a held-open wait asks the port, not the
+/// action's spawn, so a boot that crashed and was respawned inside one reads `Ran`.
+/// Its exit still counts its panic, below.
 ///
 /// Residuals, documented and not changed:
 /// - A stop requested but not finished at the close leaves the entry with no

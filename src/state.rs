@@ -365,6 +365,20 @@ impl SpawnRing {
         }
     }
 
+    /// Whether the spawn `action_id` started has ended: it exited, or a later
+    /// spawn replaced it, which may be before its exit monitor has stamped it.
+    /// `false` when no entry names the action, which says nothing about it.
+    pub fn action_spawn_ended(&self, action_id: Uuid) -> bool {
+        let Some(at) = self
+            .entries
+            .iter()
+            .rposition(|spawn| spawn.initiated_by == Some(action_id))
+        else {
+            return false;
+        };
+        self.entries[at].exited_at.is_some() || at + 1 < self.entries.len()
+    }
+
     /// The newest spawn recorded, `None` until this supervisor starts the
     /// runner.
     pub fn newest(&self) -> Option<&SpawnMarker> {
@@ -3349,6 +3363,25 @@ mod tests {
 
     fn spawn_of(secs: i64, pid: u32) -> SpawnMarker {
         SpawnMarker::new(ring_time(secs), Some(pid), None, None)
+    }
+
+    /// An action's spawn ends when it exits, or when a later spawn replaces it
+    /// before its exit is stamped. No entry naming the action says nothing.
+    #[test]
+    fn an_actions_spawn_ends_when_it_exits_or_a_later_spawn_replaces_it() {
+        let (own, later) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ring = SpawnRing::default();
+        assert!(!ring.action_spawn_ended(own), "no spawn names it");
+
+        ring.push(SpawnMarker::new(ring_time(1), Some(1), None, Some(own)));
+        assert!(!ring.action_spawn_ended(own), "it is the newest and up");
+
+        ring.push(SpawnMarker::new(ring_time(2), Some(2), None, Some(later)));
+        assert!(ring.action_spawn_ended(own), "replaced, no exit stamped");
+        assert!(!ring.action_spawn_ended(later));
+
+        assert!(ring.stamp_exit(ring_time(2), ring_time(3), None));
+        assert!(ring.action_spawn_ended(later), "the newest, but exited");
     }
 
     /// A full ring drops its OLDEST entry to make room for a spawn, and
