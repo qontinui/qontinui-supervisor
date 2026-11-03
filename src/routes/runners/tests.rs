@@ -23,7 +23,7 @@ use tempfile::TempDir;
 /// Walk every `.rs` file under `src/`, returning `(path, line_no, line)` for
 /// each PRODUCTION line matching `pred`.
 ///
-/// "Production" = everything before the file's first `#[cfg(test)] mod`,
+/// "Production" = everything before the file's test modules,
 /// nothing at all in a file that opens with `#![cfg(test)]` (an extracted
 /// test module — [`crate::source_scan::production_span`]), and never a `//` / `///` line. Test modules legitimately build fixture
 /// ids from ports, and the doc comments deliberately quote the old form to

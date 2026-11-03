@@ -4404,6 +4404,9 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         "pub async fn run_admitted_restart(",
         "async fn serving_watchdog_restart(",
         "async fn maybe_crash_restart(",
+        "async fn crash_watchdog_start(",
+        "async fn start_as_spawn_trial(",
+        "pub async fn boot_start_runner(",
     ] {
         assert!(
             !body_of(sig).contains("lifecycle."),
@@ -4623,6 +4626,98 @@ fn every_lifecycle_door_names_its_action_on_the_spawn_ring() {
             .contains("serving_watchdog_restart(&state,&managed,attempt)"),
         "the serving watchdog must restart through its minting helper"
     );
+    // The starts nobody waits on: the crash watchdog's and the boot auto-start.
+    let trial = first_call(
+        &body_of(&manager, "async fn start_as_spawn_trial("),
+        "start_managed_runner(",
+    );
+    assert!(
+        trial.contains("Some(minted.record.action_id)"),
+        "a spawn trial's start names no action: {trial}"
+    );
+    assert!(
+        body_of(&manager, "async fn maybe_crash_restart(")
+            .contains("crash_watchdog_start(&state,&managed,exited_spawned_at,attempt)"),
+        "the crash watchdog must restart through its minting helper"
+    );
+    assert!(
+        squeezed(&["src", "main.rs"])
+            .contains("process::manager::boot_start_runner(&state_for_autostart,&primary_id)"),
+        "the boot auto-start must start through its minting helper"
+    );
+}
+
+/// No production start or restart of a runner goes unminted, whatever door it
+/// comes through: a door added later that writes `None` in a call to one of the
+/// functions taking the initiating action fails here, where the door-by-door scan
+/// above would not know to look. A `None` held in a variable is not caught. A
+/// scan, not a required parameter, because a test driving a start with no trial
+/// is legitimate.
+#[test]
+fn no_production_start_goes_unminted() {
+    fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("list the source dir") {
+            let path = entry.expect("a dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    rs_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|file| {
+            let src = std::fs::read_to_string(file)
+                .expect("read the source")
+                .replace("\r\n", "\n");
+            // Comment lines out: prose quoting a call, or a `None` beside one, is
+            // not a call.
+            let squeezed = crate::source_scan::production_span(&src)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(str::split_whitespace)
+                .collect();
+            (file.display().to_string(), squeezed)
+        })
+        .collect();
+    for needle in [
+        "start_managed_runner(",
+        "record_spawn_in_registry(",
+        "restart_after_gate(",
+        "restart_runner_by_id(",
+        "run_admitted_restart(",
+        "rebuild_and_restart_by_id(",
+        "restart_runner(",
+    ] {
+        let mut calls = 0;
+        for (file, squeezed) in &sources {
+            for (at, _) in squeezed.match_indices(needle) {
+                // The definition, not a call.
+                if squeezed[..at].ends_with("fn") {
+                    continue;
+                }
+                let args = squeezed[at + needle.len()..]
+                    .split(".await")
+                    .next()
+                    .unwrap_or_default();
+                assert!(
+                    !args.contains("None"),
+                    "{file}: {needle} names no action: {args}"
+                );
+                calls += 1;
+            }
+        }
+        // So a renamed function cannot turn this into a scan that finds nothing
+        // and passes.
+        assert!(calls > 0, "no production call of {needle}");
+    }
 }
 
 /// A serving watchdog restart the readiness gate admits is a `restart` trial
@@ -4815,6 +4910,53 @@ async fn a_superseded_crash_watchdog_start_records_refused() {
     );
 }
 
+/// The boot auto-start is a `spawn` trial under the `boot_start` requester, and
+/// a start that fails lands its own error on the trial. A dead primary fails at
+/// exe resolution, so nothing is started.
+#[tokio::test]
+async fn boot_start_mints_a_spawn_with_boot_start_initiator() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+
+    let result = boot_start_runner(&state, &managed.config.id).await;
+    assert!(
+        matches!(&result, Err(SupervisorError::Process(m)) if m.contains("exe not found")),
+        "{result:?}"
+    );
+
+    let record = the_completed_trial(&state).await;
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(record.requester_id.as_deref(), Some(BOOT_START_INITIATOR));
+    assert_eq!(BOOT_START_INITIATOR, "boot_start");
+    assert!(
+        record.params_digest.contains(&managed.config.id),
+        "{}",
+        record.params_digest
+    );
+    match record.run_result().expect("checked above") {
+        crate::dev_action::ActionRunResult::Errored { reason } => assert!(
+            !reason.starts_with(crate::dev_action::record::ACTION_ABANDONED),
+            "the trial carries the abandoned-guard record, not the start's error: {reason}"
+        ),
+        other => panic!("the failed start must reach the trial as Errored: {other:?}"),
+    }
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}
+
+/// A boot start of an id the registry does not hold has no lifecycle act to
+/// measure, so it mints nothing.
+#[tokio::test]
+async fn boot_start_of_an_unregistered_runner_mints_no_trial() {
+    let (state, _root) = restart_test_state();
+
+    let result = boot_start_runner(&state, "no-such-runner").await;
+    assert!(
+        matches!(&result, Err(SupervisorError::RunnerNotFound(_))),
+        "{result:?}"
+    );
+    assert!(state.dev_actions.read().await.recent(10).is_empty());
+}
+
 /// An armed primary on `port`, for a test that drives the crash watchdog.
 async fn armed_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
     let (state, root) = armed_state();
@@ -4897,6 +5039,12 @@ async fn the_backoff_task_begins_no_restart_of_a_runner_that_changed_during_it()
 
         assert_eq!(
             restarts_begun(&state).await,
+            begun,
+            "started_at={started_at:?} stop_latched={stop_latched}"
+        );
+        // The trial is minted after this check, so a skip leaves no ledger row.
+        assert_eq!(
+            state.dev_actions.read().await.recent(10).len(),
             begun,
             "started_at={started_at:?} stop_latched={stop_latched}"
         );
@@ -5436,6 +5584,44 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
                 assert_eq!(spawned, 1, "a second process of a live runner");
                 return;
             }
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A real start through a door nobody waits on, on a stub exe: its spawn's ring
+/// entry names the trial it minted, which the source scans can only infer. A
+/// start the kernel refuses with ETXTBSY mints a trial of its own, so the trial
+/// to match is the newest. The stub never answers `/health`, so the trial's
+/// result is still the health wait's to record.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
+    let (state, managed, _root) = stub_primary(29_881).await;
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            let exited_spawned_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+            managed.runner.write().await.started_at = Some(exited_spawned_at);
+
+            past_text_file_busy(|| crash_watchdog_start(&state, &managed, exited_spawned_at, 1))
+                .await
+                .expect("the start");
+
+            let newest = state.dev_actions.read().await.recent(1);
+            let trial = newest.first().expect("the trial");
+            assert_eq!(trial.kind, crate::dev_action::ActionKind::Spawn);
+            assert_eq!(
+                managed
+                    .recent_spawns
+                    .read()
+                    .await
+                    .newest()
+                    .expect("the spawn")
+                    .initiated_by,
+                Some(trial.action_id)
+            );
+            assert_eq!(trial.run_result(), None, "nothing has checked its health");
         }
     };
     with_the_stub_stopped_after(&state, &managed, body).await;

@@ -6,7 +6,7 @@
 //! mints an action must record one on every exit. This module holds the maps
 //! those paths share:
 //!
-//! - [`run_result_for`]: an error that ended a primary-runner action;
+//! - [`run_result_for`]: an error that ended an action;
 //! - [`spawn_run_result`]: the result of a spawn route's inner future, the one
 //!   chokepoint spawn-test and spawn-named each have;
 //! - [`start_verdict`] and [`record_start_verdict`]: what a start records from
@@ -41,8 +41,7 @@ pub fn default_health_wait<'a>(
 /// The reason token of a start whose runner never answered its health check.
 pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
 
-/// Map an error that ended a primary-runner action to the action's own terminal
-/// result.
+/// Map an error that ended an action to the action's own terminal result.
 ///
 /// [`SupervisorError::RestartUnsafe`] is the readiness gate REFUSING — nothing
 /// ran, so no effect surface was touched and a clean attribution window carries
@@ -56,26 +55,30 @@ pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
 /// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
 /// verbatim rather than re-worded here.
 ///
-/// Four precondition refusals map to `Refused` too, carried as their own
+/// The other precondition refusals map to `Refused` too, carried as their own
 /// message: [`SupervisorError::RunnerAlreadyRunning`] (a start found the
 /// runner up), [`SupervisorError::Validation`] (a request or configuration the
 /// step will not act on, e.g. `manager::automated_restart_blocked`),
-/// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner)
-/// and [`SupervisorError::StartSuperseded`] (a crash-watchdog start that found
-/// the runner started, stopped or removed since the exit it answers).
-/// Each refuses the step it guards before that step touches anything, which is
-/// what `Refused` asserts: nothing ran. That holds for a start door and for a
-/// restart refused before it acted. It does NOT hold for a restart's start
+/// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner),
+/// [`SupervisorError::StartSuperseded`] (a crash-watchdog start that found
+/// the runner started, stopped or removed since the exit it answers),
+/// [`SupervisorError::UnverifiedExe`] (the exe a start resolved has no identity),
+/// [`SupervisorError::NoDisplay`] (a Linux start has no display),
+/// [`SupervisorError::PortHeldByLiveRunner`] (a live runner holds the port),
+/// [`SupervisorError::BuildPoolFull`] (the pool was full under `no-wait`) and
+/// [`SupervisorError::InsufficientDisk`] (the disk guard refused the build).
+/// Each refuses the step it guards before that step has started a process or a
+/// build, which is what `Refused` asserts: nothing ran. That holds for a start
+/// with no build in front of it and for a restart refused before it acted. A
+/// spawn route that built first and then found its port held reads `Refused` too:
+/// it started nothing, and a window reads only what its action started. It does
+/// NOT hold for a restart's start
 /// refused AFTER its stop or build ran (a start slipped in between them, or the port
 /// `apply_non_primary_instance_env_with` refuses): the stop is an effect, and a
 /// `Refused` would close the attribution window on it unobserved. The body
 /// that acted marks such an exit [`SupervisorError::AfterAct`], which this map
 /// reads as `Errored` whatever it wraps; the door's own record takes it, so no
 /// store lookup (which the store's eviction cap could miss) is involved.
-///
-/// The map is not widened for spawns: a restart's `PortHeldByLiveRunner`
-/// follows a stop that already ran, so `Errored` is right there.
-/// [`spawn_run_result`] handles the spawn-only arms and delegates the rest here.
 pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
     match err {
         SupervisorError::AfterAct(inner) => ActionRunResult::Errored {
@@ -87,7 +90,12 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
         e @ (SupervisorError::RunnerAlreadyRunning
         | SupervisorError::Validation(_)
         | SupervisorError::RunnerLifecycleBusy(_)
-        | SupervisorError::StartSuperseded(_)) => ActionRunResult::Refused {
+        | SupervisorError::StartSuperseded(_)
+        | SupervisorError::UnverifiedExe(_)
+        | SupervisorError::NoDisplay(_)
+        | SupervisorError::PortHeldByLiveRunner { .. }
+        | SupervisorError::BuildPoolFull { .. }
+        | SupervisorError::InsufficientDisk { .. }) => ActionRunResult::Refused {
             reason: e.to_string(),
         },
         other => ActionRunResult::Errored {
@@ -144,27 +152,14 @@ pub fn start_verdict(probe: SyncProbe) -> StartVerdict {
 /// - Any other status is `Errored`, carrying the body's `error` token
 ///   (`runner_died_during_startup`, `runner_started_but_unresponsive`,
 ///   `frontend_dist_missing`, `frontend_stale`, the paired-profile failure).
-/// - An `Err` that provably ran nothing is `Refused`: the pool was full under
-///   `no-wait`, the disk guard refused, there is no display, the exe has no
-///   identity, or a live runner holds the port. Every other `Err` is `Errored`,
-///   `Timeout` and `Process` included: `Timeout` has three raise sites (the
-///   queue watcher, the cargo timeout, the prewarm) that one variant cannot
-///   separate, and both results classify `Failure`.
+/// - An `Err` is [`run_result_for`]'s: `Refused` when it provably ran nothing,
+///   else `Errored`, `Timeout` and `Process` included: `Timeout` has three raise
+///   sites (the queue watcher, the cargo timeout, the prewarm) that one variant
+///   cannot separate, and both results classify `Failure`.
 pub fn spawn_run_result(
     result: &Result<(StatusCode, serde_json::Value), SupervisorError>,
 ) -> StartVerdict {
     let (status, body) = match result {
-        Err(
-            e @ (SupervisorError::BuildPoolFull { .. }
-            | SupervisorError::InsufficientDisk { .. }
-            | SupervisorError::NoDisplay(_)
-            | SupervisorError::UnverifiedExe(_)
-            | SupervisorError::PortHeldByLiveRunner { .. }),
-        ) => {
-            return StartVerdict::Now(ActionRunResult::Refused {
-                reason: e.to_string(),
-            })
-        }
         Err(e) => return StartVerdict::Now(run_result_for(e)),
         Ok(ok) => ok,
     };
@@ -290,6 +285,32 @@ mod tests {
         }
         assert!(no_health_wait_target("  ").is_some());
         assert_eq!(no_health_wait_target("primary"), None);
+    }
+
+    /// The errors a start or a build returns before it has touched anything.
+    fn start_and_build_refusals() -> Vec<SupervisorError> {
+        vec![
+            SupervisorError::BuildPoolFull {
+                queue_position: 1,
+                active_builds: vec![],
+                estimated_wait_secs: None,
+            },
+            SupervisorError::InsufficientDisk {
+                free_bytes: 1,
+                required_bytes: 2,
+                footprint: Box::new(None),
+            },
+            SupervisorError::NoDisplay("no_display".to_string()),
+            SupervisorError::UnverifiedExe(Box::new(crate::error::UnverifiedExeInfo {
+                path: "qontinui-runner.exe".to_string(),
+                mtime: None,
+                build_sha: None,
+                build_source: None,
+                target_dir_source: "workspace_default".to_string(),
+                detail: "unverified".to_string(),
+            })),
+            SupervisorError::PortHeldByLiveRunner { port: 9877, pid: 1 },
+        ]
     }
 
     fn verdict_of(status: u16, body: serde_json::Value) -> StartVerdict {
@@ -426,29 +447,7 @@ mod tests {
             assert!(reason.contains(token), "{status}: {reason}");
         }
 
-        let refused = [
-            SupervisorError::BuildPoolFull {
-                queue_position: 1,
-                active_builds: vec![],
-                estimated_wait_secs: None,
-            },
-            SupervisorError::InsufficientDisk {
-                free_bytes: 1,
-                required_bytes: 2,
-                footprint: Box::new(None),
-            },
-            SupervisorError::NoDisplay("no_display".to_string()),
-            SupervisorError::UnverifiedExe(Box::new(crate::error::UnverifiedExeInfo {
-                path: "qontinui-runner.exe".to_string(),
-                mtime: None,
-                build_sha: None,
-                build_source: None,
-                target_dir_source: "workspace_default".to_string(),
-                detail: "unverified".to_string(),
-            })),
-            SupervisorError::PortHeldByLiveRunner { port: 9877, pid: 1 },
-        ];
-        for err in refused {
+        for err in start_and_build_refusals() {
             let name = format!("{err:?}");
             assert!(
                 matches!(
@@ -539,12 +538,22 @@ mod tests {
             SupervisorError::Validation("automated restart blocked".to_string()),
             SupervisorError::RunnerLifecycleBusy("named-a".to_string()),
             SupervisorError::StartSuperseded("runner 'primary' changed".to_string()),
-        ] {
+        ]
+        .into_iter()
+        .chain(start_and_build_refusals())
+        {
             let reason = precondition.to_string();
             assert_eq!(
                 run_result_for(&precondition),
                 ActionRunResult::Refused { reason },
                 "{precondition:?}"
+            );
+            // The same refusal after a body acted (a restart's stop ran) is not
+            // "nothing ran": a `Refused` would close the window on that stop.
+            let reason = precondition.to_string();
+            assert_eq!(
+                run_result_for(&SupervisorError::after_act(precondition)),
+                ActionRunResult::Errored { reason },
             );
         }
 

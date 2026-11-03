@@ -4439,7 +4439,7 @@ async fn execute_spawn_build_inner(
 
     // Check that a runner binary exists in some build slot (or at the legacy path).
     // Without this check, a fresh supervisor would succeed the request only to
-    // fail inside `start_runner_by_id` with a less helpful error. If the check
+    // fail inside `start_managed_runner` with a less helpful error. If the check
     // fails, remove the placeholder we reserved above so the port frees up.
     // Skip when use_lkg pinned an override above — we already verified that path.
     if !body.use_lkg && manager::resolve_source_exe(state).await.is_err() {
@@ -4517,7 +4517,7 @@ async fn execute_spawn_build_inner(
     };
 
     // Start the runner using the Arc captured at insertion time. This avoids
-    // the id-based lookup in `start_runner_by_id` which can race with
+    // an id-based lookup, which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
     // spawn's failed health probe, the reaper).
     // A start that finds the id gone by the time it holds the lifecycle lock

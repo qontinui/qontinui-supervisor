@@ -80,9 +80,12 @@ fn skip_block_comment(text: &str) -> Option<&str> {
     None
 }
 
+/// What opens a test-only module, past the newline before it.
+const TEST_MODULE: &str = "#[cfg(test)]\nmod ";
+
 /// The production part of one LF-normalized source file: everything before
-/// its first `#[cfg(test)] mod`, and NOTHING for a file that is test code in
-/// its entirety ([`is_test_only_file`]).
+/// its test modules, and NOTHING for a file that is test code in its entirety
+/// ([`is_test_only_file`]).
 ///
 /// The cut is anchored on the test MODULE, not the bare attribute:
 /// `#[cfg(test)]` also decorates test-only helper items, and cutting at the
@@ -91,13 +94,63 @@ fn skip_block_comment(text: &str) -> Option<&str> {
 /// own file leaves `#[cfg(test)]\nmod tests;` in the parent, so the cut lands
 /// in the same place before and after the extraction — which is what lets a
 /// self-scan of the parent read identical production text either way.
+///
+/// The same goes for a module DECLARATION with production after it: a crate root
+/// lists its modules first, `#[cfg(test)]\nmod source_scan;` among them, and
+/// cutting there hid all of `main()` from every guard. So a declaration ends
+/// production only when nothing but comments and more test modules follow it.
+/// Anything this does not recognise after one stays in scope, the conservative
+/// direction for a guard policing production.
+///
+/// An inline test module does end production, so a file with production after
+/// one (no file here has) would lose it. So does a declaration followed only by
+/// test modules, inline ones included. A `#[cfg(test)]\npub(crate) mod` is not
+/// recognised at all and stays in scope.
 pub(crate) fn production_span(text: &str) -> &str {
     if is_test_only_file(text) {
         return "";
     }
-    text.split_once("\n#[cfg(test)]\nmod ")
-        .map(|(before, _)| before)
-        .unwrap_or(text)
+    let marker = format!("\n{TEST_MODULE}");
+    let mut searched = 0;
+    while let Some(found) = text[searched..].find(&marker) {
+        let at = searched + found;
+        let module = at + marker.len();
+        match after_declaration(&text[module..]) {
+            Some(rest) if !holds_only_test_modules(rest) => searched = module,
+            _ => return &text[..at],
+        }
+    }
+    text
+}
+
+/// `module` starts at a module's name. What follows it when it is a bodiless
+/// `name;` declaration, and `None` when it has a body.
+fn after_declaration(module: &str) -> Option<&str> {
+    let end = module.find([';', '{'])?;
+    module[end..].strip_prefix(';')
+}
+
+/// Whether `text`, what follows a test-only module declaration, holds nothing
+/// but comments and more test modules.
+fn holds_only_test_modules(mut text: &str) -> bool {
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            return true;
+        }
+        if let Some(comment) = text.strip_prefix("//") {
+            text = comment.split_once('\n').map_or("", |(_, next)| next);
+            continue;
+        }
+        let Some(module) = text.strip_prefix(TEST_MODULE) else {
+            return false;
+        };
+        match after_declaration(module) {
+            Some(rest) => text = rest,
+            // An inline test module: `production_span` cuts at one regardless.
+            None => return true,
+        }
+    }
 }
 
 /// The body of the function whose signature starts with `signature`: the text
@@ -306,6 +359,39 @@ mod tests {
         // A test-only helper ITEM does not end production.
         let helper = "#[cfg(test)]\npub fn helper() {}\npub fn real() {}\n";
         assert_eq!(production_span(helper), helper);
+    }
+
+    /// A crate root declares test-only modules among the rest, ahead of its
+    /// production code. Cutting at the first of those hid all of `main()`.
+    #[test]
+    fn production_span_keeps_what_follows_a_test_only_module_declaration() {
+        let root = "mod a;\n#[cfg(test)]\nmod scan;\nmod b;\n\nfn main() {}\n";
+        assert_eq!(production_span(root), root);
+
+        // Its inline tests still end production, and so do trailing declarations
+        // with only comments and more test modules after them.
+        let inline = format!("{root}\n#[cfg(test)]\nmod tests {{\n    fn t() {{}}\n}}\n");
+        assert_eq!(production_span(&inline), root);
+        let trailing = format!(
+            "{root}\n#[cfg(test)]\nmod one;\n\n// why\n#[cfg(test)]\nmod two;\n#[cfg(test)]\nmod tests {{}}\n"
+        );
+        assert_eq!(production_span(&trailing), root);
+
+        // What it cannot read after a declaration stays in scope.
+        let unread = format!("{root}\n#[cfg(test)]\nmod one;\n/* a */\nfn real() {{}}\n");
+        assert_eq!(production_span(&unread), unread);
+    }
+
+    /// The crate root this scanner polices: `main()` is production.
+    #[test]
+    fn the_production_span_of_main_rs_reaches_main() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let span = production_span(&src);
+        assert!(span.contains("async fn main("), "main() is out of scope");
+        assert!(
+            !span.contains("primary_to_boot_start(false"),
+            "main.rs's inline tests are in scope"
+        );
     }
 
     #[test]

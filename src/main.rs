@@ -381,11 +381,12 @@ async fn main() -> anyhow::Result<()> {
     // server + state a few seconds to settle first, mirroring the historical
     // behavior where the boot start showed up ~4s after "Supervisor starting".
     //
-    // Auto-start funnels through `start_runner_by_id` exactly like an operator
+    // Auto-start funnels through `start_managed_runner` exactly like an operator
     // `POST /runners/primary/start`, so the #65 provenance start gate applies:
     // if it refuses (e.g. a foreign slot binary), the error is logged as a
-    // WARN and boot continues — it never crashes startup. This is one-shot:
-    // the supervisor still never restarts a primary that crashes later.
+    // WARN and boot continues — it never crashes startup. Like that door it is a
+    // `spawn` dev-action trial, requested by `boot_start`. This is one-shot: only
+    // the crash watchdog, under `--watchdog`, restarts a primary that crashes later.
     if auto_start {
         let state_for_autostart = state.clone();
         tokio::spawn(async move {
@@ -409,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(primary_id) => {
                     info!("auto-start: boot-starting primary runner '{}'", primary_id);
-                    match process::manager::start_runner_by_id(&state_for_autostart, &primary_id)
+                    match process::manager::boot_start_runner(&state_for_autostart, &primary_id)
                         .await
                     {
                         Ok(()) => {

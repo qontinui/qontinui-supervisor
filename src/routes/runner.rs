@@ -1298,9 +1298,7 @@ pub async fn fix_and_rebuild(
                     )
                 }
                 Err(e) => {
-                    exec_record.record_run_result(ActionRunResult::Errored {
-                        reason: e.to_string(),
-                    });
+                    exec_record.record_run_result(run_result_for(&e));
                     (
                         StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                         serde_json::json!({

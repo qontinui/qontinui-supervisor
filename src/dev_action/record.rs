@@ -57,11 +57,15 @@ pub const ACTION_STORE_CAP: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
-    /// A primary-runner restart (`POST /runner/restart`).
+    /// A restart with no rebuild: `POST /runner/restart`,
+    /// `POST /runners/{id}/restart`, the serving watchdog's.
     Restart,
-    /// A temp/named runner spawn (`POST /runners/spawn-test` / `spawn-named`).
+    /// A start of a runner that is down: `POST /runners/spawn-test` /
+    /// `spawn-named`, `POST /runners/{id}/start`, the crash watchdog's restart,
+    /// the boot auto-start.
     Spawn,
-    /// A live-tree rebuild (`POST /runner/fix-and-rebuild`).
+    /// A rebuild: `POST /runner/fix-and-rebuild`, `POST /runner/rebuild-when-idle`,
+    /// `POST /runners/{id}/rebuild-and-restart`, a `rebuild: true` restart.
     Build,
 }
 

@@ -1,7 +1,8 @@
 //! The one mint every supervisor lifecycle door goes through.
 //!
-//! A door that stops, starts, restarts or rebuilds a runner mints a dev-action
-//! trial here before it acts: the active dev-state set is evaluated, coord's
+//! A door that starts, restarts or rebuilds a runner mints a dev-action trial
+//! here before it acts (a plain stop is not a trial: no [`ActionKind`] measures
+//! one): the active dev-state set is evaluated, coord's
 //! state-conditioned expectations are fetched and assessed, the record is
 //! stored, and the attribution watcher is spawned against the runner the door
 //! acts on. The door then records the act's terminal result on the returned

@@ -2332,14 +2332,16 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
 // replacing the previous five hand-written `forward_*_env` functions and
 // the duplicated cfg(windows) / cfg(not(windows)) call-site chains.
 
-/// Start a specific runner by ID.
+/// The requester the `--auto-start` boot start's trial is minted under.
+pub const BOOT_START_INITIATOR: &str = "boot_start";
+
+/// The `--auto-start` / `--watchdog` boot start of `runner_id`: a `spawn`
+/// dev-action trial with requester [`BOOT_START_INITIATOR`], through
+/// [`start_as_spawn_trial`].
 ///
-/// Thin wrapper around [`start_managed_runner`] that first resolves the id in
-/// the registry. Prefer `start_managed_runner` when the caller already holds
-/// an `Arc<ManagedRunner>` — that path is race-free, whereas id-based lookup
-/// can fail if a concurrent remove (reaper, stop, failed probe) fires between
-/// insertion and start.
-pub async fn start_runner_by_id(
+/// An id naming no registered runner fails before anything is minted: there is
+/// no lifecycle act to measure, as on `POST /runners/{id}/start`.
+pub async fn boot_start_runner(
     state: &SharedState,
     runner_id: &str,
 ) -> Result<(), SupervisorError> {
@@ -2347,7 +2349,15 @@ pub async fn start_runner_by_id(
         .get_runner(runner_id)
         .await
         .ok_or_else(|| SupervisorError::RunnerNotFound(runner_id.to_string()))?;
-    start_managed_runner(state, &managed, None, StartAs::Registered).await
+    start_as_spawn_trial(
+        state,
+        &managed,
+        format!("boot_start;runner={runner_id}"),
+        BOOT_START_INITIATOR,
+        "the boot auto-start task",
+        StartAs::Registered,
+    )
+    .await
 }
 
 /// Whether the registry still holds this very entry under its id. A caller
@@ -2400,8 +2410,9 @@ pub enum StartAs {
 /// the lifecycle lock is `start_as`'s to say.
 ///
 /// `initiated_by` is the dev action this start belongs to, recorded on the
-/// spawn's ring entry (`SpawnMarker::initiated_by`). `None` for a start nothing
-/// minted.
+/// spawn's ring entry (`SpawnMarker::initiated_by`). Every production start
+/// names one, which `no_production_start_goes_unminted` pins; `None` is for a
+/// test driving a start with no trial.
 pub async fn start_managed_runner(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -4821,15 +4832,55 @@ pub const SERVING_WATCHDOG_INITIATOR: &str = "watchdog";
 /// The requester the crash-only watchdog's restart trials are minted under.
 pub const CRASH_WATCHDOG_INITIATOR: &str = "crash_watchdog";
 
-/// The crash-only watchdog's start of `managed` after its spawn exited: a
-/// `spawn` dev-action trial with requester [`CRASH_WATCHDOG_INITIATOR`].
+/// A start of `managed` that nobody waits on, as a `spawn` dev-action trial with
+/// requester `requester`: the crash-only watchdog's and the boot auto-start's.
 ///
 /// `spawn`, not `restart`: the runner is already down, so nothing is stopped,
 /// and the act is the same start `POST /runners/{id}/start` measures as a
 /// `spawn`. It mints before it acts, as every lifecycle door does, threads the
 /// action id into the start (so the spawn's ring entry names it) and records
 /// the terminal result: the start's error, or the detached health wait's
-/// verdict on success. A start that finds the runner changed since the exit
+/// verdict on success. `context` names the caller for the guard's record, should
+/// the future end with no result.
+async fn start_as_spawn_trial(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    params_digest: String,
+    requester: &'static str,
+    context: &'static str,
+    start_as: StartAs,
+) -> Result<(), SupervisorError> {
+    let minted = crate::dev_action::mint_action(
+        state,
+        crate::dev_action::ActionKind::Spawn,
+        params_digest,
+        Some(requester.to_string()),
+        crate::dev_action::AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await;
+    let guard = crate::dev_action::RunResultGuard::arm(minted.record.clone(), context);
+    let result =
+        start_managed_runner(state, managed, Some(minted.record.action_id), start_as).await;
+    match &result {
+        Ok(()) => crate::dev_action::record_start_verdict(
+            state,
+            &managed.config.id,
+            crate::dev_action::StartVerdict::AfterHealthWait,
+            guard,
+        ),
+        Err(e) => {
+            minted
+                .record
+                .record_run_result(crate::dev_action::run_result_for(e));
+        }
+    }
+    result
+}
+
+/// The crash-only watchdog's start of `managed` after its spawn exited: a
+/// `spawn` dev-action trial with requester [`CRASH_WATCHDOG_INITIATOR`], through
+/// [`start_as_spawn_trial`]. A start that finds the runner changed since the exit
 /// ([`SupervisorError::StartSuperseded`]) records `Refused`: nothing ran.
 ///
 /// Unlike the serving watchdog, nothing here needs to keep a refusal out of
@@ -4841,41 +4892,18 @@ async fn crash_watchdog_start(
     exited_spawned_at: chrono::DateTime<chrono::Utc>,
     attempt: u32,
 ) -> Result<(), SupervisorError> {
-    let runner_id = managed.config.id.clone();
-    let minted = crate::dev_action::mint_action(
-        state,
-        crate::dev_action::ActionKind::Spawn,
-        format!("crash_watchdog;runner={runner_id};attempt={attempt}"),
-        Some(CRASH_WATCHDOG_INITIATOR.to_string()),
-        crate::dev_action::AttributionTargets::for_runner(managed.clone()),
-        None,
-    )
-    .await;
-    let guard = crate::dev_action::RunResultGuard::arm(
-        minted.record.clone(),
-        "the crash-only watchdog's restart task",
-    );
-    let result = start_managed_runner(
+    start_as_spawn_trial(
         state,
         managed,
-        Some(minted.record.action_id),
+        format!(
+            "crash_watchdog;runner={};attempt={attempt}",
+            managed.config.id
+        ),
+        CRASH_WATCHDOG_INITIATOR,
+        "the crash-only watchdog's restart task",
         StartAs::AfterCrash { exited_spawned_at },
     )
-    .await;
-    match &result {
-        Ok(()) => crate::dev_action::record_start_verdict(
-            state,
-            &runner_id,
-            crate::dev_action::StartVerdict::AfterHealthWait,
-            guard,
-        ),
-        Err(e) => {
-            minted
-                .record
-                .record_run_result(crate::dev_action::run_result_for(e));
-        }
-    }
-    result
+    .await
 }
 
 /// Whether the crash watchdog's backoff task must not restart the runner.
@@ -6909,7 +6937,7 @@ async fn restart_after_gate(
     //
     // Use the `managed` Arc we already hold rather than re-looking-up by id:
     // stopping a `test-*` runner auto-removes its id from `state.runners`, so
-    // `start_runner_by_id(runner_id)` would 404 with "Runner not found" even
+    // an id lookup would 404 with "Runner not found" even
     // though we have the full config in hand. `start_managed_runner`
     // re-inserts the id into the registry (`StartAs::Restart`), so a
     // restart of a *running* temp runner re-spawns on the SAME port instead

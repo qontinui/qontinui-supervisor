@@ -6,7 +6,7 @@ Rust-based build server and fleet dashboard for qontinui-runner. Provides parall
 
 The supervisor manages lifecycle for **temp runners** (`test-*`) and **named runners** (`named-*`). The primary runner and any user-started runners are **user-managed** — the supervisor tracks their health and **never restarts a user-managed runner that is serving**. The one exception, added 2026-09-03: a runner whose HTTP API has been silent for the serving threshold **while its process holds the port** is restarted only when the supervisor's own process-subtree census finds zero live `claude` sessions under it, and every such decision — restart, refusal, or disarm — is alerted to coord. See "Serving watchdog" below.
 
-With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_runner_by_id` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies); it never auto-starts named/temp/external runners. If the startup orphan scan already adopted a surviving primary, boot-start is a no-op (`main::primary_to_boot_start`).
+With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at boot (through the same `start_managed_runner` funnel an operator `POST /runners/primary/start` uses, so the provenance start gate applies, and as a `spawn` dev-action trial requested by `boot_start`: `manager::boot_start_runner`); it never auto-starts named/temp/external runners. If the startup orphan scan already adopted a surviving primary, boot-start is a no-op (`main::primary_to_boot_start`).
 
 **Supervisor *exit* used to be the one path that took every runner with it — it explicitly no longer does.** Every spawned runner was assigned to a single Win32 JobObject carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so when the supervisor process ended for any reason (graceful `/supervisor/shutdown`, `POST /supervisor/restart`, `Stop-Process`, panic, BSOD) the kernel silently terminated every assigned process. On 2026-07-27 a routine `restart-supervisor.ps1 -Build` therefore destroyed the operator's primary runner, ~80 `claude.exe` processes and 287 PTYs — with **no log line**, because nothing "stopped" it. Since 2026-07-28 the job holds **temp runners only** (`process::job::should_assign_to_ephemeral_job`, an `is_temp()` allowlist applied at the single assignment site in `start_managed_runner`):
 
@@ -1378,6 +1378,15 @@ UI Bridge relay so the dashboard's own webview can be inspected/controlled by au
 |--------|------|-------------|
 | GET | `/diagnostics` | Build/restart event history |
 | POST | `/diagnostics/clear` | Clear diagnostic events |
+
+### Dev actions
+
+Every start and restart of a runner is a dev-action trial, whichever door it came through, and so is a rebuild through a runner route (`dev_action::prepare_action` and `commit_action`, which `mint_action` composes). A plain stop is not, nor is a compile through `POST /build/submit`, which acts on no runner. `requester_id` says who asked: the caller's own id on the spawn routes that take one, `watchdog` for the serving watchdog's restart, `crash_watchdog` for the crash watchdog's, `boot_start` for the `--auto-start` boot start, and `null` for an operator door that takes no requester. These read the in-memory store, so they answer for this supervisor process only; the durable ledger is coord's.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/actions` | Most-recent-first list of trials. Optional `?limit=` (default 50, capped at the store's size) |
+| GET | `/actions/{id}/outcome` | One trial and its folded outcome, the `outcome_url` of a door's ACK. `outcome` is `null` while its window is open. 400 for an id that is not a UUID, 404 for one this process does not hold |
 
 ### Other
 

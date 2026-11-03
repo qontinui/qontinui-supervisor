@@ -232,11 +232,11 @@ pub struct SpawnMarker {
     /// the same checks as the others.
     pub boot_panic: Option<RecentPanic>,
     /// The dev action that started this spawn (`ActionRecord::action_id`).
-    /// `None` for a start nothing minted: the crash and serving watchdogs,
-    /// `POST /runners/{id}/start` and `/restart`, the boot auto-start. At
-    /// window close the attribution watcher judges only the entries its own
-    /// action initiated, so a watchdog's respawn inside a long window is not
-    /// read as that action's boot.
+    /// Every production start names one, the watchdogs' and the boot
+    /// auto-start's included; `None` is for a test driving a start with no
+    /// trial. At window close the attribution watcher judges only the entries
+    /// its own action initiated, so a watchdog's respawn inside a long window is
+    /// not read as that action's boot: it is the watchdog's own trial.
     pub initiated_by: Option<Uuid>,
 }
 
