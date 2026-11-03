@@ -4495,7 +4495,7 @@ fn every_minted_start_names_its_action() {
         (
             "pub async fn run_admitted_restart(",
             "restart_after_gate(",
-            "initiated_by,)",
+            "initiated_by,&mutstop_ran,)",
         ),
         (
             "async fn restart_after_gate(",
@@ -6010,5 +6010,160 @@ fn fresh_device_identity_reaches_the_non_primary_env_block() {
     assert_eq!(
         command_envs(&cmd).get(crate::process::instance_root::MACHINE_ID_ENV),
         None
+    );
+}
+
+/// Mint a `restart` trial for a test restart of `managed`.
+async fn mint_test_restart(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+) -> Arc<crate::dev_action::ActionRecord> {
+    crate::dev_action::mint_action(
+        state,
+        crate::dev_action::ActionKind::Restart,
+        format!("test;runner={}", managed.config.id),
+        None,
+        crate::dev_action::AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await
+    .record
+}
+
+/// A restart whose stop RAN records its failure `Errored` before it returns,
+/// so the door's later `run_result_for` (which reads a precondition refusal as
+/// `Refused`, "nothing ran") cannot close the attribution window on the stop's
+/// effects unobserved. A cached open port is evidence of life, so the stop
+/// runs (on a port nothing listens on, so it kills nothing); the start then
+/// fails.
+#[tokio::test]
+async fn a_restart_that_fails_after_its_stop_records_errored() {
+    use crate::diagnostics::RestartSource;
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-after-stop").await;
+    managed.cached_health.write().await.runner_port_open = true;
+    let record = mint_test_restart(&state, &managed).await;
+
+    let err = restart_runner_by_id(
+        &state,
+        "named-after-stop",
+        false,
+        RestartSource::Manual,
+        false,
+        BuildTree::OriginMain,
+        CloseIntent::Kill,
+        Some(record.action_id),
+    )
+    .await
+    .expect_err("no exe can be resolved from an empty project dir");
+    assert!(
+        managed.runner.read().await.stop_requested,
+        "the stop must have run for this test to say anything"
+    );
+    assert_eq!(
+        record.run_result(),
+        Some(crate::dev_action::ActionRunResult::Errored {
+            reason: err.to_string()
+        }),
+        "the restart body records a post-stop failure itself"
+    );
+    // The door's own mapping comes second and loses.
+    assert!(!record.record_run_result(crate::dev_action::run_result_for(&err)));
+}
+
+/// The same restart with NO evidence of life skips its stop, so nothing ran
+/// and the body records nothing: the door's `run_result_for` decides.
+#[tokio::test]
+async fn a_restart_that_fails_without_a_stop_leaves_the_result_to_the_door() {
+    use crate::diagnostics::RestartSource;
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-no-stop").await;
+    let record = mint_test_restart(&state, &managed).await;
+
+    restart_runner_by_id(
+        &state,
+        "named-no-stop",
+        false,
+        RestartSource::Manual,
+        false,
+        BuildTree::OriginMain,
+        CloseIntent::Kill,
+        Some(record.action_id),
+    )
+    .await
+    .expect_err("no exe can be resolved from an empty project dir");
+    assert!(!managed.runner.read().await.stop_requested);
+    assert_eq!(record.run_result(), None);
+}
+
+/// The precondition refusals a restart's START can hit after its stop ran
+/// (`RunnerAlreadyRunning` when a start slipped in, the non-primary port
+/// `Validation`) end the trial `Errored`: the body's post-stop record is
+/// written first, and the door's `Refused` mapping of the same error loses.
+/// Producing either for real needs a live runner process, so this drives the
+/// two writes in the order the restart door makes them.
+#[tokio::test]
+async fn a_post_stop_precondition_refusal_is_errored_not_refused() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-post-stop-refusal").await;
+    for err in [
+        SupervisorError::RunnerAlreadyRunning,
+        SupervisorError::Validation(
+            "Runner 'x' is configured on port 9876, which a non-primary runner may not use"
+                .to_string(),
+        ),
+    ] {
+        let record = mint_test_restart(&state, &managed).await;
+        assert!(
+            crate::dev_action::record_failure_after_stop(&state, Some(record.action_id), &err)
+                .await
+        );
+        assert!(!record.record_run_result(crate::dev_action::run_result_for(&err)));
+        assert_eq!(
+            record.run_result(),
+            Some(crate::dev_action::ActionRunResult::Errored {
+                reason: err.to_string()
+            }),
+            "{err:?}"
+        );
+    }
+    // No action, nothing to record.
+    assert!(
+        !crate::dev_action::record_failure_after_stop(
+            &state,
+            None,
+            &SupervisorError::RunnerAlreadyRunning
+        )
+        .await
+    );
+}
+
+/// A committed trial is dated at its commit, not at its preparation: the
+/// serving watchdog prepares before the readiness gate and commits after it.
+#[tokio::test]
+async fn a_committed_trial_is_dated_at_its_commit() {
+    let (state, _root) = restart_test_state();
+    let prepared = crate::dev_action::prepare_action(
+        &state,
+        crate::dev_action::ActionKind::Restart,
+        "test".to_string(),
+        None,
+    )
+    .await;
+    // Past any clock granularity, so a stamp taken at preparation cannot
+    // equal one taken at the commit.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before_commit = chrono::Utc::now();
+    let minted = crate::dev_action::commit_action(
+        &state,
+        prepared,
+        crate::dev_action::AttributionTargets::default(),
+        None,
+    )
+    .await;
+    assert!(
+        minted.record.started_at >= before_commit,
+        "{} predates the commit at {before_commit}",
+        minted.record.started_at
     );
 }
