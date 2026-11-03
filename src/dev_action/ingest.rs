@@ -61,18 +61,20 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// D3.
 pub const ATTRIBUTION_EPOCH: u32 = 2;
 
-/// The commit this supervisor binary was compiled from, as `build.rs` stamped
-/// it (`unknown` when the build could not establish one), sent as
-/// `metadata.supervisor_build_sha` so a row names the code that attributed it.
-const SUPERVISOR_BUILD_SHA: &str = env!("QONTINUI_SUPERVISOR_GIT_SHA");
-
-/// The snapshot `metadata` this build stamps on every row: its build sha and
-/// its [`ATTRIBUTION_EPOCH`].
+/// The snapshot `metadata` this build stamps on every row, so a row names the
+/// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
+/// (from [`crate::self_provenance`], the same values `/health` serves; each is
+/// JSON `null` when the build could not establish it, which is UNKNOWN, never
+/// a sha or "clean"), and its [`ATTRIBUTION_EPOCH`].
 fn snapshot_metadata() -> serde_json::Map<String, serde_json::Value> {
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "supervisor_build_sha".to_string(),
-        serde_json::Value::from(SUPERVISOR_BUILD_SHA),
+        serde_json::Value::from(crate::self_provenance::built_from_sha()),
+    );
+    metadata.insert(
+        "supervisor_build_dirty".to_string(),
+        serde_json::Value::from(crate::self_provenance::built_from_dirty()),
     );
     metadata.insert(
         "attribution_epoch".to_string(),
@@ -304,15 +306,19 @@ mod tests {
         ))
         .expect("serialize");
 
-        assert_eq!(json["metadata"]["attribution_epoch"], 2);
-        assert_eq!(ATTRIBUTION_EPOCH, 2);
-        let sha = json["metadata"]["supervisor_build_sha"]
-            .as_str()
-            .unwrap_or_else(|| panic!("supervisor_build_sha is a string: {json}"));
-        assert_eq!(sha, env!("QONTINUI_SUPERVISOR_GIT_SHA"));
-        assert!(
-            !sha.is_empty(),
-            "build.rs stamps a sha or `unknown`, never empty"
+        assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
+        // Epoch 1 is the unstamped pre-fix rows; a stamped row is 2 or later.
+        // A constant, so it is checked at compile time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 2);
+        assert_eq!(
+            json["metadata"]["supervisor_build_sha"],
+            serde_json::Value::from(crate::self_provenance::built_from_sha()),
+            "the sha is self_provenance's (null when unknown), never a literal `unknown`"
+        );
+        assert_ne!(json["metadata"]["supervisor_build_sha"], "unknown");
+        assert_eq!(
+            json["metadata"]["supervisor_build_dirty"],
+            serde_json::Value::from(crate::self_provenance::built_from_dirty()),
         );
     }
 
