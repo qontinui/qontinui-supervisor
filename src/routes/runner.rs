@@ -5,10 +5,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    assess_then_cut, coord_base, evaluate_all, fetch_expectations, record_start_verdict,
-    run_result_for, spawn_attribution_watcher, start_verdict, ActionKind, ActionRecord, ActionRisk,
-    ActionRunResult, AttributionTargets, PredictedSignature, RunResultGuard, SlotResolution,
-    SyncProbe,
+    mint_action, record_start_verdict, risk_ack_json, run_result_for, start_verdict, ActionKind,
+    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
+    RunResultGuard, SyncProbe,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -53,52 +52,16 @@ pub(crate) fn unhealthy_after_start_response(
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
-/// Render an [`ActionRisk`] as the `risk` ACK field: `null` when there is no
-/// actionable risk (healthy / no-history case), otherwise an object carrying the
-/// `route_lkg` advice, the human-readable `warning`, and the `top_signature`
-/// evidence so the initiator sees exactly what tripped the assessment.
-fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
-    if !risk.is_actionable() {
-        return serde_json::Value::Null;
-    }
-    serde_json::json!({
-        "route_lkg": risk.route_lkg,
-        "warning": risk.warn,
-        "top_signature": risk.top_signature,
-    })
-}
-
-/// Mint a dev-action snapshot for a primary-runner action (restart / build),
-/// evaluate the active dev-state set at execution time, store the record, and
-/// spawn the detached attribution watcher.
+/// Mint a dev-action trial for a primary-runner action (restart / build)
+/// through [`mint_action`], targeting the primary's registry entry
+/// ([`primary_attribution_targets`]).
 ///
-/// State evaluation includes `LEGACY_EXE_FALLBACK` via a cheap
-/// `resolve_source_exe_with_slot` probe — the `None` slot id is the
-/// genuinely-new signal (§2 of the plan) that the legacy `target/debug` exe
-/// (no embedded assets) is what would deploy. Resolution is a read of facts
-/// already in memory, so this stays off the blocking green path (§8 criterion
-/// 6).
-///
-/// Returns `(record, states_active, predicted, risk)`. The `Arc<ActionRecord>`
-/// is returned (rather than just its id) so the executing path can record the
-/// action's **terminal result** on it — the input the attribution watcher was
-/// missing, without which a refused or failed action still closed `Confirmed`
+/// Returns `(record, states_active, predicted, risk)`. The record is returned
+/// so the executing path can record the action's **terminal result** on it,
+/// without which a refused or failed action closed `Confirmed`
 /// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md`).
-/// Phase 4: `predicted` is coord's state-conditioned expectations for this
-/// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
-/// initiating agent is warned BEFORE the action completes. An empty vec when
-/// coord is unreachable / has no history (fail-open; never blocks the action).
-/// It is the ACK's cut, the top five by `posterior_mean`; the fetch itself
-/// reads coord's top 100 rows (its ceiling), and `risk` assesses all of them
-/// before the cut ([`assess_then_cut`]).
-///
-/// "Act on predictions": `risk` is the pure
-/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
-/// verdict over that whole fetch + `states_active`. It is
-/// [`ActionRisk::none`] in the common healthy / no-history case (behavior
-/// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
-/// signature clears the threshold. The caller decides what to do with it
-/// (the restart path biases toward LKG + warns; never refuses).
+/// `risk` is advice: the restart path biases toward LKG on it and warns; it
+/// never refuses.
 ///
 /// `backstop_override` replaces the kind's backstop on the watcher's window
 /// (`WindowTiming::with_backstop_override`), for an action that can outlast it.
@@ -114,55 +77,21 @@ async fn mint_primary_action(
     Vec<PredictedSignature>,
     ActionRisk,
 ) {
-    // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
-    // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
-    // unevaluated so the state surfaces as `Unknown`, never a false `False`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
-        Ok((origin, _)) => SlotResolution::Resolved(origin),
-        Err(_) => SlotResolution::NotEvaluated,
-    };
-    let states = evaluate_all(state, slot_resolution).await;
-    let record = ActionRecord::new(kind, requester_id, params_digest, &states);
-    let action_id = record.action_id;
-    // Stamp the ACK with the canonical string ids (Phase-2b stores typed
-    // `DevState`; the ACK wire form is the canonical-id array, unchanged).
-    let states_active: Vec<&'static str> =
-        record.states_active.iter().map(|s| s.as_str()).collect();
-
-    // Phase 4: fetch coord's state-conditioned expectations for this
-    // (kind, states) so the ACK warns the agent before the action completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
-    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
-    // pooled mean before cutting, which can drop the very row the exact-cell
-    // arm of the risk policy reads.
-    let coord = coord_base(&state.config.ambient_coord);
-    let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
-
-    // "Act on predictions": assess the whole fetch against the active states,
-    // then cut the ACK's `predicted` to the top five by `posterior_mean`.
-    // Pure + fail-open — `none()` in the healthy case. `route_lkg` + `warn` only
-    // when a boot-failure-class signature clears the threshold. Emit the warning
-    // here (loud `tracing::warn!` + a Supervisor log entry) so the risk is
-    // visible BEFORE the action's outcome lands, regardless of how the caller
-    // uses the advice.
-    let (predicted, risk) = assess_then_cut(fetched, &states_active);
-    if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
-            .await;
-    }
-
-    let arc = state.dev_actions.write().await.insert(record);
-    spawn_attribution_watcher(
-        state.clone(),
-        arc.clone(),
+    let minted = mint_action(
+        state,
+        kind,
+        params_digest,
+        requester_id,
         primary_attribution_targets(state).await,
         backstop_override,
-    );
-
-    (arc, states_active, predicted, risk)
+    )
+    .await;
+    (
+        minted.record,
+        minted.states_active,
+        minted.predicted,
+        minted.risk,
+    )
 }
 
 /// Where the watcher of a primary-runner action looks for its effects.

@@ -4106,3 +4106,187 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     .expect("the sweep exists");
     assert!(sweep.contains("prune_stale_early_logs("));
 }
+
+// ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-
+//    door-and-pre-fix-ledger-rows` Phase 1 (D2): every lifecycle door mints ──
+
+/// An unprotected named runner on a refused port, registered in a state over
+/// an empty runner tree: the readiness gate skips it (`runner_not_protected`),
+/// nothing is listening to stop, and every start fails at exe resolution, so a
+/// door driven against it runs to its failure without touching a process.
+async fn register_dead_unprotected_named_runner(
+    state: &crate::state::SharedState,
+    id: &str,
+) -> Arc<crate::state::ManagedRunner> {
+    let config = crate::config::RunnerConfig {
+        id: id.to_string(),
+        name: format!("Runner {id}"),
+        port: crate::test_ports::reserve_refused_port(),
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
+            name: id.to_string(),
+        },
+        protected: false,
+        ..crate::config::RunnerConfig::default_primary()
+    };
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+    managed
+}
+
+/// The one action a door minted, by the id its response named or, for a door
+/// that answered with an error, the only record in the store.
+async fn only_action(state: &crate::state::SharedState) -> Arc<crate::dev_action::ActionRecord> {
+    let recent = state.dev_actions.read().await.recent(10);
+    assert_eq!(
+        recent.len(),
+        1,
+        "exactly one action is minted per door call"
+    );
+    recent[0].clone()
+}
+
+/// `POST /runners/{id}/restart` without a rebuild mints a `restart` trial on
+/// the named runner, and the restart's failure lands on it as `Errored` with
+/// the start's own error rather than closing `Confirmed`.
+#[tokio::test]
+async fn per_runner_restart_mints_restart_and_records_errored_on_failure() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let id = "named-d2-restart";
+    register_dead_unprotected_named_runner(&state, id).await;
+    let request: super::RestartRunnerRequest =
+        serde_json::from_value(serde_json::json!({ "rebuild": false })).expect("request");
+
+    let err = super::restart_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+        axum::Json(request),
+    )
+    .await
+    .expect_err("there is no runner exe to start");
+
+    let record = only_action(&state).await;
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Restart);
+    assert!(
+        record.params_digest.contains(&format!("runner={id}")),
+        "{}",
+        record.params_digest
+    );
+    match record.run_result() {
+        Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
+            assert_eq!(reason, err.to_string(), "the restart's own error")
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+}
+
+/// `POST /runners/{id}/restart {"rebuild": true}` mints a `build` trial before
+/// it submits the detached build, names it in the 202, and the detached task
+/// records the build's failure on it. An id naming no runner mints nothing and
+/// says so with a `null`.
+#[tokio::test]
+async fn per_runner_restart_rebuild_202_carries_action_id() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let id = "named-d2-rebuild";
+    register_dead_unprotected_named_runner(&state, id).await;
+
+    let body = restart_202_body(&state, id, false).await;
+    let action_id: uuid::Uuid = body["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the 202 names its action: {body}"))
+        .parse()
+        .expect("a uuid");
+    assert_eq!(body["outcome_url"], format!("/actions/{action_id}/outcome"));
+    let record = only_action(&state).await;
+    assert_eq!(record.action_id, action_id);
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Build);
+
+    // The closed pool fails the detached build; that reaches the action.
+    let run = await_action_result(&state, action_id).await;
+    assert!(run.is_failure(), "{run:?}");
+
+    let unknown = restart_202_body(&state, "no-such-runner", false).await;
+    assert!(unknown["action_id"].is_null(), "{unknown}");
+    assert_eq!(
+        state.dev_actions.read().await.recent(10).len(),
+        1,
+        "an unknown id mints nothing"
+    );
+}
+
+/// `POST /runners/{id}/start` mints a `spawn` trial on the named runner and
+/// records the start's failure on it.
+#[tokio::test]
+async fn per_runner_start_mints_spawn() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let id = "named-d2-start";
+    register_dead_unprotected_named_runner(&state, id).await;
+
+    let err = super::start_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+        axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: false }),
+    )
+    .await
+    .expect_err("there is no runner exe to start");
+
+    let record = only_action(&state).await;
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    match record.run_result() {
+        Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
+            assert_eq!(reason, err.to_string(), "the start's own error")
+        }
+        other => panic!("expected Errored, got {other:?}"),
+    }
+
+    // An unknown id is a 404 before anything is minted.
+    let missing = super::start_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("no-such-runner".to_string()),
+        axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: false }),
+    )
+    .await
+    .expect_err("no such runner");
+    assert!(
+        matches!(missing, crate::error::SupervisorError::RunnerNotFound(_)),
+        "{missing}"
+    );
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}
+
+/// A rebuild-and-restart of a non-primary runner names its `build` trial in
+/// the 202; the primary and an unknown id, which the detached task refuses,
+/// mint nothing. The handler is not awaited past its return (see
+/// [`rebuild_and_restart_202_body`]).
+#[tokio::test]
+async fn rebuild_and_restart_202_carries_action_id_only_when_a_build_can_run() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state = make_state_at(tmp.path());
+    let id = "named-d2-rar";
+    register_dead_unprotected_named_runner(&state, id).await;
+
+    let body = rebuild_and_restart_202_body(&state, id).await;
+    let action_id = body["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the 202 names its action: {body}"))
+        .to_string();
+    let record = only_action(&state).await;
+    assert_eq!(record.action_id.to_string(), action_id);
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Build);
+
+    let primary_id = state
+        .get_primary()
+        .await
+        .expect("primary")
+        .config
+        .id
+        .clone();
+    for refused in [primary_id.as_str(), "no-such-runner"] {
+        let body = rebuild_and_restart_202_body(&state, refused).await;
+        assert!(body["action_id"].is_null(), "{refused}: {body}");
+    }
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}

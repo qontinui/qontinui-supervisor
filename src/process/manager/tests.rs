@@ -2067,7 +2067,7 @@ fn temp_restart_keeps_the_instance_state() {
         );
     }
 
-    let restart = body_of("pub async fn restart_runner_by_id(");
+    let restart = body_of("pub async fn run_admitted_restart(");
     assert!(
         restart
             .contains("if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)")
@@ -4391,6 +4391,9 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         "async fn monitor_runner_process_exit_inner(",
         "async fn restart_after_gate(",
         "pub async fn restart_runner_by_id(",
+        "pub async fn admit_restart(",
+        "pub async fn run_admitted_restart(",
+        "async fn serving_watchdog_restart(",
         "async fn maybe_crash_restart(",
     ] {
         assert!(
@@ -4464,15 +4467,15 @@ fn every_minted_start_names_its_action() {
             "a restart names no action: {call}"
         );
     }
-    // spawn-test and spawn-named.
+    // spawn-test, spawn-named and `POST /runners/{id}/start`.
     let spawns = calls(
         &squeezed(&["src", "routes", "runners.rs"]),
         "manager::start_managed_runner(",
     );
-    assert_eq!(spawns.len(), 2, "{spawns:?}");
+    assert_eq!(spawns.len(), 3, "{spawns:?}");
     for call in &spawns {
         assert!(
-            call.contains("Some(action_id)"),
+            call.contains("Some(action_id)") || call.contains("Some(minted.record.action_id)"),
             "a spawn names no action: {call}"
         );
     }
@@ -4486,6 +4489,11 @@ fn every_minted_start_names_its_action() {
         ),
         (
             "pub async fn restart_runner_by_id(",
+            "run_admitted_restart(",
+            "initiated_by)",
+        ),
+        (
+            "pub async fn run_admitted_restart(",
             "restart_after_gate(",
             "initiated_by,)",
         ),
@@ -4505,6 +4513,199 @@ fn every_minted_start_names_its_action() {
             threaded.first()
         );
     }
+}
+
+/// The spawn ring entry of every lifecycle door's start names the door's
+/// action: each door threads the id it minted into the manager call, and each
+/// manager path threads it into `start_managed_runner`, which records it on the
+/// ring through `record_spawn_in_registry` (whose entry
+/// `a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instant`
+/// pins). Pinned at source level because no route test reaches a recorded
+/// spawn on every platform: the stub-exe start runs on unix only.
+#[test]
+fn every_lifecycle_door_names_its_action_on_the_spawn_ring() {
+    let squeezed = |parts: &[&str]| -> String {
+        let path = parts.iter().fold(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
+            |dir, part| dir.join(part),
+        );
+        let src = std::fs::read_to_string(&path)
+            .expect("read the source")
+            .replace("\r\n", "\n");
+        crate::source_scan::production_span(&src)
+            .split_whitespace()
+            .collect()
+    };
+    let body_of = |src: &str, sig: &str| -> String {
+        let sig: String = sig.split_whitespace().collect();
+        let at = src.find(&sig).unwrap_or_else(|| panic!("{sig} exists"));
+        let rest = &src[at..];
+        // Up to the next top-level item: good enough to bound the calls below.
+        let end = rest[sig.len()..]
+            .find("pubasyncfn")
+            .or_else(|| rest[sig.len()..].find("asyncfn"))
+            .map(|i| i + sig.len())
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    let first_call = |body: &str, call: &str| -> String {
+        body.split(call)
+            .nth(1)
+            .unwrap_or_else(|| panic!("no call to {call}"))
+            .split(".await")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let routes = squeezed(&["src", "routes", "runners.rs"]);
+    // The per-runner restart door: both arms name the minted action.
+    let restart = body_of(&routes, "pub async fn restart_runner(");
+    let restarts: Vec<&str> = restart
+        .split("manager::restart_runner_by_id(")
+        .skip(1)
+        .map(|rest| rest.split(".await").next().unwrap_or(rest))
+        .collect();
+    assert_eq!(restarts.len(), 2, "{restarts:?}");
+    for call in &restarts {
+        assert!(
+            call.contains(".action_id)") && !call.ends_with("None,)"),
+            "a per-runner restart names no action: {call}"
+        );
+    }
+    // The per-runner start door.
+    let start = first_call(
+        &body_of(&routes, "pub async fn start_runner("),
+        "manager::start_managed_runner(",
+    );
+    assert!(
+        start.contains("Some(minted.record.action_id)"),
+        "the start door names no action: {start}"
+    );
+    // The rebuild-and-restart door, and its manager body into the start.
+    let rar = first_call(
+        &body_of(&routes, "pub async fn rebuild_and_restart_runner("),
+        "manager::rebuild_and_restart_by_id(",
+    );
+    assert!(
+        rar.contains("initiated_by)"),
+        "rebuild-and-restart names no action: {rar}"
+    );
+    let manager = squeezed(&["src", "process", "manager.rs"]);
+    let rar_start = first_call(
+        &body_of(&manager, "pub async fn rebuild_and_restart_by_id("),
+        "start_managed_runner(",
+    );
+    assert!(
+        rar_start.contains("initiated_by,"),
+        "rebuild_and_restart_by_id does not thread its action into the start: {rar_start}"
+    );
+    // The serving watchdog's restart.
+    let watchdog = first_call(
+        &body_of(&manager, "async fn serving_watchdog_restart("),
+        "run_admitted_restart(",
+    );
+    assert!(
+        watchdog.contains("Some(minted.record.action_id)"),
+        "the serving watchdog's restart names no action: {watchdog}"
+    );
+    assert!(
+        body_of(&manager, "pub async fn maybe_serving_restart(")
+            .contains("serving_watchdog_restart(&state,&managed,attempt)"),
+        "the serving watchdog must restart through its minting helper"
+    );
+}
+
+/// A serving watchdog restart the readiness gate admits is a `restart` trial
+/// requested by `watchdog`, minted against the wedged runner, and its failure
+/// lands on the trial. A dead primary passes the gate (`runner_not_running`)
+/// and fails at exe resolution, so nothing is stopped or started.
+#[tokio::test]
+async fn serving_watchdog_restart_mints_with_watchdog_initiator() {
+    assert!(
+        !serving_restart_env_disabled(),
+        "QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1 leaves this test nothing to observe"
+    );
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.watchdog_enabled_at_start = true;
+    assert!(matches!(
+        config.ambient_coord,
+        crate::config::AmbientCoord::Ignore
+    ));
+    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let managed = register_dead_primary(&state).await;
+    managed.watchdog.write().await.enabled = true;
+
+    // Silent for two days: past any threshold the clamp allows.
+    let since = chrono::Utc::now() - chrono::Duration::days(2);
+    maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::UnresponsiveSince(since),
+        false,
+    )
+    .await;
+
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + budget;
+    let record = loop {
+        let done = state
+            .dev_actions
+            .read()
+            .await
+            .recent(10)
+            .into_iter()
+            .find(|record| record.run_result().is_some());
+        if let Some(record) = done {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the serving watchdog recorded no restart trial within {budget:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(record.kind, crate::dev_action::ActionKind::Restart);
+    assert_eq!(
+        record.requester_id.as_deref(),
+        Some(SERVING_WATCHDOG_INITIATOR)
+    );
+    assert_eq!(SERVING_WATCHDOG_INITIATOR, "watchdog");
+    assert!(
+        record.params_digest.contains(&managed.config.id),
+        "{}",
+        record.params_digest
+    );
+    let run = record.run_result().expect("checked above");
+    assert!(
+        matches!(run, crate::dev_action::ActionRunResult::Errored { .. }),
+        "the failed start must reach the trial: {run:?}"
+    );
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
+}
+
+/// A serving watchdog restart the readiness gate REFUSES mints nothing: the arm
+/// retries a refusal on every escalating tick, so a trial per refusal would
+/// flood the ledger for the length of a wedge. A primary believed running on a
+/// refused port is the gate's UNKNOWN, which refuses.
+#[tokio::test]
+async fn serving_watchdog_refusal_mints_no_trial() {
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.watchdog_enabled_at_start = true;
+    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let managed = register_dead_primary(&state).await;
+    managed.watchdog.write().await.enabled = true;
+    managed.runner.write().await.running = true;
+
+    let result = serving_watchdog_restart(&state, &managed, 1).await;
+    assert!(
+        matches!(result, Err(SupervisorError::RestartUnsafe(_))),
+        "the gate must refuse: {result:?}"
+    );
+    assert!(
+        state.dev_actions.read().await.recent(10).is_empty(),
+        "a refused serving restart minted a trial"
+    );
 }
 
 /// An armed primary on `port`, for a test that drives the crash watchdog.
