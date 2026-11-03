@@ -39,6 +39,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -318,11 +319,65 @@ pub async fn submit(
     // immediately with the id.
     let state_bg = state.clone();
     let arc_bg = arc.clone();
-    tokio::spawn(async move {
-        run_submission(state_bg, arc_bg).await;
-    });
+    tokio::spawn(run_guarded(
+        arc_bg.clone(),
+        run_submission(state_bg, arc_bg),
+    ));
 
     Ok(id)
+}
+
+/// Await a submission's work, handing back a panic as its message. A panic in
+/// these tasks would otherwise end the task and leave the submission `Running`
+/// forever, and [`await_terminal`], which a synchronous spawn-test blocks on,
+/// would never return. `tokio::spawn` catches the unwind the same way, so
+/// catching it here exposes nothing new to the state the task shares.
+async fn caught<F: std::future::Future>(work: F) -> Result<F::Output, String> {
+    std::panic::AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .map_err(|payload| {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic with a non-string payload".to_string());
+            let reason = format!("the submission's task panicked: {message}");
+            tracing::error!("{reason}");
+            reason
+        })
+}
+
+/// The `(http_status, body)` a panicked [`submit_spawn`] / [`submit_detached`]
+/// records. The body's `error` is what reaches the terminal status.
+fn panicked_outcome(reason: String) -> (u16, serde_json::Value) {
+    (
+        500,
+        serde_json::json!({"status": "panicked", "error": reason}),
+    )
+}
+
+/// Run a `/build/submit` submission's work, which sets the submission's status
+/// itself, and fail the submission if the work panics.
+async fn run_guarded<F>(sub: Arc<RwLock<BuildSubmission>>, work: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    if let Err(reason) = caught(work).await {
+        let mut sub = sub.write().await;
+        let finished_at = Utc::now();
+        let started_at = match sub.status {
+            BuildStatus::Running { started_at } => started_at,
+            _ => finished_at,
+        };
+        sub.status = BuildStatus::Failed {
+            started_at,
+            finished_at,
+            duration_secs: (finished_at - started_at).num_milliseconds() as f64 / 1000.0,
+            exit_code: None,
+            error: reason,
+        };
+    }
 }
 
 /// Register a spawn-test build submission and drive it through the SAME
@@ -404,7 +459,13 @@ where
             sub.status = BuildStatus::Running { started_at };
         }
 
-        let (http_status, mut body, stderr_tail) = exec.await;
+        let (http_status, mut body, stderr_tail) = match caught(exec).await {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                let (http_status, body) = panicked_outcome(reason);
+                (http_status, body, Vec::new())
+            }
+        };
         // `build_id` = this submission's id. Inject it into the stored outcome
         // body so BOTH the sync path (which returns this stored body) and the
         // async poll (`GET /build/:id/status`) expose `build_id` = submission_id
@@ -526,7 +587,7 @@ where
             sub.status = BuildStatus::Running { started_at };
         }
 
-        let (http_status, mut body) = exec.await;
+        let (http_status, mut body) = caught(exec).await.unwrap_or_else(panicked_outcome);
         // Inject `build_id` = submission id so the stored body self-identifies,
         // mirroring submit_spawn.
         if let Some(obj) = body.as_object_mut() {
@@ -1443,6 +1504,140 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert_eq!(sub.detached.as_ref().unwrap().http_status, 500);
+    }
+
+    /// Bound a wait that a panicking exec would otherwise turn into a hang, so
+    /// the regression reads as a failure rather than a stuck suite.
+    async fn terminal_within_budget(arc: &Arc<RwLock<BuildSubmission>>) {
+        tokio::time::timeout(
+            crate::test_clock::poll_budget(std::time::Duration::from_secs(30)),
+            await_terminal(arc),
+        )
+        .await
+        .expect("a panicked submission never reached a terminal state");
+    }
+
+    /// A panic in a detached task reaches a terminal `Failed` naming the panic,
+    /// with the stored body saying so, instead of leaving `Running` forever.
+    #[tokio::test]
+    async fn submit_detached_panic_records_failed() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (id, arc) = submit_detached(store.clone(), PathBuf::from("/tmp/runner"), None, async {
+            if true {
+                panic!("the rebuild blew up");
+            }
+            (200, serde_json::json!({}))
+        });
+
+        terminal_within_budget(&arc).await;
+        let sub = arc.read().await;
+        match &sub.status {
+            BuildStatus::Failed { error, .. } => {
+                assert_eq!(error, "the submission's task panicked: the rebuild blew up")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let outcome = sub.detached.as_ref().expect("the outcome is recorded");
+        assert_eq!(outcome.http_status, 500);
+        assert_eq!(outcome.body["status"], "panicked");
+        assert_eq!(outcome.body["build_id"], id.to_string());
+    }
+
+    /// The same for a spawn-test build, whose synchronous caller blocks on
+    /// `await_terminal`: a panic must answer it, with its reserved port, and a
+    /// `String` payload (`panic!` with arguments) reads as well as a `&str` one.
+    #[tokio::test]
+    async fn submit_spawn_panic_records_failed_and_releases_the_waiter() {
+        let store = Arc::new(BuildSubmissionStore::new(100));
+        let (_id, arc) = submit_spawn(
+            store.clone(),
+            PathBuf::from("/tmp/runner"),
+            "origin_main".to_string(),
+            None,
+            9877,
+            async {
+                if true {
+                    panic!("slot {} blew up", 2);
+                }
+                (200, serde_json::json!({}), Vec::new())
+            },
+        );
+
+        terminal_within_budget(&arc).await;
+        let sub = arc.read().await;
+        match &sub.status {
+            BuildStatus::Failed { error, .. } => {
+                assert_eq!(error, "the submission's task panicked: slot 2 blew up")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let outcome = sub.spawn.as_ref().expect("the outcome is recorded");
+        assert_eq!(outcome.http_status, 500);
+        assert_eq!(outcome.port, 9877);
+        assert_eq!(outcome.body["status"], "panicked");
+    }
+
+    /// A panic in a `/build/submit` run, whose status it set itself, moves it
+    /// from `Running` to `Failed` with the run's own start time; a run that
+    /// finished is left alone.
+    #[tokio::test]
+    async fn run_guarded_turns_a_panic_into_failed() {
+        let submission_at = |status: BuildStatus| {
+            Arc::new(RwLock::new(BuildSubmission {
+                id: Uuid::new_v4(),
+                worktree_path: PathBuf::from("/tmp/runner"),
+                source: None,
+                build_kind: BuildKind::Build,
+                agent_id: None,
+                package: None,
+                features: Vec::new(),
+                base_ref: None,
+                submitted_at: Utc::now(),
+                status,
+                cache_key: None,
+                cache_outcome: None,
+                cache_hit: false,
+                stdout_tail: Vec::new(),
+                stderr_tail: Vec::new(),
+                spawn: None,
+                detached: None,
+            }))
+        };
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+
+        let running = submission_at(BuildStatus::Running { started_at });
+        run_guarded(running.clone(), async {
+            panic!("cargo blew up");
+        })
+        .await;
+        match &running.read().await.status {
+            BuildStatus::Failed {
+                started_at: recorded,
+                duration_secs,
+                error,
+                ..
+            } => {
+                assert_eq!(*recorded, started_at);
+                assert!(*duration_secs >= 5.0, "{duration_secs}");
+                assert_eq!(error, "the submission's task panicked: cargo blew up");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Before its run marks it `Running`, a panic still ends it.
+        let queued = submission_at(BuildStatus::Queued);
+        run_guarded(queued.clone(), async {
+            panic!("cargo blew up");
+        })
+        .await;
+        assert!(matches!(
+            queued.read().await.status,
+            BuildStatus::Failed { .. }
+        ));
+
+        let finished = submission_at(BuildStatus::Queued);
+        run_guarded(finished.clone(), async {}).await;
+        assert!(matches!(finished.read().await.status, BuildStatus::Queued));
     }
 
     /// The whole point of detachment: the exec future runs to completion even
