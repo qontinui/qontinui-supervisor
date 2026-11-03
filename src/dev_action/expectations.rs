@@ -201,7 +201,8 @@ fn expectations_url(base: &str, action_kind: &str, state_ids: &[&str]) -> String
 /// [`assess_action_risk`] over every fetched row, and `predicted` is the ACK's
 /// cut (`ack_predicted`), taken only after. Cutting first could drop the
 /// boot row the exact-cell arm reads (coord's pooled mean can rank it low),
-/// so both mint sites come through here rather than order the two themselves.
+/// so the one mint path (`prepare_action`) comes through here rather than
+/// order the two itself.
 pub fn assess_then_cut(
     fetched: Vec<PredictedSignature>,
     states_active: &[&str],
@@ -362,7 +363,7 @@ mod tests {
         );
     }
 
-    /// Both mint sites' `risk` reads the whole fetch and their ACK keeps the
+    /// The mint path's `risk` reads the whole fetch and its ACK keeps the
     /// top five by `posterior_mean` (signature ascending on ties), whatever
     /// order the rows arrived in. coord's pooled mean can rank the incident row
     /// sixth — 4 of 4 from this exact state set, below five other signatures —
