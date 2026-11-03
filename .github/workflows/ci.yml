@@ -147,7 +147,8 @@ jobs:
     # label set is spelled in nine places: this expression and the same one on
     # the three jobs below, the four `# coord-pools:` lines, and `route`'s
     # --self-hosted-labels. Change them together, because the router counts
-    # only jobs carrying EXACTLY that set. ram-16g is the class at or above
+    # only jobs carrying EXACTLY that set; `CI script tests` fails on drift
+    # (.github/scripts/check-ci-lane-labels.py). ram-16g is the class at or above
     # this job's peak: a cold `cargo build --all-targets` of this crate at
     # CARGO_BUILD_JOBS=20, run on nawa 2026-11-03 inside a transient
     # `systemd-run --user --scope`, peaked at 13.2 GiB of that scope's
@@ -972,6 +973,13 @@ jobs:
         run: bash .github/scripts/test-schemas-pin.sh
       - name: Pre-commit cargo target-dir tests
         run: bash .github/scripts/test-pre-commit-cargo.sh
+      # The pool label set is spelled in several places (see Rust Check's
+      # `runs-on`). Drift there makes the router count no pool jobs, so a dead
+      # pool reads healthy and the hosted floor never takes over, silently.
+      - name: Pool label set is spelled the same everywhere
+        run: |
+          bash .github/scripts/test-ci-lane-labels.sh
+          python3 -I -B .github/scripts/check-ci-lane-labels.py .github/workflows/ci.yml
 
   compose-parity:
     name: Compose Parity (cross-repo fixture drift)
