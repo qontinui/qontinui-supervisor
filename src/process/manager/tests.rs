@@ -6180,6 +6180,10 @@ fn rebuild_and_restart_marks_a_failed_start_as_after_act() {
         call.contains(".map_err(SupervisorError::after_act)?"),
         "rebuild_and_restart_by_id's start failure is not marked after_act: {call}"
     );
+    assert!(
+        body[..start].contains("Err(e)ifstopped=>returnErr(SupervisorError::after_act(e)),"),
+        "rebuild_and_restart_by_id's build failure after a real stop is not marked after_act"
+    );
 }
 
 /// A committed trial is dated at its commit, not at its preparation: the

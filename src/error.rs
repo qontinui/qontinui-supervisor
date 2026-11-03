@@ -145,13 +145,14 @@ pub enum SupervisorError {
     Other(String),
 
     /// A lifecycle body failed AFTER it had already acted on the runner (a
-    /// restart's stop or build, a rebuild-and-restart's build), so the action
-    /// is a failure that ran, never a refusal that touched nothing, even when
-    /// the error that ended it is a precondition refusal of a later step (a
-    /// start finding the runner up, a refused port). Carried to the door that
-    /// minted the trial, whose `dev_action::run_result_for` maps it to
-    /// `Errored`. Transparent on the wire: its message, status and body are
-    /// the wrapped error's. Build one with [`SupervisorError::after_act`].
+    /// restart's stop or build; a rebuild-and-restart's stop of a running
+    /// runner, or its build), so the action is a failure that ran, never a
+    /// refusal that touched nothing, even when the error that ended it is a
+    /// precondition refusal of a later step (a start finding the runner up, a
+    /// refused port). Carried to the door that minted the trial, whose
+    /// `dev_action::run_result_for` maps it to `Errored`. Transparent on the
+    /// wire: its message, status and body are the wrapped error's. Build one
+    /// with [`SupervisorError::after_act`].
     #[error("{0}")]
     AfterAct(Box<SupervisorError>),
 }
