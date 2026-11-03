@@ -1730,6 +1730,11 @@ pub async fn cleanup_orphaned_runners(state: &SharedState) {
 /// exit monitor has not stamped, and the runner's current early log while its
 /// process reads as running. Read under each runner's short-lived ring and
 /// state read locks, one at a time, never under its lifecycle lock.
+///
+/// A spawn whose exit the exit monitor never stamps reads as live for as long
+/// as its entry stays in the ring, so its early log is kept until the ring
+/// evicts that entry ([`crate::state::SPAWN_RING_CAPACITY`] spawns later) or
+/// the runner is removed from the registry.
 pub(crate) async fn live_early_log_paths(
     state: &SharedState,
 ) -> std::collections::HashSet<std::path::PathBuf> {

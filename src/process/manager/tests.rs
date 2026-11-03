@@ -6308,3 +6308,85 @@ async fn a_committed_trial_is_dated_at_its_commit() {
         minted.record.started_at
     );
 }
+
+/// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.6:
+/// [`live_early_log_paths`] returns the early log of a ring spawn whose exit is
+/// not stamped and not that of one whose exit is, and the prune, run over the
+/// real early-log directory, keeps the first and removes the second: the
+/// snapshot's path form (`early_log_dir()` + `early_log_path_for`) matches the
+/// `read_dir` entries the sweep compares it against.
+#[tokio::test]
+async fn live_early_log_paths_keeps_only_unexited_spawns_logs_end_to_end() {
+    use crate::process::early_log::{
+        early_log_dir, early_log_path_for, prune_stale_early_logs, EARLY_LOG_RETENTION,
+    };
+
+    let (state, _root) = restart_test_state();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.id = format!("test-live-early-{suffix}");
+    config.name = config.id.clone();
+    let managed = Arc::new(ManagedRunner::new(config.clone(), false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(config.id.clone(), managed.clone());
+
+    let dir = early_log_dir().expect("the early-log dir is writable");
+    let exited_log = early_log_path_for(&dir, &format!("{}-exited", config.id));
+    let live_log = early_log_path_for(&dir, &format!("{}-live", config.id));
+    let now = SystemTime::now();
+    for path in [&exited_log, &live_log] {
+        std::fs::write(path, "INFO booted, then silent\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(now - EARLY_LOG_RETENTION - Duration::from_secs(60))
+            .unwrap();
+    }
+
+    let first = chrono::Utc::now() - chrono::Duration::hours(3);
+    let second = first + chrono::Duration::minutes(1);
+    {
+        let mut ring = managed.recent_spawns.write().await;
+        ring.push(crate::state::SpawnMarker::new(
+            first,
+            Some(4242),
+            Some(exited_log.clone()),
+            None,
+        ));
+        assert!(ring.stamp_exit(first, first + chrono::Duration::seconds(30), None));
+        ring.push(crate::state::SpawnMarker::new(
+            second,
+            Some(4243),
+            Some(live_log.clone()),
+            None,
+        ));
+    }
+
+    let live = live_early_log_paths(&state).await;
+    assert!(live.contains(&live_log), "{live:?}");
+    assert!(!live.contains(&exited_log), "{live:?}");
+
+    // Prune the real directory, but protect every file this test did not
+    // create, so a live runner's log on this box is never touched.
+    let mut protected = live.clone();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let path = entry.path();
+        if path != exited_log && path != live_log {
+            protected.insert(path);
+        }
+    }
+    let sweep_dir = std::env::temp_dir().join(crate::process::early_log::EARLY_LOG_SUBDIR);
+    assert_eq!(prune_stale_early_logs(&sweep_dir, now, &protected), 1);
+    assert!(live_log.exists(), "the live spawn's early log was pruned");
+    assert!(
+        !exited_log.exists(),
+        "the exited spawn's stale early log was kept"
+    );
+
+    let _ = std::fs::remove_file(&live_log);
+    state.runners.write().await.remove(&config.id);
+}

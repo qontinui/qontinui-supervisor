@@ -34,6 +34,9 @@
 //! the registry before the sweep starts (`manager::live_early_log_paths`), and
 //! the prune skips those. The prune itself still takes no lock: a spawn that
 //! starts after the snapshot writes a fresh file, which no age prune touches.
+//! A spawn whose exit is never stamped counts as live until the spawn ring
+//! evicts it (`state::SPAWN_RING_CAPACITY`) or its runner leaves the registry,
+//! so its file is kept that long.
 //!
 //! # Best-effort
 //!

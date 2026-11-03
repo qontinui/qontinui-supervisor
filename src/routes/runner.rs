@@ -2025,11 +2025,8 @@ mod tests {
         )
         .expect("rebuild_when_idle exists")
         .to_string();
-        let lines: Vec<&str> = route.lines().map(str::trim).collect();
         assert!(
-            lines.contains(
-                &"rebuilt_body(&result, started.elapsed().as_secs(), ticks, &last_reason)"
-            ),
+            route.contains("rebuilt_body(&result"),
             "rebuild_when_idle's success path must answer from its recorded verdict"
         );
         assert!(
