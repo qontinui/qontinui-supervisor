@@ -17,9 +17,9 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_then_cut, coord_base, evaluate_all, fetch_expectations, record_start_verdict,
-    spawn_attribution_watcher, spawn_run_result, ActionKind, ActionRecord, ActionRisk,
-    AttributionTargets, PredictedSignature, RunResultGuard, SlotResolution,
+    mint_action, record_start_verdict, risk_ack_json, run_result_for, spawn_run_result,
+    start_verdict, ActionKind, ActionRecord, ActionRisk, ActionRunResult, AttributionTargets,
+    MintedAction, PredictedSignature, RunResultGuard, StartVerdict, SyncProbe,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1278,14 +1278,47 @@ pub async fn purge_stale_test_runners_core(
 ///
 /// Pass `?wait=false` to opt out and get the legacy fire-and-forget 200
 /// response the moment the process spawns (for callers that do their own
-/// readiness probing).
+/// readiness probing); the action's result then comes from a detached health
+/// wait.
+///
+/// **A start is a `spawn` trial.** It mints one ([`mint_action`]) targeting
+/// the named runner before it acts, threads the action id into the start so
+/// the spawn's ring entry names it, records the start's terminal result on it,
+/// and carries `action_id` in the 200 body. An id naming no registered runner
+/// is a 404 before anything is minted: there is no lifecycle act to measure.
 pub async fn start_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Query(wait_q): Query<crate::routes::runner::StartWaitQuery>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    manager::start_runner_by_id(&state, &id).await?;
+    let managed = state
+        .get_runner(&id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
+    let minted = mint_action(
+        &state,
+        ActionKind::Spawn,
+        format!("start;wait={}", wait_q.wait),
+        None,
+        AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await;
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "POST /runners/{id}/start");
 
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(minted.record.action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
+        minted.record.record_run_result(run_result_for(&e));
+        return Err(e);
+    }
+
+    let mut probe = SyncProbe::NotProbed;
     if wait_q.wait {
         if let Err(failure) =
             crate::process::health_probe::wait_for_runner_healthy_default(&state, &id).await
@@ -1301,17 +1334,46 @@ pub async fn start_runner(
                     ),
                 )
                 .await;
+            minted.record.record_run_result(ActionRunResult::Errored {
+                reason: format!(
+                    "runner_unhealthy_after_start: runner '{}' did not become healthy within                      {}ms of the start",
+                    id, failure.elapsed_ms
+                ),
+            });
             return Ok(crate::routes::runner::unhealthy_after_start_response(
                 &id, failure,
             ));
         }
+        probe = SyncProbe::Healthy;
     }
+    record_start_verdict(&state, &id, start_verdict(probe), run_guard);
 
-    Ok(Json(json!({
-        "status": "started",
-        "message": format!("Runner '{}' started", id)
-    }))
+    Ok(Json(with_action_fields(
+        json!({
+            "status": "started",
+            "message": format!("Runner '{}' started", id)
+        }),
+        Some(&minted),
+    ))
     .into_response())
+}
+
+/// Merge a minted action's ACK fields ([`MintedAction::ack_fields`]) into a
+/// lifecycle door's response body. With no action (the door minted none,
+/// because the id names no runner it could act on) `action_id` is `null`, so
+/// the key is always present and its absence never has to be interpreted.
+fn with_action_fields(
+    mut body: serde_json::Value,
+    minted: Option<&MintedAction>,
+) -> serde_json::Value {
+    let fields = match minted {
+        Some(minted) => minted.ack_fields(),
+        None => json!({ "action_id": null }),
+    };
+    if let (Some(body), serde_json::Value::Object(fields)) = (body.as_object_mut(), fields) {
+        body.extend(fields);
+    }
+    body
 }
 
 /// POST /runners/{id}/stop — stop a specific runner.
@@ -1369,6 +1431,14 @@ pub async fn stop_runner(
 /// `/runner/fix-and-rebuild` uses). We return **202** + a `build_id` in ~1s;
 /// callers poll `GET /builds` (or `GET /build/{id}/status`) for the terminal
 /// outcome, and the existing detached completion logic triggers the restart.
+///
+/// **Every restart is a dev-action trial** ([`mint_action`]): `build` with
+/// `rebuild: true`, `restart` without, targeting the named runner. Both
+/// response bodies carry its `action_id` (`null` when the id names no
+/// registered runner, which mints nothing), the action id names the restart's
+/// spawn ring entry, and the act's terminal result is recorded on the action,
+/// a readiness refusal included. Plan
+/// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows` D2.
 pub async fn restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -1378,6 +1448,33 @@ pub async fn restart_runner(
     // `RestartSource::ServingWatchdog` is deliberately unreachable from the
     // wire — see `diagnostics::restart_source_from_wire` and its test.
     let source = crate::diagnostics::restart_source_from_wire(&body.source);
+
+    // A restart is a trial: `build` when it rebuilds (its outcome lands after
+    // the build), `restart` otherwise, targeting the named runner, minted
+    // before anything runs. An id naming no registered runner mints nothing:
+    // the restart fails on it at once, and that is not a lifecycle act.
+    let managed = state.get_runner(&id).await;
+    let minted = match &managed {
+        Some(managed) => Some(
+            mint_action(
+                &state,
+                if body.rebuild {
+                    ActionKind::Build
+                } else {
+                    ActionKind::Restart
+                },
+                format!(
+                    "runner={};rebuild={};force={};handoff={}",
+                    id, body.rebuild, body.force, body.handoff
+                ),
+                None,
+                AttributionTargets::for_runner(managed.clone()),
+                None,
+            )
+            .await,
+        ),
+        None => None,
+    };
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     if body.rebuild {
@@ -1389,11 +1486,20 @@ pub async fn restart_runner(
         // runs. `null` when the id names no registered runner: the detached
         // restart fails on it, and a label would describe a build that never
         // happens.
-        let build_source = match state.get_runner(&id).await {
+        let build_source = match &managed {
             Some(managed) => json!(build_tree.build_source(managed.config.kind().is_primary())),
             None => serde_json::Value::Null,
         };
         let runner_id = id.clone();
+        // The detached body owns the record, so the terminal result reaches the
+        // watcher, and the guard, so a panic in it still records one.
+        let exec_record = minted.as_ref().map(|m| m.record.clone());
+        let exec_guard = minted.as_ref().map(|m| {
+            RunResultGuard::arm(
+                m.record.clone(),
+                "POST /runners/{id}/restart's detached task",
+            )
+        });
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
             state.build_submissions.clone(),
             state.config.project_dir.clone(),
@@ -1417,10 +1523,13 @@ pub async fn restart_runner(
                     force,
                     build_tree,
                     intent,
-                    None,
+                    exec_record.as_ref().map(|record| record.action_id),
                 )
                 .await
                 {
+                    if let Some(record) = &exec_record {
+                        record.record_run_result(run_result_for(&e));
+                    }
                     exec_state
                         .logs
                         .emit(
@@ -1439,6 +1548,17 @@ pub async fn restart_runner(
                     );
                 }
 
+                // The restart answers once the OS process spawns, so whether
+                // the runner came up is the detached health wait's to record.
+                if let Some(guard) = exec_guard {
+                    record_start_verdict(
+                        &exec_state,
+                        &runner_id,
+                        StartVerdict::AfterHealthWait,
+                        guard,
+                    );
+                }
+
                 (
                     axum::http::StatusCode::OK.as_u16(),
                     json!({
@@ -1451,16 +1571,19 @@ pub async fn restart_runner(
 
         return Ok((
             axum::http::StatusCode::ACCEPTED,
-            Json(json!({
-                "status": "rebuilding",
-                "build_id": submission_id.to_string(),
-                "submission_id": submission_id.to_string(),
-                "poll": "/builds",
-                "build_source": build_source,
-                "message": "rebuild-restart submitted; the build+restart runs detached from \
-                            this connection — poll GET /builds (or GET /build/{id}/status) \
-                            for the terminal outcome",
-            })),
+            Json(with_action_fields(
+                json!({
+                    "status": "rebuilding",
+                    "build_id": submission_id.to_string(),
+                    "submission_id": submission_id.to_string(),
+                    "poll": "/builds",
+                    "build_source": build_source,
+                    "message": "rebuild-restart submitted; the build+restart runs detached from \
+                                this connection — poll GET /builds (or GET /build/{id}/status) \
+                                for the terminal outcome",
+                }),
+                minted.as_ref(),
+            )),
         )
             .into_response());
     }
@@ -1471,7 +1594,13 @@ pub async fn restart_runner(
     // threaded rather than passed as a literal so both call sites say the same
     // thing, and so a future change that starts building here cannot inherit a
     // hardcoded provenance.
-    manager::restart_runner_by_id(
+    //
+    // Every exit records a result; the guard covers the handler future being
+    // dropped mid-restart when its client disconnects.
+    let run_guard = minted
+        .as_ref()
+        .map(|m| RunResultGuard::arm(m.record.clone(), "POST /runners/{id}/restart"));
+    let restart = manager::restart_runner_by_id(
         &state,
         &id,
         false,
@@ -1479,14 +1608,24 @@ pub async fn restart_runner(
         body.force,
         body.build_tree(),
         body.close_intent(),
-        None,
+        minted.as_ref().map(|m| m.record.action_id),
     )
-    .await?;
+    .await;
+    if let (Err(e), Some(minted)) = (&restart, &minted) {
+        minted.record.record_run_result(run_result_for(e));
+    }
+    restart?;
+    if let Some(guard) = run_guard {
+        record_start_verdict(&state, &id, StartVerdict::AfterHealthWait, guard);
+    }
 
-    Ok(Json(json!({
-        "status": "restarted",
-        "message": format!("Runner '{}' restarted", id)
-    }))
+    Ok(Json(with_action_fields(
+        json!({
+            "status": "restarted",
+            "message": format!("Runner '{}' restarted", id)
+        }),
+        minted.as_ref(),
+    ))
     .into_response())
 }
 
@@ -1517,25 +1656,81 @@ const REBUILD_AND_RESTART_SOURCE: manager::BuildSource = manager::BuildSource::L
 /// `live_tree` (from [`REBUILD_AND_RESTART_SOURCE`]) when the id names a
 /// non-primary runner, `null` when it names no runner or the primary, since
 /// the detached task refuses both and no build runs.
+///
+/// **It is a `build` trial** on that same non-primary runner, minted before the
+/// build is submitted: the 202 carries its `action_id` (`null` where
+/// `build_source` is), the action id names the start's spawn ring entry, and the
+/// detached task records the terminal result on it.
 pub async fn rebuild_and_restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(body): Json<RebuildAndRestartRequest>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    let build_source = match state.get_runner(&id).await {
-        Some(managed) if !managed.config.kind().is_primary() => json!(REBUILD_AND_RESTART_SOURCE),
-        _ => serde_json::Value::Null,
+    // Only a non-primary runner gets a build. The primary and an unknown id are
+    // refused by the detached task before anything runs, so they mint nothing,
+    // and their 202 names no tree.
+    let target = state
+        .get_runner(&id)
+        .await
+        .filter(|managed| !managed.config.kind().is_primary());
+    let build_source = match &target {
+        Some(_) => json!(REBUILD_AND_RESTART_SOURCE),
+        None => serde_json::Value::Null,
+    };
+    // A rebuild-and-restart is a `build` trial on the named runner, minted
+    // before the build is submitted.
+    let minted = match &target {
+        Some(managed) => Some(
+            mint_action(
+                &state,
+                ActionKind::Build,
+                format!(
+                    "rebuild_and_restart;runner={};force={};handoff={}",
+                    id, body.force, body.handoff
+                ),
+                None,
+                AttributionTargets::for_runner(managed.clone()),
+                None,
+            )
+            .await,
+        ),
+        None => None,
     };
     let exec_state = state.clone();
     let runner_id = id.clone();
+    let exec_record = minted.as_ref().map(|m| m.record.clone());
+    let exec_guard = minted.as_ref().map(|m| {
+        RunResultGuard::arm(
+            m.record.clone(),
+            "POST /runners/{id}/rebuild-and-restart's detached task",
+        )
+    });
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
         state.build_submissions.clone(),
         state.config.project_dir.clone(),
         None,
         async move {
-            match manager::rebuild_and_restart_by_id(&exec_state, &runner_id, body).await {
-                Ok(outcome) => (axum::http::StatusCode::OK.as_u16(), outcome),
+            let initiated_by = exec_record.as_ref().map(|record| record.action_id);
+            match manager::rebuild_and_restart_by_id(&exec_state, &runner_id, body, initiated_by)
+                .await
+            {
+                Ok(outcome) => {
+                    // The start answered once the process spawned; whether the
+                    // runner came up is the detached health wait's to record.
+                    if let Some(guard) = exec_guard {
+                        record_start_verdict(
+                            &exec_state,
+                            &runner_id,
+                            StartVerdict::AfterHealthWait,
+                            guard,
+                        );
+                    }
+                    (axum::http::StatusCode::OK.as_u16(), outcome)
+                }
                 Err(e) => {
+                    if let Some(record) = &exec_record {
+                        record.record_run_result(run_result_for(&e));
+                    }
                     exec_state
                         .logs
                         .emit(
@@ -1562,21 +1757,24 @@ pub async fn rebuild_and_restart_runner(
 
     Ok((
         axum::http::StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "rebuilding",
-            "build_id": submission_id.to_string(),
-            "submission_id": submission_id.to_string(),
-            "poll": "/builds",
-            "build_source": build_source,
-            "message": "rebuild-and-restart submitted; the build+restart runs detached from \
-                        this connection — poll GET /builds (or GET /build/{id}/status) for the \
-                        terminal outcome",
-        })),
+        Json(with_action_fields(
+            json!({
+                "status": "rebuilding",
+                "build_id": submission_id.to_string(),
+                "submission_id": submission_id.to_string(),
+                "poll": "/builds",
+                "build_source": build_source,
+                "message": "rebuild-and-restart submitted; the build+restart runs detached from \
+                            this connection — poll GET /builds (or GET /build/{id}/status) for the \
+                            terminal outcome",
+            }),
+            minted.as_ref(),
+        )),
     )
         .into_response())
 }
 
-/// POST /runners/{id}/watchdog — control per-runner watchdog.
+// POST /runners/{id}/watchdog — control per-runner watchdog.
 pub async fn control_runner_watchdog(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -2593,33 +2791,20 @@ async fn wait_out_queue_timeout(
     }
 }
 
-/// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
+/// Mint a `spawn`-kind dev-action trial for a freshly-reserved runner through
+/// [`mint_action`], targeting the spawned runner's registry entry.
 ///
-/// Evaluates the active dev-state set, stores the record, and spawns the
-/// attribution watcher targeting the spawned runner. The watcher reads the
-/// runner's spawn ring, and each in-window spawn's early log and panic,
-/// lazily, at window close, because the spawn records them after the mint,
-/// once the build is done. The window stays open until the spawn route records
-/// the spawn's own terminal result (`spawn_run_result`, at the route's one
-/// chokepoint), then a 30 s tail, capped by the 2-hour spawn backstop, so a
-/// `rebuild: true` spawn's build and boot land inside it.
+/// The watcher reads the runner's spawn ring, and each in-window spawn's early
+/// log and panic, lazily, at window close, because the spawn records them after
+/// the mint, once the build is done. The window stays open until the spawn
+/// route records the spawn's own terminal result (`spawn_run_result`, at the
+/// route's one chokepoint), then a 30 s tail, capped by the 2-hour spawn
+/// backstop, so a `rebuild: true` spawn's build and boot land inside it.
 ///
 /// Returns `(record, states_active, predicted, risk)`: the record so the route
 /// can record the spawn's terminal result on it, the rest for stamping into the
-/// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
-/// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
-/// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
-/// is unreachable / has no history (fail-open; never blocks the spawn). It is
-/// the ACK's cut, the top five by `posterior_mean`; the fetch itself reads
-/// coord's top 100 rows (its ceiling), and `risk` assesses all of them before
-/// the cut ([`assess_then_cut`]).
-///
-/// "Act on predictions": `risk` is the pure
-/// [`assess_action_risk`](crate::dev_action::policy::assess_action_risk) verdict
-/// over that whole fetch + `states_active`. spawn-test/named is a *testing*
-/// surface, so we do NOT auto-route it to LKG — we only SURFACE the assessment
-/// (stamp it into the ACK + a loud warn) so the caller sees the risk before the
-/// spawn completes.
+/// spawn ACK. spawn-test/named is a *testing* surface, so `risk` is never acted
+/// on here: it is surfaced in the ACK for the caller to act on.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
@@ -2631,74 +2816,21 @@ async fn mint_spawn_action(
     Vec<PredictedSignature>,
     ActionRisk,
 ) {
-    // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
-    // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
-    // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
-        Ok((origin, _)) => SlotResolution::Resolved(origin),
-        Err(_) => SlotResolution::NotEvaluated,
-    };
-    let states = evaluate_all(state, slot_resolution).await;
-    let record = ActionRecord::new(ActionKind::Spawn, requester_id, params_digest, &states);
-    let action_id = record.action_id;
-    // Stamp the ACK with the canonical string ids (Phase-2b stores typed
-    // `DevState`; the ACK wire form is the canonical-id array, unchanged).
-    let states_active: Vec<&'static str> =
-        record.states_active.iter().map(|s| s.as_str()).collect();
-
-    // Phase 4: fetch coord's state-conditioned expectations for this
-    // (spawn, states) so the ACK warns the agent before the spawn completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open). The
-    // fetch takes coord's top 100 rows, not the ACK's five: coord ranks by its
-    // pooled mean before cutting, which can drop the very row the exact-cell
-    // arm of the risk policy reads.
-    let coord = coord_base(&state.config.ambient_coord);
-    let fetched =
-        fetch_expectations(coord.as_deref(), ActionKind::Spawn.as_str(), &states_active).await;
-
-    // "Act on predictions" (surface-only for spawns): assess the whole fetch,
-    // then cut the ACK's `predicted` to the top five by `posterior_mean`; when
-    // high-risk, warn loudly so the caller sees it before the spawn completes.
-    // spawn-test/named is a testing surface — we never auto-route it to LKG;
-    // the ACK `risk` field carries the advisory for the caller to act on.
-    let (predicted, risk) = assess_then_cut(fetched, &states_active);
-    if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %action_id, kind = "spawn", "{warn}");
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
-            .await;
-    }
-
-    let arc = state.dev_actions.write().await.insert(record);
-
-    let runner_id = managed.config.id.clone();
-    spawn_attribution_watcher(
-        state.clone(),
-        arc.clone(),
-        AttributionTargets {
-            managed: Some(managed),
-            runner_id: Some(runner_id),
-        },
+    let minted = mint_action(
+        state,
+        ActionKind::Spawn,
+        params_digest,
+        requester_id,
+        AttributionTargets::for_runner(managed),
         None,
-    );
-
-    (arc, states_active, predicted, risk)
-}
-
-/// Render an [`ActionRisk`] as the spawn ACK's `risk` field: `null` when there
-/// is no actionable risk, otherwise the `route_lkg` advice (always surfaced —
-/// spawns don't auto-route, the caller decides), the human-readable `warning`,
-/// and the `top_signature` evidence.
-fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
-    if !risk.is_actionable() {
-        return serde_json::Value::Null;
-    }
-    json!({
-        "route_lkg": risk.route_lkg,
-        "warning": risk.warn,
-        "top_signature": risk.top_signature,
-    })
+    )
+    .await;
+    (
+        minted.record,
+        minted.states_active,
+        minted.predicted,
+        minted.risk,
+    )
 }
 
 /// The git repo root whose object db + refs the spawn-response provenance
@@ -3171,7 +3303,7 @@ pub async fn spawn_test(
     )
     .await;
     let action_id = action_record.action_id;
-    let action_risk_json = spawn_risk_ack_json(&action_risk);
+    let action_risk_json = risk_ack_json(&action_risk);
     // Moved into the exec future and from there into `execute_spawn_build`,
     // which records the spawn's result; it records the action abandoned if
     // that future ends first (a panic in the exec task).
@@ -5620,7 +5752,7 @@ pub async fn spawn_named(
     )
     .await;
     let action_id = action_record.action_id;
-    let action_risk_json = spawn_risk_ack_json(&action_risk);
+    let action_risk_json = risk_ack_json(&action_risk);
     // The inner future runs inside this handler, so a client disconnect drops
     // it: the guard records the action abandoned then.
     let run_guard = RunResultGuard::arm(action_record, "spawn-named's handler future");

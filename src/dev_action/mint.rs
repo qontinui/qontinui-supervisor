@@ -1,0 +1,139 @@
+//! The one mint every supervisor lifecycle door goes through.
+//!
+//! A door that stops, starts, restarts or rebuilds a runner mints a dev-action
+//! trial here before it acts: the active dev-state set is evaluated, coord's
+//! state-conditioned expectations are fetched and assessed, the record is
+//! stored, and the attribution watcher is spawned against the runner the door
+//! acts on. The door then records the act's terminal result on the returned
+//! record and threads its `action_id` into the start, so the spawn's ring entry
+//! names the action (`SpawnMarker::initiated_by`).
+//!
+//! Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+//! D2: before it, only the primary and spawn routes minted, each through its own
+//! copy of this body, so a restart through any other door was never a trial.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::dev_action::{
+    assess_then_cut, coord_base, evaluate_all, fetch_expectations, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+};
+use crate::log_capture::{LogLevel, LogSource};
+use crate::process::manager;
+use crate::state::{ManagedRunner, SharedState};
+
+/// What a mint hands back to its door.
+pub struct MintedAction {
+    /// The stored record. The door records the act's terminal result on it.
+    pub record: Arc<ActionRecord>,
+    /// The canonical ids of the dev states active at the mint, for the ACK.
+    pub states_active: Vec<&'static str>,
+    /// Coord's expectations for `(kind, states_active)`, cut to the ACK's five.
+    pub predicted: Vec<PredictedSignature>,
+    /// The risk verdict over every expectation coord served, before the cut.
+    pub risk: ActionRisk,
+}
+
+impl MintedAction {
+    /// The fields every lifecycle door's ACK carries about its action.
+    pub fn ack_fields(&self) -> serde_json::Value {
+        let action_id = self.record.action_id;
+        serde_json::json!({
+            "action_id": action_id.to_string(),
+            "states_active": self.states_active,
+            "predicted": self.predicted,
+            "risk": risk_ack_json(&self.risk),
+            "outcome_url": format!("/actions/{action_id}/outcome"),
+        })
+    }
+}
+
+impl AttributionTargets {
+    /// The targets of an action that drives `managed`'s boot: its registry
+    /// entry, whose spawn ring the start writes, and its id for the health scan.
+    pub fn for_runner(managed: Arc<ManagedRunner>) -> Self {
+        Self {
+            runner_id: Some(managed.config.id.clone()),
+            managed: Some(managed),
+        }
+    }
+}
+
+/// Mint a dev-action trial of `kind` and spawn its attribution watcher over
+/// `targets`.
+///
+/// State evaluation includes `LEGACY_EXE_FALLBACK` through a cheap
+/// `resolve_source_exe_with_origin` probe of the slot a start WOULD deploy; a
+/// resolution error leaves it unevaluated, so the state surfaces as `Unknown`
+/// rather than a false `False`. Resolution reads facts already in memory, so
+/// this stays off the blocking path.
+///
+/// `predicted` is coord's state-conditioned expectations for
+/// `(kind, states_active)`, fetched best-effort with a 2s timeout so the
+/// initiator is warned BEFORE the act completes; empty when coord is
+/// unreachable or has no history (fail-open, never blocks the act). The fetch
+/// reads coord's top 100 rows, because coord ranks by its pooled mean before
+/// cutting and could otherwise drop the very row the exact-cell arm of the risk
+/// policy reads; `risk` assesses all of them, then `predicted` is cut to five
+/// ([`assess_then_cut`]). A high risk is warned here, loudly, whatever the door
+/// does with the advice.
+///
+/// `backstop_override` replaces the kind's backstop on the watcher's window,
+/// for an act that can outlast it.
+pub async fn mint_action(
+    state: &SharedState,
+    kind: ActionKind,
+    params_digest: String,
+    requester_id: Option<String>,
+    targets: AttributionTargets,
+    backstop_override: Option<Duration>,
+) -> MintedAction {
+    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
+        Ok((origin, _)) => SlotResolution::Resolved(origin),
+        Err(_) => SlotResolution::NotEvaluated,
+    };
+    let states = evaluate_all(state, slot_resolution).await;
+    let record = ActionRecord::new(kind, requester_id, params_digest, &states);
+    let action_id = record.action_id;
+    // The record stores typed `DevState`s; the ACK's wire form is their
+    // canonical-id array.
+    let states_active: Vec<&'static str> =
+        record.states_active.iter().map(|s| s.as_str()).collect();
+
+    let coord = coord_base(&state.config.ambient_coord);
+    let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
+    let (predicted, risk) = assess_then_cut(fetched, &states_active);
+    if let Some(warn) = risk.warn.as_deref() {
+        tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
+            .await;
+    }
+
+    let record = state.dev_actions.write().await.insert(record);
+    spawn_attribution_watcher(state.clone(), record.clone(), targets, backstop_override);
+
+    MintedAction {
+        record,
+        states_active,
+        predicted,
+        risk,
+    }
+}
+
+/// Render an [`ActionRisk`] as an ACK's `risk` field: `null` when there is no
+/// actionable risk (the healthy / no-history case), otherwise the `route_lkg`
+/// advice, the human-readable `warning`, and the `top_signature` evidence, so
+/// the initiator sees exactly what tripped the assessment.
+pub fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
+    if !risk.is_actionable() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "route_lkg": risk.route_lkg,
+        "warning": risk.warn,
+        "top_signature": risk.top_signature,
+    })
+}

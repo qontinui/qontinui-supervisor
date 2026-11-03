@@ -20,6 +20,7 @@
 pub mod attribution;
 pub mod expectations;
 pub mod ingest;
+pub mod mint;
 pub mod mock;
 pub mod policy;
 pub mod record;
@@ -36,6 +37,7 @@ pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // at `crate::dev_action::attribution::…` from a test.
 pub use expectations::{assess_then_cut, fetch_expectations, PredictedSignature};
 pub use ingest::{coord_base, post_snapshot_to_coord};
+pub use mint::{mint_action, risk_ack_json, MintedAction};
 pub use policy::ActionRisk;
 pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore, RunResultGuard};
 pub use run_result::{

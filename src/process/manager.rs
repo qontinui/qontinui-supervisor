@@ -4547,23 +4547,7 @@ pub async fn maybe_serving_restart(
                 };
 
                 let result = match unprotected_refusal {
-                    None => {
-                        restart_runner_by_id(
-                            &state,
-                            &runner_id,
-                            false,
-                            RestartSource::ServingWatchdog,
-                            false,
-                            // `rebuild: false` — nothing is compiled, so the
-                            // tree is inert. Name the policy default anyway.
-                            BuildTree::OriginMain,
-                            // The watchdog never asks for a handoff: it acts
-                            // only on a zero census, so there is nothing to keep.
-                            CloseIntent::Kill,
-                            None,
-                        )
-                        .await
-                    }
+                    None => serving_watchdog_restart(&state, &managed, attempt).await,
                     Some((message, census)) => Err(SupervisorError::RestartUnsafe(Box::new(
                         crate::restart_readiness::RefusalDetail {
                             cause: "sessions_live",
@@ -4711,6 +4695,77 @@ pub async fn maybe_serving_restart(
         }
     }
 }
+
+/// The serving watchdog's restart of `managed`: a `restart` dev-action trial
+/// with requester `watchdog`, minted once the readiness gate has admitted it.
+///
+/// Minted AFTER the gate ([`admit_restart`]), not before it: a refusal gives
+/// its attempt back and the arm decides again on the next escalating tick, so
+/// a wedged runner with live sessions is refused every few seconds for as long
+/// as the wedge lasts, and a mint per refusal would flood the ledger with
+/// trials of a restart that never ran. An admitted restart is minted, threads
+/// its action id into the start (so the spawn's ring entry names it), and
+/// records its terminal result: the error on failure, the detached health
+/// wait's verdict on success.
+async fn serving_watchdog_restart(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    attempt: u32,
+) -> Result<(), SupervisorError> {
+    let runner_id = managed.config.id.clone();
+    // The watchdog never asks for a handoff: it acts only on a zero census, so
+    // there is nothing to keep.
+    let intent = CloseIntent::Kill;
+    let admitted = admit_restart(
+        state,
+        &runner_id,
+        false,
+        RestartSource::ServingWatchdog,
+        false,
+        intent,
+    )
+    .await?;
+    let minted = crate::dev_action::mint_action(
+        state,
+        crate::dev_action::ActionKind::Restart,
+        format!("serving_watchdog;runner={runner_id};attempt={attempt}"),
+        Some(SERVING_WATCHDOG_INITIATOR.to_string()),
+        crate::dev_action::AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await;
+    let guard = crate::dev_action::RunResultGuard::arm(
+        minted.record.clone(),
+        "the serving watchdog's restart task",
+    );
+    let result = run_admitted_restart(
+        state,
+        admitted,
+        // `rebuild: false` — nothing is compiled, so the tree is inert. Name
+        // the policy default anyway.
+        BuildTree::OriginMain,
+        intent,
+        Some(minted.record.action_id),
+    )
+    .await;
+    match &result {
+        Ok(()) => crate::dev_action::record_start_verdict(
+            state,
+            &runner_id,
+            crate::dev_action::StartVerdict::AfterHealthWait,
+            guard,
+        ),
+        Err(e) => {
+            minted
+                .record
+                .record_run_result(crate::dev_action::run_result_for(e));
+        }
+    }
+    result
+}
+
+/// The requester the serving watchdog's restart trials are minted under.
+pub const SERVING_WATCHDOG_INITIATOR: &str = "watchdog";
 
 /// Whether the crash watchdog's backoff task must not restart the runner.
 ///
@@ -6438,6 +6493,37 @@ pub async fn restart_runner_by_id(
     intent: CloseIntent,
     initiated_by: Option<uuid::Uuid>,
 ) -> Result<(), SupervisorError> {
+    let admitted = admit_restart(state, runner_id, rebuild, source, force, intent).await?;
+    run_admitted_restart(state, admitted, build_tree, intent, initiated_by).await
+}
+
+/// A restart the readiness gate admitted, not yet run. Only
+/// [`admit_restart`] makes one and only [`run_admitted_restart`] takes it.
+pub struct AdmittedRestart {
+    managed: Arc<ManagedRunner>,
+    runner_id: String,
+    rebuild: bool,
+    source: RestartSource,
+    started: std::time::Instant,
+}
+
+/// The front half of [`restart_runner_by_id`]: the automated-source block, the
+/// `RestartStarted` diagnostic, the existence check and the readiness gate.
+/// Nothing is stopped or latched here.
+///
+/// Split out so a caller that retries a refusal can mint a dev-action trial
+/// only for a restart that will actually run: the serving watchdog is refused
+/// on every escalating tick while sessions are live, and minting before the
+/// gate would put one refused trial in the ledger per tick for the length of a
+/// wedge (hours to days).
+pub async fn admit_restart(
+    state: &SharedState,
+    runner_id: &str,
+    rebuild: bool,
+    source: RestartSource,
+    force: bool,
+    intent: CloseIntent,
+) -> Result<AdmittedRestart, SupervisorError> {
     if automated_restart_blocked(is_temp_runner(runner_id), &source) {
         let msg = format!(
             "Automated restart of non-temp runner '{}' blocked (source: {}). \
@@ -6509,6 +6595,37 @@ pub async fn restart_runner_by_id(
             });
         return Err(e);
     }
+
+    Ok(AdmittedRestart {
+        managed,
+        runner_id: runner_id.to_string(),
+        rebuild,
+        source,
+        started: restart_start,
+    })
+}
+
+/// The back half of [`restart_runner_by_id`]: latch `restart_requested`, run
+/// the stop → (build) → start body, clear the latch on every exit, and record
+/// the outcome.
+///
+/// `initiated_by` is the dev action this restart belongs to, `None` when nothing
+/// minted one; see [`start_managed_runner`].
+pub async fn run_admitted_restart(
+    state: &SharedState,
+    admitted: AdmittedRestart,
+    build_tree: BuildTree,
+    intent: CloseIntent,
+    initiated_by: Option<uuid::Uuid>,
+) -> Result<(), SupervisorError> {
+    let AdmittedRestart {
+        managed,
+        runner_id,
+        rebuild,
+        source,
+        started: restart_start,
+    } = admitted;
+    let runner_id = runner_id.as_str();
 
     {
         let mut runner = managed.runner.write().await;
@@ -6736,10 +6853,14 @@ pub async fn restart_runner(
 /// stale-binary fallback). The runner is left stopped — callers can hit
 /// `/runners/{id}/start` if they want to revive it from the previous slot
 /// exe.
+///
+/// `initiated_by` is the dev action this rebuild belongs to, recorded on the
+/// start's spawn ring entry; see [`start_managed_runner`].
 pub async fn rebuild_and_restart_by_id(
     state: &SharedState,
     runner_id: &str,
     body: crate::routes::runners::RebuildAndRestartRequest,
+    initiated_by: Option<uuid::Uuid>,
 ) -> Result<serde_json::Value, SupervisorError> {
     let managed = state
         .get_runner(runner_id)
@@ -6799,7 +6920,7 @@ pub async fn rebuild_and_restart_by_id(
 
     // Step 3: start.
     let started_at = chrono::Utc::now();
-    start_managed_runner(state, &managed, None, StartAs::Restart).await?;
+    start_managed_runner(state, &managed, initiated_by, StartAs::Restart).await?;
     state
         .logs
         .emit(
