@@ -2962,4 +2962,48 @@ mod tests {
         assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);
         assert_eq!(earlier.category, D3Category::Confirmed);
     }
+
+    /// D3, the `recent_crash` arm: a crash report counts only when its
+    /// `reported_at` lies between the action's spawn and the close, and the
+    /// `derived_status` fold does not re-admit one its date dropped.
+    #[tokio::test]
+    async fn a_recent_crash_counts_only_when_reported_after_the_actions_spawn() {
+        use crate::health_cache::RunnerStatus;
+
+        let crash_at = |at: DateTime<Utc>| {
+            let mut health = cached_health(
+                None,
+                RunnerStatus::Errored {
+                    reason: "recent_crash".to_string(),
+                },
+            );
+            health.recent_crash = Some(crate::health_cache::RecentCrashSummary {
+                file_path: "crash-dump.json".to_string(),
+                reported_at: at,
+                panic_location: None,
+                panic_message: Some("the webview crashed".to_string()),
+                thread: None,
+            });
+            health
+        };
+
+        let its_boot = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| crash_at(inside_the_window(record)),
+        )
+        .await;
+        assert_eq!(its_boot.signatures, ["DEV-UI-ERROR-BOUNDARY"]);
+        assert_eq!(
+            its_boot.evidence_ref.as_deref(),
+            Some("recent_crash: the webview crashed")
+        );
+
+        let earlier = build_outcome_over_cached_health(
+            |record| Some(spawned_after_the_mint(record)),
+            |record| crash_at(record.started_at - chrono::Duration::seconds(5)),
+        )
+        .await;
+        assert!(earlier.signatures.is_empty(), "{:?}", earlier.signatures);
+        assert_eq!(earlier.category, D3Category::Confirmed);
+    }
 }
