@@ -18,9 +18,10 @@
 //! The first two describe one boot, so they are read per spawn, and only for
 //! the spawns this action initiated on the acted-on runner inside the window
 //! ([`scan_spawn_effects`]): an action that starts nothing inside its window
-//! has no boot of its own to judge. The third is gated the same way, and what
-//! of it can be dated is held to the span from the action's earliest such spawn
-//! to the close.
+//! has no boot of its own to judge. The third is gated the same way: what of
+//! it can be dated is held to the span from the action's earliest such spawn
+//! to the close, a recent crash to the crash of one of those spawns, and the
+//! undated self-report to an API seen answering after that spawn.
 //!
 //! The verdict closes at window end. Late observations append to
 //! `late_signatures` flagged `late: true` and update statistics only — they
@@ -602,18 +603,29 @@ async fn scan_spawn_effects(
 /// `rebuild_when_idle` still waiting start nothing, so the runner's current
 /// `ui_error` describes a boot they did not perform, and none is read for them.
 ///
-/// What can be dated is held to the span from the action's earliest in-window
-/// spawn to the close: a `ui_error` counts only if its `first_seen` lies in it,
-/// a `recent_crash` only if its `reported_at` does. `derived_status` is the
-/// supervisor's own fold of those two (`health_cache::derive_runner_status`
-/// returns `Errored` for either), so its `Errored` arm counts only when both are
-/// absent: otherwise a `ui_error` dated out of the span would fall through to it
-/// and still emit the signature.
+/// - A `ui_error` counts only if its `first_seen` lies in the span from the
+///   action's earliest in-window spawn to the close.
+/// - A `recent_crash` counts only if it is the crash of one of the action's
+///   own in-window spawns ([`is_crash_of_spawn`]) dated at or before the
+///   close. A runner reports the dump it found at startup, so the reporter is
+///   always a later process than the one that crashed, and a date in the span
+///   alone can describe a crash of a spawn the action did not make (a
+///   watchdog's respawn, another action's start).
+/// - `derived_status` is the supervisor's own fold of those two
+///   (`health_cache::derive_runner_status` returns `Errored` for either), so
+///   its `Errored` arm counts only when both are absent: otherwise a signal
+///   dated out of the span would fall through to it and still emit the
+///   signature. With both absent the `Errored` is the runner's own undated
+///   self-report, and it counts only when the snapshot shows the API
+///   answering at a time after the action's earliest spawn
+///   (`api_responding` with `last_seen_responding_at` past that spawn):
+///   otherwise nothing places the report after the action's boot and the arm
+///   is inconclusive, so it emits nothing.
 ///
-/// **Residual:** that undated `Errored` arm can also come from the runner's own
-/// self-reported status, which carries no date. With an initiated spawn in the
-/// window it is read as this action's, even if the runner reported it about an
-/// earlier boot. It is the one health signal the span cannot bound.
+/// **Residual:** an undated `Errored` that does pass that check is still read
+/// as this action's even if the runner, answering after the spawn, carried
+/// over a status about an earlier boot. Only the API answering after the
+/// spawn is proven, not the report's own date.
 async fn scan_health(
     state: &SharedState,
     managed: Option<&ManagedRunner>,
@@ -624,16 +636,19 @@ async fn scan_health(
     let (Some(managed), Some(runner_id)) = (managed, runner_id) else {
         return (Vec::new(), None);
     };
-    let earliest_spawn = managed
-        .recent_spawns
-        .read()
-        .await
-        .spawned_between(window.open_at, window.close_at)
-        .into_iter()
-        .filter(|spawn| spawn.initiated_by == Some(action_id))
-        .map(|spawn| spawn.spawned_at)
-        .min();
-    let Some(earliest_spawn) = earliest_spawn else {
+    let (initiated, ring_to_close) = {
+        let ring = managed.recent_spawns.read().await;
+        let initiated: Vec<SpawnMarker> = ring
+            .spawned_between(window.open_at, window.close_at)
+            .into_iter()
+            .filter(|spawn| spawn.initiated_by == Some(action_id))
+            .collect();
+        (
+            initiated,
+            ring.spawned_between(DateTime::<Utc>::MIN_UTC, window.close_at),
+        )
+    };
+    let Some(earliest_spawn) = initiated.iter().map(|spawn| spawn.spawned_at).min() else {
         return (Vec::new(), None);
     };
     let in_span = |at: DateTime<Utc>| earliest_spawn <= at && at <= window.close_at;
@@ -654,7 +669,11 @@ async fn scan_health(
         }
     }
     if let Some(crash) = snap.recent_crash.as_ref() {
-        if in_span(crash.reported_at) {
+        let its_spawns_crash = crash.reported_at <= window.close_at
+            && initiated
+                .iter()
+                .any(|spawn| is_crash_of_spawn(crash, spawn, &ring_to_close));
+        if its_spawns_crash {
             let what = crash
                 .panic_message
                 .as_deref()
@@ -674,13 +693,57 @@ async fn scan_health(
             snap.derived_status,
             crate::health_cache::RunnerStatus::Errored { .. }
         );
-    if undated_errored {
+    let api_answered_after_spawn = snap.api_responding
+        && snap
+            .last_seen_responding_at
+            .is_some_and(|seen| seen > earliest_spawn);
+    if undated_errored && api_answered_after_spawn {
         return (
             vec![DevSignature::DevUiErrorBoundary],
             Some("derived_status=errored".to_string()),
         );
     }
     (Vec::new(), None)
+}
+
+/// Whether `crash`, the dump a runner reported on its `/health`, is the crash
+/// of `spawn`, one of the acted-on runner's spawns. `ring` is the runner's
+/// spawn ring up to the window's close. All three must hold:
+///
+/// 1. **Dated after the spawn**: `reported_at > spawned_at`. A dump dated
+///    before the spawn is an older process's.
+/// 2. **Dated at or before the spawn's exit**, when that exit is stamped
+///    (Windows reuses pids).
+/// 3. **The spawn's pid.** With a `pid` on the dump (the runner emits it from
+///    plan Phase 6), it equals the spawn's ring-entry pid. With none, the
+///    interim rule: the ring entry that was the runner's newest spawn when the
+///    dump was written, the process that was running then, is this spawn's,
+///    entry and pid both, so a crash of a later spawn (a crash watchdog's
+///    respawn, another action's start) dated inside the window is not read as
+///    this one's.
+///
+/// The same discipline as [`is_panic_of_spawn`]: the pid, not the date, ties a
+/// crash to a process.
+pub(crate) fn is_crash_of_spawn(
+    crash: &crate::health_cache::RecentCrashSummary,
+    spawn: &SpawnMarker,
+    ring: &[SpawnMarker],
+) -> bool {
+    let after_its_spawn = crash.reported_at > spawn.spawned_at;
+    let before_its_exit = spawn
+        .exited_at
+        .is_none_or(|exited| crash.reported_at <= exited);
+    let its_pid = match crash.pid {
+        Some(pid) => spawn.pid == Some(pid),
+        None => ring
+            .iter()
+            .filter(|entry| entry.spawned_at < crash.reported_at)
+            .max_by_key(|entry| entry.spawned_at)
+            .is_some_and(|running| {
+                running.spawned_at == spawn.spawned_at && running.pid == spawn.pid
+            }),
+    };
+    after_its_spawn && before_its_exit && its_pid
 }
 
 /// Where the watcher should look for this action's effects.
@@ -753,21 +816,15 @@ async fn await_attribution_window(
         Some(other) => {
             // Tail measured from the action's REAL end, and still clamped by
             // the backstop so the window is bounded either way.
-            let room = timing.backstop.saturating_sub(elapsed_since_start(record));
+            // Both ends on the tokio clock the backstop deadline runs on.
+            let room = timing
+                .backstop
+                .saturating_sub(record.started_instant.elapsed());
             tokio::time::sleep(timing.tail.min(room)).await;
             Some(other)
         }
         None => record.run_result(),
     }
-}
-
-/// Wall-clock elapsed since the action was minted. A clock that has gone
-/// backwards reads as zero elapsed rather than as a negative (which would
-/// otherwise wrap into an enormous sleep).
-fn elapsed_since_start(record: &ActionRecord) -> Duration {
-    (Utc::now() - record.started_at)
-        .to_std()
-        .unwrap_or(Duration::ZERO)
 }
 
 /// The verdict of a closed window: [`classify`], except that a window that
@@ -2854,6 +2911,51 @@ mod tests {
             .is_some_and(|e| e.contains("runner_unhealthy_after_start")));
     }
 
+    /// Phase 4.7 (plan `2026-11-03-supervisor-dev-action-residuals-…`). The
+    /// tail after a result is capped by the backstop, and the cap is measured
+    /// on the tokio clock from the mint ([`ActionRecord::started_instant`]),
+    /// the clock the backstop deadline runs on. A result at t+90 s under a
+    /// 60 s tail and a 100 s backstop closes at t+100 s. Measured from the
+    /// wall clock, as it was, a paused tokio clock reads ~0 s elapsed and the
+    /// window would close at t+150 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_tail_cap_fires_on_the_tokio_clock_from_the_mint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let record = bare_record(ActionKind::Build);
+        spawn_attribution_watcher_with_timing(
+            state,
+            record.clone(),
+            AttributionTargets::default(),
+            WindowTiming {
+                tail: Duration::from_secs(60),
+                backstop: Duration::from_secs(100),
+            },
+        );
+
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        assert!(outcome_of(&record).is_none());
+        record.record_run_result(ActionRunResult::Ran);
+
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(
+            outcome_of(&record).is_none(),
+            "the window closed before the backstop capped its tail"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for _ in 0..100 {
+            if outcome_of(&record).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let outcome = outcome_of(&record).expect(
+            "the tail ran past the 100 s backstop: the cap was not measured on the tokio              clock from the mint",
+        );
+        assert_eq!(outcome.category, D3Category::Confirmed);
+    }
+
     /// The primary's cached health snapshot, with `ui_error` and
     /// `derived_status` as given and every other field neutral.
     fn cached_health(
@@ -3006,5 +3108,286 @@ mod tests {
                 "{access:?} must send no identity and read none"
             );
         }
+    }
+
+    // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-
+    //    restart-door-and-pre-fix-ledger-rows` Phase 4.2-4.4: `scan_health` ──
+
+    /// A closed window of one minute ending now, and the primary as the
+    /// acted-on runner with no spawn recorded yet.
+    fn health_scan_fixture() -> (
+        SharedState,
+        Arc<ManagedRunner>,
+        ClosedWindow,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = watcher_test_state(tmp.path());
+        let close_at = Utc::now();
+        let window = ClosedWindow {
+            open_at: close_at - chrono::Duration::seconds(60),
+            close_at,
+        };
+        (state, test_primary(), window, tmp)
+    }
+
+    /// `seconds` after the window opened.
+    fn at(window: ClosedWindow, seconds: i64) -> DateTime<Utc> {
+        window.open_at + chrono::Duration::seconds(seconds)
+    }
+
+    /// Record a spawn of `runner` at `spawned_at`, child `pid`, that
+    /// `initiated_by` asked for, with no early log.
+    async fn push_spawn(
+        runner: &ManagedRunner,
+        spawned_at: DateTime<Utc>,
+        pid: u32,
+        initiated_by: Option<Uuid>,
+    ) {
+        runner.recent_spawns.write().await.push(SpawnMarker::new(
+            spawned_at,
+            Some(pid),
+            None,
+            initiated_by,
+        ));
+    }
+
+    fn recent_crash(
+        reported_at: DateTime<Utc>,
+        pid: Option<u32>,
+    ) -> crate::health_cache::RecentCrashSummary {
+        crate::health_cache::RecentCrashSummary {
+            file_path: "D:/.dev-logs/crash_1.txt".to_string(),
+            reported_at,
+            panic_location: None,
+            panic_message: Some("there is no reactor running".to_string()),
+            thread: Some("main".to_string()),
+            pid,
+        }
+    }
+
+    /// The signatures `scan_health` reads for `action_id` with the primary's
+    /// cached health set to `snap`.
+    async fn scan_health_with(
+        state: &SharedState,
+        runner: &ManagedRunner,
+        action_id: Uuid,
+        window: ClosedWindow,
+        snap: crate::health_cache::CachedRunnerHealth,
+    ) -> Vec<DevSignature> {
+        *state.cached_runner_health.write().await = vec![snap];
+        scan_health(
+            state,
+            Some(runner),
+            Some(runner.config.id.as_str()),
+            action_id,
+            window,
+        )
+        .await
+        .0
+    }
+
+    /// The primary's cached health reporting `crash`, folded into `Errored`.
+    fn crashed_health(
+        crash: crate::health_cache::RecentCrashSummary,
+    ) -> crate::health_cache::CachedRunnerHealth {
+        let mut snap = cached_health(
+            None,
+            crate::health_cache::RunnerStatus::Errored {
+                reason: "there is no reactor running".to_string(),
+            },
+        );
+        snap.recent_crash = Some(crash);
+        snap
+    }
+
+    /// 4.2: a crash of the action's own spawn, dated after that spawn and
+    /// inside the window, is attributed: with no pid on the dump by the
+    /// interim rule (the spawn was the runner's newest when the dump was
+    /// written), and with one by the pid.
+    #[tokio::test]
+    async fn scan_health_recent_crash_inside_span_attributes() {
+        let (state, primary, window, _tmp) = health_scan_fixture();
+        let action_id = Uuid::new_v4();
+        push_spawn(&primary, at(window, 1), SPAWNED_PID, Some(action_id)).await;
+
+        for pid in [None, Some(SPAWNED_PID)] {
+            let sigs = scan_health_with(
+                &state,
+                &primary,
+                action_id,
+                window,
+                crashed_health(recent_crash(at(window, 5), pid)),
+            )
+            .await;
+            assert_eq!(sigs, [DevSignature::DevUiErrorBoundary], "dump pid {pid:?}");
+        }
+    }
+
+    /// 4.2: a crash dated before (or at) the action's spawn is an older
+    /// process's, inside the window or not, with or without a matching pid.
+    #[tokio::test]
+    async fn scan_health_recent_crash_before_spawn_is_ignored() {
+        let (state, primary, window, _tmp) = health_scan_fixture();
+        let action_id = Uuid::new_v4();
+        let spawned_at = at(window, 10);
+        push_spawn(&primary, spawned_at, SPAWNED_PID, Some(action_id)).await;
+
+        for reported_at in [at(window, -5), at(window, 5), spawned_at] {
+            for pid in [None, Some(SPAWNED_PID)] {
+                let sigs = scan_health_with(
+                    &state,
+                    &primary,
+                    action_id,
+                    window,
+                    crashed_health(recent_crash(reported_at, pid)),
+                )
+                .await;
+                assert!(
+                    sigs.is_empty(),
+                    "a crash dated {reported_at} (spawn at {spawned_at}) with pid {pid:?} \
+                     was attributed: {sigs:?}"
+                );
+            }
+        }
+    }
+
+    /// 4.3, the dump-pid arm: a pid on the dump decides. A crash dated inside
+    /// the span is not the action's when the dump names another process, even
+    /// where the interim rule would have read it as the action's spawn.
+    #[tokio::test]
+    async fn scan_health_recent_crash_keys_on_the_dump_pid() {
+        let (state, primary, window, _tmp) = health_scan_fixture();
+        let action_id = Uuid::new_v4();
+        push_spawn(&primary, at(window, 1), SPAWNED_PID, Some(action_id)).await;
+
+        let other = scan_health_with(
+            &state,
+            &primary,
+            action_id,
+            window,
+            crashed_health(recent_crash(at(window, 5), Some(SPAWNED_PID + 1))),
+        )
+        .await;
+        assert!(other.is_empty(), "another process's dump: {other:?}");
+
+        let its_own = scan_health_with(
+            &state,
+            &primary,
+            action_id,
+            window,
+            crashed_health(recent_crash(at(window, 5), Some(SPAWNED_PID))),
+        )
+        .await;
+        assert_eq!(its_own, [DevSignature::DevUiErrorBoundary]);
+    }
+
+    /// 4.3, the interim (ring-pid) arm and the exit bound: the action's spawn
+    /// came up and exited, and a crash-watchdog respawn it did not initiate
+    /// followed. A pid-less crash dated after that respawn is the respawn's,
+    /// not the action's. A dump naming the action's pid but dated after that
+    /// spawn's stamped exit is not its either (Windows reuses pids). One
+    /// dated while the action's spawn was the one running is its.
+    #[tokio::test]
+    async fn scan_health_recent_crash_of_a_later_spawn_is_ignored() {
+        let (state, primary, window, _tmp) = health_scan_fixture();
+        let action_id = Uuid::new_v4();
+        push_spawn(&primary, at(window, 1), SPAWNED_PID, Some(action_id)).await;
+        assert!(primary
+            .recent_spawns
+            .write()
+            .await
+            .stamp_exit(at(window, 1), at(window, 3), None));
+        push_spawn(&primary, at(window, 4), SPAWNED_PID + 1, None).await;
+
+        for pid in [None, Some(SPAWNED_PID)] {
+            let sigs = scan_health_with(
+                &state,
+                &primary,
+                action_id,
+                window,
+                crashed_health(recent_crash(at(window, 5), pid)),
+            )
+            .await;
+            assert!(
+                sigs.is_empty(),
+                "a crash after the respawn with pid {pid:?} was read as the action's: {sigs:?}"
+            );
+        }
+
+        for pid in [None, Some(SPAWNED_PID)] {
+            let sigs = scan_health_with(
+                &state,
+                &primary,
+                action_id,
+                window,
+                crashed_health(recent_crash(at(window, 2), pid)),
+            )
+            .await;
+            assert_eq!(sigs, [DevSignature::DevUiErrorBoundary], "dump pid {pid:?}");
+        }
+    }
+
+    /// 4.4: the runner's undated `derived_status: errored` counts only when
+    /// the snapshot shows the API answering after the action's spawn.
+    /// Otherwise nothing places the report after that boot, and the arm is
+    /// inconclusive: no signature.
+    #[tokio::test]
+    async fn scan_health_undated_errored_without_post_spawn_api_is_inconclusive() {
+        let (state, primary, window, _tmp) = health_scan_fixture();
+        let action_id = Uuid::new_v4();
+        let spawned_at = at(window, 10);
+        push_spawn(&primary, spawned_at, SPAWNED_PID, Some(action_id)).await;
+
+        let errored = |api_responding: bool, last_seen: Option<DateTime<Utc>>| {
+            let mut snap = cached_health(
+                None,
+                crate::health_cache::RunnerStatus::Errored {
+                    reason: "runner reported derived_status=errored".to_string(),
+                },
+            );
+            snap.api_responding = api_responding;
+            snap.last_seen_responding_at = last_seen;
+            snap
+        };
+
+        for (api_responding, last_seen, why) in [
+            (true, None, "the API was never seen answering"),
+            (
+                true,
+                Some(at(window, 5)),
+                "the API was last seen before the spawn",
+            ),
+            (
+                true,
+                Some(spawned_at),
+                "the API was last seen at the spawn, not after",
+            ),
+            (
+                false,
+                Some(at(window, 20)),
+                "the API is not answering on this snapshot",
+            ),
+        ] {
+            let sigs = scan_health_with(
+                &state,
+                &primary,
+                action_id,
+                window,
+                errored(api_responding, last_seen),
+            )
+            .await;
+            assert!(sigs.is_empty(), "{why}, yet it was attributed: {sigs:?}");
+        }
+
+        let answered_after = scan_health_with(
+            &state,
+            &primary,
+            action_id,
+            window,
+            errored(true, Some(at(window, 20))),
+        )
+        .await;
+        assert_eq!(answered_after, [DevSignature::DevUiErrorBoundary]);
     }
 }

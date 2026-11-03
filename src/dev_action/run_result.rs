@@ -16,11 +16,27 @@
 //!   D9).
 
 use axum::http::StatusCode;
+use futures::future::BoxFuture;
 
 use crate::dev_action::record::{ActionRunResult, RunResultGuard};
 use crate::error::SupervisorError;
-use crate::process::health_probe::wait_for_runner_healthy_default;
+use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
 use crate::state::SharedState;
+
+/// The health wait [`record_start_verdict_with`] runs for a deferred verdict:
+/// `Ok` once the runner answered, else the failure. Production passes
+/// [`default_health_wait`] ([`wait_for_runner_healthy_default`]); a test
+/// passes a wait it controls, so the detached half runs without a runner.
+pub type HealthWait =
+    for<'a> fn(&'a SharedState, &'a str) -> BoxFuture<'a, Result<(), HealthProbeFailure>>;
+
+/// The production [`HealthWait`]: [`wait_for_runner_healthy_default`].
+pub fn default_health_wait<'a>(
+    state: &'a SharedState,
+    runner_id: &'a str,
+) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
+    Box::pin(wait_for_runner_healthy_default(state, runner_id))
+}
 
 /// The reason token of a start whose runner never answered its health check.
 pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
@@ -198,6 +214,19 @@ pub fn record_start_verdict(
     verdict: StartVerdict,
     guard: RunResultGuard,
 ) {
+    record_start_verdict_with(state, runner_id, verdict, guard, default_health_wait);
+}
+
+/// [`record_start_verdict`] with the health wait supplied: the seam the
+/// detached half is tested through. Every production caller goes through
+/// [`record_start_verdict`], which passes [`default_health_wait`].
+pub fn record_start_verdict_with(
+    state: &SharedState,
+    runner_id: &str,
+    verdict: StartVerdict,
+    guard: RunResultGuard,
+    health_wait: HealthWait,
+) {
     match verdict {
         StartVerdict::Now(result) => {
             guard.record().record_run_result(result);
@@ -210,7 +239,7 @@ pub fn record_start_verdict(
             let state = state.clone();
             let runner_id = runner_id.to_string();
             tokio::spawn(async move {
-                let result = match wait_for_runner_healthy_default(&state, &runner_id).await {
+                let result = match health_wait(&state, &runner_id).await {
                     Ok(()) => ActionRunResult::Ran,
                     Err(failure) => ActionRunResult::Errored {
                         reason: format!(
@@ -272,6 +301,94 @@ mod tests {
             StartVerdict::Now(ActionRunResult::Errored { reason }) => reason,
             other => panic!("expected Errored, got {other:?}"),
         }
+    }
+
+    /// A [`HealthWait`] that never sees the runner answer: it gives up after
+    /// the production wait's 30 s budget, on the tokio clock.
+    fn never_healthy<'a>(
+        _: &'a SharedState,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Err(HealthProbeFailure {
+                elapsed_ms: 30_000,
+                recent_logs: Vec::new(),
+            })
+        })
+    }
+
+    /// A [`HealthWait`] whose runner answers at once.
+    fn healthy_at_once<'a>(
+        _: &'a SharedState,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<(), HealthProbeFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.1: the
+    /// detached half of [`record_start_verdict`]. A start that answered
+    /// without waiting records nothing while its health wait runs, then the
+    /// wait's verdict: `runner_unhealthy_after_start` naming the runner and
+    /// the wait's elapsed time when it never answered, `Ran` when it did.
+    #[tokio::test(start_paused = true)]
+    async fn record_start_verdict_detached_records_unhealthy_after_start() {
+        use crate::dev_action::record::{ActionKind, ActionRecord};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+        let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+
+        let record = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "test".to_string(),
+            &[],
+        ));
+        record_start_verdict_with(
+            &state,
+            "test-detached",
+            StartVerdict::AfterHealthWait,
+            RunResultGuard::arm(record.clone(), "the detached health-wait test"),
+            never_healthy,
+        );
+        assert_eq!(
+            record.run_result(),
+            None,
+            "a deferred verdict must not record at the spawn"
+        );
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert_eq!(
+            record.run_result(),
+            None,
+            "the verdict was recorded before the health wait gave up"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match record.run_result() {
+            Some(ActionRunResult::Errored { reason }) => {
+                assert!(reason.starts_with(UNHEALTHY_AFTER_START), "{reason}");
+                assert!(reason.contains("'test-detached'"), "{reason}");
+                assert!(reason.contains("30000ms"), "{reason}");
+            }
+            other => panic!("expected runner_unhealthy_after_start, got {other:?}"),
+        }
+
+        let came_up = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "test".to_string(),
+            &[],
+        ));
+        record_start_verdict_with(
+            &state,
+            "test-detached",
+            StartVerdict::AfterHealthWait,
+            RunResultGuard::arm(came_up.clone(), "the detached health-wait test"),
+            healthy_at_once,
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(came_up.run_result(), Some(ActionRunResult::Ran));
     }
 
     /// T1-3: one row per spawn exit.

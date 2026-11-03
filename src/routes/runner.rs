@@ -286,6 +286,42 @@ fn rebuild_when_idle_result(
     }
 }
 
+/// The build-status body of a `rebuild_when_idle` whose rebuild-restart
+/// succeeded, by the verdict its post-rebuild health wait recorded
+/// ([`rebuild_when_idle_result`]): `"rebuilt"` (200) once the rebuilt primary
+/// answered, else `"rebuilt_unhealthy"` (502) carrying the health wait's
+/// error. The rebuild ran either way, so an operator polling
+/// `GET /build/{id}/status` must not read a primary that never came back as
+/// a clean rebuild.
+fn rebuilt_body(
+    result: &ActionRunResult,
+    waited_secs: u64,
+    ticks: u64,
+    drained_reason: &str,
+) -> (u16, serde_json::Value) {
+    match result.reason().filter(|_| result.is_failure()) {
+        None => (
+            StatusCode::OK.as_u16(),
+            serde_json::json!({
+                "status": "rebuilt",
+                "waited_secs": waited_secs,
+                "ticks": ticks,
+                "drained_reason": drained_reason,
+            }),
+        ),
+        Some(error) => (
+            StatusCode::BAD_GATEWAY.as_u16(),
+            serde_json::json!({
+                "status": "rebuilt_unhealthy",
+                "error": error,
+                "waited_secs": waited_secs,
+                "ticks": ticks,
+                "drained_reason": drained_reason,
+            }),
+        ),
+    }
+}
+
 /// The primary's health after a restart, by the default health wait. Not
 /// probed when no primary is registered.
 async fn primary_health_after_start(state: &SharedState, after: &str) -> SyncProbe {
@@ -528,7 +564,8 @@ pub async fn rebuild_when_idle(
                 Ok(()) => primary_health_after_start(&exec_state, "rebuild-when-idle").await,
                 Err(_) => SyncProbe::NotProbed,
             };
-            exec_record.record_run_result(rebuild_when_idle_result(&restart, health));
+            let result = rebuild_when_idle_result(&restart, health);
+            exec_record.record_run_result(result.clone());
             if let Err(e) = restart {
                 exec_state
                     .logs
@@ -548,15 +585,7 @@ pub async fn rebuild_when_idle(
                 );
             }
 
-            (
-                StatusCode::OK.as_u16(),
-                serde_json::json!({
-                    "status": "rebuilt",
-                    "waited_secs": started.elapsed().as_secs(),
-                    "ticks": ticks,
-                    "drained_reason": last_reason,
-                }),
-            )
+            rebuilt_body(&result, started.elapsed().as_secs(), ticks, &last_reason)
         },
     );
 
@@ -1955,6 +1984,60 @@ mod tests {
         }
     }
 
+    /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.5. A
+    /// rebuild whose post-rebuild health wait failed answers
+    /// `"rebuilt_unhealthy"` with the wait's error, not `"rebuilt"`, and the
+    /// route's success path builds its body from the verdict it recorded.
+    #[test]
+    fn rebuild_when_idle_reports_unhealthy_after_failed_health_wait() {
+        let wait_error = "runner_unhealthy_after_start: runner 'primary' did not become \
+                          healthy within 30000ms of rebuild-when-idle";
+        let unhealthy = rebuild_when_idle_result(
+            &Ok(()),
+            SyncProbe::Unhealthy {
+                reason: wait_error.to_string(),
+            },
+        );
+        let (code, body) = rebuilt_body(&unhealthy, 42, 3, "drained");
+        assert_eq!(code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(body["status"], "rebuilt_unhealthy");
+        assert_eq!(body["error"], wait_error);
+        assert_eq!(body["waited_secs"], 42);
+
+        // The primary gone when the health check ran is unhealthy too.
+        let gone = rebuild_when_idle_result(&Ok(()), SyncProbe::NotProbed);
+        let (code, body) = rebuilt_body(&gone, 1, 0, "drained");
+        assert_eq!(code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(body["status"], "rebuilt_unhealthy");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("runner_unhealthy_after_start")));
+
+        let healthy = rebuild_when_idle_result(&Ok(()), SyncProbe::Healthy);
+        let (code, body) = rebuilt_body(&healthy, 42, 3, "drained");
+        assert_eq!(code, StatusCode::OK.as_u16());
+        assert_eq!(body["status"], "rebuilt");
+        assert!(body.get("error").is_none());
+
+        let route = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn rebuild_when_idle(",
+        )
+        .expect("rebuild_when_idle exists")
+        .to_string();
+        let lines: Vec<&str> = route.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(
+                &"rebuilt_body(&result, started.elapsed().as_secs(), ticks, &last_reason)"
+            ),
+            "rebuild_when_idle's success path must answer from its recorded verdict"
+        );
+        assert!(
+            !route.contains("\"status\": \"rebuilt\""),
+            "rebuild_when_idle answers a hard-coded \"rebuilt\" again"
+        );
+    }
+
     /// T1-15 (D16). `rebuild_when_idle` records its rebuild's verdict on
     /// success too (`Ran` once the rebuilt primary answered), and its window's
     /// backstop covers a 24-hour deadline: still open past the 2-hour build
@@ -1991,9 +2074,8 @@ mod tests {
         // A statement of its own, not under an `if`: every outcome records.
         let lines: Vec<&str> = body.lines().map(str::trim).collect();
         assert!(
-            lines.contains(
-                &"exec_record.record_run_result(rebuild_when_idle_result(&restart, health));"
-            ),
+            lines.contains(&"let result = rebuild_when_idle_result(&restart, health);")
+                && lines.contains(&"exec_record.record_run_result(result.clone());"),
             "rebuild_when_idle must record its rebuild's result on every outcome"
         );
         // And the mint hands the watcher the deadline-sized backstop.

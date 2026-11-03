@@ -185,6 +185,13 @@ pub struct ActionRecord {
     #[serde(serialize_with = "serialize_states_as_ids")]
     pub states_unknown: Vec<DevState>,
     pub started_at: DateTime<Utc>,
+    /// The mint instant on the tokio clock, the one the attribution window's
+    /// deadlines run on. The window's tail cap is measured from it rather
+    /// than from the wall-clock [`Self::started_at`], so both ends of that
+    /// subtraction read the same clock (a paused test clock included). Not
+    /// part of the wire form.
+    #[serde(skip)]
+    pub started_instant: tokio::time::Instant,
     /// The folded outcome, or `None` while the attribution window is still
     /// open. Serializes inline as `outcome: null | {..}` via the custom
     /// serializer below (a bare `RwLock` is not `Serialize`).
@@ -289,6 +296,7 @@ impl ActionRecord {
             states_active,
             states_unknown,
             started_at: Utc::now(),
+            started_instant: tokio::time::Instant::now(),
             outcome: RwLock::new(None),
             run_result: RwLock::new(None),
             run_signal: tokio::sync::Notify::new(),

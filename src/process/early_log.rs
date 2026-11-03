@@ -29,8 +29,11 @@
 //! max-age sweep (`process::manager::reap_stale_test_runners`) prunes, every
 //! five minutes, each file not written for [`EARLY_LOG_RETENTION`]
 //! ([`prune_stale_early_logs`]), whether its runner was stopped or died on its
-//! own. A runner still alive but silent for that long loses its file too: the
-//! prune reads only the directory, never the registry.
+//! own. A runner still alive but silent for that long keeps its file: the sweep
+//! hands the prune a snapshot of the live spawns' early-log paths, taken from
+//! the registry before the sweep starts (`manager::live_early_log_paths`), and
+//! the prune skips those. The prune itself still takes no lock: a spawn that
+//! starts after the snapshot writes a fresh file, which no age prune touches.
 //!
 //! # Best-effort
 //!
@@ -38,6 +41,7 @@
 //! filesystem failure (disk full, permission denied, antivirus interfering)
 //! must never crash the supervisor or block runner startup.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -76,11 +80,18 @@ pub const EARLY_LOG_RETENTION: std::time::Duration = std::time::Duration::from_s
 );
 
 /// Remove every regular file in `dir` last modified more than
-/// [`EARLY_LOG_RETENTION`] before `now`. A pure age prune of one directory
-/// listing: it reads no registry and takes no lock. Best-effort: an unreadable
-/// directory, entry or mtime is skipped, and a file dated after `now` is kept.
-/// Returns how many files it removed.
-pub fn prune_stale_early_logs(dir: &Path, now: std::time::SystemTime) -> usize {
+/// [`EARLY_LOG_RETENTION`] before `now`, except the paths in `live`: the
+/// early logs of spawns still running when the caller took that snapshot, a
+/// live but silent runner's included. An age prune of one directory listing:
+/// it reads no registry and takes no lock, so the caller snapshots the live
+/// paths before calling. Best-effort: an unreadable directory, entry or mtime
+/// is skipped, and a file dated after `now` is kept. Returns how many files it
+/// removed.
+pub fn prune_stale_early_logs(
+    dir: &Path,
+    now: std::time::SystemTime,
+    live: &HashSet<PathBuf>,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -96,8 +107,8 @@ pub fn prune_stale_early_logs(dir: &Path, now: std::time::SystemTime) -> usize {
         let stale = now
             .duration_since(modified)
             .is_ok_and(|age| age > EARLY_LOG_RETENTION);
-        if stale {
-            let path = entry.path();
+        let path = entry.path();
+        if stale && !live.contains(&path) {
             match std::fs::remove_file(&path) {
                 Ok(()) => pruned += 1,
                 Err(e) => debug!("Failed to prune early-log file {:?}: {}", path, e),
@@ -417,6 +428,41 @@ mod tests {
             "filename contains ':' which is invalid on Windows: {}",
             filename
         );
+    }
+
+    /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.6: a live
+    /// runner that has been silent past the retention keeps its early log;
+    /// a stale file no live spawn holds is still pruned.
+    #[test]
+    fn early_log_prune_skips_live_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let past_retention = EARLY_LOG_RETENTION + std::time::Duration::from_secs(60);
+        let aged = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "INFO booted, then silent\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - past_retention)
+                .unwrap();
+            path
+        };
+        let live_silent = aged("test-live-silent.log");
+        let dead = aged("test-dead.log");
+
+        let live: HashSet<PathBuf> = [live_silent.clone()].into_iter().collect();
+        assert_eq!(prune_stale_early_logs(dir.path(), now, &live), 1);
+        assert!(
+            live_silent.exists(),
+            "a live, silent runner's early log was pruned"
+        );
+        assert!(!dead.exists(), "a stale file no live spawn holds was kept");
+
+        // Once its runner is gone the same file is pruned.
+        assert_eq!(prune_stale_early_logs(dir.path(), now, &HashSet::new()), 1);
+        assert!(!live_silent.exists());
     }
 
     #[test]
