@@ -41,6 +41,46 @@ use crate::dev_action::record::{ActionOutcome, ActionRecord};
 /// `fleet.rs::publish_budget`'s 5s budget.
 const INGEST_TIMEOUT_SECS: u64 = 5;
 
+/// The attribution semantics every snapshot this build posts was recorded
+/// under, stamped as `metadata.attribution_epoch`.
+///
+/// **Bump rule: bump this whenever attribution semantics change** — what a
+/// spawn, restart or build verdict is attributed to, or the window it is read
+/// over — so coord can tell rows recorded under the old semantics from rows
+/// recorded under the new. Coord skips the `dev_action_stats` increment for
+/// `spawn` / `restart` / `build` rows whose epoch is missing or below its
+/// `MIN_SUPERVISOR_ATTRIBUTION_EPOCH`, so an old supervisor on any box stops
+/// feeding the LKG restart guard's statistics without a date cut-off.
+///
+/// Epoch 1 is every row recorded before the stamp existed (no key at all):
+/// `spawn` rows that closed `Confirmed` at ~30 000 ms regardless of outcome
+/// (before #263), and primary restart / build rows that carried the previous
+/// boot's early-log signatures (before #257). Epoch 2 is the first build that
+/// carries the stamp, which descends from #257, #263 and #264. Plan
+/// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+/// D3.
+pub const ATTRIBUTION_EPOCH: u32 = 2;
+
+/// The commit this supervisor binary was compiled from, as `build.rs` stamped
+/// it (`unknown` when the build could not establish one), sent as
+/// `metadata.supervisor_build_sha` so a row names the code that attributed it.
+const SUPERVISOR_BUILD_SHA: &str = env!("QONTINUI_SUPERVISOR_GIT_SHA");
+
+/// The snapshot `metadata` this build stamps on every row: its build sha and
+/// its [`ATTRIBUTION_EPOCH`].
+fn snapshot_metadata() -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "supervisor_build_sha".to_string(),
+        serde_json::Value::from(SUPERVISOR_BUILD_SHA),
+    );
+    metadata.insert(
+        "attribution_epoch".to_string(),
+        serde_json::Value::from(ATTRIBUTION_EPOCH),
+    );
+    metadata
+}
+
 // ---------------------------------------------------------------------------
 // machine.json — device_id + tenant_id
 // ---------------------------------------------------------------------------
@@ -178,7 +218,7 @@ impl SnapshotIngestBody {
             signatures: outcome.signatures.clone(),
             late_signatures: outcome.late_signatures.clone(),
             tenant_id,
-            metadata: serde_json::Map::new(),
+            metadata: snapshot_metadata(),
         }
     }
 }
@@ -244,6 +284,37 @@ mod tests {
     use super::*;
     use crate::dev_action::record::{ActionKind, D3Category, DevState, DevStateEval, Eval};
     use chrono::Utc;
+
+    /// Every snapshot names the build that attributed it and the attribution
+    /// epoch it was recorded under, so coord can keep pre-fix rows out of the
+    /// stats the LKG restart guard reads.
+    #[test]
+    fn snapshot_metadata_carries_build_sha_and_attribution_epoch() {
+        let record = ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &[]);
+        let outcome = ActionOutcome {
+            category: D3Category::Confirmed,
+            signatures: vec![],
+            ended_at: Utc::now(),
+            duration_ms: 1_000,
+            evidence_ref: None,
+            late_signatures: vec![],
+        };
+        let json = serde_json::to_value(SnapshotIngestBody::from_record(
+            &record, &outcome, None, None,
+        ))
+        .expect("serialize");
+
+        assert_eq!(json["metadata"]["attribution_epoch"], 2);
+        assert_eq!(ATTRIBUTION_EPOCH, 2);
+        let sha = json["metadata"]["supervisor_build_sha"]
+            .as_str()
+            .unwrap_or_else(|| panic!("supervisor_build_sha is a string: {json}"));
+        assert_eq!(sha, env!("QONTINUI_SUPERVISOR_GIT_SHA"));
+        assert!(
+            !sha.is_empty(),
+            "build.rs stamps a sha or `unknown`, never empty"
+        );
+    }
 
     /// The wire body must use the coord contract's field names + values — in
     /// particular `state_ids` (NOT `states_active`), snake_case `kind`,
