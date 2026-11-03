@@ -1795,6 +1795,24 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             .iter()
             .any(|s| s.busy.try_read().map(|g| g.is_some()).unwrap_or(true));
 
+        // Early logs outlive their runner's stop (the stop route keeps them, so
+        // an attribution window still open over that spawn can read them), and
+        // this sweep is what bounds them: each file not written for
+        // `early_log::EARLY_LOG_RETENTION` is pruned. A pure age prune of the
+        // directory listing, off the async worker, under no lifecycle lock.
+        let early_log_dir = std::env::temp_dir().join(crate::process::early_log::EARLY_LOG_SUBDIR);
+        let pruned = tokio::task::spawn_blocking(move || {
+            crate::process::early_log::prune_stale_early_logs(
+                &early_log_dir,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await
+        .unwrap_or(0);
+        if pruned > 0 {
+            debug!("reaper: pruned {pruned} early-log file(s) past their retention");
+        }
+
         let runners = state.get_all_runners().await;
         let mut reaped = 0u32;
 

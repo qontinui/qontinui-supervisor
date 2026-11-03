@@ -22,15 +22,15 @@
 //! Files live in `<TEMP_DIR>/qontinui-supervisor-spawn-logs/<runner_id>-<rfc3339-millis>.log`.
 //! The directory is created lazily on first use. There is no rotation — the
 //! file is hard-capped at [`EARLY_LOG_BYTE_CAP`] bytes via inline truncation
-//! so a runaway runner can't fill the disk. Files are deleted when the
-//! runner is explicitly stopped via `POST /runners/{id}/stop`; files for
-//! runners that died unexpectedly are preserved (the whole point of this
-//! capture). That delete runs as soon as the stop succeeds, and the dev-action
-//! attribution watcher reads each spawn's early log only when its window
-//! closes, so a window still open over the stopped spawn reads no early-log
-//! signature for it and, with no other signature, closes it `Confirmed` under
-//! `Ran` or with no run result (a residual, unchanged from 5fd1ca62, whose
-//! reach `dev_action::attribution::scan_spawn_effects` states).
+//! so a runaway runner can't fill the disk. No stop deletes a file: the
+//! dev-action attribution watcher reads each spawn's early log only when its
+//! window closes, which can be up to
+//! [`crate::dev_action::attribution::LONGEST_BACKSTOP`] after the spawn. The
+//! max-age sweep (`process::manager::reap_stale_test_runners`) prunes, every
+//! five minutes, each file not written for [`EARLY_LOG_RETENTION`]
+//! ([`prune_stale_early_logs`]), whether its runner was stopped or died on its
+//! own. A runner still alive but silent for that long loses its file too: the
+//! prune reads only the directory, never the registry.
 //!
 //! # Best-effort
 //!
@@ -61,6 +61,51 @@ const RETAIN_AFTER_TRUNCATE: u64 = (EARLY_LOG_BYTE_CAP * 3) / 4;
 
 /// Subdirectory under `std::env::temp_dir()` where early-log files live.
 pub const EARLY_LOG_SUBDIR: &str = "qontinui-supervisor-spawn-logs";
+
+/// How far past [`crate::dev_action::attribution::LONGEST_BACKSTOP`] an early
+/// log is kept: covers the sweep's 5-minute interval and a window closing a
+/// result tail after a late result, with room to spare.
+pub const EARLY_LOG_RETENTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long an early-log file is kept after its last write. A spawn writes its
+/// file from the spawn on, so a file last written longer ago than this belongs
+/// to a spawn whose every attribution window has closed.
+pub const EARLY_LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(
+    crate::dev_action::attribution::LONGEST_BACKSTOP.as_secs()
+        + EARLY_LOG_RETENTION_MARGIN.as_secs(),
+);
+
+/// Remove every regular file in `dir` last modified more than
+/// [`EARLY_LOG_RETENTION`] before `now`. A pure age prune of one directory
+/// listing: it reads no registry and takes no lock. Best-effort: an unreadable
+/// directory, entry or mtime is skipped, and a file dated after `now` is kept.
+/// Returns how many files it removed.
+pub fn prune_stale_early_logs(dir: &Path, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let stale = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > EARLY_LOG_RETENTION);
+        if stale {
+            let path = entry.path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => pruned += 1,
+                Err(e) => debug!("Failed to prune early-log file {:?}: {}", path, e),
+            }
+        }
+    }
+    pruned
+}
 
 /// Resolve the early-log directory inside the platform temp dir. Creates the
 /// directory if it does not exist. Returns `None` on a creation error so
@@ -253,9 +298,10 @@ fn truncate_file_in_place(file: &mut File, keep_bytes: u64) -> std::io::Result<(
     Ok(())
 }
 
-/// Delete an early-log file. Best-effort: a missing file is fine, and any
-/// other IO error is logged at debug level (the file lives under temp_dir
-/// and will be cleaned up by OS-level temp sweeps eventually).
+/// Delete an early-log file: test cleanup only, since no production path
+/// deletes one ([`prune_stale_early_logs`] bounds them). Best-effort: a missing
+/// file is fine, and any other IO error is logged at debug level.
+#[cfg(test)]
 pub fn delete_early_log(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => debug!("Removed early-log file {:?}", path),

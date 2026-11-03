@@ -34,16 +34,15 @@
 //! in the runner's spawn ring; that file lives under `temp_dir()` and
 //! survives runner cleanup (per `early_log.rs`), so a runner that
 //! white-screens and is purged still leaves its log for the watcher. A runner
-//! stopped through `POST /runners/{id}/stop` does not: that route deletes the
-//! stopped runner's early-log file as soon as the stop succeeds, so a window
-//! still open over the stopped spawn reads no early-log signature for it and,
-//! with no other signature, closes it `Confirmed` under `Ran` (a residual,
-//! unchanged from 5fd1ca62, whose reach [`scan_spawn_effects`] states). The
-//! panic log does not survive cleanup: a `test-*` runner writes it inside its
-//! instance root, which a stop reaps, and the runner's next panic overwrites
-//! it. So the watcher first takes the
-//! panic the exit monitor attached to the spawn's entry, then the one the
-//! supervisor stored on the runner, and only then reads the file.
+//! stopped through `POST /runners/{id}/stop` does too: no stop deletes an early
+//! log, and the max-age sweep prunes one only once it is older than
+//! [`LONGEST_BACKSTOP`] plus a margin
+//! (`process::early_log::EARLY_LOG_RETENTION`). The panic log does not survive
+//! cleanup: a `test-*` runner writes it inside its instance root, which a stop
+//! reaps, and the runner's next panic overwrites it. So the watcher first takes
+//! the boot panic spawn-test's failed probe attached to the spawn's entry, then
+//! the panic the exit monitor attached to it, then the one the supervisor
+//! stored on the runner, and only then reads the file.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -345,7 +344,7 @@ impl ClosedWindow {
 /// with no run result (a window closed on its backstop) or one other than
 /// `Ran`, a teardown panic is turned away once the exit its stop asked for is
 /// stamped by the close, and a panic of a runner the action started that is
-/// dated before any stop request counts while one of the three places the
+/// dated before any stop request counts while one of the four places the
 /// watcher reads ([`scan_panic`]) still holds it at the close.
 ///
 /// `Ran` is what a start records once its runner has answered a health check:
@@ -364,17 +363,21 @@ impl ClosedWindow {
 ///   critical section after its wait on the child, so a process whose exit
 ///   falls in that short lag before the close reads as up, exactly like an
 ///   exit just after the close, and under `Ran` its panic does not count.
-/// - Each of the three places the watcher reads holds only the runner's
+/// - Three of the four places the watcher reads hold only the runner's
 ///   latest panic, and a stop can empty them before the close: a teardown
 ///   panic overwrites `runner-panic.log`, and on an exit that is not clean
 ///   (a non-zero exit, or a wait on the child that returned no exit status,
 ///   the only exits on which the exit monitor parses the log) the stored and
-///   attached copies too, and check 4 then turns it away; a plain stop of a
-///   `test-*` runner reaps its instance root, `runner-panic.log` included,
-///   and a clean exit attaches and stores nothing. A panic the spawn logged
-///   before the request then counts only if a copy of it is still held at
-///   the close, such as the one spawn-test's failed probe stored, which a
-///   clean exit leaves in place.
+///   exit-attached copies too, and check 4 then turns it away; a plain stop of
+///   a `test-*` runner reaps its instance root, `runner-panic.log` included,
+///   and a clean exit attaches and stores nothing. The fourth, the boot panic
+///   spawn-test's failed probe attached to the spawn's entry
+///   ([`SpawnMarker::boot_panic`]), is the earliest one the probe stored and
+///   survives all of that. A panic the spawn logged before the request on a
+///   path with no failed probe has no such copy, so it counts only if one of
+///   the other three still holds it at the close: a caught boot panic followed
+///   by a teardown panic stays unrecoverable without a runner-side change to
+///   keep more than one panic.
 /// - The lifecycle lock (`ManagedRunner::lifecycle`) orders one runner's starts,
 ///   stops and removals, so a stop arriving mid-start latches after the
 ///   spawn is recorded and targets it, and a second start finds it recorded. The
@@ -463,16 +466,21 @@ fn spawn_panic_log_path(
 /// to `<log-dir>/runner-<id>`, not to the runner default path. Read, in order,
 /// each held to [`is_startup_panic_of`] for this spawn:
 ///
-/// 1. the panic the exit monitor attached to this spawn's ring entry when its
+/// 1. the boot panic spawn-test's failed health probe stored for this spawn
+///    and attached to its ring entry ([`SpawnMarker::boot_panic`]). The stop
+///    that follows the probe can end in a teardown panic that overwrites the
+///    file and, on an exit that is not clean, the next two places too, so this
+///    is the copy of a probe-caught boot panic that survives to the close;
+/// 2. the panic the exit monitor attached to this spawn's ring entry when its
 ///    process exited ([`SpawnMarker::exit_panic`]). The next spawn clears the
 ///    stored panic and the runner's next panic, a caught one included,
 ///    overwrites the file, so for a boot the crash watchdog restarted this is
 ///    the copy that survives to the close;
-/// 2. the panic the supervisor parsed and stored on the runner
+/// 3. the panic the supervisor parsed and stored on the runner
 ///    (`recent_panic`). spawn-test's probe-failure path stores it and then
 ///    stops the runner, and that stop reaps a `test-*` runner's instance root,
 ///    `runner-panic.log` included, possibly before the window closes;
-/// 3. the panic log the spawn set up ([`spawn_panic_log_path`]), read at
+/// 4. the panic log the spawn set up ([`spawn_panic_log_path`]), read at
 ///    window close because the spawn, which comes after the mint, is what
 ///    records its dir. Every spawn of one runner sets up the same dir.
 ///
@@ -485,12 +493,14 @@ fn spawn_panic_log_path(
 /// or for a primary the health cache, can publish it before the monitor
 /// does), but it clears the stored panic only after its exe copy and spawn,
 /// and the monitor's own store rewrites it after any earlier clear.
-/// Each place holds only the runner's latest panic, so a teardown panic of a
-/// spawn a stop ended replaces a panic that spawn logged before the request in
-/// the file, and on an exit that is not clean (a non-zero exit, or a wait on
-/// the child that returned no exit status, the only exits on which the exit
-/// monitor parses the log) in the stored and attached copies too, and is
-/// itself turned away (see the residuals of [`is_startup_panic_of`]).
+/// Places 2 to 4 each hold only the runner's latest panic, so a teardown panic
+/// of a spawn a stop ended replaces a panic that spawn logged before the
+/// request in the file, and on an exit that is not clean (a non-zero exit, or
+/// a wait on the child that returned no exit status, the only exits on which
+/// the exit monitor parses the log) in the stored and exit-attached copies
+/// too, and is itself turned away (see the residuals of
+/// [`is_startup_panic_of`]). Place 1 keeps the earliest panic the probe
+/// stored, so a boot panic the probe caught survives that.
 async fn scan_panic(
     state: &SharedState,
     managed: &ManagedRunner,
@@ -500,7 +510,10 @@ async fn scan_panic(
 ) -> (Vec<DevSignature>, Option<String>) {
     let counts = |panic: &panic_log::RecentPanic| is_startup_panic_of(panic, spawn, window, run);
 
-    let mut panic = spawn.exit_panic.clone().filter(|panic| counts(panic));
+    let mut panic = spawn.boot_panic.clone().filter(|panic| counts(panic));
+    if panic.is_none() {
+        panic = spawn.exit_panic.clone().filter(|panic| counts(panic));
+    }
     if panic.is_none() {
         let stored = managed.recent_panic.read().await.clone();
         panic = stored.filter(|panic| counts(panic));
@@ -546,17 +559,11 @@ async fn scan_panic(
 /// those files hold then describes a boot the action did not cause. With no
 /// managed runner there is no spawn to read.
 ///
-/// Residual, documented and not changed: an explicit
-/// `POST /runners/{id}/stop` deletes the stopped runner's early-log file as
-/// soon as the stop succeeds, so a window still open over that spawn reads no
-/// early-log signature for it (`DEV-TAURI-ASSET-MISSING`,
-/// `DEV-WEBVIEW-CONN-REFUSED`, `DEV-PORT-BIND-FAIL`) and, with no other
-/// signature, closes it `Confirmed` under `Ran`. The
-/// dashboard's Stop (named and temp runners) and spawn-test's `stop_url`
-/// reach spawn windows; a restart's, a build's or a `rebuild_when_idle`'s
-/// window is reached only by a direct `POST /runners/primary/stop`. A
-/// restart's own stop and the legacy `/runner/stop` delete nothing. Unchanged
-/// from 5fd1ca62.
+/// An explicit `POST /runners/{id}/stop` no longer deletes the stopped
+/// runner's early-log file, so a window still open over that spawn reads its
+/// early-log signatures at the close. The max-age sweep prunes an early log
+/// only once it is older than [`LONGEST_BACKSTOP`] plus a margin
+/// (`process::early_log::EARLY_LOG_RETENTION`).
 async fn scan_spawn_effects(
     state: &SharedState,
     managed: Option<&ManagedRunner>,

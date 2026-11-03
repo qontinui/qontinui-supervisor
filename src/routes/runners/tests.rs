@@ -3856,3 +3856,247 @@ async fn probe_stores_a_panic_from_this_spawn_however_long_the_probe_ran() {
         );
     }
 }
+
+// ── Plan `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-dev-action-
+//    coord` Phase 4 (PR-D): a spawn keeps its evidence until its window closes ──
+
+/// Write `<dir>/runner-panic.log` in the runner's format, its header naming
+/// `pid` and dated `at`, and return the panic as the supervisor parses it.
+fn write_runner_panic(
+    dir: &std::path::Path,
+    runner_id: &str,
+    pid: u32,
+    at: chrono::DateTime<chrono::Utc>,
+    payload: &str,
+) -> crate::process::panic_log::RecentPanic {
+    fs::create_dir_all(dir).unwrap();
+    let path = crate::process::panic_log::resolve_panic_log_path(Some(dir));
+    let stamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+    fs::write(
+        &path,
+        format!(
+            "[{stamp}] PANIC runner-id={runner_id} pid={pid} version=1.0.0\n\
+             location: src/main.rs:10:5\n\
+             thread: main\n\
+             payload:\n\
+             {payload}\n\
+             \n\
+             backtrace:\n\
+             0: qontinui_runner::main\n"
+        ),
+    )
+    .unwrap();
+    crate::process::panic_log::parse_panic_file(&path).expect("the fixture parses")
+}
+
+/// T4-1 (D14). spawn-test's probe fails and stores the boot panic of pid P,
+/// dated before the stop request; the stop is latched; the child exits non-zero
+/// with a teardown panic of pid P in the file, dated after the request, which
+/// the exit monitor also stores and attaches. With no run result the watcher
+/// still attributes `DEV-PANIC-STARTUP` with the BOOT panic's excerpt: the probe
+/// attached it to the spawn's ring entry, and the watcher reads that first.
+#[tokio::test]
+async fn a_boot_panic_survives_the_teardown_panic_that_overwrote_the_log() {
+    use crate::dev_action::attribution::{
+        spawn_attribution_watcher_with_timing, AttributionTargets, WindowTiming,
+    };
+    use crate::dev_action::{ActionKind, ActionRecord};
+
+    const P: u32 = 4242;
+    let (state, root) = state_over_an_empty_runner_tree();
+    let dead_port = crate::test_ports::reserve_refused_port();
+    let id = "test-boot-panic-kept";
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.id = id.to_string();
+    config.port = dead_port;
+    config.kind = super::RunnerKind::Temp { id: id.to_string() };
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+
+    let record = Arc::new(ActionRecord::new(
+        ActionKind::Build,
+        None,
+        "test".to_string(),
+        &[],
+    ));
+    let spawned_at = record.started_at + chrono::Duration::milliseconds(1);
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            Some(P),
+            None,
+            Some(record.action_id),
+        ));
+    let dir = root.path().join("instance-logs");
+    *managed.panic_log_dir.write().await = Some(dir.clone());
+    write_runner_panic(
+        &dir,
+        id,
+        P,
+        record.started_at + chrono::Duration::milliseconds(2),
+        "the boot panicked before its API bound",
+    );
+
+    match probe_runner_health(&state, id, dead_port, 50).await {
+        ProbeOutcome::Failed { recent_panic, .. } => {
+            assert!(recent_panic.is_some(), "the probe stored no boot panic")
+        }
+        ProbeOutcome::Healthy { .. } => panic!("nothing answers on {dead_port}"),
+    }
+
+    // The stop is latched, then the child exits non-zero with a teardown
+    // panic, which overwrites the file and, as the exit monitor does on an
+    // exit that is not clean, the stored and exit-attached copies.
+    let requested_at = chrono::Utc::now();
+    let teardown = write_runner_panic(
+        &dir,
+        id,
+        P,
+        requested_at + chrono::Duration::milliseconds(1),
+        "cannot move state from Destroyed",
+    );
+    let exited_at = requested_at + chrono::Duration::milliseconds(2);
+    {
+        let mut ring = managed.recent_spawns.write().await;
+        assert!(ring.stamp_exit(spawned_at, exited_at, Some(requested_at)));
+        assert!(ring.attach_exit_panic(spawned_at, teardown.clone()));
+    }
+    *managed.recent_panic.write().await = Some(teardown);
+
+    spawn_attribution_watcher_with_timing(
+        state.clone(),
+        record.clone(),
+        AttributionTargets {
+            managed: Some(managed.clone()),
+            runner_id: None,
+        },
+        WindowTiming {
+            tail: Duration::from_millis(10),
+            backstop: Duration::from_millis(300),
+        },
+    );
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + budget;
+    let outcome = loop {
+        if let Some(o) = record.outcome.read().ok().and_then(|g| g.clone()) {
+            break o;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher folded no outcome in within {budget:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        record.run_result().is_none(),
+        "the action recorded a result"
+    );
+    assert_eq!(outcome.signatures, ["DEV-PANIC-STARTUP"]);
+    assert_eq!(
+        outcome.evidence_ref.as_deref(),
+        Some("panic: the boot panicked before its API bound")
+    );
+}
+
+/// T4-2 (D15). `POST /runners/{id}/stop` keeps the stopped spawn's early-log
+/// file, and the max-age sweep's prune keeps a file younger than the longest
+/// attribution backstop (2 h) and removes one older than that plus its margin.
+#[tokio::test]
+async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
+    let (state, root) = state_over_an_empty_runner_tree();
+    let id = "named-early-log-kept";
+    // A port nothing holds, so the stop confirms at once.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let config = crate::config::RunnerConfig {
+        id: id.to_string(),
+        name: format!("Runner {id}"),
+        port,
+        kind: super::RunnerKind::Named {
+            name: id.to_string(),
+        },
+        protected: false,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: Default::default(),
+        fresh_device_identity: false,
+    };
+    let managed = Arc::new(crate::state::ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+    let early_log = root.path().join("named-early-log-kept-spawn.log");
+    fs::write(&early_log, "INFO early boot output\n").unwrap();
+    *managed.early_log_path.write().await = Some(early_log.clone());
+
+    if let Err(e) = super::stop_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.to_string()),
+        crate::routes::optional_json::OptionalJson(None),
+    )
+    .await
+    {
+        panic!("a dead, unprotected runner stops: {e:?}");
+    }
+    assert!(
+        early_log.exists(),
+        "the stop deleted the stopped spawn's early log"
+    );
+
+    let dir = root.path().join("spawn-logs");
+    fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now();
+    let aged = |name: &str, age: Duration| {
+        let path = dir.join(name);
+        fs::write(&path, "INFO a line\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(now - age)
+            .unwrap();
+        path
+    };
+    let young = aged("test-young.log", Duration::from_secs(119 * 60));
+    let old = aged("test-old.log", Duration::from_secs(3 * 60 * 60));
+    assert_eq!(
+        crate::process::early_log::prune_stale_early_logs(&dir, now),
+        1
+    );
+    assert!(
+        young.exists(),
+        "a file inside the longest window was pruned"
+    );
+    assert!(!old.exists(), "a file past the retention was kept");
+
+    // The sweep loop cannot be driven from a test: pin that it prunes.
+    let manager = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .unwrap()
+    .replace("\r\n", "\n");
+    let sweep = crate::source_scan::fn_body(
+        production_span(&manager),
+        "pub async fn reap_stale_test_runners(",
+    )
+    .expect("the sweep exists");
+    assert!(sweep.contains("prune_stale_early_logs("));
+}

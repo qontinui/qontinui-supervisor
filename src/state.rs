@@ -221,6 +221,16 @@ pub struct SpawnMarker {
     /// included, overwrites the file. It need not be this spawn's own panic:
     /// a reader holds it to the same checks as either of those.
     pub exit_panic: Option<RecentPanic>,
+    /// The boot panic spawn-test's failed health probe parsed and stored as
+    /// `recent_panic` for this spawn (`routes::runners::probe_runner_health`),
+    /// which it also attaches here ([`SpawnRing::attach_boot_panic`]). Kept
+    /// because the three other places a panic is read from each hold only the
+    /// runner's latest panic: a teardown panic of the stop that follows the
+    /// probe overwrites `runner-panic.log`, and on an exit that is not clean
+    /// also `recent_panic` and [`Self::exit_panic`]. The first one attached is
+    /// kept, so this is the spawn's earliest stored panic. A reader holds it to
+    /// the same checks as the others.
+    pub boot_panic: Option<RecentPanic>,
     /// The dev action that started this spawn (`ActionRecord::action_id`).
     /// `None` for a start nothing minted: the crash and serving watchdogs,
     /// `POST /runners/{id}/start` and `/restart`, the boot auto-start. At
@@ -245,6 +255,7 @@ impl SpawnMarker {
             exited_at: None,
             stop_requested_at: None,
             exit_panic: None,
+            boot_panic: None,
             initiated_by,
         }
     }
@@ -272,8 +283,8 @@ pub const SPAWN_RING_CAPACITY: usize = 32;
 /// A runner's recent spawns, oldest first, at most [`SPAWN_RING_CAPACITY`].
 ///
 /// Only [`Self::push`] removes an entry, and only the oldest, to make room for
-/// a new spawn. [`Self::stamp_exit`] and [`Self::attach_exit_panic`] fill an
-/// entry in and remove none.
+/// a new spawn. [`Self::stamp_exit`], [`Self::attach_exit_panic`] and
+/// [`Self::attach_boot_panic`] fill an entry in and remove none.
 #[derive(Debug, Default)]
 pub struct SpawnRing {
     entries: VecDeque<SpawnMarker>,
@@ -331,6 +342,26 @@ impl SpawnRing {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Attach the boot panic spawn-test's failed probe stored for the spawn
+    /// recorded at `spawned_at`, exited or not: a boot that died before the
+    /// probe gave up is already stamped. A panic already attached is kept, so
+    /// the entry holds its earliest one. Returns `false`, and changes nothing,
+    /// when no entry matches (the ring dropped that spawn) or one is already
+    /// attached.
+    pub fn attach_boot_panic(&mut self, spawned_at: DateTime<Utc>, panic: RecentPanic) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .find(|spawn| spawn.spawned_at == spawned_at)
+        {
+            Some(spawn) if spawn.boot_panic.is_none() => {
+                spawn.boot_panic = Some(panic);
+                true
+            }
+            _ => false,
         }
     }
 
