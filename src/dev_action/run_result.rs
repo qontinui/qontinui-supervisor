@@ -40,6 +40,17 @@ pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
 /// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
 /// verbatim rather than re-worded here.
 ///
+/// Three precondition refusals map to `Refused` too, carried as their own
+/// message: [`SupervisorError::RunnerAlreadyRunning`] (a start found the
+/// runner up), [`SupervisorError::Validation`] (a request or configuration the
+/// step will not act on, e.g. `manager::automated_restart_blocked`) and
+/// [`SupervisorError::RunnerLifecycleBusy`] (a start or stop holds the runner).
+/// Each refuses the step it guards before that step touches anything. A
+/// restart's start can still be refused after its stop ran (a start slipped in
+/// between them, or the configured port is refused); the record then says the
+/// start was refused, and the stop's effects are what the attribution window
+/// observes.
+///
 /// The map is not widened for spawns: a restart's `PortHeldByLiveRunner`
 /// follows a stop that already ran, so `Errored` is right there.
 /// [`spawn_run_result`] handles the spawn-only arms and delegates the rest here.
@@ -47,6 +58,11 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
     match err {
         SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
             reason: detail.message.clone(),
+        },
+        e @ (SupervisorError::RunnerAlreadyRunning
+        | SupervisorError::Validation(_)
+        | SupervisorError::RunnerLifecycleBusy(_)) => ActionRunResult::Refused {
+            reason: e.to_string(),
         },
         other => ActionRunResult::Errored {
             reason: other.to_string(),
@@ -390,6 +406,19 @@ mod tests {
             crate::dev_action::attribution::classify(Some(&refused), &[]),
             crate::dev_action::record::D3Category::Failure
         );
+
+        for precondition in [
+            SupervisorError::RunnerAlreadyRunning,
+            SupervisorError::Validation("automated restart blocked".to_string()),
+            SupervisorError::RunnerLifecycleBusy("named-a".to_string()),
+        ] {
+            let reason = precondition.to_string();
+            assert_eq!(
+                run_result_for(&precondition),
+                ActionRunResult::Refused { reason },
+                "{precondition:?}"
+            );
+        }
 
         let errored = run_result_for(&SupervisorError::RunnerNotRunning);
         assert!(matches!(errored, ActionRunResult::Errored { .. }));

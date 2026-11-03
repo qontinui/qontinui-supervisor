@@ -4677,10 +4677,15 @@ async fn serving_watchdog_restart_mints_with_watchdog_initiator() {
         record.params_digest
     );
     let run = record.run_result().expect("checked above");
-    assert!(
-        matches!(run, crate::dev_action::ActionRunResult::Errored { .. }),
-        "the failed start must reach the trial: {run:?}"
-    );
+    match &run {
+        // The restart's own error, not the guard's drop record: an abandoned
+        // guard is also `Errored`, and would pass a bare variant check.
+        crate::dev_action::ActionRunResult::Errored { reason } => assert!(
+            !reason.starts_with(crate::dev_action::record::ACTION_ABANDONED),
+            "the trial carries the abandoned-guard record, not the restart's error: {reason}"
+        ),
+        other => panic!("the failed start must reach the trial: {other:?}"),
+    }
     assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
 }
 
