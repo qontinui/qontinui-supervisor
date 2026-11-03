@@ -36,7 +36,7 @@ pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // regression tests can run the real waiting logic in milliseconds. Reach it
 // at `crate::dev_action::attribution::…` from a test.
 pub use expectations::{assess_then_cut, fetch_expectations, PredictedSignature};
-pub use ingest::{coord_base, post_snapshot_to_coord};
+pub use ingest::post_snapshot_to_coord;
 pub use mint::{commit_action, mint_action, prepare_action, risk_ack_json, MintedAction};
 pub use policy::ActionRisk;
 pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore, RunResultGuard};

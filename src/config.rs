@@ -97,16 +97,21 @@ pub enum AmbientTargetDir {
     Ignore,
 }
 
-/// Whether and where the dev-action client reaches coord: the expectations GET
-/// at both mint sites and the attribution watcher's snapshot POST.
-/// [`crate::dev_action::ingest::coord_base`] turns it into a base URL.
+/// Whether and where the supervisor reaches coord — every path that does: the
+/// dev-action client (the expectations GET at both mint sites and the
+/// attribution watcher's snapshot POST), the fleet budget publish, the
+/// serving-watchdog alert, the resource sample, the CI-runner registration-token
+/// fetch and the lineage proxy. [`crate::coord_client::coord_base`] turns it into
+/// a base URL, and is the only resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmbientCoord {
     /// `COORD_HTTP_URL`, else the active profile's `coord_url` in
     /// `~/.qontinui/profiles.json`. Production, and on a dev box that profile
     /// is production coord.
     Read,
-    /// No coord. A mint fetches nothing and a closed window posts nothing, and
+    /// No coord. A mint fetches nothing, a closed window posts nothing, no budget,
+    /// alert or sample is published (so no device JWT is minted from the runner),
+    /// the CI-runner and lineage routes answer that coord is unconfigured, and
     /// neither the environment, `profiles.json` nor `machine.json` is read.
     /// What [`SupervisorConfig::from_args`] picks in a unit-test build, so a
     /// test's route never reads the expectations that decide its branch from
@@ -353,7 +358,7 @@ pub struct SupervisorConfig {
     /// `Ignore` in a unit-test build. [`Self::from_args`] would give an
     /// integration test `Read`, so one sets `Ignore` in a struct literal.
     pub ambient_target_dir: AmbientTargetDir,
-    /// Whether and where the dev-action client reaches coord ([`AmbientCoord`]):
+    /// Whether and where the supervisor reaches coord ([`AmbientCoord`]):
     /// `Read` in production, `Ignore` in a unit-test build. [`Self::from_args`]
     /// would give an integration test `Read`, so one sets `Ignore` in a struct
     /// literal.
@@ -2438,7 +2443,7 @@ mod tests {
         let config = SupervisorConfig::from_args(make_test_args(false, false));
         assert_eq!(config.ambient_coord, AmbientCoord::Ignore);
         assert_eq!(
-            crate::dev_action::ingest::coord_base_with(
+            crate::coord_client::coord_base_with(
                 &config.ambient_coord,
                 || panic!("read COORD_HTTP_URL"),
                 || panic!("read profiles.json"),
@@ -2544,6 +2549,103 @@ mod tests {
              (`cfg(test)` is not set for the library they link); build a `SupervisorConfig` \
              literal that names `AmbientCoord::Ignore` instead:\n  {}",
             calling_from_args.join("\n  ")
+        );
+    }
+
+    /// The spellings of an ambient coord-base resolution, whitespace removed:
+    /// any literal naming the `COORD_HTTP_URL` variable (an `env::var` read, or
+    /// a constant it would read through), any literal naming `profiles.json`,
+    /// and the serde field a profiles parser declares to read a profile's coord
+    /// URL. Built here, so this file holds none of them.
+    fn ambient_coord_resolver_needles() -> Vec<String> {
+        let env_var = ["COORD", "HTTP", "URL"].join("_");
+        let file = ["profiles", "json"].join(".");
+        vec![
+            format!("\"{env_var}\""),
+            format!("\"{file}\""),
+            format!("{}:Option<String>", ["coord", "url"].join("_")),
+        ]
+    }
+
+    #[test]
+    fn no_ambient_coord_resolver_outside_coord_base() {
+        // Every path that reaches coord resolves its base through
+        // `coord_client::coord_base`, so `AmbientCoord::Ignore` keeps a test off
+        // production coord on all of them. A second resolver would read the
+        // environment or the profile with no switch, which is how the fleet
+        // budget, the serving-watchdog alert, the resource sample and the
+        // CI-runner and lineage routes did until plan
+        // `2026-11-03-supervisor-dev-action-residuals-…` Phase 2.
+        //
+        // One allowlisted file: `process::instance_root` reads `profiles.json`
+        // to PROJECT it into a spawned runner's home, never to resolve a coord
+        // base for the supervisor itself.
+        let needles = ambient_coord_resolver_needles();
+        let (env_var, file, field) = (&needles[0], &needles[1], &needles[2]);
+
+        // The needles prove nothing unless they match the forms a resolver
+        // would write, split across lines or not.
+        for (sample, needle) in [
+            (
+                format!("let u = std::env::var(\n    {env_var},\n);"),
+                env_var,
+            ),
+            (format!("const ENV: &str = {env_var};"), env_var),
+            (format!("home.join(\".qontinui\").join({file})"), file),
+            (
+                format!(
+                    "struct P {{\n    {}: Option<String>,\n}}",
+                    ["coord", "url"].join("_")
+                ),
+                field,
+            ),
+        ] {
+            assert!(
+                Squeezed::new(&sample).text.contains(needle.as_str()),
+                "{needle} does not match {sample}"
+            );
+        }
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let resolver = src.join("coord_client.rs");
+        let allowlisted = [src.join("process").join("instance_root.rs")];
+
+        let mut offenders = Vec::new();
+        let mut in_resolver = vec![0usize; needles.len()];
+        let mut files_scanned = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            let squeezed = Squeezed::new(&source);
+            if path == resolver {
+                for (count, needle) in in_resolver.iter_mut().zip(&needles) {
+                    *count = squeezed.text.matches(needle.as_str()).count();
+                }
+                continue;
+            }
+            if allowlisted.contains(&path) {
+                continue;
+            }
+            for line in squeezed.lines_matching(&needles) {
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+        }
+
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            in_resolver.iter().all(|n| *n > 0),
+            "the scan no longer matches the one resolver in coord_client.rs \
+             (matches per needle: {in_resolver:?}) — the needles have drifted from it"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these files resolve a coord base outside `coord_client::coord_base`; \
+             call it with the config's `ambient_coord` instead:\n  {}",
+            offenders.join("\n  ")
         );
     }
 

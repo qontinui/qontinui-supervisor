@@ -9,11 +9,9 @@
 //! target. Local dev coord typically reads without a token, so the header is
 //! optional (consistent with `fleet.rs`'s unauthenticated budget publish).
 //!
-//! Coord base URL resolution order:
-//!   1. `COORD_HTTP_URL` env var (explicit override; staging is
-//!      `https://coord.staging.qontinui.io`).
-//!   2. The active profile's `coord_url` from `~/.qontinui/profiles.json`
-//!      (`ws://…/ws` → `http://…`), same as `fleet.rs` / `ci_runner.rs`.
+//! The coord base is [`crate::coord_client::coord_base`] under the config's
+//! `ambient_coord`: `COORD_HTTP_URL`, else the active profile's `coord_url`, in
+//! production; no coord at all under `AmbientCoord::Ignore`.
 //!
 //! When coord can't be resolved or is unreachable the proxy returns a
 //! `502`/`503` with a descriptive `{error}` body so the page renders a clean
@@ -25,9 +23,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
 use tracing::{debug, warn};
 
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
 use crate::state::SharedState;
 
 /// Timeout for the outbound coord request. Lineage reads are small aggregate
@@ -36,53 +35,6 @@ const LINEAGE_TIMEOUT_SECS: u64 = 10;
 
 /// Upper bound on a forwarded `Authorization` header value.
 const MAX_HEADER_VALUE_LEN: usize = 4096;
-
-// ---------------------------------------------------------------------------
-// Coord base URL resolution
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfilesFile {
-    active: Option<String>,
-    profiles: std::collections::HashMap<String, ProfileSubset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfileSubset {
-    coord_url: Option<String>,
-}
-
-fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
-}
-
-/// Resolve the coord HTTP base. `COORD_HTTP_URL` wins; otherwise the active
-/// profile's `coord_url` (`ws://…/ws` → `http://…`, `wss://` → `https://`).
-fn coord_http_base() -> Option<String> {
-    if let Ok(env_url) = std::env::var("COORD_HTTP_URL") {
-        let trimmed = env_url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.trim_end_matches('/').to_string());
-        }
-    }
-
-    let bytes = std::fs::read(profiles_path()?).ok()?;
-    let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http.trim_end_matches('/').to_string())
-}
 
 // ---------------------------------------------------------------------------
 // Query types
@@ -102,15 +54,19 @@ pub struct RecentQuery {
 /// header (if any). Returns coord's status + body verbatim; maps resolution
 /// and transport failures to descriptive `5xx` JSON.
 async fn forward_get(state: &SharedState, headers: &HeaderMap, coord_path: &str) -> Response {
-    let base = match coord_http_base() {
+    let base = match coord_base(&state.config.ambient_coord) {
         Some(b) => b,
         None => {
+            let error = match state.config.ambient_coord {
+                AmbientCoord::Ignore => "No coord: this supervisor's ambient coord is Ignore.",
+                _ => {
+                    "Could not resolve coord URL. Set COORD_HTTP_URL or configure \
+                     a coord_url in ~/.qontinui/profiles.json."
+                }
+            };
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "Could not resolve coord URL. Set COORD_HTTP_URL or configure \
-                              a coord_url in ~/.qontinui/profiles.json.",
-                })),
+                Json(json!({ "error": error })),
             )
                 .into_response();
         }
@@ -269,12 +225,29 @@ fn invalid_id_response(what: &str) -> Response {
 mod tests {
     use super::*;
 
-    #[test]
-    fn coord_base_prefers_env_override() {
-        // SAFETY: single-threaded test; restore afterwards.
-        std::env::set_var("COORD_HTTP_URL", "https://coord.staging.qontinui.io/");
-        let got = coord_http_base();
-        std::env::remove_var("COORD_HTTP_URL");
-        assert_eq!(got.as_deref(), Some("https://coord.staging.qontinui.io"));
+    /// The lineage proxy obeys the ambient-coord switch: a 503 with no
+    /// connection under `Ignore`, coord's answer through one connection under
+    /// `At`.
+    #[tokio::test]
+    async fn lineage_proxy_reaches_coord_only_under_at() {
+        use crate::coord_client::counting_listener;
+        let coord = counting_listener::serve().await;
+        let state_with = |access: AmbientCoord| {
+            let (mut config, root) = crate::config::config_over_an_empty_runner_tree();
+            config.ambient_coord = access;
+            let state: SharedState =
+                std::sync::Arc::new(crate::state::SupervisorState::new(config));
+            (state, root)
+        };
+
+        let (state, _root) = state_with(AmbientCoord::Ignore);
+        let resp = forward_get(&state, &HeaderMap::new(), "/coord/lineage/stats").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+
+        let (state, _root) = state_with(AmbientCoord::At(coord.base.clone()));
+        let resp = forward_get(&state, &HeaderMap::new(), "/coord/lineage/stats").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(coord.connections(), 1);
     }
 }

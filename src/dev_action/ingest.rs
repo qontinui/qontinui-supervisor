@@ -21,12 +21,8 @@
 //!
 //! # Resolution reuse
 //!
-//! - **coord base**: [`coord_base`] answers from
-//!   [`crate::config::AmbientCoord`]. Its `Read` arm is a local copy of the
-//!   `COORD_HTTP_URL`-honoring resolver from [`crate::routes::lineage`] (that one
-//!   is module-private). The lineage variant is preferred over `fleet.rs`'s
-//!   because it honors the `COORD_HTTP_URL` override; this duplicates ~20 lines
-//!   rather than refactoring broadly.
+//! - **coord base**: [`crate::coord_client::coord_base`], the one resolver,
+//!   answering from [`crate::config::AmbientCoord`].
 //! - **device_id**: read from `~/.qontinui/machine.json`'s `device_id`
 //!   (canonical), falling back to legacy `machine_id`.
 //! - **tenant_id**: best-effort from `~/.qontinui/machine.json`'s
@@ -39,7 +35,6 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::config::AmbientCoord;
 use crate::dev_action::record::{ActionOutcome, ActionRecord};
 
 /// Timeout for the outbound coord ingest POST, matching
@@ -88,89 +83,6 @@ pub fn resolve_tenant_id() -> Option<Uuid> {
     let machine = load_machine_file()?;
     let raw = machine.active_tenant_id?;
     Uuid::parse_str(&raw).ok()
-}
-
-// ---------------------------------------------------------------------------
-// coord base resolution (COORD_HTTP_URL-honoring; mirrors routes::lineage)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfilesFile {
-    active: Option<String>,
-    profiles: std::collections::HashMap<String, ProfileSubset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfileSubset {
-    coord_url: Option<String>,
-}
-
-fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
-}
-
-/// The coord HTTP base the dev-action client uses under `access`: `None` for
-/// [`AmbientCoord::Ignore`], the given URL for `At`, and for `Read` the ambient
-/// resolution, where `COORD_HTTP_URL` wins, then the active profile's `coord_url`
-/// (`ws://…/ws` → `http://…`, `wss://` → `https://`).
-///
-/// The `Read` arm is duplicated from [`crate::routes::lineage`]'s module-private
-/// `coord_http_base` (preferred over `fleet.rs`'s copy because that one ignores
-/// `COORD_HTTP_URL`). Kept local rather than refactoring both call sites into a
-/// shared helper.
-///
-/// Both mint sites and the attribution watcher resolve through this, rather than
-/// adding a third copy.
-pub fn coord_base(access: &AmbientCoord) -> Option<String> {
-    coord_base_with(
-        access,
-        || std::env::var("COORD_HTTP_URL").ok(),
-        || std::fs::read(profiles_path()?).ok(),
-    )
-}
-
-/// [`coord_base`] with its two ambient reads passed in, so a test can stand in
-/// for them without setting process-global state. Each is called only under
-/// [`AmbientCoord::Read`].
-pub(crate) fn coord_base_with(
-    access: &AmbientCoord,
-    read_env: impl FnOnce() -> Option<String>,
-    read_profiles: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<String> {
-    match access {
-        AmbientCoord::Ignore => None,
-        AmbientCoord::At(base) => Some(base.clone()),
-        AmbientCoord::Read => ambient_coord_base(read_env, read_profiles),
-    }
-}
-
-fn ambient_coord_base(
-    read_env: impl FnOnce() -> Option<String>,
-    read_profiles: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<String> {
-    if let Some(env_url) = read_env() {
-        let trimmed = env_url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.trim_end_matches('/').to_string());
-        }
-    }
-
-    let bytes = read_profiles()?;
-    let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http.trim_end_matches('/').to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -332,44 +244,6 @@ mod tests {
     use super::*;
     use crate::dev_action::record::{ActionKind, D3Category, DevState, DevStateEval, Eval};
     use chrono::Utc;
-
-    /// Every rung of the ambient resolution comes through the two readers, and
-    /// the two switches that are not `Read` touch neither.
-    #[test]
-    fn ignoring_the_ambient_coord_drops_both_rungs() {
-        let profiles = br#"{"active":"production","profiles":{"production":{"coord_url":
-            "wss://coord.example/ws"}}}"#;
-        assert_eq!(
-            coord_base_with(
-                &AmbientCoord::Read,
-                || Some("https://coord.env.example/".to_string()),
-                || panic!("the env rung won, so profiles.json must not be read"),
-            )
-            .as_deref(),
-            Some("https://coord.env.example")
-        );
-        assert_eq!(
-            coord_base_with(&AmbientCoord::Read, || None, || Some(profiles.to_vec())).as_deref(),
-            Some("https://coord.example")
-        );
-        assert_eq!(
-            coord_base_with(
-                &AmbientCoord::Ignore,
-                || panic!("Ignore read COORD_HTTP_URL"),
-                || panic!("Ignore read profiles.json"),
-            ),
-            None
-        );
-        assert_eq!(
-            coord_base_with(
-                &AmbientCoord::At("http://127.0.0.1:1".to_string()),
-                || panic!("At read COORD_HTTP_URL"),
-                || panic!("At read profiles.json"),
-            )
-            .as_deref(),
-            Some("http://127.0.0.1:1")
-        );
-    }
 
     /// The wire body must use the coord contract's field names + values — in
     /// particular `state_ids` (NOT `states_active`), snake_case `kind`,

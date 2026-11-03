@@ -15,8 +15,10 @@
 //! 3. Computes `max_concurrent_builds = min(memory_gb / 4, cpu_cores / 4)`
 //!    per §3.2.
 //! 4. POSTs the budget to qontinui-coord's `/coord/devices/:id/budget`
-//!    endpoint. The coord URL is sourced from
-//!    `~/.qontinui/profiles.json`'s active profile.
+//!    endpoint. The coord base comes from
+//!    [`crate::coord_client::coord_base`] under the config's
+//!    [`crate::config::AmbientCoord`] — the switch is consulted FIRST, so
+//!    `Ignore` reads no `machine.json` and mints no device JWT.
 //!
 //! Why HTTP not direct PG: the supervisor has no PG dependency today
 //! and adding tokio-postgres + a connection pool is far heavier than
@@ -68,6 +70,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
 use crate::diagnostics::ServingEvent;
 
 /// §3.2 declared role for the supervisor. Always `Build` from the
@@ -155,58 +159,13 @@ impl MachineFile {
     }
 }
 
-/// `~/.qontinui/profiles.json` — minimum subset we need (the active
-/// profile's `coord_url`). Mirrors `qontinui_runner_lib::profiles` so
-/// we don't pull the whole crate in.
-#[derive(Debug, Clone, Deserialize)]
-struct ProfilesFile {
-    active: Option<String>,
-    profiles: std::collections::HashMap<String, ProfileSubset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfileSubset {
-    coord_url: Option<String>,
-}
-
 fn machine_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
-}
-
-fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
 }
 
 pub fn load_machine_file() -> Option<MachineFile> {
     let bytes = std::fs::read(machine_file_path()?).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
-/// Profile stores `ws://host:9870/ws` (the WebSocket upgrade URL); we
-/// convert that to `http://host:9870` so reqwest can POST to
-/// `/coord/devices/:id/budget`. Returns `None` if profiles.json is
-/// missing or the active profile has no coord_url.
-pub fn coord_http_base() -> Option<String> {
-    let bytes = std::fs::read(profiles_path()?).ok()?;
-    let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    // Strip the `/ws` suffix if present, then swap ws→http and wss→https.
-    // The url crate's parse + scheme swap is overkill for this; explicit
-    // string manipulation keeps it inspectable.
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
 }
 
 /// Wire shape of `POST /coord/devices/{device_id}/budget`, carrying ONLY
@@ -306,33 +265,81 @@ fn looks_like_jwt(token: &str) -> bool {
     })
 }
 
-/// Mint a device JWT from the **primary** runner's UI Bridge by invoking
-/// the runner's `get_coord_device_token` command. The runner holds the
-/// device credential in its own encrypted `SecureStorage`, which this
-/// process cannot read — asking the runner for one is the only door.
+/// Where a device-authed publish reads this box's identity and credential:
+/// `machine.json` for the device id, then the bearer cascade
+/// ([`resolve_device_bearer`]) whose last rung mints from a runner's UI Bridge.
 ///
-/// `get_coord_device_token`, not `get_access_token_for_websocket`: the
-/// latter is gated by `require_tier_2()` and by a `has_tokens()` check that
-/// wants BOTH the access and refresh slots populated (pairing writes the
-/// refresh slot empty), and it applies no shape check, so on a
-/// pre-migration install it hands back a legacy opaque
-/// `qontinui_runner_<random>` bearer. `get_coord_device_token` is the
-/// purpose-built probe: no tier gate, shape-checked runner-side, and it
-/// distinguishes "unpaired" (`null`) from "store unreadable" (a rejection).
-///
-/// Fixed to `RUNNER_API_PORT` on purpose: the credential being asked for is
-/// the MACHINE's device identity, and the primary is the instance that owns
-/// machine-scoped state. Temp runners on 9877-9899 are not asked.
-///
-/// Returns `None` for every failure mode (no runner, wedged runner,
-/// signed-out runner, non-JWT answer). The token is kept in-process: it is
-/// never written to disk, never placed on a command line, and never logged.
-async fn mint_device_jwt_from_runner() -> Option<String> {
-    // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
-    // first and the runner binds the IPv4 loopback only, so the name form
-    // pays a doomed IPv6 connect before the socket that answers.
-    let base = format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT);
-    mint_device_jwt_at(&base).await
+/// Consulted only AFTER [`crate::coord_client::coord_base`] resolved a base, so
+/// under [`crate::config::AmbientCoord::Ignore`] none of these is read. Every
+/// publish takes one, so a test can point the identity and the mint at fixtures
+/// and count what each path touches; production passes
+/// [`DeviceSources::ambient`].
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceSources {
+    /// Reads the device identity (`~/.qontinui/machine.json` in production).
+    pub(crate) machine: fn() -> Option<MachineFile>,
+    /// Whether the operator-seedable rungs (`$COORD_DEVICE_JWT`,
+    /// `~/.qontinui/coord-device-jwt`) are consulted before the mint.
+    pub(crate) read_seeded: bool,
+    /// The runner whose UI Bridge mints a device JWT.
+    pub(crate) mint_base: String,
+}
+
+impl DeviceSources {
+    /// This box: `machine.json`, both seeded rungs, and a mint from the
+    /// **primary** runner.
+    ///
+    /// The mint asks the primary runner's UI Bridge by invoking
+    /// the runner's `get_coord_device_token` command. The runner holds the
+    /// device credential in its own encrypted `SecureStorage`, which this
+    /// process cannot read — asking the runner for one is the only door.
+    ///
+    /// `get_coord_device_token`, not `get_access_token_for_websocket`: the
+    /// latter is gated by `require_tier_2()` and by a `has_tokens()` check that
+    /// wants BOTH the access and refresh slots populated (pairing writes the
+    /// refresh slot empty), and it applies no shape check, so on a
+    /// pre-migration install it hands back a legacy opaque
+    /// `qontinui_runner_<random>` bearer. `get_coord_device_token` is the
+    /// purpose-built probe: no tier gate, shape-checked runner-side, and it
+    /// distinguishes "unpaired" (`null`) from "store unreadable" (a rejection).
+    ///
+    /// Fixed to `RUNNER_API_PORT` on purpose: the credential being asked for is
+    /// the MACHINE's device identity, and the primary is the instance that owns
+    /// machine-scoped state. Temp runners on 9877-9899 are not asked.
+    pub(crate) fn ambient() -> Self {
+        // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
+        // first and the runner binds the IPv4 loopback only, so the name form
+        // pays a doomed IPv6 connect before the socket that answers.
+        Self {
+            machine: load_machine_file,
+            read_seeded: true,
+            mint_base: format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT),
+        }
+    }
+}
+
+/// Test-only: identity sources that read a fixture `machine.json` and skip the
+/// operator-seedable rungs, so the only bearer source left is the mint at
+/// `mint_base` — a stub the test counts connections on.
+#[cfg(test)]
+impl DeviceSources {
+    pub(crate) fn fixture(mint_base: &str) -> Self {
+        Self {
+            machine: fixture_machine,
+            read_seeded: false,
+            mint_base: mint_base.to_string(),
+        }
+    }
+}
+
+/// Test-only: the `machine.json` [`DeviceSources::fixture`] reads.
+#[cfg(test)]
+pub(crate) fn fixture_machine() -> Option<MachineFile> {
+    Some(MachineFile {
+        device_id: Some("6f1c0b52-1d1e-4a35-9f1e-6a8f0e0c2b11".to_string()),
+        machine_id: None,
+        hostname: "fixture-host".to_string(),
+    })
 }
 
 /// Path of the runner's in-process command door for the device-token probe.
@@ -341,8 +348,13 @@ const MINT_INVOKE_PATH: &str = "/ui-bridge/invoke/get_coord_device_token";
 /// Path of the WebView evaluation door — the pre-invoke fallback.
 const MINT_EVALUATE_PATH: &str = "/ui-bridge/control/page/evaluate";
 
-/// [`mint_device_jwt_from_runner`] against an explicit runner base — the
-/// seam the tests drive against an in-process fake runner.
+/// Mint a device JWT from the runner at `base` ([`DeviceSources::mint_base`];
+/// see [`DeviceSources::ambient`] for why the primary is asked and which
+/// command).
+///
+/// Returns `None` for every failure mode (no runner, wedged runner,
+/// signed-out runner, non-JWT answer). The token is kept in-process: it is
+/// never written to disk, never placed on a command line, and never logged.
 ///
 /// Two doors, in order:
 ///
@@ -494,23 +506,28 @@ pub(crate) const SOURCE_RUNNER_MINT: &str = "runner UI Bridge mint";
 /// structurally cannot answer there. On a workstation running a signed-in
 /// primary runner, rung 3 is the one that resolves.
 ///
+/// Rungs 1 and 2 are read only when `sources.read_seeded`; rung 3 asks
+/// `sources.mint_base`.
+///
 /// Private on purpose: every caller goes through [`resolve_device_bearer_for`],
 /// which applies the transport guard first, so no publish can put a device
 /// JWT on a cleartext non-loopback wire.
-async fn resolve_device_bearer() -> Option<(String, &'static str)> {
-    let env_token = std::env::var(DEVICE_JWT_ENV).ok();
-    let file_token = match device_jwt_file_path() {
-        Some(p) => tokio::fs::read_to_string(p).await.ok(),
-        None => None,
-    };
-    if let Some(seeded) = select_seeded_bearer(
-        env_token.as_deref(),
-        file_token.as_deref(),
-        chrono::Utc::now().timestamp(),
-    ) {
-        return Some(seeded);
+async fn resolve_device_bearer(sources: &DeviceSources) -> Option<(String, &'static str)> {
+    if sources.read_seeded {
+        let env_token = std::env::var(DEVICE_JWT_ENV).ok();
+        let file_token = match device_jwt_file_path() {
+            Some(p) => tokio::fs::read_to_string(p).await.ok(),
+            None => None,
+        };
+        if let Some(seeded) = select_seeded_bearer(
+            env_token.as_deref(),
+            file_token.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            return Some(seeded);
+        }
     }
-    mint_device_jwt_from_runner()
+    mint_device_jwt_at(&sources.mint_base)
         .await
         .map(|token| (token, SOURCE_RUNNER_MINT))
 }
@@ -531,17 +548,20 @@ pub(crate) const SOURCE_WITHHELD: &str =
 /// source it came from — or why none was sent — for the caller's log and
 /// refusal message.
 ///
-/// [`coord_http_base`] maps `ws://` to plain `http://`, so a profile pointing
+/// [`crate::coord_client::coord_base`] maps `ws://` to plain `http://`, so a profile pointing
 /// at a non-loopback `ws://` host would put a device JWT on the wire in
 /// cleartext. The guard runs BEFORE the cascade: a withheld base consults no
 /// env var, file or runner mint. Every outbound device-authed POST in this
 /// crate (budget publish, resource sample, serving-watchdog notify) resolves
 /// its bearer here, so the guard cannot be forgotten by one of them.
-pub(crate) async fn resolve_device_bearer_for(base: &str) -> ResolvedBearer {
+pub(crate) async fn resolve_device_bearer_for(
+    base: &str,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
     if !transport_may_carry_bearer(base) {
         return (None, SOURCE_WITHHELD);
     }
-    match resolve_device_bearer().await {
+    match resolve_device_bearer(sources).await {
         Some((token, source)) => (Some(token), source),
         None => (None, SOURCE_NONE),
     }
@@ -795,12 +815,33 @@ fn attach_resolved_bearer(
 /// Best-effort publish: POST the supervisor's MachineBudget to coord.
 /// Failures log a warning and return `Ok(())` so they don't break
 /// supervisor boot.
-pub async fn publish_budget(
+///
+/// The coord base is resolved FIRST: with no coord (`AmbientCoord::Ignore`,
+/// or no configured coord URL) it returns before `sources` reads
+/// `machine.json` or mints a device JWT.
+pub(crate) async fn publish_budget(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
     role: &'static str,
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
-    let machine = match load_machine_file() {
+    let base = match coord_base(access) {
+        Some(b) => b,
+        None if *access == AmbientCoord::Ignore => {
+            debug!("fleet::publish_budget: ambient coord is Ignore — not publishing");
+            return Ok(());
+        }
+        None => {
+            warn!(
+                "fleet::publish_budget: no coord base (COORD_HTTP_URL unset and \
+                 ~/.qontinui/profiles.json missing or has no coord_url in the active \
+                 profile). Skipping."
+            );
+            return Ok(());
+        }
+    };
+    let machine = match (sources.machine)() {
         Some(m) => m,
         None => {
             warn!(
@@ -825,17 +866,6 @@ pub async fn publish_budget(
             return Ok(());
         }
     };
-    let base = match coord_http_base() {
-        Some(b) => b,
-        None => {
-            warn!(
-                "fleet::publish_budget: ~/.qontinui/profiles.json missing or has no \
-                 coord_url in the active profile. Skipping."
-            );
-            return Ok(());
-        }
-    };
-
     // The supervisor owns the build-side columns and OMITS the agent cap it
     // does not own — see the module docs. Omission is the only way to say
     // "leave this column alone": coord writes each budget column with a
@@ -854,7 +884,7 @@ pub async fn publish_budget(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
-    let bearer = resolve_device_bearer_for(&base).await;
+    let bearer = resolve_device_bearer_for(&base, sources).await;
     let bearer_source = bearer.1;
     let resp = attach_resolved_bearer(client.post(&url).json(&payload), bearer)
         .send()
@@ -881,9 +911,9 @@ pub async fn publish_budget(
 /// Convenience: detect + publish on startup. Spawned from `main.rs`
 /// as a non-blocking task — supervisor boots immediately, fleet
 /// publish settles in the background.
-pub async fn publish_on_startup() {
+pub async fn publish_on_startup(access: &AmbientCoord) {
     let resources = detect_resources();
-    if let Err(e) = publish_budget(ROLE, resources, 0).await {
+    if let Err(e) = publish_budget(access, &DeviceSources::ambient(), ROLE, resources, 0).await {
         warn!("fleet::publish_on_startup failed (non-fatal): {e}");
     }
 }
@@ -1097,16 +1127,17 @@ fn build_fallback_finding_body(
 
 /// Alert coord that the serving watchdog decided something about a runner.
 ///
-/// Resolves the coord base from the active profile (`coord_http_base`) and
-/// the device bearer through the transport-guarded cascade
+/// Resolves the coord base through [`coord_base`] under `access` FIRST — with
+/// no coord it returns `Err` before reading `machine.json` or minting a device
+/// JWT — then the device bearer through the transport-guarded cascade
 /// ([`resolve_device_bearer_for`] — withheld on a cleartext non-loopback
-/// base), then posts. See the block
-/// comment above for why this exists, why it is `action: other`, and why the
-/// caller MUST spawn it rather than await it on the restart path:
+/// base), then posts. See the block comment above for why this exists, why it
+/// is `action: other`, and why the caller MUST spawn it rather than await it on
+/// the restart path:
 ///
 /// ```ignore
 /// tokio::spawn(async move {
-///     match fleet::notify_serving_watchdog(&notice).await {
+///     match fleet::notify_serving_watchdog(&access, &notice).await {
 ///         Ok(outcome) => info!(...),
 ///         Err(e) => warn!("serving watchdog: coord alert not delivered: {e}"),
 ///     }
@@ -1116,32 +1147,31 @@ fn build_fallback_finding_body(
 /// `Err` means the event did NOT land on coord by either door; the
 /// diagnostics ring event the caller emitted alongside is the record then.
 /// Never logs, formats or returns the `Authorization` value on any path.
-// Wired by Phase 4's `maybe_serving_restart` (`process::manager`), which
-// lands in a separate commit on the same branch; until it does, the lib
-// target reaches this through `lib.rs` and the bin target reports it dead.
-#[allow(dead_code)]
 pub async fn notify_serving_watchdog(
+    access: &AmbientCoord,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    let base = coord_http_base().ok_or_else(|| {
-        "no coord base: ~/.qontinui/profiles.json missing or the active profile has no coord_url"
-            .to_string()
-    })?;
-    notify_serving_watchdog_at(&base, notice).await
+    notify_serving_watchdog_from(access, &DeviceSources::ambient(), notice).await
 }
 
-/// [`notify_serving_watchdog`] against an explicit coord base — the seam the
-/// tests drive against an in-process server. Resolves the device bearer and
-/// the device id ONCE and hands both to the request path, so the fallback
-/// arm cannot mint a second credential.
-#[allow(dead_code)] // reached through `notify_serving_watchdog`; see its note
-pub async fn notify_serving_watchdog_at(
-    base: &str,
+/// [`notify_serving_watchdog`] with its identity sources passed in — the seam
+/// the counting tests drive. Resolves the device bearer and the device id ONCE
+/// and hands both to the request path, so the fallback arm cannot mint a
+/// second credential.
+pub(crate) async fn notify_serving_watchdog_from(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    let bearer = resolve_device_bearer_for(base).await;
-    let device_id = load_machine_file().and_then(|m| m.device_id().map(str::to_string));
-    notify_serving_watchdog_with(base, notice, bearer, device_id.as_deref()).await
+    let base = coord_base(access).ok_or_else(|| match access {
+        AmbientCoord::Ignore => "no coord: the ambient coord is Ignore".to_string(),
+        _ => "no coord base: COORD_HTTP_URL unset and ~/.qontinui/profiles.json missing or \
+              the active profile has no coord_url"
+            .to_string(),
+    })?;
+    let bearer = resolve_device_bearer_for(&base, sources).await;
+    let device_id = (sources.machine)().and_then(|m| m.device_id().map(str::to_string));
+    notify_serving_watchdog_with(&base, notice, bearer, device_id.as_deref()).await
 }
 
 /// The request path with credential resolution factored out, so every arm
@@ -2327,7 +2357,8 @@ mod tests {
     /// consulted), and its label says why nothing was sent.
     #[tokio::test]
     async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
-        let (bearer, source) = resolve_device_bearer_for("http://coord.example.com").await;
+        let (bearer, source) =
+            resolve_device_bearer_for("http://coord.example.com", &DeviceSources::ambient()).await;
         assert!(bearer.is_none());
         assert_eq!(source, SOURCE_WITHHELD);
     }
@@ -2349,5 +2380,107 @@ mod tests {
             refusal_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR, SOURCE_FILE),
             ""
         );
+    }
+
+    /// Under `Ignore` the budget publish reaches neither coord nor the runner's
+    /// mint and reads no `machine.json`; under `At` it connects to each once.
+    #[tokio::test]
+    async fn budget_publish_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let resources = Resources {
+            cpu_cores: 8,
+            memory_gb: 16,
+            disk_total_gb: 100,
+        };
+
+        publish_budget(&AmbientCoord::Ignore, &sources, ROLE, resources, 0)
+            .await
+            .expect("Ignore is a quiet Ok");
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        publish_budget(
+            &AmbientCoord::At(coord.base.clone()),
+            &sources,
+            ROLE,
+            resources,
+            0,
+        )
+        .await
+        .expect("the stub answers 200");
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint asks the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The serving-watchdog alert obeys the same switch: `Ignore` is an `Err`
+    /// with no connection to coord or to the mint and no `machine.json` read.
+    #[tokio::test]
+    async fn serving_watchdog_notify_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let notice = sample_notice(ServingEvent::RestartTaken);
+
+        let err = notify_serving_watchdog_from(&AmbientCoord::Ignore, &sources, &notice)
+            .await
+            .expect_err("no coord under Ignore");
+        assert!(err.contains("Ignore"), "{err}");
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        let outcome =
+            notify_serving_watchdog_from(&AmbientCoord::At(coord.base.clone()), &sources, &notice)
+                .await
+                .expect("the stub answers 200");
+        assert!(
+            matches!(outcome, NotifyOutcome::Notified { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint asks the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
     }
 }
