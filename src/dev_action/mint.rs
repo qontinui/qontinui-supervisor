@@ -137,7 +137,7 @@ pub async fn prepare_action(
 
 /// Store a prepared trial and spawn its attribution watcher over `targets`.
 ///
-/// The record's `started_at` is re-stamped here.
+/// The record's `started_at` and `started_instant` are re-stamped here.
 ///
 /// A high risk is warned here, loudly, whatever the door does with the advice:
 /// here rather than in [`prepare_action`], so an act refused before it is
@@ -161,6 +161,9 @@ pub async fn commit_action(
     // that prepares before an admission step (the serving watchdog's readiness
     // gate) must not date its act before that step.
     record.started_at = chrono::Utc::now();
+    // The watcher's window is measured from this instant, so it moves with the
+    // wall-clock stamp: a window started at preparation would close early.
+    record.started_instant = tokio::time::Instant::now();
     if let Some(warn) = risk.warn.as_deref() {
         tracing::warn!(action_id = %record.action_id, kind = record.kind.as_str(), "{warn}");
         state
