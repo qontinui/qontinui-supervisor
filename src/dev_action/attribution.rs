@@ -883,11 +883,18 @@ pub fn spawn_attribution_watcher_with_timing(
         // watcher. Detached via `tokio::spawn` so even the 5s ingest timeout
         // can't delay the dashboard nudge below. device_id / tenant_id come from
         // `~/.qontinui/machine.json` (the same `machine_id` field `fleet.rs`
-        // reads for the device id), and only when there is a coord to send them
-        // to.
-        if let Some(base) = crate::coord_client::coord_base(&state.config.ambient_coord) {
-            let device_id = crate::dev_action::ingest::resolve_device_id();
-            let tenant_id = crate::dev_action::ingest::resolve_tenant_id();
+        // reads for the device id), and only under `AmbientCoord::Read`: an
+        // `At(<stub>)` coord gets the snapshot with no identity, so a test never
+        // sends this machine's device id to a planted coord.
+        let access = &state.config.ambient_coord;
+        if let Some(base) = crate::coord_client::coord_base(access) {
+            let ambient = matches!(access, crate::config::AmbientCoord::Read);
+            let device_id = ambient
+                .then(crate::dev_action::ingest::resolve_device_id)
+                .flatten();
+            let tenant_id = ambient
+                .then(crate::dev_action::ingest::resolve_tenant_id)
+                .flatten();
             let ingest_record = Arc::clone(&record);
             tokio::spawn(async move {
                 crate::dev_action::post_snapshot_to_coord(
