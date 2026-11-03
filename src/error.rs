@@ -143,6 +143,17 @@ pub enum SupervisorError {
 
     #[error("{0}")]
     Other(String),
+
+    /// A lifecycle body failed AFTER it had already acted on the runner (a
+    /// restart's stop or build, a rebuild-and-restart's build), so the action
+    /// is a failure that ran, never a refusal that touched nothing, even when
+    /// the error that ended it is a precondition refusal of a later step (a
+    /// start finding the runner up, a refused port). Carried to the door that
+    /// minted the trial, whose `dev_action::run_result_for` maps it to
+    /// `Errored`. Transparent on the wire: its message, status and body are
+    /// the wrapped error's. Build one with [`SupervisorError::after_act`].
+    #[error("{0}")]
+    AfterAct(Box<SupervisorError>),
 }
 
 /// Payload of [`SupervisorError::UnverifiedExe`] — everything an operator needs
@@ -165,6 +176,16 @@ pub struct UnverifiedExeInfo {
 }
 
 impl SupervisorError {
+    /// Mark `err` as having ended a body that had already acted (see
+    /// [`SupervisorError::AfterAct`]). Idempotent: an error already marked is
+    /// returned as it is, never wrapped twice.
+    pub fn after_act(err: SupervisorError) -> SupervisorError {
+        match err {
+            already @ SupervisorError::AfterAct(_) => already,
+            other => SupervisorError::AfterAct(Box::new(other)),
+        }
+    }
+
     /// Render this error to the same `(StatusCode, JSON body)` pair that
     /// [`IntoResponse`] would, but as values rather than a `Response`.
     ///
@@ -302,6 +323,8 @@ impl SupervisorError {
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
             SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // The marker is not a wire concept: answer exactly as the error would.
+            SupervisorError::AfterAct(inner) => return inner.to_status_body(),
         };
         let body = serde_json::json!({ "error": self.to_string() });
         (status, body)

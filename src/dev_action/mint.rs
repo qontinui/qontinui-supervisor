@@ -136,7 +136,9 @@ pub async fn prepare_action(
 
 /// Store a prepared trial and spawn its attribution watcher over `targets`.
 ///
-/// The record's `started_at` is re-stamped here. A high risk is warned here, loudly, whatever the door does with the advice:
+/// The record's `started_at` is re-stamped here.
+///
+/// A high risk is warned here, loudly, whatever the door does with the advice:
 /// here rather than in [`prepare_action`], so an act refused before it is
 /// committed warns about nothing it did.
 ///
