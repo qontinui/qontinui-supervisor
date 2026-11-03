@@ -3477,6 +3477,42 @@ mod tests {
         assert_eq!(entries[2].stop_requested_at, Some(ring_time(12)));
     }
 
+    /// A boot panic lands on the spawn named by `spawned_at`, whether that
+    /// spawn has exited or not, and the first one attached is kept: a later
+    /// (teardown) panic of the same spawn does not replace it.
+    #[test]
+    fn a_boot_panic_is_attached_to_its_spawn_exited_or_not_and_the_first_is_kept() {
+        let mut ring = SpawnRing::default();
+        ring.push(spawn_of(0, 7));
+        ring.push(spawn_of(10, 8));
+        let boot = panic_at(2, 7, "the boot panic");
+        let teardown = panic_at(6, 7, "the teardown panic");
+
+        assert!(
+            !ring.attach_boot_panic(ring_time(3), boot.clone()),
+            "no spawn was recorded at 3"
+        );
+        // Not exited yet: a boot panic still attaches.
+        assert!(ring.attach_boot_panic(ring_time(0), boot.clone()));
+        assert!(
+            !ring.attach_boot_panic(ring_time(0), teardown.clone()),
+            "a panic already attached is kept"
+        );
+
+        // Exited before the probe gave up: still attaches.
+        assert!(ring.stamp_exit(ring_time(10), ring_time(15), None));
+        let other = panic_at(12, 8, "the other spawn's boot panic");
+        assert!(ring.attach_boot_panic(ring_time(10), other.clone()));
+
+        let entries: Vec<SpawnMarker> = ring.iter().cloned().collect();
+        assert_eq!(entries[0].boot_panic, Some(boot), "the earliest panic");
+        assert_eq!(
+            entries[0].exit_panic, None,
+            "a boot panic is not an exit panic"
+        );
+        assert_eq!(entries[1].boot_panic, Some(other));
+    }
+
     /// The spawns of a window run from its open to its close, both included.
     #[test]
     fn spawned_between_includes_both_ends_of_the_window() {

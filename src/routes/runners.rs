@@ -7175,9 +7175,15 @@ pub async fn runner_early_log(
                 axum::http::StatusCode::NOT_FOUND,
                 Json(json!({
                     "error": "early_log_unavailable",
-                    "reason": format!("file not found at {}", path.display()),
+                    "reason": format!(
+                        "file not found at {} (the max-age sweep prunes an early log once it \
+                         has not been written for {} s, so a spawn older than that may have been pruned)",
+                        path.display(),
+                        crate::process::early_log::EARLY_LOG_RETENTION.as_secs()
+                    ),
                     "runner_id": id,
                     "path": path.to_string_lossy(),
+                    "retention_secs": crate::process::early_log::EARLY_LOG_RETENTION.as_secs(),
                 })),
             )
                 .into_response();
