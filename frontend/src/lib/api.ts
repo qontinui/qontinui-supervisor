@@ -161,6 +161,10 @@ export interface RecentCrashSummary {
   panicLocation?: string | null;
   panicMessage?: string | null;
   thread?: string | null;
+  /// The pid of the process that crashed, not the one reporting it. Unset when
+  /// the runner does not emit it or the dump names none: the supervisor's own
+  /// routes drop the key, and `/runner-api/health` passes the runner's `null` on.
+  pid?: number | null;
 }
 
 /// Phase 2c (Item 9) stale-binary summary. Surfaced on `/runners` and

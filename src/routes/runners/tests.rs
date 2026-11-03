@@ -4207,7 +4207,19 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
         "pub async fn reap_stale_test_runners(",
     )
     .expect("the sweep exists");
-    assert!(sweep.contains("prune_stale_early_logs("));
+    assert!(sweep.contains("prune_early_logs(&state,"));
+    assert!(sweep.contains("early_log_dir_path()"));
+    // And the spawn writes where the sweep prunes.
+    let writer = crate::source_scan::fn_body(
+        production_span(&manager),
+        "pub async fn start_managed_runner(",
+    )
+    .expect("the start funnel exists");
+    assert!(writer.contains("early_log::early_log_dir()"));
+    let prune =
+        crate::source_scan::fn_body(production_span(&manager), "async fn prune_early_logs(")
+            .expect("the sweep's prune exists");
+    assert!(prune.contains("prune_stale_early_logs("));
 }
 
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-

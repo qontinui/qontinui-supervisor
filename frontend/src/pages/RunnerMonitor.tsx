@@ -55,6 +55,7 @@ function extractRecentCrash(health: Record<string, unknown> | null): RecentCrash
     panicLocation: typeof obj.panicLocation === 'string' ? obj.panicLocation : null,
     panicMessage: typeof obj.panicMessage === 'string' ? obj.panicMessage : null,
     thread: typeof obj.thread === 'string' ? obj.thread : null,
+    pid: typeof obj.pid === 'number' ? obj.pid : null,
   };
 }
 

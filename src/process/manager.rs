@@ -1763,6 +1763,23 @@ pub(crate) async fn live_early_log_paths(
     live
 }
 
+/// One pass of the sweep's early-log prune over `dir`: each file not written
+/// for `early_log::EARLY_LOG_RETENTION` is removed, except a live spawn's (a
+/// runner alive but silent that long). The live paths are snapshotted first;
+/// the prune itself is an age prune of the directory listing, off the async
+/// worker, under no lifecycle lock. Returns how many files it removed.
+async fn prune_early_logs(state: &SharedState, dir: std::path::PathBuf) -> usize {
+    let live = live_early_log_paths(state).await;
+    tokio::task::spawn_blocking(move || {
+        crate::process::early_log::prune_stale_early_logs(&dir, std::time::SystemTime::now(), &live)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!("reaper: the early-log prune task did not finish: {e}");
+        0
+    })
+}
+
 /// Background task that periodically detects and removes stopped/crashed test
 /// runners from the in-memory registry. Runs every 5 minutes.
 ///
@@ -1835,25 +1852,9 @@ pub async fn reap_stale_test_runners(state: SharedState) {
 
         // Early logs outlive their runner's stop (the stop route keeps them, so
         // an attribution window still open over that spawn can read them), and
-        // this sweep is what bounds them: each file not written for
-        // `early_log::EARLY_LOG_RETENTION` is pruned, except a live spawn's
-        // (a runner alive but silent that long). The live paths are
-        // snapshotted first; the prune itself is an age prune of the directory
-        // listing, off the async worker, under no lifecycle lock.
-        let live_early_logs = live_early_log_paths(&state).await;
-        let early_log_dir = std::env::temp_dir().join(crate::process::early_log::EARLY_LOG_SUBDIR);
-        let pruned = tokio::task::spawn_blocking(move || {
-            crate::process::early_log::prune_stale_early_logs(
-                &early_log_dir,
-                std::time::SystemTime::now(),
-                &live_early_logs,
-            )
-        })
-        .await
-        .unwrap_or_else(|e| {
-            warn!("reaper: the early-log prune task did not finish: {e}");
-            0
-        });
+        // this sweep is what bounds them.
+        let pruned =
+            prune_early_logs(&state, crate::process::early_log::early_log_dir_path()).await;
         if pruned > 0 {
             debug!("reaper: pruned {pruned} early-log file(s) past their retention");
         }

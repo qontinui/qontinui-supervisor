@@ -350,6 +350,12 @@ function RecentCrashPanel({ crash }: RecentCrashPanelProps) {
             <span style={{ fontFamily: 'var(--font-mono)' }}>{crash.thread}</span>
           </span>
         )}
+        {crash.pid != null && (
+          <span>
+            <strong>Crashed pid:</strong>{' '}
+            <span style={{ fontFamily: 'var(--font-mono)' }}>{crash.pid}</span>
+          </span>
+        )}
       </div>
       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
         <strong>Dump file:</strong>{' '}

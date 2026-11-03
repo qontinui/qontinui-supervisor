@@ -1551,6 +1551,18 @@ mod tests {
             body.recent_crash.expect("recent_crash present").pid,
             Some(4242)
         );
+
+        // A runner that emits the field writes an explicit null for a dump
+        // that names no pid (one written before the dump carried it).
+        let null_pid = r#"{
+            "recent_crash": {
+                "filePath": "D:/.dev-logs/crash_3.txt",
+                "reportedAt": "2026-04-22T10:15:30Z",
+                "pid": null
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(null_pid).expect("should parse");
+        assert_eq!(body.recent_crash.expect("recent_crash present").pid, None);
     }
 
     #[test]

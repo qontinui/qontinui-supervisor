@@ -33,6 +33,32 @@ function renderPage() {
   return render(<RunnerMonitor />);
 }
 
+describe('RunnerMonitor recent crash', () => {
+  it('keeps the crashed pid the runner reports', async () => {
+    const health = api.runnerHealth as ReturnType<typeof vi.fn>;
+    health.mockResolvedValue({
+      status: 'ok',
+      recent_crash: {
+        filePath: 'D:/.dev-logs/crash_1.txt',
+        reportedAt: '2026-11-03T22:00:00Z',
+        panicMessage: 'no reactor running',
+        pid: 4242,
+      },
+    });
+
+    try {
+      renderPage();
+      fireEvent.click(screen.getByRole('button', { name: 'Check' }));
+      fireEvent.click(await screen.findByText('Errored'));
+
+      expect(screen.getByText('Crashed pid:')).toBeInTheDocument();
+      expect(screen.getByText('4242')).toBeInTheDocument();
+    } finally {
+      health.mockResolvedValue({ status: 'ok' });
+    }
+  });
+});
+
 describe('RunnerMonitor task-runs envelope', () => {
   it('parses task_runs out of the envelope and renders the scope string', async () => {
     (api.runnerTaskRunsRunning as ReturnType<typeof vi.fn>).mockResolvedValue({

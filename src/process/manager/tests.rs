@@ -6502,15 +6502,19 @@ async fn a_committed_trial_is_dated_at_its_commit() {
 
 /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.6:
 /// [`live_early_log_paths`] returns the early log of a ring spawn whose exit is
-/// not stamped and not that of one whose exit is, and the prune, run over the
-/// real early-log directory, keeps the first and removes the second: the
-/// snapshot's path form (`early_log_dir()` + `early_log_path_for`) matches the
-/// `read_dir` entries the sweep compares it against.
+/// not stamped and not that of one whose exit is, and the sweep's prune
+/// ([`prune_early_logs`]) keeps the first and removes the second: the
+/// snapshot's path form (`early_log_path_for` under the swept directory) matches
+/// the `read_dir` entries it is compared against. The directory is the test's
+/// own: this box's real one belongs to whichever supervisor is running on it,
+/// whose sweep would race these back-dated files. That the writer and the sweep
+/// resolve one directory is pinned apart: `early_log_dir` returns
+/// `early_log_dir_path` (`early_log_dir_creates_subdir_under_temp`), and the
+/// source scan beside the retention test in `routes::runners::tests` holds the
+/// writer's and the sweep's calls to them.
 #[tokio::test]
 async fn live_early_log_paths_keeps_only_unexited_spawns_logs_end_to_end() {
-    use crate::process::early_log::{
-        early_log_dir, early_log_path_for, prune_stale_early_logs, EARLY_LOG_RETENTION,
-    };
+    use crate::process::early_log::{early_log_path_for, EARLY_LOG_RETENTION};
 
     let (state, _root) = restart_test_state();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -6524,17 +6528,17 @@ async fn live_early_log_paths_keeps_only_unexited_spawns_logs_end_to_end() {
         .await
         .insert(config.id.clone(), managed.clone());
 
-    let dir = early_log_dir().expect("the early-log dir is writable");
-    let exited_log = early_log_path_for(&dir, &format!("{}-exited", config.id));
-    let live_log = early_log_path_for(&dir, &format!("{}-live", config.id));
-    let now = SystemTime::now();
+    let dir = tempfile::tempdir().unwrap();
+    let exited_log = early_log_path_for(dir.path(), &format!("{}-exited", config.id));
+    let live_log = early_log_path_for(dir.path(), &format!("{}-live", config.id));
+    let past_retention = SystemTime::now() - EARLY_LOG_RETENTION - Duration::from_secs(60);
     for path in [&exited_log, &live_log] {
         std::fs::write(path, "INFO booted, then silent\n").unwrap();
         std::fs::File::options()
             .write(true)
             .open(path)
             .unwrap()
-            .set_modified(now - EARLY_LOG_RETENTION - Duration::from_secs(60))
+            .set_modified(past_retention)
             .unwrap();
     }
 
@@ -6561,23 +6565,15 @@ async fn live_early_log_paths_keeps_only_unexited_spawns_logs_end_to_end() {
     assert!(live.contains(&live_log), "{live:?}");
     assert!(!live.contains(&exited_log), "{live:?}");
 
-    // Prune the real directory, but protect every file this test did not
-    // create, so a live runner's log on this box is never touched.
-    let mut protected = live.clone();
-    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-        let path = entry.path();
-        if path != exited_log && path != live_log {
-            protected.insert(path);
-        }
-    }
-    let sweep_dir = std::env::temp_dir().join(crate::process::early_log::EARLY_LOG_SUBDIR);
-    assert_eq!(prune_stale_early_logs(&sweep_dir, now, &protected), 1);
+    assert_eq!(prune_early_logs(&state, dir.path().to_path_buf()).await, 1);
     assert!(live_log.exists(), "the live spawn's early log was pruned");
     assert!(
         !exited_log.exists(),
         "the exited spawn's stale early log was kept"
     );
 
-    let _ = std::fs::remove_file(&live_log);
+    // Once its runner leaves the registry the same file is pruned.
     state.runners.write().await.remove(&config.id);
+    assert_eq!(prune_early_logs(&state, dir.path().to_path_buf()).await, 1);
+    assert!(!live_log.exists());
 }

@@ -121,12 +121,18 @@ pub fn prune_stale_early_logs(
     pruned
 }
 
-/// Resolve the early-log directory inside the platform temp dir. Creates the
-/// directory if it does not exist. Returns `None` on a creation error so
-/// callers can degrade gracefully (no early-log capture, but the runner
-/// still starts).
+/// Where every spawn's early log is written and what the sweep prunes, whether
+/// or not the directory exists yet.
+pub fn early_log_dir_path() -> PathBuf {
+    std::env::temp_dir().join(EARLY_LOG_SUBDIR)
+}
+
+/// Resolve the early-log directory inside the platform temp dir
+/// ([`early_log_dir_path`]). Creates the directory if it does not exist.
+/// Returns `None` on a creation error so callers can degrade gracefully (no
+/// early-log capture, but the runner still starts).
 pub fn early_log_dir() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join(EARLY_LOG_SUBDIR);
+    let dir = early_log_dir_path();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!("Failed to create early-log dir {:?}: {}", dir, e);
         return None;
@@ -473,6 +479,8 @@ mod tests {
         let dir = early_log_dir().expect("temp dir should be writable");
         assert!(dir.exists());
         assert!(dir.ends_with(EARLY_LOG_SUBDIR));
+        // The directory the writer resolves is the one the sweep is handed.
+        assert_eq!(dir, early_log_dir_path());
     }
 
     #[test]

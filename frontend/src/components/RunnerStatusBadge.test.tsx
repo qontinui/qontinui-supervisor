@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { RunnerStatusBadge } from './RunnerStatusBadge';
 
 /// The wedge — "the process is ALIVE and holding its port, and its API answers
@@ -65,5 +65,35 @@ describe('RunnerStatusBadge — liveness', () => {
   it('is unchanged when the supervisor omits liveness (older build)', () => {
     render(<RunnerStatusBadge derivedStatus={{ kind: 'degraded', reason: 'runner reported derived_status=degraded' }} />);
     expect(screen.getByText('Degraded')).toBeInTheDocument();
+  });
+});
+
+/// A runner reports the dump it found at startup, so the process that crashed
+/// is never the one reporting it, and the panel must name the crashed one.
+describe('RunnerStatusBadge — recent crash panel', () => {
+  const crash = {
+    filePath: 'D:/.dev-logs/crash_1.txt',
+    reportedAt: '2026-11-03T22:00:00Z',
+    panicMessage: 'no reactor running',
+  };
+  const errored = { kind: 'errored' as const, reason: 'no reactor running' };
+
+  it('names the crashed pid when the dump carries one', () => {
+    render(<RunnerStatusBadge derivedStatus={errored} recentCrash={{ ...crash, pid: 4242 }} />);
+    fireEvent.click(screen.getByText('Errored'));
+
+    expect(screen.getByText('Crashed pid:')).toBeInTheDocument();
+    expect(screen.getByText('4242')).toBeInTheDocument();
+  });
+
+  it('shows no pid row for a dump that names none', () => {
+    for (const pid of [undefined, null]) {
+      const { unmount } = render(<RunnerStatusBadge derivedStatus={errored} recentCrash={{ ...crash, pid }} />);
+      fireEvent.click(screen.getByText('Errored'));
+
+      expect(screen.getByText('Dump file:')).toBeInTheDocument();
+      expect(screen.queryByText('Crashed pid:')).not.toBeInTheDocument();
+      unmount();
+    }
   });
 });
