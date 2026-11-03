@@ -28,6 +28,12 @@
 //! NEVER re-open the closed verdict (§3 theory item 2), and they do not bleed
 //! into the next action on the same surface.
 //!
+//! **A change here can owe a bump of
+//! [`crate::dev_action::ingest::ATTRIBUTION_EPOCH`]:** what a verdict is
+//! attributed to, or the window it is read over, is exactly what that constant
+//! versions. Without the bump, coord cannot tell rows recorded under the two
+//! semantics apart.
+//!
 //! The watcher is a detached `tokio::spawn` owning a `SharedState` clone — the
 //! same pattern `routes/runner.rs` uses for the detached rebuild — so it
 //! survives the handler future that minted the action. At window close it

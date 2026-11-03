@@ -464,6 +464,11 @@ export interface HealthResponse {
      * stays directly resolvable by git.
      */
     built_from_dirty?: boolean | null;
+    /**
+     * The attribution epoch this binary stamps on every dev-action snapshot.
+     * Absent = unknown: a build can stamp its snapshots and predate this field.
+     */
+    attribution_epoch?: number;
   };
   runners?: RunnerInstanceHealth[];
   originGuard?: OriginGuardWire;

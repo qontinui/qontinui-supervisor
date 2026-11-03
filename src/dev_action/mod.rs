@@ -37,7 +37,7 @@ pub use attribution::{spawn_attribution_watcher, AttributionTargets};
 // at `crate::dev_action::attribution::…` from a test.
 pub use expectations::{assess_then_cut, fetch_expectations, PredictedSignature};
 pub use ingest::post_snapshot_to_coord;
-pub use mint::{commit_action, mint_action, prepare_action, risk_ack_json, MintedAction};
+pub use mint::{commit_action, mint_action, prepare_action, MintedAction};
 pub use policy::ActionRisk;
 pub use record::{ActionKind, ActionRecord, ActionRunResult, ActionStore, RunResultGuard};
 pub use run_result::{

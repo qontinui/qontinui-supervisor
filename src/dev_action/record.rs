@@ -172,6 +172,13 @@ pub struct ActionRecord {
     /// the snapshot stays small; the durable ledger (Phase 3) carries the full
     /// param set.
     pub params_digest: String,
+    /// coord's top-level `evidence_basis` for this action's kind and active
+    /// states at the mint ([`FetchedExpectations::basis`]). With `predicted: []`
+    /// it separates an answer with no rows (`prior_only`) from no answer at all
+    /// (`null`), which `risk: null` cannot.
+    ///
+    /// [`FetchedExpectations::basis`]: crate::dev_action::expectations::FetchedExpectations::basis
+    pub expectations_basis: Option<String>,
     /// The dev-states evaluated `True` at action time. Stored as the typed
     /// shared [`DevState`] enum (Phase 2b) but serialized by canonical id via
     /// [`serialize_states_as_ids`] so the wire form stays an array of canonical
@@ -294,6 +301,7 @@ impl ActionRecord {
             kind,
             requester_id,
             params_digest,
+            expectations_basis: None,
             states_active,
             states_unknown,
             started_at: Utc::now(),
@@ -604,6 +612,12 @@ mod tests {
         // states_active is the canonical-id array, NOT variant names.
         assert_eq!(json["states_active"], serde_json::json!(["LKG_STALE"]));
         assert_eq!(json["states_unknown"], serde_json::json!(["DIST_STALE"]));
+        // Served even before a mint set it: an absent key would have to be
+        // interpreted, and `null` is the UNKNOWN it means.
+        assert_eq!(
+            json.get("expectations_basis"),
+            Some(&serde_json::Value::Null)
+        );
 
         // Fold a Contradiction outcome and confirm the snake_case category +
         // canonical signature strings are preserved on the wire.

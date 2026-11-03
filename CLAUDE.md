@@ -671,7 +671,7 @@ unnecessary.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | React SPA dashboard |
-| GET | `/health` | Comprehensive status (runners, build, expo). The top-level `runner` block and every `runners[]` row carry `liveness` / `last_seen_responding_at` / `port_open` — **read `liveness`, not `running`**, see "Liveness". `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. |
+| GET | `/health` | Comprehensive status (runners, build, expo). The top-level `runner` block and every `runners[]` row carry `liveness` / `last_seen_responding_at` / `port_open` — **read `liveness`, not `running`**, see "Liveness". `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. `supervisor.attribution_epoch` is the epoch this binary stamps on every dev-action snapshot (see "Dev-action trials"). |
 | GET | `/health/stream` | SSE stream of real-time health data |
 | POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, the shutdown is latched so in-flight handlers get a window to answer, then `std::process::exit(0)` closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner. The latch happens only AFTER the replacement spawn succeeds — latching first would turn a failed restart into an outage. |
 
@@ -688,7 +688,7 @@ unnecessary.
 | DELETE | `/runners/{id}` | Remove a runner from the registry. **409** `RunnerLifecycleBusy` while a start or a stop holds it. |
 | POST | `/runners/{id}/start` | Start a runner. Mints a `spawn` dev-action trial on it (`action_id` in the 200 body, on its spawn ring entry, and the start's terminal result recorded on it); an unknown id is a 404 that mints nothing. |
 | POST | `/runners/{id}/stop` | Stop a runner. Optional body `{force?}`; a bodyless POST is fine (see "Optional request bodies" below). **`force` is the restart-readiness override** — see "The restart-readiness gate". |
-| POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?, from_working_tree?, handoff?}` — every field defaults but **the body itself is required** (this route takes `Json`, not `OptionalJson`, unlike `/runners/{id}/stop`), and unknown fields are **rejected** rather than ignored, so a misspelled `from_working_tree` is a **422** (axum's `JsonDataError`, not the hand-rolled 400 the spawn-test alias guard returns) and never a silent revert to origin/main. **`force` is the restart-readiness override** — see "The restart-readiness gate". **`handoff` (default `false`) forwards the handoff intent** — see "Handoff restarts". **`from_working_tree` defaults to `false`**, so a rebuild of the PRIMARY through this route compiles a fresh `origin/main` worktree; it is inert for named/temp runners, which build the live tree regardless. The **build source** then matches `POST /runner/restart`, but the two doors are not otherwise equivalent: both mint a dev-action trial (`build` with `rebuild: true`, `restart` without, through the one helper `dev_action::mint_action`, and both bodies carry `action_id` — `null` here when the id names no runner, which mints nothing), but only the singular route acts on the risk prediction (LKG bias), optionally waits for the runner to bind its port, and attaches `origin_main_drift` to the recorded outcome — and that last one only on the **escape-hatch** (live-tree) rebuild, since an origin/main worktree is at origin/main by construction and the default path deliberately records `null`. The readiness gate is shared (it lives inside `restart_runner_by_id`), so the safety half is the same; the observability is not. `rebuild: true` returns **202** `{status:"rebuilding", build_id, poll, build_source, action_id, states_active, predicted, risk, outcome_url}`; `build_source` (`origin_main` \| `live_tree`) names the tree the rebuild selects and is `null` when the id names no registered runner — see "The 202 says which tree". |
+| POST | `/runners/{id}/restart` | Restart a runner. Body `{rebuild?, source?, force?, from_working_tree?, handoff?}` — every field defaults but **the body itself is required** (this route takes `Json`, not `OptionalJson`, unlike `/runners/{id}/stop`), and unknown fields are **rejected** rather than ignored, so a misspelled `from_working_tree` is a **422** (axum's `JsonDataError`, not the hand-rolled 400 the spawn-test alias guard returns) and never a silent revert to origin/main. **`force` is the restart-readiness override** — see "The restart-readiness gate". **`handoff` (default `false`) forwards the handoff intent** — see "Handoff restarts". **`from_working_tree` defaults to `false`**, so a rebuild of the PRIMARY through this route compiles a fresh `origin/main` worktree; it is inert for named/temp runners, which build the live tree regardless. The **build source** then matches `POST /runner/restart`, but the two doors are not otherwise equivalent: both mint a dev-action trial (`build` with `rebuild: true`, `restart` without, through the one helper `dev_action::mint_action`, and both bodies carry `action_id` — `null` here when the id names no runner, which mints nothing), but only the singular route acts on the risk prediction (LKG bias), optionally waits for the runner to bind its port, and attaches `origin_main_drift` to the recorded outcome — and that last one only on the **escape-hatch** (live-tree) rebuild, since an origin/main worktree is at origin/main by construction and the default path deliberately records `null`. The readiness gate is shared (it lives inside `restart_runner_by_id`), so the safety half is the same; the observability is not. `rebuild: true` returns **202** `{status:"rebuilding", build_id, poll, build_source, action_id, states_active, predicted, expectations_basis, risk, outcome_url}`; `build_source` (`origin_main` \| `live_tree`) names the tree the rebuild selects and is `null` when the id names no registered runner — see "The 202 says which tree". |
 | POST | `/runners/{id}/rebuild-and-restart` | Stop → build the **live tree** → start any **non-primary** runner, **detached**. Body `{source?, force?, handoff?, wait?, wait_timeout_secs?}` — every field defaults but **the body itself is required** (`Json`, not `OptionalJson`), and unknown fields are **rejected** (422); `force` is the restart-readiness override, `handoff` the handoff intent (see "Handoff restarts"). Refuses the primary. Returns **202** `{status:"rebuilding", build_id, submission_id, poll:"/builds", build_source, action_id, …}` — `build_source` is `live_tree`, or `null` when the id names no runner or the primary (and then `action_id` is `null` too: only a build that can run mints a `build` trial) (see "The 202 says which tree"). Poll `GET /build/{id}/status` for the terminal outcome. |
 | POST | `/runners/{id}/protect` | Toggle protection on a runner |
 | POST | `/runners/{id}/watchdog` | Control watchdog for a specific runner |
@@ -916,6 +916,48 @@ only these:
   (a normal one stays at `Debug`).
 
 The serving watchdog and every other internal stop pass `CloseIntent::Kill`.
+
+### Dev-action trials: what a snapshot stamps, and what an ACK says about coord's answer
+
+**Every snapshot names the code that attributed it.** `SnapshotIngestBody.metadata`
+carries `supervisor_build_sha`, `supervisor_build_dirty` (both `null` when the build
+could not establish them) and `attribution_epoch`, the constant
+`dev_action::ingest::ATTRIBUTION_EPOCH`. `GET /health` → `supervisor.attribution_epoch`
+serves the same value, so a box's stamp can be read without a snapshot having been
+posted. A missing key there is UNKNOWN: builds from #270 and #272 stamp their snapshots
+(epoch 2) and predate the field. The constant's doc comment says what each epoch means.
+
+**Bump `ATTRIBUTION_EPOCH` whenever attribution semantics change**: what a `spawn`,
+`restart` or `build` verdict is attributed to, or the window it is read over. Without
+the bump, coord cannot tell rows recorded under the two semantics apart.
+
+**Coord does not act on the stamp yet** (read at coord `6846970ac`, 2026-11-03; re-read
+it there rather than trusting this line). It stores `metadata` and counts every row in
+`dev_action_stats` whatever its epoch. Phase 5 of plan
+`2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+is to skip that count when the epoch is missing or below a
+`MIN_SUPERVISOR_ATTRIBUTION_EPOCH`, and to reset the stats once. A later bump would get
+the same treatment only if that minimum is raised as well, and rows already counted stay
+counted without another reset.
+
+**An ACK's `risk: null` is not one answer.** The LKG restart guard fails open on an
+empty expectations list, so `risk: null` beside `predicted: []` reads the same whether
+coord has no rows or never answered. `expectations_basis` separates them. It is coord's
+top-level `evidence_basis` for that kind and state set, verbatim. It travels with
+`action_id`: `MintedAction::ack_fields` renders both on a door's ACK, and a response that
+names no `action_id` (a refusal, a 503 after the start, an abandoned spawn) carries
+neither. `GET /actions/{id}/outcome` serves it as `action.expectations_basis`.
+
+| `expectations_basis` | Meaning |
+|---|---|
+| `exact`, `marginal`, `prior_only` | Coord answered. This is the WEAKEST basis among every row it served (up to 100), not only the five in `predicted`. |
+| `prior_only` with `predicted: []` | Coord answered with no rows: no trials yet, or trials that never emitted a signature. The ACK cannot tell those two apart. |
+| `null` | **Coord gave no answer** (none configured, unreachable, non-2xx, unparseable) or predates the field. UNKNOWN, never "no rows". |
+
+Any other value is passed through unchanged, so the `re-accruing` Phase 5 plans would
+reach the ACK with no change here. The field decides nothing: the risk assessment reads
+the rows themselves, so a weak basis does not stop `risk` tripping, and with no rows it
+cannot trip whatever the basis says.
 
 ### Optional request bodies — `OptionalJson`, not `Option<Json<T>>`
 

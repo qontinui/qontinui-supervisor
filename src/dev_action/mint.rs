@@ -37,16 +37,30 @@ pub struct MintedAction {
 }
 
 impl MintedAction {
-    /// The fields every lifecycle door's ACK carries about its action.
+    /// The fields a lifecycle door's success ACK carries about its action. A
+    /// response that names no `action_id` (a refusal, a 503 after the start, an
+    /// abandoned spawn) carries none of them.
     pub fn ack_fields(&self) -> serde_json::Value {
         let action_id = self.record.action_id;
         serde_json::json!({
             "action_id": action_id.to_string(),
             "states_active": self.states_active,
             "predicted": self.predicted,
+            "expectations_basis": self.record.expectations_basis,
             "risk": risk_ack_json(&self.risk),
             "outcome_url": format!("/actions/{action_id}/outcome"),
         })
+    }
+
+    /// `body` with this action's [`Self::ack_fields`] merged in. A body that is
+    /// not an object is returned unchanged.
+    pub fn stamp(&self, mut body: serde_json::Value) -> serde_json::Value {
+        if let (Some(body), serde_json::Value::Object(fields)) =
+            (body.as_object_mut(), self.ack_fields())
+        {
+            body.extend(fields);
+        }
+        body
     }
 }
 
@@ -97,7 +111,8 @@ pub async fn mint_action(
 /// `predicted` is coord's state-conditioned expectations for
 /// `(kind, states_active)`, fetched best-effort with a 2s timeout so the
 /// initiator is warned BEFORE the act completes; empty when coord is
-/// unreachable or has no history (fail-open, never blocks the act). The fetch
+/// unreachable or has no rows (fail-open, never blocks the act), and the
+/// record's `expectations_basis` separates those two. The fetch
 /// reads coord's top 100 rows, because coord ranks by its pooled mean before
 /// cutting and could otherwise drop the very row the exact-cell arm of the risk
 /// policy reads; `risk` assesses all of them, then `predicted` is cut to five
@@ -117,7 +132,7 @@ pub async fn prepare_action(
         Err(_) => SlotResolution::NotEvaluated,
     };
     let states = evaluate_all(state, slot_resolution).await;
-    let record = ActionRecord::new(kind, requester_id, params_digest, &states);
+    let mut record = ActionRecord::new(kind, requester_id, params_digest, &states);
     // The record stores typed `DevState`s; the ACK's wire form is their
     // canonical-id array.
     let states_active: Vec<&'static str> =
@@ -125,7 +140,8 @@ pub async fn prepare_action(
 
     let coord = coord_base(&state.config.ambient_coord);
     let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
-    let (predicted, risk) = assess_then_cut(fetched, &states_active);
+    record.expectations_basis = fetched.basis;
+    let (predicted, risk) = assess_then_cut(fetched.rows, &states_active);
 
     PreparedAction {
         record,

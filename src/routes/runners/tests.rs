@@ -3742,6 +3742,30 @@ async fn spawn_test_records_a_failure_run_result_on_the_action() {
     );
 }
 
+/// The synchronous spawn-test renders its ACK at its own site, so it is pinned
+/// apart from the async 202: the failed spawn's body still names the action and
+/// carries what the mint said about coord's answer.
+#[tokio::test]
+async fn synchronous_spawn_test_failure_carries_its_action_fields() {
+    use axum::response::IntoResponse;
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let resp = super::spawn_test(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({"rebuild": false})),
+    )
+    .await
+    .expect("the synchronous path renders the stored outcome")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+    assert_ne!(status, 202, "{body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+    assert_eq!(
+        body["action_id"],
+        only_action(&state).await.action_id.to_string()
+    );
+}
+
 /// T1-5. spawn-named records its failure on its action too, and its failed
 /// response now names that action so the caller can reach the verdict.
 #[tokio::test]
@@ -4204,6 +4228,7 @@ async fn per_runner_restart_rebuild_202_carries_action_id() {
         .parse()
         .expect("a uuid");
     assert_eq!(body["outcome_url"], format!("/actions/{action_id}/outcome"));
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     let record = only_action(&state).await;
     assert_eq!(record.action_id, action_id);
     assert_eq!(record.kind, crate::dev_action::ActionKind::Build);

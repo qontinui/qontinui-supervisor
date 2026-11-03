@@ -32,13 +32,24 @@ impl PlantedCoord {
     }
 }
 
-/// Serve `rows` as `GET /coord/dev-actions/expectations`' `expectations` array
-/// and accept `POST /coord/dev-actions/snapshot`, for the life of the test's
-/// runtime. Anything else is recorded too, and answered 404.
+/// The top-level `evidence_basis` [`serve_planted_expectations`] answers with.
+/// No planted row carries it, so an ACK serving it read the top level.
+pub(crate) const PLANTED_BASIS: &str = "planted-top-level-basis";
+
+/// Serve `rows` as `GET /coord/dev-actions/expectations`' `expectations` array,
+/// under a top-level [`PLANTED_BASIS`].
+pub(crate) async fn serve_planted_expectations(rows: Value) -> PlantedCoord {
+    serve_planted_answer(json!({ "evidence_basis": PLANTED_BASIS, "expectations": rows })).await
+}
+
+/// Serve `answer_body` as the whole body of
+/// `GET /coord/dev-actions/expectations` and accept
+/// `POST /coord/dev-actions/snapshot`, for the life of the test's runtime.
+/// Anything else is recorded too, and answered 404.
 ///
 /// It binds `127.0.0.1`, not `localhost`, which costs a doomed IPv6 connect on
 /// Windows.
-pub(crate) async fn serve_planted_expectations(rows: Value) -> PlantedCoord {
+pub(crate) async fn serve_planted_answer(answer_body: Value) -> PlantedCoord {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the planted coord");
@@ -46,14 +57,26 @@ pub(crate) async fn serve_planted_expectations(rows: Value) -> PlantedCoord {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
     let app = Router::new().fallback(move |req: Request| {
-        let (recorder, rows) = (recorder.clone(), rows.clone());
-        async move { answer(req, &recorder, rows).await }
+        let (recorder, answer_body) = (recorder.clone(), answer_body.clone());
+        async move { answer(req, &recorder, answer_body).await }
     });
     tokio::spawn(async move { axum::serve(listener, app).await });
     PlantedCoord { base, seen }
 }
 
-async fn answer(req: Request, recorder: &Mutex<Vec<SeenRequest>>, rows: Value) -> Response {
+/// A coord that answers every request with `status` and `body`, for the life of
+/// the test's runtime. Returns its base URL.
+pub(crate) async fn serve_planted_status(status: StatusCode, body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the planted coord");
+    let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let app = Router::new().fallback(move || async move { (status, body) });
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    base
+}
+
+async fn answer(req: Request, recorder: &Mutex<Vec<SeenRequest>>, answer_body: Value) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -66,9 +89,7 @@ async fn answer(req: Request, recorder: &Mutex<Vec<SeenRequest>>, rows: Value) -
         body: String::from_utf8_lossy(&bytes).into_owned(),
     });
     match (parts.method, path.as_str()) {
-        (Method::GET, "/coord/dev-actions/expectations") => {
-            Json(json!({ "expectations": rows })).into_response()
-        }
+        (Method::GET, "/coord/dev-actions/expectations") => Json(answer_body).into_response(),
         (Method::POST, "/coord/dev-actions/snapshot") => StatusCode::OK.into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -105,6 +126,22 @@ pub(crate) fn five_rows_and_a_sixth_boot_row() -> Value {
     ])
 }
 
+/// A body naming a minted action carries every field of
+/// [`crate::dev_action::MintedAction::ack_fields`], each as a present key: `null`
+/// is an answer, and a missing key would have to be interpreted.
+pub(crate) fn assert_the_ack_carries_its_action_fields(ack: &Value) {
+    for key in [
+        "action_id",
+        "states_active",
+        "predicted",
+        "expectations_basis",
+        "risk",
+        "outcome_url",
+    ] {
+        assert!(ack.get(key).is_some(), "the ACK lacks `{key}`: {ack}");
+    }
+}
+
 /// A mint served [`five_rows_and_a_sixth_boot_row`] asked for them once, assessed
 /// all six, and kept the top five in its ACK.
 pub(crate) fn assert_the_ack_read_every_planted_row(
@@ -127,6 +164,10 @@ pub(crate) fn assert_the_ack_read_every_planted_row(
         .map(|row| row["signature"].as_str().expect("a row's signature"))
         .collect();
     assert_eq!(predicted, ["DEV-A", "DEV-B", "DEV-C", "DEV-D", "DEV-E"]);
+    assert_eq!(
+        ack["expectations_basis"], PLANTED_BASIS,
+        "the ACK names what coord said its rows rest on: {ack}"
+    );
 
     let seen = coord.seen();
     assert_eq!(seen.len(), 1, "exactly one request at the mint: {seen:?}");

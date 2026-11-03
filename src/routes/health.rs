@@ -405,6 +405,13 @@ pub struct SupervisorInfo {
     /// sha a lower bound: "contains fix X" still holds, "does not contain fix
     /// X" is not conclusive.
     pub built_from_dirty: Option<bool>,
+    /// The attribution epoch every dev-action snapshot this binary posts is
+    /// stamped with ([`crate::dev_action::ingest::ATTRIBUTION_EPOCH`]): the
+    /// per-box answer to "what does this supervisor stamp on its rows?", which
+    /// [`Self::built_from_sha`] can only answer by ancestry against a PR the
+    /// reader has to know. A missing key is UNKNOWN: builds from
+    /// qontinui-supervisor#270 and #272 stamp epoch 2 and predate this field.
+    pub attribution_epoch: u32,
 }
 
 impl SupervisorInfo {
@@ -417,6 +424,7 @@ impl SupervisorInfo {
             project_dir,
             built_from_sha: crate::self_provenance::built_from_sha().map(str::to_string),
             built_from_dirty: crate::self_provenance::built_from_dirty(),
+            attribution_epoch: crate::dev_action::ingest::ATTRIBUTION_EPOCH,
         }
     }
 }
@@ -1569,6 +1577,18 @@ mod tests {
         assert!(
             dirty.is_null() || dirty.is_boolean(),
             "built_from_dirty must be a bool or null, got {dirty}"
+        );
+    }
+
+    /// `/health` serves the same epoch every snapshot of this binary is stamped
+    /// with, so a box's stamp can be read without a snapshot having been posted.
+    #[test]
+    fn test_supervisor_block_serves_the_attribution_epoch() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        assert_eq!(
+            value["supervisor"]["attribution_epoch"],
+            crate::dev_action::ingest::ATTRIBUTION_EPOCH
         );
     }
 

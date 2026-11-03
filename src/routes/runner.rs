@@ -5,9 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::dev_action::{
-    mint_action, record_start_verdict, risk_ack_json, run_result_for, start_verdict, ActionKind,
-    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
-    RunResultGuard, SyncProbe,
+    mint_action, record_start_verdict, run_result_for, start_verdict, ActionKind, ActionRunResult,
+    AttributionTargets, MintedAction, RunResultGuard, SyncProbe,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -56,8 +55,7 @@ pub(crate) fn unhealthy_after_start_response(
 /// through [`mint_action`], targeting the primary's registry entry
 /// ([`primary_attribution_targets`]).
 ///
-/// Returns `(record, states_active, predicted, risk)`. The record is returned
-/// so the executing path can record the action's **terminal result** on it,
+/// The returned record is there so the executing path can record the action's **terminal result** on it,
 /// without which a refused or failed action closed `Confirmed`
 /// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md`).
 /// `risk` is advice: the restart path biases toward LKG on it and warns; it
@@ -71,13 +69,8 @@ async fn mint_primary_action(
     params_digest: String,
     requester_id: Option<String>,
     backstop_override: Option<std::time::Duration>,
-) -> (
-    std::sync::Arc<ActionRecord>,
-    Vec<&'static str>,
-    Vec<PredictedSignature>,
-    ActionRisk,
-) {
-    let minted = mint_action(
+) -> MintedAction {
+    mint_action(
         state,
         kind,
         params_digest,
@@ -85,13 +78,7 @@ async fn mint_primary_action(
         primary_attribution_targets(state).await,
         backstop_override,
     )
-    .await;
-    (
-        minted.record,
-        minted.states_active,
-        minted.predicted,
-        minted.risk,
-    )
+    .await
 }
 
 /// Where the watcher of a primary-runner action looks for its effects.
@@ -405,7 +392,7 @@ pub async fn rebuild_when_idle(
     // `restart_runner` mints it — the outcome lands after the build, not after
     // this 202. It mints now, at arm time, so its window's backstop covers the
     // wait's deadline as well as the build.
-    let (action_record, _states_active, _predicted, risk) = mint_primary_action(
+    let minted = mint_primary_action(
         &state,
         ActionKind::Build,
         format!(
@@ -416,13 +403,11 @@ pub async fn rebuild_when_idle(
         Some(rebuild_when_idle_backstop(deadline_secs)),
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
 
     let exec_state = state.clone();
-    let exec_record = action_record.clone();
+    let exec_record = minted.record.clone();
     let exec_guard =
-        RunResultGuard::arm(action_record.clone(), "rebuild-when-idle's detached task");
+        RunResultGuard::arm(minted.record.clone(), "rebuild-when-idle's detached task");
     // The detached future outlives this handler, so it gets its own copy of the
     // name rather than borrowing the one the 202 body still needs.
     let exec_runner_name = runner_name.clone();
@@ -591,20 +576,18 @@ pub async fn rebuild_when_idle(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
+        Json(minted.stamp(serde_json::json!({
             "status": "watching",
             "build_id": submission_id,
             // Same contract as the two restart 202s: name the tree the
             // eventual rebuild compiles. This route already 404'd above when
             // no primary is configured, so it is never `null` here.
             "build_source": REBUILD_WHEN_IDLE_TREE.build_source(true),
-            "action_id": action_id,
             "runner": runner_name,
             "poll_secs": poll_secs,
             "deadline_secs": deadline_secs,
-            "risk": risk_json,
             "message": "Watching the primary for active sessions. It will rebuild from origin/main once they drain, and give up without rebuilding if the deadline passes first.",
-        })),
+        }))),
     )
         .into_response())
 }
@@ -636,7 +619,7 @@ pub async fn restart_runner(
     } else {
         ActionKind::Restart
     };
-    let (action_record, states_active, predicted, risk) = mint_primary_action(
+    let minted = mint_primary_action(
         &state,
         action_kind,
         // `;handoff=true` only when set, so a non-handoff action's label is
@@ -650,8 +633,7 @@ pub async fn restart_runner(
         None,
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
+    let action_record = minted.record.clone();
     // Every exit below records a result; this covers the ones that cannot: the
     // handler future dropped mid-restart when its client disconnects, or a
     // panic in the detached rebuild task, which the rebuild arm moves it into.
@@ -872,7 +854,7 @@ pub async fn restart_runner(
 
         return Ok((
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({
+            Json(minted.stamp(serde_json::json!({
                 // Phase 4: this ACK is emitted BEFORE the readiness gate runs,
                 // so it cannot honestly claim the rebuild is under way — the
                 // observed case is a restart refused 1.4s later that had already
@@ -894,15 +876,10 @@ pub async fn restart_runner(
                 // fails on it at once, and a label would name a build that
                 // never runs (same contract as `POST /runners/{id}/restart`).
                 "build_source": build_source,
-                "action_id": action_id.to_string(),
-                "states_active": states_active,
-                "predicted": predicted,
-                "risk": risk_json,
-                "outcome_url": format!("/actions/{}/outcome", action_id),
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
                             for the terminal outcome",
-            })),
+            }))),
         )
             .into_response());
     }
@@ -926,7 +903,7 @@ pub async fn restart_runner(
     // it is a no-op (fail-open) and the normal slot resolution runs.
     let want_lkg = match body.use_lkg {
         Some(explicit) => explicit,
-        None => risk.route_lkg,
+        None => minted.risk.route_lkg,
     };
     // Track whether we set a transient override so we can clear it after the
     // restart, keeping the bias scoped to THIS restart (later restarts re-decide
@@ -953,14 +930,14 @@ pub async fn restart_runner(
                     .await;
                 biased_primary = Some(primary);
             }
-        } else if risk.route_lkg || body.use_lkg == Some(true) {
+        } else if minted.risk.route_lkg || body.use_lkg == Some(true) {
             // Wanted LKG but none exists — surface it rather than silently
             // running the freshest slot exe under known high risk.
             let msg = format!(
                 "Restart wanted the last-known-good binary (risk_route_lkg={}, \
                  use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
                  freshest slot exe",
-                risk.route_lkg,
+                minted.risk.route_lkg,
                 body.use_lkg,
                 state.config.lkg_exe_path()
             );
@@ -1043,16 +1020,11 @@ pub async fn restart_runner(
 
     record_start_verdict(&state, &primary_id, start_verdict(probe), run_guard);
 
-    Ok(Json(serde_json::json!({
+    Ok(Json(minted.stamp(serde_json::json!({
         "status": "restarted",
         "message": "Runner restarted successfully",
-        "action_id": action_id.to_string(),
-        "states_active": states_active,
-        "predicted": predicted,
-        "risk": risk_json,
         "routed_lkg": want_lkg,
-        "outcome_url": format!("/actions/{}/outcome", action_id),
-    }))
+    })))
     .into_response())
 }
 
@@ -1290,7 +1262,7 @@ pub async fn fix_and_rebuild(
     // open until the build records its result below, then a 30s tail, capped
     // by the build backstop. State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
-    let (action_record, states_active, predicted, risk) = mint_primary_action(
+    let minted = mint_primary_action(
         &state,
         ActionKind::Build,
         "fix_and_rebuild".to_string(),
@@ -1298,8 +1270,6 @@ pub async fn fix_and_rebuild(
         None,
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
 
     // Submit the live-tree rebuild to the build-submissions state machine. The
     // exec future runs in a detached background task — a client disconnect can
@@ -1308,8 +1278,8 @@ pub async fn fix_and_rebuild(
     // Phase 3 path 3: `fix-and-rebuild` mints an identical `ActionKind::Build`,
     // so a failing `run_cargo_build` returned 500 into the submission while the
     // action closed `Confirmed`.
-    let exec_record = action_record.clone();
-    let exec_guard = RunResultGuard::arm(action_record.clone(), "fix-and-rebuild's detached task");
+    let exec_record = minted.record.clone();
+    let exec_guard = RunResultGuard::arm(minted.record.clone(), "fix-and-rebuild's detached task");
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
         state.build_submissions.clone(),
         state.config.project_dir.clone(),
@@ -1351,20 +1321,15 @@ pub async fn fix_and_rebuild(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
+        Json(minted.stamp(serde_json::json!({
             "status": "accepted",
             "build_id": submission_id.to_string(),
             "submission_id": submission_id.to_string(),
             "poll": format!("/build/{submission_id}/status"),
             "build_source": FIX_AND_REBUILD_SOURCE,
-            "action_id": action_id.to_string(),
-            "states_active": states_active,
-            "predicted": predicted,
-            "risk": risk_json,
-            "outcome_url": format!("/actions/{}/outcome", action_id),
             "message": "fix-and-rebuild submitted; the build runs detached from this \
                         connection — poll GET /build/{id}/status for the terminal outcome",
-        })),
+        }))),
     )
         .into_response())
 }
@@ -1761,6 +1726,7 @@ mod tests {
         assert_eq!(status, 202);
         assert_eq!(body["status"], "watching");
         assert_eq!(body["build_source"], "origin_main", "{body}");
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     }
 
     /// A second fix-and-rebuild while one is still in flight is an idempotent
@@ -2083,12 +2049,16 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let state = test_state(tmp.path());
-        let record = state.dev_actions.write().await.insert(ActionRecord::new(
-            ActionKind::Build,
-            None,
-            "rebuild_when_idle".to_string(),
-            &[],
-        ));
+        let record = state
+            .dev_actions
+            .write()
+            .await
+            .insert(crate::dev_action::ActionRecord::new(
+                ActionKind::Build,
+                None,
+                "rebuild_when_idle".to_string(),
+                &[],
+            ));
         crate::dev_action::spawn_attribution_watcher(
             state.clone(),
             record.clone(),

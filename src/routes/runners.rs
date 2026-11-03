@@ -17,9 +17,8 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    mint_action, record_start_verdict, risk_ack_json, run_result_for, spawn_run_result,
-    start_verdict, ActionKind, ActionRecord, ActionRisk, ActionRunResult, AttributionTargets,
-    MintedAction, PredictedSignature, RunResultGuard, StartVerdict, SyncProbe,
+    mint_action, record_start_verdict, run_result_for, spawn_run_result, start_verdict, ActionKind,
+    ActionRunResult, AttributionTargets, MintedAction, RunResultGuard, StartVerdict, SyncProbe,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
@@ -1349,13 +1348,10 @@ pub async fn start_runner(
     }
     record_start_verdict(&state, &id, start_verdict(probe), run_guard);
 
-    Ok(Json(with_action_fields(
-        json!({
-            "status": "started",
-            "message": format!("Runner '{}' started", id)
-        }),
-        Some(&minted),
-    ))
+    Ok(Json(minted.stamp(json!({
+        "status": "started",
+        "message": format!("Runner '{}' started", id)
+    })))
     .into_response())
 }
 
@@ -1367,12 +1363,11 @@ fn with_action_fields(
     mut body: serde_json::Value,
     minted: Option<&MintedAction>,
 ) -> serde_json::Value {
-    let fields = match minted {
-        Some(minted) => minted.ack_fields(),
-        None => json!({ "action_id": null }),
-    };
-    if let (Some(body), serde_json::Value::Object(fields)) = (body.as_object_mut(), fields) {
-        body.extend(fields);
+    if let Some(minted) = minted {
+        return minted.stamp(body);
+    }
+    if let Some(body) = body.as_object_mut() {
+        body.insert("action_id".to_string(), serde_json::Value::Null);
     }
     body
 }
@@ -2802,22 +2797,16 @@ async fn wait_out_queue_timeout(
 /// route's one chokepoint), then a 30 s tail, capped by the 2-hour spawn
 /// backstop, so a `rebuild: true` spawn's build and boot land inside it.
 ///
-/// Returns `(record, states_active, predicted, risk)`: the record so the route
-/// can record the spawn's terminal result on it, the rest for stamping into the
-/// spawn ACK. spawn-test/named is a *testing* surface, so `risk` is never acted
+/// The route records the spawn's terminal result on the returned record and
+/// stamps the rest into the spawn ACK. spawn-test/named is a *testing* surface, so `risk` is never acted
 /// on here: it is surfaced in the ACK for the caller to act on.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
     requester_id: Option<String>,
     managed: Arc<ManagedRunner>,
-) -> (
-    Arc<ActionRecord>,
-    Vec<&'static str>,
-    Vec<PredictedSignature>,
-    ActionRisk,
-) {
-    let minted = mint_action(
+) -> MintedAction {
+    mint_action(
         state,
         ActionKind::Spawn,
         params_digest,
@@ -2825,13 +2814,7 @@ async fn mint_spawn_action(
         AttributionTargets::for_runner(managed),
         None,
     )
-    .await;
-    (
-        minted.record,
-        minted.states_active,
-        minted.predicted,
-        minted.risk,
-    )
+    .await
 }
 
 /// The git repo root whose object db + refs the spawn-response provenance
@@ -3293,7 +3276,7 @@ pub async fn spawn_test(
     // lazily via the managed runner — its path is set during the build, after
     // this mint) + cached health. Reuses the request's `requester_id` as the
     // snapshot requester (Q8 — no new identity system).
-    let (action_record, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    let minted = mint_spawn_action(
         &state,
         format!(
             "rebuild={};use_lkg={};git_ref={:?}",
@@ -3303,12 +3286,10 @@ pub async fn spawn_test(
         managed.clone(),
     )
     .await;
-    let action_id = action_record.action_id;
-    let action_risk_json = risk_ack_json(&action_risk);
     // Moved into the exec future and from there into `execute_spawn_build`,
     // which records the spawn's result; it records the action abandoned if
     // that future ends first (a panic in the exec task).
-    let run_guard = RunResultGuard::arm(action_record, "spawn-test's exec future");
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-test's exec future");
 
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
@@ -3382,24 +3363,19 @@ pub async fn spawn_test(
     if want_async {
         return Ok((
             axum::http::StatusCode::ACCEPTED,
-            Json(json!({
+            Json(minted.stamp(json!({
                 "submission_id": submission_id.to_string(),
                 "status": "queued",
                 "id": id,
                 "port": port,
                 "api_url": format!("http://localhost:{}", port),
                 "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
-                "action_id": action_id.to_string(),
-                "states_active": action_states_active,
-                "predicted": action_predicted,
-                "risk": action_risk_json,
-                "outcome_url": format!("/actions/{}/outcome", action_id),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
                     "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
                     submission_id, submission_id
                 ),
-            })),
+            }))),
         )
             .into_response());
     }
@@ -3472,17 +3448,7 @@ pub async fn spawn_test(
             // fields so the synchronous ACK carries the action_id + active
             // dev-state set + outcome readback URL (in-place edit per §6.1; no
             // new route). The watcher was already spawned at mint time.
-            let mut body = o.body;
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("action_id".to_string(), json!(action_id.to_string()));
-                obj.insert("states_active".to_string(), json!(action_states_active));
-                obj.insert("predicted".to_string(), json!(action_predicted));
-                obj.insert("risk".to_string(), action_risk_json.clone());
-                obj.insert(
-                    "outcome_url".to_string(),
-                    json!(format!("/actions/{}/outcome", action_id)),
-                );
-            }
+            let body = minted.stamp(o.body);
             let mut response = (status, Json(body)).into_response();
             if frontend_stale {
                 response
@@ -5745,18 +5711,17 @@ pub async fn spawn_named(
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
     // as spawn-test). Stamped into the response below, failed or not.
-    let (action_record, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    let minted = mint_spawn_action(
         &state,
         format!("named={};rebuild={}", name, body.rebuild),
         body.requester_id.clone(),
         managed.clone(),
     )
     .await;
-    let action_id = action_record.action_id;
-    let action_risk_json = risk_ack_json(&action_risk);
+    let action_id = minted.record.action_id;
     // The inner future runs inside this handler, so a client disconnect drops
     // it: the guard records the action abandoned then.
-    let run_guard = RunResultGuard::arm(action_record, "spawn-named's handler future");
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's handler future");
 
     let result = spawn_named_inner(
         state.clone(),
@@ -5773,22 +5738,13 @@ pub async fn spawn_named(
     // `Err` is rendered to a body.
     record_start_verdict(&state, &id, spawn_run_result(&result), run_guard);
 
-    let (status, mut resp) = match result {
+    let (status, resp) = match result {
         Ok(ok) => ok,
         Err(e) => e.to_status_body(),
     };
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1), on a
     // failed response too, so its caller can reach the verdict.
-    if let Some(obj) = resp.as_object_mut() {
-        obj.insert("action_id".to_string(), json!(action_id.to_string()));
-        obj.insert("states_active".to_string(), json!(action_states_active));
-        obj.insert("predicted".to_string(), json!(action_predicted));
-        obj.insert("risk".to_string(), action_risk_json);
-        obj.insert(
-            "outcome_url".to_string(),
-            json!(format!("/actions/{}/outcome", action_id)),
-        );
-    }
+    let resp = minted.stamp(resp);
     let frontend_stale = resp
         .get("frontend_stale")
         .and_then(|v| v.as_bool())

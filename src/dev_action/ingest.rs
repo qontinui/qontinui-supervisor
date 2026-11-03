@@ -47,8 +47,10 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// **Bump rule: bump this whenever attribution semantics change** — what a
 /// spawn, restart or build verdict is attributed to, or the window it is read
 /// over — so coord can tell rows recorded under the old semantics from rows
-/// recorded under the new. Coord skips the `dev_action_stats` increment for
-/// `spawn` / `restart` / `build` rows whose epoch is missing or below its
+/// recorded under the new. As of coord `6846970ac` (2026-11-03) coord stores the
+/// stamp and does not act on it: its half of the plan below (Phase 5) is to skip the
+/// `dev_action_stats` increment for
+/// `spawn` / `restart` / `build` rows whose epoch is missing or below a
 /// `MIN_SUPERVISOR_ATTRIBUTION_EPOCH`, so an old supervisor on any box stops
 /// feeding the LKG restart guard's statistics without a date cut-off.
 ///
@@ -59,7 +61,13 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// carries the stamp, which descends from #257, #263 and #264. Plan
 /// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
 /// D3.
-pub const ATTRIBUTION_EPOCH: u32 = 2;
+///
+/// Epoch 3 follows #272, which attributes `recent_crash` only to the spawn it can
+/// be tied to, reads an undated `derived_status: Errored` as `Inconclusive` unless
+/// the API answered after the spawn, and measures the window's tail cap on the
+/// tokio clock. #272 landed still stamping 2, so a row stamped 2 can carry either
+/// semantics; a row stamped 3 carries #272's.
+pub const ATTRIBUTION_EPOCH: u32 = 3;
 
 /// The snapshot `metadata` this build stamps on every row, so a row names the
 /// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
@@ -307,9 +315,9 @@ mod tests {
         .expect("serialize");
 
         assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
-        // Epoch 1 is the unstamped pre-fix rows; a stamped row is 2 or later.
-        // A constant, so it is checked at compile time.
-        const _: () = assert!(ATTRIBUTION_EPOCH >= 2);
+        // Epoch 1 is the unstamped pre-fix rows, and 2 can carry semantics from
+        // before #272. A constant, so it is checked at compile time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 3);
         assert_eq!(
             json["metadata"]["supervisor_build_sha"],
             serde_json::Value::from(crate::self_provenance::built_from_sha()),

@@ -30,10 +30,16 @@
 //!
 //! This runs on the **synchronous ACK path** (inside the mint helper, before the
 //! action's 202/200 is returned), so the timeout MUST be short. On ANY failure
-//! (unresolvable coord base, network error, non-2xx, parse error) we return an
-//! EMPTY `Vec` and log a single `debug!`/`warn!`. We NEVER block beyond the
+//! (unresolvable coord base, network error, non-2xx, parse error) we return no
+//! rows and no basis, and log a single `debug!`/`warn!`. We NEVER block beyond the
 //! timeout, NEVER panic, NEVER fail the action path. An empty array is the
 //! correct, honest default when coord is unreachable or has no history.
+//!
+//! An empty array alone cannot say WHICH of those it is, and neither can the
+//! `risk: null` it folds to: coord being down and coord having no rows read
+//! alike, and the LKG restart guard fails open on both. So the fetch also keeps
+//! coord's top-level `evidence_basis` ([`FetchedExpectations::basis`]), and the
+//! ACK serves it as `expectations_basis`.
 
 use std::time::Duration;
 
@@ -109,20 +115,41 @@ pub struct PredictedSignature {
 }
 
 /// The coord `expectations` response shape. Private — mirrors the wire contract
-/// just enough to extract the `expectations` array. We deliberately decode only
-/// the fields we stamp (`last_seen`, top-level `action_kind`/`state_ids` are
+/// just enough to extract the `expectations` array and its top-level basis. We
+/// deliberately decode only the fields we stamp (`last_seen`, top-level `action_kind`/`state_ids` are
 /// ignored) so a coord-side additive change never breaks the parse.
 #[derive(Debug, Deserialize)]
 struct ExpectationsResponse {
     #[serde(default)]
     expectations: Vec<PredictedSignature>,
+    #[serde(default)]
+    evidence_basis: Option<String>,
+}
+
+/// One expectations read: coord's rows, and the basis it says they rest on.
+#[derive(Debug, Default)]
+pub struct FetchedExpectations {
+    /// Every row coord served, uncut.
+    pub rows: Vec<PredictedSignature>,
+    /// coord's top-level `evidence_basis`, verbatim: the WEAKEST basis among all
+    /// of [`Self::rows`], not only the five the ACK keeps. `prior_only` with no
+    /// rows means no trials yet, or trials that never emitted a signature.
+    ///
+    /// It is not parsed into an enum, so a value coord adds (plan
+    /// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+    /// D3's `re-accruing`) reaches the ACK without a supervisor change. It decides
+    /// nothing here: [`crate::dev_action::policy`] reads the rows themselves.
+    ///
+    /// `None` is UNKNOWN: coord gave no answer (none configured, unreachable,
+    /// non-2xx, unparseable) or predates the field.
+    pub basis: Option<String>,
 }
 
 /// Fetch state-conditioned expectations from the coord at `base` for
 /// `(action_kind, state_ids)`. `base` comes from
 /// [`crate::coord_client::coord_base`]; `None` makes no request.
-/// Best-effort and fail-open: returns an EMPTY `Vec` on any failure (no base,
-/// network, non-2xx, parse) after a single `debug!`/`warn!`. NEVER blocks beyond
+/// Best-effort and fail-open: returns no rows and no basis on any failure (no
+/// base, network, non-2xx, parse) after a single `debug!`/`warn!`. NEVER blocks beyond
 /// `EXPECTATIONS_TIMEOUT_SECS`, NEVER panics. Safe to `await` directly on the
 /// synchronous ACK path.
 ///
@@ -134,13 +161,13 @@ pub async fn fetch_expectations(
     base: Option<&str>,
     action_kind: &str,
     state_ids: &[&str],
-) -> Vec<PredictedSignature> {
+) -> FetchedExpectations {
     let Some(base) = base else {
         debug!(
             "dev_action::expectations: no coord base — returning empty predicted set for \
              kind={action_kind}"
         );
-        return Vec::new();
+        return FetchedExpectations::default();
     };
 
     let url = expectations_url(base, action_kind, state_ids);
@@ -152,7 +179,7 @@ pub async fn fetch_expectations(
         Ok(c) => c,
         Err(e) => {
             warn!("dev_action::expectations: reqwest builder failed: {e}");
-            return Vec::new();
+            return FetchedExpectations::default();
         }
     };
 
@@ -164,22 +191,25 @@ pub async fn fetch_expectations(
                     "dev_action::expectations: coord returned {status} for GET {url} \
                      (non-fatal) — empty predicted set"
                 );
-                return Vec::new();
+                return FetchedExpectations::default();
             }
             match resp.json::<ExpectationsResponse>().await {
-                Ok(parsed) => parsed.expectations,
+                Ok(parsed) => FetchedExpectations {
+                    rows: parsed.expectations,
+                    basis: parsed.evidence_basis,
+                },
                 Err(e) => {
                     warn!(
                         "dev_action::expectations: failed to parse coord expectations \
                          response from {url} (non-fatal): {e}"
                     );
-                    Vec::new()
+                    FetchedExpectations::default()
                 }
             }
         }
         Err(e) => {
             debug!("dev_action::expectations: GET {url} failed (non-fatal, fail-open): {e}");
-            Vec::new()
+            FetchedExpectations::default()
         }
     }
 }
@@ -410,5 +440,72 @@ mod tests {
         let parsed: ExpectationsResponse =
             serde_json::from_str(missing_key).expect("decode missing key");
         assert!(parsed.expectations.is_empty());
+    }
+
+    /// coord's top-level basis comes through verbatim beside an empty list, so
+    /// a basis this build has never heard of still reaches the ACK.
+    #[tokio::test]
+    async fn the_fetch_keeps_coords_top_level_basis_verbatim() {
+        let coord = crate::dev_action::test_support::serve_planted_answer(serde_json::json!({
+            "evidence_basis": "re-accruing",
+            "expectations": [],
+        }))
+        .await;
+        let fetched = fetch_expectations(Some(&coord.base), "restart", &[]).await;
+        assert!(fetched.rows.is_empty());
+        assert_eq!(fetched.basis.as_deref(), Some("re-accruing"));
+    }
+
+    /// A coord that predates the field still serves its rows, and its basis
+    /// reads UNKNOWN rather than a default.
+    #[tokio::test]
+    async fn a_coord_with_no_top_level_basis_keeps_its_rows_and_reads_unknown() {
+        let coord = crate::dev_action::test_support::serve_planted_answer(serde_json::json!({
+            "expectations": [{
+                "signature": "DEV-X",
+                "posterior_mean": 0.1,
+                "occurrences": 1,
+                "trials": 10,
+                "evidence_basis": "marginal",
+            }],
+        }))
+        .await;
+        let fetched = fetch_expectations(Some(&coord.base), "restart", &[]).await;
+        assert_eq!(fetched.rows.len(), 1);
+        assert_eq!(fetched.basis, None);
+    }
+
+    /// Every way of getting no answer reads UNKNOWN: no coord configured, a
+    /// non-2xx, an unparseable body, and a refused connection. None of them may
+    /// read as a basis, or an outage would look like an answer.
+    #[tokio::test]
+    async fn no_answer_from_coord_has_no_basis() {
+        use axum::http::StatusCode;
+        let fetched = fetch_expectations(None, "restart", &[]).await;
+        assert!(fetched.rows.is_empty());
+        assert_eq!(fetched.basis, None);
+
+        let refused = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let base = format!("http://{}", listener.local_addr().expect("addr"));
+            drop(listener);
+            base
+        };
+        // The 500 carries a well-formed answer, so it is the status check that
+        // refuses it, not the parse.
+        let failing = crate::dev_action::test_support::serve_planted_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"evidence_basis":"exact","expectations":[]}"#,
+        )
+        .await;
+        let garbled =
+            crate::dev_action::test_support::serve_planted_status(StatusCode::OK, "not json").await;
+        for base in [refused, failing, garbled] {
+            let fetched = fetch_expectations(Some(&base), "restart", &[]).await;
+            assert!(fetched.rows.is_empty(), "{base}");
+            assert_eq!(fetched.basis, None, "{base}");
+        }
     }
 }
