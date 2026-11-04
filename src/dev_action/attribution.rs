@@ -3068,6 +3068,7 @@ mod tests {
             answered_this_boot: None,
             last_seen_responding_at: None,
             port_open: true,
+            spawn_up: false,
             frontend_ready: None,
             frontend_state: None,
             frontend_not_ready_since: None,

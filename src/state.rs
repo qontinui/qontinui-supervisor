@@ -997,7 +997,21 @@ impl RunnerState {
     /// exists to name, classified as `Responding`. The bookkeeping flag says
     /// what the supervisor *believes it started*; only the probe says what
     /// answered.
-    pub fn liveness(&self, port_open: bool, api_responding: bool) -> RunnerLiveness {
+    ///
+    /// **`spawn_up` is the third observation**: whether the runner's newest
+    /// spawn is still its current one and its pid is alive
+    /// (`process::manager::newest_spawn_is_up`). It matters only with the port
+    /// closed, where it keeps a live spawn that has not bound its listener yet
+    /// from reading `Stopped`. `running` does not cover that case for the
+    /// primary, whose `running` the health tick lowers from the failed probe.
+    /// Callers read it from the same cache tick as the other two
+    /// (`CachedPortHealth::spawn_up`), or pass `false` where there is no ring.
+    pub fn liveness(
+        &self,
+        port_open: bool,
+        api_responding: bool,
+        spawn_up: bool,
+    ) -> RunnerLiveness {
         if api_responding {
             return RunnerLiveness::Responding;
         }
@@ -1008,9 +1022,10 @@ impl RunnerState {
             (true, None) => RunnerLiveness::Unknown,
             // Port closed. `Stopped` is a claim of POSITIVE evidence of
             // absence, so it may not be made while the supervisor still
-            // believes it owns a live process: a spawned runner that has not
-            // bound its port yet is UNKNOWN, not gone.
-            (false, _) if self.running => RunnerLiveness::Unknown,
+            // believes it owns a live process, or while its newest spawn is
+            // alive: a spawned runner that has not bound its port yet is
+            // UNKNOWN, not gone.
+            (false, _) if self.running || spawn_up => RunnerLiveness::Unknown,
             (false, Some(_)) => RunnerLiveness::Stopped,
             (false, None) => RunnerLiveness::Unknown,
         }
@@ -2970,10 +2985,10 @@ mod tests {
     fn responding_runner_is_responding() {
         let mut st = RunnerState::new();
         st.running = true;
-        assert_eq!(st.liveness(true, true), RunnerLiveness::Responding);
+        assert_eq!(st.liveness(true, true, false), RunnerLiveness::Responding);
         // Even with the port probe somehow false, a positive API answer wins:
         // it is direct evidence the process is serving.
-        assert_eq!(st.liveness(false, true), RunnerLiveness::Responding);
+        assert_eq!(st.liveness(false, true, false), RunnerLiveness::Responding);
     }
 
     #[test]
@@ -2987,10 +3002,10 @@ mod tests {
         st.pid = Some(148320);
 
         assert_eq!(
-            st.liveness(true, false),
+            st.liveness(true, false, false),
             RunnerLiveness::UnresponsiveSince(seen)
         );
-        assert_ne!(st.liveness(true, false), RunnerLiveness::Stopped);
+        assert_ne!(st.liveness(true, false, false), RunnerLiveness::Stopped);
     }
 
     /// A **supervisor-managed** runner keeps `running: true` for its whole
@@ -3007,11 +3022,11 @@ mod tests {
         st.last_seen_responding_at = Some(seen);
 
         assert_eq!(
-            st.liveness(true, false),
+            st.liveness(true, false, false),
             RunnerLiveness::UnresponsiveSince(seen),
             "port held + API silent is a wedge no matter what `running` says"
         );
-        assert_eq!(st.liveness(true, false).state(), "wedged");
+        assert_eq!(st.liveness(true, false, false).state(), "wedged");
     }
 
     #[test]
@@ -3019,7 +3034,7 @@ mod tests {
         let mut st = RunnerState::new();
         st.running = false;
         st.last_seen_responding_at = Some(Utc::now());
-        assert_eq!(st.liveness(false, false), RunnerLiveness::Stopped);
+        assert_eq!(st.liveness(false, false, false), RunnerLiveness::Stopped);
     }
 
     /// `Stopped` is a claim of positive evidence of absence. A runner the
@@ -3030,7 +3045,29 @@ mod tests {
         let mut st = RunnerState::new();
         st.running = true;
         st.last_seen_responding_at = Some(Utc::now());
-        assert_eq!(st.liveness(false, false), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(false, false, false), RunnerLiveness::Unknown);
+    }
+
+    /// A primary hung before its listener binds: the health tick has lowered
+    /// `running` from the failed probe and the stamp is a previous boot's, so
+    /// without `spawn_up` this read `Stopped` about a live process. With the
+    /// newest spawn up it is UNKNOWN; with it down, the earlier answer and the
+    /// closed port are positive evidence of absence again.
+    #[test]
+    fn a_live_spawn_with_no_port_is_never_read_as_stopped() {
+        let earlier: DateTime<Utc> = "2026-11-02T10:00:00Z".parse().unwrap();
+        let mut st = RunnerState::new();
+        st.running = false;
+        st.last_seen_responding_at = Some(earlier);
+        st.started_at = Some("2026-11-04T10:00:00Z".parse().unwrap());
+        assert_eq!(st.liveness(false, false, true), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(false, false, false), RunnerLiveness::Stopped);
+        // A held port or an answer still decides on its own.
+        assert_eq!(
+            st.liveness(true, false, true),
+            RunnerLiveness::UnresponsiveSince(earlier)
+        );
+        assert_eq!(st.liveness(false, true, true), RunnerLiveness::Responding);
     }
 
     #[test]
@@ -3038,8 +3075,8 @@ mod tests {
         // No stamp means we cannot distinguish "never started" from
         // "stopped before we looked" — say UNKNOWN rather than guessing.
         let st = RunnerState::new();
-        assert_eq!(st.liveness(false, false), RunnerLiveness::Unknown);
-        assert_eq!(st.liveness(true, false), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(false, false, false), RunnerLiveness::Unknown);
+        assert_eq!(st.liveness(true, false, false), RunnerLiveness::Unknown);
     }
 
     /// The wire shape is one object for all four states — a consumer reads

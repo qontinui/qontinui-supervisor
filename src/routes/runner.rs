@@ -489,13 +489,17 @@ pub async fn rebuild_when_idle(
                     );
                 };
 
-                let (port_open, api_responding) = {
+                let (port_open, api_responding, spawn_up) = {
                     let h = managed.cached_health.read().await;
-                    (h.runner_port_open, h.runner_responding)
+                    (h.runner_port_open, h.runner_responding, h.spawn_up)
                 };
                 let (liveness, root_pid, started_at) = {
                     let r = managed.runner.read().await;
-                    (r.liveness(port_open, api_responding), r.pid, r.started_at)
+                    (
+                        r.liveness(port_open, api_responding, spawn_up),
+                        r.pid,
+                        r.started_at,
+                    )
                 };
 
                 let readiness = crate::restart_readiness::probe_with_census_fallback(

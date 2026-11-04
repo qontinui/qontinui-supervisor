@@ -2726,7 +2726,7 @@ pub async fn start_managed_runner(
 /// Whether the runner's newest spawn is still its current one and still up:
 /// no stop has reset it (`started_at` is still its `spawned_at`), its exit
 /// monitor has stamped no exit, and its pid is alive.
-fn newest_spawn_is_up(
+pub(crate) fn newest_spawn_is_up(
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     spawns: &crate::state::SpawnRing,
 ) -> bool {

@@ -1194,14 +1194,14 @@ pub async fn enforce(
     // probe is issued. `CachedPortHealth` (`managed.cached_health`) is the
     // per-runner probe result — NOT `CachedRunnerHealth`, which is the SSE
     // snapshot vector and carries a different pair of fields.
-    let (port_open, api_responding) = {
+    let (port_open, api_responding, spawn_up) = {
         let h = managed.cached_health.read().await;
-        (h.runner_port_open, h.runner_responding)
+        (h.runner_port_open, h.runner_responding, h.spawn_up)
     };
     let (liveness, tracked_running, root_pid, started_at) = {
         let r = managed.runner.read().await;
         (
-            r.liveness(port_open, api_responding),
+            r.liveness(port_open, api_responding, spawn_up),
             r.running,
             r.pid,
             r.started_at,
@@ -1939,6 +1939,28 @@ mod tests {
             decide_skip(RunnerLiveness::Responding, true, true, false, true),
             None
         );
+    }
+
+    /// `spawn_up` moves a pre-bind primary from `Stopped` to `Unknown`, and the
+    /// readiness gate must not move with it: with the port closed and
+    /// `running` lowered by the health tick, `Unknown` is `NotRunning` exactly
+    /// as `Stopped` was. This is the one place a `liveness` change could
+    /// silently change what may be stopped.
+    #[test]
+    fn decide_skip_is_unchanged_for_a_spawn_that_has_not_bound() {
+        let mut r = crate::state::RunnerState::new();
+        r.running = false;
+        r.last_seen_responding_at = Some("2026-11-02T10:00:00Z".parse().unwrap());
+        r.started_at = Some("2026-11-04T10:00:00Z".parse().unwrap());
+        for spawn_up in [true, false] {
+            let liveness = r.liveness(false, false, spawn_up);
+            assert_eq!(
+                decide_skip(liveness, false, r.running, false, true),
+                Some(SkipReason::NotRunning),
+                "spawn_up={spawn_up} liveness={liveness:?}"
+            );
+        }
+        assert_eq!(r.liveness(false, false, true), RunnerLiveness::Unknown);
     }
 
     /// (iv)(v)(vi) The census is consulted ONLY for an unreachable probe on a

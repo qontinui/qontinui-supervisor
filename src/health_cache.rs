@@ -271,6 +271,14 @@ fn degraded_reason(body: &RunnerHealthBody) -> String {
 pub struct CachedPortHealth {
     pub runner_port_open: bool,
     pub runner_responding: bool,
+    /// Whether the runner's newest spawn is its current one and its pid is
+    /// alive (`manager::newest_spawn_is_up`), observed on this tick. Measured
+    /// only when the API is silent AND the port is free (the one shape where it
+    /// decides anything, and the only one that pays the process query);
+    /// `false` otherwise. The third input to `RunnerState::liveness`, so a
+    /// reader of this cache cannot disagree with the tick about a live spawn
+    /// that has not bound its port.
+    pub spawn_up: bool,
 }
 
 /// Cached per-runner health snapshot, built by the background refresher.
@@ -320,6 +328,10 @@ pub struct CachedRunnerHealth {
     /// sync SSE path can publish the derivation alongside the verdict without
     /// re-probing (it has no access to the per-runner `cached_health` lock).
     pub port_open: bool,
+    /// [`CachedPortHealth::spawn_up`] on this tick: the newest spawn is alive
+    /// while the port is free and the API silent. The third input `liveness`
+    /// is derived from.
+    pub spawn_up: bool,
     /// The runner's own `/health` `frontendReady` on this tick. `None` =
     /// UNKNOWN (API not answering, body unparseable, or a runner too old to
     /// publish it) — never read as ready.
@@ -618,9 +630,24 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let probe_issued_at = Utc::now();
                 let runner_responding = port::is_runner_responding(runner_port).await;
 
+                // A spawn alive with its port free: a runner hung (or slow)
+                // before its listener binds. Read off the spawn ring, not
+                // `running`, which the tick below lowers from the probe for a
+                // user-managed runner.
+                let spawn_up = if !runner_responding && !runner_port_open {
+                    let started_at = managed.runner.read().await.started_at;
+                    crate::process::manager::newest_spawn_is_up(
+                        started_at,
+                        &*managed.recent_spawns.read().await,
+                    )
+                } else {
+                    false
+                };
+
                 let new_health = CachedPortHealth {
                     runner_port_open,
                     runner_responding,
+                    spawn_up,
                 };
 
                 // 3b — record WHEN it was last seen responding, so the three
@@ -676,8 +703,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         // one is UNKNOWN, and so is this one.
                         //
                         // `pid` is now cleared only on positive evidence of
-                        // absence: the port is closed AND the API is silent.
-                        if !runner_responding && !runner_port_open {
+                        // absence: the port is closed, the API is silent, AND
+                        // the newest spawn is not alive. A spawn that has not
+                        // bound its port yet keeps its pid.
+                        if !runner_responding && !runner_port_open && !spawn_up {
                             runner_state.pid = None;
                         }
 
@@ -772,7 +801,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // and still escalated; they just say what they are.
                 let liveness_now = {
                     let runner_state = managed.runner.read().await;
-                    runner_state.liveness(runner_port_open, runner_responding)
+                    runner_state.liveness(runner_port_open, runner_responding, spawn_up)
                 };
                 let escalating = runner_port_open
                     && matches!(
@@ -950,8 +979,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;
+                // A live spawn that has not bound its port is starting, not
+                // offline, whatever the lowered `running` says.
                 let derived_status = derive_runner_status(
-                    runner_state.running,
+                    runner_state.running || spawn_up,
                     runner_responding,
                     health_body.as_ref(),
                 );
@@ -983,10 +1014,11 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     watchdog,
                     // Phase 3b — classified from the SAME tick's live listener
                     // probe, never from a remembered or assumed port state.
-                    liveness: runner_state.liveness(runner_port_open, runner_responding),
+                    liveness: runner_state.liveness(runner_port_open, runner_responding, spawn_up),
                     answered_this_boot: runner_state.answered_this_boot(),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
                     port_open: runner_port_open,
+                    spawn_up,
                     frontend_ready,
                     frontend_state,
                     frontend_not_ready_since: frontend_run.map(|r| r.since),
@@ -1018,6 +1050,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 primary_health = CachedPortHealth {
                     runner_port_open: port::is_port_listening(runner_port),
                     runner_responding: port::is_runner_responding(runner_port).await,
+                    // No registry entry, so no spawn ring to read.
+                    spawn_up: false,
                 };
             }
 
@@ -1182,6 +1216,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
+            spawn_up: false,
         };
         let cloned = health.clone();
         assert!(cloned.runner_port_open);
@@ -1193,6 +1228,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: false,
+            spawn_up: false,
         };
         let debug_str = format!("{:?}", health);
         assert!(debug_str.contains("runner_port_open: true"));
@@ -1204,6 +1240,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
+            spawn_up: false,
         };
         assert!(health.runner_port_open);
         assert!(health.runner_responding);

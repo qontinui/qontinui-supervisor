@@ -713,7 +713,11 @@ pub async fn list_runners(
         // log. A runner the refresher has not reached yet reads
         // `port_open: false, responding: false` and classifies as `unknown`,
         // which is the honest answer.
-        let liveness = runner.liveness(cached.runner_port_open, cached.runner_responding);
+        let liveness = runner.liveness(
+            cached.runner_port_open,
+            cached.runner_responding,
+            cached.spawn_up,
+        );
 
         let mut entry = json!({
             "id": managed.config.id,
@@ -744,6 +748,11 @@ pub async fn list_runners(
             // never observed responding, which is UNKNOWN, not "never ran".
             "last_seen_responding_at": runner.last_seen_responding_at.map(|t| t.to_rfc3339()),
             "port_open": cached.runner_port_open,
+            // Whether the newest spawn is alive while the port is free and the
+            // API silent: a runner that has not bound its listener (yet). It is
+            // why `liveness` reads `unknown` rather than `stopped` there, and
+            // why a Start would be refused (`RunnerAlreadyRunning`).
+            "spawn_up": cached.spawn_up,
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
             "api_responding": cached.runner_responding,

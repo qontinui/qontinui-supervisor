@@ -138,6 +138,10 @@ pub struct RunnerInstanceHealth {
     /// is derived from, so an operator can check the derivation rather than
     /// trust it.
     pub port_open: bool,
+    /// Whether this runner's newest spawn is alive while its port is free and
+    /// its API silent (`CachedPortHealth::spawn_up`): a runner that has not
+    /// bound its listener. The third input `liveness` is derived from.
+    pub spawn_up: bool,
 }
 
 #[derive(Serialize)]
@@ -164,6 +168,9 @@ pub struct RunnerHealth {
     pub answered_this_boot: Option<bool>,
     /// When the primary's API was last seen responding, RFC3339.
     pub last_seen_responding_at: Option<String>,
+    /// Whether the primary's newest spawn is alive while its port is free and
+    /// its API silent, as on `runners[]`.
+    pub spawn_up: bool,
 }
 
 #[derive(Serialize)]
@@ -623,6 +630,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 answered_this_boot: r.answered_this_boot,
                 last_seen_responding_at: r.last_seen_responding_at.map(|t| t.to_rfc3339()),
                 port_open: r.port_open,
+                spawn_up: r.spawn_up,
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -676,6 +684,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let cached = state.cached_health.read().await;
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
+    let api_spawn_up = cached.spawn_up;
     drop(cached);
 
     // Use primary ManagedRunner state (not the legacy state.runner which is never
@@ -725,7 +734,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pr.pid,
             pr.started_at,
             watchdog,
-            pr.liveness(api_in_use, api_responding),
+            pr.liveness(api_in_use, api_responding, api_spawn_up),
             pr.answered_this_boot(),
             pr.last_seen_responding_at,
             frontend,
@@ -739,7 +748,8 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             runner.pid,
             runner.started_at,
             WatchdogHealth::unavailable(),
-            runner.liveness(api_in_use, api_responding),
+            // The legacy state has no spawn ring.
+            runner.liveness(api_in_use, api_responding, false),
             runner.answered_this_boot(),
             runner.last_seen_responding_at,
             PrimaryFrontend::default(),
@@ -791,10 +801,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             ui_error: cached.and_then(|c| c.ui_error.clone()),
             recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
-            liveness: mr.liveness(mc.runner_port_open, mc.runner_responding),
+            liveness: mr.liveness(mc.runner_port_open, mc.runner_responding, mc.spawn_up),
             answered_this_boot: mr.answered_this_boot(),
             last_seen_responding_at: mr.last_seen_responding_at.map(|t| t.to_rfc3339()),
             port_open: mc.runner_port_open,
+            spawn_up: mc.spawn_up,
         });
     }
     drop(cached_snapshots);
@@ -810,6 +821,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             liveness: primary_liveness,
             answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
+            spawn_up: api_spawn_up,
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -885,6 +897,7 @@ fn try_build_sse_health(
 
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
+    let api_spawn_up = cached.spawn_up;
 
     // Use the primary runner from cached snapshots (not the legacy
     // state.runner which is never updated for user-managed runners).
@@ -966,6 +979,7 @@ fn try_build_sse_health(
             liveness: primary_liveness,
             answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
+            spawn_up: api_spawn_up,
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -1283,6 +1297,7 @@ mod tests {
             answered_this_boot: None,
             last_seen_responding_at: None,
             port_open: true,
+            spawn_up: false,
             frontend_ready: None,
             frontend_state: None,
             frontend_not_ready_since: None,
@@ -1490,6 +1505,7 @@ mod tests {
                 liveness: crate::state::RunnerLiveness::Responding,
                 answered_this_boot: None,
                 last_seen_responding_at: None,
+                spawn_up: false,
             },
             ports: PortsHealth {
                 api_port: PortStatus {
@@ -1659,6 +1675,7 @@ mod tests {
             answered_this_boot: Some(false),
             last_seen_responding_at: Some(seen.to_rfc3339()),
             port_open: true,
+            spawn_up: false,
         });
 
         let value = serde_json::to_value(&response).expect("health response serializes");
@@ -1683,6 +1700,9 @@ mod tests {
         // Beside the verdict: a wedged reading on a stamp this boot never made.
         assert_eq!(value["runner"]["answered_this_boot"], false);
         assert_eq!(row["answered_this_boot"], false);
+        // The third liveness input rides beside `port_open` on both shapes.
+        assert_eq!(value["runner"]["spawn_up"], false);
+        assert_eq!(row["spawn_up"], false);
         // The pre-existing fields keep their meanings and values.
         assert_eq!(row["running"], true);
         assert_eq!(row["api_responding"], false);
@@ -1728,6 +1748,7 @@ mod tests {
                 liveness: crate::state::RunnerLiveness::Unknown,
                 answered_this_boot: None,
                 last_seen_responding_at: None,
+                spawn_up: false,
             },
             ports: PortsHealth {
                 api_port: PortStatus {

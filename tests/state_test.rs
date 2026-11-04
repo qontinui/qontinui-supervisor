@@ -103,6 +103,7 @@ fn test_cached_port_health_clone() {
     let health = CachedPortHealth {
         runner_port_open: true,
         runner_responding: true,
+        spawn_up: false,
     };
 
     let cloned = health.clone();
@@ -126,6 +127,7 @@ async fn test_cached_port_health_update() {
         *cached = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
+            spawn_up: false,
         };
     }
 
