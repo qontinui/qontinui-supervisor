@@ -457,7 +457,7 @@ pub async fn rebuild_when_idle(
     // name rather than borrowing the one the 202 body still needs.
     let exec_runner_name = runner_name.clone();
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
@@ -634,7 +634,7 @@ pub async fn rebuild_when_idle(
 
             rebuilt_body(&result, started.elapsed().as_secs(), ticks, &last_reason)
         },
-    );
+    ).await;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -735,7 +735,7 @@ pub async fn restart_runner(
         let do_health_wait = wait_q.wait;
         let exec_guard = run_guard;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
-            state.build_submissions.clone(),
+            &state.build_submissions,
             state.config.project_dir.clone(),
             None,
             async move {
@@ -902,7 +902,8 @@ pub async fn restart_runner(
                     }),
                 )
             },
-        );
+        )
+        .await;
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -1334,7 +1335,7 @@ pub async fn fix_and_rebuild(
     let exec_record = minted.record.clone();
     let exec_guard = RunResultGuard::arm(minted.record.clone(), "fix-and-rebuild's detached task");
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
@@ -1362,7 +1363,8 @@ pub async fn fix_and_rebuild(
                 }
             }
         },
-    );
+    )
+    .await;
 
     // Record the new in-flight submission id for idempotent-accept dedup.
     {
@@ -1875,14 +1877,13 @@ mod tests {
         // AWAITED it would also have returned in milliseconds. The clock could
         // not distinguish the two states it was there to separate.
         //
-        // The submission store's write lock can. It is the detached task's
-        // first instruction (`build_submissions::submit_detached` → `spawn` →
-        // `submissions.write()`), and `restart_runner` itself never touches it,
-        // so holding it here pins the detached task at instruction one while
-        // leaving the handler free. A handler that awaited the detached body
-        // could not return; a detached one returns anyway. Plan
+        // The submission's status can. `submit_detached` registers it `Queued`
+        // and the detached task moves it on, and on this current-thread runtime
+        // that task cannot run until the test yields. So straight after the 202
+        // a detached body has not started, while a handler that awaited it would
+        // have left the submission terminal, read below. Plan
         // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
-        let registration_gate = state.build_submissions.submissions.write().await;
+        //
         // Not a speed budget: it turns "wedged forever" into a red instead of a
         // hang, so it is sized against forever, not against a measured idle run.
         let wedge_backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
@@ -1906,16 +1907,12 @@ mod tests {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "the handler did not return while the detached task was pinned at its \
-                 registration lock — rebuild:true is AWAITING the build, not detaching \
-                 (waited {wedge_backstop:?})"
+                "the handler did not return, so rebuild:true is AWAITING the build, not \
+                 detaching (waited {wedge_backstop:?})"
             )
         })
         .expect("handler ok")
         .into_response();
-        // Release the detached task now that the handler has demonstrably
-        // returned without it.
-        drop(registration_gate);
         let (status, body) = body_json(resp).await;
 
         assert_eq!(status, 202, "rebuild:true must return 202 (detached)");
@@ -1935,35 +1932,32 @@ mod tests {
             body["build_id"].is_string(),
             "must carry a submission id for /builds correlation"
         );
-        // submit_detached registers the submission on a spawned task; give it a
-        // beat to insert, then confirm a new build is observable via the store
-        // that backs GET /builds / GET /build/{id}/status.
+        // The new build is observable through the store that backs GET /builds
+        // and GET /build/{id}/status as soon as the 202 names it.
         let build_id = body["build_id"].as_str().unwrap().to_string();
         let target = uuid::Uuid::parse_str(&build_id).expect("build_id is a uuid");
-        // Give-up budgets on poll-until-true loops, not speed assertions: each
-        // exits the instant its property holds, so a generous budget costs a
-        // passing run nothing and only delays a genuine failure. The old fixed
-        // 100 x 20ms was a 2s ceiling sized against a quiet box.
-        let register_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
-        let register_deadline = std::time::Instant::now() + register_budget;
-        let mut arc = None;
-        while std::time::Instant::now() < register_deadline {
-            if let Some(a) = state.build_submissions.get(&target).await {
-                arc = Some(a);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let arc = arc.unwrap_or_else(|| {
-            panic!(
-                "the detached rebuild must register a build submission (waited {register_budget:?})"
-            )
-        });
+        let arc = state
+            .build_submissions
+            .get(&target)
+            .await
+            .expect("the 202 names a registered submission");
+        // Nothing has yielded since the handler returned.
+        assert!(
+            matches!(
+                arc.read().await.status,
+                crate::build_submissions::BuildStatus::Queued
+            ),
+            "the handler returned with the body already run, so rebuild:true AWAITED the build"
+        );
 
         // The detached task runs independently of this (already-returned)
         // handler. With the pool semaphore closed it fails fast and the
         // submission reaches a terminal status — proving the task ran to
         // completion on its own.
+        //
+        // A give-up budget on a poll-until-true loop, not a speed assertion: it
+        // exits the instant the property holds, so a generous budget costs a
+        // passing run nothing and only delays a genuine failure.
         let terminal_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
         let terminal_deadline = std::time::Instant::now() + terminal_budget;
         let mut terminal = false;

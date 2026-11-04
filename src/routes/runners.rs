@@ -1522,7 +1522,7 @@ pub async fn restart_runner(
             )
         });
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
-            state.build_submissions.clone(),
+            &state.build_submissions,
             state.config.project_dir.clone(),
             None,
             async move {
@@ -1588,7 +1588,8 @@ pub async fn restart_runner(
                     }),
                 )
             },
-        );
+        )
+        .await;
 
         return Ok((
             axum::http::StatusCode::ACCEPTED,
@@ -1729,7 +1730,7 @@ pub async fn rebuild_and_restart_runner(
         )
     });
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
@@ -1776,7 +1777,8 @@ pub async fn rebuild_and_restart_runner(
                 }
             }
         },
-    );
+    )
+    .await;
 
     Ok((
         axum::http::StatusCode::ACCEPTED,
@@ -3330,7 +3332,6 @@ pub async fn spawn_test(
     // - sync (default): await the submission's terminal state in-handler and
     //   return the stored outcome. Both paths share one state machine.
     let want_async = body.r#async;
-    let store = state.build_submissions.clone();
     let exec_state = state.clone();
     let exec_managed = managed.clone();
     let exec_id = id.clone();
@@ -3353,7 +3354,7 @@ pub async fn spawn_test(
     let exec_release_id = release_id.clone();
     let exec_release_state = state.clone();
     let (submission_id, sub_arc) = crate::build_submissions::submit_spawn(
-        store,
+        &state.build_submissions,
         worktree_label,
         source_label,
         agent_id,
@@ -3383,7 +3384,8 @@ pub async fn spawn_test(
             .await;
             (status, exec_minted.stamp(body_json), stderr_tail)
         },
-    );
+    )
+    .await;
     let _ = release_id.set(submission_id);
     // Publish the claim: from here a duplicate request for this key joins this
     // build. Dropping the guard also releases the index write lock.

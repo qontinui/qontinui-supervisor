@@ -1799,17 +1799,17 @@ impl SupervisorState {
 
     /// Is this build submission still running?
     ///
-    /// An id the store does not know is **UNKNOWN, not finished**:
-    /// `build_submissions::submit_spawn` registers the submission from a
-    /// spawned task, so a just-started build is briefly absent from the store.
-    /// Reading that absence as "terminal" would let a retry arriving in exactly
-    /// that window start the duplicate build this index exists to prevent.
-    /// Entries are removed on completion, so a genuinely finished build has no
-    /// index entry to consult in the first place.
+    /// An id the store does not know is **finished**, and this is evidence rather
+    /// than a default. `build_submissions::submit_spawn` registers the submission
+    /// before the claim is committed, so every index entry had a store row first,
+    /// and the store evicts only terminal rows. Reading the absence as "running"
+    /// would make every later request for this key join a build that has ended,
+    /// until the supervisor restarted. Entries are normally removed on completion,
+    /// so this answers for the one the exec task could not release.
     async fn spawn_build_in_flight(&self, submission_id: uuid::Uuid) -> bool {
         match self.build_submissions.get(&submission_id).await {
             Some(arc) => !arc.read().await.status.is_terminal(),
-            None => true,
+            None => false,
         }
     }
 
@@ -3294,26 +3294,22 @@ mod tests {
         );
     }
 
-    /// A build id the store has never heard of is UNKNOWN, not finished:
-    /// `submit_spawn` registers from a spawned task, so a just-started build is
-    /// briefly absent. Reading that as terminal would let the retry arriving in
-    /// exactly that window start the duplicate build.
+    /// A build id the store no longer holds has been evicted, and only a terminal
+    /// row is: `submit_spawn` registers before the claim commits, so no live build
+    /// is absent. Joining it would answer every later request with a dead build.
     #[tokio::test]
-    async fn an_unregistered_submission_reads_as_in_flight() {
+    async fn an_evicted_submission_does_not_read_as_in_flight() {
         let state = spawn_state();
         let key = dedup_key("agent-1", "origin_main");
-        let id = uuid::Uuid::new_v4();
         state
             .spawn_test_inflight
             .write()
             .await
-            .insert(key.clone(), inflight(id, 9877));
+            .insert(key.clone(), inflight(uuid::Uuid::new_v4(), 9877));
 
         match state.claim_spawn_build(Some(key)).await {
-            SpawnTicket::Join(existing) => assert_eq!(existing.submission_id, id),
-            SpawnTicket::Claim(_) => {
-                panic!("an unregistered submission must read as in flight, not as terminal")
-            }
+            SpawnTicket::Claim(_) => {}
+            SpawnTicket::Join(_) => panic!("a build the store evicted must not be joined"),
         };
     }
 
