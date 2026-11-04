@@ -5752,19 +5752,49 @@ async fn answer_the_port_after_the_boot_exits(managed: Arc<ManagedRunner>) {
     axum::serve(listener, app).await.expect("serve /health");
 }
 
-/// The trial the newest door minted must read as a boot that did not come up.
-async fn assert_the_newest_trial_read_its_boot_as_ended(state: &SharedState) {
+/// Answer `managed`'s `/health` while its newest spawn is still up: the boot itself
+/// is alive when the port first answers, so it is this boot the answer is read
+/// against. Same lifetime rule as `answer_the_port_after_the_boot_exits`.
+#[cfg(unix)]
+async fn answer_the_port_while_the_boot_is_up(managed: Arc<ManagedRunner>) {
+    loop {
+        let up = managed
+            .recent_spawns
+            .read()
+            .await
+            .newest()
+            .is_some_and(|spawn| {
+                spawn.exited_at.is_none()
+                    && spawn.pid.is_some_and(crate::process::proc_kill::pid_alive)
+            });
+        if up {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", managed.config.port))
+        .await
+        .expect("bind the runner's port");
+    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+    axum::serve(listener, app).await.expect("serve /health");
+}
+
+/// The trial the newest door minted must read as `Ran` when its own boot was up
+/// when the port answered, and as a boot that did not come up otherwise.
+async fn assert_the_newest_trial_read_its_own_boot(state: &SharedState, boot_was_up: bool) {
     let newest = state.dev_actions.read().await.recent(1);
     let trial = newest.first().expect("the trial");
-    match trial.run_result() {
-        Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
+    match (boot_was_up, trial.run_result()) {
+        (true, Some(crate::dev_action::ActionRunResult::Ran)) => {}
+        (true, other) => panic!("a boot that answered must read as up: {other:?}"),
+        (false, Some(crate::dev_action::ActionRunResult::Errored { reason })) => {
             assert!(
                 reason.starts_with(crate::dev_action::run_result::UNHEALTHY_AFTER_START),
                 "{reason}"
             );
             assert!(reason.contains("had exited or been replaced"), "{reason}");
         }
-        other => panic!("a boot that exited must not read as up: {other:?}"),
+        (false, other) => panic!("a boot that exited must not read as up: {other:?}"),
     }
 }
 
@@ -5796,21 +5826,29 @@ async fn a_door_answered_text_file_busy(
     })
 }
 
-/// Drive one held-open door against `exiting_stub_primary`, with its port answered
-/// once the boot exits, then check the door and its trial.
+/// Drive one held-open door with its port answered by `answer`, then check the door
+/// and its trial: `boot_was_up` says whether the boot was alive when `answer` bound.
 ///
 /// The listener is ended, and awaited, before anything else: before the assertions
 /// and before the stub is stopped, so the stop's ladder never finds this process on
 /// the runner's port, even when the door itself panicked. A listener that failed to
-/// bind re-raises its panic, rather than surfacing as the health wait's timeout.
-async fn through_a_held_open_door<F, Fut>(state: SharedState, managed: Arc<ManagedRunner>, door: F)
-where
+/// bind re-raises its panic, rather than surfacing as the health wait's timeout. The
+/// stub is then stopped BEFORE the trial is read, so a boot that answered and was
+/// stopped later is read after its stop.
+async fn through_a_held_open_door<A, F, Fut>(
+    state: SharedState,
+    managed: Arc<ManagedRunner>,
+    answer: A,
+    boot_was_up: bool,
+    door: F,
+) where
+    A: std::future::Future<Output = ()> + Send + 'static,
     F: Fn(SharedState) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<axum::response::Response, SupervisorError>>
         + Send
         + 'static,
 {
-    let answering = tokio::spawn(answer_the_port_after_the_boot_exits(managed.clone()));
+    let answering = tokio::spawn(answer);
     let answered = {
         let state = state.clone();
         tokio::spawn(async move {
@@ -5842,7 +5880,7 @@ where
     answering.abort();
     let listened = answering.await;
     let body = {
-        let state = state.clone();
+        let (state, managed) = (state.clone(), managed.clone());
         async move {
             if let Err(failure) = listened {
                 if failure.is_panic() {
@@ -5854,7 +5892,8 @@ where
                 Err(failure) => std::panic::resume_unwind(failure.into_panic()),
             };
             assert_eq!(response.status(), axum::http::StatusCode::OK);
-            assert_the_newest_trial_read_its_boot_as_ended(&state).await;
+            stop_the_stub(&state, &managed).await;
+            assert_the_newest_trial_read_its_own_boot(&state, boot_was_up).await;
         }
     };
     with_the_stub_stopped_after(&state, &managed, body).await;
@@ -5868,7 +5907,8 @@ where
 async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
     let (state, managed, _root) = exiting_stub_primary(29_882).await;
     let id = managed.config.id.clone();
-    through_a_held_open_door(state, managed, move |state| {
+    let answer = answer_the_port_after_the_boot_exits(managed.clone());
+    through_a_held_open_door(state, managed, answer, false, move |state| {
         crate::routes::runners::start_runner(
             axum::extract::State(state),
             axum::extract::Path(id.clone()),
@@ -5883,7 +5923,8 @@ async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot() {
     let (state, managed, _root) = exiting_stub_primary(29_883).await;
-    through_a_held_open_door(state, managed, |state| {
+    let answer = answer_the_port_after_the_boot_exits(managed.clone());
+    through_a_held_open_door(state, managed, answer, false, |state| {
         crate::routes::runner::restart_runner(
             axum::extract::State(state),
             axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
@@ -5894,6 +5935,27 @@ async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot()
                 use_lkg: Some(false),
                 handoff: false,
             }),
+        )
+    })
+    .await;
+}
+
+/// The complement at `POST /runners/{id}/start`: the boot is alive when its port
+/// first answers, and is stopped only after the door has answered. Its trial asked
+/// whether its own boot came up, and it did, so it reads `Ran` though the boot is
+/// gone by the time the trial is read. Unix only: the one stub that stays up is
+/// `stub_primary`'s bash.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_open_start_whose_boot_answered_reads_ran_though_it_was_stopped_later() {
+    let (state, managed, _root) = stub_primary(29_884).await;
+    let id = managed.config.id.clone();
+    let answer = answer_the_port_while_the_boot_is_up(managed.clone());
+    through_a_held_open_door(state, managed, answer, true, move |state| {
+        crate::routes::runners::start_runner(
+            axum::extract::State(state),
+            axum::extract::Path(id.clone()),
+            axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
         )
     })
     .await;
