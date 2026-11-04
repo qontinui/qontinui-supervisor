@@ -327,6 +327,36 @@ describe('Dashboard', () => {
     expect(screen.queryByText(/Runner: stopped/)).not.toBeInTheDocument();
   });
 
+  it('reports a primary whose spawn is up but unbound as starting, not stopped', async () => {
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'degraded',
+      runner: {
+        running: false,
+        pid: 148320,
+        api_responding: false,
+        spawn_up: true,
+        answered_this_boot: false,
+        liveness: { state: 'unknown', unresponsive_since: null },
+        last_seen_responding_at: null,
+      },
+      ports: { api_port: { port: 9876, in_use: false } },
+      watchdog: {
+        enabled: true,
+        restart_attempts: 0,
+        crash_count: 0,
+        crash_restart_armed: true,
+      },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+
+    expect(await screen.findByText(/starting \(alive, port not bound\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Runner: stopped/)).not.toBeInTheDocument();
+  });
+
   it('is unchanged for a healthy primary from a supervisor that omits liveness', async () => {
     // Default mock carries no `liveness` field at all (an older supervisor).
     // An absent verdict must never change what the header says.
@@ -431,7 +461,9 @@ describe('Dashboard — a live spawn with no port', () => {
     id: 'named-prebind',
     name: 'named-prebind',
     port: 9890,
-    kind: { type: 'named' },
+    // An external runner's `running` is lowered by the probe, so this is the
+    // shape the backend actually produces for a pre-bind spawn.
+    kind: { type: 'external' },
     protected: true,
     running: false,
     pid: 4242,

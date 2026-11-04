@@ -935,7 +935,9 @@ function RunnerRow({
       <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
       <td>
         <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-          <StatusDot up={isUp && !isWedged} error={isWedged} />
+          {/* A live spawn that has not answered is not "up": the dot stays grey
+              while `isUp` still gates Start/Stop. */}
+          <StatusDot up={isUp && !isWedged && !(r.spawn_up === true && !r.api_responding)} error={isWedged} />
           <RunnerStatusBadge
             derivedStatus={r.derived_status}
             liveness={r.liveness}
@@ -1632,11 +1634,15 @@ function DashboardInner() {
             Runner:{' '}
             {h.runner.liveness?.state === 'wedged'
               ? 'WEDGED (alive, API silent)'
-              : h.runner.running
+              : h.runner.spawn_up === true && !h.runner.api_responding
+                ? 'starting (alive, port not bound)'
+                : h.runner.running
                 ? 'running'
-                : h.runner.api_responding
-                  ? 'external (not supervised)'
-                  : 'stopped'}
+                  : h.runner.api_responding
+                    ? 'external (not supervised)'
+                    : h.runner.liveness?.state === 'unknown'
+                      ? 'unknown'
+                      : 'stopped'}
             {h.runner.liveness?.state !== 'wedged' && h.runner.api_responding && h.runner.running
               ? ' (API ok)'
               : ''}

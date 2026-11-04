@@ -793,10 +793,9 @@ exactly the kind an agent spawns and then waits on. The guard now covers only
 the `running` sync and the pid rules; `health_cache`'s
 `the_wedge_signal_is_not_gated_on_runner_ownership` pins it by scanning the
 guard's brace span, because a prose comment saying "every runner kind" cannot
-notice being moved back inside one. The escalation's "not restarting" reason is
-kind-aware: a supervisor-managed runner is not exempt because it is observed
-only — it is exempt because a wedge is not an exit (the crash-only watchdog
-does not cover it) and a restart destroys the in-flight work and the evidence.
+notice being moved back inside one. The escalation's reason clause is no longer
+kind-aware: it says what the serving arm decided on that tick
+(`serving_decision_clause`), or that no decision was evaluated.
 
 **The escalation is keyed on the classification, not on the raw probes.** It
 used to fire on `!responding && port_open`, which is BROADER than the `wedged`

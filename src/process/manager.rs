@@ -4611,7 +4611,11 @@ pub async fn maybe_serving_restart(
             };
             let silence = never_answered_silence_secs(started_at, now);
             let silent_for = match silence {
-                Some(secs) => format!("for the {secs}s since its start ({started_at:?})"),
+                Some(secs) => {
+                    let since = if adopted { "adoption" } else { "start" };
+                    let at = started_at.map(|t| t.to_rfc3339()).unwrap_or_default();
+                    format!("for the {secs}s since its {since} ({at})")
+                }
                 None => "(no start recorded, so the silence is not measured)".to_string(),
             };
             let msg = format!(

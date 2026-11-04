@@ -707,7 +707,7 @@ pub async fn list_runners(
         // refresher as `RUNNER WEDGED`) — the classification simply never
         // reached this response.
         //
-        // Both inputs come from `managed.cached_health`, i.e. the SAME
+        // All three inputs come from `managed.cached_health`, i.e. the SAME
         // refresher tick that produced `api_responding` above, so this is not
         // a second liveness system and cannot disagree with the escalation
         // log. A runner the refresher has not reached yet reads
