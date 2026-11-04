@@ -16,16 +16,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+
 use crate::coord_client::coord_base;
 use crate::dev_action::{
-    assess_then_cut, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    assess_then_cut, evaluate_all, fetch_expectations, run_result_for, spawn_attribution_watcher,
+    ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
 };
+use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::manager;
 use crate::state::{ManagedRunner, SharedState};
 
 /// What a mint hands back to its door.
+#[derive(Clone)]
 pub struct MintedAction {
     /// The stored record. The door records the act's terminal result on it.
     pub record: Arc<ActionRecord>,
@@ -61,6 +66,17 @@ impl MintedAction {
             body.extend(fields);
         }
         body
+    }
+
+    /// The response of a door whose act failed: `err`'s own status and body with
+    /// [`Self::ack_fields`] merged in, after recording `err` as the action's
+    /// terminal result. A failed act is when a caller most needs the verdict, and
+    /// this body names the action that holds it, so the caller need not search
+    /// `GET /actions`.
+    pub fn answer_failure(&self, err: &SupervisorError) -> Response {
+        self.record.record_run_result(run_result_for(err));
+        let (status, body) = err.to_status_body();
+        (status, Json(self.stamp(body))).into_response()
     }
 }
 
@@ -203,7 +219,7 @@ pub async fn commit_action(
 /// actionable risk (the healthy / no-history case), otherwise the `route_lkg`
 /// advice, the human-readable `warning`, and the `top_signature` evidence, so
 /// the initiator sees exactly what tripped the assessment.
-pub fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
+fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
     if !risk.is_actionable() {
         return serde_json::Value::Null;
     }
@@ -212,4 +228,88 @@ pub fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
         "warning": risk.warn,
         "top_signature": risk.top_signature,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev_action::test_support::{response_json, ACK_FIELDS};
+    use crate::dev_action::ActionRunResult;
+
+    fn minted() -> MintedAction {
+        let (predicted, risk) = assess_then_cut(Vec::new(), &[]);
+        MintedAction {
+            record: Arc::new(ActionRecord::new(
+                ActionKind::Restart,
+                None,
+                "test".to_string(),
+                &[],
+            )),
+            states_active: Vec::new(),
+            predicted,
+            risk,
+        }
+    }
+
+    /// The door tests assert [`ACK_FIELDS`], so a field added to the ACK has to be
+    /// added there too or this fails.
+    #[test]
+    fn the_door_tests_check_every_ack_field() {
+        let ack = minted().ack_fields();
+        let mut served: Vec<&str> = ack
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        served.sort_unstable();
+        let mut checked = ACK_FIELDS.to_vec();
+        checked.sort_unstable();
+        assert_eq!(served, checked);
+    }
+
+    #[test]
+    fn stamp_leaves_a_body_that_is_not_an_object_unchanged() {
+        let body = serde_json::json!(["not", "an", "object"]);
+        assert_eq!(minted().stamp(body.clone()), body);
+    }
+
+    /// A failure answers with the error's own status and body, the action's
+    /// fields beside them, and the error recorded as the action's result.
+    #[tokio::test]
+    async fn answer_failure_keeps_the_errors_response_and_records_its_result() {
+        let minted = minted();
+        let err = SupervisorError::PortHeldByLiveRunner {
+            port: 9877,
+            pid: 1234,
+        };
+        let (want_status, want_body) = err.to_status_body();
+
+        let (status, body) = response_json(minted.answer_failure(&err)).await;
+
+        assert_eq!(status, want_status.as_u16());
+        for (key, value) in want_body.as_object().expect("an object") {
+            assert_eq!(&body[key], value, "the error's own `{key}`: {body}");
+        }
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+        assert_eq!(body["action_id"], minted.record.action_id.to_string());
+        assert_eq!(minted.record.run_result(), Some(run_result_for(&err)));
+    }
+
+    /// The first recorded result stands, as it does for every other writer, and
+    /// the response still reports the failure it was asked to answer.
+    #[tokio::test]
+    async fn answer_failure_does_not_overwrite_a_recorded_result() {
+        let minted = minted();
+        let recorded = ActionRunResult::Refused {
+            reason: "recorded first".to_string(),
+        };
+        minted.record.record_run_result(recorded.clone());
+
+        let (status, _) =
+            response_json(minted.answer_failure(&SupervisorError::RunnerAlreadyRunning)).await;
+
+        assert_eq!(status, 409);
+        assert_eq!(minted.record.run_result(), Some(recorded));
+    }
 }

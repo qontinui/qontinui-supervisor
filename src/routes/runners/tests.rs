@@ -486,6 +486,35 @@ fn sync_spawn_test_wait_is_shutdown_aware() {
     );
 }
 
+/// A shutdown latched before the synchronous wait starts takes the shutdown arm:
+/// on this current-thread runtime the exec task has not run, so the submission
+/// is not terminal. The answer says abandoned and names the action the mint
+/// created.
+#[tokio::test]
+async fn spawn_test_abandoned_at_shutdown_names_its_action() {
+    use axum::response::IntoResponse;
+    let (state, _root) = state_over_an_empty_runner_tree();
+    state.signal_shutdown();
+
+    let resp = super::spawn_test(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({"rebuild": false})),
+    )
+    .await
+    .expect("the abandoned spawn renders its answer")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "spawn_abandoned", "{body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+    assert_eq!(
+        body["action_id"],
+        only_action(&state).await.action_id.to_string()
+    );
+}
+
 /// S-4 at the route: the spawn path hands `paired_profile_id` to the
 /// paired-state decision UNCONDITIONALLY (so an absent id reaches the
 /// primary-snapshot arm, which `no_paired_profile_id_applies_the_primary_snapshot`
@@ -3703,13 +3732,7 @@ async fn await_action_result(
     }
 }
 
-async fn json_body(resp: axum::response::Response) -> (u16, serde_json::Value) {
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("collect body");
-    (status, serde_json::from_slice(&bytes).expect("a JSON body"))
-}
+use crate::dev_action::test_support::response_json as json_body;
 
 /// T1-4. spawn-test's chokepoint records the spawn's own failure on its
 /// action: a `rebuild: false` spawn over a tree with no runner exe.
@@ -3742,9 +3765,10 @@ async fn spawn_test_records_a_failure_run_result_on_the_action() {
     );
 }
 
-/// The synchronous spawn-test renders its ACK at its own site, so it is pinned
-/// apart from the async 202: the failed spawn's body still names the action and
-/// carries what the mint said about coord's answer.
+/// The synchronous spawn-test answers with the outcome the exec future stored,
+/// not the async 202's body, so it is pinned apart from that 202: the failed
+/// spawn's body still names the action and carries what the mint said about
+/// coord's answer.
 #[tokio::test]
 async fn synchronous_spawn_test_failure_carries_its_action_fields() {
     use axum::response::IntoResponse;
@@ -3764,6 +3788,56 @@ async fn synchronous_spawn_test_failure_carries_its_action_fields() {
         body["action_id"],
         only_action(&state).await.action_id.to_string()
     );
+}
+
+/// `GET /build/{id}/status` serves the body the synchronous call would have
+/// returned, so the outcome an async spawn-test stored carries the action fields
+/// its 202 did.
+#[tokio::test]
+async fn async_spawn_test_stored_outcome_carries_its_action_fields() {
+    use axum::response::IntoResponse;
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let resp = super::spawn_test(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(serde_json::json!({"async": true, "rebuild": false})),
+    )
+    .await
+    .expect("the async path answers 202")
+    .into_response();
+    let (status, ack) = json_body(resp).await;
+    assert_eq!(status, 202, "{ack}");
+    let submission_id: uuid::Uuid = ack["submission_id"]
+        .as_str()
+        .expect("the 202 names its submission")
+        .parse()
+        .expect("a uuid");
+    let action_id: uuid::Uuid = ack["action_id"]
+        .as_str()
+        .expect("the 202 names its action")
+        .parse()
+        .expect("a uuid");
+
+    // The submission registers itself inside the task that runs the spawn, so it
+    // is in the store once that task has recorded the action's result.
+    await_action_result(&state, action_id).await;
+    let submission = state
+        .build_submissions
+        .get(&submission_id)
+        .await
+        .expect("the submission is stored");
+    crate::build_submissions::await_terminal(&submission).await;
+    let outcome = submission
+        .read()
+        .await
+        .spawn
+        .clone()
+        .expect("a terminal spawn submission stores its outcome");
+
+    assert!(outcome.http_status >= 400, "{}", outcome.body);
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&outcome.body);
+    assert_eq!(outcome.body["action_id"], ack["action_id"]);
+    assert_eq!(outcome.body["outcome_url"], ack["outcome_url"]);
 }
 
 /// T1-5. spawn-named records its failure on its action too, and its failed
@@ -4166,8 +4240,7 @@ async fn register_dead_unprotected_named_runner(
     managed
 }
 
-/// The one action a door minted, by the id its response named or, for a door
-/// that answered with an error, the only record in the store.
+/// The one action a door minted: the only record in the store.
 async fn only_action(state: &crate::state::SharedState) -> Arc<crate::dev_action::ActionRecord> {
     let recent = state.dev_actions.read().await.recent(10);
     assert_eq!(
@@ -4179,25 +4252,34 @@ async fn only_action(state: &crate::state::SharedState) -> Arc<crate::dev_action
 }
 
 /// `POST /runners/{id}/restart` without a rebuild mints a `restart` trial on
-/// the named runner, and the restart's failure lands on it as `Errored` with
-/// the start's own error rather than closing `Confirmed`.
+/// the named runner, the restart's failure lands on it as `Errored` with the
+/// start's own error rather than closing `Confirmed`, and the failed response
+/// names the action. An id naming no runner mints nothing, so its 404 has no
+/// action to name.
 #[tokio::test]
 async fn per_runner_restart_mints_restart_and_records_errored_on_failure() {
+    use axum::response::IntoResponse;
     let (state, _root) = state_over_an_empty_runner_tree();
     let id = "named-d2-restart";
     register_dead_unprotected_named_runner(&state, id).await;
-    let request: super::RestartRunnerRequest =
-        serde_json::from_value(serde_json::json!({ "rebuild": false })).expect("request");
+    let request = || -> super::RestartRunnerRequest {
+        serde_json::from_value(serde_json::json!({ "rebuild": false })).expect("request")
+    };
 
-    let err = super::restart_runner(
+    let resp = super::restart_runner(
         axum::extract::State(state.clone()),
         axum::extract::Path(id.to_string()),
-        axum::Json(request),
+        axum::Json(request()),
     )
     .await
-    .expect_err("there is no runner exe to start");
+    .expect("the failed restart renders its action")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+    assert!(status >= 400, "{status} {body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
 
     let record = only_action(&state).await;
+    assert_eq!(body["action_id"], record.action_id.to_string());
     assert_eq!(record.kind, crate::dev_action::ActionKind::Restart);
     assert!(
         record.params_digest.contains(&format!("runner={id}")),
@@ -4206,10 +4288,23 @@ async fn per_runner_restart_mints_restart_and_records_errored_on_failure() {
     );
     match record.run_result() {
         Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
-            assert_eq!(reason, err.to_string(), "the restart's own error")
+            assert_eq!(body["error"], reason, "the restart's own error")
         }
         other => panic!("expected Errored, got {other:?}"),
     }
+
+    let missing = super::restart_runner(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("no-such-runner".to_string()),
+        axum::Json(request()),
+    )
+    .await
+    .expect_err("no such runner");
+    assert!(
+        matches!(missing, crate::error::SupervisorError::RunnerNotFound(_)),
+        "{missing}"
+    );
+    assert_eq!(state.dev_actions.read().await.recent(10).len(), 1);
 }
 
 /// `POST /runners/{id}/restart {"rebuild": true}` mints a `build` trial before
@@ -4255,27 +4350,33 @@ async fn per_runner_restart_rebuild_202_carries_action_id() {
     );
 }
 
-/// `POST /runners/{id}/start` mints a `spawn` trial on the named runner and
-/// records the start's failure on it.
+/// `POST /runners/{id}/start` mints a `spawn` trial on the named runner,
+/// records the start's failure on it, and names it in the failed response.
 #[tokio::test]
 async fn per_runner_start_mints_spawn() {
+    use axum::response::IntoResponse;
     let (state, _root) = state_over_an_empty_runner_tree();
     let id = "named-d2-start";
     register_dead_unprotected_named_runner(&state, id).await;
 
-    let err = super::start_runner(
+    let resp = super::start_runner(
         axum::extract::State(state.clone()),
         axum::extract::Path(id.to_string()),
         axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: false }),
     )
     .await
-    .expect_err("there is no runner exe to start");
+    .expect("the failed start renders its action")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+    assert!(status >= 400, "{status} {body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
 
     let record = only_action(&state).await;
+    assert_eq!(body["action_id"], record.action_id.to_string());
     assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
     match record.run_result() {
         Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
-            assert_eq!(reason, err.to_string(), "the start's own error")
+            assert_eq!(body["error"], reason, "the start's own error")
         }
         other => panic!("expected Errored, got {other:?}"),
     }
@@ -4297,34 +4398,72 @@ async fn per_runner_start_mints_spawn() {
 
 /// `POST /runners/{id}/start` on a runner that is already up records its
 /// `spawn` trial `Refused`: the start refused before it touched anything, so
-/// the trial is a refusal and not a failed start.
+/// the trial is a refusal and not a failed start. The 409 names the trial.
 #[tokio::test]
 async fn per_runner_start_on_a_running_runner_records_refused() {
+    use axum::response::IntoResponse;
     let (state, _root) = state_over_an_empty_runner_tree();
     let id = "named-d2-start-running";
     let managed = register_dead_unprotected_named_runner(&state, id).await;
     managed.runner.write().await.running = true;
 
-    let err = super::start_runner(
+    let resp = super::start_runner(
         axum::extract::State(state.clone()),
         axum::extract::Path(id.to_string()),
         axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: false }),
     )
     .await
-    .expect_err("the runner is already running");
-    assert!(
-        matches!(err, crate::error::SupervisorError::RunnerAlreadyRunning),
-        "{err}"
-    );
+    .expect("the refused start renders its action")
+    .into_response();
+    let (status, body) = json_body(resp).await;
+    let refusal = crate::error::SupervisorError::RunnerAlreadyRunning.to_string();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], refusal, "{body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
 
     let record = only_action(&state).await;
+    assert_eq!(body["action_id"], record.action_id.to_string());
     assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
     assert_eq!(
         record.run_result(),
-        Some(crate::dev_action::ActionRunResult::Refused {
-            reason: err.to_string()
-        })
+        Some(crate::dev_action::ActionRunResult::Refused { reason: refusal })
     );
+}
+
+/// A runner that started and never bound its port is a 503 from a door that
+/// minted, and that action's watcher is what reads why. The two doors share this
+/// response; reaching it through either needs a real runner start.
+#[tokio::test]
+async fn unhealthy_after_start_response_names_its_action() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let id = "named-unhealthy-after-start";
+    let managed = register_dead_unprotected_named_runner(&state, id).await;
+    let minted = crate::dev_action::mint_action(
+        &state,
+        crate::dev_action::ActionKind::Spawn,
+        "unhealthy".to_string(),
+        None,
+        crate::dev_action::AttributionTargets::for_runner(managed),
+        None,
+    )
+    .await;
+
+    let resp = crate::routes::runner::unhealthy_after_start_response(
+        id,
+        crate::process::health_probe::HealthProbeFailure {
+            elapsed_ms: 1234,
+            recent_logs: vec!["ERROR boot failed".to_string()],
+        },
+        &minted,
+    );
+    let (status, body) = json_body(resp).await;
+
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "runner_unhealthy_after_start", "{body}");
+    assert_eq!(body["runner_id"], id, "{body}");
+    assert_eq!(body["elapsed_ms"], 1234, "{body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+    assert_eq!(body["action_id"], minted.record.action_id.to_string());
 }
 
 /// A rebuild-and-restart of a non-primary runner names its `build` trial in

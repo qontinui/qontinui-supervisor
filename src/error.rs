@@ -270,8 +270,10 @@ impl SupervisorError {
 
         if let SupervisorError::RestartUnsafe(detail) = self {
             // The payload is already the exact wire shape (built in
-            // `restart_readiness::decide`) so the body a caller reads and the
-            // body the log line carries can never drift.
+            // `restart_readiness::decide`) so the refusal a caller reads and the
+            // one the log line carries can never drift. A door that minted a trial
+            // merges its action fields on top
+            // (`dev_action::MintedAction::answer_failure`).
             return (StatusCode::CONFLICT, detail.payload.clone());
         }
 

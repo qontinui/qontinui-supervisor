@@ -126,18 +126,30 @@ pub(crate) fn five_rows_and_a_sixth_boot_row() -> Value {
     ])
 }
 
-/// A body naming a minted action carries every field of
-/// [`crate::dev_action::MintedAction::ack_fields`], each as a present key: `null`
-/// is an answer, and a missing key would have to be interpreted.
+/// A response's status and its JSON body.
+pub(crate) async fn response_json(response: Response) -> (u16, Value) {
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect the body");
+    (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+}
+
+/// The keys of [`crate::dev_action::MintedAction::ack_fields`].
+pub(crate) const ACK_FIELDS: [&str; 6] = [
+    "action_id",
+    "states_active",
+    "predicted",
+    "expectations_basis",
+    "risk",
+    "outcome_url",
+];
+
+/// A body naming a minted action carries every one of [`ACK_FIELDS`], each as a
+/// present key: `null` is an answer, and a missing key would have to be
+/// interpreted.
 pub(crate) fn assert_the_ack_carries_its_action_fields(ack: &Value) {
-    for key in [
-        "action_id",
-        "states_active",
-        "predicted",
-        "expectations_basis",
-        "risk",
-        "outcome_url",
-    ] {
+    for key in ACK_FIELDS {
         assert!(ack.get(key).is_some(), "the ACK lacks `{key}`: {ack}");
     }
 }

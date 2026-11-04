@@ -40,17 +40,19 @@ fn default_wait_true() -> bool {
 /// Build the standard 503 body for a runner that started but didn't bind
 /// its API port within the wait budget. Shared between the legacy
 /// `/runner/restart` and the per-runner `/runners/{id}/start` so both
-/// endpoints expose an identical contract.
+/// endpoints expose an identical contract, the action's fields included: its
+/// watcher is what reads why the runner never came up.
 pub(crate) fn unhealthy_after_start_response(
     runner_id: &str,
     failure: HealthProbeFailure,
+    minted: &MintedAction,
 ) -> Response {
-    let body = serde_json::json!({
+    let body = minted.stamp(serde_json::json!({
         "error": "runner_unhealthy_after_start",
         "runner_id": runner_id,
         "elapsed_ms": failure.elapsed_ms,
         "recent_logs": failure.recent_logs,
-    });
+    }));
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
@@ -990,10 +992,9 @@ pub async fn restart_runner(
     // minted before the `if rebuild` branch, so a readiness refusal here
     // returned 409 to the caller while the minted action still closed
     // `Confirmed` 30s later — and was ingested to coord that way.
-    if let Err(e) = &restart_result {
-        action_record.record_run_result(run_result_for(e));
+    if let Err(e) = restart_result {
+        return Ok(minted.answer_failure(&e));
     }
-    restart_result?;
 
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
@@ -1031,7 +1032,7 @@ pub async fn restart_runner(
                         ),
                     )
                     .await;
-                return Ok(unhealthy_after_start_response(&runner_id, failure));
+                return Ok(unhealthy_after_start_response(&runner_id, failure, &minted));
             }
             probe = SyncProbe::Healthy;
         }
@@ -1616,15 +1617,7 @@ mod tests {
         }
     }
 
-    async fn body_json(resp: axum::response::Response) -> (u16, serde_json::Value) {
-        let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("collect body");
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response body must be JSON");
-        (status, v)
-    }
+    use crate::dev_action::test_support::response_json as body_json;
 
     /// The primary mint site hands the watcher the primary's registry entry:
     /// the same `Arc` the restart starts again in place, which is where the
@@ -2115,7 +2108,7 @@ mod tests {
         // The gate therefore refuses — the same 409 `RestartUnsafe` the
         // observed incident produced, reached deterministically and without a
         // live runner anywhere in the loop.
-        let result = restart_runner(
+        let resp = restart_runner(
             State(state.clone()),
             Query(StartWaitQuery { wait: false }),
             Json(RestartRequest {
@@ -2126,18 +2119,31 @@ mod tests {
                 handoff: false,
             }),
         )
-        .await;
-        let err = result.expect_err("a refused restart must not report success");
-        assert!(
-            matches!(err, SupervisorError::RestartUnsafe(_)),
-            "expected the readiness gate's refusal, got {err:?}"
+        .await
+        .expect("the refusal renders its action");
+        let (status, body) = body_json(resp).await;
+        assert_eq!(
+            status, 409,
+            "a refused restart must not report success: {body}"
         );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("restart_refused")),
+            "expected the readiness gate's refusal, got {body}"
+        );
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
 
         let recent = state.dev_actions.read().await.recent(10);
         let record = recent
             .first()
             .cloned()
             .expect("the handler mints a dev-action before the restart runs");
+        assert_eq!(
+            body["action_id"],
+            record.action_id.to_string(),
+            "the refusal names the action it closed"
+        );
         let run = record
             .run_result()
             .expect("the failure must be recorded on the action");

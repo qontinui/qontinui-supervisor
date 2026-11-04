@@ -97,6 +97,7 @@ mod tests {
     use super::*;
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::dev_action::record::{ActionKind, ActionOutcome, ActionRecord, D3Category};
+    use crate::dev_action::test_support::response_json as body_json;
     use crate::state::{SharedState, SupervisorState};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -125,16 +126,6 @@ mod tests {
             ambient_coord: crate::config::AmbientCoord::Ignore,
         };
         Arc::new(SupervisorState::new(config))
-    }
-
-    async fn body_json(resp: axum::response::Response) -> (u16, serde_json::Value) {
-        let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("collect body");
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response body must be JSON");
-        (status, v)
     }
 
     #[tokio::test]

@@ -1273,7 +1273,8 @@ pub async fn purge_stale_test_runners_core(
 /// this endpoint polls the runner's `/health` for up to 30s (500ms cadence)
 /// before returning 200. If the runner stays alive but never binds the API
 /// port within the budget, the response is **503** with body
-/// `{error: "runner_unhealthy_after_start", elapsed_ms, recent_logs}`.
+/// `{error: "runner_unhealthy_after_start", runner_id, elapsed_ms, recent_logs}`
+/// plus the action's fields.
 ///
 /// Pass `?wait=false` to opt out and get the legacy fire-and-forget 200
 /// response the moment the process spawns (for callers that do their own
@@ -1283,8 +1284,9 @@ pub async fn purge_stale_test_runners_core(
 /// **A start is a `spawn` trial.** It mints one ([`mint_action`]) targeting
 /// the named runner before it acts, threads the action id into the start so
 /// the spawn's ring entry names it, records the start's terminal result on it,
-/// and carries `action_id` in the 200 body. An id naming no registered runner
-/// is a 404 before anything is minted: there is no lifecycle act to measure.
+/// and carries its fields in every response after the mint, a failed start's
+/// included. An id naming no registered runner is a 404 before anything is
+/// minted: there is no lifecycle act to measure.
 pub async fn start_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -1313,8 +1315,7 @@ pub async fn start_runner(
     )
     .await
     {
-        minted.record.record_run_result(run_result_for(&e));
-        return Err(e);
+        return Ok(minted.answer_failure(&e));
     }
 
     let mut probe = SyncProbe::NotProbed;
@@ -1341,7 +1342,7 @@ pub async fn start_runner(
                 ),
             });
             return Ok(crate::routes::runner::unhealthy_after_start_response(
-                &id, failure,
+                &id, failure, &minted,
             ));
         }
         probe = SyncProbe::Healthy;
@@ -1358,7 +1359,8 @@ pub async fn start_runner(
 /// Merge a minted action's ACK fields ([`MintedAction::ack_fields`]) into a
 /// lifecycle door's response body. With no action (the door minted none,
 /// because the id names no runner it could act on) `action_id` is `null`, so
-/// the key is always present and its absence never has to be interpreted.
+/// a body built here always carries the key and its absence never has to be
+/// interpreted.
 fn with_action_fields(
     mut body: serde_json::Value,
     minted: Option<&MintedAction>,
@@ -1429,11 +1431,12 @@ pub async fn stop_runner(
 /// outcome, and the existing detached completion logic triggers the restart.
 ///
 /// **Every restart is a dev-action trial** ([`mint_action`]): `build` with
-/// `rebuild: true`, `restart` without, targeting the named runner. Both
-/// response bodies carry its `action_id` (`null` when the id names no
-/// registered runner, which mints nothing), the action id names the restart's
-/// spawn ring entry, and the act's terminal result is recorded on the action,
-/// a readiness refusal included. Plan
+/// `rebuild: true`, `restart` without, targeting the named runner. Every
+/// response after the mint carries its fields, a failed restart's included. The
+/// rebuild 202 reads `action_id: null` when the id names no registered runner,
+/// which mints nothing; the no-rebuild arm answers that case with a plain 404.
+/// The action id names the restart's spawn ring entry, and the act's terminal
+/// result is recorded on the action, a readiness refusal included. Plan
 /// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows` D2.
 pub async fn restart_runner(
     State(state): State<SharedState>,
@@ -1607,10 +1610,12 @@ pub async fn restart_runner(
         minted.as_ref().map(|m| m.record.action_id),
     )
     .await;
-    if let (Err(e), Some(minted)) = (&restart, &minted) {
-        minted.record.record_run_result(run_result_for(e));
+    if let Err(e) = restart {
+        return match &minted {
+            Some(minted) => Ok(minted.answer_failure(&e)),
+            None => Err(e),
+        };
     }
-    restart?;
     if let Some(guard) = run_guard {
         record_start_verdict(&state, &id, StartVerdict::AfterHealthWait, guard);
     }
@@ -3290,6 +3295,9 @@ pub async fn spawn_test(
     // which records the spawn's result; it records the action abandoned if
     // that future ends first (a panic in the exec task).
     let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-test's exec future");
+    // The exec future stamps what it stores, so `GET /build/{id}/status` serves
+    // the body the synchronous answer returns.
+    let exec_minted = minted.clone();
 
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
@@ -3348,7 +3356,7 @@ pub async fn spawn_test(
             if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
                 exec_release_state.release_spawn_inflight(&key, id).await;
             }
-            (status.as_u16(), body_json, stderr_tail)
+            (status.as_u16(), exec_minted.stamp(body_json), stderr_tail)
         },
     );
     let _ = release_id.set(submission_id);
@@ -3415,15 +3423,19 @@ pub async fn spawn_test(
                     LogSource::Supervisor,
                     LogLevel::Warn,
                     format!(
-                        "spawn-test {id} (build {submission_id}) abandoned: supervisor shutdown \
-                         signalled while the build was in flight; answering the caller with its \
-                         reserved id/port instead of dropping the connection"
+                        "spawn-test {id} (build {submission_id}, action {}) abandoned: supervisor \
+                         shutdown signalled while the build was in flight; answering the caller \
+                         with its reserved id/port instead of dropping the connection",
+                        minted.record.action_id
                     ),
                 )
                 .await;
+            // Its `outcome_url` names a record in this exiting process, so the
+            // replacement supervisor answers it 404. The log line above names the
+            // same `action_id`.
             return Ok((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(spawn_abandoned_body(&id, port, submission_id)),
+                Json(minted.stamp(spawn_abandoned_body(&id, port, submission_id))),
             )
                 .into_response());
         }
@@ -3444,12 +3456,11 @@ pub async fn spawn_test(
                 .get("frontend_stale")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            // Enrich the stored spawn outcome body with the dev-action snapshot
-            // fields so the synchronous ACK carries the action_id + active
-            // dev-state set + outcome readback URL (in-place edit per §6.1; no
-            // new route). The watcher was already spawned at mint time.
-            let body = minted.stamp(o.body);
-            let mut response = (status, Json(body)).into_response();
+            // The exec future stamped this body with the dev-action snapshot
+            // fields (in-place edit per §6.1; no new route), so this answer and
+            // `GET /build/{id}/status` carry the same ones. The watcher was
+            // already spawned at mint time.
+            let mut response = (status, Json(o.body)).into_response();
             if frontend_stale {
                 response
                     .headers_mut()
@@ -3470,7 +3481,11 @@ pub async fn spawn_test(
                 "poll_url": format!("/build/{submission_id}/status"),
             });
             attach_spawn_identity(&mut body, &id, port);
-            Ok((axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response())
+            Ok((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(minted.stamp(body)),
+            )
+                .into_response())
         }
     }
 }
