@@ -2389,6 +2389,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_boot_id: crate::config::AmbientBootId::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -2635,6 +2636,7 @@ fn make_state() -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_boot_id: crate::config::AmbientBootId::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }

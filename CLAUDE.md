@@ -1770,6 +1770,14 @@ holds both by scanning every `.rs` file under `src/` and `tests/`:
   `from_args` (the scan fails on one that does); one that needs a config builds
   a `SupervisorConfig` literal that sets `ambient_target_dir: AmbientTargetDir::Ignore`.
 
+**A unit-test build touches no real `boot.id` either.** `SupervisorConfig.ambient_boot_id`
+is `AmbientBootId::Read` in production and `Ignore` when `from_args` runs under
+`cfg(test)`: `SupervisorState::new` then mints a fresh id and neither reads nor creates
+`qontinui-supervisor/boot.id`. `At(<path>)` is how a test proves the state reads the
+config. An integration test names `Ignore` in its struct literal, and
+`config::tests::no_test_config_reads_the_ambient_boot_id` fails on an `ambient_boot_id`
+field set to `Read` outside `from_args`.
+
 **A unit-test build reaches no ambient coord either.** `SupervisorConfig.ambient_coord`
 decides where every supervisor path that reaches coord goes: the dev-action
 client (the expectations GET at every mint, `dev_action::prepare_action`, and the
