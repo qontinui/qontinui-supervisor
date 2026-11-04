@@ -719,6 +719,17 @@ pub async fn list_runners(
             cached.spawn_up,
         );
 
+        // Linux spawn isolation (plan 2026-11-04-linux-dev-supervisor-dies-with-
+        // its-launcher-and-orphans-its-temp-runners, Phase 1b). `isolation_unit`
+        // is the runner's own transient systemd scope — `systemctl --user stop
+        // <unit>` stops it — or null; `isolation` carries the verdict and its
+        // reason, null when this supervisor never started the runner.
+        let isolation = managed.isolation.read().await.clone();
+        let isolation_unit = isolation
+            .as_ref()
+            .and_then(|i| i.unit().map(str::to_string));
+        let isolation_json = isolation.as_ref().map(|i| i.to_json());
+
         let mut entry = json!({
             "id": managed.config.id,
             "name": managed.config.name,
@@ -785,6 +796,10 @@ pub async fn list_runners(
                 "last_prebind_alert_spawn_started_at": watchdog.last_prebind_alert.map(|(spawn, _)| spawn.to_rfc3339()),
             }
         });
+        // Set after the literal: one more key inside `json!` above exceeds the
+        // macro's recursion limit.
+        entry["isolation_unit"] = json!(isolation_unit);
+        entry["isolation"] = json!(isolation_json);
         // Phase 8b: a `fresh_device_identity` runner's own device id, read
         // lazily from `<root>/home/machine.json` — the observable for an id
         // minted after the spawn response was sent. Absent for every

@@ -25,9 +25,13 @@
 //! - The kill itself uses `libc::kill` with `SIGTERM` first, then escalates
 //!   to `SIGKILL` if the PID is still alive after a short grace window.
 //! - Tree-kill targets the process *group* (`kill(-pgid, ...)`); runners are
-//!   spawned in their own process group (process-wrap sets `SETSID`/group on
-//!   Unix), so killing the group reaps child panes/helpers that would
-//!   otherwise keep the port held.
+//!   spawned as the leader of their own process group
+//!   ([`lead_own_process_group`], called at the runner spawn site in
+//!   `manager::start_exe_mode_for_runner`), so killing the group reaps child
+//!   panes/helpers that would otherwise keep the port held. Before plan
+//!   `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`
+//!   Phase 1 the spawn site set a group on Windows only, so `kill(-pid, …)`
+//!   here addressed no group at all.
 
 #![cfg(not(target_os = "windows"))]
 
@@ -42,6 +46,17 @@ use tracing::{debug, info};
 const TERM_POLL_MS: u64 = 100;
 /// Total grace given to SIGTERM before escalating to SIGKILL.
 const TERM_GRACE_MS: u64 = 1500;
+
+/// Make the process `cmd` spawns the leader of a new process group whose id
+/// is its own pid — what [`kill_by_pid_tree`]'s `kill(-pid, …)` addresses.
+///
+/// Called at the runner spawn site. Consequence, intended: a signal sent to the
+/// SUPERVISOR's group (a terminal Ctrl-C on a foreground supervisor) no longer
+/// reaches its runners; the supervisor's shutdown sweep owns stopping its temp
+/// runners, and user-owned runners are not the terminal's to stop.
+pub fn lead_own_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
 
 /// Return true if `pid` refers to a live process. Uses `kill(pid, 0)` which
 /// performs the permission/existence check without sending a signal.

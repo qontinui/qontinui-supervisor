@@ -1823,6 +1823,15 @@ pub async fn reap_stale_test_runners(state: SharedState) {
     // Wait a bit on startup to let normal init complete
     tokio::time::sleep(Duration::from_secs(30)).await;
 
+    // One reconcile pass NOW, before the first 5-minute wait: temp runners a
+    // crashed predecessor left behind (a SIGKILL, or a fallback launch with no
+    // systemd unit to reap them) are then freed ~30 s after startup instead of
+    // ~5.5 min. Fail-closed exactly like every later pass — it kills only a
+    // listener the durable ledger proves this supervisor lineage spawned.
+    // Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-
+    // its-temp-runners, Phase 1.
+    reconcile_orphaned_temp_runners(&state).await;
+
     // Resolved once — the accessor memoizes anyway, and reading it here means
     // the setting is reported at startup rather than only when it first bites.
     let max_age_bound = crate::config::temp_runner_max_age();
@@ -2508,7 +2517,9 @@ pub async fn start_managed_runner(
     let SpawnResult {
         mut child,
         panic_log_dir,
+        isolation,
     } = start_exe_mode_for_runner(state, managed).await?;
+    *managed.isolation.write().await = Some(isolation.clone());
 
     let pid = child.id();
     info!(
@@ -2549,15 +2560,24 @@ pub async fn start_managed_runner(
     //
     // Assignment failure is loud but non-fatal — the runner is functional;
     // it just won't be auto-killed if the supervisor dies abruptly.
+    //
+    // OFF WINDOWS the job is a no-op stub, so every line below is derived from
+    // the platform fact `RunnerJob::REAPS_ON_SUPERVISOR_EXIT` rather than
+    // claiming a kernel reaper that does not run; the user-owned line carries
+    // the Linux spawn-isolation verdict (`systemd_scope`) beside it, because
+    // off Windows that — not "never assigned" — is what keeps the runner alive
+    // across the supervisor's exit.
+    let reaps_on_exit = crate::process::job::RunnerJob::REAPS_ON_SUPERVISOR_EXIT;
     if let Some(pid_val) = pid {
         if !crate::process::job::should_assign_to_ephemeral_job(&managed.config.kind()) {
             // Log the skip too. A durable runner that is silently never
             // assigned would make the next incident's forensics as hard as
             // the 2026-07-27 one, where the reap produced NO log line at all.
-            let msg = format!(
-                "Runner '{}' (PID {}) NOT assigned to the kill-on-exit JobObject — \
-                 user-owned runners survive supervisor exit.",
-                runner_name, pid_val
+            let msg = crate::process::job::user_owned_spawn_message(
+                reaps_on_exit,
+                &runner_name,
+                pid_val,
+                &isolation,
             );
             info!("{}", msg);
             state
@@ -2567,9 +2587,10 @@ pub async fn start_managed_runner(
         } else if let Some(job) = state.ephemeral_job.as_ref() {
             match job.assign(pid_val) {
                 Ok(()) => {
-                    let msg = format!(
-                        "Assigned temp runner '{}' (PID {}) to kill-on-exit JobObject",
-                        runner_name, pid_val
+                    let msg = crate::process::job::temp_assigned_message(
+                        reaps_on_exit,
+                        &runner_name,
+                        pid_val,
                     );
                     info!("{}", msg);
                     state
@@ -3269,6 +3290,10 @@ struct SpawnResult {
     /// via `QONTINUI_RUNNER_LOG_DIR`. `None` when the supervisor deferred
     /// to the runner's default path (no `--log-dir` configured).
     panic_log_dir: Option<std::path::PathBuf>,
+    /// The spawn-isolation verdict (Linux: a user-owned runner's own systemd
+    /// scope). A `Scoped` verdict is only ever returned after the landing check
+    /// confirmed it — see [`crate::process::systemd_scope::await_scope_landing`].
+    isolation: crate::process::systemd_scope::Isolation,
 }
 
 /// Applies a non-primary runner's **instance root** to a spawn command.
@@ -3746,7 +3771,22 @@ async fn start_exe_mode_for_runner(
         managed.config.name, exe_path, managed.config.port
     );
 
-    let mut cmd = Command::new(&exe_path);
+    // Isolation is chosen AT CONSTRUCTION: neither tokio's nor std's `Command`
+    // can change its program afterwards. On Linux a user-owned runner's program
+    // is `systemd-run --user --scope … -- <exe>`, which passes the env, cwd,
+    // stdio and process group set below through to the runner it execs (so the
+    // pid `spawn()` returns is the runner's); everything else spawns the exe
+    // directly. Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
+    // and-orphans-its-temp-runners, Phase 1b.
+    let (mut cmd, mut isolation, probe) = crate::process::systemd_scope::isolation_command(
+        &managed.config.kind(),
+        &managed.config.id,
+        &exe_path,
+    )
+    .await;
+    if let Some(probe) = probe {
+        *state.runner_isolation_probe.write().await = Some(probe);
+    }
     cmd.current_dir(&state.config.project_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3783,6 +3823,12 @@ async fn start_exe_mode_for_runner(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
+    // The Unix counterpart: the runner leads its own process group, so
+    // `kill_by_pid_tree`'s `kill(-pid, …)` reaches its whole tree (panes,
+    // helpers) — the shutdown sweep and every stop path rely on it. Nothing in
+    // the supervisor signals its OWN group expecting runners to receive it.
+    #[cfg(not(windows))]
+    crate::process::unix_kill::lead_own_process_group(&mut cmd);
 
     // A supervisor launched from inside a subject's session inherits that
     // subject's QONTINUI_INSTANCE_ROOT and every location under it (children of
@@ -3857,13 +3903,71 @@ async fn start_exe_mode_for_runner(
     // non-zero exit. Cloning out keeps the lock held for the minimum span.
     let panic_log_dir = managed.panic_log_dir.read().await.clone();
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?;
+
+    // A scoped spawn is a start only once it has LANDED in its unit. A scope
+    // start that never execs, or hangs pending, is a FAILED start: the pending
+    // `systemd-run` is killed and the failure reported. It is never re-spawned
+    // unscoped — that would put a user-owned runner back into the supervisor's
+    // reapable cgroup without anyone deciding to.
+    if let crate::process::systemd_scope::Isolation::Scoped(unit) = isolation.clone() {
+        let bound = crate::process::systemd_scope::landing_timeout();
+        match crate::process::systemd_scope::await_scope_landing(
+            &mut child,
+            std::path::Path::new("/proc"),
+            &unit,
+            bound,
+            crate::process::systemd_scope::LANDING_POLL_INTERVAL,
+        )
+        .await
+        {
+            crate::process::systemd_scope::LandingOutcome::Landed => {
+                info!(
+                    "Runner '{}' landed in its own systemd scope {}",
+                    managed.config.name, unit
+                );
+            }
+            crate::process::systemd_scope::LandingOutcome::ExitedBeforeLanding(reason) => {
+                // Already dead, so nothing user-owned is left in the
+                // supervisor's cgroup. Hand the (unreaped) child on: the exit
+                // monitor, panic log and early log report it like any runner
+                // that died at start.
+                let msg = format!(
+                    "Runner '{}' exited before its systemd scope landing was confirmed — {}",
+                    managed.config.name, reason
+                );
+                warn!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                    .await;
+                isolation = crate::process::systemd_scope::Isolation::Unscoped(format!(
+                    "exited before its landing in {unit} was confirmed"
+                ));
+            }
+            crate::process::systemd_scope::LandingOutcome::Failed(reason) => {
+                let msg = format!(
+                    "Runner '{}' did NOT start: its systemd scope start failed — {}. It was not \
+                     retried unscoped (that would put a user-owned runner in the supervisor's \
+                     reapable cgroup).",
+                    managed.config.name, reason
+                );
+                error!("{}", msg);
+                state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Error, msg.clone())
+                    .await;
+                return Err(SupervisorError::Process(msg));
+            }
+        }
+    }
 
     Ok(SpawnResult {
         child,
         panic_log_dir,
+        isolation,
     })
 }
 

@@ -169,6 +169,16 @@ pub struct ManagedRunner {
     /// monitor never takes it: a stop's graceful wait, under this lock, is
     /// waiting for the monitor to clear `running`.
     pub lifecycle: tokio::sync::Mutex<()>,
+    /// The spawn-isolation verdict of this supervisor's most recent start of
+    /// the runner (plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
+    /// and-orphans-its-temp-runners`, Phase 1b). On Linux a user-owned runner is
+    /// `Scoped(<unit>)` — its own transient systemd scope, outside the
+    /// supervisor's cgroup, confirmed by the landing check — or `Unscoped(why)`.
+    /// `None` until this supervisor starts it (an adopted or external runner
+    /// was never in this supervisor's cgroup). Surfaced by `GET /runners` as
+    /// `isolation` / `isolation_unit`, and summarised in `/health`
+    /// `runner_isolation`.
+    pub isolation: RwLock<Option<crate::process::systemd_scope::Isolation>>,
 }
 
 /// One spawn of a managed runner, as [`ManagedRunner::recent_spawns`] keeps
@@ -502,6 +512,7 @@ impl ManagedRunner {
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
+            isolation: RwLock::new(None),
         }
     }
 
@@ -662,6 +673,11 @@ pub struct SupervisorState {
     /// `process::job`'s cross-platform shim). Spawning continues either
     /// way — without the safety net, but functional.
     pub ephemeral_job: Option<Arc<RunnerJob>>,
+    /// The most recent systemd preflight (`systemd-run` on PATH and the user
+    /// manager answering), run once at startup on Linux and again before each
+    /// user-owned spawn. `None` until the first one finishes, which `/health`
+    /// `runner_isolation` reports as UNKNOWN rather than as "no isolation".
+    pub runner_isolation_probe: RwLock<Option<crate::process::systemd_scope::SystemdProbe>>,
     /// Log messages captured during synchronous `SupervisorState::new`
     /// construction that need to be routed through `state.logs.emit` once
     /// async context is available. The `logs` field is initialized inside the
@@ -1931,9 +1947,11 @@ impl SupervisorState {
         // every supervisor-spawned *temp* runner dies when the supervisor
         // exits (graceful, panic, force-kill); user-owned runners (primary,
         // named, external) are never assigned to it and survive. On
-        // non-Windows it's a no-op stub. Failure to create is logged loudly
-        // but never aborts startup — the supervisor still functions, just
-        // without the safety net.
+        // non-Windows it's a no-op stub that reaps NOTHING, and the startup
+        // line says so: it is derived from `RunnerJob::REAPS_ON_SUPERVISOR_EXIT`
+        // and names what does reap there (`job_created_message`). Failure to
+        // create is logged loudly but never aborts startup — the supervisor
+        // still functions, just without the safety net.
         //
         // The `state.logs` collector isn't constructed yet at this point
         // (it's initialized inside the `Self { ... }` block below), so we
@@ -1944,9 +1962,8 @@ impl SupervisorState {
         let mut startup_logs: Vec<(LogLevel, String)> = Vec::new();
         let ephemeral_job = match RunnerJob::create() {
             Ok(j) => {
-                let msg = "Created kill-on-exit JobObject for spawned temp runners \
-                           (KILL_ON_JOB_CLOSE; user-owned runners are never assigned)"
-                    .to_string();
+                let msg =
+                    crate::process::job::job_created_message(RunnerJob::REAPS_ON_SUPERVISOR_EXIT);
                 tracing::info!("{}", msg);
                 startup_logs.push((LogLevel::Info, msg));
                 Some(Arc::new(j))
@@ -2001,6 +2018,7 @@ impl SupervisorState {
             boot_id: load_or_create_boot_id(),
             build_id: compute_build_id(),
             ephemeral_job,
+            runner_isolation_probe: RwLock::new(None),
             pending_startup_logs: std::sync::Mutex::new(startup_logs),
             active_sse_connections: Arc::new(AtomicUsize::new(0)),
             debug_endpoints_enabled,

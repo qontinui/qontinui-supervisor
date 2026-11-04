@@ -659,7 +659,46 @@ pub async fn health(
     if let (Some(axum::Extension(ctx)), Some(obj)) = (guard, value.as_object_mut()) {
         obj.insert("originGuard".to_string(), ctx.health_json());
     }
+    if let Some(obj) = value.as_object_mut() {
+        let report = runner_isolation_report(&state).await;
+        obj.insert(
+            "runner_isolation".to_string(),
+            serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+        );
+    }
     Json(value).into_response()
+}
+
+/// `/health` `runner_isolation`: `{"mechanism": "systemd-scope"|"none",
+/// "reason": …}` — whether user-owned runners this supervisor spawns leave its
+/// cgroup (Linux, plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
+/// and-orphans-its-temp-runners` Phase 1b). `supervisor-verbs.sh stop` refuses
+/// to stop a supervisor with Named runners unless this reads `systemd-scope`.
+///
+/// `systemd-scope` needs BOTH a positive systemd preflight AND no running
+/// user-owned runner this supervisor spawned unscoped: one such runner shares
+/// the supervisor's cgroup and would die with its unit.
+pub async fn runner_isolation_report(
+    state: &SharedState,
+) -> crate::process::systemd_scope::RunnerIsolationReport {
+    let probe = state.runner_isolation_probe.read().await.clone();
+    let mut spawned = Vec::new();
+    for managed in state.get_all_runners().await {
+        if crate::process::job::should_assign_to_ephemeral_job(&managed.config.kind()) {
+            continue;
+        }
+        if !managed.runner.read().await.running {
+            continue;
+        }
+        if let Some(isolation) = managed.isolation.read().await.clone() {
+            spawned.push((managed.config.name.clone(), isolation));
+        }
+    }
+    crate::process::systemd_scope::summarize_isolation(
+        cfg!(target_os = "linux"),
+        probe.as_ref(),
+        &spawned,
+    )
 }
 
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {

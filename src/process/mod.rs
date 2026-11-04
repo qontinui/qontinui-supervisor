@@ -28,6 +28,10 @@ pub mod panic_log;
 pub mod port;
 pub mod proc_kill;
 pub mod restate_port;
+/// The temp-runner sweep `shutdown_signal` runs at signal time off Windows,
+/// where the runner job reaps nothing. Its selection is cross-platform so the
+/// Linux-only merge gate covers it.
+pub mod shutdown_sweep;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
 /// slot-kill predicate must be covered by the gate that blocks merges.
 pub mod slot_territory;
@@ -52,6 +56,10 @@ pub mod stopped_cache;
 /// consumes it and removes this attribute.
 #[allow(dead_code)]
 pub mod subtree_census;
+/// Linux spawn isolation: user-owned runners leave the supervisor's cgroup at
+/// spawn, into their own transient systemd scope. Cross-platform on purpose —
+/// the argv decision and the landing check are covered by the Linux-only gate.
+pub mod systemd_scope;
 /// Cross-platform on purpose — the reconcile sweep's ownership decision must be
 /// covered by the Linux-only CI gate that blocks merges. Killing a process the
 /// supervisor never spawned is the failure it exists to prevent, and a
