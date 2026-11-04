@@ -392,6 +392,12 @@ export interface WatchdogHealthWire {
   /// Set when the SERVING-loop guard self-disarmed. Distinct from
   /// `disabled_reason`, which is the crash arm's.
   serving_disabled_reason?: string;
+  /// The last pre-bind hang alert (`never_bound_since_spawn`): when it was
+  /// sent, and the `started_at` of the spawn it named. Historical — compare the
+  /// spawn with the runner's current `started_at`. `undefined` on a supervisor
+  /// that predates the field, `null` when no such alert was sent.
+  last_prebind_alert_at?: string | null;
+  last_prebind_alert_spawn_started_at?: string | null;
 }
 
 /// `GET /health` → `originGuard` (`src/origin_guard.rs::OriginGuard::health_json`).

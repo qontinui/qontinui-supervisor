@@ -200,6 +200,15 @@ pub struct WatchdogHealth {
     /// `disabled_reason`, so a crash-loop disarm and a serving-loop disarm are
     /// never mistaken for each other.
     pub serving_disabled_reason: Option<String>,
+    /// When the last pre-bind hang alert (`never_bound_since_spawn`) was sent
+    /// for this runner, RFC3339, and the `started_at` of the spawn it named.
+    /// That shape reads `liveness: unknown` with `pid: null`, so these two are
+    /// the only place in this response that shows it. A historical fact, like
+    /// `last_serving_restart_at`: compare the spawn with the runner's current
+    /// `started_at` before reading it as current. `null` = no such alert in this
+    /// supervisor's lifetime.
+    pub last_prebind_alert_at: Option<String>,
+    pub last_prebind_alert_spawn_started_at: Option<String>,
 }
 
 impl WatchdogHealth {
@@ -230,6 +239,10 @@ impl WatchdogHealth {
             serving_restart_attempts: wd.serving_restart_attempts,
             last_serving_restart_at: wd.last_serving_restart_at.map(|t| t.to_rfc3339()),
             serving_disabled_reason: wd.serving_disabled_reason.clone(),
+            last_prebind_alert_at: wd.last_prebind_alert.map(|(_, at)| at.to_rfc3339()),
+            last_prebind_alert_spawn_started_at: wd
+                .last_prebind_alert
+                .map(|(spawn, _)| spawn.to_rfc3339()),
         }
     }
 
@@ -248,6 +261,8 @@ impl WatchdogHealth {
             serving_restart_attempts: 0,
             last_serving_restart_at: None,
             serving_disabled_reason: None,
+            last_prebind_alert_at: None,
+            last_prebind_alert_spawn_started_at: None,
         }
     }
 }
@@ -1476,6 +1491,8 @@ mod tests {
                 serving_restart_attempts: 0,
                 last_serving_restart_at: None,
                 serving_disabled_reason: None,
+                last_prebind_alert_at: None,
+                last_prebind_alert_spawn_started_at: None,
             },
             build: BuildHealth {
                 in_progress: false,
@@ -1744,6 +1761,38 @@ mod tests {
         // The unavailable fallback is never armed — on EITHER arm.
         assert!(!WatchdogHealth::unavailable().crash_restart_armed);
         assert!(!WatchdogHealth::unavailable().serving_restart_armed);
+    }
+
+    /// A pre-bind hang reads `liveness: unknown` with `pid: null`, so the alert
+    /// bookkeeping is its only trace in this response. Both halves are carried,
+    /// unswapped, and both keys stay present (as `null`) when no alert was sent.
+    #[test]
+    fn the_last_prebind_alert_is_reported_with_the_spawn_it_named() {
+        let spawn = chrono::DateTime::parse_from_rfc3339("2026-11-04T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sent = spawn + chrono::Duration::seconds(95);
+        let mut wd = crate::state::WatchdogState::new(true);
+        wd.last_prebind_alert = Some((spawn, sent));
+
+        let h = WatchdogHealth::from_state_with_arms(&wd, true, true);
+        assert_eq!(h.last_prebind_alert_at, Some(sent.to_rfc3339()));
+        assert_eq!(
+            h.last_prebind_alert_spawn_started_at,
+            Some(spawn.to_rfc3339())
+        );
+
+        let none = WatchdogHealth::from_state_with_arms(
+            &crate::state::WatchdogState::new(true),
+            true,
+            true,
+        );
+        let json = serde_json::to_value(none).unwrap();
+        assert!(json["last_prebind_alert_at"].is_null());
+        assert!(json
+            .as_object()
+            .unwrap()
+            .contains_key("last_prebind_alert_spawn_started_at"));
     }
 
     /// The serving arm is independent of the crash arm on every axis, and the
