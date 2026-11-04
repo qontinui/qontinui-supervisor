@@ -353,8 +353,9 @@ pub(crate) async fn caught<F: std::future::Future>(work: F) -> Result<F::Output,
         })
 }
 
-/// The `(http_status, body)` a panicked [`submit_spawn`] / [`submit_detached`]
-/// records. The body's `error` is what reaches the terminal status.
+/// The `(http_status, body)` a panicked [`submit_spawn`] or [`submit_detached`]
+/// records, and that `routes::runners::finish_spawn_build` answers with once it
+/// has named the runner. The body's `error` is what reaches the terminal status.
 pub(crate) fn panicked_outcome(reason: String) -> (u16, serde_json::Value) {
     (
         500,
