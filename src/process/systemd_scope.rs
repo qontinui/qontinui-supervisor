@@ -828,8 +828,10 @@ mod tests {
             cgroup_path("0::/user.slice/user-1000.slice/x.scope\n").as_deref(),
             Some("/user.slice/user-1000.slice/x.scope")
         );
+        // The unified (`0::`) line wins wherever it sits — here it is NOT the
+        // last line, so a last-line reader would answer the v1 path.
         assert_eq!(
-            cgroup_path("12:pids:/a\n1:name=systemd:/user.slice/y.scope\n0::/user.slice/y.scope\n")
+            cgroup_path("0::/user.slice/y.scope\n1:name=systemd:/user.slice/other.scope\n")
                 .as_deref(),
             Some("/user.slice/y.scope")
         );
