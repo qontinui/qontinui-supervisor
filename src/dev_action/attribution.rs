@@ -1955,10 +1955,8 @@ mod tests {
     }
 
     /// A build-kind window closes on the action's own result, which can land
-    /// minutes after the boot it judges: a rebuild-restart's health wait can run
-    /// to the first-healthy budget past a boot that neither answered nor exited,
-    /// before the 30 s tail. The panic is held to the window, not to a freshness
-    /// slack measured back from the close.
+    /// minutes after the boot it judges. The panic is held to the window, not to
+    /// a freshness slack measured back from the close.
     #[tokio::test]
     async fn a_startup_panic_long_before_a_build_window_closes_is_attributed() {
         let tmp = tempfile::tempdir().unwrap();
