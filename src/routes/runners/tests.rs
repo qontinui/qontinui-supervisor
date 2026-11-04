@@ -2820,6 +2820,7 @@ async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot()
     // A live build for (agent-1, origin_main) — what a plain
     // `{requester_id, rebuild:true}` request resolves to.
     let existing_id = uuid::Uuid::new_v4();
+    let action = crate::dev_action::test_support::minted_action();
     state
         .build_submissions
         .insert(crate::build_submissions::BuildSubmission {
@@ -2853,6 +2854,7 @@ async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot()
             submission_id: existing_id,
             runner_id: "test-abc".to_string(),
             port: 9880,
+            action: action.clone(),
         },
     );
 
@@ -2887,6 +2889,18 @@ async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot()
     );
     assert_eq!(body["id"], "test-abc", "and the existing runner");
     assert_eq!(body["port"], 9880);
+    // The joiner minted nothing, and names the action it joined: it is usually a
+    // retry whose caller never read the first answer.
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+    assert_eq!(
+        body["action_id"],
+        action.record.action_id.to_string(),
+        "and the existing action"
+    );
+    assert!(
+        state.dev_actions.read().await.recent(10).is_empty(),
+        "joining must not mint a second trial"
+    );
 
     // No second runner was reserved: the registry still holds only the
     // configured primary, and the index still points at the one build.
@@ -2895,6 +2909,39 @@ async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot()
         1,
         "joining must not record a second in-flight build"
     );
+}
+
+/// The recovery surface names each running build's action as well as its runner:
+/// a caller who lost the answer lost both ids.
+#[tokio::test]
+async fn spawn_test_in_flight_names_each_builds_action() {
+    use axum::extract::{Query, State};
+    let state = make_state();
+    let action = crate::dev_action::test_support::minted_action();
+    state.spawn_test_inflight.write().await.insert(
+        crate::state::SpawnDedupKey {
+            requester_id: "agent-1".to_string(),
+            build_target: "origin_main".to_string(),
+        },
+        crate::state::SpawnInflight {
+            submission_id: uuid::Uuid::new_v4(),
+            runner_id: "test-abc".to_string(),
+            port: 9880,
+            action: action.clone(),
+        },
+    );
+
+    let axum::Json(body) = super::spawn_test_in_flight(
+        State(state.clone()),
+        Query(super::SpawnInflightQuery { requester_id: None }),
+    )
+    .await;
+
+    assert_eq!(body["count"], 1, "{body}");
+    let spawn = &body["spawns"][0];
+    assert_eq!(spawn["id"], "test-abc", "{body}");
+    crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(spawn);
+    assert_eq!(spawn["action_id"], action.record.action_id.to_string());
 }
 
 // ── `build_source` echoed in the `POST /runners/{id}/restart` 202 ──────────
@@ -4243,6 +4290,7 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
                         submission_id,
                         runner_id: "test-abc".to_string(),
                         port: 9877,
+                        action: crate::dev_action::test_support::minted_action(),
                     })
                 }
                 crate::state::SpawnTicket::Join(_) => panic!("the key was still held"),

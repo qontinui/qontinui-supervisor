@@ -1,6 +1,7 @@
 use crate::build_submissions::BuildSubmissionStore;
 use crate::ci_runner_probe::CiRunnerState;
 use crate::config::{RunnerConfig, SupervisorConfig};
+use crate::dev_action::MintedAction;
 use crate::diagnostics::DiagnosticsState;
 use crate::health_cache::{CachedPortHealth, CachedRunnerHealth};
 use crate::log_capture::{LogLevel, LogSource, LogState};
@@ -717,15 +718,15 @@ pub struct SupervisorState {
     /// `distro_down` / `probe_failed` readings are a LOCAL view and never reach
     /// fleet metrics.
     pub ci_runner_state: RwLock<CiRunnerState>,
-    /// Submission id of the most recent in-flight `POST /runner/fix-and-rebuild`
-    /// detached rebuild, if any. `fix-and-rebuild` rebuilds the *single* live
-    /// runner tree into the build-pool slots; two concurrent ones would race the
-    /// same slots + LKG bookkeeping. The handler reads this under the lock: if it
-    /// points at a still-non-terminal submission, the second request is an
-    /// idempotent accept (returns the existing submission id) instead of kicking
-    /// off a duplicate build. Cleared/overwritten when a new rebuild is started
-    /// (the previous id having reached terminal). `None` until the first rebuild.
-    pub fix_and_rebuild_inflight: RwLock<Option<uuid::Uuid>>,
+    /// The most recent `POST /runner/fix-and-rebuild` detached rebuild, if any.
+    /// `fix-and-rebuild` rebuilds the *single* live runner tree into the
+    /// build-pool slots; two concurrent ones would race the same slots + LKG
+    /// bookkeeping. The handler reads this under the lock: if it points at a
+    /// still-non-terminal submission, the second request is an idempotent accept
+    /// (returns the existing submission id and its action) instead of kicking off
+    /// a duplicate build. Cleared/overwritten when a new rebuild is started (the
+    /// previous id having reached terminal). `None` until the first rebuild.
+    pub fix_and_rebuild_inflight: RwLock<Option<FixAndRebuildInflight>>,
     /// Single-flight index for `POST /runners/spawn-test`, keyed by
     /// **(requester, build target)** — see [`SpawnDedupKey`].
     ///
@@ -735,10 +736,10 @@ pub struct SupervisorState {
     /// SECOND slot to compile the exact same tree for the exact same caller,
     /// spending a third of the pool on a build whose output already existed.
     ///
-    /// [`SupervisorState::admit_spawn_build`] is the only door: a request whose
+    /// [`SupervisorState::claim_spawn_build`] is the only door: a request whose
     /// key is already present JOINS the running build (same `build_id`, same
-    /// runner, `"deduplicated": true`) instead of starting a second one. The
-    /// entry is removed when the build reaches a terminal state.
+    /// runner, same action, `"deduplicated": true`) instead of starting a second
+    /// one. The entry is removed when the build reaches a terminal state.
     ///
     /// Generalises the global `fix_and_rebuild_inflight` above: that one
     /// single-flights the *one* live-tree rebuild with no key at all, which is
@@ -1678,7 +1679,7 @@ pub struct SpawnDedupKey {
 }
 
 /// The in-flight spawn-test build that a duplicate request joins: the same
-/// `build_id` (= submission id) and the same reserved runner.
+/// `build_id` (= submission id), the same reserved runner and the same action.
 #[derive(Debug, Clone)]
 pub struct SpawnInflight {
     /// `build_id` — the build-submission id, identical on the sync, async and
@@ -1688,6 +1689,19 @@ pub struct SpawnInflight {
     pub runner_id: String,
     /// Port reserved for that runner.
     pub port: u16,
+    /// The dev-action trial this build runs under. A joiner minted none of its
+    /// own, and the answer it gets names this one, because a request that joins
+    /// is usually the retry of a caller who never read the first answer.
+    pub action: MintedAction,
+}
+
+/// The in-flight `POST /runner/fix-and-rebuild` a duplicate request joins.
+#[derive(Debug, Clone)]
+pub struct FixAndRebuildInflight {
+    /// The detached rebuild's build-submission id.
+    pub submission_id: uuid::Uuid,
+    /// The `build` trial it runs under, named in a joiner's answer.
+    pub action: MintedAction,
 }
 
 /// Result of asking for the spawn-test single flight for one key.
@@ -1760,7 +1774,8 @@ impl SupervisorState {
     /// and the store evicts only terminal rows. Reading the absence as "running"
     /// would make every later request for this key join a build that has ended,
     /// until the supervisor restarted. Entries are normally removed on completion,
-    /// so this answers for the one the exec task could not release.
+    /// on every exit, a panic included (`finish_spawn_build`), so this answers
+    /// for one whose release was lost.
     async fn spawn_build_in_flight(&self, submission_id: uuid::Uuid) -> bool {
         match self.build_submissions.get(&submission_id).await {
             Some(arc) => !arc.read().await.status.is_terminal(),
@@ -3067,6 +3082,7 @@ mod tests {
             submission_id: id,
             runner_id: format!("test-{port}"),
             port,
+            action: crate::dev_action::test_support::minted_action(),
         }
     }
 

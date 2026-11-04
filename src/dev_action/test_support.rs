@@ -126,6 +126,23 @@ pub(crate) fn five_rows_and_a_sixth_boot_row() -> Value {
     ])
 }
 
+/// A minted action no store holds and no watcher reads, for a test that needs one
+/// to name.
+pub(crate) fn minted_action() -> crate::dev_action::MintedAction {
+    let (predicted, risk) = crate::dev_action::assess_then_cut(Vec::new(), &[]);
+    crate::dev_action::MintedAction {
+        record: Arc::new(crate::dev_action::ActionRecord::new(
+            crate::dev_action::ActionKind::Restart,
+            None,
+            "test".to_string(),
+            &[],
+        )),
+        states_active: Vec::new(),
+        predicted,
+        risk,
+    }
+}
+
 /// A response's status and its JSON body.
 pub(crate) async fn response_json(response: Response) -> (u16, Value) {
     let status = response.status().as_u16();

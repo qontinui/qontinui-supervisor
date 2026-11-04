@@ -1253,9 +1253,16 @@ pub async fn fix_and_rebuild(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
     // Idempotent accept: if a prior rebuild is still running, return it.
+    //
+    // The write guard is held from this check through recording the new
+    // submission below, across the mint (a coord round trip) and the submit.
+    // Two calls inside that window would otherwise both build, racing the slots
+    // and the LKG, which is what the tracker exists to prevent. Nothing the
+    // guard is held across reads the tracker.
+    let mut inflight = state.fix_and_rebuild_inflight.write().await;
     {
-        let inflight = state.fix_and_rebuild_inflight.read().await;
-        if let Some(existing_id) = *inflight {
+        if let Some(existing) = inflight.as_ref() {
+            let existing_id = existing.submission_id;
             if let Some(arc) = state.build_submissions.get(&existing_id).await {
                 if !arc.read().await.status.is_terminal() {
                     state
@@ -1271,7 +1278,7 @@ pub async fn fix_and_rebuild(
                         .await;
                     return Ok((
                         StatusCode::ACCEPTED,
-                        Json(serde_json::json!({
+                        Json(existing.action.stamp(serde_json::json!({
                             "status": "accepted",
                             "build_id": existing_id.to_string(),
                             "submission_id": existing_id.to_string(),
@@ -1280,7 +1287,7 @@ pub async fn fix_and_rebuild(
                             "deduplicated": true,
                             "message": "fix-and-rebuild already in flight; \
                                         poll GET /build/{id}/status for the terminal outcome",
-                        })),
+                        }))),
                     )
                         .into_response());
                 }
@@ -1351,11 +1358,13 @@ pub async fn fix_and_rebuild(
     )
     .await;
 
-    // Record the new in-flight submission id for idempotent-accept dedup.
-    {
-        let mut inflight = state.fix_and_rebuild_inflight.write().await;
-        *inflight = Some(submission_id);
-    }
+    // Record the new in-flight submission for idempotent-accept dedup, under
+    // the guard taken at the check.
+    *inflight = Some(crate::state::FixAndRebuildInflight {
+        submission_id,
+        action: minted.clone(),
+    });
+    drop(inflight);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1792,7 +1801,11 @@ mod tests {
             .build_submissions
             .insert(queued_submission(existing_id))
             .await;
-        *state.fix_and_rebuild_inflight.write().await = Some(existing_id);
+        let action = crate::dev_action::test_support::minted_action();
+        *state.fix_and_rebuild_inflight.write().await = Some(crate::state::FixAndRebuildInflight {
+            submission_id: existing_id,
+            action: action.clone(),
+        });
 
         let resp = fix_and_rebuild(State(state.clone()))
             .await
@@ -1809,16 +1822,90 @@ mod tests {
             existing_id.to_string(),
             "must return the EXISTING submission id, not a fresh one"
         );
+        // The joiner minted nothing, and names the action it joined: it is
+        // usually a retry whose caller never read the first answer.
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+        assert_eq!(body["action_id"], action.record.action_id.to_string());
+        assert!(
+            state.dev_actions.read().await.recent(10).is_empty(),
+            "joining must not mint a second trial"
+        );
         // The tracker is unchanged — still the original submission.
         assert_eq!(
-            *state.fix_and_rebuild_inflight.read().await,
+            state
+                .fix_and_rebuild_inflight
+                .read()
+                .await
+                .as_ref()
+                .map(|inflight| inflight.submission_id),
             Some(existing_id)
         );
     }
 
+    /// Two concurrent calls start ONE build: the dedupe check and the record
+    /// are under one guard. The first call is parked between them, at its
+    /// mint's `dev_actions.write()`, which this test holds a read guard on; the
+    /// second call is then running. Releasing the dedupe lock between the check
+    /// and the record (as it once was) lets the second pass the check before
+    /// the first records, and both build. Every pool permit is held so the
+    /// first build stays in flight, then the pool is closed so neither runs
+    /// cargo.
+    #[tokio::test]
+    async fn fix_and_rebuild_concurrent_calls_start_one_build() {
+        let _building = BUILDING_TESTS.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let n = state.build_pool.permits.available_permits() as u32;
+        let held = state
+            .build_pool
+            .permits
+            .clone()
+            .acquire_many_owned(n)
+            .await
+            .expect("the pool's permits");
+
+        let parked = state.dev_actions.read().await;
+        let call = |state: SharedState| {
+            tokio::spawn(async move {
+                let resp = fix_and_rebuild(State(state))
+                    .await
+                    .expect("handler ok")
+                    .into_response();
+                body_json(resp).await
+            })
+        };
+        let first = call(state.clone());
+        let second = call(state.clone());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(parked);
+
+        let backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
+        let (status_a, a) = tokio::time::timeout(backstop, first)
+            .await
+            .expect("the first call returned")
+            .expect("the first call did not panic");
+        let (status_b, b) = tokio::time::timeout(backstop, second)
+            .await
+            .expect("the second call returned")
+            .expect("the second call did not panic");
+        state.build_pool.permits.close();
+        drop(held);
+
+        assert_eq!((status_a, status_b), (202, 202), "{a} {b}");
+        let deduplicated = [&a, &b]
+            .iter()
+            .filter(|body| body["deduplicated"] == true)
+            .count();
+        assert_eq!(deduplicated, 1, "exactly one call must join: {a} {b}");
+        assert_eq!(a["build_id"], b["build_id"], "both must name one build");
+        assert_eq!(a["action_id"], b["action_id"], "both must name one trial");
+    }
+
     /// `POST /runner/restart {"rebuild": true}` must DETACH: the handler returns
     /// 202 quickly (without awaiting the ~10-20min build) and registers a build
-    /// submission so progress is observable via `GET /builds`. The detached task
+    /// submission so progress is observable via `GET /build/{id}/status`. The detached task
     /// owns its own state clone, so it survives the handler future being dropped
     /// — the whole point of the change. We close the build-pool semaphore up
     /// front so the detached `run_cargo_build` fails fast (semaphore closed)
@@ -1851,7 +1938,16 @@ mod tests {
         //
         // Not a speed budget: it turns "wedged forever" into a red instead of a
         // hang, so it is sized against forever, not against a measured idle run.
+        //
+        // The `Queued` read alone holds only until the task is first polled, so
+        // a coop-budget yield inside the handler would fail it. Holding the
+        // diagnostics lock is the stronger proof: `manager::admit_restart`'s
+        // `diagnostics.write()` is the detached body's first exclusive lock and
+        // this handler never takes it, so while the guard is held a handler that
+        // awaited the body could not return, and the body cannot reach a
+        // terminal status.
         let wedge_backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
+        let diagnostics_guard = state.diagnostics.read().await;
         let resp = tokio::time::timeout(
             wedge_backstop,
             restart_runner(
@@ -1897,8 +1993,8 @@ mod tests {
             body["build_id"].is_string(),
             "must carry a submission id for /builds correlation"
         );
-        // The new build is observable through the store that backs GET /builds
-        // and GET /build/{id}/status as soon as the 202 names it.
+        // The new build is observable through the submission store that backs
+        // GET /build/{id}/status as soon as the 202 names it.
         let build_id = body["build_id"].as_str().unwrap().to_string();
         let target = uuid::Uuid::parse_str(&build_id).expect("build_id is a uuid");
         let arc = state
@@ -1906,14 +2002,12 @@ mod tests {
             .get(&target)
             .await
             .expect("the 202 names a registered submission");
-        // Nothing has yielded since the handler returned.
+        // The body is held at its first exclusive lock, which this test holds.
         assert!(
-            matches!(
-                arc.read().await.status,
-                crate::build_submissions::BuildStatus::Queued
-            ),
+            !arc.read().await.status.is_terminal(),
             "the handler returned with the body already run, so rebuild:true AWAITED the build"
         );
+        drop(diagnostics_guard);
 
         // The detached task runs independently of this (already-returned)
         // handler. With the pool semaphore closed it fails fast and the
