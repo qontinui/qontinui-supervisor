@@ -3812,21 +3812,20 @@ async fn async_spawn_test_stored_outcome_carries_its_action_fields() {
         .expect("the 202 names its submission")
         .parse()
         .expect("a uuid");
-    let action_id: uuid::Uuid = ack["action_id"]
-        .as_str()
-        .expect("the 202 names its action")
-        .parse()
-        .expect("a uuid");
 
-    // The submission registers itself inside the task that runs the spawn, so it
-    // is in the store once that task has recorded the action's result.
-    await_action_result(&state, action_id).await;
     let submission = state
         .build_submissions
         .get(&submission_id)
         .await
         .expect("the submission is stored");
-    crate::build_submissions::await_terminal(&submission).await;
+    // `await_terminal` never gives up on its own.
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    tokio::time::timeout(
+        budget,
+        crate::build_submissions::await_terminal(&submission),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the spawn did not reach a terminal state within {budget:?}"));
     let outcome = submission
         .read()
         .await

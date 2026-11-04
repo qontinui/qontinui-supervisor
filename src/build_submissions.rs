@@ -410,8 +410,8 @@ where
 /// label in the spawn-test `source` vocabulary — see
 /// [`BuildSubmission::worktree_path`] / [`BuildSubmission::source`]. Callers
 /// derive both via `routes::runners::resolve_spawn_source`.
-pub fn submit_spawn<F>(
-    store: Arc<BuildSubmissionStore>,
+pub async fn submit_spawn<F>(
+    store: &BuildSubmissionStore,
     worktree_path: PathBuf,
     source: String,
     agent_id: Option<String>,
@@ -443,21 +443,11 @@ where
         detached: None,
     };
 
-    // Insert synchronously-enough: callers await this fn (it's not async, so
-    // we block the insert onto the same task via a dedicated runtime handle is
-    // overkill). Instead we insert from the background task BEFORE running
-    // exec, and return the Arc the caller already holds. To keep the id
-    // queryable the instant this returns, we build the Arc here and insert it
-    // into the store from the spawned task's first step.
-    let arc = Arc::new(RwLock::new(submission));
+    // Registered before this returns: the caller answers with this id, so
+    // `GET /build/:id/status` must find it from that moment.
+    let arc = store.insert(submission).await;
     let arc_ret = arc.clone();
-    let store_bg = store.clone();
     tokio::spawn(async move {
-        // Register in the store so `GET /build/:id/status` can find it.
-        {
-            let mut map = store_bg.submissions.write().await;
-            map.insert(id, arc.clone());
-        }
         let started_at = Utc::now();
         {
             let mut sub = arc.write().await;
@@ -544,8 +534,8 @@ where
 /// Returns the submission id + Arc immediately. The handler returns a 202 with
 /// the id; there is intentionally no synchronous await path (the whole point is
 /// detachment), but callers that want to block can [`await_terminal`] the Arc.
-pub fn submit_detached<F>(
-    store: Arc<BuildSubmissionStore>,
+pub async fn submit_detached<F>(
+    store: &BuildSubmissionStore,
     worktree_path: PathBuf,
     agent_id: Option<String>,
     exec: F,
@@ -577,15 +567,10 @@ where
         detached: None,
     };
 
-    let arc = Arc::new(RwLock::new(submission));
+    // Registered before this returns, for the reason `submit_spawn` gives.
+    let arc = store.insert(submission).await;
     let arc_ret = arc.clone();
-    let store_bg = store.clone();
     tokio::spawn(async move {
-        // Register in the store so `GET /build/:id/status` can find it.
-        {
-            let mut map = store_bg.submissions.write().await;
-            map.insert(id, arc.clone());
-        }
         let started_at = Utc::now();
         {
             let mut sub = arc.write().await;
@@ -1322,7 +1307,7 @@ mod tests {
         // spawn-test response. No cargo, no runner — exercises the state
         // machine + outcome plumbing only.
         let (id, arc) = submit_spawn(
-            store.clone(),
+            &store,
             PathBuf::from("/tmp/runner/src-tauri"),
             "live_tree".to_string(),
             Some("agent-x".into()),
@@ -1339,9 +1324,10 @@ mod tests {
                     Vec::new(),
                 )
             },
-        );
+        )
+        .await;
 
-        // The id is queryable in the store (registered by the bg task).
+        // The id is queryable in the store.
         await_terminal(&arc).await;
         let found = store
             .get(&id)
@@ -1367,7 +1353,7 @@ mod tests {
     async fn submit_spawn_non_2xx_records_failed_with_reason() {
         let store = Arc::new(BuildSubmissionStore::new(100));
         let (_id, arc) = submit_spawn(
-            store.clone(),
+            &store,
             PathBuf::from("/tmp/runner/src-tauri"),
             "live_tree".to_string(),
             None,
@@ -1388,7 +1374,8 @@ mod tests {
                     ],
                 )
             },
-        );
+        )
+        .await;
 
         await_terminal(&arc).await;
         let sub = arc.read().await;
@@ -1461,7 +1448,7 @@ mod tests {
     async fn submit_detached_reaches_terminal_succeeded_and_stores_outcome() {
         let store = Arc::new(BuildSubmissionStore::new(100));
         let (id, arc) = submit_detached(
-            store.clone(),
+            &store,
             PathBuf::from("/tmp/runner/src-tauri"),
             Some("agent-y".into()),
             async {
@@ -1470,7 +1457,8 @@ mod tests {
                     serde_json::json!({"status": "ok", "message": "Runner rebuilt"}),
                 )
             },
-        );
+        )
+        .await;
 
         await_terminal(&arc).await;
         let found = store
@@ -1491,13 +1479,13 @@ mod tests {
     #[tokio::test]
     async fn submit_detached_non_2xx_records_failed_with_reason() {
         let store = Arc::new(BuildSubmissionStore::new(100));
-        let (_id, arc) =
-            submit_detached(store.clone(), PathBuf::from("/tmp/runner"), None, async {
-                (
-                    500,
-                    serde_json::json!({"status": "error", "error": "cargo exited with status 101"}),
-                )
-            });
+        let (_id, arc) = submit_detached(&store, PathBuf::from("/tmp/runner"), None, async {
+            (
+                500,
+                serde_json::json!({"status": "error", "error": "cargo exited with status 101"}),
+            )
+        })
+        .await;
 
         await_terminal(&arc).await;
         let sub = arc.read().await;
@@ -1716,31 +1704,20 @@ mod tests {
         let store = Arc::new(BuildSubmissionStore::new(100));
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in = ran.clone();
-        let (id, arc) = submit_detached(
-            store.clone(),
-            PathBuf::from("/tmp/runner"),
-            None,
-            async move {
-                ran_in.store(true, Ordering::SeqCst);
-                (200, serde_json::json!({"status": "ok"}))
-            },
-        );
+        let (id, arc) = submit_detached(&store, PathBuf::from("/tmp/runner"), None, async move {
+            ran_in.store(true, Ordering::SeqCst);
+            (200, serde_json::json!({"status": "ok"}))
+        })
+        .await;
         // Drop the handle the handler would have returned — as if the HTTP
         // connection went away. The detached task is independent.
         drop(arc);
 
-        // Poll the store (not the dropped Arc) until terminal. The bg task
-        // registers the submission as its first step, so retry briefly until it
-        // appears — registration is concurrent with this read.
-        let mut stored = None;
-        for _ in 0..200 {
-            if let Some(a) = store.get(&id).await {
-                stored = Some(a);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let stored = stored.expect("submission registered in store despite dropped handle");
+        // Poll the store (not the dropped Arc) until terminal.
+        let stored = store
+            .get(&id)
+            .await
+            .expect("submission registered in store despite dropped handle");
         await_terminal(&stored).await;
         assert!(
             ran.load(Ordering::SeqCst),
@@ -1783,5 +1760,36 @@ mod tests {
         let v = serde_json::to_value(&sub).unwrap();
         assert_eq!(v["detached"]["http_status"], 200);
         assert_eq!(v["detached"]["body"]["status"], "ok");
+    }
+
+    /// The door answers a 202 naming this id as soon as these return. On this
+    /// current-thread runtime the spawned task has not run yet, so a submission
+    /// it registered would not be there.
+    #[tokio::test]
+    async fn a_spawn_submission_is_queryable_as_soon_as_it_is_submitted() {
+        let store = Arc::new(BuildSubmissionStore::new(16));
+        let (id, _arc) = submit_spawn(
+            &store,
+            PathBuf::from("/tmp/runner/src-tauri"),
+            "live_tree".to_string(),
+            None,
+            9883,
+            std::future::pending(),
+        )
+        .await;
+        assert!(store.get(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_detached_submission_is_queryable_as_soon_as_it_is_submitted() {
+        let store = Arc::new(BuildSubmissionStore::new(16));
+        let (id, _arc) = submit_detached(
+            &store,
+            PathBuf::from("/tmp/runner"),
+            None,
+            std::future::pending(),
+        )
+        .await;
+        assert!(store.get(&id).await.is_some());
     }
 }
