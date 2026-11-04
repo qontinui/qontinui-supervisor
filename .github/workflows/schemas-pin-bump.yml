@@ -45,14 +45,15 @@ name: schemas pin bump
 #     only this workflow's commits: it cannot land, so it is closed with a
 #     comment and rebuilt (see the decide step). A CONFLICTING PR holding anyone
 #     else's commit is left for its owner and named in a warning. Otherwise it
-#     comments ONCE
-#     naming the newer schemas head and waits; the first run after that PR
+#     comments ONCE naming the newer schemas head and waits; the first run after that PR
 #     lands bumps against the new main. With a pin, lagging a run cannot red
 #     main.
 #   - move a pin that is not an ancestor of schemas main (a deliberate hand pin):
 #     it warns and leaves it.
-#   - overwrite commits on the branch it did not author (merge commits aside):
-#     it warns and stops. The push is `--force-with-lease` on the sha it read,
+#   - overwrite commits on the branch it did not author: it warns and stops.
+#     The merge train's freshen (a merge of main committed by GitHub with the
+#     merge-train app as author) is the only foreign commit it replaces; a
+#     human's merge commit blocks the rebuild (FOREIGN_COMMIT_SELECT). The push is `--force-with-lease` on the sha it read,
 #     so a push that races the check is refused rather than clobbered.
 
 on:
