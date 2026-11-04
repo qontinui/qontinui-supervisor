@@ -238,10 +238,14 @@ pub enum DiagnosticEventKind {
         /// The runner's PID when the registry or the port listener knew it.
         pid: Option<u32>,
         port: u16,
-        /// `process::manager::serving_silence_secs` at decision time: since the
-        /// last answer or this spawn's start, whichever is later, and 0 for a
-        /// never-answered event. Never a tick count.
-        silent_for_secs: u64,
+        /// How long the API had been silent at decision time, in seconds:
+        /// `process::manager::serving_silence_secs` (since the last answer or
+        /// this spawn's start, whichever is later) for a wedge; since this
+        /// boot's `started_at` for a never-answered event; how long the spawn
+        /// has been up for a never-bound one. `null` where nothing was
+        /// measured (a never-answered runner with no recorded start), never a
+        /// made-up 0. Never a tick count.
+        silent_for_secs: Option<u64>,
         census: Option<serde_json::Value>,
         /// The error string for `RestartFailed`, the disarm reason for
         /// `Disarmed`, free text otherwise.
@@ -783,7 +787,7 @@ mod tests {
                 event: ServingEvent::RestartRefusedSessionsLive,
                 pid: Some(48544),
                 port: 9876,
-                silent_for_secs: 301,
+                silent_for_secs: Some(301),
                 census: Some(serde_json::json!({
                     "source": "supervisor_subtree_census",
                     "verdict": "busy",
@@ -860,7 +864,7 @@ mod tests {
             event: ServingEvent::Threshold,
             pid: None,
             port: 9876,
-            silent_for_secs: 300,
+            silent_for_secs: Some(300),
             census: None,
             detail: None,
         });

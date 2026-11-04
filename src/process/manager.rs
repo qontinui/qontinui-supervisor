@@ -4301,6 +4301,20 @@ pub(crate) fn serving_silence_secs(
     }
 }
 
+/// How long a runner that has NEVER answered during this boot has been silent:
+/// since the boot's `started_at` (its spawn, or its adoption). `None` where no
+/// start is recorded, because then nothing was measured; never a made-up 0.
+///
+/// [`serving_silence_secs`] answers 0 for anything but `UnresponsiveSince`,
+/// which is right for the restart decision (an `Unknown` runner is never
+/// restarted) and false as a report of how long the runner has been silent.
+pub(crate) fn never_answered_silence_secs(
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    started_at.map(|started| (now - started).num_seconds().max(0) as u64)
+}
+
 /// Whether the runner's API has answered during its current spawn.
 ///
 /// `last_seen_responding_at` is never cleared, so a respawn that never answers
@@ -4414,7 +4428,7 @@ pub async fn maybe_alert_prebind_hang(state: &SharedState, managed: &Arc<Managed
         &managed.config.id,
         port,
         spawn_pid,
-        boot_secs,
+        Some(boot_secs),
         ServingEvent::NeverBoundSinceSpawn,
         None,
         Some(format!(
@@ -4492,7 +4506,7 @@ async fn emit_serving_event(
     runner_id: &str,
     port: u16,
     pid: Option<u32>,
-    silent_for_secs: u64,
+    silent_for_secs: Option<u64>,
     event: crate::diagnostics::ServingEvent,
     census: Option<serde_json::Value>,
     detail: Option<String>,
@@ -4591,10 +4605,15 @@ pub async fn maybe_serving_restart(
                     "never-answered-since-spawn",
                 )
             };
+            let silence = never_answered_silence_secs(started_at, now);
+            let silent_for = match silence {
+                Some(secs) => format!("for the {secs}s since its start ({started_at:?})"),
+                None => "(no start recorded, so the silence is not measured)".to_string(),
+            };
             let msg = format!(
                 "serving watchdog: {whose} (port {port}, pid {pid:?}) holds its port and has \
-                 NEVER answered its HTTP API. Alerting, not restarting — the supervisor cannot \
-                 classify this as a wedge, so it will not act on it."
+                 NEVER answered its HTTP API {silent_for}. Alerting, not restarting — the \
+                 supervisor cannot classify this as a wedge, so it will not act on it."
             );
             warn!("{}", msg);
             state
@@ -4606,7 +4625,7 @@ pub async fn maybe_serving_restart(
                 &runner_id,
                 port,
                 pid,
-                silent_for_secs,
+                silence,
                 event,
                 None,
                 Some(detail.to_string()),
@@ -4636,7 +4655,7 @@ pub async fn maybe_serving_restart(
                 &runner_id,
                 port,
                 pid,
-                silent_for_secs,
+                Some(silent_for_secs),
                 ServingEvent::NeverAnsweredSinceSpawn,
                 None,
                 Some(format!(
@@ -4705,7 +4724,7 @@ pub async fn maybe_serving_restart(
                 &runner_id,
                 port,
                 pid,
-                silent_for_secs,
+                Some(silent_for_secs),
                 ServingEvent::Threshold,
                 None,
                 Some(format!(
@@ -4826,7 +4845,7 @@ pub async fn maybe_serving_restart(
                             &runner_id,
                             port,
                             pid,
-                            silent_for_secs,
+                            Some(silent_for_secs),
                             ServingEvent::RestartTaken,
                             None,
                             None,
@@ -4852,7 +4871,7 @@ pub async fn maybe_serving_restart(
                             &runner_id,
                             port,
                             pid,
-                            silent_for_secs,
+                            Some(silent_for_secs),
                             ServingEvent::RestartRefusedSessionsLive,
                             detail.payload.get("census").cloned(),
                             Some(detail.cause.to_string()),
@@ -4874,7 +4893,7 @@ pub async fn maybe_serving_restart(
                             &runner_id,
                             port,
                             pid,
-                            silent_for_secs,
+                            Some(silent_for_secs),
                             ServingEvent::RestartFailed,
                             None,
                             Some(e.to_string()),
@@ -4904,7 +4923,7 @@ pub async fn maybe_serving_restart(
                 &runner_id,
                 port,
                 pid,
-                silent_for_secs,
+                Some(silent_for_secs),
                 ServingEvent::Disarmed,
                 None,
                 Some(SERVING_LOOP_DISABLED_REASON.to_string()),

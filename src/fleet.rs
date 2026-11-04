@@ -1041,8 +1041,10 @@ pub struct ServingWatchdogNotice {
     pub event: ServingEvent,
     pub pid: Option<u32>,
     pub port: u16,
-    /// `process::manager::serving_silence_secs` at decision time.
-    pub silent_for_secs: u64,
+    /// The silence at decision time, as on the diagnostics event: `None`
+    /// where nothing was measured, which the artifact line says rather than
+    /// printing 0.
+    pub silent_for_secs: Option<u64>,
     /// The census / readiness verdict that backed the decision, verbatim.
     pub census_json: Option<serde_json::Value>,
     /// The error string for `RestartFailed`, the disarm reason for
@@ -1088,9 +1090,13 @@ fn artifact_line(notice: &ServingWatchdogNotice) -> String {
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let silence = match notice.silent_for_secs {
+        Some(secs) => format!("after {secs}s silent"),
+        None => "silence not measured (no recorded start)".to_string(),
+    };
     truncate_field(&format!(
-        "runner {} pid {pid} port {} — {} after {}s silent",
-        notice.runner_id, notice.port, notice.event, notice.silent_for_secs
+        "runner {} pid {pid} port {} — {} {silence}",
+        notice.runner_id, notice.port, notice.event
     ))
 }
 
@@ -1614,7 +1620,7 @@ mod tests {
             event,
             pid: Some(48544),
             port: 9876,
-            silent_for_secs: 301,
+            silent_for_secs: Some(301),
             census_json: Some(serde_json::json!({
                 "source": "supervisor_subtree_census",
                 "root_pid": 48544,
@@ -1783,6 +1789,15 @@ mod tests {
             body["checks"],
             "serving_watchdog:restart_failed detail=port 9876 held by live runner pid 48544 \
              census=none"
+        );
+        // A silence nothing measured is said, never printed as 0.
+        let mut notice = sample_notice(ServingEvent::NeverAnsweredSinceSpawn);
+        notice.silent_for_secs = None;
+        let body = build_agent_notification_body(&notice);
+        assert_eq!(
+            body["artifact"],
+            "runner primary pid 48544 port 9876 — never_answered_since_spawn silence not \
+             measured (no recorded start)"
         );
     }
 

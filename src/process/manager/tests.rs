@@ -7047,3 +7047,65 @@ async fn a_primary_hung_before_it_binds_is_alerted_once_per_interval() {
         assert_eq!(serving_events(&state).await, expected, "{row}");
     }
 }
+
+/// A never-answered runner's silence counts from its boot's start, and is null
+/// where no start is recorded. `serving_silence_secs` answers 0 for `Unknown`,
+/// which the notice used to carry as if it had been measured.
+#[test]
+fn a_never_answered_silence_counts_from_the_start_or_is_null() {
+    let now: chrono::DateTime<chrono::Utc> = "2026-11-04T10:06:40Z".parse().unwrap();
+    let started: chrono::DateTime<chrono::Utc> = "2026-11-04T10:00:00Z".parse().unwrap();
+    assert_eq!(never_answered_silence_secs(Some(started), now), Some(400));
+    assert_eq!(never_answered_silence_secs(None, now), None);
+    assert_eq!(
+        never_answered_silence_secs(Some(now + chrono::Duration::seconds(5)), now),
+        Some(0),
+        "a start dated after now is clamped, not negative"
+    );
+    assert_eq!(
+        serving_silence_secs(crate::state::RunnerLiveness::Unknown, Some(started), now),
+        0,
+        "the decision's silence is unchanged: an Unknown runner is never restarted"
+    );
+}
+
+/// The never-answered notice for an `Unknown` runner carries that silence: the
+/// seconds since its start, or null with no start recorded. Never 0 for a
+/// runner 400 s into a boot.
+#[tokio::test]
+async fn a_never_answered_notice_carries_the_silence_since_its_start() {
+    for started_ago in [Some(400_i64), None] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        managed.runner.write().await.started_at =
+            started_ago.map(|secs| chrono::Utc::now() - chrono::Duration::seconds(secs));
+        maybe_serving_restart(
+            &state,
+            &managed,
+            crate::state::RunnerLiveness::Unknown,
+            true,
+        )
+        .await;
+        let silences: Vec<Option<u64>> = state
+            .diagnostics
+            .read()
+            .await
+            .events(usize::MAX, None)
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                DiagnosticEventKind::ServingWatchdog {
+                    silent_for_secs, ..
+                } => Some(silent_for_secs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(silences.len(), 1, "started_ago={started_ago:?}");
+        match started_ago {
+            Some(_) => assert!(
+                matches!(silences[0], Some(400..=402)),
+                "counted from the start: {silences:?}"
+            ),
+            None => assert_eq!(silences[0], None, "nothing measured is null"),
+        }
+    }
+}
