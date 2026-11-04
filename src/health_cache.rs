@@ -608,6 +608,14 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let is_primary = kind.is_primary();
 
                 let runner_port_open = port::is_port_listening(runner_port);
+                // Dated BEFORE the probe is issued, and that is the instant an
+                // answer is stamped with below. A probe in flight across a
+                // restart can be answered by the OLD process; stamped after it
+                // returned, that answer would date after the new spawn's
+                // `started_at` and read as this boot's (`answered_this_boot`).
+                // Dated at issue, it dates before the spawn. The cost is that
+                // the stamp is early by at most one probe (3 s timeout).
+                let probe_issued_at = Utc::now();
                 let runner_responding = port::is_runner_responding(runner_port).await;
 
                 let new_health = CachedPortHealth {
@@ -632,7 +640,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // with that flag and is a pure observation of what answered.
                 if runner_responding {
                     let mut runner_state = managed.runner.write().await;
-                    runner_state.last_seen_responding_at = Some(Utc::now());
+                    runner_state.last_seen_responding_at = Some(probe_issued_at);
                 }
 
                 // For user-managed runners (not temp, not named), the supervisor only
@@ -1748,7 +1756,7 @@ mod tests {
         for marker in [
             [
                 "runner_state.last_seen_responding_at = ",
-                "Some(Utc::now());",
+                "Some(probe_issued_at);",
             ]
             .concat(),
             ["RUNNER ", "WEDGED: port is held"].concat(),
@@ -1769,5 +1777,31 @@ mod tests {
                  while the gated original still runs",
             );
         }
+    }
+
+    /// The responding stamp is dated from BEFORE the probe that saw the answer
+    /// (plan `2026-11-04-a-runner-boot-that-never-answers-is-misclassified-or-unreported`
+    /// D1), so an answer from the previous process to a probe in flight across
+    /// a restart dates before the new spawn and does not count as this boot's.
+    /// Source order is the only thing that can regress here: the instant is
+    /// captured, then the probe is issued, then the instant is assigned.
+    #[test]
+    fn the_responding_stamp_is_dated_from_before_the_probe() {
+        let src = include_str!("health_cache.rs");
+        // Assembled at runtime so this test's own text is not what it finds.
+        let capture = ["let probe_issued_at = ", "Utc::now();"].concat();
+        let probe = ["port::is_runner_responding(", "runner_port).await;"].concat();
+        let assign = [
+            "runner_state.last_seen_responding_at = ",
+            "Some(probe_issued_at);",
+        ]
+        .concat();
+        let find = |m: &str| {
+            assert_eq!(src.matches(m).count(), 1, "`{m}` must appear exactly once");
+            src.find(m).unwrap()
+        };
+        let (c, p, a) = (find(&capture), find(&probe), find(&assign));
+        assert!(c < p, "the stamp's instant must be taken before the probe");
+        assert!(p < a, "the stamp is assigned only after the probe answered");
     }
 }
