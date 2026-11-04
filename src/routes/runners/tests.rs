@@ -4255,10 +4255,18 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
         }
     };
 
+    // Both builds read the index, so a key freed before the build finished
+    // fails them: as a panic with another message, or as a 500 for the 502.
+    let held_during_the_build = || {
+        let state = state.clone();
+        async move { assert_eq!(state.spawn_inflight_snapshot(None).await.len(), 1) }
+    };
+
     let release_id = claim_in_flight(uuid::Uuid::new_v4()).await;
     let (status, body, stderr_tail) = super::finish_spawn_build(
         &state,
         async {
+            held_during_the_build().await;
             if true {
                 panic!("the build blew up");
             }
@@ -4297,6 +4305,7 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
     let (status, body, stderr_tail) = super::finish_spawn_build(
         &state,
         async {
+            held_during_the_build().await;
             (
                 axum::http::StatusCode::BAD_GATEWAY,
                 serde_json::json!({"error": "cargo failed"}),
@@ -4319,10 +4328,17 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
         "pub async fn spawn_test(",
     )
     .expect("spawn_test exists");
-    assert!(
-        handler.contains("finish_spawn_build("),
-        "spawn_test's exec future must finish through the catch and the release"
-    );
+    for wiring in [
+        "finish_spawn_build(",
+        "release_key,",
+        "&exec_release_id,",
+        "release_id.set(submission_id)",
+    ] {
+        assert!(
+            handler.contains(wiring),
+            "spawn_test's exec future must finish through the catch and the release: {wiring}"
+        );
+    }
 }
 
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-

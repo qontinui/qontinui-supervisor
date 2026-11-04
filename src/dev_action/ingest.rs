@@ -48,8 +48,9 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// spawn, restart or build verdict is attributed to, what it closes as, or the
 /// window it is read over — so coord can tell rows recorded under the old
 /// semantics from rows recorded under the new. One epoch means one thing on a
-/// row, so a change that moves only the stored category or evidence counts. As of coord `6846970ac` (2026-11-03) coord stores the
-/// stamp and does not act on it: its half of the plan below (Phase 5) is to skip the
+/// row, so a change that moves only the stored category or evidence owes a bump
+/// too. As of coord `6846970ac` (2026-11-03) coord stores the stamp and does not
+/// act on it: its half of the plan below (Phase 5) is to skip the
 /// `dev_action_stats` increment for
 /// `spawn` / `restart` / `build` rows whose epoch is missing or below a
 /// `MIN_SUPERVISOR_ATTRIBUTION_EPOCH`, so an old supervisor on any box stops

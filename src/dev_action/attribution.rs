@@ -34,8 +34,9 @@
 //! **A change here can owe a bump of
 //! [`crate::dev_action::ingest::ATTRIBUTION_EPOCH`]:** what a verdict is
 //! attributed to, what it closes as, or the window it is read over, is exactly
-//! what that constant versions. Without the bump, coord cannot tell rows recorded under the two
-//! semantics apart.
+//! what that constant versions, and a change that moves only a row's category or
+//! evidence owes one too. Without the bump, coord cannot tell rows recorded under
+//! the two semantics apart.
 //!
 //! The watcher is a detached `tokio::spawn` owning a `SharedState` clone — the
 //! same pattern `routes/runner.rs` uses for the detached rebuild — so it

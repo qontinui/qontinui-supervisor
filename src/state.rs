@@ -1787,11 +1787,24 @@ impl SupervisorState {
     ///
     /// Removes only an entry that still points at `submission_id`, so a build
     /// finishing after a newer one claimed the key cannot evict its successor.
-    pub async fn release_spawn_inflight(&self, key: &SpawnDedupKey, submission_id: uuid::Uuid) {
+    ///
+    /// Takes the id's cell, not the id, and reads it under the index lock:
+    /// `spawn_test` fills the cell while its claim holds that lock, so only there
+    /// is it certain to be filled, however fast the build finished. An id read
+    /// before the lock could miss it, and the claim would then publish an entry
+    /// for a build that had already released.
+    pub async fn release_spawn_inflight(
+        &self,
+        key: &SpawnDedupKey,
+        submission_id: &std::sync::OnceLock<uuid::Uuid>,
+    ) {
         let mut index = self.spawn_test_inflight.write().await;
+        let Some(submission_id) = submission_id.get() else {
+            return;
+        };
         if index
             .get(key)
-            .is_some_and(|e| e.submission_id == submission_id)
+            .is_some_and(|e| e.submission_id == *submission_id)
         {
             index.remove(key);
         }
@@ -3193,6 +3206,45 @@ mod tests {
         };
     }
 
+    fn id_cell(id: uuid::Uuid) -> std::sync::OnceLock<uuid::Uuid> {
+        let cell = std::sync::OnceLock::new();
+        cell.set(id).unwrap();
+        cell
+    }
+
+    /// A build that finishes before `spawn_test` has filled its id cell and
+    /// published its claim waits on the claim's lock, and then frees the key, so
+    /// the claim does not publish an entry for a build already over.
+    #[tokio::test]
+    async fn a_release_racing_its_claim_still_frees_the_key() {
+        let state = spawn_state();
+        let key = dedup_key("agent-1", "origin_main");
+        let id = uuid::Uuid::new_v4();
+        let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+
+        let SpawnTicket::Claim(claim) = state.claim_spawn_build(Some(key.clone())).await else {
+            panic!("nothing held the key");
+        };
+        let releaser = tokio::spawn({
+            let (state, key, cell) = (state.clone(), key.clone(), cell.clone());
+            async move { state.release_spawn_inflight(&key, &cell).await }
+        });
+        // Let the releaser run up to the lock the claim holds.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !releaser.is_finished(),
+            "the release must wait for the claim"
+        );
+
+        cell.set(id).unwrap();
+        claim.commit(inflight(id, 9877));
+        releaser.await.unwrap();
+        assert!(
+            state.spawn_test_inflight.read().await.is_empty(),
+            "the claim published a build that had already released"
+        );
+    }
+
     /// Releasing is scoped to the submission that owns the key, so a build
     /// finishing late cannot evict the build that replaced it.
     #[tokio::test]
@@ -3207,14 +3259,14 @@ mod tests {
             .insert(key.clone(), inflight(current, 9878));
 
         state
-            .release_spawn_inflight(&key, uuid::Uuid::new_v4())
+            .release_spawn_inflight(&key, &id_cell(uuid::Uuid::new_v4()))
             .await;
         assert!(
             state.spawn_test_inflight.read().await.contains_key(&key),
             "a stale build's release must not evict its successor"
         );
 
-        state.release_spawn_inflight(&key, current).await;
+        state.release_spawn_inflight(&key, &id_cell(current)).await;
         assert!(
             !state.spawn_test_inflight.read().await.contains_key(&key),
             "the owning build's release must free the key"

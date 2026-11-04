@@ -932,9 +932,9 @@ posted. A missing key there is UNKNOWN: builds from #270 and #272 stamp their sn
 
 **Bump `ATTRIBUTION_EPOCH` whenever attribution semantics change**: what a `spawn`,
 `restart` or `build` verdict is attributed to, what it closes as, or the window it is
-read over. A change that moves only a row's category or evidence counts, even though
-coord's stats key on signatures: one epoch means one thing on a row. Without the bump,
-coord cannot tell rows recorded under the two semantics apart.
+read over. A change that moves only a row's category or evidence owes a bump too, even
+though coord's stats key on signatures: one epoch means one thing on a row. Without the
+bump, coord cannot tell rows recorded under the two semantics apart.
 
 **Coord does not act on the stamp yet** (read at coord `6846970ac`, 2026-11-03; re-read
 it there rather than trusting this line). It stores `metadata` and counts every row in

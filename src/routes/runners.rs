@@ -3325,7 +3325,7 @@ pub async fn spawn_test(
     // Single-flight release. The submission id does not exist until
     // `submit_spawn` returns, so the exec future reads it from this cell — which
     // is filled below while the claim guard is still held, i.e. strictly before
-    // any releaser can take the index lock.
+    // any releaser can take the index lock, and a releaser reads it under that lock.
     let release_key = dedup_key.clone();
     let release_id: Arc<std::sync::OnceLock<uuid::Uuid>> = Arc::new(std::sync::OnceLock::new());
     let exec_release_id = release_id.clone();
@@ -3770,8 +3770,8 @@ where
             (status, body, Vec::new())
         }
     };
-    if let (Some(key), Some(submission_id)) = (release_key, release_id.get().copied()) {
-        state.release_spawn_inflight(&key, submission_id).await;
+    if let Some(key) = release_key {
+        state.release_spawn_inflight(&key, release_id).await;
     }
     outcome
 }
