@@ -280,11 +280,12 @@ fn rebuild_when_idle_result(
 
 /// The build-status body of a `rebuild_when_idle` whose rebuild-restart
 /// succeeded, by the verdict its post-rebuild health wait recorded
-/// ([`rebuild_when_idle_result`]): `"rebuilt"` (200) once the rebuilt primary
+/// ([`rebuild_when_idle_result`]): `"rebuilt"` (200) once the rebuild's own boot
 /// answered, else `"rebuilt_unhealthy"` (502) carrying the health wait's
 /// error. The rebuild ran either way, so an operator polling
-/// `GET /build/{id}/status` must not read a primary that never came back as
-/// a clean rebuild.
+/// `GET /build/{id}/status` must not read a boot that never came up as a clean
+/// rebuild. That verdict is about this boot: a crash-watchdog respawn may be up
+/// by the time it is read.
 fn rebuilt_body(
     result: &ActionRunResult,
     waited_secs: u64,
@@ -315,12 +316,14 @@ fn rebuilt_body(
 }
 
 /// The operator log line of a `rebuild_when_idle` whose rebuild ran and whose
-/// runner did not come back ([`rebuilt_body`]'s `rebuilt_unhealthy`), and none
+/// own boot did not come up ([`rebuilt_body`]'s `rebuilt_unhealthy`), and none
 /// for one that did. Nobody is watching this door when it fires, so the line
 /// has the level of the failed restart beside it.
 fn unhealthy_rebuild_log(result: &ActionRunResult, runner_name: &str) -> Option<String> {
     result.reason().map(|reason| {
-        format!("Rebuild-when-idle: '{runner_name}' rebuilt, but it is not healthy: {reason}")
+        format!(
+            "Rebuild-when-idle: '{runner_name}' rebuilt, but that boot did not come up: {reason}"
+        )
     })
 }
 
@@ -380,7 +383,7 @@ async fn primary_health_after_start(
 ///
 /// Returns 202 + `build_id` immediately; poll `GET /build/{id}/status`. Its
 /// `detached` body ends as `rebuilt` (200), `rebuilt_unhealthy` (502: the
-/// rebuild ran and the primary never answered), `gave_up_waiting` (408: nothing
+/// rebuild ran and its own boot never answered), `gave_up_waiting` (408: nothing
 /// rebuilt, nothing stopped), `aborted` (404: the primary left the registry) or
 /// `error` (500: the restart failed, or the readiness gate refused it at fire
 /// time; the `error` text says which), or `panicked` (500) if its task panicked.
@@ -1989,7 +1992,7 @@ mod tests {
     #[test]
     fn rebuild_when_idle_reports_unhealthy_after_failed_health_wait() {
         let wait_error = "runner_unhealthy_after_start: runner 'primary' did not become \
-                          healthy within 30000ms of rebuild-when-idle";
+                          healthy within 90000ms of rebuild-when-idle";
         let unhealthy = rebuild_when_idle_result(
             &Ok(()),
             SyncProbe::Unhealthy {
@@ -2022,9 +2025,9 @@ mod tests {
         assert_eq!(
             unhealthy_rebuild_log(&unhealthy, "primary").as_deref(),
             Some(
-                "Rebuild-when-idle: 'primary' rebuilt, but it is not healthy: \
+                "Rebuild-when-idle: 'primary' rebuilt, but that boot did not come up: \
                  runner_unhealthy_after_start: runner 'primary' did not become healthy \
-                 within 30000ms of rebuild-when-idle"
+                 within 90000ms of rebuild-when-idle"
             )
         );
         assert_eq!(unhealthy_rebuild_log(&healthy, "primary"), None);

@@ -4339,6 +4339,11 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
             "spawn_test's exec future must finish through the catch and the release: {wiring}"
         );
     }
+    // Inverted, a fast build would miss its release: the claim publishes the entry.
+    assert!(
+        handler.find("release_id.set(submission_id)") < handler.find("spawn_claim.commit("),
+        "the id must be in its cell before the claim publishes the entry"
+    );
 }
 
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-
