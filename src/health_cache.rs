@@ -817,8 +817,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                      cover it, and a restart destroys the in-flight work and the \
                                      evidence"
                                 } else {
-                                    "user-managed runners are observed only, and a restart \
-                                     destroys in-flight sessions"
+                                    "a wedge is not an exit, so the crash watchdog does not cover \
+                                     it; the serving watchdog does when armed, on a zero census \
+                                     past its threshold, since a restart destroys in-flight \
+                                     sessions"
                                 }
                             );
                             state
@@ -840,10 +842,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         } else {
                             // Port held, and it has NEVER been seen answering.
                             // Not a wedge (there is no "since" — nothing has
-                            // been lost yet) and not stopped either. A start
-                            // that never binds its API is what the
-                            // first-healthy watchdog exists for, and a runner
-                            // stuck in PG bootstrap looks exactly like this.
+                            // been lost yet) and not stopped either. The
+                            // first-healthy watchdog covers a temp or named
+                            // runner here; it has stood down for a primary. A
+                            // runner stuck in PG bootstrap looks exactly like this.
                             tracing::warn!(
                                 runner_id = %runner_id,
                                 port = runner_port,

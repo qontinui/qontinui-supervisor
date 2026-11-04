@@ -1273,7 +1273,7 @@ pub async fn purge_stale_test_runners_core(
 /// this endpoint polls the runner's `/health` for up to 30s (500ms cadence)
 /// before returning 200. If the runner stays alive but never binds the API
 /// port within the budget, the response is **503** with body
-/// `{error: "runner_unhealthy_after_start", runner_id, elapsed_ms, recent_logs}`
+/// `{error: "runner_unhealthy_after_start", runner_id, elapsed_ms, ended, recent_logs}`
 /// plus the action's fields.
 ///
 /// Pass `?wait=false` to opt out and get the legacy fire-and-forget 200
@@ -1323,24 +1323,18 @@ pub async fn start_runner(
         if let Err(failure) =
             crate::process::health_probe::wait_for_runner_healthy_default(&state, &id).await
         {
+            let reason = crate::dev_action::run_result::unhealthy_after_start_reason(
+                &id,
+                &failure,
+                "the start",
+            );
             state
                 .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Warn,
-                    format!(
-                        "Runner '{}' did not become healthy {}ms after start",
-                        id, failure.elapsed_ms
-                    ),
-                )
+                .emit(LogSource::Supervisor, LogLevel::Warn, reason.clone())
                 .await;
-            minted.record.record_run_result(ActionRunResult::Errored {
-                reason: format!(
-                    "runner_unhealthy_after_start: runner '{}' did not become healthy within \
-                     {}ms of the start",
-                    id, failure.elapsed_ms
-                ),
-            });
+            minted
+                .record
+                .record_run_result(ActionRunResult::Errored { reason });
             return Ok(crate::routes::runner::unhealthy_after_start_response(
                 &id, failure, &minted,
             ));

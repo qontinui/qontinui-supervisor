@@ -9,6 +9,7 @@
 //! - [`run_result_for`]: an error that ended an action;
 //! - [`spawn_run_result`]: the result of a spawn route's inner future, the one
 //!   chokepoint spawn-test and spawn-named each have;
+//! - [`unhealthy_after_start_reason`]: the reason a failed health wait records;
 //! - [`start_verdict`] and [`record_start_verdict`]: what a start records from
 //!   the health it observed before answering, and, when it observed none, the
 //!   detached health wait that decides instead (plan
@@ -20,7 +21,9 @@ use futures::future::BoxFuture;
 
 use crate::dev_action::record::{ActionRunResult, RunResultGuard};
 use crate::error::SupervisorError;
-use crate::process::health_probe::{wait_for_action_boot_healthy, HealthProbeFailure};
+use crate::process::health_probe::{
+    wait_for_action_boot_healthy, HealthProbeFailure, HealthWaitEnd,
+};
 use crate::state::SharedState;
 
 /// The health wait [`record_start_verdict_with`] runs for a deferred verdict, on
@@ -45,6 +48,34 @@ pub fn default_health_wait<'a>(
 
 /// The reason token of a start whose runner never answered its health check.
 pub const UNHEALTHY_AFTER_START: &str = "runner_unhealthy_after_start";
+
+/// The reason a start records when its health wait gave up on `runner_id`,
+/// `after` naming what the wait followed. It says how the wait ended, since this
+/// is what `GET /actions/{id}/outcome` serves and, unless a `DEV-*` signature's excerpt
+/// wins, what coord gets as `evidence_ref`: a boot that exited after 2 s must not read
+/// as a runner slow for 2 s, and a runner out of budget may be alive.
+pub fn unhealthy_after_start_reason(
+    runner_id: &str,
+    failure: &HealthProbeFailure,
+    after: &str,
+) -> String {
+    let elapsed_ms = failure.elapsed_ms;
+    match failure.ended {
+        HealthWaitEnd::BudgetSpent => format!(
+            "{UNHEALTHY_AFTER_START}: runner '{runner_id}' did not become healthy within \
+             {elapsed_ms}ms of {after}"
+        ),
+        HealthWaitEnd::BootEnded => format!(
+            "{UNHEALTHY_AFTER_START}: the boot of runner '{runner_id}' was found ended \
+             {elapsed_ms}ms into the health wait after {after}, before it answered: its spawn \
+             exited or a later one replaced it"
+        ),
+        HealthWaitEnd::RunnerRemoved => format!(
+            "{UNHEALTHY_AFTER_START}: runner '{runner_id}' left the registry {elapsed_ms}ms \
+             into the health wait after {after}"
+        ),
+    }
+}
 
 /// Map an error that ended an action to the action's own terminal result.
 ///
@@ -118,7 +149,7 @@ pub enum SyncProbe {
     NotProbed,
     /// The runner answered its health check.
     Healthy,
-    /// The runner never answered within the budget; `reason` names it.
+    /// The runner never answered; `reason` says how the wait ended.
     Unhealthy { reason: String },
 }
 
@@ -243,10 +274,10 @@ pub fn record_start_verdict_with(
                 let result = match health_wait(&state, &runner_id, action_id).await {
                     Ok(()) => ActionRunResult::Ran,
                     Err(failure) => ActionRunResult::Errored {
-                        reason: format!(
-                            "{UNHEALTHY_AFTER_START}: runner '{runner_id}' did not become \
-                             healthy within {}ms of a start that answered without waiting",
-                            failure.elapsed_ms
+                        reason: unhealthy_after_start_reason(
+                            &runner_id,
+                            &failure,
+                            "a start nobody waited on",
                         ),
                     },
                 };
@@ -341,6 +372,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             Err(HealthProbeFailure {
                 elapsed_ms: 30_000,
+                ended: HealthWaitEnd::BudgetSpent,
                 recent_logs: Vec::new(),
             })
         })
@@ -418,6 +450,38 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(came_up.run_result(), Some(ActionRunResult::Ran));
+    }
+
+    /// The reason says how the wait ended, so a boot that exited early does not read
+    /// as a runner that was merely slow for that long. Every ending keeps the token.
+    #[test]
+    fn a_failed_waits_reason_says_how_it_ended() {
+        let reason = |ended, elapsed_ms| {
+            unhealthy_after_start_reason(
+                "primary",
+                &HealthProbeFailure {
+                    elapsed_ms,
+                    ended,
+                    recent_logs: Vec::new(),
+                },
+                "the start",
+            )
+        };
+
+        let spent = reason(HealthWaitEnd::BudgetSpent, 90_000);
+        assert!(
+            spent.contains("did not become healthy within 90000ms of the start"),
+            "{spent}"
+        );
+        let ended = reason(HealthWaitEnd::BootEnded, 2_000);
+        assert!(ended.contains("ended 2000ms into"), "{ended}");
+        assert!(!ended.contains("did not become healthy"), "{ended}");
+        let removed = reason(HealthWaitEnd::RunnerRemoved, 5);
+        assert!(removed.contains("left the registry 5ms"), "{removed}");
+        for reason in [spent, ended, removed] {
+            assert!(reason.starts_with(UNHEALTHY_AFTER_START), "{reason}");
+            assert!(reason.contains("'primary'"), "{reason}");
+        }
     }
 
     /// T1-3: one row per spawn exit.

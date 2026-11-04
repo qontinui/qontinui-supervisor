@@ -2710,7 +2710,8 @@ pub async fn start_managed_runner(
     managed.health_cache_notify.notify_one();
 
     // Spawn the first-healthy watchdog so a child that spawns but never
-    // binds its HTTP API is killed instead of lingering as a zombie.
+    // binds its HTTP API is killed instead of lingering as a zombie. It stands
+    // down for a primary: see `watch_first_healthy`.
     if let Some(pid_val) = pid {
         let state_clone = state.clone();
         let managed_clone = managed.clone();
@@ -3885,7 +3886,9 @@ pub(crate) fn first_healthy_timeout_secs() -> u64 {
 /// without spinning up a process, HTTP server, or SharedState.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstHealthyDecision {
-    /// Exit quietly — the exit monitor already reaped the process.
+    /// Exit quietly: the pid moved on or `running` went false. That may be the exit
+    /// monitor reaping the process, or a stop, or for a primary only a silent
+    /// `/health` (see [`watch_first_healthy`]).
     Abandon,
     /// HTTP /health responded; record success and exit.
     Healthy,
@@ -3896,7 +3899,7 @@ enum FirstHealthyDecision {
 }
 
 /// Decide what the watchdog should do this tick. Priority is intentional:
-///   1. Abandon — process is gone, nothing we should do to it.
+///   1. Abandon — no longer ours to act on (see [`FirstHealthyDecision::Abandon`]).
 ///   2. Healthy — responding wins even if the deadline just passed
 ///      (avoids a pointless kill on a runner that made it just in time).
 ///   3. Kill — deadline passed and still unresponsive.
@@ -4275,18 +4278,38 @@ pub enum ServingRestartDecision {
     SkipDisarmed,
 }
 
+/// How long a runner's API has been silent, for the serving threshold: since its
+/// last answer, or since this spawn started if that is later.
+///
+/// `last_seen_responding_at` survives a restart, so the stamp alone reads a primary
+/// back from a 20-minute rebuild as 20 minutes silent about 30 s into its boot. A
+/// booting runner's census is zero, so nothing later would stop that restart. Bounded
+/// by the spawn, a boot gets the whole threshold, and a boot that really hangs still
+/// reaches it. This only ever shortens the silence: a runner that answered during
+/// this spawn counts from that answer, as `/runners` publishes it.
+pub(crate) fn serving_silence_secs(
+    liveness: crate::state::RunnerLiveness,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    match liveness {
+        crate::state::RunnerLiveness::UnresponsiveSince(at) => {
+            let since = started_at.map_or(at, |started| at.max(started));
+            (now - since).num_seconds().max(0) as u64
+        }
+        _ => 0,
+    }
+}
+
 /// Decide whether a wedged runner warrants a serving restart. Pure.
 ///
 /// Priority mirrors [`decide_crash_restart`]: classification and operator
 /// intent first, arming next, the loop guard last, so `Disarm` only fires for a
 /// wedge that would otherwise have restarted.
 ///
-/// `silent_for_secs` is `(now - at)` from
-/// [`RunnerLiveness::UnresponsiveSince(at)`](crate::state::RunnerLiveness) —
-/// **never a tick count.** The health-cache loop is not 2 s per tick when
-/// `health_cache_notify` fires an immediate refresh, and the stamp is the same
-/// value `/runners` publishes, so the log, the API and this decision cannot
-/// disagree about how long the runner has been silent.
+/// `silent_for_secs` is [`serving_silence_secs`] — **never a tick count.** The
+/// health-cache loop is not 2 s per tick when `health_cache_notify` fires an
+/// immediate refresh.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_serving_restart(
     liveness: crate::state::RunnerLiveness,
@@ -4417,23 +4440,17 @@ pub async fn maybe_serving_restart(
     let kind = managed.config.kind();
     let now = chrono::Utc::now();
 
-    let silent_for_secs = match liveness {
-        crate::state::RunnerLiveness::UnresponsiveSince(at) => {
-            (now - at).num_seconds().max(0) as u64
-        }
-        _ => 0,
-    };
-
     let (pid, started_at, stop_requested, restart_requested) = {
         let r = managed.runner.read().await;
         (r.pid, r.started_at, r.stop_requested, r.restart_requested)
     };
+    let silent_for_secs = serving_silence_secs(liveness, started_at, now);
     let adopted = runner_is_adopted(pid, &*managed.recent_spawns.read().await);
 
     // Design decision 4: a runner that holds its port and has NEVER answered
     // reads `Unknown` forever (adoption stamps `running`/`pid` from a port probe
     // and never stamps `last_seen_responding_at`, and a spawn the first-healthy
-    // watchdog could not kill stays there too). That shape is occurrence 1's, and
+    // watchdog did not kill stays there too). That shape is occurrence 1's, and
     // it is never restarted — the supervisor cannot back the classification — but
     // it is never SILENT again either.
     if matches!(liveness, crate::state::RunnerLiveness::Unknown) {
@@ -4516,8 +4533,8 @@ pub async fn maybe_serving_restart(
     match decision {
         ServingRestartDecision::Restart { attempt } => {
             let msg = format!(
-                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) has held its \
-                 port with a silent HTTP API for {silent_for_secs}s (threshold {threshold_secs}s) \
+                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) holds its \
+                 port, and its HTTP API has been silent for {silent_for_secs}s (threshold {threshold_secs}s) \
                  — attempting restart {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}. The restart is \
                  still gated: it proceeds only if the supervisor's process-subtree census finds \
                  ZERO live `claude` sessions under this runner."
@@ -4643,7 +4660,7 @@ pub async fn maybe_serving_restart(
                         let msg = format!(
                             "serving watchdog RESTARTED runner '{runner_name}' \
                              (attempt {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}) after \
-                             {silent_for_secs}s of a held port with a silent API."
+                             {silent_for_secs}s of a silent API."
                         );
                         warn!("{}", msg);
                         state
@@ -5204,6 +5221,13 @@ async fn maybe_crash_restart(
 ///
 /// Scope: runs once per supervisor-initiated start. Does not auto-restart
 /// and does not touch runners started outside the supervisor.
+///
+/// A primary gets almost none of this. The health cache sets `running` from each
+/// `/health` probe (every 2 s) for any runner that is not `test-*` or `named-*`, so
+/// its first tick on a boot that has not answered yet ends this watchdog, far inside
+/// the budget. So such a runner is not killed here, and what follows depends on its
+/// port. CLAUDE.md's "First-healthy watchdog" states the three cases. A temp or named
+/// runner's `running` is latched at spawn, so the kill applies to those.
 async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pid: u32) {
     let timeout_secs = first_healthy_timeout_secs();
     let runner_name = managed.config.name.clone();
@@ -5226,7 +5250,7 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
         match decide_first_healthy(still_tracked, api_responding, deadline_passed) {
             FirstHealthyDecision::Abandon => {
                 debug!(
-                    "First-healthy watchdog for runner '{}' (PID {}) exiting — process no longer tracked",
+                    "First-healthy watchdog for runner '{}' (PID {}) exiting — pid moved on or running is false",
                     runner_name, pid
                 );
                 return;

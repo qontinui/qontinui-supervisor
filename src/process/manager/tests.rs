@@ -1018,6 +1018,39 @@ fn serving_restart_fires_on_a_wedge_past_the_threshold() {
     );
 }
 
+/// Silence counts from the later of the last answer and this spawn's start. The
+/// stamp survives a restart, so it can be the previous boot's.
+#[test]
+fn serving_silence_counts_from_the_later_of_the_answer_and_the_spawn() {
+    use crate::state::RunnerLiveness::{Responding, Unknown, UnresponsiveSince};
+    let now = chrono::Utc::now();
+    let ago = |secs| now - chrono::Duration::seconds(secs);
+
+    // A previous boot's answer: this boot's own clock decides.
+    assert_eq!(
+        serving_silence_secs(UnresponsiveSince(ago(1200)), Some(ago(35)), now),
+        35
+    );
+    // An answer during this spawn: the wedge counts from it, as `/runners` shows it.
+    assert_eq!(
+        serving_silence_secs(UnresponsiveSince(ago(400)), Some(ago(3600)), now),
+        400
+    );
+    // No spawn known: the stamp is all there is.
+    assert_eq!(
+        serving_silence_secs(UnresponsiveSince(ago(400)), None, now),
+        400
+    );
+    // A clock ahead of `now` reads as no silence, not as a huge unsigned one.
+    assert_eq!(
+        serving_silence_secs(UnresponsiveSince(ago(-5)), None, now),
+        0
+    );
+    for not_wedged in [Responding, Unknown] {
+        assert_eq!(serving_silence_secs(not_wedged, Some(ago(9)), now), 0);
+    }
+}
+
 /// Every skip variant, in priority order. Classification and operator
 /// intent win over arming; the loop guard is evaluated last so `Disarm`
 /// only fires for a wedge that would otherwise have restarted.
@@ -4718,6 +4751,42 @@ fn no_production_start_goes_unminted() {
         // and passes.
         assert!(calls > 0, "no production call of {needle}");
     }
+}
+
+/// A primary back from a long stop: its stamp is the previous boot's, older than any
+/// threshold the clamp allows, and this boot started 35 s ago, under the clamp's floor.
+/// Past the threshold by the stamp and nowhere near it by its own clock. A booting
+/// runner's census is zero, so nothing after this decision would stop the restart.
+#[tokio::test]
+async fn a_booting_runner_is_not_restarted_for_the_silence_before_it_started() {
+    assert!(
+        !serving_restart_env_disabled(),
+        "QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1 leaves this test nothing to observe"
+    );
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.watchdog_enabled_at_start = true;
+    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let managed = register_dead_primary(&state).await;
+    managed.watchdog.write().await.enabled = true;
+
+    let previous_boot = chrono::Utc::now() - chrono::Duration::days(2);
+    {
+        let mut runner = managed.runner.write().await;
+        runner.last_seen_responding_at = Some(previous_boot);
+        runner.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(35));
+    }
+    maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::UnresponsiveSince(previous_boot),
+        true,
+    )
+    .await;
+
+    let watchdog = managed.watchdog.read().await;
+    assert_eq!(watchdog.serving_restart_attempts, 0);
+    assert!(watchdog.serving_history.is_empty());
+    assert!(!watchdog.serving_restart_in_flight);
 }
 
 /// A serving watchdog restart the readiness gate admits is a `restart` trial

@@ -726,8 +726,7 @@ async fn listening_port_for_pid(pid: u32, runners: &[Arc<ManagedRunner>]) -> Por
 /// another path (race-safe no-op).
 ///
 /// `started_at` is set to `Utc::now()` — we don't have the orphan's
-/// real start time and the field is only used for human-readable
-/// "uptime" displays. Marking "now" is the clearest "we just adopted
+/// real start time. Marking "now" is the clearest "we just adopted
 /// this" signal.
 ///
 /// Note: no exit monitor watches an adopted runner. We don't have the
