@@ -25,7 +25,7 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **Never restarts a clean exit** (code 0 — window close, internal shutdown).
 - **Every crash restart is a `spawn` dev-action trial** requested by `crash_watchdog` (`manager::crash_watchdog_start`, `CRASH_WATCHDOG_INITIATOR`): minted after the backoff's own skip check, its action id threaded into the start, and its result recorded — the start's error, `Refused` for a `StartSuperseded` start (nothing ran), or the detached health wait's verdict. `spawn` rather than `restart` because nothing is stopped: the runner is already down.
 
-**Serving watchdog** (plan `2026-09-03-runner-zombie-serving-watchdog`). Liveness is **per-route serving**, not process-exists. The crash arm above is armed on process **exit**; three times in nine days the primary's `:9876` stopped answering while the process stayed alive and kept its outbound work going, for 12 hours to 5 days, with `crash_restart_armed: true, restart_attempts: 0` throughout. An armed watchdog is not a recovery path for a process that never crashes. Under `--watchdog`, a runner classified `RunnerLiveness::UnresponsiveSince` (port held, API silent, previously seen responding) for longer than the serving threshold is restarted through `restart_runner_by_id` with the internal-only `RestartSource::ServingWatchdog`. Hard rules:
+**Serving watchdog** (plan `2026-09-03-runner-zombie-serving-watchdog`). Liveness is **per-route serving**, not process-exists. The crash arm above is armed on process **exit**; three times in nine days the primary's `:9876` stopped answering while the process stayed alive and kept its outbound work going, for 12 hours to 5 days, with `crash_restart_armed: true, restart_attempts: 0` throughout. An armed watchdog is not a recovery path for a process that never crashes. Under `--watchdog`, a runner classified `RunnerLiveness::UnresponsiveSince` (port held, API silent, previously seen responding) for longer than the serving threshold, measured from the later of its last answer and this spawn's start (`manager::serving_silence_secs`), is restarted through `restart_runner_by_id` with the internal-only `RestartSource::ServingWatchdog`. Hard rules:
 
 - **Only on a zero census.** `process::subtree_census` walks the OS process table from the runner's PID and counts every `claude` image in its inclusive subtree — both session planes, since AI and terminal sessions both materialise as a `claude` child. A non-zero count REFUSES and alerts; so does a census that cannot be taken. The census over-approximates by design (a lingering shim counts), so its failure mode is refusing, never restarting over live work.
 - **The readiness gate has two sources now.** `restart_readiness::probe_with_census_fallback` asks the runner first and falls back to the census **only** when the door is wedged (probe `Unreachable` AND liveness `UnresponsiveSince`). A runner that ANSWERED — 404, non-2xx, or garbage — is never second-guessed. `RunnerLiveness::Unknown` never reaches the census: a runner that has never answered is **alerted, not restarted**.
@@ -45,6 +45,12 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **User runners** (everything else): Started by the user with visible Tauri windows. The supervisor observes health only.
 
 **First-healthy watchdog.** Every runner the supervisor spawns (via any of the `start_managed_runner` callers above) gets a per-spawn watchdog that polls its HTTP `/health`. If the process stays alive but never binds the API within the budget (default 90s), the supervisor kills the PID so a wedged start doesn't linger as a zombie on the port. Scope is strictly per-spawn — does not touch runners that were already up when the supervisor started. Budget override: env `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS` (seconds, must be > 0). Note: on a crash-watchdog-armed runner, the first-healthy kill reads as a crash (non-zero exit, no stop intent) — the crash-only watchdog will retry the start up to its loop-guard budget, then disarm.
+
+**A primary gets almost none of this.** The watchdog stands down once `running` goes false, and the health cache sets `running` from each `/health` probe (every 2 s) for any runner that is not `test-*` or `named-*`, so its first tick on a boot that has not answered yet ends the watchdog, at DEBUG. Only a temp or named runner, whose `running` is latched at spawn, gets the kill, and so only an explicitly armed one reaches the Note above. A primary that has not answered is not killed here, and what follows depends on its port:
+
+- **Port not held:** no watchdog or escalation reports it. `liveness` reads `unknown` (`stopped` if it has answered before) and `pid` is `null`, with the process alive. All that records it is that start's own wait, once, when the wait ends: the trial's verdict, and a held-open door's 503. A hang before the listener binds looks like this.
+- **Port held, never seen answering under this supervisor:** the `has NEVER answered` WARN and the serving watchdog's never-answered alert report it, with or without `--watchdog`, and nothing restarts it.
+- **Port held, seen answering earlier:** `last_seen_responding_at` is never cleared, so a previous boot's answer counts. It reads `RUNNER WEDGED`, and under `--watchdog` the serving watchdog restarts it on a zero census, past the threshold measured from the later of that answer and this spawn's start.
 
 ## Instance root (every temp and named runner is a subject)
 
@@ -381,7 +387,7 @@ cargo clippy -- -D warnings    # Lint
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QONTINUI_SUPERVISOR_NO_SERVING_RESTART` | unset | `1` disables serving restarts entirely, leaving the crash arm alone. This is the off-switch — the threshold below is **not**. |
-| `QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS` | `300` | How long a runner's API must have been silent, with its port still held, before a serving restart is considered. Clamped to `[60, 86400]`; `0` clamps **up** to 60, it does not disable. The 60 s floor is the wedge escalation (30 s) plus one full readiness probe (`READINESS_TIMEOUT` 15 s) — below it the arm could fire before the wedge was ever escalated. |
+| `QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS` | `300` | How long a runner holding its port must have been silent, since its last answer or this spawn's start, whichever is later, before a serving restart is considered. Clamped to `[60, 86400]`; `0` clamps **up** to 60, it does not disable. The 60 s floor is the wedge escalation (30 s) plus one full readiness probe (`READINESS_TIMEOUT` 15 s) — below it the arm could fire before the wedge was ever escalated. |
 
 ## Restarting the supervisor
 
@@ -1395,6 +1401,14 @@ Every start and restart of a runner is a dev-action trial, whichever door it cam
 
 A start no HTTP caller is held open on takes its verdict from a detached health wait, `process::health_probe::wait_for_action_boot_healthy`: the watchdogs, the boot start, `POST /runners/{id}/restart`, the rebuild doors, and `?wait=false` / `wait: false`. It runs up to the first-healthy budget (default 90 s, at most 300 s whatever the override says), not the 30 s a held-open request gets, and it is held to the action's own spawn: once that spawn has exited or a later one has replaced it, the verdict is `runner_unhealthy_after_start`, whoever answers the port. So a crash-watchdog respawn's answer is not read as the crashed boot's. The held-open waits (`POST /runner/restart` with no rebuild, `POST /runners/{id}/start`, spawn-test's probe and wait, spawn-named's `wait: true`) still ask the port, since their caller's question is whether the runner is up, and that answer stands. The trial asks about its own boot, so `dev_action::held_to_own_boot` holds their `Ran` to the action's spawn the same way before recording it, as of when the port answered, so a boot stopped during the slow work after a spawn route's wait still reads as up: a caller told 200 can sit beside a trial reading `runner_unhealthy_after_start`, when a respawn answered for a boot that crashed. **Residual:** the budget is a bound, not proof: the first-healthy watchdog stands down once the health cache lowers a booting primary's `running`, so a primary answering past the budget reads as failed while alive.
 
+A failed `process::health_probe` wait says how it ended. The action's `runner_unhealthy_after_start` reason words it, and the 503 of `POST /runner/restart` and `POST /runners/{id}/start` and the `unhealthy_after_start` body of `GET /build/{id}/status` carry it as `ended`. The spawn routes have a wait of their own and do not carry it.
+
+| `ended` | Meaning |
+|---|---|
+| `budget_spent` | Nothing gave a healthy answer for the whole budget. The runner may only be slow, which is how a primary answering past the budget reads. |
+| `boot_ended` | The action's own spawn exited or a later one replaced it. Only a wait nobody is held open on ends this way, and `elapsed_ms` can be far below the budget. |
+| `runner_removed` | The runner left the registry while the wait ran. |
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/actions` | Most-recent-first list of trials. Optional `?limit=` (default 50, capped at the store's size) |
@@ -1919,7 +1933,7 @@ A **primary** rebuild-restart (`POST /runner/restart {rebuild: true}` → detach
 | Pre-permit disk floor | `max(30, min(pool × one-target GB, 10% of volume))`, UNKNOWN → 30 (override: `QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB`, `0` disables) |
 | Temp runner port range | 9877-9899 |
 | Temp runner max age | 24h (86400s) default, override `QONTINUI_SUPERVISOR_TEMP_RUNNER_MAX_AGE_SECS` (clamped [3600, 604800]; **0 disables**). `RunnerKind::Temp` only; measured from `started_at`; `protected` does not exempt. |
-| First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s |
+| First-healthy watchdog budget | 90s (override: `QONTINUI_SUPERVISOR_FIRST_HEALTHY_TIMEOUT_SECS`); poll interval 3s. The detached dev-action health wait takes the same budget, capped at 300s |
 | Crash-restart backoff ladder | 5s → 30s → 120s; max 3 auto-restarts per rolling 30min, then disarm (kill-switch: `QONTINUI_SUPERVISOR_NO_CRASH_RESTART=1`) |
 | origin/main drift refresh | 120s (override: `QONTINUI_SUPERVISOR_ORIGIN_DRIFT_REFRESH_SECS`, min 1) — background ticker; `GET /builds` never computes it inline |
 | `git fetch` deadline | 20s (override: `QONTINUI_SUPERVISOR_GIT_FETCH_TIMEOUT_SECS`, min 1) — an abandoned fetch reads as `fetched: false`, not an error |

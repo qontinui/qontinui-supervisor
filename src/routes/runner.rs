@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
+use crate::dev_action::run_result::unhealthy_after_start_reason;
 use crate::dev_action::{
     mint_action, record_start_verdict, run_result_for, start_verdict, ActionKind, ActionRunResult,
     AttributionTargets, MintedAction, RunResultGuard, SyncProbe,
@@ -47,13 +48,20 @@ pub(crate) fn unhealthy_after_start_response(
     failure: HealthProbeFailure,
     minted: &MintedAction,
 ) -> Response {
-    let body = minted.stamp(serde_json::json!({
+    let body = minted.stamp(unhealthy_after_start_body(runner_id, &failure));
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// What every answer to a failed health wait says: a held-open door's 503, and a
+/// detached rebuild's `GET /build/{id}/status`.
+fn unhealthy_after_start_body(runner_id: &str, failure: &HealthProbeFailure) -> serde_json::Value {
+    serde_json::json!({
         "error": "runner_unhealthy_after_start",
         "runner_id": runner_id,
         "elapsed_ms": failure.elapsed_ms,
+        "ended": failure.ended,
         "recent_logs": failure.recent_logs,
-    }));
-    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    })
 }
 
 /// Mint a dev-action trial for a primary-runner action (restart / build)
@@ -342,11 +350,7 @@ async fn primary_health_after_start(
     match wait_for_action_boot_healthy(state, &runner_id, action_id).await {
         Ok(()) => SyncProbe::Healthy,
         Err(failure) => SyncProbe::Unhealthy {
-            reason: format!(
-                "runner_unhealthy_after_start: runner '{runner_id}' did not become healthy \
-                 within {}ms of {after}",
-                failure.elapsed_ms
-            ),
+            reason: unhealthy_after_start_reason(&runner_id, &failure, after),
         },
     }
 }
@@ -776,37 +780,21 @@ pub async fn restart_runner(
                         )
                         .await
                         {
+                            let reason = unhealthy_after_start_reason(
+                                &runner_id,
+                                &failure,
+                                "the detached rebuild-restart",
+                            );
                             exec_state
                                 .logs
-                                .emit(
-                                    LogSource::Supervisor,
-                                    LogLevel::Warn,
-                                    format!(
-                                        "Runner '{}' did not become healthy {}ms after \
-                                         detached rebuild-restart",
-                                        runner_id, failure.elapsed_ms
-                                    ),
-                                )
+                                .emit(LogSource::Supervisor, LogLevel::Warn, reason.clone())
                                 .await;
                             // Phase 3 path 4: the runner started but never
                             // bound its port. It RAN, and it failed.
-                            exec_record.record_run_result(ActionRunResult::Errored {
-                                reason: format!(
-                                    "runner_unhealthy_after_start: runner '{}' did not become \
-                                     healthy within {}ms of the detached rebuild-restart",
-                                    runner_id, failure.elapsed_ms
-                                ),
-                            });
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                                serde_json::json!({
-                                    "status": "unhealthy_after_start",
-                                    "error": "runner_unhealthy_after_start",
-                                    "runner_id": runner_id,
-                                    "elapsed_ms": failure.elapsed_ms,
-                                    "recent_logs": failure.recent_logs,
-                                }),
-                            );
+                            exec_record.record_run_result(ActionRunResult::Errored { reason });
+                            let mut body = unhealthy_after_start_body(&runner_id, &failure);
+                            body["status"] = "unhealthy_after_start".into();
+                            return (StatusCode::SERVICE_UNAVAILABLE.as_u16(), body);
                         }
                         probe = SyncProbe::Healthy;
                     }
@@ -1042,23 +1030,13 @@ pub async fn restart_runner(
         if let Some(primary) = state.get_primary().await {
             let runner_id = primary.config.id.clone();
             if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
+                let reason = unhealthy_after_start_reason(&runner_id, &failure, "the restart");
                 action_record.record_run_result(ActionRunResult::Errored {
-                    reason: format!(
-                        "runner_unhealthy_after_start: runner '{}' did not become healthy \
-                         within {}ms of the restart",
-                        runner_id, failure.elapsed_ms
-                    ),
+                    reason: reason.clone(),
                 });
                 state
                     .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Warn,
-                        format!(
-                            "Runner '{}' did not become healthy {}ms after restart",
-                            runner_id, failure.elapsed_ms
-                        ),
-                    )
+                    .emit(LogSource::Supervisor, LogLevel::Warn, reason)
                     .await;
                 return Ok(unhealthy_after_start_response(&runner_id, failure, &minted));
             }
@@ -1538,6 +1516,24 @@ pub async fn supervisor_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What both answers to a failed wait carry, the detached rebuild's included.
+    #[test]
+    fn an_unhealthy_answer_says_how_the_wait_ended() {
+        let body = unhealthy_after_start_body(
+            "primary",
+            &HealthProbeFailure {
+                elapsed_ms: 7,
+                ended: crate::process::health_probe::HealthWaitEnd::BootEnded,
+                recent_logs: vec!["last".to_string()],
+            },
+        );
+        assert_eq!(body["error"], "runner_unhealthy_after_start");
+        assert_eq!(body["runner_id"], "primary");
+        assert_eq!(body["elapsed_ms"], 7);
+        assert_eq!(body["ended"], "boot_ended");
+        assert_eq!(body["recent_logs"][0], "last");
+    }
 
     #[test]
     fn restart_request_rejects_unknown_fields() {

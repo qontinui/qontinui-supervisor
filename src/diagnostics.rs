@@ -238,8 +238,9 @@ pub enum DiagnosticEventKind {
         /// The runner's PID when the registry or the port listener knew it.
         pid: Option<u32>,
         port: u16,
-        /// `now - UnresponsiveSince(at)` at decision time — the same stamp
-        /// `/runners` publishes, never a tick count.
+        /// `process::manager::serving_silence_secs` at decision time: since the
+        /// last answer or this spawn's start, whichever is later, and 0 for a
+        /// never-answered event. Never a tick count.
         silent_for_secs: u64,
         census: Option<serde_json::Value>,
         /// The error string for `RestartFailed`, the disarm reason for

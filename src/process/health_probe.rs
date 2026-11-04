@@ -27,6 +27,7 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -61,15 +62,31 @@ const _: () = assert!(
 /// `routes/runners.rs::probe_runner_health`'s 20-line snapshot.
 const RECENT_LOG_LIMIT: usize = 20;
 
-/// Captured failure context for a runner that didn't come back up within
-/// the wait budget. Carries enough information for the route handler to
-/// build a 503 body with `elapsed_ms` and `recent_logs` without re-querying.
+/// How a health wait ended with no answer. The endings mean different things to a
+/// reader: a runner out of budget may only be slow, while a boot that ended is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthWaitEnd {
+    /// The budget ran out with no healthy answer.
+    BudgetSpent,
+    /// The spawn the wait is held to exited, or a later one replaced it. Only
+    /// [`wait_for_action_boot_healthy`] ends this way.
+    BootEnded,
+    /// The runner left the registry while the wait ran.
+    RunnerRemoved,
+}
+
+/// Captured failure context for a runner that didn't come back up. Carries
+/// enough information for the route handler to build a 503 body with
+/// `elapsed_ms`, `ended` and `recent_logs` without re-querying.
 #[derive(Debug)]
 pub struct HealthProbeFailure {
-    /// How long we waited before giving up, in milliseconds. On a real
-    /// timeout this is >= the configured budget; on an early-out (e.g.
-    /// runner removed from registry mid-probe) it can be smaller.
+    /// How long we waited before giving up, in milliseconds: at least the
+    /// budget when [`Self::ended`] is [`HealthWaitEnd::BudgetSpent`], and
+    /// possibly far less otherwise.
     pub elapsed_ms: u64,
+    /// How the wait ended.
+    pub ended: HealthWaitEnd,
     /// Last [`RECENT_LOG_LIMIT`] log lines from the runner's per-runner log
     /// buffer, formatted as `"<level> <message>"` to keep the JSON payload
     /// compact. Empty if the runner was removed from the registry between
@@ -82,7 +99,7 @@ pub struct HealthProbeFailure {
 ///
 /// Returns:
 /// - `Ok(())` on the first successful health response.
-/// - `Err(HealthProbeFailure { elapsed_ms, recent_logs })` if the runner
+/// - `Err(HealthProbeFailure { elapsed_ms, ended, recent_logs })` if the runner
 ///   never responded within the budget.
 ///
 /// **Resolution semantics.** The runner's port is read from the live
@@ -147,13 +164,14 @@ async fn poll_until_healthy(
 ) -> Result<(), HealthProbeFailure> {
     let start = Instant::now();
 
-    loop {
+    let ended = loop {
         // Re-read the runner each iteration so a config change (rare) is
         // honored, and so a registry removal cleanly aborts the loop.
         let Some(managed) = state.get_runner(runner_id).await else {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             return Err(HealthProbeFailure {
                 elapsed_ms,
+                ended: HealthWaitEnd::RunnerRemoved,
                 recent_logs: Vec::new(),
             });
         };
@@ -170,7 +188,7 @@ async fn poll_until_healthy(
                 .await
                 .action_spawn_ended(action_id)
             {
-                break;
+                break HealthWaitEnd::BootEnded;
             }
         }
         if responding {
@@ -178,15 +196,16 @@ async fn poll_until_healthy(
         }
 
         if start.elapsed() >= timeout {
-            break;
+            break HealthWaitEnd::BudgetSpent;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    };
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let recent_logs = recent_runner_log_lines(state, runner_id, RECENT_LOG_LIMIT).await;
     Err(HealthProbeFailure {
         elapsed_ms,
+        ended,
         recent_logs,
     })
 }
@@ -301,6 +320,7 @@ mod tests {
             .await
             .expect_err("the boot exited, whoever answers now");
         assert!(failure.elapsed_ms < GENEROUS.as_millis() as u64 / 2);
+        assert_eq!(failure.ended, HealthWaitEnd::BootEnded);
     }
 
     /// The monitor stamps an exit outside the lifecycle lock, so a later spawn can
@@ -320,6 +340,7 @@ mod tests {
             .await
             .expect_err("a later spawn replaced it");
         assert!(failure.elapsed_ms < GENEROUS.as_millis() as u64 / 2);
+        assert_eq!(failure.ended, HealthWaitEnd::BootEnded);
     }
 
     /// No spawn naming the action says nothing about it, so the port decides, and
@@ -374,9 +395,41 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        poll_until_healthy(&state, &managed.config.id, GENEROUS, Some(action))
+        let failure = poll_until_healthy(&state, &managed.config.id, GENEROUS, Some(action))
             .await
             .expect_err("a later spawn answered");
+        assert_eq!(failure.ended, HealthWaitEnd::BootEnded);
+    }
+
+    /// The names the 503 and `GET /build/{id}/status` carry as `ended`.
+    #[test]
+    fn a_waits_ending_has_a_stable_wire_name() {
+        for (ended, wire) in [
+            (HealthWaitEnd::BudgetSpent, "budget_spent"),
+            (HealthWaitEnd::BootEnded, "boot_ended"),
+            (HealthWaitEnd::RunnerRemoved, "runner_removed"),
+        ] {
+            assert_eq!(serde_json::to_value(ended).unwrap(), wire);
+        }
+    }
+
+    /// A wait out of budget and a runner gone from the registry each say so.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_wait_says_how_it_ended() {
+        let (state, managed, _root) = runner_on(silent_port()).await;
+        let id = managed.config.id.clone();
+
+        let spent = poll_until_healthy(&state, &id, Duration::from_secs(1), None)
+            .await
+            .expect_err("nothing answers");
+        assert_eq!(spent.ended, HealthWaitEnd::BudgetSpent);
+        assert!(spent.elapsed_ms >= 1_000, "{}", spent.elapsed_ms);
+
+        state.runners.write().await.remove(&id);
+        let removed = poll_until_healthy(&state, &id, GENEROUS, None)
+            .await
+            .expect_err("no such runner");
+        assert_eq!(removed.ended, HealthWaitEnd::RunnerRemoved);
     }
 
     /// The wiring: a deferred verdict waits on the boot of the action it records
@@ -421,7 +474,11 @@ mod tests {
         };
         match result {
             ActionRunResult::Errored { reason } => {
-                assert!(reason.starts_with(UNHEALTHY_AFTER_START), "{reason}")
+                assert!(reason.starts_with(UNHEALTHY_AFTER_START), "{reason}");
+                assert!(
+                    reason.contains("before it answered"),
+                    "the reason must say the boot ended, not that it was slow: {reason}"
+                );
             }
             other => panic!("a crashed boot must not read as up: {other:?}"),
         }

@@ -1041,7 +1041,7 @@ pub struct ServingWatchdogNotice {
     pub event: ServingEvent,
     pub pid: Option<u32>,
     pub port: u16,
-    /// `now - UnresponsiveSince(at)` at decision time.
+    /// `process::manager::serving_silence_secs` at decision time.
     pub silent_for_secs: u64,
     /// The census / readiness verdict that backed the decision, verbatim.
     pub census_json: Option<serde_json::Value>,

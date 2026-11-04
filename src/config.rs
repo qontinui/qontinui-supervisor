@@ -1053,8 +1053,9 @@ pub fn temp_runner_max_age() -> Option<std::time::Duration> {
 /// escalation still logs, the restart simply does not fire.
 const DEFAULT_SERVING_RESTART_AFTER_SECS: u64 = 300;
 
-/// How long a runner's API must have been silent (with its port still held)
-/// before the serving watchdog will restart it.
+/// How long a runner holding its port must have been silent, since its last answer
+/// or this spawn's start, whichever is later, before the serving watchdog will
+/// restart it.
 ///
 /// Env: `QONTINUI_SUPERVISOR_SERVING_RESTART_AFTER_SECS`. Default
 /// [`DEFAULT_SERVING_RESTART_AFTER_SECS`], clamped to `[60, 86_400]`.

@@ -4588,6 +4588,7 @@ async fn unhealthy_after_start_response_names_its_action() {
         id,
         crate::process::health_probe::HealthProbeFailure {
             elapsed_ms: 1234,
+            ended: crate::process::health_probe::HealthWaitEnd::BudgetSpent,
             recent_logs: vec!["ERROR boot failed".to_string()],
         },
         &minted,
@@ -4598,6 +4599,7 @@ async fn unhealthy_after_start_response_names_its_action() {
     assert_eq!(body["error"], "runner_unhealthy_after_start", "{body}");
     assert_eq!(body["runner_id"], id, "{body}");
     assert_eq!(body["elapsed_ms"], 1234, "{body}");
+    assert_eq!(body["ended"], "budget_spent", "{body}");
     crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     assert_eq!(body["action_id"], minted.record.action_id.to_string());
 }
