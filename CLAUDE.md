@@ -31,6 +31,8 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 - **The readiness gate has two sources now.** `restart_readiness::probe_with_census_fallback` asks the runner first and falls back to the census **only** when the door is wedged (probe `Unreachable` AND liveness `UnresponsiveSince`). A runner that ANSWERED — 404, non-2xx, or garbage — is never second-guessed. `RunnerLiveness::Unknown` never reaches the census: a runner that has never answered is **alerted, not restarted**.
 - **Never on a temp runner** (the max-age reaper owns those) and never against operator intent (`stop_requested` / `restart_requested`).
 - **Bounded**: 3 serving restarts per rolling 24 h, then the arm self-disarms with `serving restart loop — operator required` (`POST /runners/{id}/watchdog {"reset_attempts": true}` clears both arms). A refusal does not consume the budget.
+- **The `RUNNER WEDGED` log line says what this arm decided on that tick** (`manager::serving_decision_clause` over the decision `maybe_serving_restart` returns): restart, below threshold, not armed, disarmed, and so on, or that no decision was evaluated. It no longer says `Not restarting` on the tick that restarts.
+- **A never-answered notice carries a true silence.** `silent_for_secs` on the diagnostics event and the coord notice is a number or `null`: for a wedge, `serving_silence_secs`; for a never-answered runner (`Unknown`), the seconds since its boot's `started_at` (`manager::never_answered_silence_secs`), and `null` (the artifact line says `silence not measured`) where no start is recorded, never a made-up 0.
 - **Alerted independently of any session** — `fleet::notify_serving_watchdog` posts to coord's `/coord/agent-notifications` with the device JWT, falling back to a `status` finding on 401/403. A coord failure never delays or blocks a restart.
 - **An admitted serving restart is a `restart` dev-action trial** requested by `watchdog` (`manager::serving_watchdog_restart`), stored AFTER the readiness gate (`manager::admit_restart`) so a refusal, which the arm retries every escalating tick, leaves no ledger row. Its slow half (state evaluation and coord's expectations, `dev_action::prepare_action`) runs BEFORE the gate, so the census-to-kill window is wider than it was without a trial only by an in-memory insert (`dev_action::commit_action`, which also dates the trial at the commit).
 - `serving_restart_armed` is surfaced in `/health`, `/runners` and SSE beside `crash_restart_armed`, with a boot WARN when a primary is managed and the arm is off.
@@ -48,9 +50,9 @@ With `--auto-start` / `--watchdog` the supervisor starts the **primary** once at
 
 **A primary gets almost none of this.** The watchdog stands down once `running` goes false, and the health cache sets `running` from each `/health` probe (every 2 s) for any runner that is not `test-*` or `named-*`, so its first tick on a boot that has not answered yet ends the watchdog, at DEBUG. Only a temp or named runner, whose `running` is latched at spawn, gets the kill, and so only an explicitly armed one reaches the Note above. A primary that has not answered is not killed here, and what follows depends on its port:
 
-- **Port not held:** no watchdog restarts or kills it. `liveness` reads `unknown` (`stopped` if it has answered before) and `pid` is `null`, with the process alive. A hang before the listener binds looks like this. That start's own wait records it once, when the wait ends (the trial's verdict, a held-open door's 503). Past the first-healthy budget, while its newest spawn is alive and has not answered, `manager::maybe_alert_prebind_hang` also alerts it as `never_bound_since_spawn` (an ERROR log line, a diagnostics event and a coord alert), then every 5 min (`PREBIND_REALERT_SECS`), with or without `--watchdog`. The last alert and the `started_at` of the spawn it named are served as `watchdog.last_prebind_alert_at` / `last_prebind_alert_spawn_started_at` on `GET /health` and `GET /runners` (`null` when none was sent; compare the spawn with the runner's current `started_at` before reading it as current). The dashboard's fleet table renders it as an amber `never bound` badge (`PrebindHangBadge`) only while it names the current spawn and the runner has not answered since that spawn started. It reads the spawn ring, not `running`. A slow cold boot looks the same, which is why this only alerts.
+- **Port not held:** no watchdog restarts or kills it. While its newest spawn is alive (`manager::newest_spawn_is_up`, read by the health tick only when the API is silent and the port free, and cached as `CachedPortHealth::spawn_up`), `liveness` reads `unknown`, never `stopped`, `pid` is kept, `derived_status` reads `starting`, `PRIMARY_DOWN` is `Unknown`, and `spawn_up: true` is published beside `port_open` (the dashboard then offers no Start, which `start_managed_runner` would refuse). Once that spawn is gone it reads `stopped` if it has answered before. A hang before the listener binds looks like this. That start's own wait records it once, when the wait ends (the trial's verdict, a held-open door's 503). Past the first-healthy budget, while its newest spawn is alive and has not answered, `manager::maybe_alert_prebind_hang` also alerts it as `never_bound_since_spawn` (an ERROR log line, a diagnostics event and a coord alert), then every 5 min (`PREBIND_REALERT_SECS`), with or without `--watchdog`. The last alert and the `started_at` of the spawn it named are served as `watchdog.last_prebind_alert_at` / `last_prebind_alert_spawn_started_at` on `GET /health` and `GET /runners` (`null` when none was sent; compare the spawn with the runner's current `started_at` before reading it as current). The dashboard's fleet table renders it as an amber `never bound` badge (`PrebindHangBadge`) only while it names the current spawn and the runner has not answered since that spawn started. It reads the spawn ring, not `running`. A slow cold boot looks the same, which is why this only alerts.
 - **Port held, never seen answering under this supervisor:** the `has NEVER answered` WARN and the serving watchdog's never-answered alert report it, with or without `--watchdog`, and nothing restarts it.
-- **Port held, seen answering earlier:** `last_seen_responding_at` is never cleared, so `liveness` reads `wedged` on a previous boot's answer. When that answer predates this spawn (`manager::answered_during_spawn`), the log line says it has NEVER answered during this spawn rather than `RUNNER WEDGED`, and the serving watchdog sends the `never_answered_since_spawn` alert. Either way, under `--watchdog` the serving watchdog restarts it on a zero census, past the threshold measured from the later of that answer and this spawn's start.
+- **Port held, seen answering earlier:** `last_seen_responding_at` is never cleared, so `liveness` reads `wedged` on a previous boot's answer, and `answered_this_boot: false` beside it says so. When that answer predates this spawn (`manager::answered_during_spawn`, the same comparison as `RunnerState::answered_this_boot`), the log line says it has NEVER answered during this spawn rather than `RUNNER WEDGED`, and the serving watchdog sends the `never_answered_since_spawn` alert. Either way, under `--watchdog` the serving watchdog restarts it on a zero census, past the threshold measured from the later of that answer and this spawn's start.
 
 ## Instance root (every temp and named runner is a subject)
 
@@ -712,8 +714,10 @@ their meanings and values:
 
 ```json
 "liveness": { "state": "wedged", "unresponsive_since": "2026-08-30T04:11:07.918+00:00" },
+"answered_this_boot": true,
 "last_seen_responding_at": "2026-08-30T04:11:07.918Z",
-"port_open": true
+"port_open": true,
+"spawn_up": false
 ```
 
 | `state` | Meaning |
@@ -721,7 +725,23 @@ their meanings and values:
 | `responding` | The API answered on the most recent probe. |
 | `wedged` | **The port is held and the API is silent** — the process is ALIVE and not answering. `unresponsive_since` is when it was last seen responding. |
 | `stopped` | The API is silent, the port is not held, and it HAS been seen responding before. Positive evidence of absence. |
-| `unknown` | No positive evidence either way — never seen responding, or the supervisor believes it spawned a process that has not bound its port yet. Never read this as "stopped". |
+| `unknown` | No positive evidence either way — never seen responding, or the supervisor believes it spawned a process that has not bound its port yet (`running`, or `spawn_up`: the newest spawn's pid is alive). Never read this as "stopped". |
+
+`liveness` reads `last_seen_responding_at`, which is never cleared, so it
+answers for the runner's history under this supervisor, not for the running
+process. Two additive fields answer per boot:
+
+- **`answered_this_boot`** (`RunnerState::answered_this_boot`): whether that
+  stamp is at or after this boot's `started_at` (set at every spawn and at
+  adoption). `null` is UNKNOWN (no boot recorded), never `false`. `wedged` with
+  `false` here is a boot that has held its port and never answered, carrying a
+  previous boot's stamp. The stamp is dated from BEFORE the probe that saw the
+  answer, so a probe in flight across a restart, answered by the old process,
+  does not count for the new boot.
+- **`spawn_up`**: the third input to `liveness` (`CachedPortHealth::spawn_up`,
+  measured only when the API is silent and the port free). `true` is a spawn
+  alive that has not bound its listener; it reads `unknown`, and the restart
+  readiness gate still answers `NotRunning` for it, exactly as for `stopped`.
 
 `unresponsive_since` is `null` for every state but `wedged`; the key is always
 present, and `state` is always a string, so a consumer never branches on the
@@ -737,8 +757,8 @@ classified it correctly since Phase 3b and the health refresher was already
 escalating it (`RUNNER WEDGED: port is held but the HTTP API has not answered
 for Ns`) — the classification simply never reached this response.
 
-**It is not a second liveness system.** Both inputs (`port_open`,
-`api_responding`) come from the same `managed.cached_health` snapshot the
+**It is not a second liveness system.** All three inputs (`port_open`,
+`api_responding`, `spawn_up`) come from the same `managed.cached_health` snapshot the
 health refresher wrote, so every surface, and the escalation log, cannot
 disagree. A runner the refresher has not reached yet reads `unknown` — on the
 SSE path a missing snapshot (first ticks after boot, a contended lock) is
