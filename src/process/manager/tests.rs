@@ -5380,7 +5380,8 @@ async fn stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::
 
 /// Whether this error is the kernel refusing to exec the stub copy with ETXTBSY: a
 /// concurrent test's fork can inherit the copy's write descriptor until its exec.
-#[cfg(unix)]
+/// Linux only in practice: no other platform reports this error, so on Windows it
+/// never matches and the held-open door tests' retry is a no-op there.
 fn is_text_file_busy(err: &SupervisorError) -> bool {
     matches!(err, SupervisorError::Process(msg) if msg.contains("Text file busy"))
 }
@@ -5408,7 +5409,6 @@ where
 /// Stop what a stub test left running and remove the early logs its starts opened.
 /// A stop reaches only the current spawn, so also end any older stub process still
 /// up, checked by image in case its pid has been reused.
-#[cfg(unix)]
 async fn stop_the_stub(state: &SharedState, managed: &Arc<ManagedRunner>) {
     let _ = stop_runner_by_id(state, &managed.config.id, true, CloseIntent::Kill).await;
     let copy = state.config.runner_exe_copy_path(&managed.config);
@@ -5432,7 +5432,6 @@ async fn stop_the_stub(state: &SharedState, managed: &Arc<ManagedRunner>) {
 
 /// Run a stub test's body, then stop the stub on every exit path, a failed assertion
 /// included, and only then let that failure through.
-#[cfg(unix)]
 async fn with_the_stub_stopped_after<Fut>(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -5625,6 +5624,210 @@ async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
         }
     };
     with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A primary whose exe exits at once and cleanly, on every platform: its spawn's
+/// exit is observed, and a clean exit is one no crash watchdog answers, so nothing
+/// else starts behind the test's back.
+async fn exiting_stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+    let (state, root) = armed_state();
+    let stub = root
+        .path()
+        .join(format!("stub-runner{}", std::env::consts::EXE_SUFFIX));
+    let env: std::collections::HashMap<String, String> = {
+        #[cfg(unix)]
+        {
+            std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
+            let script = root.path().join("stub-runner.env");
+            std::fs::write(&script, "exit 0\n").expect("write the stub's script");
+            [("BASH_ENV".to_string(), script.display().to_string())]
+                .into_iter()
+                .collect()
+        }
+        #[cfg(windows)]
+        {
+            let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            std::fs::copy(format!(r"{system}\System32\hostname.exe"), &stub)
+                .expect("copy hostname as the stub");
+            std::collections::HashMap::new()
+        }
+    };
+    let managed = register_armed_primary(&state, port, env).await;
+    *managed.source_exe_override.write().await = Some(stub);
+    (state, managed, root)
+}
+
+/// Answer `managed`'s `/health` once its newest spawn has exited, as a crash-watchdog
+/// respawn does on the same port. The port stays free until then, so the start finds
+/// it unheld, and a boot that exited is all this answer can be read against.
+///
+/// The listener is THIS process, and a stop's ladder kills whatever holds the
+/// runner's port. So end this task, and await it, before anything stops the runner.
+async fn answer_the_port_after_the_boot_exits(managed: Arc<ManagedRunner>) {
+    loop {
+        let exited = managed
+            .recent_spawns
+            .read()
+            .await
+            .newest()
+            .is_some_and(|spawn| spawn.exited_at.is_some());
+        if exited {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", managed.config.port))
+        .await
+        .expect("bind the runner's port");
+    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+    axum::serve(listener, app).await.expect("serve /health");
+}
+
+/// The trial the newest door minted must read as a boot that did not come up.
+async fn assert_the_newest_trial_read_its_boot_as_ended(state: &SharedState) {
+    let newest = state.dev_actions.read().await.recent(1);
+    let trial = newest.first().expect("the trial");
+    match trial.run_result() {
+        Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
+            assert!(
+                reason.starts_with(crate::dev_action::run_result::UNHEALTHY_AFTER_START),
+                "{reason}"
+            );
+            assert!(reason.contains("had exited or been replaced"), "{reason}");
+        }
+        other => panic!("a boot that exited must not read as up: {other:?}"),
+    }
+}
+
+/// Whether a door answered a failed start whose spawn the kernel refused with
+/// ETXTBSY. A door answers a failed start with a response, not an `Err`, so
+/// `past_text_file_busy` never sees this one: read the trial the door recorded.
+///
+/// It takes what it reads of the response, not the response: a `Response` is not
+/// `Sync`, so a borrow of one held across the await would make the caller's future
+/// unsendable.
+async fn a_door_answered_text_file_busy(
+    state: &SharedState,
+    errored_text_file_busy: bool,
+    answered_server_error: bool,
+) -> bool {
+    if errored_text_file_busy {
+        return true;
+    }
+    if !answered_server_error {
+        return false;
+    }
+    let newest = state.dev_actions.read().await.recent(1);
+    newest.first().is_some_and(|trial| {
+        matches!(
+            trial.run_result(),
+            Some(crate::dev_action::ActionRunResult::Errored { reason })
+                if reason.contains("Text file busy")
+        )
+    })
+}
+
+/// Drive one held-open door against `exiting_stub_primary`, with its port answered
+/// once the boot exits, then check the door and its trial.
+///
+/// The listener is ended, and awaited, before anything else: before the assertions
+/// and before the stub is stopped, so the stop's ladder never finds this process on
+/// the runner's port, even when the door itself panicked. A listener that failed to
+/// bind re-raises its panic, rather than surfacing as the health wait's timeout.
+async fn through_a_held_open_door<F, Fut>(state: SharedState, managed: Arc<ManagedRunner>, door: F)
+where
+    F: Fn(SharedState) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<axum::response::Response, SupervisorError>>
+        + Send
+        + 'static,
+{
+    let answering = tokio::spawn(answer_the_port_after_the_boot_exits(managed.clone()));
+    let answered = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let response = door(state.clone()).await;
+                let errored_text_file_busy =
+                    matches!(&response, Err(err) if is_text_file_busy(err));
+                let answered_server_error = matches!(
+                    &response,
+                    Ok(answer) if answer.status().is_server_error()
+                );
+                if a_door_answered_text_file_busy(
+                    &state,
+                    errored_text_file_busy,
+                    answered_server_error,
+                )
+                .await
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                return response;
+            }
+        })
+        .await
+    };
+    answering.abort();
+    let listened = answering.await;
+    let body = {
+        let state = state.clone();
+        async move {
+            if let Err(failure) = listened {
+                if failure.is_panic() {
+                    std::panic::resume_unwind(failure.into_panic());
+                }
+            }
+            let response = match answered {
+                Ok(response) => response.expect("the door"),
+                Err(failure) => std::panic::resume_unwind(failure.into_panic()),
+            };
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_the_newest_trial_read_its_boot_as_ended(&state).await;
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// The regression at `POST /runners/{id}/start`: the boot exits, and something else
+/// answers its port inside the held-open wait. The caller asked whether the runner
+/// is up, so its answer stays a 200. The trial asked whether its own boot came up, so
+/// it is not `Ran`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
+    let (state, managed, _root) = exiting_stub_primary(29_882).await;
+    let id = managed.config.id.clone();
+    through_a_held_open_door(state, managed, move |state| {
+        crate::routes::runners::start_runner(
+            axum::extract::State(state),
+            axum::extract::Path(id.clone()),
+            axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
+        )
+    })
+    .await;
+}
+
+/// The same at `POST /runner/restart` with no rebuild, the held-open door a primary
+/// is restarted through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot() {
+    let (state, managed, _root) = exiting_stub_primary(29_883).await;
+    through_a_held_open_door(state, managed, |state| {
+        crate::routes::runner::restart_runner(
+            axum::extract::State(state),
+            axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
+            axum::Json(crate::routes::runner::RestartRequest {
+                rebuild: false,
+                force: false,
+                from_working_tree: false,
+                use_lkg: Some(false),
+                handoff: false,
+            }),
+        )
+    })
+    .await;
 }
 
 /// A health-cache tick before the primary answers.
