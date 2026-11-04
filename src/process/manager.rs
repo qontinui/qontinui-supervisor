@@ -4312,11 +4312,11 @@ pub(crate) fn answered_during_spawn(
     last_seen_responding_at: Option<chrono::DateTime<chrono::Utc>>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
-    match (last_seen_responding_at, started_at) {
-        (Some(at), Some(started)) => at >= started,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
+    // One definition of "this boot answered" (`state::answered_since`). Where
+    // it is UNKNOWN (no spawn recorded) this alerting predicate counts any
+    // stamp, which can only be this process's.
+    crate::state::answered_since(last_seen_responding_at, started_at)
+        .unwrap_or(last_seen_responding_at.is_some())
 }
 
 /// How often a pre-bind hang alert repeats for one spawn: the escalation loop's

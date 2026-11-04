@@ -950,7 +950,37 @@ impl serde::Serialize for RunnerLiveness {
     }
 }
 
+/// Whether `last_seen_responding_at` belongs to the boot that began at
+/// `started_at`: the ONE comparison every reader of "has this boot answered"
+/// uses ([`RunnerState::answered_this_boot`],
+/// `process::manager::answered_during_spawn`).
+///
+/// `started_at` absent is `None`, UNKNOWN: with no boot recorded there is
+/// nothing to compare the stamp against, and an absent answer is not a "no".
+/// Otherwise `Some(stamp >= started_at)`, and no stamp at all is `Some(false)`.
+/// An answer dated at the instant the boot began counts for it.
+pub fn answered_since(
+    last_seen_responding_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+) -> Option<bool> {
+    let started = started_at?;
+    Some(last_seen_responding_at.is_some_and(|seen| seen >= started))
+}
+
 impl RunnerState {
+    /// Whether the runner's HTTP API has answered during its current boot.
+    ///
+    /// `last_seen_responding_at` is never cleared, so it answers for the
+    /// runner's whole history under this supervisor; this answers for the
+    /// running process. `started_at` is set at every spawn and at adoption,
+    /// so an adopted runner counts from its adoption. `None` is UNKNOWN (no
+    /// boot recorded), never `false`. The stamp is dated from before the probe
+    /// that saw the answer (`health_cache`), so an answer from a previous
+    /// process to a probe in flight across a restart does not count here.
+    pub fn answered_this_boot(&self) -> Option<bool> {
+        answered_since(self.last_seen_responding_at, self.started_at)
+    }
+
     /// Classify liveness from the API probe, the port observation, and the
     /// last-responding stamp.
     ///
@@ -2907,6 +2937,31 @@ mod tests {
         std::fs::write(&path, format!("{seeded}\n")).expect("seed valid contents");
         let id = load_or_create_boot_id_at(&path);
         assert_eq!(id, seeded, "trailing whitespace must be trimmed");
+    }
+
+    // ---- answered_this_boot: per boot, not per supervisor lifetime ----
+
+    /// The table: no boot recorded is UNKNOWN whatever the stamp says; with a
+    /// boot, no stamp and an earlier stamp are `false`, and a stamp at or after
+    /// the boot's start is `true`. Literal instants, so an off-by-one in the
+    /// comparison (`>` for `>=`) turns the "at" row red.
+    #[test]
+    fn answered_this_boot_compares_the_stamp_with_this_boots_start() {
+        let started: DateTime<Utc> = "2026-11-04T10:00:00Z".parse().unwrap();
+        let before: DateTime<Utc> = "2026-11-02T09:59:59Z".parse().unwrap();
+        let after: DateTime<Utc> = "2026-11-04T10:00:01Z".parse().unwrap();
+        let row = |stamp: Option<DateTime<Utc>>, start: Option<DateTime<Utc>>| {
+            let mut st = RunnerState::new();
+            st.last_seen_responding_at = stamp;
+            st.started_at = start;
+            st.answered_this_boot()
+        };
+        assert_eq!(row(None, None), None, "no start, no stamp");
+        assert_eq!(row(Some(after), None), None, "no start: UNKNOWN, not true");
+        assert_eq!(row(None, Some(started)), Some(false), "no stamp");
+        assert_eq!(row(Some(before), Some(started)), Some(false), "before");
+        assert_eq!(row(Some(started), Some(started)), Some(true), "at");
+        assert_eq!(row(Some(after), Some(started)), Some(true), "after");
     }
 
     // ---- Phase 3b: liveness must not conflate "quiet" with "gone" ----

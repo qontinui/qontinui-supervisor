@@ -349,6 +349,10 @@ export interface RunnerInstanceHealth {
   /// Optional so a payload from an older supervisor still type-checks. An
   /// ABSENT verdict is unknown, never healthy.
   liveness?: RunnerLivenessWire;
+  /// Whether the API has answered during this boot (since `started_at`).
+  /// `null` is UNKNOWN (no boot recorded), never false. Optional for older
+  /// supervisors.
+  answered_this_boot?: boolean | null;
   last_seen_responding_at?: string | null;
   port_open?: boolean;
 }
@@ -437,6 +441,8 @@ export interface HealthResponse {
     api_responding: boolean;
     /// The PRIMARY's liveness verdict. Optional for older supervisors.
     liveness?: RunnerLivenessWire;
+    /// As on `runners[]`; `null` is UNKNOWN.
+    answered_this_boot?: boolean | null;
     last_seen_responding_at?: string | null;
   };
   ports: {
@@ -1130,6 +1136,8 @@ export const api = {
         /// `GET /health`. Optional for an older supervisor; an absent verdict
         /// is unknown, never healthy.
         liveness?: RunnerLivenessWire;
+        /// Whether the API has answered during this boot; `null` is UNKNOWN.
+        answered_this_boot?: boolean | null;
         last_seen_responding_at?: string | null;
         port_open?: boolean;
       }[]

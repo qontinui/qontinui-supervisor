@@ -3065,6 +3065,7 @@ mod tests {
             derived_status,
             watchdog: crate::routes::health::WatchdogHealth::unavailable(),
             liveness: crate::state::RunnerLiveness::Responding,
+            answered_this_boot: None,
             last_seen_responding_at: None,
             port_open: true,
             frontend_ready: None,

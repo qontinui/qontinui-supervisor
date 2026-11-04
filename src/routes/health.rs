@@ -125,6 +125,11 @@ pub struct RunnerInstanceHealth {
     /// see the state that most contradicts it. `running` + `api_responding`
     /// below are unchanged; read `liveness`.
     pub liveness: crate::state::RunnerLiveness,
+    /// Whether this runner's API has answered during its current boot
+    /// (`RunnerState::answered_this_boot`). `null` = UNKNOWN: no boot recorded.
+    /// A `wedged` verdict with `false` here is a boot that has held its port and
+    /// never answered, carrying a previous boot's `last_seen_responding_at`.
+    pub answered_this_boot: Option<bool>,
     /// When this runner's API was last seen responding, RFC3339. `null` =
     /// never observed responding, which is UNKNOWN, not "never ran".
     pub last_seen_responding_at: Option<String>,
@@ -154,6 +159,9 @@ pub struct RunnerHealth {
     /// a header that reads `running` alone is exactly how a runner that held
     /// its port for ~14h while answering nothing kept showing as healthy.
     pub liveness: crate::state::RunnerLiveness,
+    /// Whether the primary's API has answered during its current boot, as on
+    /// `runners[]`. `null` = UNKNOWN.
+    pub answered_this_boot: Option<bool>,
     /// When the primary's API was last seen responding, RFC3339.
     pub last_seen_responding_at: Option<String>,
 }
@@ -612,6 +620,7 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 recent_crash: r.recent_crash.clone(),
                 derived_status: r.derived_status.clone(),
                 liveness: r.liveness,
+                answered_this_boot: r.answered_this_boot,
                 last_seen_responding_at: r.last_seen_responding_at.map(|t| t.to_rfc3339()),
                 port_open: r.port_open,
             })
@@ -682,6 +691,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         primary_started_at,
         primary_watchdog,
         primary_liveness,
+        primary_answered,
         primary_last_seen,
         primary_frontend,
         primary_legacy_exe,
@@ -716,6 +726,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pr.started_at,
             watchdog,
             pr.liveness(api_in_use, api_responding),
+            pr.answered_this_boot(),
             pr.last_seen_responding_at,
             frontend,
             legacy_exe,
@@ -729,6 +740,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             runner.started_at,
             WatchdogHealth::unavailable(),
             runner.liveness(api_in_use, api_responding),
+            runner.answered_this_boot(),
             runner.last_seen_responding_at,
             PrimaryFrontend::default(),
             false,
@@ -780,6 +792,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
             liveness: mr.liveness(mc.runner_port_open, mc.runner_responding),
+            answered_this_boot: mr.answered_this_boot(),
             last_seen_responding_at: mr.last_seen_responding_at.map(|t| t.to_rfc3339()),
             port_open: mc.runner_port_open,
         });
@@ -795,6 +808,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             started_at: primary_started_at.map(|t| t.to_rfc3339()),
             api_responding,
             liveness: primary_liveness,
+            answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
         },
         ports: PortsHealth {
@@ -890,9 +904,9 @@ fn try_build_sse_health(
     // No primary snapshot yet (first ticks after boot) is not
     // evidence of health: it is `Unknown`, the same answer every other
     // surface gives for an un-probed runner.
-    let (primary_liveness, primary_last_seen) = match primary_snapshot {
-        Some(p) => (p.liveness, p.last_seen_responding_at),
-        None => (crate::state::RunnerLiveness::Unknown, None),
+    let (primary_liveness, primary_answered, primary_last_seen) = match primary_snapshot {
+        Some(p) => (p.liveness, p.answered_this_boot, p.last_seen_responding_at),
+        None => (crate::state::RunnerLiveness::Unknown, None, None),
     };
 
     // Sync-safe, and contention SKIPS the tick (keepalive) rather than
@@ -950,6 +964,7 @@ fn try_build_sse_health(
             started_at: None, // Not available from cached snapshot
             api_responding,
             liveness: primary_liveness,
+            answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
         },
         ports: PortsHealth {
@@ -1265,6 +1280,7 @@ mod tests {
             derived_status: RunnerStatus::Healthy,
             watchdog: WatchdogHealth::unavailable(),
             liveness: crate::state::RunnerLiveness::Responding,
+            answered_this_boot: None,
             last_seen_responding_at: None,
             port_open: true,
             frontend_ready: None,
@@ -1472,6 +1488,7 @@ mod tests {
                 started_at: None,
                 api_responding: true,
                 liveness: crate::state::RunnerLiveness::Responding,
+                answered_this_boot: None,
                 last_seen_responding_at: None,
             },
             ports: PortsHealth {
@@ -1624,6 +1641,7 @@ mod tests {
         let mut response = build_minimal_health_response();
         response.runner.liveness = crate::state::RunnerLiveness::UnresponsiveSince(seen);
         response.runner.last_seen_responding_at = Some(seen.to_rfc3339());
+        response.runner.answered_this_boot = Some(false);
         response.runners.push(RunnerInstanceHealth {
             id: "primary".to_string(),
             name: "Primary".to_string(),
@@ -1638,6 +1656,7 @@ mod tests {
             recent_crash: None,
             derived_status: RunnerStatus::default(),
             liveness: crate::state::RunnerLiveness::UnresponsiveSince(seen),
+            answered_this_boot: Some(false),
             last_seen_responding_at: Some(seen.to_rfc3339()),
             port_open: true,
         });
@@ -1661,6 +1680,9 @@ mod tests {
         assert_eq!(row["liveness"]["state"], "wedged", "row: {row}");
         assert_eq!(row["port_open"], true);
         assert_eq!(row["last_seen_responding_at"], seen.to_rfc3339());
+        // Beside the verdict: a wedged reading on a stamp this boot never made.
+        assert_eq!(value["runner"]["answered_this_boot"], false);
+        assert_eq!(row["answered_this_boot"], false);
         // The pre-existing fields keep their meanings and values.
         assert_eq!(row["running"], true);
         assert_eq!(row["api_responding"], false);
@@ -1684,6 +1706,13 @@ mod tests {
                 value["runner"]["liveness"]["unresponsive_since"].is_null(),
                 "{name} must carry an explicit null, never a missing key"
             );
+            // UNKNOWN is an explicit null too, never an absent key or `false`.
+            assert!(
+                value["runner"]
+                    .as_object()
+                    .is_some_and(|r| r.get("answered_this_boot") == Some(&serde_json::Value::Null)),
+                "answered_this_boot must be an explicit null: {value}"
+            );
         }
     }
     /// Minimal `HealthResponse` for serialization-shape assertions.
@@ -1697,6 +1726,7 @@ mod tests {
                 started_at: None,
                 api_responding: false,
                 liveness: crate::state::RunnerLiveness::Unknown,
+                answered_this_boot: None,
                 last_seen_responding_at: None,
             },
             ports: PortsHealth {

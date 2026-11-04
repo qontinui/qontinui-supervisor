@@ -307,6 +307,11 @@ pub struct CachedRunnerHealth {
     /// pid: null` about a live process it could see holding the port in the
     /// same document. **Render this field, not `running`.**
     pub liveness: crate::state::RunnerLiveness,
+    /// [`crate::state::RunnerState::answered_this_boot`] on this tick: whether
+    /// the API has answered since this boot's `started_at`. `None` = UNKNOWN
+    /// (no boot recorded), never `false`. Beside `liveness` because a `wedged`
+    /// verdict reads the never-cleared stamp, which may be a previous boot's.
+    pub answered_this_boot: Option<bool>,
     /// When the API was last seen responding — `None` if never seen.
     /// Gives "unresponsive since T" an actual T to show.
     pub last_seen_responding_at: Option<DateTime<Utc>>,
@@ -975,6 +980,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // Phase 3b — classified from the SAME tick's live listener
                     // probe, never from a remembered or assumed port state.
                     liveness: runner_state.liveness(runner_port_open, runner_responding),
+                    answered_this_boot: runner_state.answered_this_boot(),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
                     port_open: runner_port_open,
                     frontend_ready,

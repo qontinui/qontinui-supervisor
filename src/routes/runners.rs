@@ -734,6 +734,11 @@ pub async fn list_runners(
             // `{"state": "responding"|"wedged"|"stopped"|"unknown",
             //   "unresponsive_since": <rfc3339>|null}`.
             "liveness": liveness,
+            // Whether the API has answered during THIS boot (since
+            // `started_at`). `null` = UNKNOWN (no boot recorded), never false.
+            // `wedged` with `false` here is a boot that never answered, whose
+            // `last_seen_responding_at` is a previous boot's.
+            "answered_this_boot": runner.answered_this_boot(),
             // The T behind "unresponsive since T", also present for the
             // non-wedged states so a caller can age any verdict. `null` =
             // never observed responding, which is UNKNOWN, not "never ran".
