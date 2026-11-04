@@ -64,6 +64,18 @@ fn unhealthy_after_start_body(runner_id: &str, failure: &HealthProbeFailure) -> 
     })
 }
 
+/// The body a detached rebuild-restart records when its health wait fails
+/// (surfaced on `GET /build/{id}/status`): the shared body plus `status`, which
+/// a poller of that route branches on.
+fn detached_unhealthy_after_start_body(
+    runner_id: &str,
+    failure: &HealthProbeFailure,
+) -> serde_json::Value {
+    let mut body = unhealthy_after_start_body(runner_id, failure);
+    body["status"] = "unhealthy_after_start".into();
+    body
+}
+
 /// Mint a dev-action trial for a primary-runner action (restart / build)
 /// through [`mint_action`], targeting the primary's registry entry
 /// ([`primary_attribution_targets`]).
@@ -792,8 +804,7 @@ pub async fn restart_runner(
                             // Phase 3 path 4: the runner started but never
                             // bound its port. It RAN, and it failed.
                             exec_record.record_run_result(ActionRunResult::Errored { reason });
-                            let mut body = unhealthy_after_start_body(&runner_id, &failure);
-                            body["status"] = "unhealthy_after_start".into();
+                            let body = detached_unhealthy_after_start_body(&runner_id, &failure);
                             return (StatusCode::SERVICE_UNAVAILABLE.as_u16(), body);
                         }
                         probe = SyncProbe::Healthy;
@@ -1533,6 +1544,26 @@ mod tests {
         assert_eq!(body["elapsed_ms"], 7);
         assert_eq!(body["ended"], "boot_ended");
         assert_eq!(body["recent_logs"][0], "last");
+    }
+
+    /// The detached rebuild's body carries `status`, which only it adds: a
+    /// poller of `GET /build/{id}/status` branches on it. Pinned beside the
+    /// shared fields so dropping either half turns this red.
+    #[test]
+    fn the_detached_unhealthy_body_carries_its_status() {
+        let body = detached_unhealthy_after_start_body(
+            "primary",
+            &HealthProbeFailure {
+                elapsed_ms: 90_000,
+                ended: crate::process::health_probe::HealthWaitEnd::BootEnded,
+                recent_logs: vec![],
+            },
+        );
+        assert_eq!(body["status"], "unhealthy_after_start");
+        assert_eq!(body["error"], "runner_unhealthy_after_start");
+        assert_eq!(body["runner_id"], "primary");
+        assert_eq!(body["elapsed_ms"], 90_000);
+        assert_eq!(body["ended"], "boot_ended");
     }
 
     #[test]
