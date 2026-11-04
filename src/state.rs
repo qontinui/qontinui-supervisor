@@ -1715,8 +1715,7 @@ fn default_boot_id_path() -> PathBuf {
 /// will simply generate a new one. The returned string is always a
 /// well-formed UUID.
 ///
-/// This is the testable variant of [`load_or_create_boot_id`]. The public
-/// function calls this with [`default_boot_id_path()`].
+/// [`resolve_boot_id`] calls this with [`default_boot_id_path`] in production.
 pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
     if let Ok(contents) = std::fs::read_to_string(path) {
         let trimmed = contents.trim();
@@ -1749,12 +1748,19 @@ pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
     fresh
 }
 
-/// Resolve the persistent `boot_id` for this supervisor installation.
-/// Reads the persisted UUID from the platform-default path if present,
-/// otherwise generates and persists a fresh one. See
+/// The `boot_id` a state starts with: the persisted one, at `default_path` or the
+/// config's own file, generated and persisted if absent, or under
+/// [`crate::config::AmbientBootId::Ignore`] a fresh one that touches no file. See
 /// [`SupervisorState::boot_id`] for semantics.
-pub fn load_or_create_boot_id() -> String {
-    load_or_create_boot_id_at(&default_boot_id_path())
+fn resolve_boot_id(
+    access: &crate::config::AmbientBootId,
+    default_path: &std::path::Path,
+) -> String {
+    match access {
+        crate::config::AmbientBootId::Read => load_or_create_boot_id_at(default_path),
+        crate::config::AmbientBootId::At(path) => load_or_create_boot_id_at(path),
+        crate::config::AmbientBootId::Ignore => uuid::Uuid::new_v4().to_string(),
+    }
 }
 
 /// Identity of a spawn-test build for single-flight purposes: **who** asked,
@@ -1982,6 +1988,7 @@ impl SupervisorState {
         }
 
         let build_pool = BuildPool::new(&config);
+        let boot_id = resolve_boot_id(&config.ambient_boot_id, &default_boot_id_path());
 
         // Create the kill-on-exit JobObject. On Windows this enforces that
         // every supervisor-spawned *temp* runner dies when the supervisor
@@ -2056,7 +2063,7 @@ impl SupervisorState {
             runner_api_port: crate::config::RUNNER_API_PORT,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
-            boot_id: load_or_create_boot_id(),
+            boot_id,
             build_id: compute_build_id(),
             ephemeral_job,
             runner_isolation_probe: RwLock::new(None),
@@ -2543,6 +2550,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
         }
     }
 
@@ -3121,6 +3129,63 @@ mod tests {
     }
 
     // --- boot_id persistence tests ---
+
+    /// `Ignore` neither creates the file nor reads one that is there, and `Read`
+    /// over the same path returns what the file holds.
+    #[test]
+    fn ignoring_the_ambient_boot_id_touches_no_file() {
+        use crate::config::AmbientBootId;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("boot.id");
+
+        let first = resolve_boot_id(&AmbientBootId::Ignore, &path);
+        assert!(uuid::Uuid::parse_str(&first).is_ok(), "{first}");
+        assert!(!path.exists(), "Ignore created the file");
+        assert!(
+            !dir.path().join("nested").exists(),
+            "Ignore created its dir"
+        );
+        assert_ne!(first, resolve_boot_id(&AmbientBootId::Ignore, &path));
+
+        let persisted = resolve_boot_id(&AmbientBootId::Read, &path);
+        assert!(path.exists(), "Read must persist the id");
+        assert_ne!(resolve_boot_id(&AmbientBootId::Ignore, &path), persisted);
+        assert_eq!(resolve_boot_id(&AmbientBootId::Read, &path), persisted);
+        let elsewhere = dir.path().join("elsewhere").join("boot.id");
+        assert_ne!(
+            resolve_boot_id(&AmbientBootId::At(elsewhere), &path),
+            persisted
+        );
+    }
+
+    /// `SupervisorState::new` follows the config, both ways: two states over one
+    /// file carry its id, and two states ignoring it would carry one id if they read
+    /// any file.
+    #[tokio::test]
+    async fn a_state_takes_its_boot_id_from_the_configured_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.id");
+        let config = || {
+            let mut config = make_test_config();
+            config.ambient_boot_id = crate::config::AmbientBootId::At(path.clone());
+            config
+        };
+        let (first, second) = (
+            SupervisorState::new(config()),
+            SupervisorState::new(config()),
+        );
+        assert_eq!(first.boot_id, second.boot_id);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first.boot_id);
+    }
+
+    #[tokio::test]
+    async fn a_test_state_takes_no_boot_id_from_the_real_file() {
+        let (first, second) = (
+            SupervisorState::new(make_test_config()),
+            SupervisorState::new(make_test_config()),
+        );
+        assert_ne!(first.boot_id, second.boot_id);
+    }
 
     #[test]
     fn test_load_or_create_boot_id_at_persists_across_calls() {
