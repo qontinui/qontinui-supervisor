@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
 import { api } from '../lib/api';
@@ -421,5 +421,52 @@ describe('Dashboard — build staleness', () => {
     await vi.waitFor(() => expect(api.builds).toHaveBeenCalled());
     expect(screen.queryByTestId('build-staleness-badge-primary')).not.toBeInTheDocument();
     expect(rebuild.getAttribute('title')).not.toContain('origin/main');
+  });
+});
+
+// ─── A spawn that has not bound its port (plan 2026-11-04-a-runner-boot-that-never-answers…, D3) ──
+
+describe('Dashboard — a live spawn with no port', () => {
+  const PREBIND_NAMED = {
+    id: 'named-prebind',
+    name: 'named-prebind',
+    port: 9890,
+    kind: { type: 'named' },
+    protected: true,
+    running: false,
+    pid: 4242,
+    api_responding: false,
+    port_open: false,
+    liveness: { state: 'unknown', unresponsive_since: null },
+  };
+
+  afterEach(() => {
+    vi.mocked(api.listRunners).mockResolvedValue([] as never);
+  });
+
+  /// The runner's own table row, so the panel's other Start/Stop buttons
+  /// (dev-start services, Expo) cannot answer for it.
+  async function prebindRow(): Promise<HTMLElement> {
+    const cells = await screen.findAllByText('named-prebind');
+    const row = cells.map((c) => c.closest('tr')).find((r) => r !== null);
+    if (!row) throw new Error('no table row for named-prebind');
+    return row as HTMLElement;
+  }
+
+  it('offers no Start for a runner whose newest spawn is up', async () => {
+    vi.mocked(api.listRunners).mockResolvedValue([{ ...PREBIND_NAMED, spawn_up: true }] as never);
+    renderDashboard();
+    const row = within(await prebindRow());
+    expect(row.getByRole('button', { name: 'Stop' })).toBeInTheDocument();
+    expect(row.getByRole('button', { name: 'Restart' })).toBeInTheDocument();
+    expect(row.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+  });
+
+  it('still offers Start when the spawn is not up', async () => {
+    vi.mocked(api.listRunners).mockResolvedValue([{ ...PREBIND_NAMED, spawn_up: false }] as never);
+    renderDashboard();
+    const row = within(await prebindRow());
+    expect(row.getByRole('button', { name: 'Start' })).toBeInTheDocument();
+    expect(row.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
   });
 });

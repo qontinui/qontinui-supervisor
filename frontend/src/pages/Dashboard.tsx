@@ -274,6 +274,9 @@ interface RunnerInstance {
   liveness?: RunnerLivenessWire;
   last_seen_responding_at?: string | null;
   port_open?: boolean;
+  // The newest spawn is alive while the port is free and the API silent: a
+  // runner that has not bound its listener. Optional for older supervisors.
+  spawn_up?: boolean;
 }
 
 // ─── Per-runner watchdog badge (#111/#113 per-runner completion) ────────────
@@ -830,7 +833,11 @@ function RunnerRow({
   // the probe, so the same wedge rendered as down and offered Start for a
   // process that was already running.
   const isWedged = r.liveness?.state === 'wedged';
-  const isUp = r.running || r.api_responding || isWedged;
+  // A spawn alive with its port free (hung or slow before its listener binds)
+  // is up too: `running` is lowered from the failed probe for the primary, and
+  // a Start would be refused by `start_managed_runner` (RunnerAlreadyRunning).
+  // Only an explicit `true` counts; an older supervisor omits the field.
+  const isUp = r.running || r.api_responding || isWedged || r.spawn_up === true;
   const isPrimary = r.kind.type === 'primary';
   // A detached rebuild for this runner is in flight (driven off /build/:id/status
   // polling). While building, every action button stays disabled and the Rebuild

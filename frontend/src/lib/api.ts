@@ -355,6 +355,9 @@ export interface RunnerInstanceHealth {
   answered_this_boot?: boolean | null;
   last_seen_responding_at?: string | null;
   port_open?: boolean;
+  /// The newest spawn is alive while the port is free and the API silent: a
+  /// runner that has not bound its listener. Optional for older supervisors.
+  spawn_up?: boolean;
 }
 
 /// Watchdog health as surfaced by the supervisor. The top-level
@@ -444,6 +447,8 @@ export interface HealthResponse {
     /// As on `runners[]`; `null` is UNKNOWN.
     answered_this_boot?: boolean | null;
     last_seen_responding_at?: string | null;
+    /// As on `runners[]`. Optional for older supervisors.
+    spawn_up?: boolean;
   };
   ports: {
     api_port: { port: number; in_use: boolean };
@@ -1140,6 +1145,9 @@ export const api = {
         answered_this_boot?: boolean | null;
         last_seen_responding_at?: string | null;
         port_open?: boolean;
+        /// The newest spawn is alive while the port is free and the API
+        /// silent (not bound yet): the runner is up, so no Start is offered.
+        spawn_up?: boolean;
       }[]
     >('/runners'),
   protectRunner: (id: string, isProtected: boolean) =>
