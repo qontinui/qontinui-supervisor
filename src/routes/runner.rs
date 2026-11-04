@@ -283,9 +283,10 @@ fn rebuild_when_idle_result(
 /// ([`rebuild_when_idle_result`]): `"rebuilt"` (200) once the rebuild's own boot
 /// answered, else `"rebuilt_unhealthy"` (502) carrying the health wait's
 /// error. The rebuild ran either way, so an operator polling
-/// `GET /build/{id}/status` must not read a boot that did not answer in time as
-/// a clean rebuild. The wait's budget is a bound, not proof: that boot may still
-/// answer later, and a crash-watchdog respawn may be up by the time this is read.
+/// `GET /build/{id}/status` must not read a boot nothing confirmed healthy as a
+/// clean rebuild. It can mean the boot did not answer within the wait (a bound,
+/// not proof: it may still answer), ended early, or had no primary left to check,
+/// and a crash-watchdog respawn may be up by the time this is read.
 fn rebuilt_body(
     result: &ActionRunResult,
     waited_secs: u64,
@@ -316,13 +317,13 @@ fn rebuilt_body(
 }
 
 /// The operator log line of a `rebuild_when_idle` whose rebuild ran and whose
-/// own boot did not answer in time ([`rebuilt_body`]'s `rebuilt_unhealthy`), and
-/// none for one that did. Nobody is watching this door when it fires, so the line
+/// own boot was not confirmed healthy ([`rebuilt_body`]'s `rebuilt_unhealthy`),
+/// and none for one that was. Nobody is watching this door when it fires, so the line
 /// has the level of the failed restart beside it.
 fn unhealthy_rebuild_log(result: &ActionRunResult, runner_name: &str) -> Option<String> {
     result.reason().map(|reason| {
         format!(
-            "Rebuild-when-idle: '{runner_name}' rebuilt, but that boot did not answer in time: {reason}"
+            "Rebuild-when-idle: '{runner_name}' rebuilt, but that boot was not confirmed healthy: {reason}"
         )
     })
 }
@@ -383,7 +384,7 @@ async fn primary_health_after_start(
 ///
 /// Returns 202 + `build_id` immediately; poll `GET /build/{id}/status`. Its
 /// `detached` body ends as `rebuilt` (200), `rebuilt_unhealthy` (502: the
-/// rebuild ran and its own boot did not answer in time), `gave_up_waiting` (408: nothing
+/// rebuild ran and its own boot was not confirmed healthy), `gave_up_waiting` (408: nothing
 /// rebuilt, nothing stopped), `aborted` (404: the primary left the registry) or
 /// `error` (500: the restart failed, or the readiness gate refused it at fire
 /// time; the `error` text says which), or `panicked` (500) if its task panicked.
@@ -2025,7 +2026,7 @@ mod tests {
         assert_eq!(
             unhealthy_rebuild_log(&unhealthy, "primary").as_deref(),
             Some(
-                "Rebuild-when-idle: 'primary' rebuilt, but that boot did not answer in time: \
+                "Rebuild-when-idle: 'primary' rebuilt, but that boot was not confirmed healthy: \
                  runner_unhealthy_after_start: runner 'primary' did not become healthy \
                  within 90000ms of rebuild-when-idle"
             )
