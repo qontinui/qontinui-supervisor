@@ -45,9 +45,10 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// under, stamped as `metadata.attribution_epoch`.
 ///
 /// **Bump rule: bump this whenever attribution semantics change** — what a
-/// spawn, restart or build verdict is attributed to, or the window it is read
-/// over — so coord can tell rows recorded under the old semantics from rows
-/// recorded under the new. As of coord `6846970ac` (2026-11-03) coord stores the
+/// spawn, restart or build verdict is attributed to, what it closes as, or the
+/// window it is read over — so coord can tell rows recorded under the old
+/// semantics from rows recorded under the new. One epoch means one thing on a
+/// row, so a change that moves only the stored category or evidence counts. As of coord `6846970ac` (2026-11-03) coord stores the
 /// stamp and does not act on it: its half of the plan below (Phase 5) is to skip the
 /// `dev_action_stats` increment for
 /// `spawn` / `restart` / `build` rows whose epoch is missing or below a
@@ -72,7 +73,12 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// whichever spawn answered the port, and the wait runs to the first-healthy budget
 /// (`process::health_probe::wait_for_action_boot_healthy`), so a boot answering
 /// after 30 s no longer reads as failed and a crashed one no longer reads as up.
-pub const ATTRIBUTION_EPOCH: u32 = 4;
+///
+/// Epoch 5 closes `partial`, with its own `evidence_ref`, a window that holds an
+/// `Errored` report it cannot place after the action's spawn, where it used to
+/// close `confirmed`. Category and evidence only: no signature or window moves,
+/// and coord's `dev_action_stats` keys on signatures, so its counts do not.
+pub const ATTRIBUTION_EPOCH: u32 = 5;
 
 /// The snapshot `metadata` this build stamps on every row, so a row names the
 /// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
@@ -321,9 +327,10 @@ mod tests {
 
         assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
         // Epoch 1 is the unstamped pre-fix rows, 2 can carry semantics from before
-        // #272, and 3 reads a detached verdict off the port. A constant, so it is
-        // checked at compile time.
-        const _: () = assert!(ATTRIBUTION_EPOCH >= 4);
+        // #272, 3 reads a detached verdict off the port, and 4 can close `confirmed`
+        // on a report it could not place. A constant, so it is checked at compile
+        // time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 5);
         assert_eq!(
             json["metadata"]["supervisor_build_sha"],
             serde_json::Value::from(crate::self_provenance::built_from_sha()),

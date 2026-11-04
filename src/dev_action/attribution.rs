@@ -33,8 +33,8 @@
 //!
 //! **A change here can owe a bump of
 //! [`crate::dev_action::ingest::ATTRIBUTION_EPOCH`]:** what a verdict is
-//! attributed to, or the window it is read over, is exactly what that constant
-//! versions. Without the bump, coord cannot tell rows recorded under the two
+//! attributed to, what it closes as, or the window it is read over, is exactly
+//! what that constant versions. Without the bump, coord cannot tell rows recorded under the two
 //! semantics apart.
 //!
 //! The watcher is a detached `tokio::spawn` owning a `SharedState` clone — the
@@ -1081,7 +1081,6 @@ pub fn spawn_attribution_watcher_with_timing(
     });
 }
 
-/// Stable log token for an [`ActionRunResult`] variant.
 /// The operator line's note on a `Partial` nothing else on the line would
 /// explain: the unplaced `Errored` that made it one. A backstop close is
 /// `Partial` with or without one, and its evidence says so.
@@ -1097,6 +1096,7 @@ fn health_note(
     }
 }
 
+/// Stable log token for an [`ActionRunResult`] variant.
 fn run_kind(r: &ActionRunResult) -> &'static str {
     match r {
         ActionRunResult::Refused { .. } => "refused",

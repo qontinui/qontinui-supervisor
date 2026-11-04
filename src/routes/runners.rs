@@ -3342,7 +3342,8 @@ pub async fn spawn_test(
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
             let runner_id = exec_id.clone();
-            let outcome = spawn_build_or_panicked(
+            let (status, body_json, stderr_tail) = finish_spawn_build(
+                &exec_release_state,
                 execute_spawn_build(
                     exec_state,
                     body,
@@ -3354,15 +3355,10 @@ pub async fn spawn_test(
                 ),
                 &runner_id,
                 port,
+                release_key,
+                &exec_release_id,
             )
             .await;
-            // The build is over (succeeded, failed or panicked): free the key so
-            // the next request for it starts a fresh build instead of joining a
-            // corpse.
-            if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
-                exec_release_state.release_spawn_inflight(&key, id).await;
-            }
-            let (status, body_json, stderr_tail) = outcome;
             (status, exec_minted.stamp(body_json), stderr_tail)
         },
     );
@@ -3746,20 +3742,26 @@ fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usiz
 }
 
 /// Await `build`, the spawn-test's build, as the `(http_status, body,
-/// stderr_tail)` its submission stores. A panic skips everything
-/// `execute_spawn_build` would have attached, so it is caught here, where the
-/// reservation is known: it answers `panicked` naming the runner, which a caller
-/// needs to follow or stop it, since the process may already be running. A
-/// placeholder that never started is left to the stale sweep.
-async fn spawn_build_or_panicked<F>(
+/// stderr_tail)` its submission stores, then free its dedup key so the next
+/// request for it starts a fresh build instead of joining a corpse.
+///
+/// A panic skips everything `execute_spawn_build` would have attached, so it is
+/// caught here, where the reservation is known: it answers `panicked` naming the
+/// runner, which a caller needs to follow or stop it, since the process may
+/// already be running. A placeholder that never started is left to the stale
+/// sweep.
+async fn finish_spawn_build<F>(
+    state: &SharedState,
     build: F,
     id: &str,
     port: u16,
+    release_key: Option<SpawnDedupKey>,
+    release_id: &std::sync::OnceLock<uuid::Uuid>,
 ) -> (u16, serde_json::Value, Vec<String>)
 where
     F: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value, Vec<String>)>,
 {
-    match crate::build_submissions::caught(build).await {
+    let outcome = match crate::build_submissions::caught(build).await {
         Ok((status, body, stderr_tail)) => (status.as_u16(), body, stderr_tail),
         Err(reason) => {
             let (status, mut body) = crate::build_submissions::panicked_outcome(reason);
@@ -3767,7 +3769,11 @@ where
             attach_build_slot_id(&mut body, None);
             (status, body, Vec::new())
         }
+    };
+    if let (Some(key), Some(submission_id)) = (release_key, release_id.get().copied()) {
+        state.release_spawn_inflight(&key, submission_id).await;
     }
+    outcome
 }
 
 /// Merge the reserved runner IDENTITY (`id`, `port`, and the URLs derived from

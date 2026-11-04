@@ -1551,7 +1551,7 @@ mod tests {
     /// The same for a spawn-test build, whose synchronous caller blocks on
     /// `await_terminal`: a panic that reaches this backstop still releases it,
     /// and the stored outcome keeps the reserved port. What that caller is told
-    /// is `routes::runners::spawn_build_or_panicked`'s, which catches first.
+    /// is `routes::runners::finish_spawn_build`'s, which catches first.
     #[tokio::test]
     async fn submit_spawn_panic_records_failed_and_releases_the_waiter() {
         let store = Arc::new(BuildSubmissionStore::new(100));
@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     /// [`caught`] reads every payload a panic carries: a literal, a formatted
-    /// `String` (what `unwrap` and `expect` raise, and `panic!` with a runtime
+    /// `String` (what `Result::unwrap` raises, and `panic!` with a runtime
     /// argument), and anything else.
     #[tokio::test]
     async fn caught_names_every_panic_payload() {

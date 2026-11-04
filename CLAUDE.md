@@ -931,8 +931,10 @@ posted. A missing key there is UNKNOWN: builds from #270 and #272 stamp their sn
 (epoch 2) and predate the field. The constant's doc comment says what each epoch means.
 
 **Bump `ATTRIBUTION_EPOCH` whenever attribution semantics change**: what a `spawn`,
-`restart` or `build` verdict is attributed to, or the window it is read over. Without
-the bump, coord cannot tell rows recorded under the two semantics apart.
+`restart` or `build` verdict is attributed to, what it closes as, or the window it is
+read over. A change that moves only a row's category or evidence counts, even though
+coord's stats key on signatures: one epoch means one thing on a row. Without the bump,
+coord cannot tell rows recorded under the two semantics apart.
 
 **Coord does not act on the stamp yet** (read at coord `6846970ac`, 2026-11-03; re-read
 it there rather than trusting this line). It stores `metadata` and counts every row in
@@ -1815,9 +1817,9 @@ failed could not read why or clean up after itself.
 `ui_bridge_url` / `logs_url` / `stop_url` into **both** arms of
 `execute_spawn_build` — the same uniformity contract `attach_build_slot_id`
 already has, and pinned by the same style of test.
-A build that panics answers the same way, with `status: "panicked"`: `spawn_build_or_panicked`
-catches it where the reservation is known, and frees the dedup key behind it. Without that a
-panic left the submission `Running` for good and a synchronous caller blocked on it.
+A build that panics answers the same way, with `status: "panicked"`: `finish_spawn_build`
+catches it where the reservation is known, then frees the dedup key. `submit_spawn`'s own catch
+stays as the backstop that keeps a panic from leaving the submission `Running`.
 
 ### A lost spawn-test answer
 

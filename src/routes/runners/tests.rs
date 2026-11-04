@@ -4223,12 +4223,41 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
 }
 
 /// A spawn-test build that panics still names the runner it reserved, so a
-/// caller can follow or stop a process that may already be running, and every
-/// other outcome passes through untouched. The exec future runs it BEFORE it
-/// frees the dedup key, so a panic cannot leave a dead build listed in flight.
+/// caller can follow or stop a process that may already be running, and frees
+/// its dedup key, so `GET /runners/spawn-test/in-flight` stops listing it and the
+/// next request starts a fresh build. Every other outcome passes through
+/// untouched and frees the key too.
 #[tokio::test]
 async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
-    let (status, body, stderr_tail) = super::spawn_build_or_panicked(
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state_at(root.path());
+    let key = crate::state::SpawnDedupKey {
+        requester_id: "agent-1".to_string(),
+        build_target: "origin_main".to_string(),
+    };
+    let claim_in_flight = |submission_id: uuid::Uuid| {
+        let (state, key) = (state.clone(), key.clone());
+        async move {
+            match state.claim_spawn_build(Some(key)).await {
+                crate::state::SpawnTicket::Claim(claim) => {
+                    claim.commit(crate::state::SpawnInflight {
+                        submission_id,
+                        runner_id: "test-abc".to_string(),
+                        port: 9877,
+                    })
+                }
+                crate::state::SpawnTicket::Join(_) => panic!("the key was still held"),
+            }
+            assert_eq!(state.spawn_inflight_snapshot(None).await.len(), 1);
+            let release_id = std::sync::OnceLock::new();
+            release_id.set(submission_id).unwrap();
+            release_id
+        }
+    };
+
+    let release_id = claim_in_flight(uuid::Uuid::new_v4()).await;
+    let (status, body, stderr_tail) = super::finish_spawn_build(
+        &state,
         async {
             if true {
                 panic!("the build blew up");
@@ -4241,8 +4270,14 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
         },
         "test-abc",
         9877,
+        Some(key.clone()),
+        &release_id,
     )
     .await;
+    assert!(
+        state.spawn_inflight_snapshot(None).await.is_empty(),
+        "a panicked build is still listed in flight"
+    );
     assert_eq!(status, 500);
     assert_eq!(body["status"], "panicked");
     assert_eq!(
@@ -4258,7 +4293,9 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
     assert_eq!(obj["build_slot_id"], serde_json::Value::Null);
     assert!(stderr_tail.is_empty());
 
-    let (status, body, stderr_tail) = super::spawn_build_or_panicked(
+    let release_id = claim_in_flight(uuid::Uuid::new_v4()).await;
+    let (status, body, stderr_tail) = super::finish_spawn_build(
+        &state,
         async {
             (
                 axum::http::StatusCode::BAD_GATEWAY,
@@ -4268,8 +4305,11 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
         },
         "test-abc",
         9877,
+        Some(key.clone()),
+        &release_id,
     )
     .await;
+    assert!(state.spawn_inflight_snapshot(None).await.is_empty());
     assert_eq!(status, 502);
     assert_eq!(body, serde_json::json!({"error": "cargo failed"}));
     assert_eq!(stderr_tail, ["error[E0277]"]);
@@ -4279,15 +4319,9 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
         "pub async fn spawn_test(",
     )
     .expect("spawn_test exists");
-    let caught_at = handler
-        .find("spawn_build_or_panicked(")
-        .expect("the exec future catches a panicked build");
-    let released_at = handler
-        .find("release_spawn_inflight(")
-        .expect("the exec future frees the key");
     assert!(
-        caught_at < released_at,
-        "the key must be freed after the catch, or a panic skips it"
+        handler.contains("finish_spawn_build("),
+        "spawn_test's exec future must finish through the catch and the release"
     );
 }
 
