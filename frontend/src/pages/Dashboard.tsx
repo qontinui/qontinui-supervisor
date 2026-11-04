@@ -237,6 +237,10 @@ interface RunnerInstance {
   protected: boolean;
   running: boolean;
   pid: number | null;
+  /// The current spawn's start (RFC3339). Optional: absent on an older
+  /// supervisor, `null` for a runner never started. Read by `PrebindHangBadge`
+  /// to tell whether the last pre-bind alert is about THIS spawn.
+  started_at?: string | null;
   api_responding: boolean;
   // Phase 3J.3: supervisor-derived status + runner-reported ui_error.
   // Post-3J follow-up adds `recent_crash` for Rust panics the React boundary
@@ -434,6 +438,63 @@ export function RunnerWatchdogBadge({
   }
 
   return null;
+}
+
+// ─── Pre-bind hang badge (post-merge completion of #283/#286) ───────────────
+// `manager::maybe_alert_prebind_hang` alerts a runner whose newest spawn is
+// alive, has not answered, and does not hold its port past the first-healthy
+// budget (`never_bound_since_spawn`). That shape reads `liveness: unknown` with
+// `pid: null`, so the status badge shows nothing alarming; `/runners[].watchdog`
+// serves the last alert as `last_prebind_alert_at` +
+// `last_prebind_alert_spawn_started_at`. The value is HISTORICAL, so this badge
+// renders only when the alert names the runner's CURRENT spawn and the runner
+// has not been seen answering since that spawn started. Amber, not red: a slow
+// cold boot looks the same, which is why the supervisor only alerts.
+function sameInstant(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  return !Number.isNaN(ta) && ta === tb;
+}
+
+export function PrebindHangBadge({
+  watchdog,
+  startedAt,
+  lastSeenRespondingAt,
+}: {
+  watchdog?: WatchdogHealthWire | null;
+  startedAt?: string | null;
+  lastSeenRespondingAt?: string | null;
+}) {
+  const alertAt = watchdog?.last_prebind_alert_at;
+  const alertSpawn = watchdog?.last_prebind_alert_spawn_started_at;
+  if (!alertAt || !alertSpawn || !startedAt) return null;
+  if (!sameInstant(alertSpawn, startedAt)) return null;
+  if (lastSeenRespondingAt) {
+    const seen = Date.parse(lastSeenRespondingAt);
+    const spawn = Date.parse(startedAt);
+    // Answered during this spawn → the alert no longer describes it.
+    if (!Number.isNaN(seen) && !Number.isNaN(spawn) && seen >= spawn) return null;
+  }
+  return (
+    <span
+      title={`Pre-bind hang alerted at ${alertAt}: this runner's spawn (started ${startedAt}) is alive but has never answered its HTTP API and does not hold its port, past the first-healthy budget. It may be hung before its listener binds, or only slow to boot. No watchdog restarts a runner that does not hold its port.`}
+      aria-label={`Never bound: the spawn started ${startedAt} has not answered or bound its port past the first-healthy budget. Alerted, not restarted.`}
+      data-testid="runner-prebind-hang-badge"
+      style={{
+        fontSize: '0.65rem',
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: '0.03em',
+        color: 'var(--warning, #eab308)',
+        border: '1px solid var(--warning, #eab308)',
+        borderRadius: '4px',
+        padding: '0.05rem 0.35rem',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      ⚠ never bound
+    </span>
+  );
 }
 
 // ─── Startup-panic badge + modal (Phase 2b) ─────────────────────────────
@@ -895,6 +956,11 @@ function RunnerRow({
             />
           )}
           <RunnerWatchdogBadge watchdog={r.watchdog} running={r.running} isPrimary={isPrimary} />
+          <PrebindHangBadge
+            watchdog={r.watchdog}
+            startedAt={r.started_at}
+            lastSeenRespondingAt={r.last_seen_responding_at}
+          />
         </div>
       </td>
       <td>
