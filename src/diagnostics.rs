@@ -343,9 +343,11 @@ pub enum ServingEvent {
     /// threshold. Alert-only by Design decision 4 — the supervisor cannot
     /// back a restart on a classification it has never confirmed.
     NeverAnsweredSinceAdoption,
-    /// A runner this supervisor started has held its port and read
-    /// `RunnerLiveness::Unknown` for at least the threshold. Alert-only, for
-    /// the same reason.
+    /// A runner this supervisor started holds its port and has not answered
+    /// during its current spawn. Either it reads `RunnerLiveness::Unknown`
+    /// (never seen answering), which is alert-only for the same reason as
+    /// above, or it reads `UnresponsiveSince` through an earlier boot's stamp,
+    /// in which case the serving restart decision still runs on it.
     NeverAnsweredSinceSpawn,
     /// A user-managed runner this supervisor started is alive on its newest
     /// spawn, has not answered during it, and does not hold its port, past the

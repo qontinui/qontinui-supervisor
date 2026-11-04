@@ -4402,7 +4402,7 @@ pub async fn maybe_alert_prebind_hang(state: &SharedState, managed: &Arc<Managed
     let runner_name = &managed.config.name;
     let port = managed.config.port;
     let msg = format!(
-        "runner '{runner_name}' (port {port}, pid {spawn_pid:?}) has been alive for          {boot_secs}s on the spawn started {started}, has not answered its HTTP API during it,          and does not hold its port (first-healthy budget {budget_secs}s). It may be hung          before its listener binds, or only slow to boot. Alerting, not restarting: no          watchdog acts on a runner that does not hold its port."
+        "runner '{runner_name}' (port {port}, pid {spawn_pid:?}) has been alive for {boot_secs}s on the spawn started {started}, has not answered its HTTP API during it, and does not hold its port (first-healthy budget {budget_secs}s). It may be hung before its listener binds, or only slow to boot. Alerting, not restarting: no watchdog acts on a runner that does not hold its port."
     );
     warn!("{}", msg);
     state
@@ -4624,7 +4624,7 @@ pub async fn maybe_serving_restart(
     if let crate::state::RunnerLiveness::UnresponsiveSince(at) = liveness {
         if should_alert && !answered_during_spawn(Some(at), started_at) {
             let msg = format!(
-                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) holds its                  port and has NEVER answered its HTTP API during this spawn (started                  {started_at:?}). Its liveness reads wedged only because an earlier boot last                  answered at {at}. The serving restart still applies past its threshold."
+                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) holds its port and has NEVER answered its HTTP API during this spawn (started {started_at:?}). Its liveness reads wedged only because an earlier boot last answered at {at}. Where the serving arm is armed for it (`--watchdog`, by default the primary only), the serving restart still applies past its threshold."
             );
             warn!("{}", msg);
             state

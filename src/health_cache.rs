@@ -819,7 +819,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                 started_at = ?started_at,
                                 last_seen_responding_at = ?since,
                                 silent_for_secs = (*ticks * 2),
-                                "Runner has held port {} for {}s and has NEVER answered its                                  HTTP API during this spawn (an earlier boot last answered).                                  Liveness reads wedged because that stamp survives a restart;                                  most likely a start that has not finished.",
+                                "Runner has held port {} for {}s and has NEVER answered its HTTP API during this spawn (an earlier boot last answered). Liveness reads wedged because that stamp survives a restart; most likely a start that has not finished.",
                                 runner_port,
                                 *ticks * 2
                             );

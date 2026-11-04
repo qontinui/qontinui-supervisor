@@ -6750,10 +6750,16 @@ async fn a_primary_hung_before_it_binds_is_alerted_once_per_interval() {
     let started =
         chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 5);
     let live_pid = std::process::id();
-    for (exited, answered, expected) in [
-        (false, false, vec![ServingEvent::NeverBoundSinceSpawn]),
-        (true, false, vec![]),
-        (false, true, vec![]),
+    for (exited, answered, stop_requested, expected) in [
+        (
+            false,
+            false,
+            false,
+            vec![ServingEvent::NeverBoundSinceSpawn],
+        ),
+        (true, false, false, vec![]),
+        (false, true, false, vec![]),
+        (false, false, true, vec![]),
     ] {
         let (state, _root) = restart_test_state();
         let managed = register_dead_primary(&state).await;
@@ -6766,10 +6772,11 @@ async fn a_primary_hung_before_it_binds_is_alerted_once_per_interval() {
             let mut runner = managed.runner.write().await;
             runner.started_at = Some(started);
             runner.last_seen_responding_at = answered.then(chrono::Utc::now);
+            runner.stop_requested = stop_requested;
         }
         maybe_alert_prebind_hang(&state, &managed).await;
         maybe_alert_prebind_hang(&state, &managed).await;
-        let row = format!("exited={exited} answered={answered}");
+        let row = format!("exited={exited} answered={answered} stop_requested={stop_requested}");
         assert_eq!(serving_events(&state).await, expected, "{row}");
     }
 }
