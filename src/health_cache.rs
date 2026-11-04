@@ -796,11 +796,34 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     }
 
                     if should_escalate {
-                        let (pid, since) = {
+                        let (pid, since, started_at) = {
                             let runner_state = managed.runner.read().await;
-                            (runner_state.pid, runner_state.last_seen_responding_at)
+                            (
+                                runner_state.pid,
+                                runner_state.last_seen_responding_at,
+                                runner_state.started_at,
+                            )
                         };
-                        if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
+                        let answered_this_spawn =
+                            crate::process::manager::answered_during_spawn(since, started_at);
+                        if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_))
+                            && !answered_this_spawn
+                        {
+                            // The stamp is a previous boot's: this spawn has held
+                            // its port and never answered. Liveness still reads
+                            // wedged, but "it stopped answering" would be false.
+                            tracing::warn!(
+                                runner_id = %runner_id,
+                                port = runner_port,
+                                pid = ?pid,
+                                started_at = ?started_at,
+                                last_seen_responding_at = ?since,
+                                silent_for_secs = (*ticks * 2),
+                                "Runner has held port {} for {}s and has NEVER answered its                                  HTTP API during this spawn (an earlier boot last answered).                                  Liveness reads wedged because that stamp survives a restart;                                  most likely a start that has not finished.",
+                                runner_port,
+                                *ticks * 2
+                            );
+                        } else if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
                             tracing::error!(
                                 runner_id = %runner_id,
                                 port = runner_port,
@@ -879,9 +902,16 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         }
                     }
                 } else {
-                    // Port not held either — that is a stopped runner,
-                    // not a wedge. Different condition, different signal.
+                    // Port not held either — a stopped runner, not a wedge.
+                    // Different condition, different signal. Unless the newest
+                    // spawn is still alive and has not answered: a user-managed
+                    // runner hung before its listener binds looks like this, and
+                    // no other watchdog reports it (the first-healthy watchdog
+                    // covers temp and named runners, whose `running` is latched).
                     unresponsive_ticks.remove(runner_id);
+                    if !is_supervisor_managed {
+                        crate::process::manager::maybe_alert_prebind_hang(&state, managed).await;
+                    }
                 }
 
                 // If the runner's TCP port is responsive, GET its /health to

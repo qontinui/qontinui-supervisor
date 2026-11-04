@@ -1014,6 +1014,10 @@ pub struct WatchdogState {
     /// two escalating ticks 2 s apart could both decide to restart before the
     /// first one latched anything.
     pub serving_restart_in_flight: bool,
+    /// The last pre-bind hang alert, as `(the spawn's started_at, when it was
+    /// sent)`, so the alert repeats on its own cadence and starts over for a
+    /// new spawn. Alert bookkeeping only: nothing restarts on it.
+    pub last_prebind_alert: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 pub struct BuildState {
@@ -2173,6 +2177,7 @@ impl WatchdogState {
             serving_history: Vec::new(),
             serving_disabled_reason: None,
             serving_restart_in_flight: false,
+            last_prebind_alert: None,
         }
     }
 

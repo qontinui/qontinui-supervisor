@@ -6646,3 +6646,130 @@ async fn live_early_log_paths_keeps_only_unexited_spawns_logs_end_to_end() {
     assert_eq!(prune_early_logs(&state, dir.path().to_path_buf()).await, 1);
     assert!(!live_log.exists());
 }
+
+/// The serving-watchdog events in the diagnostics ring, oldest first.
+async fn serving_events(state: &SharedState) -> Vec<crate::diagnostics::ServingEvent> {
+    state
+        .diagnostics
+        .read()
+        .await
+        .events(usize::MAX, None)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            DiagnosticEventKind::ServingWatchdog { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An answer counts for a spawn only when it came after that spawn started. With
+/// no spawn recorded the stamp can only be this process's.
+#[test]
+fn an_answer_counts_only_for_the_spawn_it_came_after() {
+    let started = chrono::Utc::now();
+    let before = started - chrono::Duration::seconds(1);
+    let after = started + chrono::Duration::seconds(1);
+    assert!(!answered_during_spawn(Some(before), Some(started)));
+    assert!(answered_during_spawn(Some(started), Some(started)));
+    assert!(answered_during_spawn(Some(after), Some(started)));
+    assert!(answered_during_spawn(Some(before), None));
+    assert!(!answered_during_spawn(None, Some(started)));
+    assert!(!answered_during_spawn(None, None));
+}
+
+/// A pre-bind alert is due once the spawn is alive, unanswered and past the
+/// budget, then once per re-alert interval, and again at once for a new spawn.
+#[test]
+fn a_prebind_alert_is_due_past_the_budget_and_repeats_on_its_own_cadence() {
+    let now = chrono::Utc::now();
+    let spawn = now - chrono::Duration::seconds(200);
+    let due =
+        |up, answered, boot, last| prebind_alert_due(up, answered, boot, 90, spawn, last, now);
+    assert!(due(true, false, 90, None));
+    assert!(!due(true, false, 89, None), "inside the budget");
+    assert!(!due(false, false, 200, None), "the spawn is not up");
+    assert!(!due(true, true, 200, None), "it answered during this spawn");
+    let recent = Some((
+        spawn,
+        now - chrono::Duration::seconds(PREBIND_REALERT_SECS - 1),
+    ));
+    assert!(
+        !due(true, false, 200, recent),
+        "alerted inside the interval"
+    );
+    let stale = Some((spawn, now - chrono::Duration::seconds(PREBIND_REALERT_SECS)));
+    assert!(due(true, false, 200, stale));
+    let older_spawn = Some((spawn - chrono::Duration::seconds(1), now));
+    assert!(
+        due(true, false, 200, older_spawn),
+        "a new spawn starts over"
+    );
+}
+
+/// A respawn that holds its port and never answers reads `UnresponsiveSince`
+/// through the previous boot's stamp. It is alerted as never answered since its
+/// spawn; a runner that answered during this spawn and went silent is not.
+#[tokio::test]
+async fn a_respawn_that_never_answered_is_alerted_as_never_answered() {
+    use crate::diagnostics::ServingEvent;
+
+    let started = chrono::Utc::now() - chrono::Duration::seconds(35);
+    for (stamp, expected) in [
+        (
+            started - chrono::Duration::days(2),
+            vec![ServingEvent::NeverAnsweredSinceSpawn],
+        ),
+        (started + chrono::Duration::seconds(5), vec![]),
+    ] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        {
+            let mut runner = managed.runner.write().await;
+            runner.last_seen_responding_at = Some(stamp);
+            runner.started_at = Some(started);
+        }
+        maybe_serving_restart(
+            &state,
+            &managed,
+            crate::state::RunnerLiveness::UnresponsiveSince(stamp),
+            true,
+        )
+        .await;
+        assert_eq!(serving_events(&state).await, expected, "stamp {stamp}");
+        assert_eq!(managed.watchdog.read().await.serving_restart_attempts, 0);
+    }
+}
+
+/// A primary alive on its newest spawn, silent and holding no port past the
+/// first-healthy budget is alerted once, and not again inside the interval. One
+/// whose spawn exited, or that answered during it, is not.
+#[tokio::test]
+async fn a_primary_hung_before_it_binds_is_alerted_once_per_interval() {
+    use crate::diagnostics::ServingEvent;
+
+    let started =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 5);
+    let live_pid = std::process::id();
+    for (exited, answered, expected) in [
+        (false, false, vec![ServingEvent::NeverBoundSinceSpawn]),
+        (true, false, vec![]),
+        (false, true, vec![]),
+    ] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        let mut marker = crate::state::SpawnMarker::new(started, Some(live_pid), None, None);
+        if exited {
+            marker.exited_at = Some(chrono::Utc::now());
+        }
+        managed.recent_spawns.write().await.push(marker);
+        {
+            let mut runner = managed.runner.write().await;
+            runner.started_at = Some(started);
+            runner.last_seen_responding_at = answered.then(chrono::Utc::now);
+        }
+        maybe_alert_prebind_hang(&state, &managed).await;
+        maybe_alert_prebind_hang(&state, &managed).await;
+        let row = format!("exited={exited} answered={answered}");
+        assert_eq!(serving_events(&state).await, expected, "{row}");
+    }
+}

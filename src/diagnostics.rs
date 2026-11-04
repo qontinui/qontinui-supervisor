@@ -347,6 +347,12 @@ pub enum ServingEvent {
     /// `RunnerLiveness::Unknown` for at least the threshold. Alert-only, for
     /// the same reason.
     NeverAnsweredSinceSpawn,
+    /// A user-managed runner this supervisor started is alive on its newest
+    /// spawn, has not answered during it, and does not hold its port, past the
+    /// first-healthy budget. Alert-only: no other watchdog reports this shape,
+    /// because the escalation loop needs a held port and the first-healthy
+    /// watchdog stands down for a runner whose `running` follows the probe.
+    NeverBoundSinceSpawn,
     /// The census found zero live `claude` sessions and the restart was
     /// issued. The only irreversible event in the set.
     RestartTaken,
@@ -369,6 +375,7 @@ impl ServingEvent {
             Self::Threshold => "threshold",
             Self::NeverAnsweredSinceAdoption => "never_answered_since_adoption",
             Self::NeverAnsweredSinceSpawn => "never_answered_since_spawn",
+            Self::NeverBoundSinceSpawn => "never_bound_since_spawn",
             Self::RestartTaken => "restart_taken",
             Self::RestartRefusedSessionsLive => "restart_refused_sessions_live",
             Self::RestartFailed => "restart_failed",
@@ -818,6 +825,10 @@ mod tests {
             (
                 ServingEvent::NeverAnsweredSinceSpawn,
                 "never_answered_since_spawn",
+            ),
+            (
+                ServingEvent::NeverBoundSinceSpawn,
+                "never_bound_since_spawn",
             ),
             (ServingEvent::RestartTaken, "restart_taken"),
             (

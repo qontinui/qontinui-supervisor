@@ -4301,6 +4301,129 @@ pub(crate) fn serving_silence_secs(
     }
 }
 
+/// Whether the runner's API has answered during its current spawn.
+///
+/// `last_seen_responding_at` is never cleared, so a respawn that never answers
+/// still carries the previous boot's stamp and reads `UnresponsiveSince`, which
+/// renders `wedged`. This tells that respawn apart from a runner that answered
+/// and then went silent. With no spawn recorded (`started_at` unset, as for an
+/// adopted runner) the stamp can only be this process's, so it counts.
+pub(crate) fn answered_during_spawn(
+    last_seen_responding_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (last_seen_responding_at, started_at) {
+        (Some(at), Some(started)) => at >= started,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// How often a pre-bind hang alert repeats for one spawn: the escalation loop's
+/// re-escalation interval (150 ticks of 2 s).
+pub(crate) const PREBIND_REALERT_SECS: i64 = 300;
+
+/// Whether a pre-bind hang alert is due. Pure.
+///
+/// Due once the newest spawn is alive, has not answered, and has been up for the
+/// first-healthy budget, then again every [`PREBIND_REALERT_SECS`] while that
+/// stays true. A new spawn starts over, because `last_alert` names the spawn it
+/// was sent for.
+pub(crate) fn prebind_alert_due(
+    spawn_up: bool,
+    answered_this_spawn: bool,
+    boot_secs: u64,
+    budget_secs: u64,
+    started_at: chrono::DateTime<chrono::Utc>,
+    last_alert: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !spawn_up || answered_this_spawn || boot_secs < budget_secs {
+        return false;
+    }
+    match last_alert {
+        Some((spawn, at)) if spawn == started_at => {
+            (now - at).num_seconds() >= PREBIND_REALERT_SECS
+        }
+        _ => true,
+    }
+}
+
+/// Alert on a user-managed runner that is alive on its newest spawn, has not
+/// answered during it, and does not hold its port, past the first-healthy
+/// budget. Called from the health-cache loop when the port is not held and the
+/// API is silent.
+///
+/// Nothing else reports this shape: the escalation loop (and so the serving
+/// watchdog) needs a held port, and the first-healthy watchdog stands down once
+/// the health cache lowers `running`. It alerts and never restarts or kills: a
+/// slow cold boot looks the same, and killing one would read as a crash and spend
+/// the crash arm's budget. The process check reads the spawn ring
+/// ([`pid_of_newest_spawn_if_up`]), not `running`, which the health cache rewrites
+/// from the probe.
+pub async fn maybe_alert_prebind_hang(state: &SharedState, managed: &Arc<ManagedRunner>) {
+    use crate::diagnostics::ServingEvent;
+
+    let now = chrono::Utc::now();
+    let (started_at, last_seen, stop_requested) = {
+        let r = managed.runner.read().await;
+        (r.started_at, r.last_seen_responding_at, r.stop_requested)
+    };
+    let Some(started) = started_at else { return };
+    if stop_requested || answered_during_spawn(last_seen, started_at) {
+        return;
+    }
+    let boot_secs = (now - started).num_seconds().max(0) as u64;
+    let budget_secs = first_healthy_timeout_secs();
+    if boot_secs < budget_secs {
+        return;
+    }
+    let spawn_pid = pid_of_newest_spawn_if_up(started_at, &*managed.recent_spawns.read().await);
+    let due = {
+        let mut wd = managed.watchdog.write().await;
+        let due = prebind_alert_due(
+            spawn_pid.is_some(),
+            false,
+            boot_secs,
+            budget_secs,
+            started,
+            wd.last_prebind_alert,
+            now,
+        );
+        if due {
+            wd.last_prebind_alert = Some((started, now));
+        }
+        due
+    };
+    if !due {
+        return;
+    }
+
+    let runner_name = &managed.config.name;
+    let port = managed.config.port;
+    let msg = format!(
+        "runner '{runner_name}' (port {port}, pid {spawn_pid:?}) has been alive for          {boot_secs}s on the spawn started {started}, has not answered its HTTP API during it,          and does not hold its port (first-healthy budget {budget_secs}s). It may be hung          before its listener binds, or only slow to boot. Alerting, not restarting: no          watchdog acts on a runner that does not hold its port."
+    );
+    warn!("{}", msg);
+    state
+        .logs
+        .emit(LogSource::Supervisor, LogLevel::Error, msg)
+        .await;
+    emit_serving_event(
+        state,
+        &managed.config.id,
+        port,
+        spawn_pid,
+        boot_secs,
+        ServingEvent::NeverBoundSinceSpawn,
+        None,
+        Some(format!(
+            "never-bound-since-spawn; spawn started {started}, budget {budget_secs}s"
+        )),
+    )
+    .await;
+}
+
 /// Decide whether a wedged runner warrants a serving restart. Pure.
 ///
 /// Priority mirrors [`decide_crash_restart`]: classification and operator
@@ -4491,6 +4614,37 @@ pub async fn maybe_serving_restart(
             .await;
         }
         return;
+    }
+
+    // A respawn that has never answered reads `UnresponsiveSince`, not `Unknown`,
+    // because the previous boot's stamp survives the restart. Alert on it the
+    // way the branch above does, and then let the decision below run unchanged:
+    // the serving restart on a zero census past the threshold, counted from this
+    // spawn's start, is the recovery path for a boot that holds its port and hangs.
+    if let crate::state::RunnerLiveness::UnresponsiveSince(at) = liveness {
+        if should_alert && !answered_during_spawn(Some(at), started_at) {
+            let msg = format!(
+                "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) holds its                  port and has NEVER answered its HTTP API during this spawn (started                  {started_at:?}). Its liveness reads wedged only because an earlier boot last                  answered at {at}. The serving restart still applies past its threshold."
+            );
+            warn!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg)
+                .await;
+            emit_serving_event(
+                state,
+                &runner_id,
+                port,
+                pid,
+                silent_for_secs,
+                ServingEvent::NeverAnsweredSinceSpawn,
+                None,
+                Some(format!(
+                    "never-answered-since-spawn; an earlier boot last answered at {at}"
+                )),
+            )
+            .await;
+        }
     }
 
     let threshold_secs = crate::config::serving_restart_after_secs();
