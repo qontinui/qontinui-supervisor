@@ -885,8 +885,10 @@ pub async fn restart_runner(
                 // effect surfaces in charge of the verdict (existing
                 // precedence) and, critically, CLOSES the window then rather
                 // than at the backstop — the window is a measurement of the
-                // action.
-                record_start_verdict(&exec_state, &primary_id, start_verdict(probe), exec_guard);
+                // action. `Healthy` here came from the own-boot wait above, so
+                // unlike a held-open door's it needs no `held_to_own_boot`.
+                let verdict = start_verdict(probe);
+                record_start_verdict(&exec_state, &primary_id, verdict, exec_guard);
 
                 (
                     StatusCode::OK.as_u16(),
@@ -1064,7 +1066,19 @@ pub async fn restart_runner(
         }
     }
 
-    record_start_verdict(&state, &primary_id, start_verdict(probe), run_guard);
+    record_start_verdict(
+        &state,
+        &primary_id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &primary_id,
+            action_record.action_id,
+            start_verdict(probe),
+            chrono::Utc::now(),
+        )
+        .await,
+        run_guard,
+    );
 
     Ok(Json(minted.stamp(serde_json::json!({
         "status": "restarted",

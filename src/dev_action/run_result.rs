@@ -256,6 +256,48 @@ pub fn record_start_verdict_with(
     }
 }
 
+/// Hold a `Ran` a held-open wait supplied to the boot `action_id` started.
+///
+/// A held-open wait asks the port, because its caller's question is whether the
+/// runner is up, and its answer to the caller stays that. The trial asks whether
+/// THIS ACTION'S boot came up, so a respawn answering that port must not read as
+/// this boot's: with the action's own spawn already exited or replaced when the
+/// port answered ([`crate::state::SpawnRing::action_spawn_ended_by`]), the verdict
+/// is `runner_unhealthy_after_start` whatever the caller was told. Anything but a
+/// `Ran` passes through, and with no spawn naming the action the `Ran` stands.
+///
+/// `answered_at` is when the port FIRST answered, not when the door got here. The
+/// spawn routes do slow work after their wait, a `git fetch` among it, and a boot
+/// that answered and was stopped during that work did come up.
+pub async fn held_to_own_boot(
+    state: &SharedState,
+    runner_id: &str,
+    action_id: uuid::Uuid,
+    verdict: StartVerdict,
+    answered_at: chrono::DateTime<chrono::Utc>,
+) -> StartVerdict {
+    if verdict != StartVerdict::Now(ActionRunResult::Ran) {
+        return verdict;
+    }
+    let ended = match state.get_runner(runner_id).await {
+        Some(managed) => managed
+            .recent_spawns
+            .read()
+            .await
+            .action_spawn_ended_by(action_id, answered_at),
+        None => false,
+    };
+    if !ended {
+        return verdict;
+    }
+    StartVerdict::Now(ActionRunResult::Errored {
+        reason: format!(
+            "{UNHEALTHY_AFTER_START}: runner '{runner_id}' answered, but the boot this action \
+             started had exited or been replaced by then"
+        ),
+    })
+}
+
 /// The reason token of a start that left no runner to wait on.
 pub const NO_RUNNER_TO_WAIT_ON: &str = "no_runner_to_wait_on";
 
@@ -328,6 +370,234 @@ mod tests {
             StartVerdict::Now(ActionRunResult::Errored { reason }) => reason,
             other => panic!("expected Errored, got {other:?}"),
         }
+    }
+
+    /// A `Ran` a held-open wait supplied stands only for the action's own boot: a
+    /// respawn or a later start answering the same port does not make it that
+    /// boot's. Nothing but a `Ran` is changed, and no spawn naming the action says
+    /// nothing about it.
+    #[tokio::test]
+    async fn a_held_open_ran_is_held_to_the_actions_own_boot() {
+        use crate::state::{ManagedRunner, SpawnMarker};
+        use std::sync::Arc;
+
+        let (config, _root) = crate::config::config_over_an_empty_runner_tree();
+        let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+        let runner = crate::config::RunnerConfig::default_primary();
+        let id = runner.id.clone();
+        let managed = Arc::new(ManagedRunner::new(runner, false));
+        state
+            .runners
+            .write()
+            .await
+            .insert(id.clone(), managed.clone());
+        let ran = || StartVerdict::Now(ActionRunResult::Ran);
+        let (own, later) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let spawned = chrono::Utc::now();
+        let secs = |n: i64| spawned + chrono::Duration::seconds(n);
+        let millis = |n: i64| spawned + chrono::Duration::milliseconds(n);
+
+        assert_eq!(
+            held_to_own_boot(&state, &id, own, ran(), secs(9)).await,
+            ran()
+        );
+        assert_eq!(
+            held_to_own_boot(&state, "no-such-runner", own, ran(), secs(9)).await,
+            ran()
+        );
+
+        managed.recent_spawns.write().await.push(SpawnMarker::new(
+            spawned,
+            Some(1),
+            None,
+            Some(own),
+        ));
+        assert_eq!(
+            held_to_own_boot(&state, &id, own, ran(), secs(9)).await,
+            ran()
+        );
+
+        managed.recent_spawns.write().await.push(SpawnMarker::new(
+            secs(1),
+            Some(2),
+            None,
+            Some(later),
+        ));
+        let replaced = held_to_own_boot(&state, &id, own, ran(), secs(1)).await;
+        assert!(
+            errored_reason(&replaced).starts_with(UNHEALTHY_AFTER_START),
+            "{replaced:?}"
+        );
+        // It answered before the replacement, so that boot did come up, however
+        // late the door asks.
+        assert_eq!(
+            held_to_own_boot(&state, &id, own, ran(), millis(500)).await,
+            ran()
+        );
+        assert_eq!(
+            held_to_own_boot(&state, &id, later, ran(), secs(9)).await,
+            ran()
+        );
+
+        assert!(managed
+            .recent_spawns
+            .write()
+            .await
+            .stamp_exit(secs(1), secs(2), None));
+        let exited = held_to_own_boot(&state, &id, later, ran(), secs(2)).await;
+        assert!(
+            errored_reason(&exited).starts_with(UNHEALTHY_AFTER_START),
+            "{exited:?}"
+        );
+        assert_eq!(
+            held_to_own_boot(&state, &id, later, ran(), millis(1500)).await,
+            ran(),
+            "it answered before its exit"
+        );
+
+        // Nothing but a `Ran` is changed, on a boot that has ended.
+        for other in [
+            StartVerdict::AfterHealthWait,
+            StartVerdict::Now(ActionRunResult::Errored {
+                reason: "its own".to_string(),
+            }),
+        ] {
+            assert_eq!(
+                held_to_own_boot(&state, &id, own, other.clone(), secs(9)).await,
+                other
+            );
+        }
+    }
+
+    /// Every production `record_start_verdict(` under `src/` is accounted for. One
+    /// whose verdict a held-open wait or a spawn route's body supplied must go
+    /// through [`held_to_own_boot`], and the total is pinned, so a call added
+    /// anywhere fails here until someone decides which kind it is. Source level,
+    /// because no route test reaches a recorded spawn on every platform. It reads
+    /// spellings: a verdict bound to a local first is not recognised as probed,
+    /// which is how the detached rebuild's door stays out, its `Healthy` already
+    /// being the own-boot wait's. The total is what catches a new door written that
+    /// way. It does not check the ids. `record_run_result(` is counted as well, since
+    /// a door can record a `Ran` directly: a census, so whoever moves that number
+    /// still has to judge the new call.
+    #[test]
+    fn every_door_recording_a_probed_verdict_holds_it_to_its_own_boot() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("list the source dir") {
+                let path = entry.expect("a dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let (mut calls, mut held, mut direct) = (0, 0, 0);
+        for file in files {
+            let src = std::fs::read_to_string(&file)
+                .expect("read the source")
+                .replace("\r\n", "\n");
+            let squeezed: String = crate::source_scan::production_span(&src)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(str::split_whitespace)
+                .collect();
+            direct += squeezed.matches("record_run_result(").count();
+            for call in squeezed.split("record_start_verdict(").skip(1) {
+                calls += 1;
+                let args = call.split(";").next().unwrap_or_default();
+                if args.contains("start_verdict(") || args.contains("spawn_run_result(") {
+                    assert!(
+                        args.contains("held_to_own_boot("),
+                        "{}: {args}",
+                        file.display()
+                    );
+                    held += 1;
+                }
+            }
+        }
+        // Restart, start, spawn-test, spawn-named: a rename cannot empty this.
+        assert_eq!(held, 4);
+        // Those four, the six recording a deferred verdict or the own-boot wait's,
+        // and the definition.
+        assert_eq!(
+            calls, 11,
+            "a `record_start_verdict(` was added or removed: if a wait that asks the \
+             port supplied its verdict, it needs `held_to_own_boot`; then update this count"
+        );
+        // The definition and the guard's `Drop`, `answer_failure`, three inside
+        // `record_start_verdict_with`, two error arms in the manager, and eleven at
+        // the doors, of which only rebuild-when-idle's and fix-and-rebuild's can
+        // carry a `Ran`.
+        assert_eq!(
+            direct, 19,
+            "a `record_run_result(` was added or removed: if it records a `Ran` that a wait \
+             asking the port supplied, it needs `held_to_own_boot`; then update this count"
+        );
+    }
+
+    /// A spawn door dates its answer where its wait got it, the only place that can
+    /// know: after asking, since a date before any answer would let a respawn's answer
+    /// read as this boot's, and before the slow work that follows the wait. It keeps
+    /// the first date, and then reads it. Source level, for the same reason as the test
+    /// above. It reads spellings, so it does not check which argument the date is
+    /// passed as.
+    #[test]
+    fn a_spawn_doors_wait_dates_its_answer() {
+        fn squeezed(text: &str) -> String {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(str::split_whitespace)
+                .collect()
+        }
+
+        let src = include_str!("../routes/runners.rs").replace("\r\n", "\n");
+        for (signature, first_check, stamp, stamps) in [
+            (
+                "async fn execute_spawn_build_inner(",
+                "probe_runner_health(",
+                "side.answered_at.get_or_insert_with(chrono::Utc::now);",
+                2,
+            ),
+            (
+                "async fn spawn_named_inner(",
+                "client.get(&health_url)",
+                "answered_at.get_or_insert_with(chrono::Utc::now);",
+                1,
+            ),
+        ] {
+            let body = squeezed(crate::source_scan::fn_body(&src, signature).expect(signature));
+            assert_eq!(body.matches(stamp).count(), stamps, "{signature}");
+            let (first, last) = (
+                body.find(stamp).expect("a stamp"),
+                body.rfind(stamp).expect("a stamp"),
+            );
+            assert!(
+                body.find(first_check).expect("its first health check") < first
+                    && body.find("client.get(&health_url)").expect("its wait") < last,
+                "{signature} must date an answer it has, not one it is waiting for"
+            );
+            let slow_work = body
+                .find("resolve_frontend_stale_for_spawn(")
+                .expect("the slow work after the wait");
+            assert!(
+                last < slow_work,
+                "{signature} must date its answer before the slow work after its wait"
+            );
+        }
+        // Spawn-test's door and spawn-named's.
+        assert_eq!(
+            squeezed(crate::source_scan::production_span(&src))
+                .matches("answered_at.unwrap_or_else(chrono::Utc::now),")
+                .count(),
+            2
+        );
     }
 
     /// A [`HealthWait`] that never sees the runner answer: it gives up after

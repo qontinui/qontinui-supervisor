@@ -1347,7 +1347,19 @@ pub async fn start_runner(
         }
         probe = SyncProbe::Healthy;
     }
-    record_start_verdict(&state, &id, start_verdict(probe), run_guard);
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            minted.record.action_id,
+            start_verdict(probe),
+            chrono::Utc::now(),
+        )
+        .await,
+        run_guard,
+    );
 
     Ok(Json(minted.stamp(json!({
         "status": "started",
@@ -3629,7 +3641,21 @@ async fn execute_spawn_build(
         &state, body, &id, port, &managed, no_wait, action_id, &mut side,
     )
     .await;
-    record_start_verdict(&state, &id, spawn_run_result(&result), run_guard);
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            action_id,
+            spawn_run_result(&result),
+            // Every `Ran` has an answer dated. With none, the date is this
+            // chokepoint, which errs towards a false failure, never a false up.
+            side.answered_at.unwrap_or_else(chrono::Utc::now),
+        )
+        .await,
+        run_guard,
+    );
     match result {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
@@ -3724,6 +3750,12 @@ struct SpawnBuildSideChannel {
     /// signal for that: a quiet cleanup pass emits no event at all, and the
     /// diagnostics ring can evict one that did.
     slot_id: Option<usize>,
+    /// When this spawn's runner FIRST answered its health check, the probe's or
+    /// else the `wait` loop's. The first, because a boot that answered the probe and
+    /// was restarted before the wait's answer did come up. The trial asks whether
+    /// its boot had ended by THEN ([`crate::dev_action::held_to_own_boot`]), and the
+    /// door records its verdict only after the slow work that follows the wait.
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Merge `build_slot_id` into an already-rendered error body.
@@ -4635,6 +4667,7 @@ async fn execute_spawn_build_inner(
                 git_sha,
                 health_body,
             } => {
+                side.answered_at.get_or_insert_with(chrono::Utc::now);
                 health_probe_ms = Some(elapsed_ms);
                 probed_git_sha = git_sha;
                 child_health_body = health_body;
@@ -4786,6 +4819,7 @@ async fn execute_spawn_build_inner(
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     healthy = true;
+                    side.answered_at.get_or_insert_with(chrono::Utc::now);
                     wait_ms = start.elapsed().as_millis() as u64;
                     if let Some(v) = resp
                         .text()
@@ -5776,6 +5810,7 @@ pub async fn spawn_named(
     // it: the guard records the action abandoned then.
     let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's handler future");
 
+    let mut answered_at = None;
     let result = spawn_named_inner(
         state.clone(),
         &body,
@@ -5785,11 +5820,25 @@ pub async fn spawn_named(
         managed.clone(),
         no_wait,
         action_id,
+        &mut answered_at,
     )
     .await;
     // The one chokepoint of a spawn-named's terminal result, read before an
     // `Err` is rendered to a body.
-    record_start_verdict(&state, &id, spawn_run_result(&result), run_guard);
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            action_id,
+            spawn_run_result(&result),
+            // As at spawn-test's door: with no date, this chokepoint's.
+            answered_at.unwrap_or_else(chrono::Utc::now),
+        )
+        .await,
+        run_guard,
+    );
 
     let (status, resp) = match result {
         Ok(ok) => ok,
@@ -5824,6 +5873,7 @@ async fn spawn_named_inner(
     managed: Arc<ManagedRunner>,
     no_wait: bool,
     action_id: uuid::Uuid,
+    answered_at: &mut Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     let name = name.to_string();
     let id = id.to_string();
@@ -6047,6 +6097,7 @@ async fn spawn_named_inner(
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     healthy = true;
+                    answered_at.get_or_insert_with(chrono::Utc::now);
                     wait_ms = start.elapsed().as_millis() as u64;
                     state
                         .logs

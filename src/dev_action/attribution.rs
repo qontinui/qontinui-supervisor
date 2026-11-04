@@ -368,10 +368,13 @@ impl ClosedWindow {
 /// `Ran` is what a start records once its runner has answered a health check:
 /// the restart routes' wait, spawn-test's probe or wait, spawn-named's wait,
 /// or, when the route answered without one, the detached health wait
-/// (`dev_action::run_result::record_start_verdict`). So `Ran` stands for a boot
-/// whose API bound, with one residual: a held-open wait asks the port, not the
-/// action's spawn, so a boot that crashed and was respawned inside one reads `Ran`.
-/// Its exit still counts its panic, below.
+/// (`dev_action::run_result::record_start_verdict`). A wait that asks the port has
+/// its `Ran` held to the action's own spawn before it is recorded
+/// (`dev_action::run_result::held_to_own_boot`), so a respawn answering for a boot
+/// that crashed does not read as that boot's. The hold sees only an exit or a
+/// replacement, so `Ran` can still stand for a boot whose API never bound: one that
+/// stays alive and unbound while another process answers its port, or one that
+/// another process answered for before it ended.
 ///
 /// Residuals, documented and not changed:
 /// - A stop requested but not finished at the close leaves the entry with no

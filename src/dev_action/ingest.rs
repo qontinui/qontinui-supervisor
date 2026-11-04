@@ -79,7 +79,11 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// `Errored` report it cannot place after the action's spawn, where it used to
 /// close `confirmed`. Category and evidence only: no signature or window moves,
 /// and coord's `dev_action_stats` keys on signatures, so its counts do not.
-pub const ATTRIBUTION_EPOCH: u32 = 5;
+///
+/// Epoch 6: a held-open door's `Ran` is held to the same spawn, as of when the port
+/// answered (`dev_action::run_result::held_to_own_boot`). A row stamped 5 can still
+/// read a crashed boot as up, when a respawn answered inside a held-open wait.
+pub const ATTRIBUTION_EPOCH: u32 = 6;
 
 /// The snapshot `metadata` this build stamps on every row, so a row names the
 /// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
@@ -328,10 +332,10 @@ mod tests {
 
         assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
         // Epoch 1 is the unstamped pre-fix rows, 2 can carry semantics from before
-        // #272, 3 reads a detached verdict off the port, and 4 can close `confirmed`
-        // on a report it could not place. A constant, so it is checked at compile
-        // time.
-        const _: () = assert!(ATTRIBUTION_EPOCH >= 5);
+        // #272, 3 reads a detached verdict off the port, 4 can close `confirmed` on a
+        // report it could not place, and 5 reads a held-open verdict off the port. A
+        // constant, so it is checked at compile time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 6);
         assert_eq!(
             json["metadata"]["supervisor_build_sha"],
             serde_json::Value::from(crate::self_provenance::built_from_sha()),

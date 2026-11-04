@@ -369,14 +369,28 @@ impl SpawnRing {
     /// spawn replaced it, which may be before its exit monitor has stamped it.
     /// `false` when no entry names the action, which says nothing about it.
     pub fn action_spawn_ended(&self, action_id: Uuid) -> bool {
-        let Some(at) = self
+        self.action_spawn_ended_by(action_id, DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// Whether that spawn had already ended by `at`, for a reader asking about a
+    /// moment in the past: a spawn that answered and ended later had not. An exit
+    /// counts from its stamp, which lags the real exit a little, and a replacement
+    /// from the later spawn's record, which needs no stamp.
+    pub fn action_spawn_ended_by(&self, action_id: Uuid, at: DateTime<Utc>) -> bool {
+        let Some(own) = self
             .entries
             .iter()
             .rposition(|spawn| spawn.initiated_by == Some(action_id))
         else {
             return false;
         };
-        self.entries[at].exited_at.is_some() || at + 1 < self.entries.len()
+        self.entries[own]
+            .exited_at
+            .is_some_and(|exited| exited <= at)
+            || self
+                .entries
+                .get(own + 1)
+                .is_some_and(|next| next.spawned_at <= at)
     }
 
     /// The newest spawn recorded, `None` until this supervisor starts the
@@ -3434,6 +3448,44 @@ mod tests {
 
         assert!(ring.stamp_exit(ring_time(2), ring_time(3), None));
         assert!(ring.action_spawn_ended(later), "the newest, but exited");
+    }
+
+    /// Asked about a moment, a spawn has ended only from its replacement or its
+    /// exit on: before either, it had not, whatever has happened since.
+    #[test]
+    fn an_actions_spawn_had_ended_by_a_moment_only_from_its_end_on() {
+        let (own, later) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ring = SpawnRing::default();
+        assert!(
+            !ring.action_spawn_ended_by(own, ring_time(9)),
+            "no spawn names it"
+        );
+
+        ring.push(SpawnMarker::new(ring_time(1), Some(1), None, Some(own)));
+        assert!(
+            !ring.action_spawn_ended_by(own, ring_time(9)),
+            "it is the newest and up"
+        );
+
+        ring.push(SpawnMarker::new(ring_time(3), Some(2), None, Some(later)));
+        assert!(
+            !ring.action_spawn_ended_by(own, ring_time(2)),
+            "before its replacement"
+        );
+        assert!(
+            ring.action_spawn_ended_by(own, ring_time(3)),
+            "as of its replacement"
+        );
+
+        assert!(ring.stamp_exit(ring_time(3), ring_time(5), None));
+        assert!(
+            !ring.action_spawn_ended_by(later, ring_time(4)),
+            "before its exit"
+        );
+        assert!(
+            ring.action_spawn_ended_by(later, ring_time(5)),
+            "as of its exit"
+        );
     }
 
     /// A full ring drops its OLDEST entry to make room for a spawn, and
