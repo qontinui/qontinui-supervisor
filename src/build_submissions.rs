@@ -1515,12 +1515,13 @@ mod tests {
     #[tokio::test]
     async fn submit_detached_panic_records_failed() {
         let store = Arc::new(BuildSubmissionStore::new(100));
-        let (id, arc) = submit_detached(store.clone(), PathBuf::from("/tmp/runner"), None, async {
+        let (id, arc) = submit_detached(&store, PathBuf::from("/tmp/runner"), None, async {
             if true {
                 panic!("the rebuild blew up");
             }
             (200, serde_json::json!({}))
-        });
+        })
+        .await;
 
         terminal_within_budget(&arc).await;
         let sub = arc.read().await;
@@ -1544,7 +1545,7 @@ mod tests {
     async fn submit_spawn_panic_records_failed_and_releases_the_waiter() {
         let store = Arc::new(BuildSubmissionStore::new(100));
         let (_id, arc) = submit_spawn(
-            store.clone(),
+            &store,
             PathBuf::from("/tmp/runner"),
             "origin_main".to_string(),
             None,
@@ -1555,7 +1556,8 @@ mod tests {
                 }
                 (200, serde_json::json!({}), Vec::new())
             },
-        );
+        )
+        .await;
 
         terminal_within_budget(&arc).await;
         let sub = arc.read().await;
@@ -1791,5 +1793,52 @@ mod tests {
         )
         .await;
         assert!(store.get(&id).await.is_some());
+    }
+
+    /// Both async doors register through `BuildSubmissionStore::insert`, so
+    /// they come under its cap. Registering with a raw map insert (as the
+    /// spawned task once did) leaves 17 rows here. The floor is 16, so a
+    /// smaller store would prove nothing.
+    #[tokio::test]
+    async fn async_submissions_come_under_the_store_cap() {
+        let store = Arc::new(BuildSubmissionStore::new(16));
+        for _ in 0..16 {
+            let (_id, arc) = submit_detached(&store, PathBuf::from("/tmp/runner"), None, async {
+                (200, serde_json::json!({}))
+            })
+            .await;
+            terminal_within_budget(&arc).await;
+        }
+        assert_eq!(store.submissions.read().await.len(), 16);
+
+        let (detached, _arc) = submit_detached(
+            &store,
+            PathBuf::from("/tmp/runner"),
+            None,
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(
+            store.submissions.read().await.len(),
+            16,
+            "a detached submission must evict a terminal row"
+        );
+
+        let (spawned, _arc) = submit_spawn(
+            &store,
+            PathBuf::from("/tmp/runner/src-tauri"),
+            "live_tree".to_string(),
+            None,
+            9884,
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(
+            store.submissions.read().await.len(),
+            16,
+            "a spawn submission must evict a terminal row"
+        );
+        assert!(store.get(&detached).await.is_some());
+        assert!(store.get(&spawned).await.is_some());
     }
 }

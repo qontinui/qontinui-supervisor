@@ -691,7 +691,7 @@ unnecessary.
 | POST | `/runners` | Add a runner config to the registry |
 | POST | `/runners/spawn-test` | Spawn ephemeral test runner on next free port (9877-9899). Body: `{rebuild?, use_lkg?, wait?, wait_timeout_secs?, requester_id?, queue_timeout_secs?, git_ref?, worktree_path?, from_working_tree?, frontend_only?, async?, paired_profile_id?, extra_env?, fresh_device_identity?}` (`fresh_device_identity: true` — no projected identity or pairing, a `device_identity` block in the response; see the instance-root section). **`rebuild: true` builds a supervisor-owned `origin/main` worktree by default**, NOT the shared working checkout. Returns `{id, port, api_url, ui_bridge_url, build_id, source, build_sha, build_source_default, build_source_warning}` plus `used_lkg`/`lkg` when `use_lkg: true`. See "Build provenance: spawn-test builds `origin/main` by DEFAULT" and "Last-known-good (LKG) fallback for agents" below. Auto-cleaned on stop. |
 | POST | `/runners/spawn-named` | Spawn persistent named runner. Body: `{name, rebuild?, port?, wait?, wait_timeout_secs?, protected?, queue_timeout_secs?, extra_env?, fresh_device_identity?}`. `extra_env` has spawn-test's contract (applied last; a `DISPLAY` there satisfies the Linux display preflight) and is persisted with the runner. `fresh_device_identity: true` spawns it under its own device id — see "`fresh_device_identity: true` makes the subject its own device" above; the response then carries `device_identity`. Persisted to settings, NOT auto-cleaned. Name must not be empty, "primary", or start with "test-". Returns `{id, port, api_url, ui_bridge_url}`. |
-| GET | `/runners/spawn-test/in-flight` | The spawn-test builds running right now, each with the `id` + `port` reserved for it plus `build_id` / `logs_url` / `stop_url`. Optional `?requester_id=` narrows to one caller. **Recovery for a lost spawn-test answer** — see "A lost spawn-test answer" below. |
+| GET | `/runners/spawn-test/in-flight` | The spawn-test builds running right now, each with the `id` + `port` reserved for it plus `build_id` / `logs_url` / `stop_url` and its dev-action's fields (`action_id`, `outcome_url`, …). Optional `?requester_id=` narrows to one caller. **Recovery for a lost spawn-test answer** — see "A lost spawn-test answer" below. |
 | POST | `/runners/purge-stale` | Remove runners whose processes are no longer alive. Optional body `{requester_id?}` scopes the purge; a bodyless POST purges every stale test runner. |
 | DELETE | `/runners/{id}` | Remove a runner from the registry. **409** `RunnerLifecycleBusy` while a start or a stop holds it. |
 | POST | `/runners/{id}/start` | Start a runner. Mints a `spawn` dev-action trial on it (its fields in every response after the mint, a failed start's included; `action_id` on its spawn ring entry; the start's terminal result recorded on it); an unknown id is a 404 that mints nothing. |
@@ -975,15 +975,17 @@ empty expectations list, so `risk: null` beside `predicted: []` reads the same w
 coord has no rows or never answered. `expectations_basis` separates them. It is coord's
 top-level `evidence_basis` for that kind and state set, verbatim. It travels with
 `action_id`: `MintedAction::ack_fields` renders both, so a response with no `action_id`
-has no `expectations_basis` either. That absence means the door did not stamp that
-response (it answered before its mint, or joined an in-flight build), not that coord gave
-no answer. Every response a door answers with after its mint is stamped, a refusal's or a
-failure's included (`MintedAction::answer_failure`), so a caller whose act failed can read
-the verdict. So is the outcome spawn-test stores for `GET /build/{id}/status`. The other
-detached doors store a bare build result there, their 202 having named the action. The
-in-memory record outlives neither the supervisor nor the ring, so after a restart
-`outcome_url` can answer 404. `GET /actions/{id}/outcome` serves the field as
-`action.expectations_basis`.
+has no `expectations_basis` either. That absence means the door answered before it minted
+anything, not that coord gave no answer. Every response a door answers with after its mint
+is stamped, a refusal's or a failure's included (`MintedAction::answer_failure`), so a
+caller whose act failed can read the verdict. A request that joins an in-flight build
+(`deduplicated: true` on spawn-test and fix-and-rebuild) mints nothing and names the action
+it joined, and so does each `GET /runners/spawn-test/in-flight` row: those callers are
+usually retrying an answer they never read. The outcome spawn-test stores for `GET
+/build/{id}/status` is stamped too. The other detached doors store a bare build result
+there, their 202 having named the action. The in-memory record outlives neither the
+supervisor nor the ring, so after a restart `outcome_url` can answer 404. `GET
+/actions/{id}/outcome` serves the field as `action.expectations_basis`.
 
 | `expectations_basis` | Meaning |
 |---|---|
@@ -1443,7 +1445,7 @@ A failed `process::health_probe` wait says how it ended. The action's `runner_un
 | POST | `/runner/restart` | Restart runner (legacy single-runner endpoint, targets the primary). Body `{rebuild?, force?, from_working_tree?, use_lkg?, handoff?}` (`handoff`: see "Handoff restarts") — every field defaults, and unknown fields are **rejected** (422, `#[serde(deny_unknown_fields)]`), so a stale caller sending `trigger_auto_continue` or `wait_timeout_seconds` fails loudly instead of being ignored. `use_lkg` is only meaningful on the `rebuild: false` restart: `null` lets the supervisor auto-bias toward the last-known-good exe when the risk assessment flags the restart as high-risk, `true` pins LKG, `false` opts out of the bias. **`rebuild: true` is detached from the HTTP connection** — returns **202** `{status:"submitted", build_id, poll:"/builds", build_source, action_id, …}` immediately — `build_source` (`origin_main` \| `live_tree`, `null` with no configured primary) names the tree the rebuild selects — and runs the stop→build→start sequence in a background task (a client disconnect / short HTTP timeout can no longer abandon the build mid-flight). Poll `GET /builds` (or `GET /build/{id}/status`) for the terminal outcome. **`from_working_tree` defaults to `false`** → the rebuild compiles a fresh `origin/main` worktree (provenance `origin_main`), so the primary runs latest-green-main; set `from_working_tree: true` to compile the live working tree (legacy `live_tree`). See "Primary rebuild builds origin/main by default". `rebuild: false` stays synchronous (fast restart, 200 on success / 503 if unhealthy after start). |
 | POST | `/runner/watchdog` | Control watchdog (legacy single-runner endpoint) |
 | POST | `/runner/rebuild-when-idle` | Watch the primary until its Claude sessions drain, then rebuild it from `origin/main`. Optional body `{deadline_secs?, poll_secs?}` (default 6 h and 30 s, clamped to 60 s–24 h and 5–600 s). Returns **202** `{status:"watching", build_id, build_source:"origin_main", action_id, …}`; **404** with no primary. The deadline expires the wait and never converts into a rebuild. Poll `GET /build/{id}/status`: `detached.body.status` ends as `rebuilt` (200), `rebuilt_unhealthy` (502, carrying the `error`: the rebuild ran and its own boot was not confirmed healthy, because it did not answer within the wait, ended early, or no primary was left to check; a boot past the wait may still answer, and a crash-watchdog respawn may be up by then), `gave_up_waiting` (408: nothing rebuilt, nothing stopped), `aborted` (404: the primary left the registry), `error` (500: the restart failed, or the readiness gate refused it at fire time; the `error` text says which) or `panicked` (500: the task panicked; every detached submission can end this way). Only `rebuilt` reads as `status.state: "succeeded"`. The submission store is in memory, so a supervisor restart during the wait loses it: the poll answers 404. |
-| POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll, build_source}` immediately (`build_source` is always `live_tree` — this route has no origin/main arm); the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id (`deduplicated: true`). |
+| POST | `/runner/fix-and-rebuild` | Rebuild the live runner tree, **detached from the HTTP connection**. Returns **202** `{status:"accepted", build_id, submission_id, poll, build_source, action_id, …}` immediately (`build_source` is always `live_tree` — this route has no origin/main arm); the ~10-20min build runs in a background task (so a client disconnect can't cancel it mid-flight) and writes the provenance sidecar + LKG. Poll `GET /build/{id}/status` for the terminal outcome. A second call while one is in flight returns the existing submission id and its action (`deduplicated: true`). |
 
 ### Debug endpoints (gated)
 
@@ -1886,8 +1888,10 @@ Three changes close it, and they are load-bearing together:
   *it did not happen* from *it worked and I was not told*.
 - **`GET /runners/spawn-test/in-flight`** recovers the id when no answer arrived
   at all (a client-side timeout, a hard kill). It reads the single-flight index,
-  which already holds `(submission_id, runner_id, port)` keyed by requester, so
-  it is exact — unlike polling `GET /runners` and guessing by `requester_id`.
+  which already holds `(submission_id, runner_id, port, action)` keyed by
+  requester, so it is exact — unlike polling `GET /runners` and guessing by
+  `requester_id`. Each row names its action, so the caller can reach the verdict
+  as well as the runner.
 
 **Registrations are deliberately NOT persisted across a restart.** A temp runner
 is terminated by the kill-on-exit JobObject when the supervisor process exits, so

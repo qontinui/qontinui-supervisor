@@ -3150,9 +3150,11 @@ pub async fn spawn_test(
                     ),
                 )
                 .await;
+            // Names the action it joined: this request minted none, and it is
+            // usually the retry of a caller who never read the first answer.
             return Ok((
                 axum::http::StatusCode::ACCEPTED,
-                Json(json!({
+                Json(existing.action.stamp(json!({
                     "status": "queued",
                     "deduplicated": true,
                     "build_id": existing_id.to_string(),
@@ -3168,7 +3170,7 @@ pub async fn spawn_test(
                          slot — poll GET /build/{}/status for the terminal outcome",
                         existing_id, existing_id
                     ),
-                })),
+                }))),
             )
                 .into_response());
         }
@@ -3393,6 +3395,7 @@ pub async fn spawn_test(
         submission_id,
         runner_id: id.clone(),
         port,
+        action: minted.clone(),
     });
 
     if want_async {
@@ -3467,54 +3470,36 @@ pub async fn spawn_test(
                 .into_response());
         }
     }
-    let outcome = {
-        let sub = sub_arc.read().await;
-        sub.spawn.clone()
-    };
-    match outcome {
-        Some(o) => {
-            let status = axum::http::StatusCode::from_u16(o.http_status)
-                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            // Back-compat: re-attach the legacy `X-Frontend-Stale: 1` header
-            // when the body flags a stale frontend (the header couldn't ride
-            // the stored submission outcome).
-            let frontend_stale = o
-                .body
-                .get("frontend_stale")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            // The exec future stamped this body with the dev-action snapshot
-            // fields (in-place edit per §6.1; no new route), so this answer and
-            // `GET /build/{id}/status` carry the same ones. The watcher was
-            // already spawned at mint time.
-            let mut response = (status, Json(o.body)).into_response();
-            if frontend_stale {
-                response
-                    .headers_mut()
-                    .insert("X-Frontend-Stale", "1".parse().unwrap());
-            }
-            Ok(response)
-        }
-        // Terminal with no stored outcome: an internal error, but the caller
-        // still created a runner and still needs its id to follow or stop it.
-        // Rendering this as a bare `SupervisorError` string threw that away.
-        None => {
-            let mut body = json!({
-                "error": "spawn_outcome_missing",
-                "message": "spawn-test submission reached terminal state without a spawn outcome \
-                            (internal error)",
-                "submission_id": submission_id.to_string(),
-                "build_id": submission_id.to_string(),
-                "poll_url": format!("/build/{submission_id}/status"),
-            });
-            attach_spawn_identity(&mut body, &id, port);
-            Ok((
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(minted.stamp(body)),
-            )
-                .into_response())
-        }
+    // `submit_spawn` stores the outcome under the same guard as the terminal
+    // status, its panic path included, and nothing else writes a spawn
+    // submission's status, so a terminal one always carries it.
+    let o = sub_arc
+        .read()
+        .await
+        .spawn
+        .clone()
+        .expect("a terminal spawn submission carries its outcome");
+    let status = axum::http::StatusCode::from_u16(o.http_status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    // Back-compat: re-attach the legacy `X-Frontend-Stale: 1` header
+    // when the body flags a stale frontend (the header couldn't ride
+    // the stored submission outcome).
+    let frontend_stale = o
+        .body
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The exec future stamped this body with the dev-action snapshot
+    // fields (in-place edit per §6.1; no new route), so this answer and
+    // `GET /build/{id}/status` carry the same ones. The watcher was
+    // already spawned at mint time.
+    let mut response = (status, Json(o.body)).into_response();
+    if frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
     }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -3539,6 +3524,9 @@ pub struct SpawnInflightQuery {
 ///
 /// The entries come from the single-flight index, so `build_id` here is the
 /// same token the sync body, the async 202 and `GET /build/{id}/status` all use.
+/// Each carries its action's fields too ([`MintedAction::stamp`]): a caller who
+/// lost the answer lost the action id along with the runner id, and
+/// `GET /actions/{id}/outcome` is where a failed build's verdict is read.
 pub async fn spawn_test_in_flight(
     State(state): State<SharedState>,
     Query(q): Query<SpawnInflightQuery>,
@@ -3549,7 +3537,7 @@ pub async fn spawn_test_in_flight(
     let spawns: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(key, inflight)| {
-            json!({
+            inflight.action.stamp(json!({
                 "requester_id": key.requester_id,
                 "build_target": key.build_target,
                 "id": inflight.runner_id,
@@ -3560,7 +3548,7 @@ pub async fn spawn_test_in_flight(
                 "poll_url": format!("/build/{}/status", inflight.submission_id),
                 "logs_url": format!("/runners/{}/logs", inflight.runner_id),
                 "stop_url": format!("/runners/{}/stop", inflight.runner_id),
-            })
+            }))
         })
         .collect();
     Json(json!({

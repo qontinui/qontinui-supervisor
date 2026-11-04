@@ -30,7 +30,7 @@ use crate::process::manager;
 use crate::state::{ManagedRunner, SharedState};
 
 /// What a mint hands back to its door.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MintedAction {
     /// The stored record. The door records the act's terminal result on it.
     pub record: Arc<ActionRecord>,
@@ -233,23 +233,8 @@ fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev_action::test_support::{response_json, ACK_FIELDS};
+    use crate::dev_action::test_support::{minted_action as minted, response_json, ACK_FIELDS};
     use crate::dev_action::ActionRunResult;
-
-    fn minted() -> MintedAction {
-        let (predicted, risk) = assess_then_cut(Vec::new(), &[]);
-        MintedAction {
-            record: Arc::new(ActionRecord::new(
-                ActionKind::Restart,
-                None,
-                "test".to_string(),
-                &[],
-            )),
-            states_active: Vec::new(),
-            predicted,
-            risk,
-        }
-    }
 
     /// The door tests assert [`ACK_FIELDS`], so a field added to the ACK has to be
     /// added there too or this fails.
