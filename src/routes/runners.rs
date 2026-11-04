@@ -767,6 +767,8 @@ pub async fn list_runners(
                 "serving_restart_attempts": watchdog.serving_restart_attempts,
                 "last_serving_restart_at": watchdog.last_serving_restart_at.map(|t| t.to_rfc3339()),
                 "serving_disabled_reason": watchdog.serving_disabled_reason.clone(),
+                "last_prebind_alert_at": watchdog.last_prebind_alert.map(|(_, at)| at.to_rfc3339()),
+                "last_prebind_alert_spawn_started_at": watchdog.last_prebind_alert.map(|(spawn, _)| spawn.to_rfc3339()),
             }
         });
         // Phase 8b: a `fresh_device_identity` runner's own device id, read
