@@ -798,15 +798,19 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // operator configured, so the 60 s clamp floor would be
                     // unreachable. The ALERT keeps `should_escalate`'s slower
                     // cadence, which is passed in rather than recomputed.
-                    if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
+                    let serving_decision = if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
                         crate::process::manager::maybe_serving_restart(
                             &state,
                             managed,
                             liveness_now,
                             should_escalate,
                         )
-                        .await;
-                    }
+                        .await
+                    } else {
+                        None
+                    };
+                    let serving_clause =
+                        crate::process::manager::serving_decision_clause(serving_decision);
 
                     if should_escalate {
                         let (pid, since, started_at) = {
@@ -832,9 +836,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                 started_at = ?started_at,
                                 last_seen_responding_at = ?since,
                                 silent_for_secs = (*ticks * 2),
-                                "Runner has held port {} for {}s and has NEVER answered its HTTP API during this spawn (an earlier boot last answered). Liveness reads wedged because that stamp survives a restart; most likely a start that has not finished.",
+                                "Runner has held port {} for {}s and has NEVER answered its HTTP API during this spawn (an earlier boot last answered). Liveness reads wedged because that stamp survives a restart; most likely a start that has not finished. {}.",
                                 runner_port,
-                                *ticks * 2
+                                *ticks * 2,
+                                serving_clause
                             );
                         } else if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
                             tracing::error!(
@@ -845,19 +850,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                 unresponsive_for_secs = (*ticks * 2),
                                 "RUNNER WEDGED: port is held but the HTTP API has not answered \
                                  for {}s. The process is ALIVE and not responding — this is not \
-                                 a stopped runner. Not restarting ({}); capture a thread dump \
-                                 before any manual restart.",
+                                 a stopped runner. {}. Capture a thread dump before any manual \
+                                 restart.",
                                 *ticks * 2,
-                                if is_supervisor_managed {
-                                    "a wedge is not an exit, so the crash-only watchdog does not \
-                                     cover it, and a restart destroys the in-flight work and the \
-                                     evidence"
-                                } else {
-                                    "a wedge is not an exit, so the crash watchdog does not cover \
-                                     it; the serving watchdog does when armed, on a zero census \
-                                     past its threshold, since a restart destroys in-flight \
-                                     sessions"
-                                }
+                                serving_clause
                             );
                             state
                                 .logs

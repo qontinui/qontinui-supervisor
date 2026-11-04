@@ -7109,3 +7109,31 @@ async fn a_never_answered_notice_carries_the_silence_since_its_start() {
         }
     }
 }
+
+/// The `RUNNER WEDGED` line says what the serving arm decided on that tick. It
+/// used to say `Not restarting` on every tick, including the one where the arm
+/// had just decided to restart.
+#[test]
+fn the_wedged_line_says_what_the_serving_arm_decided() {
+    let restart = serving_decision_clause(Some(ServingRestartDecision::Restart { attempt: 2 }));
+    assert_eq!(
+        restart,
+        "The serving watchdog decided on this tick to RESTART it (attempt 2/3), still gated \
+         on a zero session census"
+    );
+    assert!(!restart.contains("Not restarting"));
+    assert_eq!(
+        serving_decision_clause(Some(ServingRestartDecision::SkipBelowThreshold)),
+        "Not restarting yet: the silence is below the serving threshold"
+    );
+    assert_eq!(
+        serving_decision_clause(Some(ServingRestartDecision::SkipNotArmed)),
+        "Not restarting: the serving watchdog is not armed for it (--watchdog absent, or the \
+         kill-switch is set)"
+    );
+    assert_eq!(
+        serving_decision_clause(None),
+        "The serving watchdog made no restart decision on this tick",
+        "no decision evaluated is said, never a claimed one"
+    );
+}

@@ -4563,12 +4563,16 @@ async fn emit_serving_event(
 /// evaluating it only on the alert cadence would make the effective threshold
 /// floor 330 s no matter what the operator configured. The ALERT keeps the
 /// slower cadence so a long wedge does not spam coord.
+///
+/// Returns the decision taken on this tick, so the caller's log line can say
+/// what the serving arm did rather than guess; `None` when no decision was
+/// evaluated (an `Unknown` liveness, which is alerted and never restarted).
 pub async fn maybe_serving_restart(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
     liveness: crate::state::RunnerLiveness,
     should_alert: bool,
-) {
+) -> Option<ServingRestartDecision> {
     use crate::diagnostics::ServingEvent;
 
     let runner_id = managed.config.id.clone();
@@ -4632,7 +4636,7 @@ pub async fn maybe_serving_restart(
             )
             .await;
         }
-        return;
+        return None;
     }
 
     // A respawn that has never answered reads `UnresponsiveSince`, not `Unknown`,
@@ -4935,6 +4939,55 @@ pub async fn maybe_serving_restart(
                 "serving watchdog: no action for runner '{}' ({:?}, silent {}s/{}s)",
                 runner_id, other, silent_for_secs, threshold_secs
             );
+        }
+    }
+    Some(decision)
+}
+
+/// What the serving arm decided on one tick, as a clause for the health
+/// cache's `RUNNER WEDGED` line. That line used to say `Not restarting` on
+/// every tick, including the one where this arm had just decided to restart.
+/// `None` is "no decision evaluated this tick", and says so rather than
+/// claiming one.
+pub(crate) fn serving_decision_clause(decision: Option<ServingRestartDecision>) -> String {
+    match decision {
+        None => "The serving watchdog made no restart decision on this tick".to_string(),
+        Some(ServingRestartDecision::Restart { attempt }) => format!(
+            "The serving watchdog decided on this tick to RESTART it (attempt \
+             {attempt}/{SERVING_RESTART_MAX_PER_WINDOW}), still gated on a zero session census"
+        ),
+        Some(ServingRestartDecision::Disarm) => {
+            "Not restarting: the serving watchdog DISARMED itself on this tick (restart-loop \
+             guard); an operator is required"
+                .to_string()
+        }
+        Some(ServingRestartDecision::SkipNotWedged) => {
+            "Not restarting: the serving watchdog did not classify it as wedged".to_string()
+        }
+        Some(ServingRestartDecision::SkipTempRunner) => {
+            "Not restarting: the serving watchdog does not act on a temp runner (a wedge is \
+             not an exit, so the crash-only watchdog does not cover it either)"
+                .to_string()
+        }
+        Some(ServingRestartDecision::SkipOperatorIntent) => {
+            "Not restarting: an operator stop or restart is pending".to_string()
+        }
+        Some(ServingRestartDecision::SkipInFlight) => {
+            "A serving restart taken on an earlier tick is still in flight".to_string()
+        }
+        Some(ServingRestartDecision::SkipBelowThreshold) => {
+            "Not restarting yet: the silence is below the serving threshold".to_string()
+        }
+        Some(ServingRestartDecision::SkipNotArmed) => {
+            "Not restarting: the serving watchdog is not armed for it (--watchdog absent, or \
+             the kill-switch is set)"
+                .to_string()
+        }
+        Some(ServingRestartDecision::SkipDisabled) => {
+            "Not restarting: the watchdog is disabled for this runner".to_string()
+        }
+        Some(ServingRestartDecision::SkipDisarmed) => {
+            "Not restarting: the serving watchdog disarmed itself earlier".to_string()
         }
     }
 }
