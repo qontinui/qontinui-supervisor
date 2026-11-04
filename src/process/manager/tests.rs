@@ -5764,8 +5764,9 @@ async fn a_door_answered_text_file_busy(
 /// and before the stub is stopped, so the stop's ladder never finds this process on
 /// the runner's port, even when the door itself panicked. A listener that failed to
 /// bind re-raises its panic, rather than surfacing as the health wait's timeout. The
-/// stub is then stopped BEFORE the trial is read, so a boot that answered and was
-/// stopped later is read after its stop.
+/// stub is then stopped before the trial is read. The trial's result is fixed when
+/// the door answers (a run result is written once), so that stop shows only that
+/// nothing records over it.
 async fn through_a_held_open_door<A, F, Fut>(
     state: SharedState,
     managed: Arc<ManagedRunner>,
@@ -5872,13 +5873,14 @@ async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot()
 }
 
 /// The complement at `POST /runners/{id}/start`: the boot is alive when its port
-/// first answers, and is stopped only after the door has answered. Its trial asked
-/// whether its own boot came up, and it did, so it reads `Ran` though the boot is
-/// gone by the time the trial is read. Unix only: the one stub that stays up is
+/// answers, so its trial reads `Ran`. This guards the over-correction direction: a
+/// hold that demoted every held-open `Ran` turns it red. It does not stage a boot
+/// that answered and was stopped before the door recorded; that timing is held by
+/// `dev_action::run_result`'s unit test. Unix only: the one stub that stays up is
 /// `stub_primary`'s bash.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_open_start_whose_boot_answered_reads_ran_though_it_was_stopped_later() {
+async fn a_held_open_start_whose_boot_answered_reads_ran() {
     let (state, managed, _root) = stub_primary(29_884).await;
     let id = managed.config.id.clone();
     let answer = answer_the_port_while_the_boot_is_up(managed.clone());
