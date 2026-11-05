@@ -258,8 +258,7 @@ mod tests {
     /// A port that answers `/health`, as whatever process holds it does.
     async fn answering_port() -> u16 {
         let app = Router::new().route("/health", get(|| async { "ok" }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         port
     }
@@ -363,8 +362,8 @@ mod tests {
     #[tokio::test]
     async fn a_spawn_recorded_while_the_probe_was_out_is_not_the_boot_it_replaced() {
         let (action, later) = (Uuid::new_v4(), Uuid::new_v4());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (state, managed, _root) = runner_on(listener.local_addr().unwrap().port()).await;
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+        let (state, managed, _root) = runner_on(port).await;
         let spawned = chrono::Utc::now();
         managed
             .recent_spawns

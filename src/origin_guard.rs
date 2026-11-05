@@ -1825,8 +1825,7 @@ mod router_tests {
                 axum::Json(serde_json::json!({ "ok": true }))
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (port, seen)
     }

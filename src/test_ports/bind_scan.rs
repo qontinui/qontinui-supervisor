@@ -1,91 +1,50 @@
-//! The data-flow half of `test_ports::tests::no_test_fixture_releases_a_port_to_fabricate_a_dead_one`:
-//! find test code that binds a loopback socket to port 0, reads the port the
-//! kernel chose, and lets the socket go while the port is still in use.
+//! The scan behind `test_ports::tests::no_test_code_binds_port_0_outside_test_ports`:
+//! every `bind(…)` in test code whose argument is an address with port 0.
 //!
-//! **A release is a fact about data flow, not about syntax.** A socket bound to
-//! port 0 is its port's HOLDER. The holder is released by `drop(holder)`, or at
-//! the end of the block that declares it, unless it is moved out first: into a
-//! call, a `move` closure or an `async move` block, an aggregate, `mem::forget`,
-//! or the block's own value. A PORT VALUE is anything read from the holder's
-//! `local_addr()`, or computed from another port value (`addr.port()`,
-//! `format!("http://{addr}")`, `config.port = port`). The scan flags two shapes:
+//! **Why a token rule is enough.** A port the kernel picked belongs to the test
+//! only while the socket that holds it lives. `test_ports` hands one out only
+//! together with that socket ([`super::held_ephemeral_listener`],
+//! [`super::held_ephemeral_tokio_listener`]), and its dead-port fixtures
+//! ([`super::unheld_port`], [`super::reserve_refused_port`]) never release one.
+//! So the property needs no data flow: if test code binds port 0 in `test_ports`
+//! and nowhere else, no fixture outside it can let such a socket go and keep
+//! using its port. Dropping a listener that `test_ports` handed out is still
+//! possible; it is visible at the call site, and the helpers' docs say only a
+//! test whose subject is a released port does it.
 //!
-//! * [`Shape::UsedAfterRelease`]: a port value is used after its holder was
-//!   released, inside one function (`drop(l); register(port)`);
-//! * [`Shape::ValueOutlivesHolder`]: a block or a function's value is a port
-//!   value, while its holder is released at that block's end
-//!   (`let port = { let l = bind(..)?; l.local_addr()?.port() };`, or a helper
-//!   returning the port of a listener it lets go).
+//! **A port-0 bind** is a call of `bind` (`TcpListener::bind(…)`,
+//! `sock.bind(…)`) whose parenthesised argument holds, at any depth:
 //!
-//! A listener HELD until after the port's last use is not a release, which is
-//! why the rule is keyed on data flow: a syntactic rule ("a bind followed by a
-//! drop") flags every held listener, and a guard that flags correct code trains
-//! people to allowlist it.
+//! * a string literal that is a host and port 0: `"127.0.0.1:0"`, `"[::1]:0"`,
+//!   `"localhost:0"`;
+//! * a tuple whose last element is the literal `0`: `("127.0.0.1", 0)`,
+//!   `([127, 0, 0, 1], 0)` (so `SocketAddr::from(([127, 0, 0, 1], 0))`),
+//!   `(Ipv4Addr::LOCALHOST, 0u16)`;
+//! * `SocketAddr::new`, `SocketAddrV4::new` or `SocketAddrV6::new` whose second
+//!   argument, the port, is the literal `0`.
 //!
-//! What it follows. A bind is `bind(…)` whose argument is a loopback or
-//! wildcard address with port 0 (`"127.0.0.1:0"`, `("127.0.0.1", 0)`,
-//! `SocketAddr::from(([127, 0, 0, 1], 0))`, or a binding initialised from one),
-//! as a path call (`TcpListener::bind`, whose value is the holder) or as a
-//! method call on a socket (`sock.bind(&addr)`, which makes `sock` the holder).
-//! A same-file helper whose value is a fresh holder, or a tuple of one and its
-//! port (`fn ephemeral_listener() -> (TcpListener, u16)`), is followed into its
-//! callers. A drop on a branch that diverges (`return`, `break`, `continue`,
-//! `panic!`) does not release the holder on the path after the branch.
+//! What it does not see, so it can miss a bind but never invents one: an
+//! address built before the call and passed in by name
+//! (`let a = "127.0.0.1:0"; bind(a)`), and a port computed at run time.
 //!
-//! What it does not follow, so it can miss a release but never invents one:
-//! helpers in other files, holders stored in a field or a collection, a port
-//! captured by a closure that is called later, and `return` from a closure.
-
-mod flow;
-#[cfg(test)]
-mod tests;
+//! **Test code** is a file under `tests/`, a file that opens with
+//! `#![cfg(test)]` ([`is_test_only_file`]), a file declared by a
+//! `#[cfg(test)] mod NAME;` (or declared at all inside such a file), and, in
+//! every other file, the items under `#[test]`, `#[tokio::test]` or a
+//! `#[cfg(…)]` that requires `test`, with everything inside them.
 
 use crate::source_scan::{is_test_only_file, token_trees, tokens, TokenKind, TokenTree};
-use flow::{Analyzer, Helper};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// A test fixture that let a port-0 socket go while its port was still in use.
+/// A port-0 bind in test code.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Release {
-    /// The function the socket was bound in.
-    pub(crate) function: String,
-    /// The line of the bind.
-    pub(crate) bound_at: usize,
-    /// The line the release shows on: the use after the release, or the value
-    /// that outlives its holder.
+pub(crate) struct Bind {
+    /// The line the `bind` call is on.
     pub(crate) line: usize,
-    pub(crate) shape: Shape,
-}
-
-impl fmt::Display for Release {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.shape {
-            Shape::UsedAfterRelease { released_at } => write!(
-                f,
-                "fn {}: the port of the socket bound to port 0 at line {} is used after the \
-                 socket is released at line {released_at}",
-                self.function, self.bound_at
-            ),
-            Shape::ValueOutlivesHolder => write!(
-                f,
-                "fn {}: this value is the port of the socket bound to port 0 at line {}, which \
-                 is released as the block that holds it ends",
-                self.function, self.bound_at
-            ),
-        }
-    }
-}
-
-/// How a [`Release`] shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape {
-    /// The port is used after its holder was released at line `released_at`.
-    UsedAfterRelease { released_at: usize },
-    /// A block or a function's value is the port, and the holder it was read
-    /// from is released at that block's end.
-    ValueOutlivesHolder,
+    /// The test item it is in: a function's name, or the name of the other item
+    /// (a `static`, a `const`) that holds it.
+    pub(crate) function: String,
 }
 
 /// A `mod NAME;` declaration, so a caller can find the module's file. `path` is
@@ -100,90 +59,27 @@ pub(crate) struct ModDecl {
 /// What a scan of one file found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileScan {
-    pub(crate) releases: Vec<Release>,
-    /// How many port-0 binds in test code the scan followed. A scan that
-    /// followed none of the binds it was pointed at proves nothing.
-    pub(crate) binds: usize,
-    /// Each test-code function the scan analysed, by name, and how many binds it
-    /// followed there.
-    pub(crate) function_binds: BTreeMap<String, usize>,
-    /// The file's `mod NAME;` declarations.
+    pub(crate) binds: Vec<Bind>,
     pub(crate) mod_decls: Vec<ModDecl>,
 }
 
-/// Scan one source file. With `whole_file_is_test` every function is test code
-/// (an integration test, a module compiled only for tests); otherwise only
-/// functions under `#[test]`, `#[tokio::test]` or `#[cfg(test)]` are. `None`
-/// when the file does not lex or its delimiters do not balance.
+/// Scan one source file. With `whole_file_is_test` every item is test code (an
+/// integration test, a module compiled only for tests); otherwise only test
+/// items are. `None` when the file does not lex or its delimiters do not
+/// balance.
 pub(crate) fn scan(text: &str, whole_file_is_test: bool) -> Option<FileScan> {
     let tokens = tokens(text)?;
     let trees = token_trees(&tokens)?;
-    let mut items = Items::default();
-    collect_items(&trees, whole_file_is_test, &[], &mut items);
-
-    // Pass 1: which same-file helpers hand out a fresh holder (and its port).
-    let no_helpers = HashMap::new();
-    let mut helpers: HashMap<String, Option<Helper>> = HashMap::new();
-    for item in &items.fns {
-        let mut analyzer = Analyzer::new(&item.name, &no_helpers);
-        let shape = analyzer.function(item.body, item.close_line, true);
-        if let Some(shape) = shape {
-            helpers
-                .entry(item.name.clone())
-                .and_modify(|seen| {
-                    if seen.as_ref() != Some(&shape) {
-                        *seen = None;
-                    }
-                })
-                .or_insert(Some(shape));
-        }
-    }
-
-    // Pass 2: every test-code function, its nested functions included.
-    let mut scan = FileScan {
-        mod_decls: items.decls,
-        ..FileScan::default()
-    };
-    let mut queue: Vec<(String, &[TokenTree<'_>], usize)> = items
-        .fns
-        .iter()
-        .filter(|item| item.test)
-        .map(|item| (item.name.clone(), item.body, item.close_line))
-        .collect();
-    while let Some((name, body, close_line)) = queue.pop() {
-        let mut analyzer = Analyzer::new(&name, &helpers);
-        analyzer.function(body, close_line, false);
-        scan.binds += analyzer.binds();
-        *scan.function_binds.entry(name).or_default() += analyzer.binds();
-        scan.releases.extend(analyzer.releases);
-        queue.extend(analyzer.nested);
-    }
-    scan.releases.sort_by_key(|r| (r.bound_at, r.line));
+    let mut scan = FileScan::default();
+    walk_items(&trees, whole_file_is_test, &[], &mut scan);
+    scan.binds.sort_by_key(|b| b.line);
     Some(scan)
 }
 
-/// A function item and whether it is test code.
-struct FnItem<'a, 't> {
-    name: String,
-    body: &'a [TokenTree<'t>],
-    close_line: usize,
-    test: bool,
-}
-
-#[derive(Default)]
-struct Items<'a, 't> {
-    fns: Vec<FnItem<'a, 't>>,
-    decls: Vec<ModDecl>,
-}
-
-/// Walk an item list (a file, a module, an `impl` or a `trait` body), collecting
-/// its functions and module declarations. `test` is whether the list is test code.
-fn collect_items<'a, 't>(
-    trees: &'a [TokenTree<'t>],
-    mut test: bool,
-    path: &[String],
-    items: &mut Items<'a, 't>,
-) {
+/// Walk an item list (a file, a module, an `impl` or a `trait` body): record
+/// its module declarations, and the port-0 binds in each of its test items.
+/// `test` is whether the whole list is test code.
+fn walk_items(trees: &[TokenTree<'_>], mut test: bool, path: &[String], scan: &mut FileScan) {
     let mut i = 0;
     let mut attribute_test = false;
     while i < trees.len() {
@@ -202,51 +98,168 @@ fn collect_items<'a, 't>(
         let Some(head) = trees.get(keyword) else {
             break;
         };
-        if head.is_ident("fn") {
-            let name = ident_text(trees.get(keyword + 1)).unwrap_or_default();
-            match fn_body_index(trees, keyword + 2) {
-                Some(body) => {
-                    items.fns.push(FnItem {
-                        name,
-                        body: trees[body].inner(),
-                        close_line: trees[body].end_line(),
-                        test: item_test,
-                    });
-                    i = body + 1;
-                }
-                None => i = item_end(trees, keyword),
-            }
-        } else if head.is_ident("mod") {
-            let name = ident_text(trees.get(keyword + 1)).unwrap_or_default();
+        let name = ident_text(trees.get(keyword + 1)).unwrap_or_default();
+        if head.is_ident("mod") {
             match trees.get(keyword + 2) {
                 Some(group) if group.delimiter() == Some(b'{') => {
                     let mut inner_path = path.to_vec();
                     inner_path.push(name);
-                    collect_items(group.inner(), item_test, &inner_path, items);
+                    walk_items(group.inner(), item_test, &inner_path, scan);
                     i = keyword + 3;
                 }
                 _ => {
                     let mut decl_path = path.to_vec();
                     decl_path.push(name);
-                    items.decls.push(ModDecl {
+                    scan.mod_decls.push(ModDecl {
                         path: decl_path,
                         test: item_test,
                     });
                     i = item_end(trees, keyword);
                 }
             }
-        } else if head.is_ident("impl") || head.is_ident("trait") {
+            continue;
+        }
+        if head.is_ident("impl") || head.is_ident("trait") {
             match first_brace(trees, keyword + 1) {
                 Some(body) => {
-                    collect_items(trees[body].inner(), item_test, path, items);
+                    walk_items(trees[body].inner(), item_test, path, scan);
                     i = body + 1;
                 }
                 None => i = item_end(trees, keyword),
             }
-        } else {
-            i = item_end(trees, keyword);
+            continue;
         }
+        let end = if head.is_ident("fn") {
+            fn_body_index(trees, keyword + 2).map_or_else(|| item_end(trees, keyword), |b| b + 1)
+        } else {
+            item_end(trees, keyword)
+        };
+        if item_test {
+            port_zero_binds(&trees[keyword..end], &name, &mut scan.binds);
+        }
+        i = end.max(i + 1);
     }
+}
+
+/// Every port-0 bind in `trees`, at any depth, as found in `item`.
+fn port_zero_binds(trees: &[TokenTree<'_>], item: &str, out: &mut Vec<Bind>) {
+    for (i, tree) in trees.iter().enumerate() {
+        let is_call = tree.is_ident("bind")
+            && !(i > 0 && trees[i - 1].is_ident("fn"))
+            && trees
+                .get(i + 1)
+                .is_some_and(|t| t.delimiter() == Some(b'('));
+        if is_call && holds_port_zero_address(trees[i + 1].inner()) {
+            out.push(Bind {
+                line: tree.line(),
+                function: item.to_string(),
+            });
+        }
+        port_zero_binds(tree.inner(), item, out);
+    }
+}
+
+/// Whether `trees`, at any depth, hold an address with port 0: a `host:0`
+/// string literal, a tuple ending in the literal `0`, or a `SocketAddr*::new`
+/// whose port argument is `0`.
+fn holds_port_zero_address(trees: &[TokenTree<'_>]) -> bool {
+    trees.iter().enumerate().any(|(i, tree)| {
+        if tree
+            .leaf()
+            .is_some_and(|t| t.kind == TokenKind::Str && is_port_zero_text(t.text))
+        {
+            return true;
+        }
+        if tree.delimiter() == Some(b'(') {
+            let elements = split(tree.inner(), ",");
+            let called = i > 0 && is_callee_end(&trees[i - 1]);
+            if called && is_socket_addr_new(&trees[..i]) {
+                if elements.get(1).is_some_and(|port| is_zero_literal(port)) {
+                    return true;
+                }
+            } else if !called
+                && elements.len() >= 2
+                && elements.last().is_some_and(|last| is_zero_literal(last))
+            {
+                return true;
+            }
+        }
+        holds_port_zero_address(tree.inner())
+    })
+}
+
+/// Whether a `(…)` group right after `tree` is a call's argument list rather
+/// than a tuple: it follows a name, a closing generic or a macro's `!`.
+fn is_callee_end(tree: &TokenTree<'_>) -> bool {
+    tree.leaf()
+        .is_some_and(|t| t.kind == TokenKind::Ident || t.text == ">" || t.text == "!")
+}
+
+/// Whether `before` ends in `SocketAddr::new`, `SocketAddrV4::new` or
+/// `SocketAddrV6::new`, the constructors whose second argument is the port.
+fn is_socket_addr_new(before: &[TokenTree<'_>]) -> bool {
+    match before {
+        [.., ty, sep, new] => {
+            new.is_ident("new")
+                && sep.is_punct("::")
+                && ["SocketAddr", "SocketAddrV4", "SocketAddrV6"]
+                    .iter()
+                    .any(|name| ty.is_ident(name))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `element` is the one integer literal `0`, with any `_` separators
+/// and integer suffix (`0`, `0u16`, `0_u16`).
+fn is_zero_literal(element: &[TokenTree<'_>]) -> bool {
+    let [only] = element else {
+        return false;
+    };
+    only.leaf()
+        .filter(|t| t.kind == TokenKind::Number)
+        .is_some_and(|t| {
+            let digits = t.text.replace('_', "");
+            let digits = [
+                "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8",
+                "i8",
+            ]
+            .iter()
+            .find_map(|suffix| digits.strip_suffix(suffix))
+            .unwrap_or(&digits);
+            digits == "0"
+        })
+}
+
+/// Whether a string literal's token text is a host with port 0: an IPv4
+/// address, a bracketed IPv6 address or `localhost`, then `:0`.
+fn is_port_zero_text(literal: &str) -> bool {
+    let Some(content) = string_content(literal) else {
+        return false;
+    };
+    let Some(host) = content.strip_suffix(":0") else {
+        return false;
+    };
+    let ipv4 = host.split('.').count() == 4
+        && host.split('.').all(|octet| {
+            !octet.is_empty() && octet.len() <= 3 && octet.bytes().all(|b| b.is_ascii_digit())
+        });
+    let ipv6 = host.len() > 2
+        && host.starts_with('[')
+        && host.ends_with(']')
+        && host[1..host.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+    ipv4 || ipv6 || host == "localhost"
+}
+
+/// What a plain or raw string literal's token text holds between its quotes;
+/// `None` for a byte or C string, which no address parse takes.
+fn string_content(literal: &str) -> Option<&str> {
+    let raw = literal.strip_prefix('r').unwrap_or(literal);
+    let hashes = raw.len() - raw.trim_start_matches('#').len();
+    let body = raw[hashes..].strip_prefix('"')?;
+    body.get(..body.len().checked_sub(1 + hashes)?)
 }
 
 /// At `i`, an attribute: `(index after it, whether it is an inner `#![…]`, whether
@@ -368,14 +381,15 @@ fn split<'a, 't>(trees: &'a [TokenTree<'t>], sep: &str) -> Vec<&'a [TokenTree<'t
         .collect()
 }
 
-/// Scan every `.rs` file under `root`'s `src/` and `tests/`, keyed by its path
-/// relative to `root` with `/` separators; `None` for a file that does not lex.
+/// The port-0 binds in the test code of every `.rs` file under `root`'s `src/`
+/// and `tests/`, keyed by its path relative to `root` with `/` separators;
+/// `None` for a file that does not lex.
 ///
 /// A file is test code as a whole when it sits under `tests/`, opens with
 /// `#![cfg(test)]` ([`is_test_only_file`]), or is the file of a module declared
 /// `#[cfg(test)] mod NAME;` (or declared at all inside such a file); in every
 /// other file only test items are.
-pub(crate) fn scan_crate(root: &Path) -> BTreeMap<String, Option<FileScan>> {
+pub(crate) fn scan_crate(root: &Path) -> BTreeMap<String, Option<Vec<Bind>>> {
     let src = rust_files(&root.join("src"));
     let tests = rust_files(&root.join("tests"));
     let texts: BTreeMap<&PathBuf, String> = src
@@ -414,7 +428,7 @@ pub(crate) fn scan_crate(root: &Path) -> BTreeMap<String, Option<FileScan>> {
         .map(|(path, text)| {
             let relative = path.strip_prefix(root).unwrap_or(path);
             let key = relative.to_string_lossy().replace('\\', "/");
-            (key, scan(text, whole.contains(path)))
+            (key, scan(text, whole.contains(path)).map(|s| s.binds))
         })
         .collect()
 }
@@ -459,3 +473,6 @@ fn declared_files(file: &Path, path: &[String]) -> [PathBuf; 2] {
         dir.join(name).join("mod.rs"),
     ]
 }
+
+#[cfg(test)]
+mod tests;

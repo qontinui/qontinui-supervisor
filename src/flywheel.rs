@@ -569,12 +569,11 @@ mod tests {
             )
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://127.0.0.1:{}", addr.port())
+        format!("http://127.0.0.1:{port}")
     }
 
     /// Build a real `SharedState` cheap enough to use as the http_client
@@ -691,29 +690,13 @@ mod tests {
 
     #[tokio::test]
     async fn tick_runner_unreachable_returns_error() {
-        // Reserve a port that nothing listens on: bind a socket but never
-        // call listen(), and keep it alive for the whole test. Connects to it
-        // are refused, and because the port stays bound no concurrently
-        // running test's mock server can take it. (Binding a listener and
-        // DROPPING it freed the port, and a sibling test's server grabbed it
-        // and answered — a flake, coord finding 2d01deb3.) The cron's GET
-        // /apps must then fail with a connection error, which
-        // `run_one_tick_against` surfaces as a non-sentinel Err.
-        let reserved = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .unwrap();
-        reserved
-            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
-            .unwrap();
-        let port = reserved
-            .local_addr()
-            .unwrap()
-            .as_socket()
-            .expect("an IPv4 bind yields an IP socket address")
-            .port();
+        // A port nothing listens on and nothing else can take: connects to it
+        // are refused. (Binding a listener and DROPPING it freed the port, and
+        // a sibling test's server grabbed it and answered — a flake, coord
+        // finding 2d01deb3.) The cron's GET /apps must then fail with a
+        // connection error, which `run_one_tick_against` surfaces as a
+        // non-sentinel Err.
+        let port = crate::test_ports::reserve_refused_port();
         let base = format!("http://127.0.0.1:{}", port);
 
         let (state, _root) = test_state();
@@ -730,7 +713,6 @@ mod tests {
             "unexpected error message: {}",
             err
         );
-        drop(reserved);
     }
 
     /// Stream E.9 test #5: cron iterates the registry and a 5xx on one

@@ -301,13 +301,12 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let transport = HttpTransport::new(format!("http://{addr}")).unwrap();
+        let transport = HttpTransport::new(format!("http://127.0.0.1:{port}")).unwrap();
         let req = ClaimRequestWire::for_symbol("m", "r", JsonValue::Null);
         let outcome = transport.acquire(req).await;
         assert_eq!(outcome, AcquireOutcome::Claimed);
@@ -324,13 +323,12 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let transport = HttpTransport::new(format!("http://{addr}")).unwrap();
+        let transport = HttpTransport::new(format!("http://127.0.0.1:{port}")).unwrap();
         let req = ClaimRequestWire::for_symbol("m", "r", JsonValue::Null);
         let outcome = transport.acquire(req).await;
         match outcome {
@@ -349,13 +347,12 @@ mod tests {
                 axum::Json(serde_json::json!({"result": "released"}))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let transport = HttpTransport::new(format!("http://{addr}")).unwrap();
+        let transport = HttpTransport::new(format!("http://127.0.0.1:{port}")).unwrap();
         let req = ClaimRequestWire::for_symbol("m", "r", JsonValue::Null);
         assert_eq!(transport.release(req).await, ReleaseOutcome::Released);
     }

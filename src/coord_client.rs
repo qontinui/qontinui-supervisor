@@ -130,13 +130,11 @@ pub(crate) mod counting_listener {
         }
     }
 
-    /// Bind `127.0.0.1:0` (not `localhost`, which costs a doomed IPv6 connect on
-    /// Windows) and serve for the life of the test's runtime.
+    /// Listen on `127.0.0.1` (not `localhost`, which costs a doomed IPv6 connect
+    /// on Windows) and serve for the life of the test's runtime.
     pub(crate) async fn serve() -> CountingListener {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the counting listener");
-        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+        let base = format!("http://127.0.0.1:{port}");
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&connections);
         let listener = listener.tap_io(move |_| {

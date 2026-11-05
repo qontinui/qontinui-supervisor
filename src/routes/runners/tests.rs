@@ -2484,8 +2484,7 @@ async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
 #[tokio::test]
 async fn purge_spares_a_runner_past_its_window_whose_port_is_listening() {
     let state = make_state();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a live port");
-    let port = listener.local_addr().expect("local addr").port();
+    let (listener, port) = crate::test_ports::held_ephemeral_listener();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -3289,8 +3288,7 @@ async fn spawn_fake_runner(
                 }
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
     tokio::spawn(async move {
         let mut rx = stop_rx;
         let _ = axum::serve(listener, app)

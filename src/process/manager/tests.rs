@@ -69,8 +69,7 @@ async fn skip_for_startup_window_decisions() {
     );
 
     // In window but LISTENING → not skipped; proceeds to the sweep's logic.
-    let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live");
-    let live_port = live.local_addr().expect("addr").port();
+    let (live, live_port) = crate::test_ports::held_ephemeral_listener();
     let m = startup_test_runner(live_port);
     m.runner.write().await.started_at = Some(now);
     m.set_spawn_in_flight(budget);
@@ -3323,8 +3322,7 @@ fn port_held_by_live_runner_truth_table() {
 /// dead port is the trivially-allowed case.
 #[tokio::test]
 async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = crate::test_ports::held_ephemeral_listener();
     assert!(
         crate::process::port::is_port_listening(port),
         "the bind probe must see our own listener"
@@ -6342,12 +6340,11 @@ async fn spawn_close_request_recorder() -> (
             },
         ),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://127.0.0.1:{}", addr.port()), seen)
+    (format!("http://127.0.0.1:{port}"), seen)
 }
 
 /// A handoff stop sends `{"handoff":"holders"}` as JSON on the close-request.

@@ -1711,12 +1711,11 @@ mod tests {
             .route(AGENT_NOTIFICATIONS_PATH, post(mock_notifications))
             .route(AGENT_FINDINGS_PATH, post(mock_findings))
             .with_state(st);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("http://127.0.0.1:{}", addr.port()), seen)
+        (format!("http://127.0.0.1:{port}"), seen)
     }
 
     /// A URL nothing is listening on.
@@ -2318,12 +2317,11 @@ mod tests {
             .route(MINT_INVOKE_PATH, post(mock_invoke))
             .route(MINT_EVALUATE_PATH, post(mock_evaluate))
             .with_state(st);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("http://127.0.0.1:{}", addr.port()), inv, eval)
+        (format!("http://127.0.0.1:{port}"), inv, eval)
     }
 
     #[tokio::test]
