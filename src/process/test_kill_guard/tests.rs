@@ -76,13 +76,21 @@ fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
     let started = crate::process::temp_runner_ledger::process_start_time_secs(pid);
     assert!(started.is_some(), "a live child's start time reads");
 
-    // A record of another process that once had this pid: left alone.
+    // A record of another process that once had this pid: left alone. A
+    // signalled child is not marked exited the instant the kill returns, so
+    // it is watched for a second: a SIGKILL lands well inside that, and the
+    // spared child is a 30 s sleep.
     Orphan {
         pid,
         start_time_secs: started.map(|s| s.saturating_sub(3600)),
     }
     .end();
-    let spared = matches!(child.try_wait(), Ok(None));
+    let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut spared = true;
+    while spared && std::time::Instant::now() < watch_until {
+        spared = matches!(child.try_wait(), Ok(None));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     // A record of this process: ended.
     Orphan {
