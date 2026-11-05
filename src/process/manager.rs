@@ -5261,6 +5261,16 @@ async fn serving_watchdog_restart(
     // stops nothing. (A stop that is already running cannot be recalled by any
     // read; that residual is a known limit.)
     if shutdown_has_latched(state) {
+        // `admit_restart` emitted a `RestartStarted`; pair it, as
+        // `run_admitted_restart` does on every exit.
+        state
+            .diagnostics
+            .write()
+            .await
+            .emit(DiagnosticEventKind::RestartFailed {
+                source: RestartSource::ServingWatchdog,
+                error: "the supervisor is shutting down".to_string(),
+            });
         return Err(SupervisorError::ShuttingDown(runner_id.clone()));
     }
     let minted = crate::dev_action::commit_action(

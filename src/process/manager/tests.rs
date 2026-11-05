@@ -7582,7 +7582,7 @@ fn the_serving_restart_rereads_the_shutdown_latch_before_it_is_admitted() {
     // ...and once more AFTER admission (its readiness probe can take 15 s),
     // before anything is stopped.
     let after = restart[admit..]
-        .find("if shutdown_has_latched(state) {\n        return Err(SupervisorError::ShuttingDown(")
+        .find("if shutdown_has_latched(state) {")
         .map(|i| i + admit)
         .expect("serving_watchdog_restart re-reads the latch after admission");
     let run = restart
@@ -7591,6 +7591,19 @@ fn the_serving_restart_rereads_the_shutdown_latch_before_it_is_admitted() {
     assert!(
         admit < after && after < run,
         "admit {admit} < re-read {after} < run {run}"
+    );
+    // That refusal pairs the `RestartStarted` admission emitted with a
+    // `RestartFailed`, then returns.
+    let arm = &restart[after..run];
+    let failed = arm
+        .find("emit(DiagnosticEventKind::RestartFailed {\n                source: RestartSource::ServingWatchdog,")
+        .expect("the post-admission refusal emits a serving-watchdog RestartFailed");
+    let ret = arm
+        .find("return Err(SupervisorError::ShuttingDown(")
+        .expect("the post-admission refusal returns ShuttingDown");
+    assert!(
+        failed < ret,
+        "the RestartFailed is emitted before the return"
     );
 }
 
