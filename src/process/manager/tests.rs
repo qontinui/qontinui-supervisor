@@ -5417,56 +5417,6 @@ async fn stub_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) 
     (state, managed, root)
 }
 
-/// Whether this error is the kernel refusing to exec the stub copy with ETXTBSY: a
-/// concurrent test's fork can inherit the copy's write descriptor until its exec.
-/// Linux only in practice: no other platform reports this error, so on Windows it
-/// never matches and the held-open door tests' retry is a no-op there. A restart
-/// returns its start's error marked [`SupervisorError::AfterAct`] (its stop has
-/// already acted), so the marker is looked through: without it a restart that hit
-/// ETXTBSY was never retried and failed under a parallel suite.
-fn is_text_file_busy(err: &SupervisorError) -> bool {
-    match err {
-        SupervisorError::AfterAct(inner) => is_text_file_busy(inner),
-        SupervisorError::Process(msg) => msg.contains("Text file busy"),
-        _ => false,
-    }
-}
-
-/// A restart's ETXTBSY reaches the retry through its `AfterAct` marker.
-#[test]
-fn text_file_busy_is_recognised_through_the_after_act_marker() {
-    let busy =
-        || SupervisorError::Process("Failed to spawn exe: Text file busy (os error 26)".into());
-    assert!(is_text_file_busy(&busy()));
-    assert!(is_text_file_busy(&SupervisorError::AfterAct(Box::new(
-        busy()
-    ))));
-    assert!(!is_text_file_busy(&SupervisorError::AfterAct(Box::new(
-        SupervisorError::Process("Failed to spawn exe: not found".into())
-    ))));
-    assert!(!is_text_file_busy(&SupervisorError::RunnerAlreadyRunning));
-}
-
-/// Wait out that fork, for at most two seconds in all. Every attempt copies the file
-/// again and opens a new descriptor, so it pays to wait. This sleep orders nothing
-/// a test asserts: it only lets a concurrent exec happen.
-#[cfg(unix)]
-async fn past_text_file_busy<F, Fut, T>(mut attempt: F) -> Result<T, SupervisorError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, SupervisorError>>,
-{
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match attempt().await {
-            Err(err) if is_text_file_busy(&err) && std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            other => return other,
-        }
-    }
-}
-
 /// Stop what a stub test left running and remove the early logs its starts opened.
 /// A stop reaches only the current spawn, so also end any older stub process still
 /// up, checked by image in case its pid has been reused.
@@ -5543,37 +5493,29 @@ async fn a_stop_queued_mid_start_targets_the_recorded_spawn() {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
             let id = managed.config.id.clone();
-            let outcome = past_text_file_busy(|| {
-                let (state, managed, id) = (state.clone(), managed.clone(), id.clone());
-                async move {
-                    let holder = managed.lifecycle.lock().await;
-                    let mut start = {
-                        let (state, managed) = (state.clone(), managed.clone());
-                        Box::pin(async move {
-                            start_managed_runner(&state, &managed, None, StartAs::Registered).await
-                        })
-                    };
-                    assert!(futures::poll!(&mut start).is_pending());
-                    let mut stop = {
-                        let state = state.clone();
-                        Box::pin(async move {
-                            stop_runner_by_id(&state, &id, false, CloseIntent::Kill).await
-                        })
-                    };
-                    assert!(futures::poll!(&mut stop).is_pending());
-                    drop(holder);
-                    let start = tokio::spawn(start);
-                    let stop = tokio::spawn(stop);
-                    let (start, stop) = (
-                        start.await.expect("the start"),
-                        stop.await.expect("the stop"),
-                    );
-                    start?;
-                    stop
-                }
-            })
-            .await;
-            outcome.expect("the start and the stop succeed");
+            let holder = managed.lifecycle.lock().await;
+            let mut start = {
+                let (state, managed) = (state.clone(), managed.clone());
+                Box::pin(async move {
+                    start_managed_runner(&state, &managed, None, StartAs::Registered).await
+                })
+            };
+            assert!(futures::poll!(&mut start).is_pending());
+            let mut stop = {
+                let state = state.clone();
+                Box::pin(
+                    async move { stop_runner_by_id(&state, &id, false, CloseIntent::Kill).await },
+                )
+            };
+            assert!(futures::poll!(&mut stop).is_pending());
+            drop(holder);
+            let start = tokio::spawn(start);
+            let stop = tokio::spawn(stop);
+            let (start, stop) = (
+                start.await.expect("the start"),
+                stop.await.expect("the stop"),
+            );
+            start.and(stop).expect("the start and the stop succeed");
 
             let entry = wait_for_exit_stamp(&managed).await;
             let runner = managed.runner.read().await;
@@ -5596,9 +5538,7 @@ async fn a_stop_queued_mid_start_targets_the_recorded_spawn() {
 }
 
 /// Two real starts queued on the lock: the second finds the first's spawn. One
-/// process, whatever `running` said when each was asked for. An attempt either start
-/// of which hit ETXTBSY proves nothing about the queue, so it is cleaned up and run
-/// again, and only the last attempt's outcomes and spawns are read.
+/// process, whatever `running` said when each was asked for.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_queued_behind_a_start_finds_its_spawn() {
@@ -5606,54 +5546,39 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                let spawns_before = managed.recent_spawns.read().await.iter().count();
-                let holder = managed.lifecycle.lock().await;
-                let start = || {
-                    let (state, managed) = (state.clone(), managed.clone());
-                    Box::pin(async move {
-                        start_managed_runner(&state, &managed, None, StartAs::Registered).await
-                    })
-                };
-                let (mut first, mut second) = (start(), start());
-                assert!(futures::poll!(&mut first).is_pending());
-                assert!(futures::poll!(&mut second).is_pending());
-                drop(holder);
-                let (first, second) = (tokio::spawn(first), tokio::spawn(second));
-                let outcomes = [
-                    first.await.expect("the first start"),
-                    second.await.expect("the second start"),
-                ];
-                let spawned = managed.recent_spawns.read().await.iter().count() - spawns_before;
+            let holder = managed.lifecycle.lock().await;
+            let start = || {
+                let (state, managed) = (state.clone(), managed.clone());
+                Box::pin(async move {
+                    start_managed_runner(&state, &managed, None, StartAs::Registered).await
+                })
+            };
+            let (mut first, mut second) = (start(), start());
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            drop(holder);
+            let (first, second) = (tokio::spawn(first), tokio::spawn(second));
+            let (first, second) = (
+                first.await.expect("the first start"),
+                second.await.expect("the second start"),
+            );
+            let spawned = managed.recent_spawns.read().await.iter().count();
 
-                let busy = outcomes
-                    .iter()
-                    .any(|outcome| outcome.as_ref().is_err_and(is_text_file_busy));
-                if busy && std::time::Instant::now() < deadline {
-                    stop_the_stub(&state, &managed).await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                let [first, second] = outcomes;
-                assert!(first.is_ok(), "{first:?}");
-                assert!(
-                    matches!(second, Err(SupervisorError::RunnerAlreadyRunning)),
-                    "{second:?}"
-                );
-                assert_eq!(spawned, 1, "a second process of a live runner");
-                return;
-            }
+            assert!(first.is_ok(), "{first:?}");
+            assert!(
+                matches!(second, Err(SupervisorError::RunnerAlreadyRunning)),
+                "{second:?}"
+            );
+            assert_eq!(spawned, 1, "a second process of a live runner");
         }
     };
     with_the_stub_stopped_after(&state, &managed, body).await;
 }
 
 /// A real start through a door nobody waits on, on a stub exe: its spawn's ring
-/// entry names the trial it minted, which the source scans can only infer. A
-/// start the kernel refuses with ETXTBSY mints a trial of its own, so the trial
-/// to match is the newest. The stub never answers `/health`, so the trial's
-/// result is still the health wait's to record.
+/// entry names the trial it minted, which the source scans can only infer. The
+/// stub never answers `/health`, so the trial's result is still the health
+/// wait's to record.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
@@ -5664,7 +5589,7 @@ async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
             let exited_spawned_at = chrono::Utc::now() - chrono::Duration::seconds(10);
             managed.runner.write().await.started_at = Some(exited_spawned_at);
 
-            past_text_file_busy(|| crash_watchdog_start(&state, &managed, exited_spawned_at, 1))
+            crash_watchdog_start(&state, &managed, exited_spawned_at, 1)
                 .await
                 .expect("the start");
 
@@ -5790,34 +5715,6 @@ async fn assert_the_newest_trial_read_its_own_boot(state: &SharedState, boot_was
     }
 }
 
-/// Whether a door answered a failed start whose spawn the kernel refused with
-/// ETXTBSY. A door answers a failed start with a response, not an `Err`, so
-/// `past_text_file_busy` never sees this one: read the trial the door recorded.
-///
-/// It takes what it reads of the response, not the response: a `Response` is not
-/// `Sync`, so a borrow of one held across the await would make the caller's future
-/// unsendable.
-async fn a_door_answered_text_file_busy(
-    state: &SharedState,
-    errored_text_file_busy: bool,
-    answered_server_error: bool,
-) -> bool {
-    if errored_text_file_busy {
-        return true;
-    }
-    if !answered_server_error {
-        return false;
-    }
-    let newest = state.dev_actions.read().await.recent(1);
-    newest.first().is_some_and(|trial| {
-        matches!(
-            trial.run_result(),
-            Some(crate::dev_action::ActionRunResult::Errored { reason })
-                if reason.contains("Text file busy")
-        )
-    })
-}
-
 /// Drive one held-open door with its port answered by `answer`, then check the door
 /// and its trial: `boot_was_up` says whether the boot was alive when `answer` bound.
 ///
@@ -5836,40 +5733,13 @@ async fn through_a_held_open_door<A, F, Fut>(
     door: F,
 ) where
     A: std::future::Future<Output = ()> + Send + 'static,
-    F: Fn(SharedState) -> Fut + Send + 'static,
+    F: FnOnce(SharedState) -> Fut,
     Fut: std::future::Future<Output = Result<axum::response::Response, SupervisorError>>
         + Send
         + 'static,
 {
     let answering = tokio::spawn(answer);
-    let answered = {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                let response = door(state.clone()).await;
-                let errored_text_file_busy =
-                    matches!(&response, Err(err) if is_text_file_busy(err));
-                let answered_server_error = matches!(
-                    &response,
-                    Ok(answer) if answer.status().is_server_error()
-                );
-                if a_door_answered_text_file_busy(
-                    &state,
-                    errored_text_file_busy,
-                    answered_server_error,
-                )
-                .await
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                return response;
-            }
-        })
-        .await
-    };
+    let answered = tokio::spawn(door(state.clone())).await;
     answering.abort();
     let listened = answering.await;
     let body = {
@@ -5904,7 +5774,7 @@ async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
     through_a_held_open_door(state, managed, answer, false, move |state| {
         crate::routes::runners::start_runner(
             axum::extract::State(state),
-            axum::extract::Path(id.clone()),
+            axum::extract::Path(id),
             axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
         )
     })
@@ -5948,7 +5818,7 @@ async fn a_held_open_start_whose_boot_answered_reads_ran() {
     through_a_held_open_door(state, managed, answer, true, move |state| {
         crate::routes::runners::start_runner(
             axum::extract::State(state),
-            axum::extract::Path(id.clone()),
+            axum::extract::Path(id),
             axum::extract::Query(crate::routes::runner::StartWaitQuery { wait: true }),
         )
     })
@@ -5976,25 +5846,21 @@ async fn a_restart_replaces_a_primary_booting_before_it_binds() {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
             let id = managed.config.id.clone();
-            past_text_file_busy(|| {
-                start_managed_runner(&state, &managed, None, StartAs::Registered)
-            })
-            .await
-            .expect("the stub starts");
+            start_managed_runner(&state, &managed, None, StartAs::Registered)
+                .await
+                .expect("the stub starts");
             let booting = the_health_cache_clears_a_booting_primary(&managed).await;
 
-            past_text_file_busy(|| {
-                restart_runner_by_id(
-                    &state,
-                    &id,
-                    false,
-                    RestartSource::Manual,
-                    false,
-                    BuildTree::OriginMain,
-                    CloseIntent::Kill,
-                    None,
-                )
-            })
+            restart_runner_by_id(
+                &state,
+                &id,
+                false,
+                RestartSource::Manual,
+                false,
+                BuildTree::OriginMain,
+                CloseIntent::Kill,
+                None,
+            )
             .await
             .expect("the restart replaces it");
 
@@ -6028,11 +5894,9 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
         let script = root.path().join("stub-runner.env");
         async move {
             let id = managed.config.id.clone();
-            past_text_file_busy(|| {
-                start_managed_runner(&state, &managed, None, StartAs::Registered)
-            })
-            .await
-            .expect("the stub starts");
+            start_managed_runner(&state, &managed, None, StartAs::Registered)
+                .await
+                .expect("the stub starts");
             the_health_cache_clears_a_booting_primary(&managed).await;
 
             let copy = state.config.runner_exe_copy_path(&managed.config);
@@ -6052,6 +5916,146 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
             assert!(
                 matches!(bystander.try_wait(), Ok(None)),
                 "the stop ended a process it was not asked to"
+            );
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A temp runner whose exe is `stub_primary`'s stub: a copy of bash, running
+/// `STUB_ENV_SCRIPT` from `BASH_ENV`. A temp runner because no spawn path wraps one
+/// in `systemd-run`, so on any box its start's own spawn is the exec a test reads.
+/// Its `DISPLAY` only satisfies a Linux temp start's display check; the stub opens
+/// no window. A fresh device identity, so the start projects none of the operator's
+/// into the instance root it writes under the real config dir.
+#[cfg(target_os = "linux")]
+async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+    let (state, root) = restart_test_state();
+    let stub = root.path().join("stub-runner");
+    std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
+    let script = root.path().join("stub-runner.env");
+    std::fs::write(&script, STUB_ENV_SCRIPT).expect("write the stub's script");
+    let id = format!("test-{}", uuid::Uuid::new_v4().simple());
+    let config = crate::config::RunnerConfig {
+        id: id.clone(),
+        name: crate::process::temp_runner_instance_name(&id),
+        port: crate::test_ports::unheld_port(),
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Temp { id: id.clone() },
+        protected: true,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: [
+            ("BASH_ENV".to_string(), script.display().to_string()),
+            ("DISPLAY".to_string(), ":0".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        fresh_device_identity: true,
+    };
+    let managed = Arc::new(ManagedRunner::new(config, false));
+    *managed.source_exe_override.write().await = Some(stub);
+    state.runners.write().await.insert(id, managed.clone());
+    (state, managed, root)
+}
+
+/// Phase 3's arming test (plan `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`).
+/// A start execs its copy while another process holds a write descriptor on the
+/// inode the copy path names, which is what a sibling fork that inherited an earlier
+/// in-process write's descriptor holds until that fork execs. The start's copy is a
+/// fresh inode, so its exec is not refused. With the copy written in place, onto the
+/// held inode, the start fails `Failed to spawn exe: Text file busy (os error 26)`.
+///
+/// The holder is a process of its own, `sh -c 'exec 3>>"$1"; exec sleep 60'`, not a
+/// fork of this test binary parked before its exec, which would inherit every
+/// descriptor open at that moment, other tests' listeners and pipe ends included. It
+/// holds the descriptor until the test ends it, and the test reads `/proc/<pid>/fd/3`
+/// before the start and again after it: a holder that let go before the exec makes
+/// the run prove nothing, so that run fails. The start can spend seconds between its
+/// copy and its exec (a temp start asks the primary for a window placement, for up
+/// to 3 s), so the 60 s sleep only bounds a holder that a killed test binary leaks.
+///
+/// A temp start writes two things outside the test's tempdir: its instance root under
+/// the real config dir, which the stop's teardown removes, and a row in the temp-runner
+/// ledger, which no stop removes. Both are removed again on every exit path, and so is
+/// a ledger file the start created. The row is keyed by this test's port, which lies
+/// below the range the reconcile sweep reads.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked() {
+    use crate::process::temp_runner_ledger;
+    let (state, managed, _root) = stub_temp_runner().await;
+    let _leaves_nothing_outside_the_tempdir = {
+        let (id, port) = (managed.config.id.clone(), managed.config.port);
+        let created_ledger = temp_runner_ledger::ledger_path().filter(|path| !path.exists());
+        scopeguard::guard((), move |()| {
+            temp_runner_ledger::forget_port(port);
+            if let Some(path) = created_ledger {
+                if temp_runner_ledger::load().is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::remove_dir(dir);
+                    }
+                }
+            }
+            if let Some(dir) = instance_config_dir(&id) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        })
+    };
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            let copy = state.config.runner_exe_copy_path(&managed.config);
+            std::fs::create_dir_all(copy.parent().expect("the copy's dir"))
+                .expect("create the copy's dir");
+            let mut holder = tokio::process::Command::new("sh")
+                .args(["-c", r#"exec 3>>"$1"; exec sleep 60"#, "sh"])
+                .arg(&copy)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn the holder");
+            let held = std::path::PathBuf::from(format!(
+                "/proc/{}/fd/3",
+                holder.id().expect("the holder's pid")
+            ));
+            let deadline = std::time::Instant::now() + MONITOR_BUDGET;
+            while !held.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the holder never opened the copy path"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let started = start_managed_runner(&state, &managed, None, StartAs::Registered).await;
+            let held_across_the_exec = held.exists();
+            let _ = holder.start_kill();
+            let _ = holder.wait().await;
+
+            started.expect("the start execs its copy");
+            assert!(
+                held_across_the_exec,
+                "the holder let go of the copy path before the start returned, so this run \
+                 proves nothing"
+            );
+            let pid = managed.runner.read().await.pid.expect("the spawn's pid");
+            assert!(
+                crate::process::proc_kill::pid_alive(pid),
+                "the spawn is not alive"
+            );
+            assert_eq!(
+                crate::process::proc_kill::pid_exe_path(pid)
+                    .await
+                    .as_deref(),
+                Some(copy.as_path()),
+                "the spawn runs something other than its copy"
             );
         }
     };
