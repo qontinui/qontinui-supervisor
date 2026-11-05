@@ -2380,7 +2380,7 @@ mod tests {
         for (use_lkg, lkg_on_disk) in cases {
             let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
             let tmp = TempDir::new().expect("tempdir");
-            let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+            let mut config = test_config(tmp.path(), crate::test_ports::unheld_port());
             config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
             if lkg_on_disk {
                 let lkg = config.lkg_exe_path();
