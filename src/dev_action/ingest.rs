@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::dev_action::record::{ActionOutcome, ActionRecord};
+use crate::dev_action::record::{ActionKind, ActionOutcome, ActionRecord};
 
 /// Timeout for the outbound coord ingest POST, matching
 /// `fleet.rs::publish_budget`'s 5s budget.
@@ -90,8 +90,18 @@ pub const ATTRIBUTION_EPOCH: u32 = 6;
 /// (from [`crate::self_provenance`], the same values `/health` serves; each is
 /// JSON `null` when the build could not establish it, which is UNKNOWN, never
 /// a sha or "clean"), and its [`ATTRIBUTION_EPOCH`].
-fn snapshot_metadata() -> serde_json::Map<String, serde_json::Value> {
+///
+/// A restart that fetched coord's expectations also carries
+/// `route_lkg_shadow` (S3): the record's
+/// [`crate::dev_action::policy::RouteLkgShadow`] plus `use_lkg`, which exe the
+/// restart ran (the LKG one exactly when the door re-keyed it to
+/// `restart_lkg`). Coord copies the block into its forecast ledger at first
+/// ingest; snapshot metadata itself is pruned at 30 days.
+fn snapshot_metadata(record: &ActionRecord) -> serde_json::Map<String, serde_json::Value> {
     let mut metadata = serde_json::Map::new();
+    if let Some(shadow) = route_lkg_shadow_block(record) {
+        metadata.insert(ROUTE_LKG_SHADOW_KEY.to_string(), shadow);
+    }
     metadata.insert(
         "supervisor_build_sha".to_string(),
         serde_json::Value::from(crate::self_provenance::built_from_sha()),
@@ -105,6 +115,32 @@ fn snapshot_metadata() -> serde_json::Map<String, serde_json::Value> {
         serde_json::Value::from(ATTRIBUTION_EPOCH),
     );
     metadata
+}
+
+/// The metadata key of the S3 shadow stamp.
+const ROUTE_LKG_SHADOW_KEY: &str = "route_lkg_shadow";
+
+/// The metadata key a snapshot coord refused as `restart_lkg` carries when it
+/// is re-sent as `restart` ([`post_snapshot_to_coord`]): the kind it was
+/// refused as, so the row is still told apart from an untreated restart.
+const REFUSED_KIND_KEY: &str = "refused_kind";
+
+/// `metadata.route_lkg_shadow`: the record's shadow with `use_lkg` added, the
+/// stamp's twelve fields. `None` for a record with no shadow.
+fn route_lkg_shadow_block(record: &ActionRecord) -> Option<serde_json::Value> {
+    let shadow = record.route_lkg_shadow.as_ref()?;
+    let mut block = match serde_json::to_value(shadow) {
+        Ok(serde_json::Value::Object(block)) => block,
+        // A struct of numbers, strings and options always serializes to an
+        // object; if it ever did not, the row goes without the stamp rather
+        // than without the trial.
+        _ => return None,
+    };
+    block.insert(
+        "use_lkg".to_string(),
+        serde_json::Value::Bool(record.kind() == ActionKind::RestartLkg),
+    );
+    Some(serde_json::Value::Object(block))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +197,7 @@ pub fn resolve_tenant_id() -> Option<Uuid> {
 #[derive(Debug, Serialize)]
 pub struct SnapshotIngestBody {
     action_id: Uuid,
-    /// `"restart" | "spawn" | "build"` (from `ActionKind::as_str`).
+    /// `"restart" | "restart_lkg" | "spawn" | "build"` (from `ActionKind::as_str`).
     kind: &'static str,
     device_id: Option<Uuid>,
     requester_id: Option<String>,
@@ -222,7 +258,7 @@ impl SnapshotIngestBody {
     ) -> Self {
         SnapshotIngestBody {
             action_id: record.action_id,
-            kind: record.kind.as_str(),
+            kind: record.kind().as_str(),
             device_id,
             requester_id: record.requester_id.as_deref().map(without_nul),
             params_digest: without_nul(&record.params_digest),
@@ -244,7 +280,7 @@ impl SnapshotIngestBody {
             signatures: outcome.signatures.clone(),
             late_signatures: outcome.late_signatures.clone(),
             tenant_id,
-            metadata: snapshot_metadata(),
+            metadata: snapshot_metadata(record),
         }
     }
 }
@@ -253,10 +289,46 @@ impl SnapshotIngestBody {
 // POST
 // ---------------------------------------------------------------------------
 
+impl SnapshotIngestBody {
+    /// This body re-keyed from `restart_lkg` to `restart`, for a coord that
+    /// refused the kind: `metadata.refused_kind` names it, and the shadow's
+    /// `use_lkg: true` still marks the treatment.
+    fn rekeyed_to_restart_for_a_coord_without_restart_lkg(mut self) -> Self {
+        self.kind = ActionKind::Restart.as_str();
+        self.metadata.insert(
+            REFUSED_KIND_KEY.to_string(),
+            serde_json::Value::from(ActionKind::RestartLkg.as_str()),
+        );
+        self
+    }
+}
+
+/// Whether coord's answer to a snapshot of `kind` is the refusal of a coord
+/// that does not accept `restart_lkg` yet: a 400 whose error is coord's
+/// unknown-kind refusal (`dev_actions::snapshot_refusal`, "an unknown kind;
+/// a snapshot's kind is one of ..."), for a `restart_lkg` snapshot. Any other
+/// 400 is a refusal a re-key would not cure.
+fn refused_for_restart_lkg(kind: &str, status: reqwest::StatusCode, detail: &str) -> bool {
+    kind == ActionKind::RestartLkg.as_str()
+        && status == reqwest::StatusCode::BAD_REQUEST
+        && detail.contains("unknown kind")
+}
+
 /// Best-effort POST of a completed snapshot to the coord at `base`. Fail-open:
 /// any failure (network error, non-2xx) logs a single `warn!` and returns. NEVER
 /// panics, NEVER propagates — safe to `await` or `tokio::spawn` from the
 /// attribution watcher without risk to the watcher.
+///
+/// A `restart_lkg` snapshot a coord refuses for its kind (one that predates the
+/// kind: the snapshot table's CHECK and coord's `SNAPSHOT_KINDS` gained it in
+/// the web migration and coord change of the same plan, and the refusal is
+/// otherwise a lost trial) is sent once more as `restart`, carrying
+/// `metadata.refused_kind = "restart_lkg"` and the shadow's `use_lkg: true`.
+/// So no deploy order and no flag decides whether the trial survives: the
+/// supervisor sends `restart_lkg` from the first build, coord keeps it under
+/// that kind from the moment it accepts it, and before then keeps it, marked,
+/// under `restart`. The cost is one refused POST per LKG-routed restart while
+/// coord lags, at about one LKG restart a month.
 pub async fn post_snapshot_to_coord(
     base: &str,
     record: &ActionRecord,
@@ -265,6 +337,10 @@ pub async fn post_snapshot_to_coord(
     tenant_id: Option<Uuid>,
 ) {
     let body = SnapshotIngestBody::from_record(record, outcome, device_id, tenant_id);
+    post_snapshot_body(base, record.action_id, body).await;
+}
+
+async fn post_snapshot_body(base: &str, action_id: Uuid, body: SnapshotIngestBody) {
     let url = format!("{base}/coord/dev-actions/snapshot");
 
     let client = match reqwest::Client::builder()
@@ -278,29 +354,43 @@ pub async fn post_snapshot_to_coord(
         }
     };
 
-    match client.post(&url).json(&body).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                debug!(
-                    "dev_action::ingest: persisted snapshot {} ({}) to coord",
-                    record.action_id,
-                    record.kind.as_str()
-                );
-            } else {
+    let mut body = body;
+    // At most two sends: the second only for a `restart_lkg` refused for its
+    // kind, re-keyed to `restart`, which cannot be refused that way again.
+    for _ in 0..2 {
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    debug!(
+                        "dev_action::ingest: persisted snapshot {action_id} ({}) to coord",
+                        body.kind
+                    );
+                    return;
+                }
                 let detail = resp.text().await.unwrap_or_default();
+                if refused_for_restart_lkg(body.kind, status, &detail) {
+                    warn!(
+                        "dev_action::ingest: coord refused kind restart_lkg for snapshot \
+                         {action_id} ({detail}); re-sending it as restart with \
+                         metadata.refused_kind=restart_lkg"
+                    );
+                    body = body.rekeyed_to_restart_for_a_coord_without_restart_lkg();
+                    continue;
+                }
                 warn!(
                     "dev_action::ingest: coord returned {status} for POST {url} \
-                     (snapshot {}): {detail}",
-                    record.action_id
+                     (snapshot {action_id}): {detail}"
                 );
+                return;
             }
-        }
-        Err(e) => {
-            warn!(
-                "dev_action::ingest: POST {url} failed for snapshot {} (non-fatal): {e}",
-                record.action_id
-            );
+            Err(e) => {
+                warn!(
+                    "dev_action::ingest: POST {url} failed for snapshot {action_id} \
+                     (non-fatal): {e}"
+                );
+                return;
+            }
         }
     }
 }
@@ -467,5 +557,312 @@ mod tests {
             json["evidence_ref"],
             "panic: open C:\\runner\u{FFFD}\u{FFFD}\u{FFFD} failed"
         );
+    }
+
+    // -- S3: the route_lkg shadow stamp and the restart_lkg kind -------------
+
+    use crate::dev_action::expectations::PredictedSignature;
+    use crate::dev_action::policy::{assess_route_lkg_shadow, RouteLkgShadow};
+
+    fn confirmed() -> ActionOutcome {
+        ActionOutcome {
+            category: D3Category::Confirmed,
+            signatures: vec![],
+            ended_at: Utc::now(),
+            duration_ms: 30_000,
+            evidence_ref: None,
+            late_signatures: vec![],
+        }
+    }
+
+    /// A restart whose expectations held the 4-of-4 incident cell.
+    fn restart_with_shadow() -> ActionRecord {
+        let mut record = ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &[]);
+        let row = PredictedSignature {
+            signature: "DEV-TAURI-ASSET-MISSING".to_string(),
+            posterior_mean: 0.2,
+            occurrences: 1,
+            trials: 10,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: Some(4),
+            exact_occurrences: Some(4),
+        };
+        record.route_lkg_shadow = Some(assess_route_lkg_shadow(&[row], 0.5));
+        record
+    }
+
+    /// The stamp carries the shadow's eleven fields plus `use_lkg`, which
+    /// reads the kind at the stamp: `false` for a restart that ran the fresh
+    /// exe, `true` once the door re-keyed it to `restart_lkg`, whose snapshot
+    /// then goes out under that kind. A record with no shadow (another kind,
+    /// or coord gave no answer) carries no stamp at all.
+    #[test]
+    fn a_restart_stamps_its_route_lkg_shadow_and_which_exe_ran() {
+        let record = restart_with_shadow();
+        let json = serde_json::to_value(SnapshotIngestBody::from_record(
+            &record,
+            &confirmed(),
+            None,
+            None,
+        ))
+        .expect("serialize");
+        let block = &json["metadata"]["route_lkg_shadow"];
+        let mut keys: Vec<&str> = block
+            .as_object()
+            .expect("the stamp is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "exact_trials",
+                "expected_loss_fresh",
+                "expected_loss_lkg",
+                "live_route",
+                "p_exact",
+                "p_served",
+                "ratio",
+                "rule_version",
+                "shadow_route",
+                "top_signature",
+                "trials",
+                "use_lkg",
+            ]
+        );
+        assert_eq!(block["use_lkg"], false);
+        assert_eq!(block["shadow_route"], "lkg");
+        assert_eq!(block["live_route"], "lkg");
+        assert_eq!(block["top_signature"], "DEV-TAURI-ASSET-MISSING");
+        assert_eq!(block["expected_loss_fresh"], 4.4 / 8.0);
+        assert_eq!(block["expected_loss_lkg"], 0.5);
+        assert_eq!(json["kind"], "restart");
+
+        assert!(record.rekey_restart_to_lkg());
+        let json = serde_json::to_value(SnapshotIngestBody::from_record(
+            &record,
+            &confirmed(),
+            None,
+            None,
+        ))
+        .expect("serialize");
+        assert_eq!(json["kind"], "restart_lkg");
+        assert_eq!(json["metadata"]["route_lkg_shadow"]["use_lkg"], true);
+
+        let plain = ActionRecord::new(ActionKind::Spawn, None, "p".into(), &[]);
+        let json = serde_json::to_value(SnapshotIngestBody::from_record(
+            &plain,
+            &confirmed(),
+            None,
+            None,
+        ))
+        .expect("serialize");
+        assert!(json["metadata"].get("route_lkg_shadow").is_none(), "{json}");
+    }
+
+    /// The length of `value` as Postgres prints a jsonb back, which is what
+    /// coord bounds (`dev_actions::rendered_jsonb_len`, at coord `0a8d8e847`):
+    /// `", "` between members, `": "` after each key, and a number printed in
+    /// full, which for a float is Rust's own `Display` (shortest round-trip
+    /// digits, no exponent), the expansion Postgres's `numeric_out` prints for
+    /// the exponent form serde_json sends.
+    fn pg_rendered_len(value: &serde_json::Value) -> usize {
+        use serde_json::Value;
+        let frame = |n: usize| 2 + 2 * n.saturating_sub(1);
+        let escaped = |s: &str| serde_json::to_string(s).expect("a string").len();
+        match value {
+            Value::Null | Value::Bool(true) => 4,
+            Value::Bool(false) => 5,
+            Value::Number(n) => match n.as_f64() {
+                Some(f) if n.is_f64() => format!("{f}").len(),
+                _ => n.to_string().len(),
+            },
+            Value::String(s) => escaped(s),
+            Value::Array(items) => {
+                frame(items.len()) + items.iter().map(pg_rendered_len).sum::<usize>()
+            }
+            Value::Object(map) => {
+                frame(map.len())
+                    + map
+                        .iter()
+                        .map(|(k, v)| escaped(k) + 2 + pg_rendered_len(v))
+                        .sum::<usize>()
+            }
+        }
+    }
+
+    /// Coord refuses a snapshot whose metadata, as Postgres prints it back,
+    /// passes 4096 bytes (`MAX_SNAPSHOT_METADATA_BYTES`), and a refused
+    /// snapshot is a lost trial. The worst stamp this build can send, with
+    /// every field at its longest (a 40-hex sha, a re-sent `restart_lkg`'s
+    /// `refused_kind`, the longest boot signature, floats with the most digits
+    /// and the smallest magnitudes, `u64::MAX` counts) beside the five-row
+    /// `predicted[]` Phase 5 adds (128-byte signatures, coord's
+    /// `MAX_SIGNATURE_BYTES`; the smallest posterior a `u64::MAX`-trial cell
+    /// serves; `u64::MAX` counts), fits. Fails if a field is added or
+    /// lengthened past the budget.
+    #[test]
+    fn the_worst_case_stamp_and_a_five_row_predicted_fit_coords_metadata_cap() {
+        const MAX_SNAPSHOT_METADATA_BYTES: usize = 4096;
+        let record = restart_with_shadow();
+        let mut body = SnapshotIngestBody::from_record(&record, &confirmed(), None, None)
+            .rekeyed_to_restart_for_a_coord_without_restart_lkg();
+        let longest_boot = crate::dev_action::policy::BOOT_FAILURE_SIGNATURES
+            .iter()
+            .max_by_key(|s| s.len())
+            .expect("a boot signature");
+        // Floats Rust prints longest: 17 significant digits behind a long run
+        // of leading zeros.
+        let tiny = 0.4 / (u64::MAX as f64 + 4.0) * (1.0 + f64::EPSILON);
+        let worst = RouteLkgShadow {
+            rule_version: u32::MAX,
+            ratio: 0.1 + 0.2,
+            shadow_route: crate::dev_action::policy::Route::Fresh,
+            live_route: crate::dev_action::policy::Route::Fresh,
+            top_signature: Some(longest_boot.to_string()),
+            p_served: Some(tiny),
+            trials: Some(u64::MAX),
+            p_exact: Some(tiny),
+            exact_trials: Some(u64::MAX),
+            expected_loss_fresh: Some(tiny),
+            expected_loss_lkg: 0.1 + 0.2,
+        };
+        let mut worst_record =
+            ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &[]);
+        worst_record.route_lkg_shadow = Some(worst);
+        assert!(worst_record.rekey_restart_to_lkg());
+        body.metadata.insert(
+            ROUTE_LKG_SHADOW_KEY.to_string(),
+            route_lkg_shadow_block(&worst_record).expect("a stamp"),
+        );
+        body.metadata.insert(
+            "supervisor_build_sha".to_string(),
+            serde_json::Value::from("f".repeat(40)),
+        );
+        body.metadata.insert(
+            "supervisor_build_dirty".to_string(),
+            serde_json::Value::from(false),
+        );
+        body.metadata.insert(
+            "attribution_epoch".to_string(),
+            serde_json::Value::from(u32::MAX),
+        );
+        let predicted_row = |i: usize| PredictedSignature {
+            signature: format!("DEV-{i}-{}", "X".repeat(128 - 6)),
+            posterior_mean: tiny,
+            occurrences: u64::MAX,
+            trials: u64::MAX,
+            evidence_basis: "prior_only".to_string(),
+            exact_trials: Some(u64::MAX),
+            exact_occurrences: Some(u64::MAX),
+        };
+        let predicted: Vec<PredictedSignature> = (0..5).map(predicted_row).collect();
+        assert!(predicted.iter().all(|p| p.signature.len() == 128));
+        body.metadata.insert(
+            "predicted".to_string(),
+            serde_json::to_value(&predicted).expect("serialize"),
+        );
+
+        let metadata = serde_json::Value::Object(body.metadata.clone());
+        let rendered = pg_rendered_len(&metadata);
+        assert!(
+            rendered <= MAX_SNAPSHOT_METADATA_BYTES,
+            "the worst-case metadata renders {rendered} bytes, over coord's \
+             {MAX_SNAPSHOT_METADATA_BYTES}: {metadata}"
+        );
+        // The measure is not vacuous: the floats print expanded.
+        assert!(format!("{tiny}").len() > 30, "{tiny}");
+    }
+
+    /// Only coord's unknown-kind 400 on a `restart_lkg` snapshot is cured by
+    /// re-sending it as `restart`.
+    #[test]
+    fn only_an_unknown_kind_refusal_of_restart_lkg_is_resent() {
+        use reqwest::StatusCode;
+        let unknown = "an unknown kind; a snapshot's kind is one of restart, spawn, build";
+        assert!(refused_for_restart_lkg(
+            "restart_lkg",
+            StatusCode::BAD_REQUEST,
+            unknown
+        ));
+        assert!(!refused_for_restart_lkg(
+            "restart",
+            StatusCode::BAD_REQUEST,
+            unknown
+        ));
+        assert!(!refused_for_restart_lkg(
+            "restart_lkg",
+            StatusCode::BAD_REQUEST,
+            "metadata of 5000 bytes"
+        ));
+        assert!(!refused_for_restart_lkg(
+            "restart_lkg",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            unknown
+        ));
+    }
+
+    /// A coord that does not accept `restart_lkg` yet still keeps the trial:
+    /// the refused snapshot is re-sent once as `restart`, marked
+    /// `refused_kind`, with `use_lkg: true` in its stamp. A coord that accepts
+    /// the kind gets one POST under it. Drives the real POST against a planted
+    /// coord, which refuses `restart_lkg` exactly as coord's `snapshot_refusal`
+    /// does when `toggle` reads false.
+    #[tokio::test]
+    async fn a_coord_without_restart_lkg_keeps_the_trial_as_a_marked_restart() {
+        use axum::extract::Json as AxumJson;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let accepts_lkg = Arc::new(AtomicBool::new(false));
+        let (recorder, toggle) = (seen.clone(), accepts_lkg.clone());
+        let app = axum::Router::new().route(
+            "/coord/dev-actions/snapshot",
+            post(move |AxumJson(body): AxumJson<serde_json::Value>| {
+                let (recorder, toggle) = (recorder.clone(), toggle.clone());
+                async move {
+                    let kind = body["kind"].as_str().unwrap_or_default().to_string();
+                    recorder.lock().expect("seen").push(body);
+                    if kind == "restart_lkg" && !toggle.load(Ordering::SeqCst) {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            AxumJson(serde_json::json!({
+                                "error": "an unknown kind; a snapshot's kind is one of \
+                                          restart, spawn, build, deploy, migrate"
+                            })),
+                        )
+                    } else {
+                        (StatusCode::OK, AxumJson(serde_json::json!({"ok": true})))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let record = restart_with_shadow();
+        assert!(record.rekey_restart_to_lkg());
+        post_snapshot_to_coord(&base, &record, &confirmed(), None, None).await;
+        let sent = std::mem::take(&mut *seen.lock().expect("seen"));
+        assert_eq!(sent.len(), 2, "refused once, then re-sent: {sent:?}");
+        assert_eq!(sent[0]["kind"], "restart_lkg");
+        assert!(sent[0]["metadata"].get("refused_kind").is_none());
+        assert_eq!(sent[1]["kind"], "restart");
+        assert_eq!(sent[1]["metadata"]["refused_kind"], "restart_lkg");
+        assert_eq!(sent[1]["metadata"]["route_lkg_shadow"]["use_lkg"], true);
+        assert_eq!(sent[1]["action_id"], sent[0]["action_id"]);
+
+        accepts_lkg.store(true, Ordering::SeqCst);
+        post_snapshot_to_coord(&base, &record, &confirmed(), None, None).await;
+        let sent = std::mem::take(&mut *seen.lock().expect("seen"));
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["kind"], "restart_lkg");
     }
 }

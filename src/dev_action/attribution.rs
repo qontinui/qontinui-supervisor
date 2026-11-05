@@ -134,11 +134,13 @@ pub struct WindowTiming {
 impl WindowTiming {
     /// The production timing of a `kind` window: [`RESULT_TAIL_WINDOW`], and
     /// [`LONG_BACKSTOP_WINDOW`] for a spawn or a build or
-    /// [`RESTART_BACKSTOP_WINDOW`] for a restart.
+    /// [`RESTART_BACKSTOP_WINDOW`] for a restart, an LKG-routed one included
+    /// (the same door and the same act, only the exe differs; the watcher is
+    /// spawned before the re-key, so the two must agree).
     pub fn for_kind(kind: ActionKind) -> Self {
         let backstop = match kind {
             ActionKind::Spawn | ActionKind::Build => LONG_BACKSTOP_WINDOW,
-            ActionKind::Restart => RESTART_BACKSTOP_WINDOW,
+            ActionKind::Restart | ActionKind::RestartLkg => RESTART_BACKSTOP_WINDOW,
         };
         Self {
             tail: RESULT_TAIL_WINDOW,
@@ -923,7 +925,7 @@ pub fn spawn_attribution_watcher(
     targets: AttributionTargets,
     backstop_override: Option<Duration>,
 ) {
-    let timing = WindowTiming::for_kind(record.kind).with_backstop_override(backstop_override);
+    let timing = WindowTiming::for_kind(record.kind()).with_backstop_override(backstop_override);
     spawn_attribution_watcher_with_timing(state, record, targets, timing);
 }
 
@@ -938,9 +940,10 @@ pub fn spawn_attribution_watcher_with_timing(
     timing: WindowTiming,
 ) {
     tokio::spawn(async move {
-        let kind = record.kind;
-
         let run_result = await_attribution_window(&record, timing).await;
+        // Read after the window: a restart that ran the LKG exe is re-keyed to
+        // `restart_lkg` after the watcher was spawned.
+        let kind = record.kind();
         let window = ClosedWindow {
             open_at: record.started_at,
             close_at: Utc::now(),
@@ -2810,9 +2813,15 @@ mod tests {
     /// differs, and an override replaces it.
     #[test]
     fn window_timing_is_per_kind_and_the_override_replaces_the_backstop() {
-        for kind in [ActionKind::Spawn, ActionKind::Build, ActionKind::Restart] {
+        for kind in ActionKind::ALL {
             assert_eq!(WindowTiming::for_kind(kind).tail, Duration::from_secs(30));
         }
+        // A restart is minted `restart` and its watcher spawned before the door
+        // re-keys it, so an LKG-routed restart must hold the same window.
+        assert_eq!(
+            WindowTiming::for_kind(ActionKind::RestartLkg).backstop,
+            WindowTiming::for_kind(ActionKind::Restart).backstop
+        );
         assert_eq!(
             WindowTiming::for_kind(ActionKind::Spawn).backstop,
             Duration::from_secs(2 * 60 * 60)

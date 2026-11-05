@@ -58,6 +58,8 @@
 //! earlier reader. Against a coord that sends no exact-cell counts (a reader
 //! that predates them) only the served arm exists, and its rule is unchanged.
 
+use serde::Serialize;
+
 use crate::dev_action::expectations::PredictedSignature;
 
 /// Posterior-mean threshold at or above which a boot-failure-class signature is
@@ -300,6 +302,215 @@ pub fn assess_action_risk(predicted: &[PredictedSignature], states_active: &[&st
         route_lkg: true,
         warn: Some(warn),
         top_signature: Some(top.clone()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3: `route_lkg` by expected loss, in shadow
+// ---------------------------------------------------------------------------
+
+/// The version of the shadow rule [`assess_route_lkg_shadow`] stamps as
+/// `metadata.route_lkg_shadow.rule_version`. Bump it whenever the rule, its
+/// loss model or the meaning of a stamped field changes, so a scorer can tell
+/// rows recorded under the two apart.
+pub const ROUTE_LKG_SHADOW_RULE_VERSION: u32 = 1;
+
+/// The environment variable that declares the shadow rule's cost ratio
+/// `c_LKG / c_fail` ([`route_lkg_ratio`]).
+pub const ROUTE_LKG_RATIO_ENV: &str = "SUPERVISOR_ROUTE_LKG_RATIO";
+
+/// The default cost ratio: the live threshold [`RISK_POSTERIOR_THRESHOLD`],
+/// kept for continuity alone, since neither cost is measured (the research
+/// record's theory §6.1).
+pub const DEFAULT_ROUTE_LKG_RATIO: f64 = RISK_POSTERIOR_THRESHOLD;
+
+/// Parse a declared cost ratio: a finite number in `(0, 1]`. `None` (the
+/// variable unset) is the default with no complaint; anything else that is
+/// not such a number is the default plus the warning to log. A ratio of 0 or
+/// below would route every restart with any eligible evidence and one above 1
+/// none, so neither is a cost ratio this rule can mean.
+pub fn parse_route_lkg_ratio(raw: Option<&str>) -> (f64, Option<String>) {
+    let Some(raw) = raw else {
+        return (DEFAULT_ROUTE_LKG_RATIO, None);
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(ratio) if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 => (ratio, None),
+        _ => (
+            DEFAULT_ROUTE_LKG_RATIO,
+            Some(format!(
+                "{ROUTE_LKG_RATIO_ENV}={raw:?} is not a cost ratio in (0, 1]; \
+                 the route_lkg shadow uses the default {DEFAULT_ROUTE_LKG_RATIO}"
+            )),
+        ),
+    }
+}
+
+/// The declared cost ratio from [`ROUTE_LKG_RATIO_ENV`], read at each mint so
+/// it needs no restart to take effect. An invalid value falls back to
+/// [`DEFAULT_ROUTE_LKG_RATIO`] with a warning ([`parse_route_lkg_ratio`]).
+pub fn route_lkg_ratio() -> f64 {
+    let raw = std::env::var(ROUTE_LKG_RATIO_ENV).ok();
+    let (ratio, warning) = parse_route_lkg_ratio(raw.as_deref());
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    ratio
+}
+
+/// The posterior the shadow rule decides one prediction on: the failure
+/// probability `p` its expected loss is computed from. `None` when the row is
+/// not boot-failure class or no arm has eligible evidence, so the rule takes
+/// the fresh exe at every ratio.
+///
+/// It is [`high_risk_arm`]'s two arms and veto, folded into one number:
+///
+/// - from [`N_MIN_EXACT`] exact trials the exact cell's own posterior alone
+///   ([`exact_cell_posterior`]): below the ratio the veto silences the served
+///   arm, so the exact arm decides, and at or above it the exact arm trips;
+/// - below that, the larger of the exact cell's own posterior (when coord sent
+///   the exact-cell counts) and coord's served mean (over at least
+///   [`RISK_MIN_TRIALS`] trials), since either arm reaching the ratio routes.
+///
+/// None of it reads the ratio, so a row stamped with this `p` can be
+/// re-scored at any other ratio.
+fn decision_posterior(pred: &PredictedSignature) -> Option<f64> {
+    if !is_boot_failure_signature(&pred.signature) {
+        return None;
+    }
+    let exact = exact_cell_posterior(pred);
+    if pred.exact_trials.is_some_and(|n| n >= N_MIN_EXACT) {
+        return exact;
+    }
+    let served = (pred.trials >= RISK_MIN_TRIALS).then_some(pred.posterior_mean);
+    match (exact, served) {
+        (Some(exact), Some(served)) => Some(exact.max(served)),
+        (exact, served) => exact.or(served),
+    }
+}
+
+/// Whether the shadow rule routes one prediction to the LKG exe at `ratio`.
+///
+/// This is [`high_risk_arm`] with `ratio` in place of
+/// [`RISK_POSTERIOR_THRESHOLD`], veto included (it vetoes the served arm when
+/// the exact cell's own posterior is below `ratio`), written as the
+/// expected-loss comparison of [`RouteLkgShadow`]: route when
+/// `p · c_fail >= c_LKG`, i.e. `p >= ratio`, with `p` the
+/// [`decision_posterior`]. At `ratio` 0.5 it equals the live arm on every
+/// prediction (`route_lkg_shadow_equals_the_live_arm_at_ratio_one_half`).
+pub fn route_lkg_shadow(pred: &PredictedSignature, ratio: f64) -> bool {
+    decision_posterior(pred).is_some_and(|p| p >= ratio)
+}
+
+/// Which exe a rule sends a restart to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Route {
+    /// The freshest slot exe.
+    Fresh,
+    /// The last-known-good exe.
+    Lkg,
+}
+
+impl Route {
+    fn from_lkg(lkg: bool) -> Self {
+        if lkg {
+            Route::Lkg
+        } else {
+            Route::Fresh
+        }
+    }
+}
+
+/// The `route_lkg` shadow over one restart's expectations: what the
+/// expected-loss rule would decide at the declared ratio beside what the live
+/// rule decided, with the evidence that lets the row be re-scored at another
+/// ratio. Stamped into the snapshot as `metadata.route_lkg_shadow`, with
+/// `use_lkg` (which exe the restart actually ran) added at the stamp
+/// (`dev_action::ingest`).
+///
+/// # The loss model (the research record's theory §6.1)
+///
+/// Losses are in units of `c_fail`, the cost of a restart that white-screens,
+/// and `ratio = c_LKG / c_fail`, the declared cost of running the
+/// last-known-good exe instead (older code, a pinned restart), which is paid
+/// whether or not the fresh exe would have failed:
+///
+/// - `expected_loss_fresh = p`: the fresh exe fails with probability `p`, the
+///   [`decision_posterior`] of the strongest boot-failure row;
+/// - `expected_loss_lkg = ratio`.
+///
+/// The rule takes the LKG exe iff `expected_loss_fresh >= expected_loss_lkg`
+/// (`>=`, as the live arm's `>=`). The LKG exe's own failure rate is taken as
+/// negligible, as the record's rule does; nothing measures it until
+/// `restart_lkg` rows accrue. `expected_loss_fresh` is `null` when no row has
+/// eligible evidence, and the rule then takes the fresh exe at every ratio.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouteLkgShadow {
+    /// [`ROUTE_LKG_SHADOW_RULE_VERSION`].
+    pub rule_version: u32,
+    /// The declared `c_LKG / c_fail` ([`route_lkg_ratio`]).
+    pub ratio: f64,
+    /// What the expected-loss rule decides at `ratio`.
+    pub shadow_route: Route,
+    /// What the live rule ([`assess_action_risk`]) advised over the same rows.
+    /// Not which exe ran: an operator's `use_lkg` overrides the advice, and an
+    /// absent LKG exe defeats it.
+    pub live_route: Route,
+    /// The boot-failure row the shadow decided on: the largest
+    /// [`decision_posterior`], ties broken as the live rule breaks them
+    /// (served posterior, trials, occurrences, then the smaller signature).
+    /// `None` when coord served no boot-failure row.
+    pub top_signature: Option<String>,
+    /// That row's served posterior (coord's `posterior_mean`).
+    pub p_served: Option<f64>,
+    /// That row's served trials.
+    pub trials: Option<u64>,
+    /// That row's exact cell's own posterior ([`exact_cell_posterior`]),
+    /// `None` when coord sent no exact-cell counts or the cell is empty.
+    pub p_exact: Option<f64>,
+    /// That row's exact-cell trials, as coord sent them.
+    pub exact_trials: Option<u64>,
+    /// `p` in units of `c_fail` (see the loss model above).
+    pub expected_loss_fresh: Option<f64>,
+    /// `ratio` in units of `c_fail`.
+    pub expected_loss_lkg: f64,
+}
+
+/// The `route_lkg` shadow over every expectation coord served for a restart
+/// (the same uncut rows the live assessment reads), at `ratio`. Pure.
+pub fn assess_route_lkg_shadow(predicted: &[PredictedSignature], ratio: f64) -> RouteLkgShadow {
+    let live = predicted.iter().any(|p| high_risk_arm(p).is_some());
+    let top = predicted
+        .iter()
+        .filter(|p| is_boot_failure_signature(&p.signature))
+        .map(|p| (p, decision_posterior(p)))
+        .max_by(|(a, pa), (b, pb)| {
+            let by_p = match (pa, pb) {
+                (Some(x), Some(y)) => x.total_cmp(y),
+                (x, y) => x.is_some().cmp(&y.is_some()),
+            };
+            by_p.then_with(|| a.posterior_mean.total_cmp(&b.posterior_mean))
+                .then_with(|| a.trials.cmp(&b.trials))
+                .then_with(|| a.occurrences.cmp(&b.occurrences))
+                .then_with(|| b.signature.cmp(&a.signature))
+        });
+    let p = top.and_then(|(_, p)| p);
+    let top = top.map(|(row, _)| row);
+    RouteLkgShadow {
+        rule_version: ROUTE_LKG_SHADOW_RULE_VERSION,
+        ratio,
+        // Any row routing routes the restart. The top row carries the largest
+        // decision posterior, so this is `expected_loss_fresh >= ratio`
+        // (pinned by `assess_route_lkg_shadow_agrees_with_the_live_rule_at_one_half`).
+        shadow_route: Route::from_lkg(predicted.iter().any(|row| route_lkg_shadow(row, ratio))),
+        live_route: Route::from_lkg(live),
+        top_signature: top.map(|row| row.signature.clone()),
+        p_served: top.map(|row| row.posterior_mean),
+        trials: top.map(|row| row.trials),
+        p_exact: top.and_then(exact_cell_posterior),
+        exact_trials: top.and_then(|row| row.exact_trials),
+        expected_loss_fresh: p,
+        expected_loss_lkg: ratio,
     }
 }
 
@@ -670,5 +881,249 @@ mod tests {
         let risk = assess_action_risk(&predicted, &[]);
         assert!(risk.route_lkg);
         assert!(risk.warn.unwrap().contains("no active dev-states"));
+    }
+
+    // -- S3: the route_lkg shadow --------------------------------------------
+
+    /// Every prediction shape the arms distinguish: boot and non-boot
+    /// signatures, served posteriors around the thresholds, served trials
+    /// around [`RISK_MIN_TRIALS`], and every exact record up to 12 trials, plus
+    /// none (an older coord).
+    fn prediction_grid() -> Vec<PredictedSignature> {
+        let mut grid = Vec::new();
+        let exacts: Vec<Option<(u64, u64)>> = std::iter::once(None)
+            .chain((0..=12u64).flat_map(|n| (0..=n).map(move |y| Some((y, n)))))
+            .collect();
+        for sig in ["DEV-TAURI-ASSET-MISSING", "DEV-UI-ERROR-BOUNDARY"] {
+            for posterior in [0.0, 0.1, 0.15, 0.2, 0.3, 0.4968, 0.5, 0.51, 0.62, 0.9, 1.0] {
+                for trials in [0, 1, 2, 3, 4, 12, 40] {
+                    for exact in &exacts {
+                        grid.push(PredictedSignature {
+                            signature: sig.to_string(),
+                            posterior_mean: posterior,
+                            occurrences: trials / 2,
+                            trials,
+                            evidence_basis: "marginal".to_string(),
+                            exact_trials: exact.map(|(_, n)| n),
+                            exact_occurrences: exact.map(|(y, _)| y),
+                        });
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// The research record's S3 rule written out literally: [`high_risk_arm`]
+    /// with `ratio` in place of the 0.5 threshold, veto at `ratio`. The
+    /// reference [`route_lkg_shadow`]'s expected-loss form is held to.
+    fn arm_at(pred: &PredictedSignature, ratio: f64) -> bool {
+        if !is_boot_failure_signature(&pred.signature) {
+            return false;
+        }
+        let exact_cell = exact_cell_posterior(pred).is_some_and(|p| p >= ratio);
+        let vetoed = !exact_cell && pred.exact_trials.is_some_and(|n| n >= N_MIN_EXACT);
+        let served = pred.posterior_mean >= ratio && pred.trials >= RISK_MIN_TRIALS && !vetoed;
+        served || exact_cell
+    }
+
+    /// At ratio 0.5 the shadow routes exactly where the live arm trips, on
+    /// every prediction in the grid. Fails if the expected-loss form drops an
+    /// arm, the veto, the trials floor or the `>=`, or if the live arm moves
+    /// without the shadow.
+    #[test]
+    fn route_lkg_shadow_equals_the_live_arm_at_ratio_one_half() {
+        let grid = prediction_grid();
+        assert!(
+            grid.len() > 10_000,
+            "the grid covers the arms: {}",
+            grid.len()
+        );
+        let mut routed = 0;
+        for pred in &grid {
+            let live = high_risk_arm(pred).is_some();
+            assert_eq!(
+                route_lkg_shadow(pred, DEFAULT_ROUTE_LKG_RATIO),
+                live,
+                "{pred:?}"
+            );
+            routed += usize::from(live);
+        }
+        assert!(routed > 0 && routed < grid.len(), "both routes occur");
+    }
+
+    /// At every other ratio the shadow is the literal substitution, so the
+    /// stamped expected loss is enough to re-score a row at any ratio.
+    #[test]
+    fn route_lkg_shadow_is_the_live_arm_with_the_ratio_substituted() {
+        let grid = prediction_grid();
+        for ratio in [0.05, 0.1, 0.15, 0.3, 0.45, 0.55, 0.7, 0.9, 1.0] {
+            for pred in &grid {
+                assert_eq!(
+                    route_lkg_shadow(pred, ratio),
+                    arm_at(pred, ratio),
+                    "{ratio} {pred:?}"
+                );
+                // The decision posterior reads no ratio: routing at `ratio`
+                // is exactly the expected-loss comparison on it.
+                assert_eq!(
+                    route_lkg_shadow(pred, ratio),
+                    decision_posterior(pred).is_some_and(|p| p >= ratio),
+                );
+            }
+        }
+    }
+
+    /// Over a set of rows the shadow at 0.5 agrees with the live assessment,
+    /// and its expected losses are `p` against `ratio`.
+    #[test]
+    fn assess_route_lkg_shadow_agrees_with_the_live_rule_at_one_half() {
+        let grid = prediction_grid();
+        // Pairs of rows: any one routing routes the restart, in both rules.
+        for pair in grid.chunks(2).step_by(7) {
+            let shadow = assess_route_lkg_shadow(pair, DEFAULT_ROUTE_LKG_RATIO);
+            let live = assess_action_risk(pair, INCIDENT_STATES).route_lkg;
+            assert_eq!(shadow.shadow_route, Route::from_lkg(live), "{pair:?}");
+            assert_eq!(shadow.live_route, Route::from_lkg(live), "{pair:?}");
+            assert_eq!(shadow.expected_loss_lkg, DEFAULT_ROUTE_LKG_RATIO);
+            if let Some(fresh) = shadow.expected_loss_fresh {
+                assert_eq!(fresh >= shadow.expected_loss_lkg, live, "{pair:?}");
+            } else {
+                assert!(!live, "no eligible evidence never routes: {pair:?}");
+            }
+            // At any ratio the stamped expected losses re-score the route.
+            for ratio in [0.15, 0.7] {
+                let shadow = assess_route_lkg_shadow(pair, ratio);
+                let by_loss = shadow
+                    .expected_loss_fresh
+                    .is_some_and(|fresh| fresh >= shadow.expected_loss_lkg);
+                assert_eq!(shadow.shadow_route, Route::from_lkg(by_loss), "{pair:?}");
+            }
+        }
+    }
+
+    /// The incident replica (theory §3.3: a served 0.152 over 39 trials, the
+    /// exact cell 3 of 5): the live rule takes the fresh exe, and so does the
+    /// shadow at 0.5, but a declared ratio of 0.15 routes it. The stamp names
+    /// the row and every input, and the exact cell decides (from 5 trials, the
+    /// veto regime), so `expected_loss_fresh` is its own posterior.
+    #[test]
+    fn a_lower_ratio_routes_the_incident_replica_the_live_rule_does_not() {
+        let replica = PredictedSignature {
+            signature: "DEV-TAURI-ASSET-MISSING".to_string(),
+            posterior_mean: 0.152,
+            occurrences: 3,
+            trials: 39,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: Some(5),
+            exact_occurrences: Some(3),
+        };
+        let rows = vec![pred("DEV-UI-ERROR-BOUNDARY", 0.9, 9, 10), replica];
+        let own = 3.4 / 9.0;
+
+        let at_half = assess_route_lkg_shadow(&rows, 0.5);
+        assert_eq!(at_half.shadow_route, Route::Fresh);
+        assert_eq!(at_half.live_route, Route::Fresh);
+
+        let low = assess_route_lkg_shadow(&rows, 0.15);
+        assert_eq!(
+            low,
+            RouteLkgShadow {
+                rule_version: ROUTE_LKG_SHADOW_RULE_VERSION,
+                ratio: 0.15,
+                shadow_route: Route::Lkg,
+                live_route: Route::Fresh,
+                top_signature: Some("DEV-TAURI-ASSET-MISSING".to_string()),
+                p_served: Some(0.152),
+                trials: Some(39),
+                p_exact: Some(own),
+                exact_trials: Some(5),
+                expected_loss_fresh: Some(own),
+                expected_loss_lkg: 0.15,
+            }
+        );
+    }
+
+    /// The shadow decides on the boot row with the largest decision
+    /// posterior, not the largest served one: a served 0.9 over 2 trials is
+    /// not eligible, and an exact record of 6 of 6 is. With no boot row the
+    /// stamp names none and holds no expected fresh loss.
+    #[test]
+    fn the_shadow_decides_on_the_strongest_eligible_boot_row() {
+        let rows = vec![
+            pred("DEV-PANIC-STARTUP", 0.9, 2, 2),
+            pooled("DEV-WEBVIEW-CONN-REFUSED", 0.3, 6, 6),
+            pred("DEV-UI-ERROR-BOUNDARY", 0.99, 99, 100),
+        ];
+        let shadow = assess_route_lkg_shadow(&rows, 0.5);
+        assert_eq!(
+            shadow.top_signature.as_deref(),
+            Some("DEV-WEBVIEW-CONN-REFUSED")
+        );
+        assert_eq!(shadow.expected_loss_fresh, Some(6.4 / 10.0));
+        assert_eq!(shadow.shadow_route, Route::Lkg);
+
+        // Only an ineligible boot row: it is named, with no `p`, and never routes.
+        let ineligible = assess_route_lkg_shadow(&rows[..1], 0.05);
+        assert_eq!(
+            ineligible.top_signature.as_deref(),
+            Some("DEV-PANIC-STARTUP")
+        );
+        assert_eq!(ineligible.expected_loss_fresh, None);
+        assert_eq!(ineligible.shadow_route, Route::Fresh);
+
+        let none = assess_route_lkg_shadow(&rows[2..], 0.05);
+        assert_eq!(none.top_signature, None);
+        assert_eq!(none.p_served, None);
+        assert_eq!(none.expected_loss_fresh, None);
+        assert_eq!(none.shadow_route, Route::Fresh);
+        assert_eq!(none.live_route, Route::Fresh);
+    }
+
+    /// The declared ratio: unset is the default silently; a number in (0, 1]
+    /// is taken; anything else is the default with a warning naming the value.
+    #[test]
+    fn the_declared_ratio_falls_back_to_one_half_with_a_warning() {
+        assert_eq!(parse_route_lkg_ratio(None), (0.5, None));
+        assert_eq!(parse_route_lkg_ratio(Some("0.15")), (0.15, None));
+        assert_eq!(parse_route_lkg_ratio(Some(" 1 ")), (1.0, None));
+        for bad in ["", "abc", "0", "-0.2", "1.5", "NaN", "inf"] {
+            let (ratio, warning) = parse_route_lkg_ratio(Some(bad));
+            assert_eq!(ratio, 0.5, "{bad:?}");
+            let warning = warning.expect("an invalid ratio warns");
+            assert!(warning.contains(ROUTE_LKG_RATIO_ENV), "{warning}");
+            assert!(warning.contains(&format!("{bad:?}")), "{warning}");
+        }
+    }
+
+    /// The stamp's wire names and route spellings.
+    #[test]
+    fn the_shadow_serializes_with_its_stamped_field_names() {
+        let json = serde_json::to_value(assess_route_lkg_shadow(&[], 0.5)).expect("serialize");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "exact_trials",
+                "expected_loss_fresh",
+                "expected_loss_lkg",
+                "live_route",
+                "p_exact",
+                "p_served",
+                "ratio",
+                "rule_version",
+                "shadow_route",
+                "top_signature",
+                "trials",
+            ]
+        );
+        assert_eq!(json["shadow_route"], "fresh");
+        assert_eq!(serde_json::to_value(Route::Lkg).expect("serialize"), "lkg");
     }
 }

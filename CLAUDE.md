@@ -970,6 +970,21 @@ is to skip that count when the epoch is missing or below a
 the same treatment only if that minimum is raised as well, and rows already counted stay
 counted without another reset.
 
+**A restart's snapshot carries the `route_lkg` shadow, and an LKG-routed restart is its
+own kind** (plan `2026-10-27-bayesian-consequence-model-for-the-dev-twin` Phase 6c, S3).
+A `restart` whose expectations coord answered stamps `metadata.route_lkg_shadow`: what
+an expected-loss rule would decide at the declared cost ratio `c_LKG / c_fail`
+(`SUPERVISOR_ROUTE_LKG_RATIO`, default 0.5, read at each mint; a value outside (0, 1]
+falls back to 0.5 with a WARN) beside what the live rule decided, `use_lkg` (which exe
+ran), and the inputs and expected losses that re-score it at any other ratio. Its loss
+model is in `dev_action::policy::RouteLkgShadow`. The live rule is unchanged; at 0.5 the
+shadow equals it on every prediction, which a test pins. A restart is minted `restart`,
+and the door that points its start at an existing LKG exe (`POST /runner/restart`, by
+the auto-bias or `use_lkg: true`) re-keys it to `restart_lkg` before the start. A coord
+that does not accept that kind yet refuses it with a 400; the ingest then re-sends the
+snapshot once as `restart` with `metadata.refused_kind: "restart_lkg"`, so no trial is
+lost whatever order the coord and web changes deploy in, and none needs a flag flipped.
+
 **An ACK's `risk: null` is not one answer.** The LKG restart guard fails open on an
 empty expectations list, so `risk: null` beside `predicted: []` reads the same whether
 coord has no rows or never answered. `expectations_basis` separates them. It is coord's

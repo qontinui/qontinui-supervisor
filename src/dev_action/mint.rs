@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use crate::coord_client::coord_base;
+use crate::dev_action::policy::{self, assess_route_lkg_shadow};
 use crate::dev_action::{
     assess_then_cut, evaluate_all, fetch_expectations, run_result_for, spawn_attribution_watcher,
     ActionKind, ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
@@ -156,6 +157,15 @@ pub async fn prepare_action(
 
     let coord = coord_base(&state.config.ambient_coord);
     let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
+    // The `route_lkg` shadow (S3) reads the same uncut rows the live risk does,
+    // for a restart coord answered (a basis, or rows from a coord that predates
+    // the basis field). With no answer there is nothing to score.
+    if kind == ActionKind::Restart && (fetched.basis.is_some() || !fetched.rows.is_empty()) {
+        record.route_lkg_shadow = Some(assess_route_lkg_shadow(
+            &fetched.rows,
+            policy::route_lkg_ratio(),
+        ));
+    }
     record.expectations_basis = fetched.basis;
     let (predicted, risk) = assess_then_cut(fetched.rows, &states_active);
 
@@ -197,7 +207,7 @@ pub async fn commit_action(
     // wall-clock stamp: a window started at preparation would close early.
     record.started_instant = tokio::time::Instant::now();
     if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %record.action_id, kind = record.kind.as_str(), "{warn}");
+        tracing::warn!(action_id = %record.action_id, kind = record.kind().as_str(), "{warn}");
         state
             .logs
             .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())

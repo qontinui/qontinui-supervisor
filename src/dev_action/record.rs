@@ -26,6 +26,7 @@
 //! whole-store lock.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -60,6 +61,16 @@ pub enum ActionKind {
     /// A restart with no rebuild: `POST /runner/restart`,
     /// `POST /runners/{id}/restart`, the serving watchdog's.
     Restart,
+    /// A [`Self::Restart`] that ran the last-known-good exe instead of the
+    /// freshest slot exe: the LKG route is a treatment, so its trials are kept
+    /// out of `restart`'s statistics, which would otherwise credit the LKG
+    /// exe's boots to "restart under these states" and settle the white-screen
+    /// rate at the routing threshold (the research record's theory §6.5,
+    /// performativity). Never minted directly: a restart is minted as
+    /// `restart`, before the door decides on the LKG exe, and re-keyed with
+    /// [`ActionRecord::rekey_restart_to_lkg`] when it does. Coord's
+    /// expectations are still fetched for `restart`.
+    RestartLkg,
     /// A start of a runner that is down: `POST /runners/spawn-test` /
     /// `spawn-named`, `POST /runners/{id}/start`, the crash watchdog's restart,
     /// the boot auto-start.
@@ -75,9 +86,54 @@ impl ActionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ActionKind::Restart => "restart",
+            ActionKind::RestartLkg => "restart_lkg",
             ActionKind::Spawn => "spawn",
             ActionKind::Build => "build",
         }
+    }
+
+    /// Every kind, for the tables keyed on one.
+    pub const ALL: [ActionKind; 4] = [
+        ActionKind::Restart,
+        ActionKind::RestartLkg,
+        ActionKind::Spawn,
+        ActionKind::Build,
+    ];
+
+    fn to_u8(self) -> u8 {
+        match self {
+            ActionKind::Restart => 0,
+            ActionKind::RestartLkg => 1,
+            ActionKind::Spawn => 2,
+            ActionKind::Build => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        Self::ALL[usize::from(value)]
+    }
+}
+
+/// An [`ActionRecord`]'s kind, which one door changes after the record is
+/// stored ([`ActionRecord::rekey_restart_to_lkg`]) while the attribution
+/// watcher holds the same `Arc`. An atomic rather than a lock: the value is
+/// one byte and every read is a copy.
+#[derive(Debug)]
+struct ActionKindCell(AtomicU8);
+
+impl ActionKindCell {
+    fn new(kind: ActionKind) -> Self {
+        Self(AtomicU8::new(kind.to_u8()))
+    }
+
+    fn get(&self) -> ActionKind {
+        ActionKind::from_u8(self.0.load(Ordering::Acquire))
+    }
+}
+
+impl Serialize for ActionKindCell {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
     }
 }
 
@@ -167,7 +223,9 @@ impl ActionRunResult {
 #[derive(Debug, Serialize)]
 pub struct ActionRecord {
     pub action_id: Uuid,
-    pub kind: ActionKind,
+    /// Read it with [`Self::kind`]: a restart that ran the LKG exe is re-keyed
+    /// after it is stored ([`Self::rekey_restart_to_lkg`]).
+    kind: ActionKindCell,
     /// Caller identity (the existing `requester_id` already threaded through
     /// the spawn routes; `None` for callers that didn't supply one). Q8.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +241,13 @@ pub struct ActionRecord {
     ///
     /// [`FetchedExpectations::basis`]: crate::dev_action::expectations::FetchedExpectations::basis
     pub expectations_basis: Option<String>,
+    /// The `route_lkg` expected-loss shadow over coord's expectations at the
+    /// mint ([`crate::dev_action::policy::assess_route_lkg_shadow`]), stamped
+    /// into the snapshot's `metadata.route_lkg_shadow`. Set for a `restart`
+    /// whose expectations coord answered; `None` otherwise (another kind, or
+    /// no answer, which the shadow could not score).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_lkg_shadow: Option<crate::dev_action::policy::RouteLkgShadow>,
     /// The dev-states evaluated `True` at action time. Stored as the typed
     /// shared [`DevState`] enum (Phase 2b) but serialized by canonical id via
     /// [`serialize_states_as_ids`] so the wire form stays an array of canonical
@@ -302,10 +367,11 @@ impl ActionRecord {
             .collect();
         Self {
             action_id: Uuid::new_v4(),
-            kind,
+            kind: ActionKindCell::new(kind),
             requester_id,
             params_digest,
             expectations_basis: None,
+            route_lkg_shadow: None,
             states_active,
             states_unknown,
             started_at: Utc::now(),
@@ -314,6 +380,31 @@ impl ActionRecord {
             run_result: RwLock::new(None),
             run_signal: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The action's kind as it is now: the minted kind, or
+    /// [`ActionKind::RestartLkg`] once [`Self::rekey_restart_to_lkg`] took.
+    pub fn kind(&self) -> ActionKind {
+        self.kind.get()
+    }
+
+    /// Re-key a `restart` to [`ActionKind::RestartLkg`], for the door that
+    /// pointed the restart's start at the last-known-good exe. Call it before
+    /// the start, so the attribution watcher, which reads the kind when it
+    /// ingests the snapshot at window close, sees the treatment the restart
+    /// ran under. Only a `restart` is re-keyed: returns `true` when this call
+    /// changed the kind, `false` for any other kind (a `restart_lkg` already
+    /// re-keyed included).
+    pub fn rekey_restart_to_lkg(&self) -> bool {
+        self.kind
+            .0
+            .compare_exchange(
+                ActionKind::Restart.to_u8(),
+                ActionKind::RestartLkg.to_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Record the action's terminal result. **First write wins**: an action has
@@ -574,9 +665,43 @@ mod tests {
 
     #[test]
     fn action_kind_as_str_matches_serde_wire_form() {
-        for kind in [ActionKind::Restart, ActionKind::Spawn, ActionKind::Build] {
+        for kind in ActionKind::ALL {
             let json = serde_json::to_string(&kind).expect("serialize");
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
+        }
+        assert_eq!(ActionKind::RestartLkg.as_str(), "restart_lkg");
+    }
+
+    /// The byte the kind cell stores maps back to the same kind for every
+    /// kind, so a re-key or a new variant cannot read back as another kind.
+    #[test]
+    fn every_kind_round_trips_through_the_cell() {
+        for kind in ActionKind::ALL {
+            assert_eq!(ActionKind::from_u8(kind.to_u8()), kind);
+            assert_eq!(ActionKindCell::new(kind).get(), kind);
+        }
+    }
+
+    /// Only a `restart` is re-keyed to `restart_lkg`, once, and the stored
+    /// record reads and serializes the new kind afterwards; a spawn or a build
+    /// pointed at the LKG exe keeps its kind.
+    #[test]
+    fn rekey_turns_a_restart_into_restart_lkg_and_nothing_else() {
+        let restart = ActionRecord::new(ActionKind::Restart, None, "p".to_string(), &[]);
+        assert!(restart.rekey_restart_to_lkg(), "a restart is re-keyed");
+        assert_eq!(restart.kind(), ActionKind::RestartLkg);
+        assert!(
+            !restart.rekey_restart_to_lkg(),
+            "a second re-key changes nothing"
+        );
+        assert_eq!(restart.kind(), ActionKind::RestartLkg);
+        let v = serde_json::to_value(&restart).expect("serialize");
+        assert_eq!(v["kind"], "restart_lkg");
+
+        for kind in [ActionKind::Spawn, ActionKind::Build] {
+            let other = ActionRecord::new(kind, None, "p".to_string(), &[]);
+            assert!(!other.rekey_restart_to_lkg(), "{kind:?} is not re-keyed");
+            assert_eq!(other.kind(), kind);
         }
     }
 

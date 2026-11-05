@@ -4463,7 +4463,7 @@ async fn per_runner_restart_mints_restart_and_records_errored_on_failure() {
 
     let record = only_action(&state).await;
     assert_eq!(body["action_id"], record.action_id.to_string());
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Restart);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Restart);
     assert!(
         record.params_digest.contains(&format!("runner={id}")),
         "{}",
@@ -4510,7 +4510,7 @@ async fn per_runner_restart_rebuild_202_carries_action_id() {
     crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     let record = only_action(&state).await;
     assert_eq!(record.action_id, action_id);
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Build);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Build);
 
     // The closed pool fails the detached build; that reaches the action as the
     // build's own error, not as the guard's drop record (also `Errored`).
@@ -4556,7 +4556,7 @@ async fn per_runner_start_mints_spawn() {
 
     let record = only_action(&state).await;
     assert_eq!(body["action_id"], record.action_id.to_string());
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Spawn);
     match record.run_result() {
         Some(crate::dev_action::ActionRunResult::Errored { reason }) => {
             assert_eq!(body["error"], reason, "the start's own error")
@@ -4606,7 +4606,7 @@ async fn per_runner_start_on_a_running_runner_records_refused() {
 
     let record = only_action(&state).await;
     assert_eq!(body["action_id"], record.action_id.to_string());
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Spawn);
     assert_eq!(
         record.run_result(),
         Some(crate::dev_action::ActionRunResult::Refused { reason: refusal })
@@ -4670,7 +4670,7 @@ async fn rebuild_and_restart_202_carries_action_id_only_when_a_build_can_run() {
         .to_string();
     let record = only_action(&state).await;
     assert_eq!(record.action_id.to_string(), action_id);
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Build);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Build);
 
     let primary_id = state
         .get_primary()

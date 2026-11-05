@@ -4838,7 +4838,7 @@ async fn serving_watchdog_restart_mints_with_watchdog_initiator() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Restart);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Restart);
     assert_eq!(
         record.requester_id.as_deref(),
         Some(SERVING_WATCHDOG_INITIATOR)
@@ -4928,7 +4928,7 @@ async fn crash_watchdog_start_mints_a_spawn_with_crash_watchdog_initiator() {
     );
 
     let record = the_completed_trial(&state).await;
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Spawn);
     assert_eq!(
         record.requester_id.as_deref(),
         Some(CRASH_WATCHDOG_INITIATOR)
@@ -4994,7 +4994,7 @@ async fn boot_start_mints_a_spawn_with_boot_start_initiator() {
     );
 
     let record = the_completed_trial(&state).await;
-    assert_eq!(record.kind, crate::dev_action::ActionKind::Spawn);
+    assert_eq!(record.kind(), crate::dev_action::ActionKind::Spawn);
     assert_eq!(record.requester_id.as_deref(), Some(BOOT_START_INITIATOR));
     assert_eq!(BOOT_START_INITIATOR, "boot_start");
     assert!(
@@ -5678,7 +5678,7 @@ async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
 
             let newest = state.dev_actions.read().await.recent(1);
             let trial = newest.first().expect("the trial");
-            assert_eq!(trial.kind, crate::dev_action::ActionKind::Spawn);
+            assert_eq!(trial.kind(), crate::dev_action::ActionKind::Spawn);
             assert_eq!(
                 managed
                     .recent_spawns

@@ -967,6 +967,14 @@ pub async fn restart_runner(
         if lkg_exe.exists() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                // The LKG exe is a treatment: this restart's trial is a
+                // `restart_lkg`, not a `restart` (S3). Re-keyed here, before the
+                // start, so the watcher ingests it under the kind it ran as.
+                // Only here: the override is what makes the start run the LKG
+                // exe, whether the auto-bias or the operator's `use_lkg: true`
+                // asked for it, and a wanted LKG with no exe on disk runs the
+                // fresh one and stays a `restart`.
+                action_record.rekey_restart_to_lkg();
                 let reason = if body.use_lkg == Some(true) {
                     "operator-requested (use_lkg:true)"
                 } else {
@@ -2336,6 +2344,94 @@ mod tests {
             crate::dev_action::record::D3Category::Confirmed,
             "a clean window behind a failed restart must not classify Confirmed"
         );
+    }
+
+    /// S3 through the door: `POST /runner/restart` without a rebuild stamps the
+    /// `route_lkg` shadow on its `restart` trial from the rows coord served
+    /// (here the sixth-ranked 4-of-4 boot row, so both rules route), and the
+    /// trial is re-keyed to `restart_lkg` exactly when the start was pointed at
+    /// an LKG exe that exists: the auto-bias or `use_lkg: true` with the exe on
+    /// disk. With no LKG exe, or `use_lkg: false`, the fresh exe runs and the
+    /// trial stays a `restart`. Expectations are fetched for `restart` either
+    /// way. The readiness gate refuses on the dead port, so no runner is
+    /// stopped or started.
+    #[tokio::test]
+    async fn a_restart_routed_to_the_lkg_exe_is_rekeyed_and_carries_its_shadow() {
+        use crate::dev_action::policy::Route;
+        use crate::dev_action::test_support::{
+            five_rows_and_a_sixth_boot_row, serve_planted_expectations,
+        };
+        use crate::dev_action::ActionKind;
+
+        // (use_lkg, LKG exe on disk) → the kind the trial ends as.
+        let cases = [
+            (None, true, ActionKind::RestartLkg),
+            (Some(true), true, ActionKind::RestartLkg),
+            (None, false, ActionKind::Restart),
+            (Some(false), true, ActionKind::Restart),
+        ];
+        for (use_lkg, lkg_on_disk, want) in cases {
+            let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+            let tmp = TempDir::new().expect("tempdir");
+            let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+            config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+            if lkg_on_disk {
+                let lkg = config.lkg_exe_path();
+                std::fs::create_dir_all(lkg.parent().expect("an lkg dir")).expect("mkdir");
+                std::fs::write(&lkg, b"stub").expect("write the lkg exe");
+            }
+            let state = Arc::new(SupervisorState::new(config));
+            let primary = state.get_primary().await.expect("primary");
+            // Evidence of life on a dead port: the gate's UNKNOWN, which refuses.
+            primary.runner.write().await.running = true;
+
+            let resp = restart_runner(
+                State(state.clone()),
+                Query(StartWaitQuery { wait: false }),
+                Json(RestartRequest {
+                    rebuild: false,
+                    force: false,
+                    from_working_tree: false,
+                    use_lkg,
+                    handoff: false,
+                }),
+            )
+            .await
+            .expect("the refusal renders its action");
+            let (status, body) = body_json(resp).await;
+            assert_eq!(status, 409, "{use_lkg:?} {lkg_on_disk}: {body}");
+
+            let record = state
+                .dev_actions
+                .read()
+                .await
+                .recent(10)
+                .first()
+                .cloned()
+                .expect("a minted trial");
+            assert_eq!(record.kind(), want, "{use_lkg:?} {lkg_on_disk}");
+            let shadow = record
+                .route_lkg_shadow
+                .as_ref()
+                .expect("a restart coord answered carries the shadow");
+            assert_eq!(shadow.live_route, Route::Lkg);
+            assert_eq!(shadow.shadow_route, Route::Lkg);
+            assert_eq!(
+                shadow.top_signature.as_deref(),
+                Some("DEV-TAURI-ASSET-MISSING")
+            );
+            assert_eq!(shadow.expected_loss_fresh, Some(4.4 / 8.0));
+            let seen = coord.seen();
+            assert!(
+                seen[0].query.split('&').any(|p| p == "action_kind=restart"),
+                "expectations are fetched for restart: {}",
+                seen[0].query
+            );
+            assert!(
+                primary.source_exe_override.read().await.is_none(),
+                "the LKG pin is scoped to this restart"
+            );
+        }
     }
 
     /// Plan §6 Phase 5 test 5b — `POST /runner/fix-and-rebuild`. An identical
