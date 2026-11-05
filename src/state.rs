@@ -2937,6 +2937,35 @@ mod tests {
 
     // --- boot_id persistence tests ---
 
+    /// The boot id follows the per-user-dirs switch: a unit-test build's
+    /// (`Ignore`) is minted in memory and persisted nowhere, and a tempdir's
+    /// (`At`) persists under it, so no test reads or writes the operator's.
+    #[test]
+    fn the_boot_id_follows_the_user_dirs_switch() {
+        let ignore = crate::config::AmbientUserDirs::Ignore;
+        assert_eq!(default_boot_id_path(&ignore), None);
+        let (a, b) = (
+            load_or_create_boot_id(&ignore),
+            load_or_create_boot_id(&ignore),
+        );
+        assert!(
+            uuid::Uuid::parse_str(&a).is_ok() && a != b,
+            "a fresh id each time, persisted nowhere: {a} {b}"
+        );
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let at = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+        let path = default_boot_id_path(&at).expect("At has a data-local dir");
+        assert!(path.starts_with(tmp.path()), "{path:?}");
+        let first = load_or_create_boot_id(&at);
+        assert_eq!(
+            load_or_create_boot_id(&at),
+            first,
+            "persisted under the tempdir"
+        );
+        assert!(path.is_file(), "{path:?}");
+    }
+
     #[test]
     fn test_load_or_create_boot_id_at_persists_across_calls() {
         let dir = tempfile::tempdir().expect("create tempdir");
