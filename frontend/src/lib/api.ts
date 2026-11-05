@@ -1302,3 +1302,4 @@ export const api = {
   expoStop: () => fetchJson<unknown>('/expo/stop', { method: 'POST' }),
   expoStatus: () => fetchJson<ExpoStatus>('/expo/status'),
 };
+export   const   __armingProbeFormat    =   1
