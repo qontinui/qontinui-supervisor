@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 use crate::dev_action::run_result::unhealthy_after_start_reason;
 use crate::dev_action::{
-    mint_action, record_start_verdict, run_result_for, start_verdict, ActionKind, ActionRunResult,
-    AttributionTargets, MintedAction, RunResultGuard, SyncProbe,
+    mint_action, record_start_verdict, run_result_for, start_verdict, ActionKind, ActionRecord,
+    ActionRunResult, AttributionTargets, MintedAction, RunResultGuard, SyncProbe,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
@@ -104,6 +104,17 @@ async fn mint_primary_action(
         backstop_override,
     )
     .await
+}
+
+/// Re-key a restart's trial to `restart_lkg` when its start ran the LKG exe:
+/// the start was pointed at an LKG exe that exists (`lkg_pinned`, by the
+/// auto-bias or `use_lkg: true`) and `restart_runner` returned `Ok`, which it
+/// does only after spawning that exe (a pinned override whose file is missing
+/// fails the start rather than falling back to a slot exe). A refused or
+/// failed restart ran nothing and stays a `restart`, as does one that ran the
+/// fresh exe. Returns whether the trial was re-keyed.
+fn record_lkg_treatment(record: &ActionRecord, lkg_pinned: bool, restarted: bool) -> bool {
+    lkg_pinned && restarted && record.rekey_restart_to_lkg()
 }
 
 /// Where the watcher of a primary-runner action looks for its effects.
@@ -967,14 +978,6 @@ pub async fn restart_runner(
         if lkg_exe.exists() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
-                // The LKG exe is a treatment: this restart's trial is a
-                // `restart_lkg`, not a `restart` (S3). Re-keyed here, before the
-                // start, so the watcher ingests it under the kind it ran as.
-                // Only here: the override is what makes the start run the LKG
-                // exe, whether the auto-bias or the operator's `use_lkg: true`
-                // asked for it, and a wanted LKG with no exe on disk runs the
-                // fresh one and stays a `restart`.
-                action_record.rekey_restart_to_lkg();
                 let reason = if body.use_lkg == Some(true) {
                     "operator-requested (use_lkg:true)"
                 } else {
@@ -1025,9 +1028,16 @@ pub async fn restart_runner(
     // restart (which re-evaluates risk from fresh predictions). The runner has
     // already resolved + copied its exe by the time `restart_runner` returns, so
     // clearing now does not affect the just-started process.
+    let lkg_pinned = biased_primary.is_some();
     if let Some(primary) = biased_primary {
         *primary.source_exe_override.write().await = None;
     }
+    // S3: a restart that ran the LKG exe is a `restart_lkg` trial. Decided only
+    // now, once the start has run: a readiness refusal or a failed start ran no
+    // exe and stays a `restart`. Still before any run result is recorded on the
+    // action, and the watcher's window closes only on that result (plus its
+    // tail), so the snapshot is ingested under the re-keyed kind.
+    record_lkg_treatment(&action_record, lkg_pinned, restart_result.is_ok());
     // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
     // minted before the `if rebuild` branch, so a readiness refusal here
     // returned 409 to the caller while the minted action still closed
@@ -2348,29 +2358,28 @@ mod tests {
 
     /// S3 through the door: `POST /runner/restart` without a rebuild stamps the
     /// `route_lkg` shadow on its `restart` trial from the rows coord served
-    /// (here the sixth-ranked 4-of-4 boot row, so both rules route), and the
-    /// trial is re-keyed to `restart_lkg` exactly when the start was pointed at
-    /// an LKG exe that exists: the auto-bias or `use_lkg: true` with the exe on
-    /// disk. With no LKG exe, or `use_lkg: false`, the fresh exe runs and the
-    /// trial stays a `restart`. Expectations are fetched for `restart` either
-    /// way. The readiness gate refuses on the dead port, so no runner is
-    /// stopped or started.
+    /// (here the sixth-ranked 4-of-4 boot row, so both rules route), and
+    /// fetches expectations for `restart`. A restart the readiness gate refuses
+    /// ran no exe, so it stays a `restart` even when its start was pointed at
+    /// an LKG exe that exists: fails if the re-key moves back ahead of
+    /// `restart_runner`. The success arm, which a unit test cannot reach
+    /// without starting a runner, is [`record_lkg_treatment`]'s test below.
+    /// The gate refuses on the dead port, so no runner is stopped or started.
     #[tokio::test]
-    async fn a_restart_routed_to_the_lkg_exe_is_rekeyed_and_carries_its_shadow() {
+    async fn a_refused_restart_carries_its_shadow_and_stays_a_restart() {
         use crate::dev_action::policy::Route;
         use crate::dev_action::test_support::{
             five_rows_and_a_sixth_boot_row, serve_planted_expectations,
         };
-        use crate::dev_action::ActionKind;
 
-        // (use_lkg, LKG exe on disk) → the kind the trial ends as.
+        // (use_lkg, LKG exe on disk): every combination that pins and that does not.
         let cases = [
-            (None, true, ActionKind::RestartLkg),
-            (Some(true), true, ActionKind::RestartLkg),
-            (None, false, ActionKind::Restart),
-            (Some(false), true, ActionKind::Restart),
+            (None, true),
+            (Some(true), true),
+            (None, false),
+            (Some(false), true),
         ];
-        for (use_lkg, lkg_on_disk, want) in cases {
+        for (use_lkg, lkg_on_disk) in cases {
             let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
             let tmp = TempDir::new().expect("tempdir");
             let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
@@ -2409,7 +2418,11 @@ mod tests {
                 .first()
                 .cloned()
                 .expect("a minted trial");
-            assert_eq!(record.kind(), want, "{use_lkg:?} {lkg_on_disk}");
+            assert_eq!(
+                record.kind(),
+                ActionKind::Restart,
+                "a refused restart ran no exe: {use_lkg:?} {lkg_on_disk}"
+            );
             let shadow = record
                 .route_lkg_shadow
                 .as_ref()
@@ -2430,6 +2443,31 @@ mod tests {
             assert!(
                 primary.source_exe_override.read().await.is_none(),
                 "the LKG pin is scoped to this restart"
+            );
+        }
+    }
+
+    /// The re-key the door applies after `restart_runner`: only a restart that
+    /// was pinned to the LKG exe AND started is a `restart_lkg`. Fails if a
+    /// refused or failed restart, or one that ran the fresh exe, is re-keyed,
+    /// or if a pinned restart that started is not.
+    #[test]
+    fn only_a_started_lkg_pinned_restart_is_rekeyed() {
+        for (lkg_pinned, restarted, want) in [
+            (true, true, ActionKind::RestartLkg),
+            (true, false, ActionKind::Restart),
+            (false, true, ActionKind::Restart),
+            (false, false, ActionKind::Restart),
+        ] {
+            let record = ActionRecord::new(ActionKind::Restart, None, "p".to_string(), &[]);
+            assert_eq!(
+                record_lkg_treatment(&record, lkg_pinned, restarted),
+                want == ActionKind::RestartLkg
+            );
+            assert_eq!(
+                record.kind(),
+                want,
+                "pinned={lkg_pinned} restarted={restarted}"
             );
         }
     }

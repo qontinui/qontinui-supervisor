@@ -68,7 +68,8 @@ pub enum ActionKind {
     /// rate at the routing threshold (the research record's theory §6.5,
     /// performativity). Never minted directly: a restart is minted as
     /// `restart`, before the door decides on the LKG exe, and re-keyed with
-    /// [`ActionRecord::rekey_restart_to_lkg`] when it does. Coord's
+    /// [`ActionRecord::rekey_restart_to_lkg`] once that start has run the LKG
+    /// exe (a refused or failed restart ran none and stays `restart`). Coord's
     /// expectations are still fetched for `restart`.
     RestartLkg,
     /// A start of a runner that is down: `POST /runners/spawn-test` /
@@ -389,10 +390,11 @@ impl ActionRecord {
     }
 
     /// Re-key a `restart` to [`ActionKind::RestartLkg`], for the door that
-    /// pointed the restart's start at the last-known-good exe. Call it before
-    /// the start, so the attribution watcher, which reads the kind when it
-    /// ingests the snapshot at window close, sees the treatment the restart
-    /// ran under. Only a `restart` is re-keyed: returns `true` when this call
+    /// pointed the restart's start at the last-known-good exe, once that start
+    /// has run. Call it before recording the action's run result: the
+    /// attribution watcher's window closes only after that result, and it
+    /// reads the kind when it ingests the snapshot at window close, so it sees
+    /// the treatment the restart ran under. Only a `restart` is re-keyed: returns `true` when this call
     /// changed the kind, `false` for any other kind (a `restart_lkg` already
     /// re-keyed included).
     pub fn rekey_restart_to_lkg(&self) -> bool {

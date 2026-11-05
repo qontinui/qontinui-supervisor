@@ -980,7 +980,9 @@ ran), and the inputs and expected losses that re-score it at any other ratio. It
 model is in `dev_action::policy::RouteLkgShadow`. The live rule is unchanged; at 0.5 the
 shadow equals it on every prediction, which a test pins. A restart is minted `restart`,
 and the door that points its start at an existing LKG exe (`POST /runner/restart`, by
-the auto-bias or `use_lkg: true`) re-keys it to `restart_lkg` before the start. A coord
+the auto-bias or `use_lkg: true`) re-keys it to `restart_lkg` once that start has run
+(`restart_runner` returned `Ok`), before any run result is recorded; a refused or
+failed restart ran no exe and stays `restart`. A coord
 that does not accept that kind yet refuses it with a 400; the ingest then re-sends the
 snapshot once as `restart` with `metadata.refused_kind: "restart_lkg"`, so no trial is
 lost whatever order the coord and web changes deploy in, and none needs a flag flipped.

@@ -661,12 +661,41 @@ mod tests {
         assert!(json["metadata"].get("route_lkg_shadow").is_none(), "{json}");
     }
 
+    /// The length Postgres's `numeric_out` prints for the JSON number `token`,
+    /// a copy of coord's `dev_actions::rendered_numeric_len` (at coord
+    /// `0a8d8e847`): no exponent, the integer digits the value needs (at least
+    /// one), as many decimals as the token carries past its point (`1.0`
+    /// keeps its one, `1.5e-7` carries 8), and a minus sign unless the value
+    /// is zero. Applied to the token serde_json sends, not to a re-formatting
+    /// of the value: serde_json writes a whole float as `1.0`, which Postgres
+    /// prints with its scale.
+    fn pg_numeric_len(token: &str) -> usize {
+        let (sign, unsigned) = match token.strip_prefix('-') {
+            Some(rest) => (1, rest),
+            None => (0, token),
+        };
+        let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+            Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().unwrap_or(0)),
+            None => (unsigned, 0),
+        };
+        let sign = if mantissa.bytes().all(|b| matches!(b, b'0' | b'.')) {
+            0
+        } else {
+            sign
+        };
+        let (int_digits, frac_digits) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let int_len = (int_digits.len() as i64).saturating_add(exponent).max(1);
+        let scale = (frac_digits.len() as i64).saturating_sub(exponent).max(0);
+        let len = int_len.saturating_add(if scale > 0 { scale + 1 } else { 0 });
+        usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .saturating_add(sign)
+    }
+
     /// The length of `value` as Postgres prints a jsonb back, which is what
     /// coord bounds (`dev_actions::rendered_jsonb_len`, at coord `0a8d8e847`):
-    /// `", "` between members, `": "` after each key, and a number printed in
-    /// full, which for a float is Rust's own `Display` (shortest round-trip
-    /// digits, no exponent), the expansion Postgres's `numeric_out` prints for
-    /// the exponent form serde_json sends.
+    /// `", "` between members, `": "` after each key, and each number as
+    /// [`pg_numeric_len`] prints the token serde_json sends.
     fn pg_rendered_len(value: &serde_json::Value) -> usize {
         use serde_json::Value;
         let frame = |n: usize| 2 + 2 * n.saturating_sub(1);
@@ -674,10 +703,7 @@ mod tests {
         match value {
             Value::Null | Value::Bool(true) => 4,
             Value::Bool(false) => 5,
-            Value::Number(n) => match n.as_f64() {
-                Some(f) if n.is_f64() => format!("{f}").len(),
-                _ => n.to_string().len(),
-            },
+            Value::Number(n) => pg_numeric_len(&serde_json::to_string(n).expect("a number")),
             Value::String(s) => escaped(s),
             Value::Array(items) => {
                 frame(items.len()) + items.iter().map(pg_rendered_len).sum::<usize>()
@@ -692,6 +718,24 @@ mod tests {
         }
     }
 
+    /// The measure agrees with coord's rule on the tokens that matter here:
+    /// the whole float `1.0` keeps its scale, an exponent expands, and an
+    /// integer prints as sent.
+    #[test]
+    fn the_metadata_measure_prints_numbers_as_postgres_does() {
+        assert_eq!(serde_json::to_string(&1.0_f64).expect("serialize"), "1.0");
+        assert_eq!(pg_numeric_len("1.0"), 3);
+        assert_eq!(pg_numeric_len("0.5"), 3);
+        assert_eq!(pg_numeric_len("1.5e-7"), "0.00000015".len());
+        assert_eq!(pg_numeric_len("5e-324"), 2 + 324);
+        assert_eq!(pg_numeric_len("-0.0"), 3);
+        assert_eq!(pg_numeric_len("18446744073709551615"), 20);
+        assert_eq!(
+            pg_rendered_len(&serde_json::json!({"a": 1.0, "b": [1, 2]})),
+            r#"{"a": 1.0, "b": [1, 2]}"#.len()
+        );
+    }
+
     /// Coord refuses a snapshot whose metadata, as Postgres prints it back,
     /// passes 4096 bytes (`MAX_SNAPSHOT_METADATA_BYTES`), and a refused
     /// snapshot is a lost trial. The worst stamp this build can send, with
@@ -700,79 +744,92 @@ mod tests {
     /// and the smallest magnitudes, `u64::MAX` counts) beside the five-row
     /// `predicted[]` Phase 5 adds (128-byte signatures, coord's
     /// `MAX_SIGNATURE_BYTES`; the smallest posterior a `u64::MAX`-trial cell
-    /// serves; `u64::MAX` counts), fits. Fails if a field is added or
-    /// lengthened past the budget.
+    /// serves; `u64::MAX` counts), fits, at each extreme ratio
+    /// `SUPERVISOR_ROUTE_LKG_RATIO` accepts: the smallest positive float
+    /// (`5e-324`, which Postgres prints as 326 characters, twice in the stamp),
+    /// `1` (sent as `1.0`), and a ratio with 17 significant digits. Fails if a
+    /// field is added or lengthened past the budget, or the ratio parser
+    /// starts accepting a value that prints longer.
     #[test]
     fn the_worst_case_stamp_and_a_five_row_predicted_fit_coords_metadata_cap() {
         const MAX_SNAPSHOT_METADATA_BYTES: usize = 4096;
-        let record = restart_with_shadow();
-        let mut body = SnapshotIngestBody::from_record(&record, &confirmed(), None, None)
-            .rekeyed_to_restart_for_a_coord_without_restart_lkg();
         let longest_boot = crate::dev_action::policy::BOOT_FAILURE_SIGNATURES
             .iter()
             .max_by_key(|s| s.len())
             .expect("a boot signature");
-        // Floats Rust prints longest: 17 significant digits behind a long run
-        // of leading zeros.
+        // A float serde_json sends with 16 significant digits in exponent form
+        // behind 19 leading zeros: about as long as a probability prints.
         let tiny = 0.4 / (u64::MAX as f64 + 4.0) * (1.0 + f64::EPSILON);
-        let worst = RouteLkgShadow {
-            rule_version: u32::MAX,
-            ratio: 0.1 + 0.2,
-            shadow_route: crate::dev_action::policy::Route::Fresh,
-            live_route: crate::dev_action::policy::Route::Fresh,
-            top_signature: Some(longest_boot.to_string()),
-            p_served: Some(tiny),
-            trials: Some(u64::MAX),
-            p_exact: Some(tiny),
-            exact_trials: Some(u64::MAX),
-            expected_loss_fresh: Some(tiny),
-            expected_loss_lkg: 0.1 + 0.2,
-        };
-        let mut worst_record =
-            ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &[]);
-        worst_record.route_lkg_shadow = Some(worst);
-        assert!(worst_record.rekey_restart_to_lkg());
-        body.metadata.insert(
-            ROUTE_LKG_SHADOW_KEY.to_string(),
-            route_lkg_shadow_block(&worst_record).expect("a stamp"),
-        );
-        body.metadata.insert(
-            "supervisor_build_sha".to_string(),
-            serde_json::Value::from("f".repeat(40)),
-        );
-        body.metadata.insert(
-            "supervisor_build_dirty".to_string(),
-            serde_json::Value::from(false),
-        );
-        body.metadata.insert(
-            "attribution_epoch".to_string(),
-            serde_json::Value::from(u32::MAX),
-        );
-        let predicted_row = |i: usize| PredictedSignature {
-            signature: format!("DEV-{i}-{}", "X".repeat(128 - 6)),
-            posterior_mean: tiny,
-            occurrences: u64::MAX,
-            trials: u64::MAX,
-            evidence_basis: "prior_only".to_string(),
-            exact_trials: Some(u64::MAX),
-            exact_occurrences: Some(u64::MAX),
-        };
-        let predicted: Vec<PredictedSignature> = (0..5).map(predicted_row).collect();
-        assert!(predicted.iter().all(|p| p.signature.len() == 128));
-        body.metadata.insert(
-            "predicted".to_string(),
-            serde_json::to_value(&predicted).expect("serialize"),
-        );
+        for declared in ["5e-324", "1", "0.30000000000000004"] {
+            let (ratio, warning) = crate::dev_action::policy::parse_route_lkg_ratio(Some(declared));
+            assert_eq!(warning, None, "{declared} is a ratio the env var accepts");
+            let record = restart_with_shadow();
+            let mut body = SnapshotIngestBody::from_record(&record, &confirmed(), None, None)
+                .rekeyed_to_restart_for_a_coord_without_restart_lkg();
+            let worst = RouteLkgShadow {
+                rule_version: u32::MAX,
+                ratio,
+                shadow_route: crate::dev_action::policy::Route::Fresh,
+                live_route: crate::dev_action::policy::Route::Fresh,
+                top_signature: Some(longest_boot.to_string()),
+                p_served: Some(tiny),
+                trials: Some(u64::MAX),
+                p_exact: Some(tiny),
+                exact_trials: Some(u64::MAX),
+                expected_loss_fresh: Some(tiny),
+                expected_loss_lkg: ratio,
+            };
+            let mut worst_record =
+                ActionRecord::new(ActionKind::Restart, None, "rebuild=false".into(), &[]);
+            worst_record.route_lkg_shadow = Some(worst);
+            assert!(worst_record.rekey_restart_to_lkg());
+            body.metadata.insert(
+                ROUTE_LKG_SHADOW_KEY.to_string(),
+                route_lkg_shadow_block(&worst_record).expect("a stamp"),
+            );
+            body.metadata.insert(
+                "supervisor_build_sha".to_string(),
+                serde_json::Value::from("f".repeat(40)),
+            );
+            body.metadata.insert(
+                "supervisor_build_dirty".to_string(),
+                serde_json::Value::from(false),
+            );
+            body.metadata.insert(
+                "attribution_epoch".to_string(),
+                serde_json::Value::from(u32::MAX),
+            );
+            let predicted_row = |i: usize| PredictedSignature {
+                signature: format!("DEV-{i}-{}", "X".repeat(128 - 6)),
+                posterior_mean: tiny,
+                occurrences: u64::MAX,
+                trials: u64::MAX,
+                evidence_basis: "prior_only".to_string(),
+                exact_trials: Some(u64::MAX),
+                exact_occurrences: Some(u64::MAX),
+            };
+            let predicted: Vec<PredictedSignature> = (0..5).map(predicted_row).collect();
+            assert!(predicted.iter().all(|p| p.signature.len() == 128));
+            body.metadata.insert(
+                "predicted".to_string(),
+                serde_json::to_value(&predicted).expect("serialize"),
+            );
 
-        let metadata = serde_json::Value::Object(body.metadata.clone());
-        let rendered = pg_rendered_len(&metadata);
-        assert!(
-            rendered <= MAX_SNAPSHOT_METADATA_BYTES,
-            "the worst-case metadata renders {rendered} bytes, over coord's \
-             {MAX_SNAPSHOT_METADATA_BYTES}: {metadata}"
-        );
-        // The measure is not vacuous: the floats print expanded.
-        assert!(format!("{tiny}").len() > 30, "{tiny}");
+            // Measured on the bytes that go over the wire, as coord sees them.
+            let wire = serde_json::to_string(&serde_json::Value::Object(body.metadata.clone()))
+                .expect("serialize");
+            let metadata: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+            let rendered = pg_rendered_len(&metadata);
+            assert!(
+                rendered <= MAX_SNAPSHOT_METADATA_BYTES,
+                "ratio {declared}: the worst-case metadata renders {rendered} bytes, \
+                 over coord's {MAX_SNAPSHOT_METADATA_BYTES}: {metadata}"
+            );
+            eprintln!("ratio {declared}: worst-case metadata renders {rendered} bytes");
+        }
+        // The measure is not vacuous: the probabilities print expanded.
+        let token = serde_json::to_string(&tiny).expect("serialize");
+        assert!(pg_numeric_len(&token) > 30, "{token}");
     }
 
     /// Only coord's unknown-kind 400 on a `restart_lkg` snapshot is cured by
