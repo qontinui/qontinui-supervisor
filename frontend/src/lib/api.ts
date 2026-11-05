@@ -874,12 +874,7 @@ export interface VelocityImprovementHistory {
 //   - `server_mode`   -> the `Runner.server_mode` column was dropped as
 //                        unpopulated when WS became the sole dispatch transport
 //   - `restate_enabled` / `restate_healthy` -> never existed on this entity
-export type WebFleetDeviceStatus =
-  | 'healthy'
-  | 'degraded'
-  | 'offline'
-  | 'starting'
-  | 'errored';
+export type WebFleetDeviceStatus = 'healthy' | 'degraded' | 'offline' | 'starting' | 'errored';
 
 export interface WebFleetDevice {
   id: string;

@@ -63,7 +63,11 @@ describe('RunnerStatusBadge — liveness', () => {
   });
 
   it('is unchanged when the supervisor omits liveness (older build)', () => {
-    render(<RunnerStatusBadge derivedStatus={{ kind: 'degraded', reason: 'runner reported derived_status=degraded' }} />);
+    render(
+      <RunnerStatusBadge
+        derivedStatus={{ kind: 'degraded', reason: 'runner reported derived_status=degraded' }}
+      />,
+    );
     expect(screen.getByText('Degraded')).toBeInTheDocument();
   });
 });
@@ -88,7 +92,9 @@ describe('RunnerStatusBadge — recent crash panel', () => {
 
   it('shows no pid row for a dump that names none', () => {
     for (const pid of [undefined, null]) {
-      const { unmount } = render(<RunnerStatusBadge derivedStatus={errored} recentCrash={{ ...crash, pid }} />);
+      const { unmount } = render(
+        <RunnerStatusBadge derivedStatus={errored} recentCrash={{ ...crash, pid }} />,
+      );
       fireEvent.click(screen.getByText('Errored'));
 
       expect(screen.getByText('Dump file:')).toBeInTheDocument();

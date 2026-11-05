@@ -181,11 +181,7 @@ export function RunnerStatusBadge({
   return (
     <>
       <span
-        ref={
-          elementId !== undefined
-            ? (badgeRef as React.RefCallback<HTMLSpanElement>)
-            : undefined
-        }
+        ref={elementId !== undefined ? (badgeRef as React.RefCallback<HTMLSpanElement>) : undefined}
         data-ui-bridge-value={String(expanded)}
         className={`badge ${badgeClass}${clickable ? ' badge-clickable' : ''}`}
         style={style}
@@ -239,7 +235,13 @@ function UiErrorPanel({ uiError }: UiErrorPanelProps) {
       </div>
       <div
         className="text-muted"
-        style={{ fontSize: '0.7rem', marginBottom: '0.4rem', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}
+        style={{
+          fontSize: '0.7rem',
+          marginBottom: '0.4rem',
+          display: 'flex',
+          gap: '1rem',
+          flexWrap: 'wrap',
+        }}
       >
         <span>
           <strong>First seen:</strong> {formatTimestamp(uiError.first_seen)}
@@ -333,7 +335,13 @@ function RecentCrashPanel({ crash }: RecentCrashPanelProps) {
       </div>
       <div
         className="text-muted"
-        style={{ fontSize: '0.7rem', marginBottom: '0.4rem', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}
+        style={{
+          fontSize: '0.7rem',
+          marginBottom: '0.4rem',
+          display: 'flex',
+          gap: '1rem',
+          flexWrap: 'wrap',
+        }}
       >
         <span>
           <strong>Reported:</strong> {formatTimestamp(crash.reportedAt)}

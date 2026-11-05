@@ -181,7 +181,10 @@ function LogViewer() {
             </div>
           )}
           {filtered.map((l, i) => (
-            <div key={`${l.timestamp}-${l.source}-${i}`} className={`log-line ${levelClass(l.level)}`}>
+            <div
+              key={`${l.timestamp}-${l.source}-${i}`}
+              className={`log-line ${levelClass(l.level)}`}
+            >
               <span className="text-muted">{new Date(l.timestamp).toLocaleTimeString()} </span>[
               {l.source}] {l.message}
             </div>
@@ -318,8 +321,7 @@ export function RunnerWatchdogBadge({
 }) {
   if (!watchdog) return null;
 
-  const crashLoopDisarmed =
-    !!watchdog.disabled_reason && watchdog.crash_restart_armed !== false;
+  const crashLoopDisarmed = !!watchdog.disabled_reason && watchdog.crash_restart_armed !== false;
   if (crashLoopDisarmed) {
     const crashes = watchdog.crash_count ?? 0;
     const attempts = watchdog.restart_attempts ?? 0;
@@ -382,10 +384,7 @@ export function RunnerWatchdogBadge({
   }
 
   const armedButGlobalOff =
-    !isPrimary &&
-    running &&
-    watchdog.enabled === true &&
-    watchdog.crash_restart_armed === false;
+    !isPrimary && running && watchdog.enabled === true && watchdog.crash_restart_armed === false;
   if (armedButGlobalOff) {
     return (
       <span
@@ -413,10 +412,7 @@ export function RunnerWatchdogBadge({
   // twin, and `=== false` (not falsy) so a supervisor that predates the
   // serving arm — which reports `undefined` — never false-alarms.
   const servingArmOff =
-    !isPrimary &&
-    running &&
-    watchdog.enabled === true &&
-    watchdog.serving_restart_armed === false;
+    !isPrimary && running && watchdog.enabled === true && watchdog.serving_restart_armed === false;
   if (servingArmOff) {
     return (
       <span
@@ -512,9 +508,10 @@ export function PrebindHangBadge({
 
 function PanicBadge({ panic, runnerName }: { panic: RecentPanicSummary; runnerName: string }) {
   const [modalOpen, setModalOpen] = useState(false);
-  const tooltipPreview = `${panic.payload}${
-    panic.location ? `\n@ ${panic.location}` : ''
-  }`.slice(0, 500);
+  const tooltipPreview = `${panic.payload}${panic.location ? `\n@ ${panic.location}` : ''}`.slice(
+    0,
+    500,
+  );
 
   return (
     <>
@@ -544,7 +541,9 @@ function PanicBadge({ panic, runnerName }: { panic: RecentPanicSummary; runnerNa
       >
         Panic
       </button>
-      {modalOpen && <PanicModal panic={panic} runnerName={runnerName} onClose={() => setModalOpen(false)} />}
+      {modalOpen && (
+        <PanicModal panic={panic} runnerName={runnerName} onClose={() => setModalOpen(false)} />
+      )}
     </>
   );
 }
@@ -609,9 +608,7 @@ function PanicModal({
           }}
         >
           <div>
-            <div style={{ fontWeight: 600, fontSize: '1rem' }}>
-              Startup panic — {runnerName}
-            </div>
+            <div style={{ fontWeight: 600, fontSize: '1rem' }}>Startup panic — {runnerName}</div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
               {new Date(panic.timestamp).toLocaleString()}
               {panic.pid != null && ` · PID ${panic.pid}`}
@@ -1297,7 +1294,15 @@ function RunnerInstancesPanel() {
 
   return (
     <div className="card" style={{ marginBottom: '1rem' }}>
-      <div className="card-header" style={{ marginBottom: '0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+      <div
+        className="card-header"
+        style={{
+          marginBottom: '0.5rem',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}
+      >
         <span className="card-title">Runner Instances</span>
         <button
           className="btn"
@@ -1313,7 +1318,15 @@ function RunnerInstancesPanel() {
           the user hasn't clicked "+ New" yet, but the DOM nodes (and refs)
           are present so automation can target runner-spawn-submit without
           first toggling showAdd. */}
-      <div style={{ display: showAdd ? 'flex' : 'none', gap: '0.4rem', marginBottom: showAdd ? '0.5rem' : 0, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div
+        style={{
+          display: showAdd ? 'flex' : 'none',
+          gap: '0.4rem',
+          marginBottom: showAdd ? '0.5rem' : 0,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
         <input
           type="text"
           value={newName}
@@ -1344,7 +1357,15 @@ function RunnerInstancesPanel() {
             width: 80,
           }}
         />
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.2rem',
+            fontSize: '0.7rem',
+            cursor: 'pointer',
+          }}
+        >
           <input
             type="checkbox"
             checked={rebuild}
@@ -1353,7 +1374,15 @@ function RunnerInstancesPanel() {
           />
           Rebuild
         </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.2rem',
+            fontSize: '0.7rem',
+            cursor: 'pointer',
+          }}
+        >
           <input
             type="checkbox"
             checked={isProtected}
@@ -1449,9 +1478,7 @@ function RunnerInstancesPanel() {
                       })
                     }
                     onProtect={() =>
-                      doAction(`Protect ${r.name}`, () =>
-                        api.protectRunner(r.id, !r.protected),
-                      )
+                      doAction(`Protect ${r.name}`, () => api.protectRunner(r.id, !r.protected))
                     }
                   />
                 );
@@ -1784,7 +1811,9 @@ function DashboardInner() {
                 {data.services.map((svc) => (
                   <tr key={svc.name}>
                     <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{svc.name}</td>
-                    <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{svc.port}</td>
+                    <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>
+                      {svc.port}
+                    </td>
                     <td>
                       <StatusDot up={svc.available} />
                       <span
@@ -1814,10 +1843,8 @@ function DashboardInner() {
                         <SmallBtn
                           label="Start"
                           activeLabel="Starting..."
-                          onClick={doAction(
-                            `${svc.name.toLowerCase()}-start`,
-                            svc.name,
-                            () => api.devStartAction(`${svc.name.toLowerCase()}-start`),
+                          onClick={doAction(`${svc.name.toLowerCase()}-start`, svc.name, () =>
+                            api.devStartAction(`${svc.name.toLowerCase()}-start`),
                           )}
                           busy={busy}
                           busyKey={`${svc.name.toLowerCase()}-start`}
@@ -1825,10 +1852,8 @@ function DashboardInner() {
                         <SmallBtn
                           label="Stop"
                           activeLabel="Stopping..."
-                          onClick={doAction(
-                            `${svc.name.toLowerCase()}-stop`,
-                            svc.name,
-                            () => api.devStartAction(`${svc.name.toLowerCase()}-stop`),
+                          onClick={doAction(`${svc.name.toLowerCase()}-stop`, svc.name, () =>
+                            api.devStartAction(`${svc.name.toLowerCase()}-stop`),
                           )}
                           busy={busy}
                           busyKey={`${svc.name.toLowerCase()}-stop`}
@@ -1854,7 +1879,9 @@ function DashboardInner() {
                     marginBottom: '0.25rem',
                   }}
                 >
-                  <strong className="text-danger">{err.service} — {err.action} failed</strong>
+                  <strong className="text-danger">
+                    {err.service} — {err.action} failed
+                  </strong>
                   {err.stderr && (
                     <pre
                       style={{
@@ -1880,7 +1907,9 @@ function DashboardInner() {
           <div className="card-header" style={{ marginBottom: '0.5rem' }}>
             <span className="card-title">Expo</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}>
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}
+          >
             <StatusDot up={data.expo.running} />
             <span>{data.expo.running ? 'Running' : 'Stopped'}</span>
             {data.expo.port > 0 && (

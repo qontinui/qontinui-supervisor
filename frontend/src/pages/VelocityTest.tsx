@@ -141,7 +141,10 @@ function ResourceTable({ resources }: { resources: VtDiagnostics['resources'] })
             const shortName = r.name.split('/').pop()?.split('?')[0] || r.name;
             const isSlowResource = r.duration > 500;
             return (
-              <tr key={`${r.name}-${i}`} style={{ color: isSlowResource ? 'var(--danger)' : 'inherit' }}>
+              <tr
+                key={`${r.name}-${i}`}
+                style={{ color: isSlowResource ? 'var(--danger)' : 'inherit' }}
+              >
                 <td
                   title={r.name}
                   style={{
@@ -188,7 +191,10 @@ function LongTaskList({ tasks }: { tasks: VtDiagnostics['longTasks'] }) {
         const maxBar = 1000;
         const barWidth = Math.min((dur / maxBar) * 100, 100);
         return (
-          <div key={`task-${i}-${dur}`} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+          <div
+            key={`task-${i}-${dur}`}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}
+          >
             <span className="text-mono" style={{ width: 60, textAlign: 'right', color }}>
               {formatMs(dur)}
             </span>
@@ -550,7 +556,10 @@ export default function VelocityTest() {
           )}
         </div>
       </div>
-      <p className="page-desc">Automated page load performance tests — timing breakdown, bottleneck detection, and score trends.</p>
+      <p className="page-desc">
+        Automated page load performance tests — timing breakdown, bottleneck detection, and score
+        trends.
+      </p>
 
       {/* Progress bar */}
       {status?.running && (

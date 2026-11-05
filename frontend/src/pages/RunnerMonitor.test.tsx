@@ -82,7 +82,9 @@ describe('RunnerMonitor task-runs envelope', () => {
     expect(screen.getByText('2 active')).toBeInTheDocument();
 
     // The scope string is surfaced near the list, not silently dropped.
-    expect(screen.getByText(new RegExp(SCOPE_TEXT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))).toBeInTheDocument();
+    expect(
+      screen.getByText(new RegExp(SCOPE_TEXT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))),
+    ).toBeInTheDocument();
   });
 
   it('shows the scope alongside the empty state instead of an unqualified "no running tasks"', async () => {
@@ -126,9 +128,7 @@ describe('RunnerMonitor task-runs envelope', () => {
     });
 
     // The malformed response surfaced as a visible error, not a silent empty list.
-    expect(
-      screen.getByText(/Cannot read propert(y|ies) of null/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Cannot read propert(y|ies) of null/)).toBeInTheDocument();
     expect(screen.queryByText('task-1')).not.toBeInTheDocument();
   });
 });

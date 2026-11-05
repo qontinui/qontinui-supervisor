@@ -252,17 +252,16 @@ export default function RunnerMonitor() {
       <div className="page-header">
         <h1 className="page-title">Runner Monitor</h1>
       </div>
-      <p className="page-desc">Runner process health and active task runs — view workflow state, AI output, or stop tasks.</p>
+      <p className="page-desc">
+        Runner process health and active task runs — view workflow state, AI output, or stop tasks.
+      </p>
 
       <div className="card-grid">
         {/* Runner Health */}
         <div className="card">
           <div className="card-header">
             <span className="card-title">Runner Health</span>
-            <div
-              className="flex gap-2"
-              style={{ alignItems: 'center', flexWrap: 'wrap' }}
-            >
+            <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
               {runnerHealth === null && !healthError ? (
                 <span className="badge badge-warning">Unknown</span>
               ) : (
@@ -351,9 +350,7 @@ export default function RunnerMonitor() {
               onWorkflowState={wrapAction(`Workflow State (${run.id})`, () =>
                 api.runnerWorkflowState(run.id),
               )}
-              onAiOutput={wrapAction(`AI Output (${run.id})`, () =>
-                api.runnerTaskOutput(run.id),
-              )}
+              onAiOutput={wrapAction(`AI Output (${run.id})`, () => api.runnerTaskOutput(run.id))}
               onStop={wrapAction(`Stop (${run.id})`, () => api.runnerStopTask(run.id))}
             />
           ))}
