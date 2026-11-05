@@ -4,8 +4,9 @@
 //! reading the port and dropping the socket hands the port back to the kernel,
 //! and any `bind(0)` or `connect()` on the box can be given it before the code
 //! under test looks (coord finding `2d01deb3`, the `flywheel` flake; finding
-//! `ed257f86`, the purge flake). So no fixture here releases a port. Pick by
-//! what the code under test does with the port:
+//! `ed257f86`, the purge flake). So no fixture here releases a port, and
+//! [`tests::no_test_fixture_releases_a_port_to_fabricate_a_dead_one`] fails any
+//! test code that does. Pick by what the code under test does with the port:
 //!
 //! * It only CONNECTS: [`reserve_refused_port`]. Bound, never listened on, and
 //!   kept, so a connect is refused and nothing else can listen there.
@@ -18,6 +19,7 @@
 //! Plan `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`, Phase 2.
 
 mod ephemeral_ranges;
+mod release_scan;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -233,6 +235,8 @@ fn blocks_clear(ranges: &[ephemeral_ranges::PortRange]) -> Result<(), String> {
 mod tests {
     use super::*;
     use ephemeral_ranges::PortRange;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn an_unheld_port_reads_free_and_can_be_listened_on() {
@@ -338,6 +342,127 @@ mod tests {
             assert!(
                 why.contains("27000-27999") && why.contains("28000-28999"),
                 "{why}"
+            );
+        }
+    }
+
+    /// Release sites the tripwire accepts, each with the reason inline. A listed
+    /// site that no longer releases fails the tripwire, so the list cannot
+    /// outlive its reasons.
+    const ALLOWED: [(&str, &str, &str); 2] = [
+        (
+            "src/process/port.rs",
+            "test_free_port_reads_as_free",
+            "its subject IS a released port: the bind probe must read a port it just let go \
+             as free, and it retries on a fresh port when another socket took it",
+        ),
+        (
+            "src/process/port.rs",
+            "test_time_wait_remnant_reads_as_free",
+            "its subject IS the TIME_WAIT a released port leaves: the probe must read the \
+             remnant as free, which only a released port can show",
+        ),
+    ];
+
+    /// No test fixture fabricates a "dead" port by binding port 0, reading the
+    /// port and letting the socket go (plan
+    /// `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`, Phase 2): such a
+    /// port is anybody's, so a bind probe can read it held and a stop or a purge
+    /// can kill whatever took it. Use [`unheld_port`] or [`reserve_refused_port`].
+    ///
+    /// The rule is data flow, not syntax: [`release_scan`] says what a release
+    /// is. It covers all test code under `src/` and `tests/`: files that are
+    /// test code as a whole (an integration test, `#![cfg(test)]`, or a module
+    /// declared under `#[cfg(test)]`) and test items in the rest.
+    #[test]
+    fn no_test_fixture_releases_a_port_to_fabricate_a_dead_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let scans = release_scan::scan_crate(root);
+        let mut unread = Vec::new();
+        let mut binds = 0;
+        let mut releases = Vec::new();
+        let mut allowed_hits: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        for (path, scan) in &scans {
+            let Some(scan) = scan else {
+                unread.push(path.clone());
+                continue;
+            };
+            binds += scan.binds;
+            for release in &scan.releases {
+                match ALLOWED
+                    .iter()
+                    .find(|(p, f, _)| *p == path.as_str() && *f == release.function)
+                {
+                    Some((p, f, _)) => *allowed_hits.entry((*p, *f)).or_default() += 1,
+                    None => releases.push(format!("{path}:{} {release}", release.line)),
+                }
+            }
+        }
+        assert!(
+            unread.is_empty(),
+            "files the scan could not read: {unread:?}"
+        );
+        assert!(
+            releases.is_empty(),
+            "test code releases a port to fabricate a dead one; take it from \
+             test_ports::unheld_port() (code that bind-probes the port or can kill its \
+             holder) or test_ports::reserve_refused_port() (code that only connects):\n{}",
+            releases.join("\n")
+        );
+        let stale: Vec<_> = ALLOWED
+            .iter()
+            .filter(|(p, f, _)| !allowed_hits.contains_key(&(*p, *f)))
+            .map(|(p, f, _)| format!("{p} {f}"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "allowlisted sites that no longer release a port; remove them: {stale:?}"
+        );
+        // A scan that followed no binds would pass on a blind reader.
+        assert!(
+            binds >= 20,
+            "the scan followed only {binds} port-0 binds in test code; it is not reading the \
+             tree"
+        );
+    }
+
+    /// The held listeners the tripwire must never flag, read from the tree: each is
+    /// dropped only after its port's last use.
+    #[test]
+    fn the_tripwire_does_not_flag_a_listener_held_past_its_ports_last_use() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let scans = release_scan::scan_crate(root);
+        for (path, function) in [
+            (
+                "src/process/manager/tests.rs",
+                "skip_for_startup_window_decisions",
+            ),
+            (
+                "src/process/manager/tests.rs",
+                "port_held_guard_does_not_refuse_a_non_runner_listener",
+            ),
+            (
+                "src/routes/runners/tests.rs",
+                "purge_spares_a_runner_past_its_window_whose_port_is_listening",
+            ),
+        ] {
+            let scan = scans
+                .get(path)
+                .and_then(Option::as_ref)
+                .unwrap_or_else(|| panic!("{path} was not scanned"));
+            let binds = scan
+                .function_binds
+                .get(function)
+                .unwrap_or_else(|| panic!("{path} has no test function {function}"));
+            assert!(
+                *binds >= 1,
+                "{path} {function}: the scan followed no bind there, so this case proves nothing"
+            );
+            assert!(
+                scan.releases.iter().all(|r| r.function != function),
+                "{path} {function} holds its listener past the port's last use, yet was flagged: \
+                 {:?}",
+                scan.releases
             );
         }
     }
