@@ -7219,3 +7219,181 @@ fn the_wedged_line_says_what_the_serving_arm_decided() {
         "no decision evaluated is said, never a claimed one"
     );
 }
+
+/// A supervisor that is shutting down starts nothing: off Windows the shutdown
+/// sweep reads the registry once, so a temp runner started after it (a
+/// `spawn-test` build finishing during the drain, a crash-watchdog restart of a
+/// swept runner) would be orphaned. Plan
+/// `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`.
+/// The control start runs first, on the same runner, so the refusal is shown
+/// to come from the latch and not from this state's missing runner exe.
+#[tokio::test]
+async fn no_runner_is_started_once_the_shutdown_has_latched() {
+    let (state, _root) = restart_test_state();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let id = "test-shutdown-latched";
+    let config = crate::config::RunnerConfig {
+        id: id.to_string(),
+        name: format!("Runner {id}"),
+        port,
+        kind: qontinui_types::wire::runner_kind::RunnerKind::Temp { id: id.to_string() },
+        protected: false,
+        server_mode: false,
+        restate_ingress_port: None,
+        restate_admin_port: None,
+        restate_service_port: None,
+        external_restate_admin_url: None,
+        external_restate_ingress_url: None,
+        extra_env: Default::default(),
+        fresh_device_identity: false,
+    };
+    let managed = Arc::new(ManagedRunner::new(config, false));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.to_string(), managed.clone());
+
+    let before = start_managed_runner(&state, &managed, None, StartAs::Registered)
+        .await
+        .expect_err("this state has no runner exe to start");
+    assert!(
+        !matches!(before, SupervisorError::ShuttingDown(_)),
+        "before the shutdown latches a start must not be refused as shutting down: {before}"
+    );
+
+    state.signal_shutdown();
+    let after = start_managed_runner(&state, &managed, None, StartAs::Registered)
+        .await
+        .expect_err("a start after the shutdown latched must be refused");
+    assert!(
+        matches!(&after, SupervisorError::ShuttingDown(rid) if rid == id),
+        "expected ShuttingDown('{id}'), got: {after}"
+    );
+    assert!(
+        managed.runner.read().await.pid.is_none(),
+        "a refused start must spawn nothing"
+    );
+}
+
+/// `manager.rs`'s production source, for the source guards below.
+fn manager_production_source() -> String {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    crate::source_scan::production_span(&src).to_string()
+}
+
+/// The body of `sig` in `manager.rs`, up to its own closing brace.
+fn manager_fn_body(sig: &str) -> String {
+    crate::source_scan::fn_body(&manager_production_source(), sig)
+        .unwrap_or_else(|| panic!("{sig} exists"))
+        .to_string()
+}
+
+// Source guards for the wiring the Linux isolation and shutdown helpers depend
+// on (plan
+// `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`).
+// Each helper has its own tests; these pin that the ONE spawn site, the one
+// start entry point and the startup reaper actually call them, in order.
+
+#[test]
+fn the_spawn_site_sets_the_process_group_and_stdin_before_it_spawns() {
+    let spawn_site = manager_fn_body("async fn start_exe_mode_for_runner(");
+    let spawn = spawn_site
+        .find("let mut child = cmd")
+        .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    let group = spawn_site
+        .find("crate::process::unix_kill::lead_own_process_group(&mut cmd);")
+        .expect(
+            "the runner must lead its own process group on Unix, or `kill_by_pid_tree`'s \
+             `kill(-pid)` reaches no group and the shutdown sweep signals nothing but the pid",
+        );
+    let stdin = spawn_site
+        .find(".stdin(Stdio::null())")
+        .expect("a group-leading runner must not inherit the supervisor's tty as stdin (SIGTTIN)");
+    assert!(
+        group < spawn && stdin < spawn,
+        "the process group and stdin are set BEFORE the spawn (group {group}, stdin {stdin}, \
+         spawn {spawn})"
+    );
+}
+
+#[test]
+fn the_spawn_site_confirms_a_scoped_landing_and_fails_an_early_exit() {
+    let spawn_site = manager_fn_body("async fn start_exe_mode_for_runner(");
+    let spawn = spawn_site
+        .find("let mut child = cmd")
+        .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    let landing = spawn_site
+        .find("await_scope_landing(")
+        .expect("a scoped spawn must be confirmed to have landed in its unit");
+    assert!(
+        spawn < landing,
+        "the landing is confirmed after the spawn ({spawn} vs {landing})"
+    );
+    let exited = spawn_site
+        .find("LandingOutcome::ExitedBeforeLanding(")
+        .expect("the exited-before-landing arm is handled");
+    let exited_arm = &spawn_site[exited..];
+    let arm_end = exited_arm
+        .find("LandingOutcome::Failed(")
+        .unwrap_or(exited_arm.len());
+    assert!(
+        exited_arm[..arm_end].contains("return Err("),
+        "a scope start that exited before it landed is a FAILED start, not a started runner"
+    );
+}
+
+#[test]
+fn a_start_reads_the_shutdown_latch_under_its_lock_and_clears_the_old_verdict() {
+    let start = manager_fn_body("pub async fn start_managed_runner(");
+    let lock = start
+        .find("managed.lifecycle.lock().await")
+        .expect("start_managed_runner takes the lifecycle lock");
+    let latch = start
+        .find("shutdown_latched")
+        .expect("a start must refuse once the shutdown has latched");
+    let refuse = start
+        .find("SupervisorError::ShuttingDown(")
+        .expect("checked above");
+    assert!(
+        lock < latch && latch < refuse,
+        "the shutdown latch is read UNDER the lifecycle lock, which the sweep waits for \
+         (lock {lock}, latch {latch}, refusal {refuse})"
+    );
+    let reset = start
+        .find("*managed.isolation.write().await = None;")
+        .expect("a start clears the previous spawn's isolation verdict");
+    let spawn_call = start
+        .find("start_exe_mode_for_runner(state, managed)")
+        .expect("start_managed_runner spawns through start_exe_mode_for_runner");
+    assert!(
+        reset < spawn_call,
+        "the old verdict is cleared before the spawn, so a failed start cannot keep it"
+    );
+}
+
+#[test]
+fn the_startup_reaper_runs_one_reconcile_pass_before_its_loop() {
+    let reaper = manager_fn_body("pub async fn reap_stale_test_runners(");
+    let wait = reaper
+        .find("tokio::time::sleep(Duration::from_secs(30)).await;")
+        .expect("the startup wait");
+    let pass = reaper
+        .find("reconcile_orphaned_temp_runners(&state).await;")
+        .expect("one reconcile pass must run at startup");
+    let looped = reaper.find("loop {").expect("the periodic loop");
+    assert!(
+        wait < pass && pass < looped,
+        "the startup reconcile pass runs after the 30 s wait and before the loop (wait {wait}, \
+         pass {pass}, loop {looped})"
+    );
+}

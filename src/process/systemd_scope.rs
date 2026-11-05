@@ -147,7 +147,8 @@ pub enum SystemdProbe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunnerIsolationReport {
     /// `"systemd-scope"` when every user-owned runner this supervisor spawns
-    /// (and has spawned and still runs) leaves its cgroup; `"none"` otherwise.
+    /// (and has spawned and still runs) leaves its cgroup; `"unknown"` before
+    /// the systemd preflight has answered; `"none"` otherwise.
     pub mechanism: &'static str,
     /// Why — always present, never blank.
     pub reason: String,
@@ -407,17 +408,22 @@ pub fn proc_state(proc_root: &Path, pid: u32) -> Option<char> {
     rest.split_whitespace().next()?.chars().next()
 }
 
-/// The cgroup v2 path of a `/proc/<pid>/cgroup` body: the `0::` line, else the
-/// path field of the last line (a v1/hybrid layout).
+/// The systemd cgroup path of a `/proc/<pid>/cgroup` body: the unified
+/// (`0::`) line; else, on a v1 layout, the `name=systemd` hierarchy (the one
+/// systemd places units in); else the path field of the last line.
 pub fn cgroup_path(body: &str) -> Option<String> {
     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
     if let Some(v2) = lines.iter().find_map(|l| l.strip_prefix("0::")) {
         return Some(v2.trim().to_string());
     }
-    lines
-        .last()
-        .and_then(|l| l.splitn(3, ':').nth(2))
-        .map(|p| p.trim().to_string())
+    let path_of = |l: &str| l.splitn(3, ':').nth(2).map(|p| p.trim().to_string());
+    if let Some(named) = lines
+        .iter()
+        .find(|l| l.split(':').nth(1) == Some("name=systemd"))
+    {
+        return path_of(named);
+    }
+    lines.last().and_then(|l| path_of(l))
 }
 
 /// Read `<proc_root>/<pid>/exe` and `<proc_root>/<pid>/cgroup` once and
@@ -434,6 +440,11 @@ pub fn observe_landing(proc_root: &Path, pid: u32, unit: &str) -> LandingObserva
             }
         }
     };
+    // Pending is recognised by the exe's NAME. A `systemd-run` reached through
+    // a wrapper script (the exe is then its interpreter) reads Elsewhere and
+    // fails the start; that is the fail-safe direction — the runner is killed
+    // and never runs unscoped — so it is accepted rather than widening
+    // "pending" to "anything that is not yet the runner".
     if exe.file_name().and_then(|n| n.to_str()) == Some(SYSTEMD_RUN) {
         return LandingObservation::Pending;
     }
@@ -461,10 +472,10 @@ pub enum LandingOutcome {
     Failed(String),
     /// The spawned process exited before its landing could be observed: either
     /// `systemd-run` could not start the scope, or the runner exec'd and died
-    /// at once. The process is left UNREAPED, so the caller's ordinary
-    /// exit handling (exit monitor, panic log, early log — which carries
-    /// `systemd-run`'s own stderr) reports it. Nothing of this start is alive,
-    /// so nothing user-owned can be left in the supervisor's cgroup.
+    /// at once. The process is left UNREAPED and its stdio untouched, so the
+    /// caller can reap it and read `systemd-run`'s own error off its stderr;
+    /// the spawn site reports the start as FAILED. Nothing of this start is
+    /// alive, so nothing user-owned can be left in the supervisor's cgroup.
     ExitedBeforeLanding(String),
 }
 
@@ -495,7 +506,7 @@ async fn kill_spawned(child: &mut tokio::process::Child) {
 /// - landed → [`LandingOutcome::Landed`];
 /// - exited before landing → [`LandingOutcome::ExitedBeforeLanding`], naming
 ///   both shapes it could be (`systemd-run` never exec'd, or the runner died
-///   at once), the child left for the caller's exit handling;
+///   at once), the child left unreaped for the caller to reap and report;
 /// - exec'd into a cgroup that is not the unit → killed, failed;
 /// - at the bound, still pending or unreadable → the identity is re-read
 ///   once (a landing at that last instant is accepted), otherwise the pending
@@ -523,7 +534,7 @@ pub async fn await_scope_landing(
                 return LandingOutcome::ExitedBeforeLanding(format!(
                     "PID {pid} exited before it was observed in {unit}: either {SYSTEMD_RUN} could \
                      not start the scope (it never exec'd the runner) or the runner exec'd and \
-                     died at once — the runner's early log carries {SYSTEMD_RUN}'s own error"
+                     died at once"
                 ));
             }
             LandingObservation::Elsewhere { cgroup } => {
@@ -603,8 +614,10 @@ pub fn summarize_isolation(
         };
     }
     match probe {
+        // Not "none": nothing has been measured yet, and a consumer must not
+        // read an unmeasured answer as a negative one.
         None => RunnerIsolationReport {
-            mechanism: "none",
+            mechanism: "unknown",
             reason: "UNKNOWN — the systemd preflight has not run yet".to_string(),
         },
         Some(SystemdProbe::Unavailable(why)) => RunnerIsolationReport {
@@ -625,6 +638,108 @@ pub fn summarize_isolation(
             }
         }
     }
+}
+
+// ---- the supervisor's OWN unit (self-restart) ------------------------------
+
+/// Where this process sits relative to a systemd SERVICE unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnUnit {
+    /// Not inside a `*.service` leaf cgroup (a scope, a slice, or not Linux).
+    NotAService,
+    /// Inside service `unit`, whose main process is `main_pid`.
+    Service { unit: String, main_pid: u32 },
+    /// Whether this process is a service's main process could not be read.
+    Unknown { why: String },
+}
+
+/// The `*.service` leaf of a cgroup path, if that is what the path ends in. Pure.
+pub fn service_leaf(cgroup: &str) -> Option<&str> {
+    let leaf = cgroup.rsplit('/').next()?;
+    (leaf.len() > ".service".len() && leaf.ends_with(".service")).then_some(leaf)
+}
+
+/// Why a self-restart must be refused, or `None` when it may proceed. Pure.
+///
+/// A replacement spawned by a service's MAIN process lives in the same unit,
+/// and systemd stops the unit and kills the rest of its cgroup the moment the
+/// main process exits (`KillMode=mixed`, and the default `control-group`;
+/// plan Phase 0 P2c) — so the replacement dies with the process it replaces.
+/// That is exactly how `supervisor-verbs.sh start` runs the supervisor on
+/// Linux. An UNKNOWN answer is refused too: the input gates an action.
+pub fn self_restart_refusal(own: &OwnUnit, self_pid: u32) -> Option<String> {
+    const HOW: &str = "Restart it with `supervisor-verbs.sh stop` and then `start`";
+    match own {
+        OwnUnit::NotAService => None,
+        OwnUnit::Service { main_pid, .. } if *main_pid != self_pid => None,
+        OwnUnit::Service { unit, .. } => Some(format!(
+            "this supervisor is the main process of systemd unit {unit}: a replacement it \
+             spawned would run in that unit and be killed with it the moment this process \
+             exits. {HOW}."
+        )),
+        OwnUnit::Unknown { why } => Some(format!(
+            "whether this supervisor is the main process of a systemd service is UNKNOWN \
+             ({why}); a replacement spawned by a service's main process is killed with it, so \
+             the restart is refused. {HOW}."
+        )),
+    }
+}
+
+/// Read this process's own unit: `<proc_root>/self/cgroup`, and — when that
+/// ends in a `*.service` — the unit's `MainPID` from a bounded
+/// `systemctl [--user] show`. Off Linux, and in a unit-test build (which never
+/// queries the host's systemd), [`OwnUnit::NotAService`].
+pub async fn own_unit(proc_root: &Path) -> OwnUnit {
+    if !cfg!(target_os = "linux") || cfg!(test) {
+        return OwnUnit::NotAService;
+    }
+    let body = match std::fs::read_to_string(proc_root.join("self").join("cgroup")) {
+        Ok(body) => body,
+        Err(e) => {
+            return OwnUnit::Unknown {
+                why: format!("/proc/self/cgroup: {e}"),
+            }
+        }
+    };
+    let Some(path) = cgroup_path(&body) else {
+        return OwnUnit::Unknown {
+            why: "/proc/self/cgroup names no cgroup path".to_string(),
+        };
+    };
+    let Some(unit) = service_leaf(&path) else {
+        return OwnUnit::NotAService;
+    };
+    let mut cmd = tokio::process::Command::new("systemctl");
+    // A unit under the user manager's cgroup (`…/user@<uid>.service/…`) is the
+    // user manager's; anything else is the system manager's.
+    if path.contains("/user@") {
+        cmd.arg("--user");
+    }
+    cmd.args(["show", "-p", "MainPID", "--value", unit])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let why = match tokio::time::timeout(MANAGER_PROBE_TIMEOUT, cmd.output()).await {
+        Err(_) => format!(
+            "`systemctl show -p MainPID {unit}` did not answer within {}s",
+            MANAGER_PROBE_TIMEOUT.as_secs()
+        ),
+        Ok(Err(e)) => format!("`systemctl show -p MainPID {unit}` could not run: {e}"),
+        Ok(Ok(out)) if !out.status.success() => {
+            format!("`systemctl show -p MainPID {unit}` exited {}", out.status)
+        }
+        Ok(Ok(out)) => match String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() {
+            Ok(main_pid) if main_pid > 0 => {
+                return OwnUnit::Service {
+                    unit: unit.to_string(),
+                    main_pid,
+                }
+            }
+            _ => format!("`systemctl show -p MainPID {unit}` named no main process"),
+        },
+    };
+    OwnUnit::Unknown { why }
 }
 
 #[cfg(test)]
@@ -839,6 +954,17 @@ mod tests {
             cgroup_path("1:name=systemd:/z.scope\n").as_deref(),
             Some("/z.scope")
         );
+        // A v1 layout: the `name=systemd` hierarchy wins even when it is not
+        // the last line, so a last-line reader would answer `/mem`.
+        assert_eq!(
+            cgroup_path("2:cpu,cpuacct:/cpu\n1:name=systemd:/user.slice/a.scope\n3:memory:/mem\n")
+                .as_deref(),
+            Some("/user.slice/a.scope")
+        );
+        assert_eq!(
+            cgroup_path("2:cpu,cpuacct:/cpu\n3:memory:/mem\n").as_deref(),
+            Some("/mem")
+        );
         assert_eq!(cgroup_path(""), None);
     }
 
@@ -892,6 +1018,27 @@ mod tests {
             LandingObservation::Unreadable(_)
         ));
 
+        // Other SCOPES are elsewhere too — the hazard the plan names is itself
+        // a scope (`qontinui-pty-holder-*`), and a sibling runner's scope
+        // shares the unit prefix. Only the unit's own leaf is a landing.
+        let pty_holder =
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-pty-holder-abc.scope";
+        fake_proc(root, 15, "/ws/target/debug/qontinui-runner-x", pty_holder);
+        assert_eq!(
+            observe_landing(root, 15, UNIT),
+            LandingObservation::Elsewhere {
+                cgroup: pty_holder.to_string()
+            }
+        );
+        let sibling = "/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner-y-20261104T230000000Z.scope";
+        fake_proc(root, 16, "/ws/target/debug/qontinui-runner-x", sibling);
+        assert_eq!(
+            observe_landing(root, 16, UNIT),
+            LandingObservation::Elsewhere {
+                cgroup: sibling.to_string()
+            }
+        );
+
         // A zombie: no readable exe, `stat` says Z.
         std::fs::create_dir_all(root.join("14")).expect("fake pid dir");
         std::fs::write(
@@ -920,7 +1067,7 @@ mod tests {
         assert!(mixed.reason.contains("'n2'"), "{}", mixed.reason);
 
         let unknown = summarize_isolation(true, None, &[]);
-        assert_eq!(unknown.mechanism, "none");
+        assert_eq!(unknown.mechanism, "unknown");
         assert!(unknown.reason.contains("UNKNOWN"), "{}", unknown.reason);
 
         let down = summarize_isolation(
@@ -940,5 +1087,63 @@ mod tests {
             summarize_isolation(false, Some(&available()), &[scoped]).mechanism,
             "none"
         );
+    }
+
+    // ---- the supervisor's own unit (self-restart) -------------------------
+
+    #[test]
+    fn service_leaf_names_only_a_service() {
+        assert_eq!(
+            service_leaf("/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-supervisor-20261105T080000Z.service"),
+            Some("qontinui-supervisor-20261105T080000Z.service")
+        );
+        assert_eq!(
+            service_leaf("/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-pty-holder-abc.scope"),
+            None
+        );
+        assert_eq!(
+            service_leaf("/user.slice/user-1000.slice/session-3.scope"),
+            None
+        );
+        assert_eq!(service_leaf("/.service"), None);
+        assert_eq!(service_leaf(""), None);
+    }
+
+    #[test]
+    fn self_restart_is_refused_only_for_a_service_main_process_or_unknown() {
+        assert_eq!(self_restart_refusal(&OwnUnit::NotAService, 4242), None);
+        // Inside a service whose main process is someone else (a bare launch
+        // from a runner pane): the replacement outlives this process.
+        assert_eq!(
+            self_restart_refusal(
+                &OwnUnit::Service {
+                    unit: "qontinui-runner.service".to_string(),
+                    main_pid: 100,
+                },
+                4242
+            ),
+            None
+        );
+        let own = self_restart_refusal(
+            &OwnUnit::Service {
+                unit: "qontinui-supervisor-20261105T080000Z.service".to_string(),
+                main_pid: 4242,
+            },
+            4242,
+        )
+        .expect("the main process of its own unit must be refused");
+        assert!(
+            own.contains("qontinui-supervisor-20261105T080000Z.service")
+                && own.contains("supervisor-verbs.sh stop"),
+            "{own}"
+        );
+        let unknown = self_restart_refusal(
+            &OwnUnit::Unknown {
+                why: "systemctl did not answer".to_string(),
+            },
+            4242,
+        )
+        .expect("an UNKNOWN own unit must be refused");
+        assert!(unknown.contains("UNKNOWN"), "{unknown}");
     }
 }

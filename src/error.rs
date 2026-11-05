@@ -23,6 +23,13 @@ pub enum SupervisorError {
     #[error("Crash restart superseded: {0}")]
     StartSuperseded(String),
 
+    /// The supervisor is shutting down, so it starts no runner: a runner
+    /// started now would be managed by nobody once this process exits (off
+    /// Windows nothing in the OS would reap a temp one either). Plan
+    /// `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`.
+    #[error("Supervisor is shutting down; not starting runner '{0}'")]
+    ShuttingDown(String),
+
     /// Legacy variant — retained for call sites in `process/manager.rs` and
     /// `routes/runner.rs` that report "build currently in progress". With the
     /// parallel build pool, this is derived from "any slot busy".
@@ -311,6 +318,7 @@ impl SupervisorError {
             SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
             SupervisorError::RunnerLifecycleBusy(_) => StatusCode::CONFLICT,
             SupervisorError::StartSuperseded(_) => StatusCode::CONFLICT,
+            SupervisorError::ShuttingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,

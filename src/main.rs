@@ -296,7 +296,13 @@ async fn main() -> anyhow::Result<()> {
                 .logs
                 .emit(LogSource::Supervisor, LogLevel::Info, msg)
                 .await;
-            *state_for_probe.runner_isolation_probe.write().await = Some(probe);
+            // A user-owned spawn re-probes and records its own result. If one
+            // already has, that answer is newer than this startup probe, so
+            // it is kept rather than overwritten by an older reading.
+            let mut slot = state_for_probe.runner_isolation_probe.write().await;
+            if slot.is_none() {
+                *slot = Some(probe);
+            }
         });
     }
 

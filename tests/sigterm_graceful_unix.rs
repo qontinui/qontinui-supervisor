@@ -210,6 +210,13 @@ fn sigterm_is_a_graceful_shutdown_and_names_its_signal() {
         "SIGTERM must be handled as a graceful shutdown that names its signal (exit {status}). \
          Output:\n{output}"
     );
+    // The off-Windows temp-runner sweep RAN on this signal (this supervisor
+    // has no temp runner, so the sweep says it found none) — not merely that
+    // its call is somewhere in the source.
+    assert!(
+        output.contains("Shutdown sweep: no temp runner with a known PID to stop"),
+        "the SIGTERM shutdown must run the off-Windows temp-runner sweep. Output:\n{output}"
+    );
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(
         status.signal(),

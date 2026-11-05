@@ -2446,6 +2446,21 @@ pub async fn start_managed_runner(
     // from the registry. See `ManagedRunner::lifecycle`.
     let _lifecycle = managed.lifecycle.lock().await;
 
+    // A supervisor that is shutting down starts nothing. Off Windows nothing in
+    // the OS reaps a temp runner when this process exits, and the shutdown
+    // sweep reads the registry once: a start that slipped in after it (a
+    // `spawn-test` build finishing during the drain, or a crash-watchdog
+    // restart of a swept runner) would be orphaned. Checked under the
+    // lifecycle lock, so the sweep — which waits for that lock — sees every
+    // start that got past this point. Plan
+    // 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
+    if state
+        .shutdown_latched
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(SupervisorError::ShuttingDown(runner_id));
+    }
+
     match start_as {
         StartAs::Registered => {
             if !is_registered(state, managed).await {
@@ -2514,6 +2529,9 @@ pub async fn start_managed_runner(
         )
         .await;
 
+    // The previous spawn's verdict (and its long-collected unit) must not
+    // outlive a failed start of this one.
+    *managed.isolation.write().await = None;
     let SpawnResult {
         mut child,
         panic_log_dir,
@@ -3778,7 +3796,7 @@ async fn start_exe_mode_for_runner(
     // pid `spawn()` returns is the runner's); everything else spawns the exe
     // directly. Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
     // and-orphans-its-temp-runners, Phase 1b.
-    let (mut cmd, mut isolation, probe) = crate::process::systemd_scope::isolation_command(
+    let (mut cmd, isolation, probe) = crate::process::systemd_scope::isolation_command(
         &managed.config.kind(),
         &managed.config.id,
         &exe_path,
@@ -3788,6 +3806,11 @@ async fn start_exe_mode_for_runner(
         *state.runner_isolation_probe.write().await = Some(probe);
     }
     cmd.current_dir(&state.config.project_dir)
+        // Never the supervisor's own stdin: a runner leads its own process
+        // group on Unix (below), so if the supervisor runs in a terminal's
+        // foreground the runner is a BACKGROUND group there, and any read of an
+        // inherited tty would stop it with SIGTTIN.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // The supervisor inherits Claude Code's topology markers from whatever
@@ -3930,22 +3953,23 @@ async fn start_exe_mode_for_runner(
                 );
             }
             crate::process::systemd_scope::LandingOutcome::ExitedBeforeLanding(reason) => {
-                // Already dead, so nothing user-owned is left in the
-                // supervisor's cgroup. Hand the (unreaped) child on: the exit
-                // monitor, panic log and early log report it like any runner
-                // that died at start.
+                // A FAILED start, like the two shapes below: the process is
+                // already dead, so nothing user-owned is left in the
+                // supervisor's cgroup, and it is never retried unscoped. Reap
+                // it and name what it said — when `systemd-run` could not
+                // start the scope, its own error is on this stderr pipe.
+                let (status, stderr_tail) = reap_with_stderr_tail(&mut child).await;
                 let msg = format!(
-                    "Runner '{}' exited before its systemd scope landing was confirmed — {}",
-                    managed.config.name, reason
+                    "Runner '{}' did NOT start: it exited before its systemd scope landing was \
+                     confirmed — {}. Exit: {}. stderr (tail): {}. It was not retried unscoped.",
+                    managed.config.name, reason, status, stderr_tail
                 );
-                warn!("{}", msg);
+                error!("{}", msg);
                 state
                     .logs
-                    .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                    .emit(LogSource::Supervisor, LogLevel::Error, msg.clone())
                     .await;
-                isolation = crate::process::systemd_scope::Isolation::Unscoped(format!(
-                    "exited before its landing in {unit} was confirmed"
-                ));
+                return Err(SupervisorError::Process(msg));
             }
             crate::process::systemd_scope::LandingOutcome::Failed(reason) => {
                 let msg = format!(
@@ -3969,6 +3993,45 @@ async fn start_exe_mode_for_runner(
         panic_log_dir,
         isolation,
     })
+}
+
+/// Reap a spawned process that has already exited, and read the tail of its
+/// piped stderr — both bounded, since a grandchild could still hold the pipe.
+/// Returns `(exit status, stderr tail)` as display strings; either can read
+/// as UNKNOWN with the reason, never as an empty success.
+async fn reap_with_stderr_tail(child: &mut tokio::process::Child) -> (String, String) {
+    use tokio::io::AsyncReadExt;
+    const BOUND: Duration = Duration::from_secs(2);
+    const TAIL_BYTES: usize = 2048;
+
+    let status = match tokio::time::timeout(BOUND, child.wait()).await {
+        Ok(Ok(status)) => status.to_string(),
+        Ok(Err(e)) => format!("UNKNOWN (wait failed: {e})"),
+        Err(_) => format!("UNKNOWN (not reaped within {}s)", BOUND.as_secs()),
+    };
+    let tail = match child.stderr.take() {
+        None => "UNKNOWN (no stderr pipe)".to_string(),
+        Some(mut stderr) => {
+            let mut buf = Vec::new();
+            match tokio::time::timeout(BOUND, stderr.read_to_end(&mut buf)).await {
+                Ok(Ok(_)) => {
+                    let start = buf.len().saturating_sub(TAIL_BYTES);
+                    let text = String::from_utf8_lossy(&buf[start..]).trim().to_string();
+                    if text.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        text
+                    }
+                }
+                Ok(Err(e)) => format!("UNKNOWN (read failed: {e})"),
+                Err(_) => format!(
+                    "UNKNOWN (the pipe stayed open past {}s — a child may still hold it)",
+                    BOUND.as_secs()
+                ),
+            }
+        }
+    };
+    (status, tail)
 }
 
 /// Default deadline for a newly-spawned runner to bind its HTTP API

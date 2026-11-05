@@ -669,11 +669,14 @@ pub async fn health(
     Json(value).into_response()
 }
 
-/// `/health` `runner_isolation`: `{"mechanism": "systemd-scope"|"none",
+/// `/health` `runner_isolation`: `{"mechanism": "systemd-scope"|"unknown"|"none",
 /// "reason": …}` — whether user-owned runners this supervisor spawns leave its
 /// cgroup (Linux, plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
-/// and-orphans-its-temp-runners` Phase 1b). `supervisor-verbs.sh stop` refuses
-/// to stop a supervisor with Named runners unless this reads `systemd-scope`.
+/// and-orphans-its-temp-runners` Phase 1b; `unknown` until the systemd
+/// preflight has answered). Its consumer is qontinui-claude-config's
+/// `supervisor-verbs.sh stop` (that plan's Phase 2), which treats anything but
+/// `systemd-scope` as not isolated, and also checks each user-owned runner's
+/// own cgroup before it stops a supervisor.
 ///
 /// `systemd-scope` needs BOTH a positive systemd preflight AND no running
 /// user-owned runner this supervisor spawned unscoped: one such runner shares

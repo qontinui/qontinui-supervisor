@@ -721,12 +721,16 @@ pub async fn list_runners(
 
         // Linux spawn isolation (plan 2026-11-04-linux-dev-supervisor-dies-with-
         // its-launcher-and-orphans-its-temp-runners, Phase 1b). `isolation_unit`
-        // is the runner's own transient systemd scope — `systemctl --user stop
-        // <unit>` stops it — or null; `isolation` carries the verdict and its
-        // reason, null when this supervisor never started the runner.
+        // is the RUNNING runner's own transient systemd scope (the full unit
+        // name, `.scope` included — `systemctl --user stop <unit>` stops it),
+        // or null; a stopped runner's scope has already been collected.
+        // `isolation` carries the last spawn's verdict and its reason, null
+        // when this supervisor never started the runner.
         let isolation = managed.isolation.read().await.clone();
+        let is_running = managed.runner.read().await.running;
         let isolation_unit = isolation
             .as_ref()
+            .filter(|_| is_running)
             .and_then(|i| i.unit().map(str::to_string));
         let isolation_json = isolation.as_ref().map(|i| i.to_json());
 

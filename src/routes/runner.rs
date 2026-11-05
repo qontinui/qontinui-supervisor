@@ -1477,20 +1477,42 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // NOTE: we deliberately do NOT sweep temp runners here — same
-    // reasoning as the shutdown path in `main.rs` ("the dominant source of
-    // `POST /supervisor/shutdown` latency: it iterated every temp runner with
-    // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
-    // wall-clock"). The `std::process::exit(0)` below closes this process's
-    // handles, including the kill-on-exit JobObject's, so the kernel reaps
-    // every assigned temp runner anyway.
+    // A supervisor that is the MAIN process of a systemd service — which is
+    // how `supervisor-verbs.sh start` runs it on Linux — cannot restart itself
+    // this way: the replacement would be spawned into the same unit, and
+    // systemd kills the rest of that unit's cgroup the moment this process
+    // exits. Refuse BEFORE spawning anything, naming the way that works.
+    let own_unit = crate::process::systemd_scope::own_unit(std::path::Path::new("/proc")).await;
+    if let Some(why) =
+        crate::process::systemd_scope::self_restart_refusal(&own_unit, std::process::id())
+    {
+        let msg = format!("Supervisor self-restart refused: {why}");
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg.clone())
+            .await;
+        return Err(SupervisorError::Validation(msg));
+    }
+
+    // What happens to temp runners on this spawn-and-exit path is
+    // PLATFORM-SPECIFIC:
+    // - Windows: the `std::process::exit(0)` below closes this process's
+    //   handles, including the kill-on-exit JobObject's, so the kernel reaps
+    //   every assigned temp runner. No sweep runs here — it was "the dominant
+    //   source of `POST /supervisor/shutdown` latency" (a 5 s graceful-stop
+    //   poll plus a 5 s port-free wait per runner).
+    // - Off Windows the runner job is a no-op stub and nothing reaps them, so
+    //   the bounded (2 s), concurrent shutdown sweep runs below, after the
+    //   shutdown is latched and BEFORE the hard exit is armed — otherwise that
+    //   exit, ~600 ms later, would cut the sweep short inside its SIGTERM grace.
     //
-    // User-owned runners (primary, named, external) genuinely survive this
-    // restart: `process::job::should_assign_to_ephemeral_job` never assigns
-    // them to that job. Before 2026-07-28 they did NOT survive — this
-    // endpoint is spawn-and-exit, so it reaped them exactly like the
-    // `restart-supervisor.ps1` path did, while the comment here claimed the
-    // opposite.
+    // User-owned runners (primary, named, external) survive this restart on
+    // every platform: `process::job::should_assign_to_ephemeral_job` never
+    // assigns them to that job, the sweep never selects them, and on Linux
+    // they run in their own transient scopes. Before 2026-07-28 they did NOT
+    // survive — this endpoint is spawn-and-exit, so it reaped them exactly
+    // like the `restart-supervisor.ps1` path did, while the comment here
+    // claimed the opposite.
 
     // Spawn replacement process.
     //
@@ -1532,6 +1554,16 @@ pub async fn supervisor_restart(
             // returns an error and leaves this supervisor running, and an
             // already-latched shutdown would then take it down anyway.
             state.signal_shutdown();
+
+            // Off Windows, stop the temp runners before the hard exit below is
+            // armed (see the platform note above). The same one-shot sweep
+            // `shutdown_signal` runs, so the two never overlap.
+            #[cfg(not(windows))]
+            crate::process::shutdown_sweep::sweep_temp_runners_at_shutdown(
+                &state,
+                crate::process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,
+            )
+            .await;
 
             // Give the new process a moment to start
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2646,6 +2678,27 @@ mod tests {
             latch < exit,
             "the shutdown must be latched BEFORE the hard exit, or in-flight handlers get no \
              window in which to answer"
+        );
+
+        // Off Windows nothing reaps temp runners on this exit, so the
+        // one-shot shutdown sweep runs between the latch and the hard exit;
+        // and a supervisor that is its own unit's main process is refused
+        // BEFORE it spawns a replacement that would die with that unit. Plan
+        // 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
+        let sweep = body
+            .find("sweep_temp_runners_at_shutdown(")
+            .expect("supervisor_restart must run the off-Windows temp-runner sweep");
+        assert!(
+            latch < sweep && sweep < exit,
+            "the sweep must run after the latch and before the hard exit is armed, or the exit \
+             cuts it short inside its SIGTERM grace (latch {latch}, sweep {sweep}, exit {exit})"
+        );
+        let refusal = body
+            .find("self_restart_refusal(")
+            .expect("supervisor_restart must refuse when it is its own unit's main process");
+        assert!(
+            refusal < spawn,
+            "the own-unit refusal must come BEFORE the replacement is spawned"
         );
     }
 }

@@ -607,6 +607,12 @@ pub struct SupervisorState {
     /// already fired still observe the shutdown — broadcast channels do
     /// not replay missed messages, but this latched bool does.
     pub shutdown_latched: AtomicBool,
+    /// The off-Windows shutdown temp-runner sweep, run ONCE per process.
+    /// `shutdown_signal` and the self-restart endpoint both await it; whichever
+    /// arrives second waits for the first's sweep to finish instead of
+    /// starting a second, concurrent one
+    /// (`process::shutdown_sweep::sweep_temp_runners_at_shutdown`).
+    pub shutdown_sweep: tokio::sync::OnceCell<()>,
     pub cached_health: RwLock<CachedPortHealth>,
     /// Cached per-runner health snapshots, updated by the background health refresher.
     /// Readable via `try_read()` in sync contexts (SSE streams).
@@ -2008,6 +2014,7 @@ impl SupervisorState {
             health_tx,
             shutdown_tx,
             shutdown_latched: AtomicBool::new(false),
+            shutdown_sweep: tokio::sync::OnceCell::new(),
             cached_health: RwLock::new(CachedPortHealth::default()),
             cached_runner_health: RwLock::new(Vec::new()),
             health_cache_notify: Notify::new(),
