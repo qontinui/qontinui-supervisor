@@ -152,7 +152,7 @@ pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
 /// state is therefore UNKNOWN. Collapsing the second into the first is how a
 /// probe that never ran comes to read as "nothing is listening" — and then as
 /// "nothing to kill".
-async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+pub(crate) async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
     let output = Command::new("lsof")
         .args([
             "-t",                       // terse: PIDs only, one per line
@@ -191,12 +191,6 @@ async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
         }
     }
     Ok(pids)
-}
-
-/// Return the PID of the first process LISTENING on `port`. See
-/// [`find_pids_on_port`] for why `Err` is not `Ok(None)`.
-pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
-    Ok(find_pids_on_port(port).await?.into_iter().next())
 }
 
 /// Kill every process listening on `port` with a plain per-PID

@@ -63,7 +63,7 @@ fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
 /// level the types could see. That module's docs carry the full incident.
 /// `netstat` is now invoked directly rather than through `cmd /C`: there is no
 /// shell pipeline left to build, and one fewer process to fail to spawn.
-async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+pub(crate) async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
     // Plain `-ano`, deliberately without `-p TCP`: the parser already filters
     // non-TCP rows structurally, so the flag buys nothing and only adds a
     // flag-rejection failure mode that would degrade the probe to UNKNOWN.

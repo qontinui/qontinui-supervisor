@@ -166,7 +166,11 @@ impl Drop for Listener {
 /// port between the caller's pre-check and the child's bind read exactly the
 /// same, the child's bind failed, and `kill_by_port` then killed that process —
 /// on these tests' old ports, a live temp runner. A bind that fails now exits
-/// the child before it prints, so the test skips and kills nothing.
+/// the child before it prints, so the test skips and kills nothing. The child
+/// binds without `SO_REUSEADDR`, which on macOS would let it share the port with
+/// a listener on the wildcard address, so its bind fails while anything else
+/// holds the port. A listener that coexists with it anyway (an IPv6-only socket
+/// on Linux) is what [`ProbeView::Other`] catches.
 ///
 /// `None` means **the fixture could not be established**, which is UNKNOWN about
 /// the primitives under test rather than a verdict on them. That is the same
@@ -187,7 +191,6 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
     let script = format!(
         "import socket,time\n\
          s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n\
-         s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
          s.bind(('127.0.0.1',{port}))\n\
          s.listen(8)\n\
          print('{LISTENING}',flush=True)\n\
@@ -244,11 +247,12 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
 /// What the `lsof`-backed probe was observed doing while we waited for it.
 #[derive(Debug)]
 enum ProbeView {
-    /// The probe positively saw this test's child listening on the port.
+    /// The probe saw this test's child listening on the port, and nothing else:
+    /// every listener `kill_by_port` would kill is the child.
     Child,
-    /// The probe saw a different process listening on the port. With the child
-    /// listening too, a probe answer this test cannot account for: a kill by
-    /// port would reach that process, so nothing is killed.
+    /// The probe saw a process other than the child listening on the port,
+    /// alone or beside the child. `kill_by_port` kills every listener, so it
+    /// would reach that process, and nothing is killed.
     Other(u32),
     /// The probe RAN for the whole budget and never saw the listener.
     NeverSaw,
@@ -256,8 +260,10 @@ enum ProbeView {
     Unavailable(String),
 }
 
-/// Block until the `lsof`-backed probe can SEE the child `pid` listening, sees
-/// another process there, errors, or the shared budget is spent.
+/// Block until the `lsof`-backed probe sees the child `pid` as the port's only
+/// listener, sees another process there, errors, or the shared budget is spent.
+/// It reads every listener (`proc_kill::find_pids_on_port`, the probe
+/// `kill_by_port` itself iterates), not just the first.
 ///
 /// [`spawn_bound_listener`] waits on `is_port_listening`, which BINDS the port
 /// to test it, so it succeeds the moment the listen backlog exists.
@@ -281,10 +287,12 @@ enum ProbeView {
 /// was.
 async fn wait_until_probe_sees(port: u16, pid: u32) -> ProbeView {
     for _ in 0..POLL_ATTEMPTS {
-        match proc_kill::find_pid_on_port(port).await {
-            Ok(Some(found)) if found == pid => return ProbeView::Child,
-            Ok(Some(other)) => return ProbeView::Other(other),
-            Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
+        match proc_kill::find_pids_on_port(port).await {
+            Ok(found) if found == [pid] => return ProbeView::Child,
+            Ok(found) => match found.into_iter().find(|&other| other != pid) {
+                Some(other) => return ProbeView::Other(other),
+                None => tokio::time::sleep(POLL_INTERVAL).await,
+            },
             Err(e) => return ProbeView::Unavailable(e.to_string()),
         }
     }
