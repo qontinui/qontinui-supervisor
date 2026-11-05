@@ -107,10 +107,16 @@ use std::path::PathBuf;
 /// because that module is `#[cfg(target_os = "windows")]` while all four sides
 /// are cross-platform (CI builds this crate on Linux).
 ///
-/// Returns `None` when the platform has no resolvable config dir, or when
-/// `runner_id` is degenerate (empty, or containing a path separator or `..`).
-/// Callers must treat that as a hard failure — silently falling back to a
-/// shared directory is precisely the bug described above.
+/// `<config_dir>` is `dirs`' ([`crate::config::AmbientUserDirs::config_dir`]):
+/// the platform's in production, none in a unit-test build, a tempdir's under
+/// [`crate::config::config_over_an_empty_runner_tree`]. Every caller passes its
+/// state's `config.ambient_user_dirs`, so the four sides above resolve one dir
+/// in a test as they do in production.
+///
+/// Returns `None` when `dirs` has no config dir, or when `runner_id` is
+/// degenerate (empty, or containing a path separator or `..`). Callers must
+/// treat that as a hard failure — silently falling back to a shared directory
+/// is precisely the bug described above.
 ///
 /// The id guard mirrors the traversal rejection in
 /// `routes::runners::apply_paired_profile`. It matters because
@@ -122,11 +128,14 @@ use std::path::PathBuf;
 /// and is the single source of truth for every call site that resolves the dir
 /// (spawn, pair, paired-state copy, teardown), so the guard is worth its two
 /// comparisons.
-pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
+pub fn instance_config_dir(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+) -> Option<PathBuf> {
     if runner_id.is_empty() || runner_id.contains(['/', '\\']) || runner_id.contains("..") {
         return None;
     }
-    dirs::config_dir().map(|d| {
+    dirs.config_dir().map(|d| {
         d.join("com.qontinui.runner")
             .join("instances")
             .join(runner_id)
@@ -146,14 +155,18 @@ pub fn instance_config_dir(runner_id: &str) -> Option<PathBuf> {
 ///
 /// Returns `Ok(true)` when a dir was removed, `Ok(false)` when there was none.
 /// Refuses the primary outright.
-pub async fn remove_instance_config_dir(runner_id: &str, is_primary: bool) -> anyhow::Result<bool> {
+pub async fn remove_instance_config_dir(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+    is_primary: bool,
+) -> anyhow::Result<bool> {
     if is_primary {
         anyhow::bail!("refusing to remove the primary runner's instance config dir");
     }
     // Resolve through the shared helper, never inline: the reaper must delete
     // exactly the directory the spawn side exported as
     // `QONTINUI_SECURE_STORAGE_DIR` and the paired-profile writer copied into.
-    let Some(dir) = crate::process::instance_config_dir(runner_id) else {
+    let Some(dir) = crate::process::instance_config_dir(dirs, runner_id) else {
         return Ok(false);
     };
     if !dir.exists() {
@@ -191,9 +204,10 @@ pub async fn remove_instance_config_dir(runner_id: &str, is_primary: bool) -> an
 /// `spawn-test` without a `paired_profile_id` snapshots this dir into the temp
 /// runner's instance dir (`routes::runners::apply_primary_paired_snapshot`).
 ///
-/// Returns `None` only when the platform data-local dir can't be resolved.
-pub fn primary_paired_state_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner"))
+/// Returns `None` only when `dirs` has no data-local dir
+/// ([`crate::config::AmbientUserDirs::data_local_dir`]).
+pub fn primary_paired_state_dir(dirs: &crate::config::AmbientUserDirs) -> Option<PathBuf> {
+    dirs.data_local_dir().map(|d| d.join("com.qontinui.runner"))
 }
 
 /// The value a temp runner is given as its `QONTINUI_INSTANCE_NAME` — i.e.
@@ -307,10 +321,13 @@ pub(crate) fn sanitize_instance_name(runner_name: &str) -> String {
 /// through `config_dir()` (roaming) — but dropping it would be a Windows
 /// behavior change this commit does not intend, and probing one extra path
 /// that never exists costs nothing.
-fn app_data_dir_candidates(subdir: &str) -> Vec<PathBuf> {
-    let data_local = dirs::data_local_dir();
-    let data = dirs::data_dir();
-    let config = dirs::config_dir();
+///
+/// The bases are `dirs`' ([`crate::config::AmbientUserDirs`]), so a unit test's
+/// teardown probes its tempdir's, not the operator's.
+fn app_data_dir_candidates(dirs: &crate::config::AmbientUserDirs, subdir: &str) -> Vec<PathBuf> {
+    let data_local = dirs.data_local_dir();
+    let data = dirs.data_dir();
+    let config = dirs.config_dir();
     [
         data_local
             .as_ref()
@@ -364,6 +381,7 @@ fn app_data_dir_candidates(subdir: &str) -> Vec<PathBuf> {
 ///
 /// Refuses to touch anything for primary runners as a safety check.
 pub async fn remove_runner_app_data_dirs(
+    dirs: &crate::config::AmbientUserDirs,
     runner_name: &str,
     is_primary: bool,
 ) -> anyhow::Result<u32> {
@@ -373,7 +391,7 @@ pub async fn remove_runner_app_data_dirs(
 
     let subdir = format!("instance-{}", sanitize_instance_name(runner_name));
     let mut removed = 0u32;
-    for path in app_data_dir_candidates(&subdir) {
+    for path in app_data_dir_candidates(dirs, &subdir) {
         if !path.exists() {
             continue;
         }
@@ -401,6 +419,7 @@ pub async fn remove_runner_app_data_dirs(
 #[cfg(test)]
 mod tests {
     use super::{instance_config_dir, sanitize_instance_name};
+    use crate::config::AmbientUserDirs;
 
     /// The sanitizer still agrees with the runner's `sanitize()` on the exact
     /// cases the runner pins (`instance.rs::sanitize_keeps_safe_chars`).
@@ -444,6 +463,13 @@ mod tests {
         }
     }
 
+    /// A tempdir's per-user dirs ([`AmbientUserDirs::At`]), so a test here
+    /// writes nothing outside it. Hold the `TempDir` for the test's lifetime.
+    fn temp_user_dirs() -> (AmbientUserDirs, tempfile::TempDir) {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        (AmbientUserDirs::At(root.path().join("user-dirs")), root)
+    }
+
     /// A degenerate id must resolve to `None`, never to a path.
     ///
     /// `""` is the dangerous one: `PathBuf::join("")` does not descend, so
@@ -452,9 +478,10 @@ mod tests {
     /// `..` cases are the same traversal class `apply_paired_profile` rejects.
     #[test]
     fn instance_config_dir_rejects_degenerate_ids() {
+        let (dirs, _root) = temp_user_dirs();
         for bad in ["", "a/b", "a\\b", ".."] {
             assert_eq!(
-                instance_config_dir(bad),
+                instance_config_dir(&dirs, bad),
                 None,
                 "instance_config_dir({bad:?}) must be None — it escapes or collapses to the \
                  shared instances/ parent"
@@ -463,16 +490,30 @@ mod tests {
     }
 
     /// The happy path still resolves, so the guard cannot be satisfied by
-    /// simply returning `None` everywhere.
+    /// simply returning `None` everywhere, and it resolves under the dirs it
+    /// was given.
     #[test]
     fn instance_config_dir_accepts_a_normal_runner_id() {
-        if dirs::config_dir().is_none() {
-            return;
-        }
-        let dir = instance_config_dir("test-9877").expect("normal id must resolve");
-        assert!(dir.ends_with(std::path::Path::new(
-            "com.qontinui.runner/instances/test-9877"
-        )));
+        let (dirs, _root) = temp_user_dirs();
+        let dir = instance_config_dir(&dirs, "test-9877").expect("normal id must resolve");
+        assert_eq!(
+            dir,
+            dirs.config_dir()
+                .expect("At has a config dir")
+                .join("com.qontinui.runner")
+                .join("instances")
+                .join("test-9877")
+        );
+    }
+
+    /// With no per-user dirs there is no instance root, so a test-build start
+    /// refuses rather than fall back to a shared dir.
+    #[test]
+    fn no_user_dirs_resolve_no_instance_root() {
+        assert_eq!(
+            instance_config_dir(&AmbientUserDirs::Ignore, "test-9877"),
+            None
+        );
     }
 
     /// The write side and the reap side must resolve the SAME directory.
@@ -487,22 +528,13 @@ mod tests {
     /// (`Ok(true)` — it returns `Ok(false)` for a dir it does not find).
     #[tokio::test]
     async fn instance_config_dir_and_remover_agree_on_path() {
-        let runner_id = format!("test-instance-config-dir-selftest-{}", std::process::id());
-        let Some(dir) = instance_config_dir(&runner_id) else {
-            // No resolvable config dir on this platform — nothing to assert.
-            return;
-        };
+        let (dirs, _root) = temp_user_dirs();
+        let runner_id = "test-instance-config-dir-selftest";
+        let dir = instance_config_dir(&dirs, runner_id).expect("At resolves an instance root");
         std::fs::create_dir_all(&dir).expect("create instance dir");
-        // The dir lives under the operator's REAL config dir, so it must not
-        // survive a failing assertion below — the divergence case this test
-        // exists to catch is exactly the one that would leak it permanently.
-        // Same guard the routes-side test uses.
-        let _cleanup = scopeguard::guard(dir.clone(), |d| {
-            let _ = std::fs::remove_dir_all(d);
-        });
         std::fs::write(dir.join("paired_user.json"), b"{}").expect("write marker");
 
-        let removed = super::remove_instance_config_dir(&runner_id, false)
+        let removed = super::remove_instance_config_dir(&dirs, runner_id, false)
             .await
             .expect("remover must not error");
 
@@ -518,29 +550,32 @@ mod tests {
     /// delete the operator's own runner config.
     #[tokio::test]
     async fn instance_config_dir_remover_refuses_primary() {
-        assert!(super::remove_instance_config_dir("primary", true)
+        let (dirs, _root) = temp_user_dirs();
+        assert!(super::remove_instance_config_dir(&dirs, "primary", true)
             .await
             .is_err());
     }
 
     // --- remove_runner_app_data_dirs (app-data instance-tree reaper) ------
 
-    /// Every base that resolves on this platform must produce a candidate
-    /// ending in the `instance-<name>` subdir — so a caller that creates
-    /// markers at each and calls the remover can expect them all gone.
+    /// Every base resolves under the dirs it was given, as a distinct
+    /// candidate ending in the `instance-<name>` subdir — so a caller that
+    /// creates markers at each and calls the remover can expect them all gone.
     #[test]
     fn app_data_dir_candidates_all_end_in_the_subdir() {
-        let candidates = super::app_data_dir_candidates("instance-selftest");
-        assert!(
-            !candidates.is_empty(),
-            "at least one of data_local_dir/data_dir/config_dir must resolve on CI"
-        );
+        let (dirs, root) = temp_user_dirs();
+        let mut candidates = super::app_data_dir_candidates(&dirs, "instance-selftest");
+        assert_eq!(candidates.len(), 5, "{candidates:?}");
         for c in &candidates {
             assert!(
-                c.ends_with("instance-selftest"),
-                "{c:?} does not end with the instance subdir"
+                c.ends_with("instance-selftest") && c.starts_with(root.path()),
+                "{c:?} does not end with the instance subdir inside {:?}",
+                root.path()
             );
         }
+        candidates.sort();
+        candidates.dedup();
+        assert_eq!(candidates.len(), 5, "the five bases are distinct under At");
     }
 
     /// The write side (the runner's own `instance::scope_path()`, mirrored
@@ -553,27 +588,17 @@ mod tests {
     /// populate these trees at all — nothing ever reaped them.
     #[tokio::test]
     async fn remove_runner_app_data_dirs_removes_every_resolved_candidate() {
-        let runner_name = format!("app-data-selftest-{}", std::process::id());
-        let subdir = format!("instance-{}", sanitize_instance_name(&runner_name));
-        let mut candidates = super::app_data_dir_candidates(&subdir);
-        candidates.sort();
-        candidates.dedup();
-        if candidates.is_empty() {
-            // No resolvable base dir on this platform — nothing to assert.
-            return;
-        }
-        let mut cleanups = Vec::new();
+        let (dirs, _root) = temp_user_dirs();
+        let runner_name = "app-data-selftest";
+        let subdir = format!("instance-{}", sanitize_instance_name(runner_name));
+        let candidates = super::app_data_dir_candidates(&dirs, &subdir);
+        assert_eq!(candidates.len(), 5, "{candidates:?}");
         for dir in &candidates {
             std::fs::create_dir_all(dir).expect("create candidate dir");
             std::fs::write(dir.join("marker.json"), b"{}").expect("write marker");
-            // Same belt-and-braces guard as the instance-config-dir test
-            // above: these live under the operator's real data/config dirs.
-            cleanups.push(scopeguard::guard(dir.clone(), |d| {
-                let _ = std::fs::remove_dir_all(d);
-            }));
         }
 
-        let removed = super::remove_runner_app_data_dirs(&runner_name, false)
+        let removed = super::remove_runner_app_data_dirs(&dirs, runner_name, false)
             .await
             .expect("remover must not error");
 
@@ -587,7 +612,6 @@ mod tests {
         for dir in &candidates {
             assert!(!dir.exists(), "{dir:?} must be gone after removal");
         }
-        cleanups.clear();
     }
 
     /// Refuses primaries outright, mirroring `remove_instance_config_dir`'s
@@ -595,7 +619,8 @@ mod tests {
     /// data.
     #[tokio::test]
     async fn remove_runner_app_data_dirs_refuses_primary() {
-        assert!(super::remove_runner_app_data_dirs("primary", true)
+        let (dirs, _root) = temp_user_dirs();
+        assert!(super::remove_runner_app_data_dirs(&dirs, "primary", true)
             .await
             .is_err());
     }

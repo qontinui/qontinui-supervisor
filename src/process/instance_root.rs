@@ -280,11 +280,12 @@ pub struct InstanceRoot {
 
 impl InstanceRoot {
     /// The instance root of the runner `runner_id`:
-    /// [`super::instance_config_dir`]. `None` exactly when that is `None` (no
-    /// resolvable config dir, or a degenerate id) — callers must treat it as a
+    /// [`super::instance_config_dir`] under `dirs`, the state's
+    /// `config.ambient_user_dirs`. `None` exactly when that is `None` (no
+    /// config dir in `dirs`, or a degenerate id) — callers must treat it as a
     /// hard failure, never fall back to a shared dir.
-    pub fn for_runner(runner_id: &str) -> Option<Self> {
-        super::instance_config_dir(runner_id).map(Self::at)
+    pub fn for_runner(dirs: &crate::config::AmbientUserDirs, runner_id: &str) -> Option<Self> {
+        super::instance_config_dir(dirs, runner_id).map(Self::at)
     }
 
     /// An instance root at an explicit path (tests).
@@ -438,18 +439,16 @@ impl InstanceRoot {
 /// The secure-storage dir of the runner `runner_id` — where its pairing is read
 /// from. Every supervisor writer of paired state resolves its destination here,
 /// so a writer can never land a pairing somewhere the child does not read.
-pub fn instance_secure_storage_dir(runner_id: &str) -> Option<PathBuf> {
-    InstanceRoot::for_runner(runner_id).map(|r| r.secure_storage_dir())
+pub fn instance_secure_storage_dir(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+) -> Option<PathBuf> {
+    InstanceRoot::for_runner(dirs, runner_id).map(|r| r.secure_storage_dir())
 }
 
-/// The harness's own `~/.qontinui` — the provisioning SOURCE: `$QONTINUI_HOME`
-/// when set non-blank (the runner's `ambient::qontinui_dir` rule), else
-/// `<home>/.qontinui`.
-pub fn harness_qontinui_dir() -> Option<PathBuf> {
-    harness_qontinui_dir_from(std::env::var_os("QONTINUI_HOME"), dirs::home_dir())
-}
-
-/// Env-free core of [`harness_qontinui_dir`].
+/// Env-free core of the harness's own `~/.qontinui` — the provisioning SOURCE,
+/// [`crate::config::AmbientUserDirs::harness_qontinui_dir`] under `Read`:
+/// `override_dir` (`$QONTINUI_HOME`) when non-blank, else `<home>/.qontinui`.
 pub fn harness_qontinui_dir_from(
     override_dir: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
@@ -629,14 +628,16 @@ pub(crate) mod tests {
 
     #[test]
     fn instance_secure_storage_dir_is_the_runner_root() {
-        if dirs::config_dir().is_none() {
-            return;
-        }
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+        let root = super::super::instance_config_dir(&dirs, "test-9877");
+        assert!(root.is_some(), "At resolves an instance root");
+        assert_eq!(instance_secure_storage_dir(&dirs, "test-9877"), root);
+        assert_eq!(instance_secure_storage_dir(&dirs, ""), None);
         assert_eq!(
-            instance_secure_storage_dir("test-9877"),
-            super::super::instance_config_dir("test-9877")
+            instance_secure_storage_dir(&crate::config::AmbientUserDirs::Ignore, "test-9877"),
+            None
         );
-        assert_eq!(instance_secure_storage_dir(""), None);
     }
 
     #[test]

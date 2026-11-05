@@ -1637,21 +1637,27 @@ pub fn read_debug_endpoints_env() -> bool {
         .unwrap_or(false)
 }
 
-/// Default platform-appropriate path for the persisted `boot.id` file.
+/// Default platform-appropriate path for the persisted `boot.id` file, under
+/// `dirs`' data-local dir ([`crate::config::AmbientUserDirs`]):
 ///
 /// - Windows: `%LOCALAPPDATA%\qontinui-supervisor\boot.id`
 /// - Linux:   `~/.local/share/qontinui-supervisor/boot.id`
 /// - macOS:   `~/Library/Application Support/qontinui-supervisor/boot.id`
 ///
-/// Falls back to `./qontinui-supervisor/boot.id` if `dirs::data_local_dir()`
-/// can't determine a home/data dir (extremely rare — e.g. a stripped-down
-/// container with no `HOME` set). The fallback keeps the supervisor running
-/// rather than panicking; persistence may simply not survive a CWD change.
-fn default_boot_id_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-supervisor")
-        .join("boot.id")
+/// Under `Read`, falls back to `./qontinui-supervisor/boot.id` if
+/// `dirs::data_local_dir()` can't determine a home/data dir (extremely rare —
+/// e.g. a stripped-down container with no `HOME` set). The fallback keeps the
+/// supervisor running rather than panicking; persistence may simply not
+/// survive a CWD change. `None` under `Ignore`: a unit-test build persists no
+/// boot id, so it neither reads nor writes the operator's.
+fn default_boot_id_path(dirs: &crate::config::AmbientUserDirs) -> Option<PathBuf> {
+    let base = match dirs {
+        crate::config::AmbientUserDirs::Read => {
+            Some(dirs.data_local_dir().unwrap_or_else(|| PathBuf::from(".")))
+        }
+        _ => dirs.data_local_dir(),
+    };
+    base.map(|b| b.join("qontinui-supervisor").join("boot.id"))
 }
 
 /// Load a previously-persisted `boot_id` from `path`, or generate a fresh
@@ -1695,11 +1701,15 @@ pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
 }
 
 /// Resolve the persistent `boot_id` for this supervisor installation.
-/// Reads the persisted UUID from the platform-default path if present,
-/// otherwise generates and persists a fresh one. See
+/// Reads the persisted UUID from the default path under `dirs` if present,
+/// otherwise generates and persists a fresh one. With no per-user dirs
+/// (`Ignore`, a unit-test build) the id is fresh and persisted nowhere. See
 /// [`SupervisorState::boot_id`] for semantics.
-pub fn load_or_create_boot_id() -> String {
-    load_or_create_boot_id_at(&default_boot_id_path())
+pub fn load_or_create_boot_id(dirs: &crate::config::AmbientUserDirs) -> String {
+    match default_boot_id_path(dirs) {
+        Some(path) => load_or_create_boot_id_at(&path),
+        None => uuid::Uuid::new_v4().to_string(),
+    }
 }
 
 /// Identity of a spawn-test build for single-flight purposes: **who** asked,
@@ -1900,6 +1910,7 @@ impl SupervisorState {
         // signal).
         let (synthetic_build_id_tx, _) = broadcast::channel::<String>(8);
         let debug_endpoints_enabled = read_debug_endpoints_env();
+        let boot_id = load_or_create_boot_id(&config.ambient_user_dirs);
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(4)
@@ -1998,7 +2009,7 @@ impl SupervisorState {
             runner_api_port: crate::config::RUNNER_API_PORT,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
-            boot_id: load_or_create_boot_id(),
+            boot_id,
             build_id: compute_build_id(),
             ephemeral_job,
             pending_startup_logs: std::sync::Mutex::new(startup_logs),
@@ -2405,6 +2416,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
         }
     }
 

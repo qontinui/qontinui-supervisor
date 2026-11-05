@@ -69,6 +69,7 @@ fn test_config() -> SupervisorConfig {
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
         ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_user_dirs: qontinui_supervisor::config::AmbientUserDirs::Ignore,
     }
 }
 

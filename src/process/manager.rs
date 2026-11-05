@@ -2093,6 +2093,7 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             // dropping its ManagedRunner so post-mortem debugging still works
             // via `GET /runners/{id}/logs?include_stopped=true`.
             let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                &state.config.ambient_user_dirs,
                 managed,
                 None,
                 crate::process::stopped_cache::StopReason::Reaped,
@@ -2109,7 +2110,7 @@ pub async fn reap_stale_test_runners(state: SharedState) {
             }
 
             // WebView2 profile, app-data trees, instance config dir.
-            reap_runner_instance_state(&id, &name).await;
+            reap_runner_instance_state(&state.config.ambient_user_dirs, &id, &name).await;
             // The per-runner exe-copy directory (S-2): the other three
             // removal sites already call this; the periodic max-age sweep
             // did not, so a temp runner reaped for age (rather than stopped
@@ -2183,7 +2184,7 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
     // Read the spawn ledger ONCE per sweep, not once per port: it is the same
     // answer for all 23 ports and re-reading it 23 times would let it change
     // mid-sweep, so two ports could be judged against two different ledgers.
-    let spawned = crate::process::temp_runner_ledger::load();
+    let spawned = crate::process::temp_runner_ledger::load(&state.config.ambient_user_dirs);
 
     let mut freed = 0u32;
     // Defect 2 of the same plan: the operator-visible log used to carry the
@@ -2271,7 +2272,7 @@ async fn reconcile_orphaned_temp_runners(state: &SharedState) {
         );
         let _ = crate::process::proc_kill::kill_by_pid_tree(pid).await;
         let _ = crate::process::proc_kill::kill_by_port(port).await;
-        crate::process::temp_runner_ledger::forget_port(port);
+        crate::process::temp_runner_ledger::forget_port(&state.config.ambient_user_dirs, port);
         if crate::process::port::wait_for_port_free(port, 5).await {
             freed += 1;
             victims.push(format!("pid {pid} on port {port}"));
@@ -2525,7 +2526,11 @@ pub async fn start_managed_runner(
     // ever reads.
     if let Some(pid_val) = pid {
         if managed.config.kind().is_temp() {
-            crate::process::temp_runner_ledger::record_spawn(pid_val, port);
+            crate::process::temp_runner_ledger::record_spawn(
+                &state.config.ambient_user_dirs,
+                pid_val,
+                port,
+            );
         }
     }
 
@@ -3100,28 +3105,41 @@ pub(crate) fn reap_instance_state_on_stop(restart_requested: bool) -> bool {
 /// app-data reap became cross-platform (qontinui-supervisor #198) outside the
 /// restart gate that already protected the config dir, so every temp restart
 /// on Linux wiped the runner's dev logs and Restate journal.
-pub(crate) async fn reap_runner_instance_state(runner_id: &str, runner_name: &str) {
+///
+/// Every location is `dirs`' — the state's `config.ambient_user_dirs` — so a
+/// unit test's teardown removes what its start wrote under its tempdir and
+/// touches nothing of the operator's.
+pub(crate) async fn reap_runner_instance_state(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+    runner_name: &str,
+) {
     #[cfg(windows)]
     {
-        if let Err(e) = remove_webview2_user_data_folder(runner_id, false).await {
-            warn!(
-                "Failed to remove WebView2 data folder for runner '{}': {}",
-                runner_id, e
-            );
+        // The legacy per-runner WebView2 folder is resolved by qontinui-types
+        // from `%LOCALAPPDATA%`, not through `dirs`, so only a supervisor on
+        // the platform's per-user dirs removes it.
+        if *dirs == crate::config::AmbientUserDirs::Read {
+            if let Err(e) = remove_webview2_user_data_folder(runner_id, false).await {
+                warn!(
+                    "Failed to remove WebView2 data folder for runner '{}': {}",
+                    runner_id, e
+                );
+            }
         }
     }
     // Keyed off the config name, because that is what the runner received as
     // QONTINUI_INSTANCE_NAME.
-    if let Err(e) = remove_runner_app_data_dirs(runner_name, false).await {
+    if let Err(e) = remove_runner_app_data_dirs(dirs, runner_name, false).await {
         warn!(
             "Failed to remove per-instance app data for runner '{}': {}",
             runner_name, e
         );
     }
-    if let Some(root) = InstanceRoot::for_runner(runner_id) {
+    if let Some(root) = InstanceRoot::for_runner(dirs, runner_id) {
         let _ = stop_orphaned_embedded_pg(runner_id, &root).await;
     }
-    if let Err(e) = remove_instance_config_dir(runner_id, false).await {
+    if let Err(e) = remove_instance_config_dir(dirs, runner_id, false).await {
         warn!(
             "Failed to remove instance config dir (the instance root, which holds a copy of \
              the pairing: paired_user.json, auth_tokens.enc) for runner '{}': {}",
@@ -3311,15 +3329,16 @@ struct SpawnResult {
 /// read somewhere else.
 fn apply_instance_root_env(
     cmd: &mut Command,
+    dirs: &crate::config::AmbientUserDirs,
     runner_id: &str,
     home_source: Option<&std::path::Path>,
     identity: instance_root::DeviceIdentity,
 ) -> Result<InstanceRoot, SupervisorError> {
-    let root = InstanceRoot::for_runner(runner_id).ok_or_else(|| {
+    let root = InstanceRoot::for_runner(dirs, runner_id).ok_or_else(|| {
         SupervisorError::Process(format!(
             "Could not resolve the instance root \
              <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
-             dirs::config_dir() returned None. Refusing to spawn — without \
+             no per-user config dir resolved ({dirs:?}). Refusing to spawn — without \
              QONTINUI_INSTANCE_ROOT and its per-instance dirs the child falls back to the \
              shared data_local_dir(), which is where paired-profile snapshots are NOT written."
         ))
@@ -3392,20 +3411,25 @@ pub(crate) fn drop_inherited_subject_env(
 /// [`apply_instance_root_env`] is: so a test can drive it against a REAL
 /// [`Command`] and read the vars back, rather than re-deriving the body.
 /// The primary-port lookup stays in the caller because it is async.
+///
+/// `dirs` is the state's `config.ambient_user_dirs`: the root is resolved under
+/// it, and so is the harness `~/.qontinui` the subject's home is provisioned
+/// from.
 pub(crate) fn apply_non_primary_instance_env(
     cmd: &mut Command,
+    dirs: &crate::config::AmbientUserDirs,
     config: &crate::config::RunnerConfig,
     primary_port: u16,
 ) -> Result<InstanceRoot, SupervisorError> {
-    let home_source = instance_root::harness_qontinui_dir();
-    apply_non_primary_instance_env_with(cmd, config, primary_port, home_source.as_deref())
+    let home_source = dirs.harness_qontinui_dir();
+    apply_non_primary_instance_env_with(cmd, dirs, config, primary_port, home_source.as_deref())
 }
 
 /// [`apply_non_primary_instance_env`] with the provisioning source (the
-/// harness's `~/.qontinui`) injected, so a test never copies the operator's
-/// real files.
+/// harness's `~/.qontinui`) injected, so a test chooses what is copied.
 pub(crate) fn apply_non_primary_instance_env_with(
     cmd: &mut Command,
+    dirs: &crate::config::AmbientUserDirs,
     config: &crate::config::RunnerConfig,
     primary_port: u16,
     home_source: Option<&std::path::Path>,
@@ -3439,6 +3463,7 @@ pub(crate) fn apply_non_primary_instance_env_with(
     // inherited `QONTINUI_MACHINE_ID` — the subject mints its own device id.
     let root = apply_instance_root_env(
         cmd,
+        dirs,
         &config.id,
         home_source,
         instance_root::DeviceIdentity::from_fresh_flag(config.fresh_device_identity),
@@ -3450,6 +3475,23 @@ pub(crate) fn apply_non_primary_instance_env_with(
     );
 
     Ok(root)
+}
+
+/// The primary runner a secondary is told about (`QONTINUI_PRIMARY_PORT`) and
+/// asks for its window placement (`env_forwarders::WindowPositionEnv`): the
+/// registered primary's port, else the conventional default.
+///
+/// The user-started primary isn't in the supervisor's runners registry (the
+/// supervisor only tracks runners IT spawned), so `state.get_primary()`
+/// returns None on most setups and the default answers. A test state registers
+/// its primary on a port of its choosing, so a test's spawn asks that port and
+/// never a live primary on 9876.
+pub(crate) async fn primary_runner_port(state: &SharedState) -> u16 {
+    state
+        .get_primary()
+        .await
+        .map(|p| p.config.port)
+        .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT)
 }
 
 /// Start exe mode for a specific runner with port/name env vars.
@@ -3812,27 +3854,22 @@ async fn start_exe_mode_for_runner(
     // the scheduler and `QONTINUI_PRIMARY_PORT` so they can proxy process
     // commands to the primary.
     if !managed.config.kind().is_primary() {
-        // Find the primary runner's port for process log proxying.
-        //
-        // The user-started primary isn't in the supervisor's runners
-        // registry (the supervisor only tracks runners IT spawned),
-        // so `state.get_primary()` returns None on most setups. Fall
-        // back to the conventional default port — the runner's
-        // `process_capture::primary_proxy::is_secondary()` requires
-        // BOTH env vars to be set, so leaving the port unset would
-        // cause every secondary to silently behave as a primary
-        // (re-introducing the wrappers-dir contention this var was
-        // added to fix).
-        let primary_port = state
-            .get_primary()
-            .await
-            .map(|p| p.config.port)
-            .unwrap_or(crate::config::DEFAULT_RUNNER_API_PORT);
+        // Find the primary runner's port for process log proxying. The
+        // runner's `process_capture::primary_proxy::is_secondary()` requires
+        // BOTH env vars to be set, so leaving the port unset would cause every
+        // secondary to silently behave as a primary (re-introducing the
+        // wrappers-dir contention this var was added to fix).
+        let primary_port = primary_runner_port(state).await;
 
         // The rest of the block is `apply_non_primary_instance_env` so it can
         // be asserted as a WHOLE against a real `Command` in tests — see that
         // function for the per-var rationale.
-        apply_non_primary_instance_env(&mut cmd, &managed.config, primary_port)?;
+        apply_non_primary_instance_env(
+            &mut cmd,
+            &state.config.ambient_user_dirs,
+            &managed.config,
+            primary_port,
+        )?;
     }
 
     // Apply the registered env forwarders. Order is load-bearing — see
@@ -6492,6 +6529,7 @@ pub async fn stop_runner_by_id(
     let pre_clear_snapshot = if runner_id.starts_with("test-") {
         Some(
             crate::process::stopped_cache::snapshot_from_managed(
+                &state.config.ambient_user_dirs,
                 managed.as_ref(),
                 None,
                 crate::process::stopped_cache::StopReason::GracefulStop,
@@ -6558,7 +6596,8 @@ pub async fn stop_runner_by_id(
         // first half of a restart — see `reap_instance_state_on_stop`.
         let restarting = managed.runner.read().await.restart_requested;
         if reap_instance_state_on_stop(restarting) {
-            reap_runner_instance_state(&runner_id, &runner_name).await;
+            reap_runner_instance_state(&state.config.ambient_user_dirs, &runner_id, &runner_name)
+                .await;
         } else {
             info!(
                 "Keeping per-instance state for test runner '{}' across its restart \
@@ -7091,7 +7130,12 @@ pub async fn run_admitted_restart(
                      reaping the per-instance state its stop kept",
                     runner_id
                 );
-                reap_runner_instance_state(runner_id, &managed.config.name).await;
+                reap_runner_instance_state(
+                    &state.config.ambient_user_dirs,
+                    runner_id,
+                    &managed.config.name,
+                )
+                .await;
             }
             state
                 .diagnostics

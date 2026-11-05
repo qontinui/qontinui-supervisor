@@ -61,6 +61,12 @@ Every non-primary spawn carries `QONTINUI_INSTANCE_ROOT=<config_dir>/com.qontinu
 `manager::apply_non_primary_instance_env` (plan
 `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`,
 Phase 4; the runner-side contract is qontinui-runner `src-tauri/src/instance_env.rs`).
+`<config_dir>`, and every other per-user location a runner's start and teardown use
+(the app-data trees it reaps, the harness `~/.qontinui` it provisions from, the
+temp-runner ledger) and the boot id, resolve through `config::AmbientUserDirs`: the
+platform's in production, none in a unit-test build, and a tempdir's under
+`config::config_over_an_empty_runner_tree`, so a test's spawn writes and reads nothing
+of the operator's.
 `process::instance_root::InstanceRoot` is the one layout:
 
 | Var | Value |
@@ -1306,7 +1312,7 @@ Used by the evaluation and velocity systems to select which AI provider and mode
 
 ### Spawn-Monitor Placement
 
-The supervisor pulls placement config from the primary runner via `GET http://localhost:9876/spawn-placement/preview?slot=N&overflow=wrap` when spawning a temp runner. Configuration lives in the runner's Settings → Runner Instances UI.
+The supervisor pulls placement config from the primary runner via `GET http://127.0.0.1:<primary port>/spawn-placement/temp?index=N&overflow=wrap` when spawning a temp runner (`env_forwarders::WindowPositionEnv`). The port is the registered primary's, else 9876 (`manager::primary_runner_port`, the same port the temp runner gets as `QONTINUI_PRIMARY_PORT`), and the host is the IPv4 loopback the runner binds: `localhost` resolves to `::1` first on Windows, and that doomed connect alone can spend most of the GET's 3 s budget. Configuration lives in the runner's Settings → Runner Instances UI.
 
 ### Proxies
 

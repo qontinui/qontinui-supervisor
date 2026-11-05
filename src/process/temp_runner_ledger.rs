@@ -144,11 +144,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Where the ledger lives. `None` when no per-user data directory resolves —
-/// in which case ownership is UNKNOWN for every listener and the sweep leaves
-/// them all alone, which is the correct fail-closed direction.
-pub fn ledger_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| {
+/// Where the ledger lives: under `dirs`' data-local dir, the state's
+/// `config.ambient_user_dirs` ([`crate::config::AmbientUserDirs`]), so a unit
+/// test's spawn records into its tempdir and never into the box's ledger.
+/// `None` when no per-user data directory resolves — in which case ownership
+/// is UNKNOWN for every listener and the sweep leaves them all alone, which is
+/// the correct fail-closed direction.
+pub fn ledger_path(dirs: &crate::config::AmbientUserDirs) -> Option<PathBuf> {
+    dirs.data_local_dir().map(|d| {
         d.join("com.qontinui.supervisor")
             .join("spawned-temp-runners.json")
     })
@@ -156,8 +159,8 @@ pub fn ledger_path() -> Option<PathBuf> {
 
 /// Read the ledger. An absent or unreadable file is an empty ledger — which,
 /// via [`classify_listener`], means "own nothing, kill nothing".
-pub fn load() -> Vec<SpawnRecord> {
-    let Some(path) = ledger_path() else {
+pub fn load(dirs: &crate::config::AmbientUserDirs) -> Vec<SpawnRecord> {
+    let Some(path) = ledger_path(dirs) else {
         return Vec::new();
     };
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -174,8 +177,8 @@ pub fn load() -> Vec<SpawnRecord> {
     })
 }
 
-fn store(records: &[SpawnRecord]) {
-    let Some(path) = ledger_path() else {
+fn store(dirs: &crate::config::AmbientUserDirs, records: &[SpawnRecord]) {
+    let Some(path) = ledger_path(dirs) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -206,27 +209,27 @@ pub fn upsert(records: &mut Vec<SpawnRecord>, record: SpawnRecord) {
 /// Record that this supervisor spawned a temp runner. Called at the one spawn
 /// site, for temp runners only — a named or primary runner is outside the
 /// swept port range and has no business in this file.
-pub fn record_spawn(pid: u32, port: u16) {
+pub fn record_spawn(dirs: &crate::config::AmbientUserDirs, pid: u32, port: u16) {
     let record = SpawnRecord {
         pid,
         port,
         start_time_secs: process_start_time_secs(pid),
         recorded_at_secs: now_secs(),
     };
-    let mut records = load();
+    let mut records = load(dirs);
     upsert(&mut records, record);
-    store(&records);
+    store(dirs, &records);
 }
 
 /// Drop the record for a port once its process is confirmed gone. Best-effort:
 /// a stale row is harmless because [`classify_listener`] re-checks the live
 /// PID and start time before killing anything.
-pub fn forget_port(port: u16) {
-    let mut records = load();
+pub fn forget_port(dirs: &crate::config::AmbientUserDirs, port: u16) {
+    let mut records = load(dirs);
     let before = records.len();
     records.retain(|r| r.port != port);
     if records.len() != before {
-        store(&records);
+        store(dirs, &records);
     }
 }
 
@@ -314,6 +317,34 @@ mod tests {
         assert_eq!(row.start_time_secs, Some(30));
         // The unrelated port survives untouched.
         assert_eq!(records.iter().find(|r| r.port == 9878).unwrap().pid, 2);
+    }
+
+    /// A spawn is recorded into, and forgotten from, the ledger under the dirs
+    /// it was given; with no dirs nothing is written and nothing is owned.
+    #[test]
+    fn the_ledger_lives_under_the_dirs_it_is_given() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+        let path = ledger_path(&dirs).expect("At has a data-local dir");
+        assert!(path.starts_with(tmp.path()), "{path:?}");
+
+        let own = std::process::id();
+        record_spawn(&dirs, own, 27_999);
+        let records = load(&dirs);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!((records[0].pid, records[0].port), (own, 27_999));
+        assert!(path.is_file(), "the row is written at {path:?}");
+
+        forget_port(&dirs, 27_999);
+        assert!(load(&dirs).is_empty());
+
+        let none = crate::config::AmbientUserDirs::Ignore;
+        assert_eq!(ledger_path(&none), None);
+        record_spawn(&none, own, 27_999);
+        assert!(
+            load(&none).is_empty(),
+            "no dirs: nothing recorded, nothing owned"
+        );
     }
 
     #[test]

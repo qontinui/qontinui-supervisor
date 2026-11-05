@@ -309,20 +309,27 @@ fn child_api_url_explicit_env_forwarded_to_all() {
 // re-derivation of the helper's body: re-inlining a divergent path at the
 // spawn's `cmd.env(...)` site — the failure this test exists to catch —
 // fails here.
+/// A tempdir's per-user dirs ([`crate::config::AmbientUserDirs::At`]): a test
+/// that applies the non-primary env block creates its instance root there, never
+/// under the operator's config dir. Hold the `TempDir` for the test's lifetime.
+fn temp_user_dirs() -> (crate::config::AmbientUserDirs, tempfile::TempDir) {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    (
+        crate::config::AmbientUserDirs::At(root.path().join("user-dirs")),
+        root,
+    )
+}
+
 #[test]
 fn apply_instance_root_env_exports_the_root_and_confines_every_location() {
-    let id = format!("test-apply-instance-root-env-{}", std::process::id());
-    let Some(expected) = instance_config_dir(&id) else {
-        eprintln!("SKIPPED: dirs::config_dir() did not resolve on this platform");
-        return;
-    };
-    let _cleanup = scopeguard::guard(expected.clone(), |dir| {
-        let _ = std::fs::remove_dir_all(dir);
-    });
+    let (dirs, _user_dirs) = temp_user_dirs();
+    let id = "test-apply-instance-root-env".to_string();
+    let expected = instance_config_dir(&dirs, &id).expect("At resolves an instance root");
 
     let mut cmd = Command::new("cargo");
     let root = super::apply_instance_root_env(
         &mut cmd,
+        &dirs,
         &id,
         None,
         crate::process::instance_root::DeviceIdentity::Harness,
@@ -395,15 +402,10 @@ fn assert_confined_to_root(
 /// provisioned home — and the port refusal.
 #[test]
 fn non_primary_env_block_carries_the_root_and_provisions_the_home() {
-    let pid = std::process::id();
-    let config = temp_config(&format!("test-rootblock-{pid}"), 9877);
-    let Some(expected_root) = instance_config_dir(&config.id) else {
-        eprintln!("SKIPPED: dirs::config_dir() did not resolve on this platform");
-        return;
-    };
-    let _cleanup = scopeguard::guard(expected_root.clone(), |dir| {
-        let _ = std::fs::remove_dir_all(dir);
-    });
+    let (dirs, _user_dirs) = temp_user_dirs();
+    let config = temp_config("test-rootblock", 9877);
+    let expected_root =
+        instance_config_dir(&dirs, &config.id).expect("At resolves an instance root");
     let harness_home = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(
         harness_home.path().join("machine.json"),
@@ -415,6 +417,7 @@ fn non_primary_env_block_carries_the_root_and_provisions_the_home() {
     let mut cmd = Command::new("cargo");
     let root = super::apply_non_primary_instance_env_with(
         &mut cmd,
+        &dirs,
         &config,
         9876,
         Some(harness_home.path()),
@@ -446,11 +449,13 @@ fn non_primary_env_block_carries_the_root_and_provisions_the_home() {
 
 #[test]
 fn non_primary_env_block_refuses_the_primary_port() {
+    let (dirs, _user_dirs) = temp_user_dirs();
     for (port, primary) in [(9876u16, 9876u16), (9876, 9990), (9990, 9990), (0, 9876)] {
         let config = temp_config("test-refuse-port", port);
         let mut cmd = Command::new("cargo");
-        let err = super::apply_non_primary_instance_env_with(&mut cmd, &config, primary, None)
-            .expect_err("a non-primary runner on a refused port must not spawn");
+        let err =
+            super::apply_non_primary_instance_env_with(&mut cmd, &dirs, &config, primary, None)
+                .expect_err("a non-primary runner on a refused port must not spawn");
         assert!(
             err.to_string().contains("may not use"),
             "port {port} (primary {primary}): {err}"
@@ -520,33 +525,15 @@ fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
     // Two sequential spawns that RECYCLE the same port.
     const PORT: u16 = 9877;
     const PRIMARY_PORT: u16 = 9876;
-    let pid = std::process::id();
-    let first = temp_config(&format!("test-envblock-a-{pid}"), PORT);
-    let second = temp_config(&format!("test-envblock-b-{pid}"), PORT);
-
-    if instance_config_dir(&first.id).is_none() {
-        // No resolvable config dir on this platform — nothing to assert.
-        return;
-    }
-    // Both dirs land under the operator's REAL app-data roots (the block
-    // creates them), so they must not survive a failing assertion below.
-    // Same guard shape as `apply_instance_root_env_exports_the_root_…`.
-    let _cleanup = scopeguard::guard(
-        vec![first.id.clone(), second.id.clone()],
-        |ids: Vec<String>| {
-            for id in ids {
-                if let Some(dir) = instance_config_dir(&id) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            }
-        },
-    );
+    let (dirs, _user_dirs) = temp_user_dirs();
+    let first = temp_config("test-envblock-a", PORT);
+    let second = temp_config("test-envblock-b", PORT);
 
     let mut cmd_a = Command::new("cargo");
     let mut cmd_b = Command::new("cargo");
-    super::apply_non_primary_instance_env_with(&mut cmd_a, &first, PRIMARY_PORT, None)
+    super::apply_non_primary_instance_env_with(&mut cmd_a, &dirs, &first, PRIMARY_PORT, None)
         .expect("must resolve + create");
-    super::apply_non_primary_instance_env_with(&mut cmd_b, &second, PRIMARY_PORT, None)
+    super::apply_non_primary_instance_env_with(&mut cmd_b, &dirs, &second, PRIMARY_PORT, None)
         .expect("must resolve + create");
     let envs_a = command_envs(&cmd_a);
     let envs_b = command_envs(&cmd_b);
@@ -591,8 +578,8 @@ fn non_primary_env_block_keys_instance_name_per_spawn_not_per_port() {
                  classify itself as secondary; unset makes it behave as a primary"
         );
 
-        let want = instance_config_dir(&config.id)
-            .expect("resolved above")
+        let want = instance_config_dir(&dirs, &config.id)
+            .expect("At resolves an instance root")
             .join("webview")
             .to_string_lossy()
             .into_owned();
@@ -2061,23 +2048,32 @@ fn temp_restart_keeps_the_instance_state() {
     // `process/manager/tests.rs`. `body_of` panics on a missing signature,
     // so the scan cannot pass on text that no longer holds the functions.
     let src = crate::source_scan::production_span(&src).to_string();
+    // Calls are compared with their whitespace and trailing commas removed, so
+    // an assertion pins the call and not where rustfmt broke its lines.
+    let sq = |text: &str| {
+        text.split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+    };
     // Up to the function's own closing brace, by brace matching, so a match
     // cannot come from a neighbouring function.
     let body_of = |sig: &str| {
-        crate::source_scan::fn_body(&src, sig)
-            .unwrap_or_else(|| panic!("{sig} exists"))
-            .to_string()
+        sq(crate::source_scan::fn_body(&src, sig).unwrap_or_else(|| panic!("{sig} exists")))
     };
 
+    let dirs = "&state.config.ambient_user_dirs";
     let stop = body_of("pub async fn stop_runner_by_id(");
     assert!(
-        stop.contains("let restarting = managed.runner.read().await.restart_requested;")
-            && stop
-                .split_once("if reap_instance_state_on_stop(restarting) {")
-                .and_then(|(_, gated)| gated.split('}').next())
-                .is_some_and(
-                    |gated| gated.contains("reap_runner_instance_state(&runner_id, &runner_name)")
-                ),
+        stop.contains(&sq(
+            "let restarting = managed.runner.read().await.restart_requested;"
+        )) && stop
+            .split_once(&sq("if reap_instance_state_on_stop(restarting) {"))
+            .and_then(|(_, gated)| gated.split('}').next())
+            .is_some_and(|gated| {
+                gated.contains(&sq(&format!(
+                    "reap_runner_instance_state({dirs}, &runner_id, &runner_name)"
+                )))
+            }),
         "stop_runner_by_id must gate the per-instance reap on restart_requested"
     );
     assert_eq!(
@@ -2098,9 +2094,11 @@ fn temp_restart_keeps_the_instance_state() {
 
     let restart = body_of("pub async fn run_admitted_restart(");
     assert!(
-        restart
-            .contains("if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)")
-            && restart.contains("reap_runner_instance_state(runner_id, &managed.config.name)"),
+        restart.contains(&sq(
+            "if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)"
+        )) && restart.contains(&sq(&format!(
+            "reap_runner_instance_state({dirs}, runner_id, &managed.config.name)"
+        ))),
         "a failed temp restart must reap the per-instance state its stop half kept"
     );
 
@@ -2108,13 +2106,15 @@ fn temp_restart_keeps_the_instance_state() {
     // re-spell its set: the max-age sweep here, and `DELETE
     // /runners/{id}` / `purge-stale` in routes/runners.rs.
     let sweep = body_of("pub async fn reap_stale_test_runners(");
-    assert!(sweep.contains("reap_runner_instance_state(&id, &name)"));
+    assert!(sweep.contains(&sq(&format!(
+        "reap_runner_instance_state({dirs}, &id, &name)"
+    ))));
     // Startup-window grace (plan
     // 2026-09-19-supervisor-reaper-purges-an-in-flight-spawn-test): the
     // endless sweep loop cannot be driven from a test, so pin that it
     // still consults the shared, unit-tested skip decision.
     assert!(
-        sweep.contains("skip_for_startup_window(managed, is_running)"),
+        sweep.contains(&sq("skip_for_startup_window(managed, is_running)")),
         "reap_stale_test_runners no longer consults skip_for_startup_window — a starting \
              temp runner whose port is not bound yet would be reaped as crashed"
     );
@@ -2128,10 +2128,12 @@ fn temp_restart_keeps_the_instance_state() {
     .replace("\r\n", "\n");
     // Production only — the bans below police teardown call sites, and
     // that file's tests live in `routes/runners/tests.rs` once extracted.
-    let routes = crate::source_scan::production_span(&routes).to_string();
+    let routes = sq(crate::source_scan::production_span(&routes));
     assert_eq!(
         routes
-            .matches("manager::reap_runner_instance_state(&id, &name)")
+            .matches(&sq(&format!(
+                "manager::reap_runner_instance_state({dirs}, &id, &name)"
+            )))
             .count(),
         2,
         "remove_runner and purge_stale_test_runners_core must use the helper"
@@ -2155,11 +2157,11 @@ fn temp_restart_keeps_the_instance_state() {
     let helper = body_of("pub(crate) async fn reap_runner_instance_state(");
     for removal in [
         "remove_webview2_user_data_folder(runner_id, false)",
-        "remove_runner_app_data_dirs(runner_name, false)",
-        "remove_instance_config_dir(runner_id, false)",
+        "remove_runner_app_data_dirs(dirs, runner_name, false)",
+        "remove_instance_config_dir(dirs, runner_id, false)",
     ] {
         assert!(
-            helper.contains(removal),
+            helper.contains(&sq(removal)),
             "reap_runner_instance_state must include {removal}"
         );
     }
@@ -2174,33 +2176,25 @@ fn temp_restart_keeps_the_instance_state() {
 /// trees silently. Driven with deliberately DIFFERENT id and name.
 #[tokio::test]
 async fn reap_runner_instance_state_keys_config_on_id_and_app_data_on_name() {
-    let pid = std::process::id();
-    let runner_id = format!("named-reap-selftest-id-{pid}");
-    let runner_name = format!("reap-selftest-name-{pid}");
+    let (dirs, _user_dirs) = temp_user_dirs();
+    let runner_id = "named-reap-selftest-id";
+    let runner_name = "reap-selftest-name";
 
-    let Some(config_dir) = instance_config_dir(&runner_id) else {
-        // No resolvable config dir on this platform — nothing to assert.
-        return;
-    };
-    let mut app_data = crate::process::app_data_dir_candidates(&format!(
-        "instance-{}",
-        crate::process::sanitize_instance_name(&runner_name)
-    ));
-    app_data.sort();
-    app_data.dedup();
-
-    // These live under the operator's REAL config/data dirs, so they must
-    // not survive a failing assertion (same guard as process::tests).
-    let mut cleanups = Vec::new();
+    let config_dir = instance_config_dir(&dirs, runner_id).expect("At resolves an instance root");
+    let app_data = crate::process::app_data_dir_candidates(
+        &dirs,
+        &format!(
+            "instance-{}",
+            crate::process::sanitize_instance_name(runner_name)
+        ),
+    );
+    assert_eq!(app_data.len(), 5, "{app_data:?}");
     for dir in std::iter::once(&config_dir).chain(app_data.iter()) {
         std::fs::create_dir_all(dir).expect("create dir");
-        cleanups.push(scopeguard::guard(dir.clone(), |d| {
-            let _ = std::fs::remove_dir_all(d);
-        }));
         std::fs::write(dir.join("marker.json"), b"{}").expect("write marker");
     }
 
-    reap_runner_instance_state(&runner_id, &runner_name).await;
+    reap_runner_instance_state(&dirs, runner_id, runner_name).await;
 
     assert!(
         !config_dir.exists(),
@@ -5926,11 +5920,24 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
 /// `STUB_ENV_SCRIPT` from `BASH_ENV`. A temp runner because no spawn path wraps one
 /// in `systemd-run`, so on any box its start's own spawn is the exec a test reads.
 /// Its `DISPLAY` only satisfies a Linux temp start's display check; the stub opens
-/// no window. A fresh device identity, so the start projects none of the operator's
-/// into the instance root it writes under the real config dir.
+/// no window. A fresh device identity, so its home is provisioned with no device
+/// identity at all.
+///
+/// Nothing its start touches is the operator's or a live service. The state's
+/// per-user dirs are its tempdir's ([`crate::config::config_over_an_empty_runner_tree`]),
+/// so the start's instance root and ledger row land there and the teardown
+/// removes the root from there. Its registered primary is on a refused port
+/// ([`crate::test_ports::reserve_refused_port`]), so the start's window-placement
+/// GET (`env_forwarders::WindowPositionEnv`, which asks the registered primary) is
+/// refused at once instead of asking whatever primary runner serves 9876.
 #[cfg(target_os = "linux")]
 async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
-    let (state, root) = restart_test_state();
+    let (mut config, root) = crate::config::config_over_an_empty_runner_tree();
+    let refused = crate::test_ports::reserve_refused_port();
+    for primary in config.runners.iter_mut().filter(|r| r.kind().is_primary()) {
+        primary.port = refused;
+    }
+    let state = Arc::new(crate::state::SupervisorState::new(config));
     let stub = root.path().join("stub-runner");
     std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
     let script = root.path().join("stub-runner.env");
@@ -5978,34 +5985,16 @@ async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempD
 /// copy and its exec (a temp start asks the primary for a window placement, for up
 /// to 3 s), so the 60 s sleep only bounds a holder that a killed test binary leaks.
 ///
-/// A temp start writes two things outside the test's tempdir: its instance root under
-/// the real config dir, which the stop's teardown removes, and a row in the temp-runner
-/// ledger, which no stop removes. Both are removed again on every exit path, and so is
-/// a ledger file the start created. The row is keyed by this test's port, which lies
-/// below the range the reconcile sweep reads.
+/// A temp start writes an instance root and a temp-runner ledger row and asks the
+/// primary for a window placement. The test asserts where each went, so it would fail
+/// a start that wrote into the operator's config or data dirs again or asked a live
+/// primary: the root and the row under this test's tempdir ([`stub_temp_runner`]),
+/// and the placement refused on the registered primary's refused port.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked() {
-    use crate::process::temp_runner_ledger;
-    let (state, managed, _root) = stub_temp_runner().await;
-    let _leaves_nothing_outside_the_tempdir = {
-        let (id, port) = (managed.config.id.clone(), managed.config.port);
-        let created_ledger = temp_runner_ledger::ledger_path().filter(|path| !path.exists());
-        scopeguard::guard((), move |()| {
-            temp_runner_ledger::forget_port(port);
-            if let Some(path) = created_ledger {
-                if temp_runner_ledger::load().is_empty() {
-                    let _ = std::fs::remove_file(&path);
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::remove_dir(dir);
-                    }
-                }
-            }
-            if let Some(dir) = instance_config_dir(&id) {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-        })
-    };
+    let (state, managed, tempdir) = stub_temp_runner().await;
+    let tempdir_path = tempdir.path().to_path_buf();
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -6057,9 +6046,42 @@ async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked
                 Some(copy.as_path()),
                 "the spawn runs something other than its copy"
             );
+
+            // Where the start wrote, and whom it asked.
+            let dirs = &state.config.ambient_user_dirs;
+            let root = instance_config_dir(dirs, &managed.config.id).expect("an instance root");
+            assert!(
+                root.starts_with(&tempdir_path) && root.is_dir(),
+                "the instance root {root:?} is not this test's, under {tempdir_path:?}"
+            );
+            let ledger = crate::process::temp_runner_ledger::ledger_path(dirs).expect("a ledger");
+            assert!(ledger.starts_with(&tempdir_path), "{ledger:?}");
+            assert!(
+                crate::process::temp_runner_ledger::load(dirs)
+                    .iter()
+                    .any(|row| row.pid == pid && row.port == managed.config.port),
+                "the spawn is recorded in this test's ledger at {ledger:?}"
+            );
+            let primary_port = super::primary_runner_port(&state).await;
+            let placement: Vec<String> = state
+                .logs
+                .history()
+                .await
+                .into_iter()
+                .map(|entry| entry.message)
+                .filter(|message| message.starts_with("Spawn temp placement:"))
+                .collect();
+            assert!(
+                placement.len() == 1
+                    && placement[0].contains("skipping")
+                    && placement[0].contains(&format!("127.0.0.1:{primary_port}")),
+                "the placement GET must be refused on the registered primary's port \
+                 {primary_port}: {placement:?}"
+            );
         }
     };
     with_the_stub_stopped_after(&state, &managed, body).await;
+    drop(tempdir);
 }
 
 /// A pid from the ring can have been reused, so the stop checks its image first. A
@@ -6562,26 +6584,12 @@ fn stop_escalation_only_runs_kills_from_the_table() {
 #[test]
 fn fresh_device_identity_reaches_the_non_primary_env_block() {
     const PRIMARY_PORT: u16 = 9876;
-    let pid = std::process::id();
-    let mut fresh_a = temp_config(&format!("test-fresh-id-a-{pid}"), 9877);
-    let mut fresh_b = temp_config(&format!("test-fresh-id-b-{pid}"), 9878);
+    let (dirs, _user_dirs) = temp_user_dirs();
+    let mut fresh_a = temp_config("test-fresh-id-a", 9877);
+    let mut fresh_b = temp_config("test-fresh-id-b", 9878);
     fresh_a.fresh_device_identity = true;
     fresh_b.fresh_device_identity = true;
-    let plain = temp_config(&format!("test-fresh-id-plain-{pid}"), 9879);
-    if instance_config_dir(&plain.id).is_none() {
-        eprintln!("SKIP fresh_device_identity_reaches_the_non_primary_env_block: no resolvable instance config dir on this platform");
-        return;
-    }
-    let _cleanup = scopeguard::guard(
-        vec![fresh_a.id.clone(), fresh_b.id.clone(), plain.id.clone()],
-        |ids: Vec<String>| {
-            for id in ids {
-                if let Some(dir) = instance_config_dir(&id) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            }
-        },
-    );
+    let plain = temp_config("test-fresh-id-plain", 9879);
     let harness = tempfile::tempdir().unwrap();
     std::fs::write(
         harness.path().join("machine.json"),
@@ -6597,6 +6605,7 @@ fn fresh_device_identity_reaches_the_non_primary_env_block() {
         );
         let root = super::apply_non_primary_instance_env_with(
             &mut cmd,
+            &dirs,
             cfg,
             PRIMARY_PORT,
             Some(harness.path()),
@@ -6618,6 +6627,7 @@ fn fresh_device_identity_reaches_the_non_primary_env_block() {
     let mut cmd = Command::new("cargo");
     let root = super::apply_non_primary_instance_env_with(
         &mut cmd,
+        &dirs,
         &plain,
         PRIMARY_PORT,
         Some(harness.path()),

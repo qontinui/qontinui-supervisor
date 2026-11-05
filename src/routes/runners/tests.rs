@@ -854,26 +854,19 @@ fn apply_paired_profile_copies_both_files_when_present() {
 ///
 /// Driven through the real `apply_paired_state_for_spawn` rather than
 /// re-deriving the destination, so re-inlining a different path in the
-/// route fails here even though the helper itself is unchanged. Uses the
-/// production `~/.qontinui/profiles` root under a pid-unique profile id and
-/// removes both dirs afterwards.
+/// route fails here even though the helper itself is unchanged. Every root
+/// is a tempdir's ([`crate::config::AmbientUserDirs::At`]): the profile
+/// snapshot under its harness home, the destination under its config dir.
 #[test]
 fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
-    let unique = format!("supervisor-selftest-{}", std::process::id());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+    let unique = "supervisor-selftest";
     let runner_id = format!("test-{unique}");
-    let (Some(home), Some(dest)) = (
-        dirs::home_dir(),
-        crate::process::instance_config_dir(&runner_id),
-    ) else {
-        // No resolvable home / config dir on this platform.
-        return;
-    };
-    let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+    let home = dirs.home_dir().expect("At has a home");
+    let dest = crate::process::instance_config_dir(&dirs, &runner_id).expect("an instance root");
+    let snapshot = home.join(".qontinui").join("profiles").join(unique);
     std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
-    let _cleanup = scopeguard::guard((snapshot.clone(), dest.clone()), |(snap, dst)| {
-        let _ = std::fs::remove_dir_all(snap);
-        let _ = std::fs::remove_dir_all(dst);
-    });
     std::fs::write(
         snapshot.join("paired_user.json"),
         r#"{"user_id":"selftest"}"#,
@@ -883,8 +876,9 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
         .expect("write auth_tokens.enc");
 
     let report = super::apply_paired_state_for_spawn(
+        &dirs,
         crate::process::instance_root::DeviceIdentity::Harness,
-        Some(&unique),
+        Some(unique),
         &runner_id,
     )
     .expect("must succeed");
@@ -900,8 +894,9 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     // separately by
     // `process::manager::tests::apply_instance_root_env_exports_the_root_and_confines_every_location`
     // and, end to end, by `paired_state_writer_targets_the_childs_secure_storage_dir`.
-    let expected = dirs::config_dir()
-        .expect("config_dir resolved above")
+    let expected = dirs
+        .config_dir()
+        .expect("At has a config dir")
         .join("com.qontinui.runner")
         .join("instances")
         .join(&runner_id);
@@ -915,9 +910,11 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
         "auth_tokens.enc must land in the runner's instance dir {dest:?}"
     );
     // And NOT in the shared fallback the runner ignores.
-    if let Some(shared) = dirs::data_local_dir() {
-        assert_ne!(dest, shared.join("com.qontinui.runner"));
-    }
+    assert_ne!(
+        Some(dest),
+        crate::process::primary_paired_state_dir(&dirs),
+        "the copy landed in the shared fallback the runner ignores"
+    );
 }
 
 /// The paired-state writer and the spawn's env block agree END TO END: the dir
@@ -929,21 +926,13 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
 /// `Command` — so neither can drift without failing here.
 #[test]
 fn paired_state_writer_targets_the_childs_secure_storage_dir() {
-    let unique = format!("supervisor-selftest-secure-{}", std::process::id());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+    let unique = "supervisor-selftest-secure";
     let runner_id = format!("test-{unique}");
-    let (Some(home), Some(root)) = (
-        dirs::home_dir(),
-        crate::process::instance_config_dir(&runner_id),
-    ) else {
-        eprintln!("SKIPPED: no resolvable home / config dir on this platform");
-        return;
-    };
-    let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+    let home = dirs.home_dir().expect("At has a home");
+    let snapshot = home.join(".qontinui").join("profiles").join(unique);
     std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
-    let _cleanup = scopeguard::guard((snapshot.clone(), root.clone()), |(snap, dst)| {
-        let _ = std::fs::remove_dir_all(snap);
-        let _ = std::fs::remove_dir_all(dst);
-    });
     std::fs::write(
         snapshot.join("paired_user.json"),
         r#"{"user_id":"selftest"}"#,
@@ -968,8 +957,10 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
         fresh_device_identity: false,
     };
     let mut cmd = tokio::process::Command::new("cargo");
-    crate::process::manager::apply_non_primary_instance_env_with(&mut cmd, &config, 9876, None)
-        .expect("env block must apply");
+    crate::process::manager::apply_non_primary_instance_env_with(
+        &mut cmd, &dirs, &config, 9876, None,
+    )
+    .expect("env block must apply");
     let env = |key: &str| -> Option<std::path::PathBuf> {
         cmd.as_std()
             .get_envs()
@@ -981,8 +972,9 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
     let child_root = env("QONTINUI_INSTANCE_ROOT").expect("instance root exported");
 
     super::apply_paired_state_for_spawn(
+        &dirs,
         crate::process::instance_root::DeviceIdentity::Harness,
-        Some(&unique),
+        Some(unique),
         &runner_id,
     )
     .expect("must succeed");
@@ -1730,6 +1722,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1921,6 +1914,7 @@ fn make_state() -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -3754,14 +3748,21 @@ fn spawn_routes_wire_fresh_device_identity_end_to_end() {
     let named = fn_source("pub async fn spawn_named(");
     assert!(named.contains("extra_env: body.extra_env.clone(),"));
     let named_inner = fn_source("async fn spawn_named_inner(");
-    assert!(named_inner.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
+    // Whitespace removed, so the pin is the call and not rustfmt's line break.
+    let sq = |text: &str| text.split_whitespace().collect::<String>();
+    let dirs = "&state.config.ambient_user_dirs";
+    assert!(sq(&named_inner).contains(&sq(&format!(
+        "resp[\"device_identity\"] = device_identity_report({dirs}, &id)"
+    ))));
     let exec = fn_source("async fn execute_spawn_build_inner(");
-    assert!(exec.contains("resp[\"device_identity\"] = device_identity_report(id)"));
+    assert!(sq(&exec).contains(&sq(&format!(
+        "resp[\"device_identity\"] = device_identity_report({dirs}, id)"
+    ))));
     assert!(exec.contains("managed.config.fresh_device_identity"));
     let list = fn_source("pub async fn list_runners(");
-    assert!(
-        list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
-    );
+    assert!(sq(&list).contains(&sq(&format!(
+        "entry[\"device_identity\"] = device_identity_report({dirs}, &managed.config.id)"
+    ))));
 }
 
 // ── Plan `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-dev-action-

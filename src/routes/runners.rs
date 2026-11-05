@@ -515,12 +515,17 @@ pub(crate) fn apply_spawn_paired_state_for_identity(
 ///
 /// An unresolvable config dir FAILS the spawn. There is deliberately no
 /// fallback to the shared dir — a silent fallback is the original bug.
+///
+/// Every location is `dirs`' (the state's `config.ambient_user_dirs`): the
+/// destination, the paired-profile snapshots under the harness home, and the
+/// primary's paired-state dir.
 fn apply_paired_state_for_spawn(
+    dirs: &crate::config::AmbientUserDirs,
     identity: crate::process::instance_root::DeviceIdentity,
     paired_profile_id: Option<&str>,
     runner_id: &str,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    let home = dirs.home_dir().ok_or_else(|| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -534,7 +539,7 @@ fn apply_paired_state_for_spawn(
     // cannot drift (plan
     // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
     // Phase 4: "writes into the subject's own secure dir").
-    let dest_dir = crate::process::instance_root::instance_secure_storage_dir(runner_id)
+    let dest_dir = crate::process::instance_root::instance_secure_storage_dir(dirs, runner_id)
         .ok_or_else(|| {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -546,7 +551,7 @@ fn apply_paired_state_for_spawn(
             )
         })?;
     let profiles_root = home.join(".qontinui").join("profiles");
-    let primary_dir = crate::process::primary_paired_state_dir();
+    let primary_dir = crate::process::primary_paired_state_dir(dirs);
     apply_spawn_paired_state_for_identity(
         identity,
         paired_profile_id,
@@ -579,8 +584,11 @@ fn refuse_reserved_non_primary_port(port: u16) -> Result<(), SupervisorError> {
 /// `~/.qontinui` — the loopback handshake key, its port breadcrumb, session
 /// names — under `home`, NOT under the harness's `~/.qontinui`, so a client that
 /// reads those files must read them from here.
-pub(crate) fn instance_root_json(runner_id: &str) -> serde_json::Value {
-    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+pub(crate) fn instance_root_json(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(dirs, runner_id) {
         Some(root) => json!({
             "path": root.path().display().to_string(),
             "home": root.home_dir().display().to_string(),
@@ -790,7 +798,8 @@ pub async fn list_runners(
         // minted after the spawn response was sent. Absent for every
         // unflagged runner, whose entry is unchanged.
         if managed.config.fresh_device_identity {
-            entry["device_identity"] = device_identity_report(&managed.config.id);
+            entry["device_identity"] =
+                device_identity_report(&state.config.ambient_user_dirs, &managed.config.id);
         }
         result.push(entry);
     }
@@ -1022,6 +1031,7 @@ pub async fn remove_runner(
     // `?include_stopped=true` on the logs endpoint.
     {
         let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+            &state.config.ambient_user_dirs,
             managed.as_ref(),
             None,
             crate::process::stopped_cache::StopReason::GracefulStop,
@@ -1044,7 +1054,7 @@ pub async fn remove_runner(
     // what the runner received as `QONTINUI_INSTANCE_NAME`), and the instance
     // config dir with its copy of the pairing. Primary runners are never
     // reached here (the is_primary check above returns early).
-    manager::reap_runner_instance_state(&id, &name).await;
+    manager::reap_runner_instance_state(&state.config.ambient_user_dirs, &id, &name).await;
 
     // Clean up the per-runner exe copy (its whole directory, sidecars
     // included) for temp runners to prevent disk bloat.
@@ -1251,6 +1261,7 @@ pub async fn purge_stale_test_runners_core(
         // whose process is already dead, so mark them `Crashed`.
         {
             let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                &state.config.ambient_user_dirs,
                 managed.as_ref(),
                 None,
                 crate::process::stopped_cache::StopReason::Crashed,
@@ -1267,7 +1278,7 @@ pub async fn purge_stale_test_runners_core(
         }
 
         // Best-effort cleanup of on-disk per-instance state.
-        manager::reap_runner_instance_state(&id, &name).await;
+        manager::reap_runner_instance_state(&state.config.ambient_user_dirs, &id, &name).await;
 
         // Clean up the per-runner exe copy (its whole directory, sidecars
         // included) to prevent disk bloat.
@@ -2452,11 +2463,14 @@ fn fresh_identity_paired_state() -> serde_json::Value {
 /// `device_id` it minted into `<root>/home/machine.json`, read lazily
 /// ([`crate::process::instance_root::device_identity_json`]). Emitted by the
 /// spawn responses and `GET /runners` for FLAGGED runners only.
-pub(crate) fn device_identity_report(runner_id: &str) -> serde_json::Value {
-    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+pub(crate) fn device_identity_report(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(dirs, runner_id) {
         Some(root) => crate::process::instance_root::device_identity_json(
             &root.home_dir(),
-            crate::process::instance_root::harness_qontinui_dir().as_deref(),
+            dirs.harness_qontinui_dir().as_deref(),
         ),
         None => json!({
             "fresh": true,
@@ -4568,6 +4582,7 @@ async fn execute_spawn_build_inner(
     // subject is a different device, and the primary's pairing (or a
     // snapshot) would bind it to the harness's device.
     let paired_state = match apply_paired_state_for_spawn(
+        &state.config.ambient_user_dirs,
         crate::process::instance_root::DeviceIdentity::from_fresh_flag(
             managed.config.fresh_device_identity,
         ),
@@ -4591,7 +4606,9 @@ async fn execute_spawn_build_inner(
             // from the registry, and the instance-dir reaper only visits
             // REGISTERED runners — so the dir would leak forever. `id` is
             // uuid-unique, so nothing else owns this path.
-            if let Some(dest) = crate::process::instance_config_dir(id) {
+            if let Some(dest) =
+                crate::process::instance_config_dir(&state.config.ambient_user_dirs, id)
+            {
                 let _ = std::fs::remove_dir_all(&dest);
             }
             let mut runners = state.runners.write().await;
@@ -4619,7 +4636,8 @@ async fn execute_spawn_build_inner(
         // paired-state copy just populated (it holds a copy of the
         // operator's credential store, and the instance-dir reaper only
         // visits registered runners, so it would otherwise leak forever).
-        if let Some(dest) = crate::process::instance_config_dir(id) {
+        if let Some(dest) = crate::process::instance_config_dir(&state.config.ambient_user_dirs, id)
+        {
             let _ = std::fs::remove_dir_all(&dest);
         }
         let mut runners = state.runners.write().await;
@@ -4713,6 +4731,7 @@ async fn execute_spawn_build_inner(
                 // is the more accurate reason.
                 if let Some(managed) = state.get_runner(id).await {
                     let snapshot = crate::process::stopped_cache::snapshot_from_managed(
+                        &state.config.ambient_user_dirs,
                         managed.as_ref(),
                         None,
                         crate::process::stopped_cache::StopReason::Crashed,
@@ -5034,7 +5053,7 @@ async fn execute_spawn_build_inner(
         // directory the binary came from, which is the gap that let a
         // 54-day-old exe pass for a branch under test.
         "source_exe": source_exe_json(managed).await,
-        "instance_root": instance_root_json(id),
+        "instance_root": instance_root_json(&state.config.ambient_user_dirs, id),
         "auth_state": auth_state_json,
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
@@ -5060,7 +5079,7 @@ async fn execute_spawn_build_inner(
     }
     resp["paired_state"] = paired_state;
     if managed.config.fresh_device_identity {
-        resp["device_identity"] = device_identity_report(id);
+        resp["device_identity"] = device_identity_report(&state.config.ambient_user_dirs, id);
     }
     resp["coord_credential"] = coord_credential_from_health(
         child_health_body.as_ref(),
@@ -6188,7 +6207,7 @@ async fn spawn_named_inner(
         // Which artifact was launched and which resolution rung produced it —
         // same shape as spawn-test (`source_exe_json`).
         "source_exe": source_exe_json(&managed).await,
-        "instance_root": instance_root_json(&id),
+        "instance_root": instance_root_json(&state.config.ambient_user_dirs, &id),
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {
@@ -6205,7 +6224,7 @@ async fn spawn_named_inner(
     // first start reaches `ensure_device_initialized` — `GET /runners`
     // re-reads it). Flagged runners only.
     if body.fresh_device_identity {
-        resp["device_identity"] = device_identity_report(&id);
+        resp["device_identity"] = device_identity_report(&state.config.ambient_user_dirs, &id);
     }
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a
     // diagnostic `frontend_stale_reason` when set. (Named runners don't get
