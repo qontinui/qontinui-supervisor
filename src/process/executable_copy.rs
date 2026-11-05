@@ -54,9 +54,10 @@
 //! `deploy_sidecar`'s and the last-known-good copy's are. A leftover from a
 //! supervisor that died between the `cp` and the rename is removed by the next
 //! copy to that destination, where a unique name would leak a whole runner
-//! binary every time. Two copies to one destination at once would share the
-//! name, so callers serialize them: a runner's starts hold its lifecycle lock,
-//! and the pair route copies into a directory of its own.
+//! binary every time. A leftover that cannot be removed (a directory, which
+//! `cp` would copy into) refuses the copy. Two copies to one destination at once
+//! would share the name, so callers serialize them: a runner's starts hold its
+//! lifecycle lock, and the pair route copies into a directory of its own.
 
 use std::io;
 use std::path::Path;
@@ -65,9 +66,10 @@ use std::path::Path;
 /// On Unix a child `cp` writes a temp file that is renamed over `dst` (see the
 /// module docs); on Windows this is `std::fs::copy`.
 ///
-/// Every error names `src`. A failed Unix copy removes its temp file, so it
-/// leaves nothing new beside `dst`, and `dst` is replaced only by a complete
-/// copy.
+/// Every error names `src`. A source that is not a regular file is refused, as
+/// `std::fs::copy` refuses one: a `cp` would block on a FIFO, or copy a device
+/// without end. A failed Unix copy removes its temp file, so it leaves nothing
+/// new beside `dst`, and `dst` is replaced only by a complete copy.
 pub(crate) fn copy_executable(src: &Path, dst: &Path) -> io::Result<u64> {
     #[cfg(unix)]
     {
@@ -103,12 +105,29 @@ mod unix {
     }
 
     pub(super) fn copy_through_a_child(src: &Path, dst: &Path) -> io::Result<u64> {
+        let source = std::fs::metadata(src).map_err(|e| {
+            io::Error::new(e.kind(), format!("cannot read the source {src:?}: {e}"))
+        })?;
+        if !source.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{src:?} is not a regular file, so it is not copied"),
+            ));
+        }
         let tmp = temp_path_for(dst)?;
         // A leftover of an earlier copy to this destination that never reached
-        // its rename. Best effort: only a `cp` ever writes this name, and a `cp`
-        // leaves no inheritor behind, so even a leftover that `cp` has to
-        // overwrite in place carries no writer into the exec.
-        let _ = std::fs::remove_file(&tmp);
+        // its rename. It has to go first: `cp` would copy into a leftover
+        // directory, and could not overwrite a read-only leftover file.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot copy {src:?}: the leftover {tmp:?} cannot be removed: {e}"),
+                ));
+            }
+        }
         let copied = cp_then_rename(src, &tmp, dst);
         if copied.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -182,46 +201,104 @@ mod tests {
     }
 
     /// A copy that fails names its source, and leaves nothing beside its
-    /// destination: neither when the copy itself fails (no source), nor when
-    /// the bytes were copied and could not be put in place (the destination is
-    /// a directory, so the rename is refused).
+    /// destination, however it fails: a source that is missing or is not a
+    /// regular file is refused before anything is written; a destination whose
+    /// directory does not exist fails the copy itself; and a destination that
+    /// is a directory lets the bytes be copied and then refuses their rename.
     #[test]
     fn a_failed_copy_names_its_source_and_leaves_no_temp_file() {
         let root = tempfile::tempdir().expect("tempdir");
         let dest_dir = root.path().join("dest");
         std::fs::create_dir(&dest_dir).expect("mkdir dest");
-
-        let missing = root.path().join("no-such-source");
-        let err = copy_executable(&missing, &dest_dir.join("runner"))
-            .expect_err("a copy of a missing source must fail");
-        assert!(
-            err.to_string().contains(&format!("{missing:?}")),
-            "the error must name its source: {err}"
-        );
-        assert_eq!(
-            entries(&dest_dir),
-            Vec::<String>::new(),
-            "a failed copy left something behind"
-        );
-
-        let src = root.path().join("source");
-        std::fs::write(&src, b"an executable").expect("write the source");
         let occupied = dest_dir.join("occupied");
         std::fs::create_dir(&occupied).expect("mkdir the occupied destination");
-        let err = copy_executable(&src, &occupied).expect_err("a copy over a directory must fail");
+        let file = root.path().join("source");
+        std::fs::write(&file, b"an executable").expect("write the source");
+        let directory = root.path().join("a-directory");
+        std::fs::create_dir(&directory).expect("mkdir the directory source");
+
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases = vec![
+            (
+                "a missing source",
+                root.path().join("no-such-source"),
+                dest_dir.join("runner"),
+            ),
+            ("a directory source", directory, dest_dir.join("runner")),
+            (
+                "a destination whose directory does not exist",
+                file.clone(),
+                dest_dir.join("missing").join("runner"),
+            ),
+            ("a destination that is a directory", file, occupied.clone()),
+        ];
+        // A device, which a `cp` would copy as an empty file rather than refuse.
+        #[cfg(unix)]
+        cases.push((
+            "a device source",
+            std::path::PathBuf::from("/dev/null"),
+            dest_dir.join("runner"),
+        ));
+        for (case, src, dst) in cases {
+            let err =
+                copy_executable(&src, &dst).expect_err(&format!("{case}: the copy must fail"));
+            assert!(
+                err.to_string().contains(&format!("{src:?}")),
+                "{case}: the error must name its source: {err}"
+            );
+            assert_eq!(
+                entries(&dest_dir),
+                ["occupied"],
+                "{case}: a failed copy left something behind"
+            );
+            assert_eq!(
+                entries(&occupied),
+                Vec::<String>::new(),
+                "{case}: the occupied destination was written into"
+            );
+        }
+    }
+
+    /// A leftover of an interrupted copy, at the fixed temp name beside the
+    /// destination, is cleared before the next copy. A leftover file is
+    /// removed, so the copy succeeds even when it is read-only, which a `cp`
+    /// could not overwrite (a root test process can, so it proves nothing
+    /// there). A leftover directory, which a `cp` would copy into, cannot be
+    /// removed that way, so the copy is refused and nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_of_an_interrupted_copy_is_cleared_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let src = root.path().join("source");
+        std::fs::write(&src, b"the new copy").expect("write the source");
+        let dst = root.path().join("runner");
+        let leftover = root.path().join(".runner.copy-tmp");
+
+        std::fs::write(&leftover, b"half of an old copy").expect("write the leftover");
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o444))
+            .expect("make the leftover read-only");
+        let copied = copy_executable(&src, &dst).expect("a copy over a leftover file");
+        assert_eq!(copied as usize, b"the new copy".len());
+        assert_eq!(std::fs::read(&dst).expect("read the copy"), b"the new copy");
+        assert_eq!(entries(root.path()), ["runner", "source"]);
+
+        std::fs::create_dir(&leftover).expect("mkdir the leftover");
+        let err =
+            copy_executable(&src, &dst).expect_err("a leftover directory must refuse the copy");
         assert!(
-            err.to_string().contains(&format!("{src:?}")),
-            "the error must name its source: {err}"
+            err.to_string().contains(&format!("{leftover:?}")),
+            "the error must name the leftover: {err}"
         );
         assert_eq!(
-            entries(&dest_dir),
-            ["occupied"],
-            "a copy that could not be put in place left its temp file behind"
-        );
-        assert_eq!(
-            entries(&occupied),
+            entries(&leftover),
             Vec::<String>::new(),
-            "the occupied destination was written into"
+            "the refused copy wrote into the leftover directory"
+        );
+        assert_eq!(
+            std::fs::read(&dst).expect("read the copy"),
+            b"the new copy",
+            "the refused copy replaced the destination"
         );
     }
 
