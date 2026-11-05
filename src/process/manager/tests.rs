@@ -7312,8 +7312,9 @@ async fn no_runner_is_started_once_the_shutdown_has_latched() {
         );
     } else {
         assert!(
-            !matches!(err, SupervisorError::ShuttingDown(_)),
-            "on Windows a crash restart is not refused for the shutdown: {err}"
+            matches!(err, SupervisorError::StartSuperseded(_)),
+            "on Windows a crash restart is not refused for the shutdown (it is superseded: \
+             never started): {err}"
         );
     }
 }
@@ -7577,5 +7578,40 @@ fn the_serving_restart_rereads_the_shutdown_latch_before_it_is_admitted() {
     assert!(
         again < admit,
         "the latch is re-read before the restart is admitted"
+    );
+    // ...and once more AFTER admission (its readiness probe can take 15 s),
+    // before anything is stopped.
+    let after = restart[admit..]
+        .find("if shutdown_has_latched(state) {\n        return Err(SupervisorError::ShuttingDown(")
+        .map(|i| i + admit)
+        .expect("serving_watchdog_restart re-reads the latch after admission");
+    let run = restart
+        .find("run_admitted_restart(")
+        .expect("serving_watchdog_restart runs the admitted restart");
+    assert!(
+        admit < after && after < run,
+        "admit {admit} < re-read {after} < run {run}"
+    );
+}
+
+/// A serving restart refused for the shutdown is a skip: it is refunded like a
+/// readiness refusal and reported as no failure.
+#[test]
+fn a_serving_restart_refused_at_shutdown_is_a_refunded_skip() {
+    let decide = manager_fn_body("pub async fn maybe_serving_restart(");
+    assert!(
+        decide
+            .contains("Err(SupervisorError::RestartUnsafe(_) | SupervisorError::ShuttingDown(_))"),
+        "a shutdown refusal is refunded alongside a readiness refusal"
+    );
+    let skip = decide
+        .find("Err(SupervisorError::ShuttingDown(_)) => {")
+        .expect("the shutdown refusal has its own arm");
+    let failed = decide
+        .find("serving watchdog FAILED to restart runner")
+        .expect("the failure arm");
+    assert!(
+        skip < failed,
+        "the skip arm comes before the catch-all failure arm"
     );
 }

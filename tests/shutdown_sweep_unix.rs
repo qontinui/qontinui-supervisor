@@ -94,13 +94,9 @@ async fn the_kill_phase_ends_an_ordinary_and_a_sigterm_ignoring_runner_inside_it
     // The plain one exits inside the SIGTERM grace and is reaped by its waiter
     // before `kill_by_pid_tree` returns, so it is observed stopped.
     assert_eq!(outcomes[0].1, KillOutcome::Stopped, "{outcomes:?}");
-    assert!(
-        matches!(
-            outcomes[1].1,
-            KillOutcome::Stopped | KillOutcome::SignalledNotObserved
-        ),
-        "the stubborn one is SIGKILLed after the grace, never cut off: {outcomes:?}"
-    );
+    // The stubborn one is SIGKILLed after the grace and reaped by its waiter
+    // inside the rest of the bound, so it too is observed stopped.
+    assert_eq!(outcomes[1].1, KillOutcome::Stopped, "{outcomes:?}");
 
     for (name, exit) in [("plain", plain_exit), ("stubborn", stubborn_exit)] {
         let status = tokio::time::timeout(Duration::from_secs(2), exit)
@@ -167,10 +163,12 @@ async fn a_victim_whose_leader_is_gone_still_has_its_group_signalled() {
         SHUTDOWN_SWEEP_BOUND,
     )
     .await;
-    assert_ne!(
-        outcomes[0].1,
-        KillOutcome::AlreadyGone,
-        "a group with a live member is not 'already gone'"
+    assert!(
+        matches!(
+            outcomes[0].1,
+            KillOutcome::GroupStopped | KillOutcome::SignalledNotObserved
+        ),
+        "a group with a live member is neither 'already gone' nor a live leader's stop: {outcomes:?}"
     );
     let started = std::time::Instant::now();
     while !dead(orphan) {
@@ -243,8 +241,85 @@ async fn a_sigterm_ignoring_orphan_in_the_group_is_sigkilled_too() {
     assert!(
         matches!(
             outcomes[0].1,
-            KillOutcome::Stopped | KillOutcome::SignalledNotObserved
+            KillOutcome::GroupStopped | KillOutcome::SignalledNotObserved
         ),
         "{outcomes:?}"
     );
+}
+
+/// A group member whose leader had already exited still gets the SIGTERM
+/// GRACE before any SIGKILL: here it takes 0.8 s to shut down, then leaves a
+/// marker — which only exists if nothing killed it first.
+#[tokio::test]
+async fn a_leaderless_group_member_gets_its_sigterm_grace_before_sigkill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mark = dir.path().join("shut-down-cleanly");
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args([
+        "-c",
+        "(trap 'sleep 0.8; touch \"$MARK\"; exit 0' TERM; i=0; while [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done) \
+         </dev/null >/dev/null 2>&1 & echo $!; exit 0",
+    ])
+    .env("MARK", &mark)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
+    lead_own_process_group(&mut cmd);
+    let child = cmd.spawn().expect("spawn the leader");
+    let leader = child.id().expect("pid");
+    let out = child.wait_with_output().await.expect("the leader exits");
+    let member: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the leader printed its child's pid");
+    // Let the subshell install its trap, then let the sweep signal it. Its
+    // loop is bounded (~30 s), so a failed run leaves nothing behind for long.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dead(member), "the member outlives its leader");
+
+    let outcomes = kill_victims(
+        &[victim("test-graceful-member", leader)],
+        SHUTDOWN_SWEEP_BOUND,
+    )
+    .await;
+    assert!(
+        mark.exists(),
+        "the member was SIGKILLed inside its SIGTERM grace (no marker): {outcomes:?}"
+    );
+}
+
+/// Something of the group still live when the kill phase returns — here a
+/// member left an unreaped zombie — is SignalledNotObserved, never Stopped.
+#[tokio::test]
+async fn a_group_member_still_live_after_the_kill_is_not_reported_stopped() {
+    let (leader, _leader_exit) = dummy("exec sleep 30");
+    until_sleeping(leader).await;
+    let mut member_cmd = tokio::process::Command::new("sleep");
+    member_cmd
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .process_group(leader as i32);
+    // Held but never awaited: once killed it stays a zombie IN the group.
+    let member = member_cmd
+        .spawn()
+        .expect("spawn the member into the leader's group");
+    let member_pid = member.id().expect("pid");
+    until_sleeping(member_pid).await;
+
+    let outcomes = kill_victims(
+        &[victim("test-zombie-member", leader)],
+        SHUTDOWN_SWEEP_BOUND,
+    )
+    .await;
+    assert_eq!(
+        outcomes[0].1,
+        KillOutcome::SignalledNotObserved,
+        "{outcomes:?}"
+    );
+    assert!(dead(member_pid), "the member was killed all the same");
+    drop(member);
 }

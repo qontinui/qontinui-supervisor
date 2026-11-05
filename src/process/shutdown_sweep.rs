@@ -280,11 +280,20 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
                     v.id, v.pid, v.port
                 ),
             ),
+            KillOutcome::GroupStopped => (
+                LogLevel::Info,
+                format!(
+                    "Shutdown sweep: temp runner '{}' (PID {}, port {}) had already exited; its \
+                     process group was signalled and is gone",
+                    v.id, v.pid, v.port
+                ),
+            ),
             KillOutcome::SignalledNotObserved => (
                 LogLevel::Warn,
                 format!(
-                    "Shutdown sweep: signalled temp runner '{}' (PID {}, port {}) — SIGKILL was \
-                     sent after the SIGTERM grace and its exit was NOT yet observed",
+                    "Shutdown sweep: signalled temp runner '{}' (PID {}, port {}) — SIGTERM, \
+                     then SIGKILL after the grace for anything that outlived it — and it was \
+                     NOT yet observed gone",
                     v.id, v.pid, v.port
                 ),
             ),
@@ -322,10 +331,14 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
 #[cfg(not(windows))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillOutcome {
-    /// Signalled, and observed gone afterwards.
+    /// Signalled, and the leader and its group observed gone afterwards.
     Stopped,
-    /// SIGKILL was sent after the SIGTERM grace, and the exit was not yet
-    /// observed when the kill returned.
+    /// The leader had already exited; what was left of its process group was
+    /// signalled and is observed gone.
+    GroupStopped,
+    /// Signalled (SIGTERM, and SIGKILL after the grace for anything that
+    /// outlived it), and something of it was still live when the kill phase
+    /// had to return — never "stopped".
     SignalledNotObserved,
     /// Gone before the sweep signalled it.
     AlreadyGone,
@@ -357,15 +370,26 @@ pub async fn kill_victims(
         {
             return (v.clone(), KillOutcome::AlreadyGone);
         }
+        let leader_was_gone = !crate::process::proc_kill::pid_alive(v.pid);
         let gone = || {
             !crate::process::proc_kill::pid_alive(v.pid)
                 && !crate::process::unix_kill::group_alive(v.pid)
         };
         let outcome = tokio::time::timeout_at(deadline, async {
+            // The group's SIGTERM grace runs from the FIRST signal, the one
+            // `kill_by_pid_tree` sends now.
+            let grace_end = tokio::time::Instant::now()
+                + Duration::from_millis(crate::process::unix_kill::TERM_GRACE_MS);
             let killed = crate::process::proc_kill::kill_by_pid_tree(v.pid).await?;
-            // `kill_by_pid_tree`'s grace polls only the LEADER, so a group
-            // member that ignores SIGTERM — or a whole group whose leader had
-            // already exited — can still be standing: SIGKILL the group.
+            // `kill_by_pid_tree`'s grace polls only the LEADER, which can be
+            // gone long before the rest of its group — or gone before the sweep
+            // began. Give the group the same grace, then SIGKILL whatever is
+            // still standing in it.
+            while crate::process::unix_kill::group_alive(v.pid)
+                && tokio::time::Instant::now() < grace_end
+            {
+                tokio::time::sleep(SWEEP_POLL).await;
+            }
             if crate::process::unix_kill::group_alive(v.pid) {
                 crate::process::unix_kill::kill_group(v.pid, libc::SIGKILL);
             }
@@ -379,6 +403,7 @@ pub async fn kill_victims(
         .await;
         let outcome = match outcome {
             // Stopped only when the leader AND its group are observed gone.
+            Ok(Ok(_)) if gone() && leader_was_gone => KillOutcome::GroupStopped,
             Ok(Ok(_)) if gone() => KillOutcome::Stopped,
             // Still something live after the kill: SIGKILL went out and the
             // exit has not been observed (or the number now names another
@@ -678,6 +703,7 @@ mod tests {
         let body =
             crate::source_scan::fn_body(&src, "async fn sweep_once(").expect("sweep_once exists");
         for needle in [
+            "temp_runners_of(all)",
             "temp_runners_to_sweep(&snapshot_of(&reads))",
             "kill_victims(&victims, bound)",
         ] {

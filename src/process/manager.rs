@@ -4755,7 +4755,8 @@ async fn emit_serving_event(
 ///
 /// Returns the decision taken on this tick, so the caller's log line can say
 /// what the serving arm did rather than guess; `None` when no decision was
-/// evaluated (an `Unknown` liveness, which is alerted and never restarted).
+/// evaluated — an `Unknown` liveness (alerted and never restarted), or a
+/// supervisor whose shutdown has latched (it restarts nothing).
 pub async fn maybe_serving_restart(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -5022,7 +5023,11 @@ pub async fn maybe_serving_restart(
                 // and refunding second would let the next 2 s tick push its
                 // own history entry in between, and the refund would pop the
                 // wrong one.
-                let refunded = matches!(result, Err(SupervisorError::RestartUnsafe(_)));
+                // A shutdown refusal is no restart either: nothing was stopped.
+                let refunded = matches!(
+                    result,
+                    Err(SupervisorError::RestartUnsafe(_) | SupervisorError::ShuttingDown(_))
+                );
                 {
                     let mut wd = managed.watchdog.write().await;
                     if refunded {
@@ -5081,6 +5086,19 @@ pub async fn maybe_serving_restart(
                             Some(detail.cause.to_string()),
                         )
                         .await;
+                    }
+                    // The supervisor is shutting down: a skip, not a failure —
+                    // nothing was stopped, and nothing is reported to coord.
+                    Err(SupervisorError::ShuttingDown(_)) => {
+                        let msg = format!(
+                            "serving watchdog: skipped the restart of '{runner_name}': the \
+                             supervisor is shutting down"
+                        );
+                        info!("{}", msg);
+                        state
+                            .logs
+                            .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                            .await;
                     }
                     Err(e) => {
                         let msg = format!(
@@ -5238,6 +5256,13 @@ async fn serving_watchdog_restart(
         intent,
     )
     .await?;
+    // And again AFTER admission: the readiness probe inside it can take up to
+    // 15 s. Dropping `prepared` and `admitted` here writes no ledger row and
+    // stops nothing. (A stop that is already running cannot be recalled by any
+    // read; that residual is a known limit.)
+    if shutdown_has_latched(state) {
+        return Err(SupervisorError::ShuttingDown(runner_id.clone()));
+    }
     let minted = crate::dev_action::commit_action(
         state,
         prepared,
