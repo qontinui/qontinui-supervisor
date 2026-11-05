@@ -1179,7 +1179,6 @@ function RunnerInstancesPanel() {
       // Safety cap so a stuck/evicted build can't pin the indicator forever
       // (build timeout is 30 min on the backend; cap a little above that).
       const deadline = Date.now() + 35 * 60 * 1000;
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         await new Promise((res) => setTimeout(res, POLL_MS));
         let terminal = false;
