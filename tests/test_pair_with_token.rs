@@ -288,17 +288,19 @@ async fn override_path_must_exist() {
 
 #[tokio::test]
 async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
-    // Use a built-in OS command that always exits non-zero so we
-    // exercise the failure-path branch without needing to build a stub
-    // binary. On Windows we use `cmd /c exit 2`; on Unix `/bin/false`.
+    // Use a stub script that always exits non-zero so we exercise the
+    // failure-path branch without needing to build a stub binary. It is
+    // written into this test's own tempdir: at a fixed path under the system
+    // temp dir, two concurrent runs could each rewrite it while the other's
+    // pair route copies it.
     //
     // The handler treats this as a CLI invocation: it passes `device
     // pair --auth-token ... --tenant-id ...` as additional arguments,
-    // which the stub command ignores. The stub exits non-zero, and we
+    // which the stub ignores. The stub exits non-zero, and we
     // assert the response carries the discriminator + exit_code + the
     // captured (empty) stderr.
-    let stub_path = pick_failing_stub();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let stub_path = write_failing_stub(tmp.path());
     let state = Arc::new(SupervisorState::new(test_config()));
     let app = build_app_copying_into(state, copy_root_in(tmp.path()));
     let (status, body) = post_json(
@@ -483,25 +485,24 @@ fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
     stub
 }
 
+/// A stub in `dir` that exits 2 regardless of its arguments.
 #[cfg(windows)]
-fn pick_failing_stub() -> PathBuf {
-    // On Windows there's no `/bin/false`. Use a small .bat file written to
-    // a tempdir that exits with code 2 regardless of args. We can't use
-    // `cmd /c exit 2` directly as the override because tokio's Command
-    // expects a binary, not a shell built-in (it would try to exec
+fn write_failing_stub(dir: &std::path::Path) -> PathBuf {
+    // A small .cmd file rather than `cmd /c exit 2` as the override: tokio's
+    // Command expects a binary, not a shell built-in (it would try to exec
     // "/bin/cmd" or similar).
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.cmd");
-    std::fs::write(&tmp, b"@exit /b 2\r\n").expect("write stub");
-    tmp
+    let stub = dir.join("qontinui_supervisor_failing_stub.cmd");
+    std::fs::write(&stub, b"@exit /b 2\r\n").expect("write stub");
+    stub
 }
 
 #[cfg(not(windows))]
-fn pick_failing_stub() -> PathBuf {
+fn write_failing_stub(dir: &std::path::Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.sh");
-    std::fs::write(&tmp, b"#!/bin/sh\nexit 2\n").expect("write stub");
-    let mut perms = std::fs::metadata(&tmp).expect("metadata").permissions();
+    let stub = dir.join("qontinui_supervisor_failing_stub.sh");
+    std::fs::write(&stub, b"#!/bin/sh\nexit 2\n").expect("write stub");
+    let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&tmp, perms).expect("set perms");
-    tmp
+    std::fs::set_permissions(&stub, perms).expect("set perms");
+    stub
 }
