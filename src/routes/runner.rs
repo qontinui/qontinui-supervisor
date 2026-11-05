@@ -2705,5 +2705,12 @@ mod tests {
             refusal < spawn,
             "the own-unit refusal must come BEFORE the replacement is spawned"
         );
+        assert!(
+            body.contains(
+                "sweep_temp_runners_at_shutdown(\n                &state,\n                \
+                 crate::process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,"
+            ),
+            "the self-restart sweep runs with its named kill bound, not an ad-hoc one"
+        );
     }
 }

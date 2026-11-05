@@ -1039,8 +1039,9 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
     // exits (the runner job is a no-op stub), so stop them NOW, at signal
     // time: the drain deadline armed below force-exits in 10 s, and an
     // in-flight long-poll keeps the serve future — and so every post-serve
-    // step — from ever running. Bounded (~2.5 s: ≤500 ms read, then 2 s kill) and concurrent; temp runners
-    // only (`should_assign_to_ephemeral_job`), never a user-owned runner.
+    // step — from ever running. Bounded (~2.5 s: ≤500 ms read, then 2 s kill)
+    // and concurrent; temp runners only (`should_assign_to_ephemeral_job`),
+    // never a user-owned runner.
     #[cfg(not(windows))]
     process::shutdown_sweep::sweep_temp_runners_at_shutdown(
         &state,
@@ -1222,6 +1223,13 @@ mod tests {
             latch < sweep && sweep < deadline,
             "the temp-runner sweep must run after `signal_shutdown()` and before the drain \
              deadline is armed (latch {latch}, sweep {sweep}, deadline {deadline})"
+        );
+        assert!(
+            body.contains(
+                "sweep_temp_runners_at_shutdown(\n        &state,\n        \
+                 process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,"
+            ),
+            "the sweep runs with its named kill bound, not an ad-hoc one"
         );
     }
 }

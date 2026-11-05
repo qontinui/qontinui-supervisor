@@ -2456,13 +2456,15 @@ pub async fn start_managed_runner(
     // between (the exe copy, the env forwarders) cannot carry a start past the
     // sweep. A user-owned runner survives the supervisor's exit on every
     // platform, so an operator's restart of one that straddles the shutdown
-    // still starts — but a crash-watchdog restart of ANY kind does not: nobody
-    // asked for it, a Linux start can outlast the drain deadline, and off
-    // Windows no later supervisor adopts what it would leave behind.
+    // still starts. Off Windows a crash-watchdog restart of ANY kind does not:
+    // nobody asked for it, a Linux start (probe, spawn, scope landing) can
+    // outlast the drain deadline, and no later supervisor adopts what it would
+    // leave behind. On Windows the next supervisor's orphan scan adopts a named
+    // runner, so the watchdog's restart is left as it was. Both refusals are
+    // read again just before the spawn.
     // Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
-    if refuses_temp_start_at_shutdown(state, &managed.config.kind())
-        || (matches!(start_as, StartAs::AfterCrash { .. }) && shutdown_has_latched(state))
-    {
+    let crash_restart = matches!(start_as, StartAs::AfterCrash { .. });
+    if refuses_start_at_shutdown(state, &managed.config.kind(), crash_restart) {
         return Err(SupervisorError::ShuttingDown(runner_id));
     }
 
@@ -2541,7 +2543,7 @@ pub async fn start_managed_runner(
         mut child,
         panic_log_dir,
         isolation,
-    } = start_exe_mode_for_runner(state, managed).await?;
+    } = start_exe_mode_for_runner(state, managed, crash_restart).await?;
     *managed.isolation.write().await = Some(isolation.clone());
 
     let pid = child.id();
@@ -3503,6 +3505,7 @@ pub(crate) fn apply_non_primary_instance_env_with(
 async fn start_exe_mode_for_runner(
     state: &SharedState,
     managed: &ManagedRunner,
+    crash_restart: bool,
 ) -> Result<SpawnResult, SupervisorError> {
     // Locate the source exe. The per-runner `source_exe_override` takes
     // precedence — set by `spawn_test` when the caller passes `use_lkg: true`
@@ -3822,8 +3825,8 @@ async fn start_exe_mode_for_runner(
             std::process::id(),
         ) {
             let msg = format!(
-                "Runner '{}' did NOT start: {why}. It was not started unscoped; retry once \
-                 `systemctl --user` answers.",
+                "Runner '{}' did NOT start: {why}. It was not started unscoped; start it again \
+                 once the cause above is resolved.",
                 managed.config.name
             );
             error!("{}", msg);
@@ -3955,11 +3958,11 @@ async fn start_exe_mode_for_runner(
     // non-zero exit. Cloning out keeps the lock held for the minimum span.
     let panic_log_dir = managed.panic_log_dir.read().await.clone();
 
-    // The second read of the shutdown latch for a temp start (the first is on
-    // entry to `start_managed_runner`): everything since then — the exe copy,
-    // the env forwarders — can take seconds, and the shutdown sweep must find
-    // every temp runner it is going to orphan otherwise.
-    if refuses_temp_start_at_shutdown(state, &managed.config.kind()) {
+    // The second read of the shutdown latch (the first is on entry to
+    // `start_managed_runner`): everything since then — the exe copy, the env
+    // forwarders, a Linux scope probe — can take seconds, and the shutdown
+    // sweep must find every temp runner it is going to orphan otherwise.
+    if refuses_start_at_shutdown(state, &managed.config.kind(), crash_restart) {
         return Err(SupervisorError::ShuttingDown(managed.config.id.clone()));
     }
     let mut child = cmd
@@ -4033,13 +4036,17 @@ async fn start_exe_mode_for_runner(
 }
 
 /// Whether a start of a runner of `kind` must be refused because the
-/// supervisor is shutting down: only a TEMP runner (the ownership predicate the
-/// sweep uses), and only once the shutdown has latched.
-fn refuses_temp_start_at_shutdown(
+/// supervisor is shutting down — only once the shutdown has latched, and then
+/// for a TEMP runner (the ownership predicate the sweep uses), or, off Windows,
+/// for a crash-watchdog restart of any kind (see `start_managed_runner`).
+fn refuses_start_at_shutdown(
     state: &SharedState,
     kind: &qontinui_types::wire::runner_kind::RunnerKind,
+    crash_restart: bool,
 ) -> bool {
-    crate::process::job::should_assign_to_ephemeral_job(kind) && shutdown_has_latched(state)
+    shutdown_has_latched(state)
+        && (crate::process::job::should_assign_to_ephemeral_job(kind)
+            || (crash_restart && cfg!(not(windows))))
 }
 
 /// Whether the supervisor's shutdown has latched.
@@ -5503,8 +5510,9 @@ async fn maybe_crash_restart(
                     }
                     // A correct skip, not a failure. The event pairs with the
                     // `RestartStarted` above, and its detail says superseded —
-                    // or, for a temp runner, that the supervisor is shutting
-                    // down and starts none.
+                    // or that the supervisor is shutting down, when no crash
+                    // restart is started (any kind off Windows, a temp runner
+                    // everywhere).
                     Err(
                         superseded @ (SupervisorError::StartSuperseded(_)
                         | SupervisorError::ShuttingDown(_)),

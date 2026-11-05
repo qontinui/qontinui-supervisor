@@ -337,7 +337,11 @@ pub async fn kill_victims(
 ) -> Vec<(SweepVictim, KillOutcome)> {
     let deadline = tokio::time::Instant::now() + bound;
     let kills = victims.iter().map(|v| async move {
-        if !crate::process::proc_kill::pid_alive(v.pid) {
+        // Gone only when the leader AND its group are: a runner's children can
+        // outlive it in its group, and the group signal below still reaches them.
+        if !crate::process::proc_kill::pid_alive(v.pid)
+            && !crate::process::unix_kill::group_alive(v.pid)
+        {
             return (v.clone(), KillOutcome::AlreadyGone);
         }
         let outcome =
@@ -348,10 +352,10 @@ pub async fn kill_victims(
             // inside the SIGTERM grace and when it escalated to SIGKILL, so
             // look again rather than claim an exit nobody observed.
             Ok(Ok(_)) if !crate::process::proc_kill::pid_alive(v.pid) => KillOutcome::Stopped,
-            Ok(Ok(true)) => KillOutcome::SignalledNotObserved,
-            // It was alive a moment ago, so a `false` means it exited in
-            // between: gone, by its own hand or ours.
-            Ok(Ok(false)) => KillOutcome::Stopped,
+            // Still a live pid after the kill: SIGKILL went out after the grace
+            // and the exit has not been observed (or the number now names
+            // another process) — never "stopped".
+            Ok(Ok(_)) => KillOutcome::SignalledNotObserved,
             Ok(Err(e)) => KillOutcome::Failed(e.to_string()),
             Err(_) => KillOutcome::CutOff,
         };
@@ -628,5 +632,28 @@ mod tests {
             snapshot_of(&reads),
             vec![row("test-a", 1), row("test-b", 2)]
         );
+    }
+
+    /// `sweep_once` selects from every runner it read and kills them through
+    /// `kill_victims` with the bound it was handed — the helpers are tested
+    /// directly, this pins that the sweep uses them.
+    #[test]
+    fn the_sweep_selects_from_the_snapshot_and_kills_with_its_bound() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("process")
+                .join("shutdown_sweep.rs"),
+        )
+        .expect("read shutdown_sweep.rs")
+        .replace("\r\n", "\n");
+        let body =
+            crate::source_scan::fn_body(&src, "async fn sweep_once(").expect("sweep_once exists");
+        for needle in [
+            "temp_runners_to_sweep(&snapshot_of(&reads))",
+            "kill_victims(&victims, bound)",
+        ] {
+            assert!(body.contains(needle), "sweep_once lacks `{needle}`");
+        }
     }
 }

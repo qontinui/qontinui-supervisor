@@ -7371,7 +7371,7 @@ fn the_spawn_site_reads_the_shutdown_latch_again_just_before_the_spawn() {
     // keep the call's text and refuse nothing.
     let latch = spawn_site
         .rfind(
-            "refuses_temp_start_at_shutdown(state, &managed.config.kind()) {\n        \
+            "refuses_start_at_shutdown(state, &managed.config.kind(), crash_restart) {\n        \
              return Err(SupervisorError::ShuttingDown(",
         )
         .expect("the spawn site re-reads the shutdown latch for a temp start, and refuses");
@@ -7422,7 +7422,7 @@ fn a_start_reads_the_shutdown_latch_under_its_lock_and_clears_the_old_verdict() 
         .find("managed.lifecycle.lock().await")
         .expect("start_managed_runner takes the lifecycle lock");
     let latch = start
-        .find("refuses_temp_start_at_shutdown(state, &managed.config.kind())")
+        .find("refuses_start_at_shutdown(state, &managed.config.kind(), crash_restart)")
         .expect("a temp start must refuse once the shutdown has latched");
     let refuse = start
         .find("SupervisorError::ShuttingDown(")
@@ -7436,7 +7436,7 @@ fn a_start_reads_the_shutdown_latch_under_its_lock_and_clears_the_old_verdict() 
         .find("*managed.isolation.write().await = None;")
         .expect("a start clears the previous spawn's isolation verdict");
     let spawn_call = start
-        .find("start_exe_mode_for_runner(state, managed)")
+        .find("start_exe_mode_for_runner(state, managed, crash_restart)")
         .expect("start_managed_runner spawns through start_exe_mode_for_runner");
     assert!(
         reset < spawn_call,
@@ -7476,6 +7476,23 @@ fn the_spawn_site_refuses_an_unscoped_runner_inside_its_own_unit() {
         unscoped < spawn,
         "that check runs BEFORE the spawn ({unscoped} vs {spawn})"
     );
+    // The whole check, not just the call's name: it runs for an UNSCOPED
+    // verdict, reads the real `/proc`, compares this process's pid, and
+    // refuses.
+    let block_start = spawn_site
+        .find("if let crate::process::systemd_scope::Isolation::Unscoped(_) = &isolation {")
+        .expect("the check is gated on an unscoped verdict");
+    let block = &spawn_site[block_start..spawn];
+    for needle in [
+        "crate::process::systemd_scope::own_unit(std::path::Path::new(\"/proc\")).await",
+        "std::process::id(),",
+        "return Err(SupervisorError::Process(msg));",
+    ] {
+        assert!(
+            block.contains(needle),
+            "the unscoped-spawn check lacks `{needle}`"
+        );
+    }
 }
 
 /// Read a repo file for a source guard.

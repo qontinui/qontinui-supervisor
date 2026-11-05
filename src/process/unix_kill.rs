@@ -54,6 +54,13 @@ pub(crate) const TERM_GRACE_MS: u64 = 1500;
 /// SUPERVISOR's group (a terminal Ctrl-C on a foreground supervisor) no longer
 /// reaches its runners; the supervisor's shutdown sweep owns stopping its temp
 /// runners, and user-owned runners are not the terminal's to stop.
+///
+/// Known limit: a terminal HANG-UP (SIGHUP) of a hand-run foreground
+/// supervisor kills the supervisor on SIGHUP's default action, without the
+/// sweep, and no longer reaches its runners either; its temp runners then wait
+/// for the next supervisor's ledger-gated reconcile (~30 s after it starts).
+/// `supervisor-verbs.sh start` (a service unit, or `setsid nohup`) has no
+/// controlling terminal, so it never gets a SIGHUP.
 pub fn lead_own_process_group(cmd: &mut Command) {
     cmd.process_group(0);
 }
@@ -70,6 +77,14 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     // errno == EPERM means the process exists but we can't signal it — still
     // "alive" for our purposes. ESRCH means no such process.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Return true if any process is left in the process group `pgid`
+/// (`kill(-pgid, 0)`; EPERM counts as alive). A group can outlive its leader.
+pub(crate) fn group_alive(pgid: u32) -> bool {
+    // SAFETY: signal 0 only probes; a negative pid names the group. Scalars only.
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Send `signal` to `pid`. Returns true if the signal was delivered (or the

@@ -2,12 +2,13 @@
 //! (plan
 //! `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`,
 //! Phase 1): `kill_victims` starts its own deadline, so even a victim that
-//! ignores SIGTERM gets the SIGKILL that follows the grace inside the bound.
+//! ignores SIGTERM gets the SIGKILL that follows the grace inside the bound;
+//! and a victim whose leader is gone still has its group signalled.
 //!
 //! In its own test binary on purpose: these tests fork, and in the library's
 //! unit-test binary a fork can make a sibling test's exec fail with ETXTBSY.
 //! Spawns only its own `sleep`/`sh` dummies and touches no port or unit.
-//! Linux only: it reads `/proc/<pid>/exe` to know a dummy has exec'd.
+//! Linux only: it reads `/proc/<pid>/{comm,stat}` to observe the dummies.
 #![cfg(target_os = "linux")]
 
 use std::time::Duration;
@@ -33,56 +34,73 @@ fn dummy(script: &str) -> (u32, tokio::task::JoinHandle<std::process::ExitStatus
     (pid, waiter)
 }
 
+/// Wait until `pid` has exec'd `sleep` (its `comm`), bounded.
+async fn until_sleeping(pid: u32) {
+    let started = std::time::Instant::now();
+    while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() != "sleep")
+        .unwrap_or(true)
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "dummy {pid} never exec'd sleep"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` is gone or a zombie — dead, whoever reaps it.
+fn dead(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state == "Z" || state == "X"),
+    }
+}
+
+fn victim(id: &str, pid: u32) -> SweepVictim {
+    SweepVictim {
+        id: id.into(),
+        port: 9899,
+        pid,
+    }
+}
+
 #[tokio::test]
 async fn the_kill_phase_ends_an_ordinary_and_a_sigterm_ignoring_runner_inside_its_bound() {
     let (plain, plain_exit) = dummy("exec sleep 30");
     // Ignores SIGTERM, and so does the `sleep` it execs (an ignored disposition
     // survives exec): only the SIGKILL after the grace can end it.
     let (stubborn, stubborn_exit) = dummy("trap '' TERM; exec sleep 30");
-    // Both must have exec'd their `sleep` — the stubborn one only then
-    // carries the ignored SIGTERM — before they are signalled.
-    for pid in [plain, stubborn] {
-        let started = std::time::Instant::now();
-        while !std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map(|exe| exe.to_string_lossy().ends_with("sleep"))
-            .unwrap_or(false)
-        {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "dummy {pid} never exec'd sleep"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    let victims = [
-        SweepVictim {
-            id: "test-plain".into(),
-            port: 9898,
-            pid: plain,
-        },
-        SweepVictim {
-            id: "test-stubborn".into(),
-            port: 9899,
-            pid: stubborn,
-        },
-    ];
+    until_sleeping(plain).await;
+    until_sleeping(stubborn).await;
 
     let started = std::time::Instant::now();
-    let outcomes = kill_victims(&victims, SHUTDOWN_SWEEP_BOUND).await;
+    let outcomes = kill_victims(
+        &[
+            victim("test-plain", plain),
+            victim("test-stubborn", stubborn),
+        ],
+        SHUTDOWN_SWEEP_BOUND,
+    )
+    .await;
     assert!(
         started.elapsed() <= SHUTDOWN_SWEEP_BOUND + Duration::from_millis(500),
         "the kill phase must finish inside its bound: {:?}",
         started.elapsed()
     );
-    assert_eq!(outcomes.len(), 2);
-    for (victim, outcome) in &outcomes {
-        assert_ne!(
-            *outcome,
-            KillOutcome::CutOff,
-            "'{}' must not be cut off by the bound",
-            victim.id
-        );
-    }
+    // The plain one exits inside the SIGTERM grace and is reaped by its waiter
+    // before `kill_by_pid_tree` returns, so it is observed stopped.
+    assert_eq!(outcomes[0].1, KillOutcome::Stopped, "{outcomes:?}");
+    assert!(
+        matches!(
+            outcomes[1].1,
+            KillOutcome::Stopped | KillOutcome::SignalledNotObserved
+        ),
+        "the stubborn one is SIGKILLed after the grace, never cut off: {outcomes:?}"
+    );
 
     for (name, exit) in [("plain", plain_exit), ("stubborn", stubborn_exit)] {
         let status = tokio::time::timeout(Duration::from_secs(2), exit)
@@ -93,18 +111,89 @@ async fn the_kill_phase_ends_an_ordinary_and_a_sigterm_ignoring_runner_inside_it
     }
 }
 
+/// A bound shorter than the SIGTERM grace cuts a SIGTERM-ignoring victim off,
+/// and says so — never "stopped".
 #[tokio::test]
-async fn a_victim_already_gone_is_reported_as_such_and_not_signalled() {
+async fn a_victim_the_bound_cuts_off_is_reported_cut_off() {
+    let (stubborn, _exit) = dummy("trap '' TERM; exec sleep 30");
+    until_sleeping(stubborn).await;
+    let outcomes = kill_victims(
+        &[victim("test-cut-off", stubborn)],
+        Duration::from_millis(200),
+    )
+    .await;
+    assert_eq!(outcomes[0].1, KillOutcome::CutOff);
+    // `kill_on_drop` ends the dummy when its waiter is dropped with the test.
+}
+
+/// A leader gone and nothing left in its group: reported already gone.
+#[tokio::test]
+async fn a_victim_already_gone_is_reported_as_already_gone() {
     let (pid, exit) = dummy("exit 0");
     exit.await.expect("the dummy exits and is reaped");
+    let outcomes = kill_victims(&[victim("test-gone", pid)], SHUTDOWN_SWEEP_BOUND).await;
+    assert_eq!(outcomes[0].1, KillOutcome::AlreadyGone);
+}
+
+/// A leader gone but a child left in its group: the group is still signalled,
+/// so the child dies too.
+#[tokio::test]
+async fn a_victim_whose_leader_is_gone_still_has_its_group_signalled() {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "sleep 30 & echo $!; exit 0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    lead_own_process_group(&mut cmd);
+    let child = cmd.spawn().expect("spawn the leader");
+    let leader = child.id().expect("pid");
+    let out = child.wait_with_output().await.expect("the leader exits");
+    let orphan: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the leader printed its child's pid");
+    until_sleeping(orphan).await;
+    assert!(!dead(orphan), "the group's child outlives its leader");
+
     let outcomes = kill_victims(
-        &[SweepVictim {
-            id: "test-gone".into(),
-            port: 9897,
-            pid,
-        }],
+        &[victim("test-orphaned-group", leader)],
         SHUTDOWN_SWEEP_BOUND,
     )
     .await;
-    assert_eq!(outcomes[0].1, KillOutcome::AlreadyGone);
+    assert_ne!(
+        outcomes[0].1,
+        KillOutcome::AlreadyGone,
+        "a group with a live member is not 'already gone'"
+    );
+    let started = std::time::Instant::now();
+    while !dead(orphan) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the group's surviving child {orphan} must be signalled and die"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A pid still live after the kill — here a zombie nobody reaps yet — is
+/// reported as signalled but not observed gone, never "stopped".
+#[tokio::test]
+async fn a_victim_still_live_after_the_kill_is_not_reported_stopped() {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "exec sleep 30"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    lead_own_process_group(&mut cmd);
+    // Held but never awaited: once it dies it stays a zombie, which
+    // `kill(pid, 0)` still answers for.
+    let child = cmd.spawn().expect("spawn dummy");
+    let pid = child.id().expect("pid");
+    until_sleeping(pid).await;
+    let outcomes = kill_victims(&[victim("test-unreaped", pid)], SHUTDOWN_SWEEP_BOUND).await;
+    assert_eq!(outcomes[0].1, KillOutcome::SignalledNotObserved);
+    assert!(dead(pid), "it was killed all the same");
+    drop(child);
 }
