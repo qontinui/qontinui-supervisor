@@ -74,6 +74,10 @@ fn pid_1_this_process_and_a_reaped_child_are_not_descendants() {
 #[test]
 fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
     let mut child = a_child();
+    // Held for the whole test: `Child::wait` would close a stdin it still owns,
+    // and the child's `read` would then end it with no signal at all, so a
+    // cleanup that never signalled would read as one that did.
+    let _lifeline = child.stdin.take();
     let pid = child.id();
     let started = crate::process::temp_runner_ledger::process_start_time_secs(pid);
     assert!(started.is_some(), "a live child's start time reads");
@@ -92,11 +96,30 @@ fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
 
     // A record of this process: ended.
     Orphan::record(pid, started).end();
-    let ended = child.wait().map(|status| !status.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("poll the child") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     assert!(spared, "a pid that names another process is not signalled");
+    // Its stdin is still open, so only a signal can have ended it.
+    #[cfg(unix)]
+    let ended = {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal()) == Some(libc::SIGKILL)
+    };
+    #[cfg(windows)]
+    let ended = status.is_some_and(|status| !status.success());
     assert!(
-        matches!(ended, Ok(true)),
-        "the orphan's own process is ended: {ended:?}"
+        ended,
+        "the orphan's own process is ended by its cleanup: {status:?}"
     );
 }
 
