@@ -178,8 +178,10 @@ fn insert_and_evict_with_bounds(
 }
 
 /// Build a snapshot from a managed runner's current state. Logs are tailed to
-/// [`STOPPED_CACHE_LOG_CAP`].
+/// [`STOPPED_CACHE_LOG_CAP`]. A non-primary's startup refusal is read from its
+/// instance root under `dirs`, the state's `config.ambient_user_dirs`.
 pub async fn snapshot_from_managed(
+    dirs: &crate::config::AmbientUserDirs,
     managed: &crate::state::ManagedRunner,
     exit_code: Option<i32>,
     exit_reason: StopReason,
@@ -196,6 +198,7 @@ pub async fn snapshot_from_managed(
         None
     } else {
         read_startup_refusal(crate::process::instance_root::InstanceRoot::for_runner(
+            dirs,
             &managed.config.id,
         ))
         .await

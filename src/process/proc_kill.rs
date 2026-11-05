@@ -103,7 +103,14 @@ pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
 /// that never ran gets reported as "nothing was listening", which then reads
 /// as "nothing to kill".
 pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
-    imp::find_pid_on_port(port).await
+    Ok(find_pids_on_port(port).await?.into_iter().next())
+}
+
+/// Every PID LISTENING on `port`: what [`kill_by_port`] kills. Three-state like
+/// [`find_pid_on_port`]: `Ok(vec![])` means the probe ran and the port is idle,
+/// and `Err` means it could not run, so the port's state is UNKNOWN.
+pub async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+    imp::find_pids_on_port(port).await
 }
 
 /// Executable path of a live PID via sysinfo, or `None` when the process is

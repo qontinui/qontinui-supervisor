@@ -77,6 +77,7 @@ use std::time::Duration;
 
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
+use crate::process::executable_copy::copy_executable;
 use crate::state::SharedState;
 
 /// JSON body for `POST /runners/pair-with-token`.
@@ -168,7 +169,10 @@ impl Drop for PrivateCliCopy {
 ///
 /// The copy keeps the source's file name (so a `.cmd` test stub stays one) and
 /// its bytes are checked: a copy of ZERO bytes — the source rewritten with
-/// tauri-build's placeholder since it was resolved — is refused.
+/// tauri-build's placeholder since it was resolved — is refused. It is written
+/// by [`copy_executable`], so on Unix no fork of this process holds a write
+/// descriptor on the file the route then execs, which would refuse that exec
+/// `ETXTBSY` ("Text file busy").
 fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy, String> {
     sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
     let file_name = cli
@@ -184,7 +188,7 @@ fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy
         exe: dir.join(file_name),
         dir,
     };
-    let bytes = std::fs::copy(cli, &copy.exe)
+    let bytes = copy_executable(cli, &copy.exe)
         .map_err(|e| format!("copy {:?} -> {:?}: {e}", cli, copy.exe))?;
     if bytes == 0 {
         return Err(format!(
@@ -332,12 +336,15 @@ pub(crate) fn paired_user_json_path(target_dir: Option<&Path>) -> Option<PathBuf
 /// side, and the removal side all funnel through it) — so this route can
 /// never diverge from the dir `start_exe_mode_for_runner` points the runner
 /// itself at.
-pub(crate) fn pair_target_instance_dir(runner_id: &str) -> Result<PathBuf, String> {
-    crate::process::instance_root::instance_secure_storage_dir(runner_id).ok_or_else(|| {
+pub(crate) fn pair_target_instance_dir(
+    dirs: &crate::config::AmbientUserDirs,
+    runner_id: &str,
+) -> Result<PathBuf, String> {
+    crate::process::instance_root::instance_secure_storage_dir(dirs, runner_id).ok_or_else(|| {
         format!(
             "could not resolve the per-instance config dir \
              <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
-             dirs::config_dir() returned None or the runner id is degenerate"
+             no per-user config dir resolved ({dirs:?}) or the runner id is degenerate"
         )
     })
 }
@@ -444,7 +451,7 @@ pub async fn pair_with_token_copying_into(
                 )
                     .into_response();
             }
-            match pair_target_instance_dir(runner_id) {
+            match pair_target_instance_dir(&state.config.ambient_user_dirs, runner_id) {
                 Ok(dir) => Some(dir),
                 Err(message) => {
                     return server_error("instance_dir_unresolved", &message);
@@ -567,21 +574,32 @@ pub async fn pair_with_token_copying_into(
     let target_home = body
         .target_runner_id
         .as_deref()
-        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .and_then(|id| {
+            crate::process::instance_root::InstanceRoot::for_runner(
+                &state.config.ambient_user_dirs,
+                id,
+            )
+        })
         .map(|root| root.home_dir());
     if let Some(refusal) = fresh_target_not_yet_minted(target_identity, target_home.as_deref()) {
         return (StatusCode::CONFLICT, Json(refusal)).into_response();
     }
     if let Some(dir) = &target_dir {
-        let root = body
-            .target_runner_id
-            .as_deref()
-            .and_then(crate::process::instance_root::InstanceRoot::for_runner);
+        let root = body.target_runner_id.as_deref().and_then(|id| {
+            crate::process::instance_root::InstanceRoot::for_runner(
+                &state.config.ambient_user_dirs,
+                id,
+            )
+        });
         let applied = match &root {
             Some(root) if root.secure_storage_dir() == *dir => root
                 .apply_env(
                     &mut cmd,
-                    crate::process::instance_root::harness_qontinui_dir().as_deref(),
+                    state
+                        .config
+                        .ambient_user_dirs
+                        .harness_qontinui_dir()
+                        .as_deref(),
                     target_identity,
                 )
                 .map(|_| ()),
@@ -688,7 +706,12 @@ pub async fn pair_with_token_copying_into(
     let target_machine_json = body
         .target_runner_id
         .as_deref()
-        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .and_then(|id| {
+            crate::process::instance_root::InstanceRoot::for_runner(
+                &state.config.ambient_user_dirs,
+                id,
+            )
+        })
         .map(|root| root.home_dir().join("machine.json"));
     let machine_json = match target_machine_json.or_else(machine_json_path) {
         Some(p) => p,
@@ -1047,13 +1070,12 @@ mod tests {
     /// pair-with-token writes credentials into a dir the target never reads.
     #[test]
     fn pair_target_instance_dir_matches_spawn_side_shape() {
-        if dirs::config_dir().is_none() {
-            return;
-        }
-        let dir = pair_target_instance_dir("test-9877").expect("normal id must resolve");
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+        let dir = pair_target_instance_dir(&dirs, "test-9877").expect("normal id must resolve");
         assert_eq!(
             Some(dir.as_path()),
-            crate::process::instance_config_dir("test-9877").as_deref(),
+            crate::process::instance_config_dir(&dirs, "test-9877").as_deref(),
             "pair side and spawn side must agree byte-for-byte on the instance dir"
         );
         assert!(
@@ -1068,9 +1090,11 @@ mod tests {
     /// shared `instances/` parent.
     #[test]
     fn pair_target_instance_dir_rejects_degenerate_ids() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
         for bad in ["", "a/b", "a\\b", ".."] {
             assert!(
-                pair_target_instance_dir(bad).is_err(),
+                pair_target_instance_dir(&dirs, bad).is_err(),
                 "pair_target_instance_dir({bad:?}) must be an error"
             );
         }

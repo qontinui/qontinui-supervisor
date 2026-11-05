@@ -1628,10 +1628,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    /// A port in the IANA dynamic range that nothing on a dev box or a CI
-    /// runner listens on — see [`test_state_dead_runner_port`].
-    const DEAD_RUNNER_PORT: u16 = 39876;
-
     /// Serializes the tests that drive a real [`crate::build_monitor::run_cargo_build`].
     ///
     /// Each closes the build-pool semaphore so the build itself fails fast —
@@ -1650,7 +1646,8 @@ mod tests {
         test_state_on_port(root, crate::config::DEFAULT_RUNNER_API_PORT)
     }
 
-    /// A [`test_state`] whose primary points at [`DEAD_RUNNER_PORT`].
+    /// A [`test_state`] whose primary points at a port nothing holds and no
+    /// kernel allocation hands out ([`crate::test_ports::unheld_port`]).
     ///
     /// Use this for any test that drives a restart to the point of running
     /// `restart_readiness::enforce` **synchronously**. Against a dead port the
@@ -1660,7 +1657,7 @@ mod tests {
     /// verdict away from stopping a live runner that happens to be listening on
     /// `DEFAULT_RUNNER_API_PORT` on the machine running the suite.
     fn test_state_dead_runner_port(root: &std::path::Path) -> SharedState {
-        test_state_on_port(root, DEAD_RUNNER_PORT)
+        test_state_on_port(root, crate::test_ports::unheld_port())
     }
 
     fn test_state_on_port(root: &std::path::Path, runner_port: u16) -> SharedState {
@@ -1689,6 +1686,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
         }
     }
 
@@ -1764,7 +1762,7 @@ mod tests {
         let _building = BUILDING_TESTS.lock().await;
         let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
         let tmp = TempDir::new().expect("tempdir");
-        let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+        let mut config = test_config(tmp.path(), crate::test_ports::unheld_port());
         config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
         let state = Arc::new(SupervisorState::new(config));
         state.build_pool.permits.close();
@@ -2382,7 +2380,7 @@ mod tests {
         for (use_lkg, lkg_on_disk) in cases {
             let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
             let tmp = TempDir::new().expect("tempdir");
-            let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+            let mut config = test_config(tmp.path(), crate::test_ports::unheld_port());
             config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
             if lkg_on_disk {
                 let lkg = config.lkg_exe_path();

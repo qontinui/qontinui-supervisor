@@ -61,13 +61,18 @@ pub const PID_REUSE_SKEW_SECS: u64 = 5;
 
 /// One row of a process-table snapshot, in the shape the pure layer walks.
 ///
-/// Built from `sysinfo::Process` by [`take_census`]; hand-built by tests.
+/// Built from `sysinfo::Process` by [`snapshot_rows`]; hand-built by tests.
+/// On Linux sysinfo lists every thread as a row too, parented to its process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcRow {
     pub pid: u32,
     /// Parent PID, `None` when the platform could not resolve one (the init
     /// process, or a permission-denied `/proc` entry).
     pub ppid: Option<u32>,
+    /// True for a row that is a thread of another row's process: sysinfo lists
+    /// every Linux thread as a row whose parent is its process. A signal to a
+    /// thread's id reaches that whole process. Always false off Linux.
+    pub thread: bool,
     /// The process's image name as the platform reports it (`comm` on Linux,
     /// the image file name on Windows). Used only when `exe` is unresolved.
     pub name: String,
@@ -311,6 +316,8 @@ fn is_claude_image(row: &ProcRow) -> bool {
 /// with no root must never be representable as `Idle`, which is why this
 /// returns a `Result` rather than an empty census. When `reference_unix_secs`
 /// is given, the PID-reuse guard runs on the root first (`Err(RootReused)`).
+///
+/// The walk is [`inclusive_subtree`].
 pub fn census_from_snapshot(
     root_pid: u32,
     procs: &[ProcRow],
@@ -341,8 +348,45 @@ pub fn census_from_snapshot(
         }
     };
 
+    let subtree = inclusive_subtree(root_pid, procs);
+    let mut live: Vec<CensusEntry> = subtree
+        .iter()
+        .filter_map(|pid| by_pid.get(pid))
+        .filter(|row| is_claude_image(row))
+        .map(|row| CensusEntry {
+            pid: row.pid,
+            name: row.name.clone(),
+            exe: row.exe.clone(),
+        })
+        .collect();
+    live.sort_by_key(|e| e.pid);
+
+    Ok(ClaudeCensus {
+        root_pid,
+        root_source,
+        walked: subtree.len(),
+        live,
+        pid_reuse_guard,
+    })
+}
+
+/// The pids of `root`'s inclusive subtree over `rows`: `root` and every row
+/// that descends from it by the parent links the table records, in BFS order,
+/// children in ascending pid order, so the result does not depend on the
+/// snapshot's map order. A visited set guards against a malformed table (a pid
+/// listed as its own ancestor) looping forever.
+///
+/// Every link is followed, a stale one included: Windows keeps an orphan's
+/// parent pid after the parent exits, so a later process that reuses that pid
+/// is walked as the orphan's parent. That errs toward over-counting, the
+/// census's safe direction (a `claude` it should not count can only refuse a
+/// restart, a `claude` it dropped could let one through), and it is what
+/// [`census_from_snapshot`] counts `claude` images over. The unit-test kill
+/// guard (`process::test_kill_guard`) errs the other way, so it walks this
+/// over rows whose unproven links it has cut first.
+pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for row in procs {
+    for row in rows {
         if let Some(ppid) = row.ppid {
             children.entry(ppid).or_default().push(row.pid);
         }
@@ -352,42 +396,23 @@ pub fn census_from_snapshot(
         kids.dedup();
     }
 
-    let mut queue: VecDeque<u32> = VecDeque::from([root_pid]);
-    let mut visited: HashSet<u32> = HashSet::from([root_pid]);
-    let mut walked = 0usize;
-    let mut live: Vec<CensusEntry> = Vec::new();
-
+    let mut order = Vec::new();
+    let mut queue: VecDeque<u32> = VecDeque::from([root]);
+    let mut visited: HashSet<u32> = HashSet::from([root]);
     while let Some(pid) = queue.pop_front() {
-        walked += 1;
-        if let Some(row) = by_pid.get(&pid) {
-            if is_claude_image(row) {
-                live.push(CensusEntry {
-                    pid: row.pid,
-                    name: row.name.clone(),
-                    exe: row.exe.clone(),
-                });
-            }
-        }
-        if let Some(kids) = children.get(&pid) {
-            for &kid in kids {
-                if visited.insert(kid) {
-                    queue.push_back(kid);
-                }
+        order.push(pid);
+        for &kid in children.get(&pid).into_iter().flatten() {
+            if visited.insert(kid) {
+                queue.push_back(kid);
             }
         }
     }
-    live.sort_by_key(|e| e.pid);
-
-    Ok(ClaudeCensus {
-        root_pid,
-        root_source,
-        walked,
-        live,
-        pid_reuse_guard,
-    })
+    order
 }
 
-/// One `sysinfo` snapshot of the whole process table, in [`ProcRow`] form.
+/// One `sysinfo` snapshot of the whole process table, in [`ProcRow`] form, on
+/// every OS. The census reads it, and so does the unit-test kill guard
+/// (`process::test_kill_guard`).
 ///
 /// Same refresh idiom as [`crate::process::proc_kill::find_pids_holding_exe`]:
 /// processes only, with exe paths always resolved. `parent()` and
@@ -397,8 +422,8 @@ pub fn census_from_snapshot(
 /// `Err(Unreadable)` when the table does not even contain the supervisor's
 /// own PID — a readable table always does, so its absence is the one
 /// enumeration failure `sysinfo` reports by omission rather than by error.
-fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
-    use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System, ThreadKind, UpdateKind};
     let system = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::new().with_exe(UpdateKind::Always)),
     );
@@ -408,6 +433,7 @@ fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
         .map(|p| ProcRow {
             pid: p.pid().as_u32(),
             ppid: p.parent().map(|pp| pp.as_u32()),
+            thread: p.thread_kind() == Some(ThreadKind::Userland),
             name: p.name().to_string_lossy().into_owned(),
             exe: p.exe().map(|e| e.to_path_buf()),
             start_time_secs: p.start_time(),
@@ -494,6 +520,7 @@ mod tests {
         ProcRow {
             pid,
             ppid,
+            thread: false,
             name: name.to_string(),
             exe: exe.map(PathBuf::from),
             start_time_secs: start,
@@ -501,16 +528,25 @@ mod tests {
     }
 
     /// The registry-root census of a live process with one non-`claude`
-    /// child walks at least the root plus that child and reads `Idle`.
+    /// child walks at least the root plus that child and reads `Idle`. The child
+    /// waits on its stdin, which this test holds, so it lives until the test
+    /// ends it, however long the census takes.
     #[test]
-    fn census_of_own_process_with_a_sleep_child_is_idle() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
+    fn census_of_own_process_with_a_shell_child_is_idle() {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(unix)]
+        command.args(["-c", "read unused"]);
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(windows)]
+        command.args(["/C", "set /p unused="]);
+        let mut child = command
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn a shell that waits on its stdin");
         let child_pid = child.id();
 
         let census = take_census(std::process::id(), None).expect("census of own pid");
@@ -522,7 +558,7 @@ mod tests {
         assert_eq!(census.root_source, RootSource::Registry);
         assert!(
             census.walked >= 2,
-            "expected the root and at least the sleep child {child_pid}, walked {}",
+            "expected the root and at least the shell child {child_pid}, walked {}",
             census.walked
         );
         assert_eq!(census.verdict(), CensusVerdict::Idle);
@@ -705,6 +741,69 @@ mod tests {
             CensusVerdict::Busy {
                 count: 1,
                 pids: vec![20]
+            }
+        );
+    }
+
+    /// The walk follows every parent link the table records, in BFS order with
+    /// children in ascending pid order, whatever the rows' start times say.
+    #[test]
+    fn the_subtree_follows_every_parent_link_in_bfs_order() {
+        let rows = vec![
+            row(1, None, "init", None, 1),
+            row(10, Some(1), "root", None, 100),
+            row(12, Some(10), "late-child", None, 101),
+            row(11, Some(10), "child", None, 100),
+            row(20, Some(11), "grandchild", None, 102),
+            // Started long before pid 10's process: an orphan whose parent pid
+            // 10 was reused. Still walked, and so is everything under it.
+            row(30, Some(10), "orphan", None, 50),
+            row(31, Some(30), "orphans-child", None, 60),
+            row(40, Some(10), "same-second", None, 96),
+            row(41, Some(10), "unknown-start", None, 0),
+        ];
+        assert_eq!(
+            inclusive_subtree(10, &rows),
+            vec![10, 11, 12, 30, 40, 41, 20, 31]
+        );
+        assert_eq!(
+            inclusive_subtree(30, &rows),
+            vec![30, 31],
+            "its own subtree"
+        );
+        // A root that is not in the table still walks its children.
+        assert_eq!(inclusive_subtree(7, &rows), vec![7]);
+    }
+
+    /// A stale parent link is followed and counted: a `claude` whose recorded
+    /// parent pid now names a process that started after it (an orphan whose
+    /// parent pid was reused, which Windows allows) is still in the runner's
+    /// census, and so is what runs under it. Dropping the link would be an
+    /// under-count, which could let a restart through over a live session.
+    #[test]
+    fn a_stale_parent_link_is_still_counted() {
+        let claude = Some("/home/u/.local/bin/claude");
+        let rows = vec![
+            row(1, None, "init", None, 1),
+            row(
+                100,
+                Some(1),
+                "qontinui-runner",
+                Some("/opt/runner/qontinui-runner"),
+                10_000,
+            ),
+            // Started an hour before the process its parent pid names.
+            row(300, Some(100), "claude", claude, 10_000 - 3_600),
+            row(301, Some(300), "claude", claude, 10_000 - 3_590),
+        ];
+        let census =
+            census_from_snapshot(100, &rows, None, RootSource::Registry).expect("root present");
+        assert_eq!(census.walked, 3, "the root, the stale child and its child");
+        assert_eq!(
+            census.verdict(),
+            CensusVerdict::Busy {
+                count: 2,
+                pids: vec![300, 301]
             }
         );
     }

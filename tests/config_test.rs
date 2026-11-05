@@ -30,6 +30,7 @@ fn test_config_from_fields() {
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
         ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_user_dirs: qontinui_supervisor::config::AmbientUserDirs::Ignore,
     };
 
     assert!(!config.watchdog_enabled_at_start);
@@ -62,6 +63,7 @@ fn test_config_runner_exe_path() {
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
         ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_user_dirs: qontinui_supervisor::config::AmbientUserDirs::Ignore,
     };
 
     let exe_path = config.runner_exe_path();
@@ -96,6 +98,7 @@ fn test_config_runner_npm_dir() {
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
         ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_user_dirs: qontinui_supervisor::config::AmbientUserDirs::Ignore,
     };
 
     let npm_dir = config.runner_npm_dir();

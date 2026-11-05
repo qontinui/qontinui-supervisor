@@ -165,19 +165,13 @@ pub async fn wait_for_port_free(port: u16, timeout_secs: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ports::held_ephemeral_listener;
     use std::io::Read;
-    use std::net::{TcpListener, TcpStream};
-
-    /// Bind an ephemeral port and return (listener, port).
-    fn ephemeral_listener() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-        let port = listener.local_addr().expect("local_addr").port();
-        (listener, port)
-    }
+    use std::net::TcpStream;
 
     #[test]
     fn test_real_listener_reads_as_listening() {
-        let (_listener, port) = ephemeral_listener();
+        let (_listener, port) = held_ephemeral_listener();
         assert!(
             is_port_listening(port),
             "a live TcpListener on port {} must read as listening",
@@ -207,7 +201,7 @@ mod tests {
         // the diff" defect measured in ports rather than in milliseconds.)
         const ATTEMPTS: usize = 20;
         for attempt in 1..=ATTEMPTS {
-            let (listener, port) = ephemeral_listener();
+            let (listener, port) = held_ephemeral_listener();
             drop(listener);
             if !is_port_listening(port) {
                 return;
@@ -260,7 +254,7 @@ mod tests {
     /// probes, so it cannot pass vacuously again.
     #[test]
     fn test_time_wait_remnant_reads_as_free() {
-        let (listener, port) = ephemeral_listener();
+        let (listener, port) = held_ephemeral_listener();
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let (server_sock, _) = listener.accept().expect("accept");
@@ -308,7 +302,7 @@ mod tests {
     /// carries TIME_WAIT remnants from an earlier connection.
     #[test]
     fn test_listener_beside_time_wait_still_reads_as_held() {
-        let (listener, port) = ephemeral_listener();
+        let (listener, port) = held_ephemeral_listener();
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let (server_sock, _) = listener.accept().expect("accept");
         drop(server_sock);

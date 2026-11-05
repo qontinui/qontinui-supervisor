@@ -63,7 +63,7 @@ fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
 /// level the types could see. That module's docs carry the full incident.
 /// `netstat` is now invoked directly rather than through `cmd /C`: there is no
 /// shell pipeline left to build, and one fewer process to fail to spawn.
-async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+pub(crate) async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
     // Plain `-ano`, deliberately without `-p TCP`: the parser already filters
     // non-TCP rows structurally, so the flag buys nothing and only adds a
     // flag-rejection failure mode that would degrade the probe to UNKNOWN.
@@ -235,6 +235,9 @@ pub async fn cleanup_orphaned_slot_processes(
                 slot_target_dir.display()
             );
             let snippet = cmd_snippet(process.cmd());
+            // A unit test never signals a process it did not spawn.
+            #[cfg(test)]
+            crate::process::test_kill_guard::assert_may_signal_pid(pid);
             if process.kill() {
                 candidates.push(SweepCandidate {
                     pid,
@@ -411,7 +414,13 @@ pub async fn find_runner_processes() -> Vec<(u32, PathBuf)> {
 }
 
 /// Kill a process by its PID using taskkill.
+///
+/// In a unit-test build it first asserts that `pid` descends from the test
+/// process (`process::test_kill_guard`), and panics before the kill when it
+/// does not.
 pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    crate::process::test_kill_guard::assert_may_signal_pid(pid);
     let output = Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
@@ -438,7 +447,13 @@ pub async fn kill_by_pid(pid: u32) -> anyhow::Result<bool> {
 /// survive and can keep the API port held open after the parent is gone.
 /// The tree variant is the escalation used by `stop_runner_by_id` when a
 /// plain PID kill leaves the port in use.
+///
+/// In a unit-test build it first asserts that everything `/T` would end
+/// descends from the test process (`process::test_kill_guard`), and panics
+/// before the kill when something does not.
 pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    crate::process::test_kill_guard::assert_may_signal_tree(pid);
     let output = Command::new("taskkill")
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)

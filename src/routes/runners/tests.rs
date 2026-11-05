@@ -854,26 +854,19 @@ fn apply_paired_profile_copies_both_files_when_present() {
 ///
 /// Driven through the real `apply_paired_state_for_spawn` rather than
 /// re-deriving the destination, so re-inlining a different path in the
-/// route fails here even though the helper itself is unchanged. Uses the
-/// production `~/.qontinui/profiles` root under a pid-unique profile id and
-/// removes both dirs afterwards.
+/// route fails here even though the helper itself is unchanged. Every root
+/// is a tempdir's ([`crate::config::AmbientUserDirs::At`]): the profile
+/// snapshot under its harness home, the destination under its config dir.
 #[test]
 fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
-    let unique = format!("supervisor-selftest-{}", std::process::id());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+    let unique = "supervisor-selftest";
     let runner_id = format!("test-{unique}");
-    let (Some(home), Some(dest)) = (
-        dirs::home_dir(),
-        crate::process::instance_config_dir(&runner_id),
-    ) else {
-        // No resolvable home / config dir on this platform.
-        return;
-    };
-    let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+    let home = dirs.home_dir().expect("At has a home");
+    let dest = crate::process::instance_config_dir(&dirs, &runner_id).expect("an instance root");
+    let snapshot = home.join(".qontinui").join("profiles").join(unique);
     std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
-    let _cleanup = scopeguard::guard((snapshot.clone(), dest.clone()), |(snap, dst)| {
-        let _ = std::fs::remove_dir_all(snap);
-        let _ = std::fs::remove_dir_all(dst);
-    });
     std::fs::write(
         snapshot.join("paired_user.json"),
         r#"{"user_id":"selftest"}"#,
@@ -883,8 +876,9 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
         .expect("write auth_tokens.enc");
 
     let report = super::apply_paired_state_for_spawn(
+        &dirs,
         crate::process::instance_root::DeviceIdentity::Harness,
-        Some(&unique),
+        Some(unique),
         &runner_id,
     )
     .expect("must succeed");
@@ -900,8 +894,9 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
     // separately by
     // `process::manager::tests::apply_instance_root_env_exports_the_root_and_confines_every_location`
     // and, end to end, by `paired_state_writer_targets_the_childs_secure_storage_dir`.
-    let expected = dirs::config_dir()
-        .expect("config_dir resolved above")
+    let expected = dirs
+        .config_dir()
+        .expect("At has a config dir")
         .join("com.qontinui.runner")
         .join("instances")
         .join(&runner_id);
@@ -915,9 +910,11 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
         "auth_tokens.enc must land in the runner's instance dir {dest:?}"
     );
     // And NOT in the shared fallback the runner ignores.
-    if let Some(shared) = dirs::data_local_dir() {
-        assert_ne!(dest, shared.join("com.qontinui.runner"));
-    }
+    assert_ne!(
+        Some(dest),
+        crate::process::primary_paired_state_dir(&dirs),
+        "the copy landed in the shared fallback the runner ignores"
+    );
 }
 
 /// The paired-state writer and the spawn's env block agree END TO END: the dir
@@ -929,21 +926,13 @@ fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
 /// `Command` — so neither can drift without failing here.
 #[test]
 fn paired_state_writer_targets_the_childs_secure_storage_dir() {
-    let unique = format!("supervisor-selftest-secure-{}", std::process::id());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
+    let unique = "supervisor-selftest-secure";
     let runner_id = format!("test-{unique}");
-    let (Some(home), Some(root)) = (
-        dirs::home_dir(),
-        crate::process::instance_config_dir(&runner_id),
-    ) else {
-        eprintln!("SKIPPED: no resolvable home / config dir on this platform");
-        return;
-    };
-    let snapshot = home.join(".qontinui").join("profiles").join(&unique);
+    let home = dirs.home_dir().expect("At has a home");
+    let snapshot = home.join(".qontinui").join("profiles").join(unique);
     std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
-    let _cleanup = scopeguard::guard((snapshot.clone(), root.clone()), |(snap, dst)| {
-        let _ = std::fs::remove_dir_all(snap);
-        let _ = std::fs::remove_dir_all(dst);
-    });
     std::fs::write(
         snapshot.join("paired_user.json"),
         r#"{"user_id":"selftest"}"#,
@@ -968,8 +957,10 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
         fresh_device_identity: false,
     };
     let mut cmd = tokio::process::Command::new("cargo");
-    crate::process::manager::apply_non_primary_instance_env_with(&mut cmd, &config, 9876, None)
-        .expect("env block must apply");
+    crate::process::manager::apply_non_primary_instance_env_with(
+        &mut cmd, &dirs, &config, 9876, None,
+    )
+    .expect("env block must apply");
     let env = |key: &str| -> Option<std::path::PathBuf> {
         cmd.as_std()
             .get_envs()
@@ -981,8 +972,9 @@ fn paired_state_writer_targets_the_childs_secure_storage_dir() {
     let child_root = env("QONTINUI_INSTANCE_ROOT").expect("instance root exported");
 
     super::apply_paired_state_for_spawn(
+        &dirs,
         crate::process::instance_root::DeviceIdentity::Harness,
-        Some(&unique),
+        Some(unique),
         &runner_id,
     )
     .expect("must succeed");
@@ -1730,6 +1722,7 @@ fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -1921,6 +1914,7 @@ fn make_state() -> crate::state::SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
     };
     std::sync::Arc::new(crate::state::SupervisorState::new(config))
 }
@@ -2358,9 +2352,11 @@ async fn scoped_purge_never_evicts_another_requesters_runner() {
     // Session-A purges scoped to itself — only A's runner is reaped, B's
     // (and an unowned third) survive untouched.
     let state = make_state();
-    let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-    let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-    let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+    let id_a =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-A")).await;
+    let id_b =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-B")).await;
+    let id_unowned = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, false, Some("session-A")).await;
 
@@ -2393,9 +2389,11 @@ async fn unscoped_purge_reaps_all_stale_runners() {
     // The periodic sweep / body-less purge-stale passes None and reaps
     // every stale test runner regardless of owner (legacy behavior).
     let state = make_state();
-    let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-    let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-    let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+    let id_a =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-A")).await;
+    let id_b =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-B")).await;
+    let id_unowned = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, false, None).await;
     let purged_ids: std::collections::HashSet<String> =
@@ -2404,16 +2402,6 @@ async fn unscoped_purge_reaps_all_stale_runners() {
     for id in [&id_a, &id_b, &id_unowned] {
         assert!(purged_ids.contains(id), "unscoped purge reaps {id}");
     }
-}
-
-/// A loopback port nothing is listening on: bind an ephemeral port, read
-/// it, drop the listener. Never hard-code 9877 — a live temp runner on the
-/// test box may hold it.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = l.local_addr().expect("local addr").port();
-    drop(l);
-    port
 }
 
 /// Mark a registered runner running (or not) with the given start time and
@@ -2441,7 +2429,7 @@ async fn set_runner_phase(
 #[tokio::test]
 async fn purge_spares_a_runner_inside_its_spawn_startup_window() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2468,7 +2456,7 @@ async fn purge_spares_a_runner_inside_its_spawn_startup_window() {
 #[tokio::test]
 async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2488,13 +2476,45 @@ async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
     assert!(!state.runners.read().await.contains_key(&id));
 }
 
+/// The crash arm's other branch: a runner past its startup window whose port IS
+/// listening is alive, and the purge spares it. Its port is held by a listener
+/// this test keeps past the purge, which is the state a released "dead" port is
+/// in once a concurrent bind takes it (plan
+/// `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`), reached on purpose.
+#[tokio::test]
+async fn purge_spares_a_runner_past_its_window_whose_port_is_listening() {
+    let state = make_state();
+    let (listener, port) = crate::test_ports::held_ephemeral_listener();
+    let id = insert_temp_runner_owned(&state, port, None).await;
+    set_runner_phase(
+        &state,
+        &id,
+        true,
+        Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        None,
+    )
+    .await;
+
+    let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+    assert!(
+        purged.iter().all(|(pid, _, _)| pid != &id),
+        "a runner whose port is listening is alive and must be spared: {purged:?}"
+    );
+    assert!(
+        state.runners.read().await.contains_key(&id),
+        "the live runner must still be registered"
+    );
+    drop(listener);
+}
+
 /// Post-build / pre-start window: the placeholder is still running=false,
 /// no build is active, but the spawn handler owns it. Even the operator
 /// path (`respect_active_builds=false`) must spare it.
 #[tokio::test]
 async fn operator_purge_spares_a_placeholder_whose_spawn_is_in_flight() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2519,7 +2539,7 @@ async fn operator_purge_spares_a_placeholder_whose_spawn_is_in_flight() {
 #[tokio::test]
 async fn purge_spares_a_just_started_runner_without_a_marker() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(&state, &id, true, Some(chrono::Utc::now()), None).await;
 
@@ -2540,7 +2560,7 @@ async fn purge_marker_protects_past_the_floor_but_within_the_budget() {
     let state = make_state();
     let started = chrono::Utc::now() - chrono::Duration::seconds(120);
 
-    let marked = insert_temp_runner_owned(&state, free_port(), None).await;
+    let marked = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
     set_runner_phase(
         &state,
         &marked,
@@ -2549,13 +2569,9 @@ async fn purge_marker_protects_past_the_floor_but_within_the_budget() {
         Some(std::time::Duration::from_secs(240)),
     )
     .await;
-    let unmarked = loop {
-        // Distinct id: ids are derived from the port.
-        let p = free_port();
-        if format!("test-{p}") != marked {
-            break insert_temp_runner_owned(&state, p, None).await;
-        }
-    };
+    // A distinct id, since ids are derived from the port: no two unheld ports
+    // are the same.
+    let unmarked = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
     set_runner_phase(&state, &unmarked, true, Some(started), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, true, None).await;
@@ -3236,6 +3252,13 @@ fn stated_defaults_reads_each_doc_spelling() {
 /// the close-request kills `child` (the runner's stand-in process) and stops
 /// listening, so the stop's PID wait and port reap both resolve without
 /// any kill landing on this test process.
+///
+/// It listens on [`crate::test_ports::unheld_port`], bound here, not on a port the
+/// kernel picked. The stop probes the port after the fake has stopped listening
+/// (`wait_for_port_free`) and can go on to kill whatever listens there, and axum's
+/// graceful shutdown drops its listener as soon as the close-request signals it. A
+/// kernel-picked port is then free for any `bind(0)` or `connect()` on the box to be
+/// handed; no kernel allocation hands out an unheld one.
 #[cfg(unix)]
 async fn spawn_fake_runner(
     readiness: &'static str,
@@ -3272,8 +3295,10 @@ async fn spawn_fake_runner(
                 }
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::test_ports::unheld_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("listen on the fake runner's unheld port");
     tokio::spawn(async move {
         let mut rx = stop_rx;
         let _ = axum::serve(listener, app)
@@ -3488,8 +3513,11 @@ async fn call_restart_route(
 #[cfg(unix)]
 #[tokio::test]
 async fn handoff_restart_route_forwards_the_intent_to_the_runner() {
-    let child = tokio::process::Command::new("sleep")
-        .arg("60")
+    // The stand-in waits on its stdin, which the handle holds, so it lives until
+    // the fake runner kills it, or the test drops it, however long the test takes.
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", "read unused"])
+        .stdin(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn stand-in runner process");
@@ -3731,14 +3759,21 @@ fn spawn_routes_wire_fresh_device_identity_end_to_end() {
     let named = fn_source("pub async fn spawn_named(");
     assert!(named.contains("extra_env: body.extra_env.clone(),"));
     let named_inner = fn_source("async fn spawn_named_inner(");
-    assert!(named_inner.contains("resp[\"device_identity\"] = device_identity_report(&id)"));
+    // Whitespace removed, so the pin is the call and not rustfmt's line break.
+    let sq = |text: &str| text.split_whitespace().collect::<String>();
+    let dirs = "&state.config.ambient_user_dirs";
+    assert!(sq(&named_inner).contains(&sq(&format!(
+        "resp[\"device_identity\"] = device_identity_report({dirs}, &id)"
+    ))));
     let exec = fn_source("async fn execute_spawn_build_inner(");
-    assert!(exec.contains("resp[\"device_identity\"] = device_identity_report(id)"));
+    assert!(sq(&exec).contains(&sq(&format!(
+        "resp[\"device_identity\"] = device_identity_report({dirs}, id)"
+    ))));
     assert!(exec.contains("managed.config.fresh_device_identity"));
     let list = fn_source("pub async fn list_runners(");
-    assert!(
-        list.contains("entry[\"device_identity\"] = device_identity_report(&managed.config.id)")
-    );
+    assert!(sq(&list).contains(&sq(&format!(
+        "entry[\"device_identity\"] = device_identity_report({dirs}, &managed.config.id)"
+    ))));
 }
 
 // ── Plan `2026-10-29-supervisor-spawn-attribution-window-and-hermetic-dev-action-
@@ -4158,10 +4193,7 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     let (state, root) = state_over_an_empty_runner_tree();
     let id = "named-early-log-kept";
     // A port nothing holds, so the stop confirms at once.
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let port = crate::test_ports::unheld_port();
     let config = crate::config::RunnerConfig {
         id: id.to_string(),
         name: format!("Runner {id}"),
@@ -4396,10 +4428,12 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-
 //    door-and-pre-fix-ledger-rows` Phase 1 (D2): every lifecycle door mints ──
 
-/// An unprotected named runner on a refused port, registered in a state over
-/// an empty runner tree: the readiness gate skips it (`runner_not_protected`),
-/// nothing is listening to stop, and every start fails at exe resolution, so a
-/// door driven against it runs to its failure without touching a process.
+/// An unprotected named runner on a port nothing holds, registered in a state
+/// over an empty runner tree: the readiness gate skips it
+/// (`runner_not_protected`), nothing is listening to stop, and every start fails
+/// at exe resolution, so a door driven against it runs to its failure without
+/// touching a process. An unheld port and not a refused one, because a start's
+/// port guard bind-probes it.
 async fn register_dead_unprotected_named_runner(
     state: &crate::state::SharedState,
     id: &str,
@@ -4407,7 +4441,7 @@ async fn register_dead_unprotected_named_runner(
     let config = crate::config::RunnerConfig {
         id: id.to_string(),
         name: format!("Runner {id}"),
-        port: crate::test_ports::reserve_refused_port(),
+        port: crate::test_ports::unheld_port(),
         kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
             name: id.to_string(),
         },

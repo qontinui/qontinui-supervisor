@@ -639,7 +639,8 @@ impl EnvForwarder for WorktreeModeEnv {
 // =============================================================================
 
 /// Fetch placement for a TEMP runner from the primary runner's
-/// `/spawn-placement/temp` endpoint, then push its rect as
+/// `/spawn-placement/temp` endpoint (on `127.0.0.1`, at
+/// [`crate::process::manager::primary_runner_port`]), then push its rect as
 /// `QONTINUI_WINDOW_X/Y/WIDTH/HEIGHT` (+ optional `_DECORATIONS`). The
 /// runner reads these at window-build time.
 ///
@@ -704,10 +705,17 @@ impl EnvForwarder for WindowPositionEnv {
                 Overflow, SpawnPlacementClient, SpawnPlacementClientError,
             };
 
-            let base = match reqwest::Url::parse("http://localhost:9876") {
+            // The primary this runner is told about (`QONTINUI_PRIMARY_PORT`),
+            // on the IPv4 loopback the runner binds (qontinui-runner's
+            // `RUNNER_API_BIND_IP`): `localhost` resolves to `::1` first on
+            // Windows, and that doomed connect alone can spend most of the 3 s
+            // budget below.
+            let primary_port = crate::process::manager::primary_runner_port(state).await;
+            let base = match reqwest::Url::parse(&format!("http://127.0.0.1:{primary_port}")) {
                 Ok(u) => u,
                 Err(e) => {
-                    // Static URL — this should never fail, but log defensively.
+                    // An IPv4 literal and a `u16` port always parse; this
+                    // arm only logs defensively.
                     let msg = format!(
                         "Spawn temp placement: skipping runner '{}' — runner base URL parse failed: {}",
                         runner_name, e
@@ -1074,6 +1082,7 @@ impl EnvForwarder for PanicLogEnv {
             cmd.env("QONTINUI_RUNNER_ID", runner_id);
 
             let new_dir = panic_log_dir_for(
+                &state.config.ambient_user_dirs,
                 runner.config.kind().is_primary(),
                 runner_id,
                 state.config.log_dir.as_deref(),
@@ -1116,12 +1125,13 @@ impl PanicLogDir {
 
 /// Pure core of [`PanicLogEnv`]: see its resolution rules.
 pub(crate) fn panic_log_dir_for(
+    dirs: &crate::config::AmbientUserDirs,
     is_primary: bool,
     runner_id: &str,
     supervisor_log_dir: Option<&std::path::Path>,
 ) -> PanicLogDir {
     if !is_primary {
-        return match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        return match crate::process::instance_root::InstanceRoot::for_runner(dirs, runner_id) {
             Some(root) => PanicLogDir::InstanceRoot(root.logs_dir()),
             // Unreachable in a real spawn — the env block refuses an
             // unresolvable root before forwarders run.
@@ -1832,23 +1842,33 @@ mod tests {
 
     #[test]
     fn panic_log_dir_follows_the_instance_root_for_non_primary_runners() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
         let log_dir = Path::new("/var/log/sup");
         assert_eq!(
-            panic_log_dir_for(true, "primary", Some(log_dir)),
+            panic_log_dir_for(&dirs, true, "primary", Some(log_dir)),
             PanicLogDir::Export(log_dir.join("runner-primary"))
         );
         assert_eq!(
-            panic_log_dir_for(true, "primary", None),
+            panic_log_dir_for(&dirs, true, "primary", None),
             PanicLogDir::RunnerDefault
         );
-        let Some(root) = crate::process::instance_config_dir("test-panic-1") else {
-            eprintln!("SKIPPED non-primary arm: dirs::config_dir() did not resolve");
-            return;
-        };
+        let root = crate::process::instance_config_dir(&dirs, "test-panic-1")
+            .expect("At resolves an instance root");
         // Even with --log-dir: a dir outside the root would be refused.
         assert_eq!(
-            panic_log_dir_for(false, "test-panic-1", Some(log_dir)),
+            panic_log_dir_for(&dirs, false, "test-panic-1", Some(log_dir)),
             PanicLogDir::InstanceRoot(root.join("logs"))
+        );
+        // No per-user dirs: no root, and the runner keeps its own default.
+        assert_eq!(
+            panic_log_dir_for(
+                &crate::config::AmbientUserDirs::Ignore,
+                false,
+                "test-panic-1",
+                Some(log_dir)
+            ),
+            PanicLogDir::RunnerDefault
         );
     }
 

@@ -465,6 +465,7 @@ pub(crate) fn is_panic_of_spawn(panic: &panic_log::RecentPanic, spawn: &SpawnMar
 /// `--log-dir`; no other runner writes there, so any other runner whose dir
 /// cannot be resolved has no panic log to read.
 fn spawn_panic_log_path(
+    dirs: &crate::config::AmbientUserDirs,
     recorded_dir: Option<&Path>,
     is_primary: bool,
     runner_id: &str,
@@ -473,7 +474,7 @@ fn spawn_panic_log_path(
     if let Some(dir) = recorded_dir {
         return Some(panic_log::resolve_panic_log_path(Some(dir)));
     }
-    match env_forwarders::panic_log_dir_for(is_primary, runner_id, supervisor_log_dir) {
+    match env_forwarders::panic_log_dir_for(dirs, is_primary, runner_id, supervisor_log_dir) {
         PanicLogDir::Export(dir) | PanicLogDir::InstanceRoot(dir) => {
             Some(panic_log::resolve_panic_log_path(Some(&dir)))
         }
@@ -546,6 +547,7 @@ async fn scan_panic(
     if panic.is_none() {
         let recorded_dir = managed.panic_log_dir.read().await.clone();
         panic = spawn_panic_log_path(
+            &state.config.ambient_user_dirs,
             recorded_dir.as_deref(),
             managed.config.kind().is_primary(),
             &managed.config.id,
@@ -1181,6 +1183,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_user_dirs: crate::config::AmbientUserDirs::Ignore,
         }
     }
 
@@ -2674,32 +2677,45 @@ mod tests {
     /// sent it, or there is none to read.
     #[test]
     fn only_a_primary_with_no_log_dir_reads_the_runner_default_panic_log() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dirs = crate::config::AmbientUserDirs::At(tmp.path().to_path_buf());
         let recorded = Path::new("/var/log/sup/runner-primary");
         assert_eq!(
-            spawn_panic_log_path(Some(recorded), true, "primary", None),
+            spawn_panic_log_path(&dirs, Some(recorded), true, "primary", None),
             Some(recorded.join("runner-panic.log"))
         );
         assert_eq!(
-            spawn_panic_log_path(None, true, "primary", None),
+            spawn_panic_log_path(&dirs, None, true, "primary", None),
             Some(panic_log::resolve_panic_log_path(None))
         );
         let log_dir = Path::new("/var/log/sup");
         assert_eq!(
-            spawn_panic_log_path(None, true, "primary", Some(log_dir)),
+            spawn_panic_log_path(&dirs, None, true, "primary", Some(log_dir)),
             Some(log_dir.join("runner-primary").join("runner-panic.log"))
         );
         // A non-primary's panic log is in its instance root whatever
         // `--log-dir` says, and with no root there is none to read.
-        let temp = spawn_panic_log_path(None, false, "test-panic-dir", Some(log_dir));
-        match crate::process::instance_config_dir("test-panic-dir") {
-            Some(root) => assert_eq!(temp, Some(root.join("logs").join("runner-panic.log"))),
-            None => assert_eq!(temp, None),
-        }
+        let root = crate::process::instance_config_dir(&dirs, "test-panic-dir")
+            .expect("At resolves an instance root");
+        assert_eq!(
+            spawn_panic_log_path(&dirs, None, false, "test-panic-dir", Some(log_dir)),
+            Some(root.join("logs").join("runner-panic.log"))
+        );
+        assert_eq!(
+            spawn_panic_log_path(
+                &crate::config::AmbientUserDirs::Ignore,
+                None,
+                false,
+                "test-panic-dir",
+                Some(log_dir)
+            ),
+            None
+        );
         // No root on any box: an id with a path separator is refused before
         // any config-dir lookup. Not the runner default path, which only the
         // primary writes, and not a `--log-dir` subdir either.
         assert_eq!(
-            spawn_panic_log_path(None, false, "bad/id", Some(log_dir)),
+            spawn_panic_log_path(&dirs, None, false, "bad/id", Some(log_dir)),
             None
         );
     }

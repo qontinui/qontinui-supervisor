@@ -130,6 +130,120 @@ pub enum AmbientCoord {
     At(String),
 }
 
+/// Whether and where the supervisor resolves the per-user directories that the
+/// state of the runners it spawns, the temp-runner ledger and its own boot id
+/// live in. [`AmbientUserDirs::config_dir`], [`AmbientUserDirs::data_local_dir`],
+/// [`AmbientUserDirs::data_dir`], [`AmbientUserDirs::home_dir`] and
+/// [`AmbientUserDirs::harness_qontinui_dir`] are the resolvers, and they cover:
+///
+/// - each non-primary runner's instance root, `<config>/com.qontinui.runner/instances/<id>`
+///   (`process::instance_config_dir`, which the spawn, the paired-state writer,
+///   the pair route, the panic-log and startup-refusal readers and the teardown
+///   all go through);
+/// - the app-data trees a runner writes under its instance name, which the
+///   teardown removes (`process::app_data_dir_candidates`);
+/// - the harness's `~/.qontinui` a subject's home is provisioned from
+///   (`harness_qontinui_dir`, which follows a non-blank `$QONTINUI_HOME`), and
+///   the paired-profile snapshots spawn-test copies from
+///   `<home>/.qontinui/profiles` (`home_dir`, which does not: the two disagree
+///   when that variable is set, as they did before this switch);
+/// - the primary's paired-state dir a spawn-test snapshots
+///   (`process::primary_paired_state_dir`);
+/// - the temp-runner ledger (`process::temp_runner_ledger`);
+/// - the supervisor's boot id (`state::load_or_create_boot_id`).
+///
+/// Not covered: the coord identity files (`machine.json`, the device JWT,
+/// `profiles.json`), which [`AmbientCoord`] decides whether to read at all;
+/// the pair route's private CLI copies and its primary pairing fallback; the
+/// default panic-log path of a primary started without `--log-dir`; and
+/// cargo's own home. `tests::no_user_dir_resolver_outside_ambient_user_dirs`
+/// counts each of those by file, so a new resolver anywhere fails it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbientUserDirs {
+    /// The platform's: `dirs::config_dir()`, `dirs::data_local_dir()`,
+    /// `dirs::data_dir()`, `dirs::home_dir()`, and for the harness's
+    /// `~/.qontinui` a non-blank `$QONTINUI_HOME` first. Production.
+    Read,
+    /// None of them resolves, and nothing is read: a non-primary start refuses
+    /// for want of an instance root, nothing is provisioned, reaped or
+    /// recorded, an absent ledger owns nothing (so the reconcile sweep kills
+    /// nothing), and the boot id is minted in memory. What
+    /// [`SupervisorConfig::from_args`] picks in a unit-test build, so a test
+    /// writes nothing into the operator's config or data dirs and reads
+    /// nothing from them: a temp start used to create its instance root under
+    /// the real config dir, provision it from the operator's `profiles.json`
+    /// and add a row to the box's temp-runner ledger.
+    ///
+    /// An integration test under `tests/` links the library without
+    /// `cfg(test)`, so `from_args` gives it `Read`: it builds a struct literal
+    /// that names `Ignore` or `At` instead.
+    /// `tests::no_test_config_reads_the_ambient_coord` fails an integration
+    /// test that calls `from_args`, and
+    /// `tests::no_user_dir_resolver_outside_ambient_user_dirs` fails a per-user
+    /// dir resolved outside this switch, or a `Read` named, beyond the reasoned
+    /// exceptions it lists.
+    Ignore,
+    /// Every one of them under this directory, with no ambient read:
+    /// `<dir>/config`, `<dir>/data-local`, `<dir>/data` and `<dir>/home`, whose
+    /// `.qontinui` is the harness's. How a test gives a start somewhere to
+    /// write: [`config_over_an_empty_runner_tree`] roots it in its tempdir.
+    #[allow(dead_code)]
+    At(PathBuf),
+}
+
+impl AmbientUserDirs {
+    /// The per-user config dir (`dirs::config_dir()` under `Read`).
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Read => dirs::config_dir(),
+            Self::Ignore => None,
+            Self::At(root) => Some(root.join("config")),
+        }
+    }
+
+    /// The per-user local data dir (`dirs::data_local_dir()` under `Read`).
+    pub fn data_local_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Read => dirs::data_local_dir(),
+            Self::Ignore => None,
+            Self::At(root) => Some(root.join("data-local")),
+        }
+    }
+
+    /// The per-user (roaming, on Windows) data dir (`dirs::data_dir()` under
+    /// `Read`).
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Read => dirs::data_dir(),
+            Self::Ignore => None,
+            Self::At(root) => Some(root.join("data")),
+        }
+    }
+
+    /// The user's home dir (`dirs::home_dir()` under `Read`).
+    pub fn home_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Read => dirs::home_dir(),
+            Self::Ignore => None,
+            Self::At(root) => Some(root.join("home")),
+        }
+    }
+
+    /// The harness's own `~/.qontinui`, the source a subject's home is
+    /// provisioned from: under `Read`, `$QONTINUI_HOME` when set non-blank (the
+    /// runner's `ambient::qontinui_dir` rule), else `<home>/.qontinui`; under
+    /// `At`, `<dir>/home/.qontinui`.
+    pub fn harness_qontinui_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Read => crate::process::instance_root::harness_qontinui_dir_from(
+                std::env::var_os("QONTINUI_HOME"),
+                dirs::home_dir(),
+            ),
+            Self::Ignore | Self::At(_) => self.home_dir().map(|h| h.join(".qontinui")),
+        }
+    }
+}
+
 /// Resolve `p` against `base` when it is relative. Cargo resolves a relative
 /// `CARGO_TARGET_DIR` against its own working directory and a relative
 /// `build.target-dir` against the directory *containing* the `.cargo` dir the
@@ -363,6 +477,13 @@ pub struct SupervisorConfig {
     /// would give an integration test `Read`, so one sets `Ignore` in a struct
     /// literal.
     pub ambient_coord: AmbientCoord,
+    /// Whether and where the per-user dirs a runner's start and teardown, the
+    /// temp-runner ledger and the boot id resolve ([`AmbientUserDirs`]): `Read`
+    /// in production, `Ignore` in a unit-test build, `At(<tempdir>)` from
+    /// [`config_over_an_empty_runner_tree`]. [`Self::from_args`] would give an
+    /// integration test `Read`, so one sets `Ignore` or `At` in a struct
+    /// literal.
+    pub ambient_user_dirs: AmbientUserDirs,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -1186,11 +1307,11 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 }
 
 impl SupervisorConfig {
-    /// Build the config from the command line. `ambient_target_dir` and
-    /// `ambient_coord` are `Ignore` in a unit-test build and `Read` everywhere
-    /// else, an integration test under `tests/` included, which is why no file
-    /// there calls this (see [`AmbientTargetDir::Ignore`] and
-    /// [`AmbientCoord::Ignore`]).
+    /// Build the config from the command line. `ambient_target_dir`,
+    /// `ambient_coord` and `ambient_user_dirs` are `Ignore` in a unit-test build
+    /// and `Read` everywhere else, an integration test under `tests/` included,
+    /// which is why no file there calls this (see [`AmbientTargetDir::Ignore`],
+    /// [`AmbientCoord::Ignore`] and [`AmbientUserDirs::Ignore`]).
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1258,6 +1379,11 @@ impl SupervisorConfig {
                 AmbientCoord::Ignore
             } else {
                 AmbientCoord::Read
+            },
+            ambient_user_dirs: if cfg!(test) {
+                AmbientUserDirs::Ignore
+            } else {
+                AmbientUserDirs::Read
             },
         };
         config.build_pool =
@@ -1537,17 +1663,22 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// checkout would find that checkout's slot exe and start it. That is the
 /// incident class of coord finding 46f09ce5, which went through
 /// `CARGO_TARGET_DIR`.
+///
+/// Its per-user dirs are [`AmbientUserDirs::At`] `<tempdir>/user-dirs`, so a
+/// start that gets past exe resolution (a stub) writes its instance root and
+/// ledger row there, and its teardown removes them from there.
 #[cfg(test)]
 pub(crate) fn config_over_an_empty_runner_tree() -> (SupervisorConfig, tempfile::TempDir) {
     let root = tempfile::TempDir::new().expect("tempdir");
     let src_tauri = root.path().join("qontinui-runner").join("src-tauri");
     std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
     let project_dir = src_tauri.to_string_lossy().into_owned();
-    let config = SupervisorConfig::from_args(CliArgs::parse_from([
+    let mut config = SupervisorConfig::from_args(CliArgs::parse_from([
         "test",
         "--project-dir",
         project_dir.as_str(),
     ]));
+    config.ambient_user_dirs = AmbientUserDirs::At(root.path().join("user-dirs"));
     (config, root)
 }
 
@@ -2725,6 +2856,217 @@ mod tests {
                     })
             })
             .collect();
+        assert!(
+            drifted.is_empty(),
+            "a sanctioned file no longer carries exactly its allowed count — a second \
+             resolver was added there, or one moved and the table must follow it:\n  {}",
+            drifted.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn a_test_build_resolves_no_user_dir() {
+        let dirs = SupervisorConfig::from_args(make_test_args(false, false)).ambient_user_dirs;
+        assert_eq!(dirs, AmbientUserDirs::Ignore);
+        assert_eq!(
+            [
+                dirs.config_dir(),
+                dirs.data_local_dir(),
+                dirs.data_dir(),
+                dirs.home_dir(),
+                dirs.harness_qontinui_dir(),
+            ],
+            [None, None, None, None, None]
+        );
+        // The helper every stub test builds its state on gives its tempdir's.
+        let (config, root) = config_over_an_empty_runner_tree();
+        assert_eq!(
+            config.ambient_user_dirs,
+            AmbientUserDirs::At(root.path().join("user-dirs"))
+        );
+    }
+
+    #[test]
+    fn at_resolves_every_user_dir_under_its_root_and_read_is_the_platforms() {
+        let root = PathBuf::from("/user-dirs-root");
+        let at = AmbientUserDirs::At(root.clone());
+        let mut resolved: Vec<PathBuf> = [at.config_dir(), at.data_local_dir(), at.data_dir()]
+            .into_iter()
+            .chain([at.home_dir()])
+            .map(|dir| dir.expect("At resolves every dir"))
+            .collect();
+        for dir in &resolved {
+            assert!(dir.starts_with(&root), "{dir:?} lies outside {root:?}");
+        }
+        resolved.sort();
+        resolved.dedup();
+        assert_eq!(resolved.len(), 4, "each dir is distinct under At");
+        assert_eq!(
+            at.harness_qontinui_dir(),
+            Some(root.join("home").join(".qontinui"))
+        );
+
+        // Production resolves exactly what it resolved before the switch.
+        let read = AmbientUserDirs::Read;
+        assert_eq!(read.config_dir(), dirs::config_dir());
+        assert_eq!(read.data_local_dir(), dirs::data_local_dir());
+        assert_eq!(read.data_dir(), dirs::data_dir());
+        assert_eq!(read.home_dir(), dirs::home_dir());
+        assert_eq!(
+            read.harness_qontinui_dir(),
+            crate::process::instance_root::harness_qontinui_dir_from(
+                std::env::var_os("QONTINUI_HOME"),
+                dirs::home_dir(),
+            )
+        );
+    }
+
+    /// How many times the code of `text` names the path `a::b`, comments and
+    /// string literals excluded (so a doc mention is not a resolution).
+    fn code_paths(text: &str, a: &str, b: &str) -> usize {
+        use crate::source_scan::TokenKind;
+        let tokens = crate::source_scan::tokens(text).expect("the source lexes");
+        tokens
+            .windows(3)
+            .filter(|w| {
+                w[0].kind == TokenKind::Ident
+                    && w[0].text == a
+                    && w[1].text == "::"
+                    && w[2].kind == TokenKind::Ident
+                    && w[2].text == b
+            })
+            .count()
+    }
+
+    #[test]
+    fn no_user_dir_resolver_outside_ambient_user_dirs() {
+        // Every per-user dir the supervisor resolves goes through
+        // `AmbientUserDirs`, so a unit-test build (`Ignore`) or a test's
+        // tempdir (`At`) holds for all of them. A second resolver would read
+        // the platform's dirs with no switch, which is how a temp start came
+        // to write its instance root under the operator's config dir, provision
+        // it from the operator's `profiles.json` and add a row to the box's
+        // ledger, from a unit test. `AmbientUserDirs::Read` is counted too: a
+        // test that names it resolves the operator's dirs. An integration test
+        // that calls `from_args` gets `Read` without naming it, which
+        // `no_test_config_reads_the_ambient_coord` already refuses.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let (crate_dirs, user_dirs) = (["di", "rs"].concat(), ["Ambient", "UserDirs"].concat());
+        let read = ["Re", "ad"].concat();
+        let file = |rel: &str| src.join(rel);
+        // (path, a::b, exact count in that file, why it is not the switch's).
+        let allowed: Vec<(PathBuf, &str, &str, usize)> = vec![
+            // The resolver itself (and `from_args`, and its own tests above).
+            (file("config.rs"), crate_dirs.as_str(), "config_dir", 2),
+            (file("config.rs"), crate_dirs.as_str(), "data_local_dir", 2),
+            (file("config.rs"), crate_dirs.as_str(), "data_dir", 2),
+            (file("config.rs"), crate_dirs.as_str(), "home_dir", 4),
+            (file("config.rs"), user_dirs.as_str(), read.as_str(), 2),
+            // The boot id keeps its `.` fallback for a box with no data dir.
+            (file("state.rs"), user_dirs.as_str(), read.as_str(), 1),
+            // The legacy Windows WebView2 folder, resolved by qontinui-types
+            // from `%LOCALAPPDATA%`, is removed only under `Read`.
+            (
+                file("process/manager.rs"),
+                user_dirs.as_str(),
+                read.as_str(),
+                1,
+            ),
+            // `AmbientCoord` decides whether these identity files are read.
+            (file("coord_client.rs"), crate_dirs.as_str(), "home_dir", 1),
+            (file("fleet.rs"), crate_dirs.as_str(), "home_dir", 2),
+            (
+                file("dev_action/ingest.rs"),
+                crate_dirs.as_str(),
+                "home_dir",
+                1,
+            ),
+            // A separate CLI subcommand with its own config.
+            (
+                file("symbol_watcher/mod.rs"),
+                crate_dirs.as_str(),
+                "home_dir",
+                1,
+            ),
+            // Cargo's own home, read by the sccache probe of a build.
+            (file("sccache_guard.rs"), crate_dirs.as_str(), "home_dir", 1),
+            // A primary started without `--log-dir`: the runner's default.
+            (
+                file("process/panic_log.rs"),
+                crate_dirs.as_str(),
+                "data_local_dir",
+                1,
+            ),
+            // The pair route's private CLI copies and its primary pairing
+            // fallback (and a test of that path), and the pair CLI's
+            // `machine.json`. Not reached by a runner start or teardown.
+            (
+                file("routes/runners_pair.rs"),
+                crate_dirs.as_str(),
+                "data_local_dir",
+                3,
+            ),
+            (
+                file("routes/runners_pair.rs"),
+                crate_dirs.as_str(),
+                "home_dir",
+                1,
+            ),
+        ];
+        let needles: Vec<(&str, &str)> = ["config_dir", "data_local_dir", "data_dir", "home_dir"]
+            .into_iter()
+            .map(|b| (crate_dirs.as_str(), b))
+            .chain([(user_dirs.as_str(), read.as_str())])
+            .collect();
+
+        // The scan proves nothing unless it finds the forms a resolver writes,
+        // and skips a comment or a string that only names one.
+        let sample = format!(
+            "let a = {crate_dirs}::config_dir();\n// {crate_dirs}::home_dir()\n\
+             let b = \"{crate_dirs}::data_dir()\";\nlet c = {crate_dirs}\n    ::data_local_dir();\n\
+             let d = crate::config::{user_dirs}::{read};\n"
+        );
+        for (a, b) in &needles {
+            let want = usize::from(*b != "home_dir" && *b != "data_dir");
+            assert_eq!(code_paths(&sample, a, b), want, "{a}::{b} in {sample}");
+        }
+
+        let mut offenders = Vec::new();
+        let mut drifted = Vec::new();
+        let mut files_scanned = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            files_scanned += 1;
+            for (a, b) in &needles {
+                let found = code_paths(&source, a, b);
+                match allowed
+                    .iter()
+                    .find(|(p, na, nb, _)| *p == path && na == a && nb == b)
+                {
+                    Some((_, _, _, want)) if *want != found => drifted.push(format!(
+                        "{}: {a}::{b} {found} time(s), allowed {want}",
+                        path.display()
+                    )),
+                    Some(_) => {}
+                    None if found > 0 => {
+                        offenders.push(format!("{}: {a}::{b} {found} time(s)", path.display()))
+                    }
+                    None => {}
+                }
+            }
+        }
+        assert!(
+            files_scanned > 20,
+            "scanned only {files_scanned} source file(s)"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these files resolve a per-user dir outside `AmbientUserDirs`, or name its \
+             `Read` arm; take the state's `config.ambient_user_dirs` instead (a test: \
+             `AmbientUserDirs::At(<tempdir>)`):\n  {}",
+            offenders.join("\n  ")
+        );
         assert!(
             drifted.is_empty(),
             "a sanctioned file no longer carries exactly its allowed count — a second \

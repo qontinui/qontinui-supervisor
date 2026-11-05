@@ -601,6 +601,14 @@ impl Drop for FileCleanup {
 /// Kill the whole process tree via the `process-wrap` child wrapper. On Windows
 /// this terminates the JobObject (every descendant); on Unix the process group.
 /// `start_kill` returns immediately; the subsequent `wait()` reaps the tree.
+///
+/// The one process-wrap kill in production code, and exempt from the unit-test
+/// kill guard (`process::test_kill_guard`) for what it can reach: the group or
+/// job process-wrap made for a child this process spawned, which that child's
+/// own tree normally fills, reparented or not. It is not the only way in: POSIX
+/// lets any process of the same session `setpgid` itself into the group, and
+/// the guard's module doc says what that leaves unchecked. `test_kill_guard`'s
+/// scan holds this as the only place a process-wrap kill is sent from.
 async fn kill_tree(child: &mut Box<dyn ChildWrapper>) {
     if let Err(e) = child.start_kill() {
         warn!("GCMD: start_kill (tree) failed: {e}");

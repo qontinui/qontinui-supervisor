@@ -44,7 +44,9 @@ const TERM_POLL_MS: u64 = 100;
 const TERM_GRACE_MS: u64 = 1500;
 
 /// Return true if `pid` refers to a live process. Uses `kill(pid, 0)` which
-/// performs the permission/existence check without sending a signal.
+/// performs the permission/existence check without sending a signal — which is
+/// why it is the one `kill` call outside the unit-test kill guard
+/// (`process::test_kill_guard`): signal 0 delivers nothing.
 pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 only probes for existence/permission and
     // never delivers a signal. `pid` is a plain integer; no memory is touched.
@@ -60,7 +62,13 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
 /// Send `signal` to `pid`. Returns true if the signal was delivered (or the
 /// process exists but we lacked permission), false if there is no such
 /// process.
+///
+/// In a unit-test build it first asserts that `pid` descends from the test
+/// process (`process::test_kill_guard`), and panics before signalling when it
+/// does not: a unit test never signals a process it did not spawn.
 fn raw_kill(pid: u32, signal: libc::c_int) -> bool {
+    #[cfg(test)]
+    crate::process::test_kill_guard::assert_may_signal_pid(pid);
     // SAFETY: `kill` is async-signal-safe and takes only scalar arguments.
     let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -68,7 +76,13 @@ fn raw_kill(pid: u32, signal: libc::c_int) -> bool {
 
 /// Send `signal` to the entire process group led by `pgid` (negative-pid
 /// form of `kill`).
+///
+/// In a unit-test build it first asserts that every live member of the group
+/// descends from the test process (`process::test_kill_guard`), and panics
+/// before signalling when one does not.
 fn raw_kill_group(pgid: u32, signal: libc::c_int) -> bool {
+    #[cfg(test)]
+    crate::process::test_kill_guard::assert_may_signal_group(pgid);
     // SAFETY: negative pid targets the process group; scalar args only.
     let rc = unsafe { libc::kill(-(pgid as libc::pid_t), signal) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -138,7 +152,7 @@ pub async fn kill_by_pid_tree(pid: u32) -> anyhow::Result<bool> {
 /// state is therefore UNKNOWN. Collapsing the second into the first is how a
 /// probe that never ran comes to read as "nothing is listening" — and then as
 /// "nothing to kill".
-async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
+pub(crate) async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
     let output = Command::new("lsof")
         .args([
             "-t",                       // terse: PIDs only, one per line
@@ -177,12 +191,6 @@ async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
         }
     }
     Ok(pids)
-}
-
-/// Return the PID of the first process LISTENING on `port`. See
-/// [`find_pids_on_port`] for why `Err` is not `Ok(None)`.
-pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
-    Ok(find_pids_on_port(port).await?.into_iter().next())
 }
 
 /// Kill every process listening on `port` with a plain per-PID

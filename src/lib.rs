@@ -75,7 +75,9 @@ pub mod state;
 /// binaries under `tests/` share ONE definition of the env knob's name with
 /// the in-crate unit tests; a second spelling is how the two drift apart.
 pub mod test_clock;
-/// Test-only: a loopback port that refuses connects and stays reserved.
+/// Test-only: the one place test code binds port 0, and a loopback-port
+/// fixture per kind of consumer (a held listener, a refused port, a port
+/// nothing holds and no kernel hands out).
 #[cfg(test)]
 mod test_ports;
 // Phase 4.1 (`plans/2026-05-21-coordination-improvements.md`): per-machine

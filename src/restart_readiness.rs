@@ -1373,16 +1373,16 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        format!("http://127.0.0.1:{}", addr.port())
+        format!("http://127.0.0.1:{port}")
     }
 
-    /// A URL nothing is listening on: bind an ephemeral port to reserve it,
-    /// then drop the listener.
+    /// A URL whose connects are refused: the port is bound and kept by
+    /// [`crate::test_ports::reserve_refused_port`] and never listened on, so
+    /// nothing answers it and nothing else can listen there.
     async fn dead_url() -> String {
         let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{}", port)
@@ -2149,8 +2149,7 @@ mod tests {
     /// and not be mistaken for a live door) and the census must answer.
     #[tokio::test]
     async fn phase_two_signature_accept_and_hang_falls_back_to_a_real_census() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         // Accept and hold every connection open forever, answering nothing.
         tokio::spawn(async move {
             let mut held = Vec::new();
@@ -2429,8 +2428,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -2491,8 +2489,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

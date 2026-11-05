@@ -485,14 +485,10 @@ mod tests {
         assert!(fetched.rows.is_empty());
         assert_eq!(fetched.basis, None);
 
-        let refused = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let base = format!("http://{}", listener.local_addr().expect("addr"));
-            drop(listener);
-            base
-        };
+        let refused = format!(
+            "http://127.0.0.1:{}",
+            crate::test_ports::reserve_refused_port()
+        );
         // The 500 carries a well-formed answer, so it is the status check that
         // refuses it, not the parse.
         let failing = crate::dev_action::test_support::serve_planted_status(

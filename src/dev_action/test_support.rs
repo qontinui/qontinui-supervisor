@@ -50,10 +50,8 @@ pub(crate) async fn serve_planted_expectations(rows: Value) -> PlantedCoord {
 /// It binds `127.0.0.1`, not `localhost`, which costs a doomed IPv6 connect on
 /// Windows.
 pub(crate) async fn serve_planted_answer(answer_body: Value) -> PlantedCoord {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the planted coord");
-    let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+    let base = format!("http://127.0.0.1:{port}");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
     let app = Router::new().fallback(move |req: Request| {
@@ -67,10 +65,8 @@ pub(crate) async fn serve_planted_answer(answer_body: Value) -> PlantedCoord {
 /// A coord that answers every request with `status` and `body`, for the life of
 /// the test's runtime. Returns its base URL.
 pub(crate) async fn serve_planted_status(status: StatusCode, body: &'static str) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the planted coord");
-    let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+    let base = format!("http://127.0.0.1:{port}");
     let app = Router::new().fallback(move || async move { (status, body) });
     tokio::spawn(async move { axum::serve(listener, app).await });
     base
