@@ -1581,16 +1581,15 @@ mod tests {
 
     /// Serializes the tests that drive a real [`crate::build_monitor::run_cargo_build`].
     ///
-    /// Both of them close the build-pool semaphore so the build itself fails
-    /// fast — but the PRE-permit guards still run, and `check_ram_guard`'s
+    /// Each closes the build-pool semaphore so the build itself fails fast —
+    /// but the PRE-permit guards still run, and `check_ram_guard`'s
     /// `available_commit_bytes()` is a whole-machine memory/process query.
     /// Two of those in flight at once cost ~3.3s wall-clock apiece on a loaded
-    /// box, which is enough to trip
-    /// `restart_rebuild_true_detaches_returns_202_and_registers_build`'s 2s
-    /// latency pin — a pin about the HANDLER detaching, not about how busy the
-    /// machine running the suite is. Serializing the two keeps that pin
-    /// measuring what it was written to measure. Measured before/after: 1 in 4
-    /// full-suite runs failed, then 0 in 8.
+    /// box. That once tripped a 2s latency pin in
+    /// `restart_rebuild_true_detaches_returns_202_and_registers_build` (1 in 4
+    /// full-suite runs failed, then 0 in 8 serialized); the pin is gone, and
+    /// serializing still keeps each test's backstops measuring its own build
+    /// rather than a peer's.
     static BUILDING_TESTS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1847,22 +1846,17 @@ mod tests {
     /// mint's `dev_actions.write()`, which this test holds a read guard on; the
     /// second call is then running. Releasing the dedupe lock between the check
     /// and the record (as it once was) lets the second pass the check before
-    /// the first records, and both build. Every pool permit is held so the
-    /// first build stays in flight, then the pool is closed so neither runs
-    /// cargo.
+    /// the first records, and both build. The first build is held in flight at
+    /// its disk guard, whose floor reads `state.footprint` first, by a write
+    /// guard on it: holding pool permits is not enough, since the disk guard
+    /// runs before the permit and on a box short of disk would end the build at
+    /// once. The pool is closed before release so neither call runs cargo.
     #[tokio::test]
     async fn fix_and_rebuild_concurrent_calls_start_one_build() {
         let _building = BUILDING_TESTS.lock().await;
         let tmp = TempDir::new().expect("tempdir");
         let state = test_state(tmp.path());
-        let n = state.build_pool.permits.available_permits() as u32;
-        let held = state
-            .build_pool
-            .permits
-            .clone()
-            .acquire_many_owned(n)
-            .await
-            .expect("the pool's permits");
+        let footprint = state.footprint.write().await;
 
         let parked = state.dev_actions.read().await;
         let call = |state: SharedState| {
@@ -1891,7 +1885,7 @@ mod tests {
             .expect("the second call returned")
             .expect("the second call did not panic");
         state.build_pool.permits.close();
-        drop(held);
+        drop(footprint);
 
         assert_eq!((status_a, status_b), (202, 202), "{a} {b}");
         let deduplicated = [&a, &b]
@@ -1942,8 +1936,9 @@ mod tests {
         // The `Queued` read alone holds only until the task is first polled, so
         // a coop-budget yield inside the handler would fail it. Holding the
         // diagnostics lock is the stronger proof: `manager::admit_restart`'s
-        // `diagnostics.write()` is the detached body's first exclusive lock and
-        // this handler never takes it, so while the guard is held a handler that
+        // `diagnostics.write()` is the first lock the detached body contends on
+        // (its write of `Running` to its own submission is uncontended), and
+        // this handler never takes it. So while the guard is held a handler that
         // awaited the body could not return, and the body cannot reach a
         // terminal status.
         let wedge_backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
