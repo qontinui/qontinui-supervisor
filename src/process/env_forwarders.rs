@@ -706,14 +706,16 @@ impl EnvForwarder for WindowPositionEnv {
             };
 
             // The primary this runner is told about (`QONTINUI_PRIMARY_PORT`),
-            // on the IPv4 loopback the runner binds: `localhost` resolves to
-            // `::1` first on Windows, and that doomed connect alone can spend
-            // most of the 3 s budget below.
+            // on the IPv4 loopback the runner binds (qontinui-runner's
+            // `RUNNER_API_BIND_IP`): `localhost` resolves to `::1` first on
+            // Windows, and that doomed connect alone can spend most of the 3 s
+            // budget below.
             let primary_port = crate::process::manager::primary_runner_port(state).await;
             let base = match reqwest::Url::parse(&format!("http://127.0.0.1:{primary_port}")) {
                 Ok(u) => u,
                 Err(e) => {
-                    // Static URL — this should never fail, but log defensively.
+                    // An IPv4 literal and a `u16` port always parse; this
+                    // arm only logs defensively.
                     let msg = format!(
                         "Spawn temp placement: skipping runner '{}' — runner base URL parse failed: {}",
                         runner_name, e

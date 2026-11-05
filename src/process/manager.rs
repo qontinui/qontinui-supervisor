@@ -3481,11 +3481,14 @@ pub(crate) fn apply_non_primary_instance_env_with(
 /// asks for its window placement (`env_forwarders::WindowPositionEnv`): the
 /// registered primary's port, else the conventional default.
 ///
-/// The user-started primary isn't in the supervisor's runners registry (the
-/// supervisor only tracks runners IT spawned), so `state.get_primary()`
-/// returns None on most setups and the default answers. A test state registers
-/// its primary on a port of its choosing, so a test's spawn asks that port and
-/// never a live primary on 9876.
+/// A running supervisor always has a registered primary, whoever started the
+/// runner itself: `SupervisorConfig::from_args` seeds
+/// `RunnerConfig::default_primary` (9876), `main` puts it back when saved
+/// settings carry runners but no primary, and `DELETE /runners/{id}` refuses
+/// the primary. So the default answers only a state built with no primary,
+/// which `main`, the one production builder of a state, never makes. A test
+/// state registers its primary on a port of its choosing, so a test's spawn
+/// asks that port and never a live primary on 9876.
 pub(crate) async fn primary_runner_port(state: &SharedState) -> u16 {
     state
         .get_primary()

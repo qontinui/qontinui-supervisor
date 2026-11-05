@@ -176,8 +176,12 @@ pub enum AmbientUserDirs {
     ///
     /// An integration test under `tests/` links the library without
     /// `cfg(test)`, so `from_args` gives it `Read`: it builds a struct literal
-    /// that names `Ignore` or `At` instead, and
-    /// `tests::no_test_config_reads_the_ambient_user_dirs` holds both halves.
+    /// that names `Ignore` or `At` instead.
+    /// `tests::no_test_config_reads_the_ambient_coord` fails an integration
+    /// test that calls `from_args`, and
+    /// `tests::no_user_dir_resolver_outside_ambient_user_dirs` fails a per-user
+    /// dir resolved outside this switch, or a `Read` named, beyond the reasoned
+    /// exceptions it lists.
     Ignore,
     /// Every one of them under this directory, with no ambient read:
     /// `<dir>/config`, `<dir>/data-local`, `<dir>/data` and `<dir>/home`, whose
