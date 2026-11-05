@@ -5523,17 +5523,21 @@ where
     }
 }
 
-/// A slow attempt does not spend the retry budget: only waits do.
+/// A slow attempt does not spend the retry budget: only waits do. The first attempt
+/// burns more REAL time than the whole waiting budget (a blocking sleep, since the
+/// deadline this replaced read `std::time::Instant`), and is still retried. Fails
+/// against a wall-clock deadline measured from the first attempt.
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_slow_attempt_still_gets_its_text_file_busy_retries() {
     let mut calls = 0u32;
     let outcome = past_text_file_busy(|| {
         calls += 1;
         let call = calls;
         async move {
-            // Far longer than the whole waiting budget.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            if call == 1 {
+                std::thread::sleep(Duration::from_millis(2_100));
+            }
             if call < 3 {
                 Err(SupervisorError::Process(
                     "Failed to spawn exe: Text file busy (os error 26)".into(),
@@ -5544,7 +5548,7 @@ async fn a_slow_attempt_still_gets_its_text_file_busy_retries() {
         }
     })
     .await;
-    assert_eq!(outcome.expect("retried past two slow ETXTBSY attempts"), 3);
+    assert_eq!(outcome.expect("retried past a slow ETXTBSY attempt"), 3);
 
     let mut waits = TextFileBusyWaits::new();
     let mut taken = 0;
