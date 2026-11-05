@@ -343,9 +343,262 @@ fn skip_char_or_lifetime(text: &str, i: usize) -> usize {
     }
 }
 
+/// What a [`Token`] is. Comments are not tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenKind {
+    /// An identifier or a keyword. A raw identifier's `r#` is dropped.
+    Ident,
+    /// A lifetime or a loop label: `'a`, `'static`.
+    Lifetime,
+    /// A string literal in any spelling: `"…"`, `r#"…"#`, `b"…"`, `br"…"`, `c"…"`.
+    Str,
+    /// A char or byte literal: `'x'`, `'\n'`, `b'x'`.
+    Char,
+    /// A numeric literal, its suffix included: `0`, `1_000u16`, `0x1F`, `1.5`.
+    Number,
+    /// Punctuation. A multi-character operator (`::`, `->`, `=>`, `==`, `..`, …)
+    /// is one token.
+    Punct,
+    /// `(`, `[` or `{`.
+    Open,
+    /// `)`, `]` or `}`.
+    Close,
+}
+
+/// One lexeme of Rust source and the 1-based line it starts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Token<'t> {
+    pub(crate) kind: TokenKind,
+    pub(crate) text: &'t str,
+    pub(crate) line: usize,
+}
+
+/// Multi-character operators, longest first so the first match is the longest.
+const MULTI_PUNCT: [&str; 24] = [
+    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "..", "+=",
+    "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>",
+];
+
+/// `text` as tokens, comments dropped, with the same rules [`fn_body`] uses for
+/// comments, strings, chars and lifetimes. `None` when a comment or a literal
+/// never closes, which rustc would reject too.
+pub(crate) fn tokens(text: &str) -> Option<Vec<Token<'_>>> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut line = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        let kind = match bytes[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+                continue;
+            }
+            b if b.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = text.len() - skip_block_comment(&text[i..])?.len();
+                line += text[start..i].matches('\n').count();
+                continue;
+            }
+            b'"' => {
+                i = skip_string(bytes, i + 1)?;
+                TokenKind::Str
+            }
+            b'r' | b'b' | b'c' if !is_ident_byte(bytes, i.wrapping_sub(1)) => {
+                if let Some(end) = raw_or_prefixed_string(bytes, i) {
+                    i = end?;
+                    TokenKind::Str
+                } else if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+                    i = skip_char_or_lifetime(text, i + 1);
+                    TokenKind::Char
+                } else if bytes[i] == b'r'
+                    && bytes.get(i + 1) == Some(&b'#')
+                    && is_ident_start(bytes.get(i + 2).copied())
+                {
+                    // A raw identifier: the token is the name after `r#`.
+                    let name = i + 2;
+                    i = ident_end(bytes, name);
+                    out.push(Token {
+                        kind: TokenKind::Ident,
+                        text: &text[name..i],
+                        line,
+                    });
+                    continue;
+                } else {
+                    i = ident_end(bytes, i);
+                    TokenKind::Ident
+                }
+            }
+            b'\'' => {
+                let end = skip_char_or_lifetime(text, i);
+                if end == i + 1 {
+                    // `'` of a lifetime or label: the token runs over its name.
+                    i = ident_end(bytes, i + 1);
+                    TokenKind::Lifetime
+                } else {
+                    i = end;
+                    TokenKind::Char
+                }
+            }
+            b if is_ident_start(Some(b)) => {
+                i = ident_end(bytes, i);
+                TokenKind::Ident
+            }
+            b if b.is_ascii_digit() => {
+                i = ident_end(bytes, i);
+                // A fraction, but not the `..` of a range (`0..10`).
+                if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    i = ident_end(bytes, i + 1);
+                }
+                TokenKind::Number
+            }
+            b'(' | b'[' | b'{' => {
+                i += 1;
+                TokenKind::Open
+            }
+            b')' | b']' | b'}' => {
+                i += 1;
+                TokenKind::Close
+            }
+            _ => {
+                let rest = &text[i..];
+                let len = MULTI_PUNCT
+                    .iter()
+                    .find(|op| rest.starts_with(**op))
+                    .map_or_else(
+                        || rest.chars().next().map_or(1, char::len_utf8),
+                        |op| op.len(),
+                    );
+                i += len;
+                TokenKind::Punct
+            }
+        };
+        out.push(Token {
+            kind,
+            text: &text[start..i],
+            line,
+        });
+        line += text[start..i].matches('\n').count();
+    }
+    Some(out)
+}
+
+/// Whether `b` can start an identifier (non-ASCII bytes are taken as part of one).
+fn is_ident_start(b: Option<u8>) -> bool {
+    b.is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b >= 0x80)
+}
+
+/// The index just past the identifier-like run starting at `i`.
+fn ident_end(bytes: &[u8], mut i: usize) -> usize {
+    while is_ident_byte(bytes, i) {
+        i += 1;
+    }
+    i
+}
+
+/// A token, or a delimited group of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TokenTree<'t> {
+    Leaf(Token<'t>),
+    Group {
+        open: Token<'t>,
+        close: Token<'t>,
+        inner: Vec<TokenTree<'t>>,
+    },
+}
+
+impl<'t> TokenTree<'t> {
+    /// The group's opening delimiter (`b'('`, `b'['` or `b'{'`), `None` for a leaf.
+    pub(crate) fn delimiter(&self) -> Option<u8> {
+        match self {
+            TokenTree::Group { open, .. } => open.text.bytes().next(),
+            TokenTree::Leaf(_) => None,
+        }
+    }
+
+    /// The group's contents; empty for a leaf.
+    pub(crate) fn inner(&self) -> &[TokenTree<'t>] {
+        match self {
+            TokenTree::Group { inner, .. } => inner,
+            TokenTree::Leaf(_) => &[],
+        }
+    }
+
+    /// The leaf token, `None` for a group.
+    pub(crate) fn leaf(&self) -> Option<&Token<'t>> {
+        match self {
+            TokenTree::Leaf(token) => Some(token),
+            TokenTree::Group { .. } => None,
+        }
+    }
+
+    /// Whether this is the identifier or keyword `name`.
+    pub(crate) fn is_ident(&self, name: &str) -> bool {
+        self.leaf()
+            .is_some_and(|t| t.kind == TokenKind::Ident && t.text == name)
+    }
+
+    /// Whether this is the punctuation `op`.
+    pub(crate) fn is_punct(&self, op: &str) -> bool {
+        self.leaf()
+            .is_some_and(|t| t.kind == TokenKind::Punct && t.text == op)
+    }
+
+    /// The line the tree starts on.
+    pub(crate) fn line(&self) -> usize {
+        match self {
+            TokenTree::Leaf(token) => token.line,
+            TokenTree::Group { open, .. } => open.line,
+        }
+    }
+
+    /// The line the tree ends on.
+    pub(crate) fn end_line(&self) -> usize {
+        match self {
+            TokenTree::Leaf(token) => token.line,
+            TokenTree::Group { close, .. } => close.line,
+        }
+    }
+}
+
+/// `tokens` nested by their delimiters. `None` when they do not balance.
+pub(crate) fn token_trees<'t>(tokens: &[Token<'t>]) -> Option<Vec<TokenTree<'t>>> {
+    let mut stack: Vec<(Token<'t>, Vec<TokenTree<'t>>)> = Vec::new();
+    let mut top: Vec<TokenTree<'t>> = Vec::new();
+    for token in tokens {
+        match token.kind {
+            TokenKind::Open => stack.push((*token, std::mem::take(&mut top))),
+            TokenKind::Close => {
+                let (open, outer) = stack.pop()?;
+                let pair = (open.text.as_bytes()[0], token.text.as_bytes()[0]);
+                if !matches!(pair, (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                    return None;
+                }
+                let inner = std::mem::replace(&mut top, outer);
+                top.push(TokenTree::Group {
+                    open,
+                    close: *token,
+                    inner,
+                });
+            }
+            _ => top.push(TokenTree::Leaf(*token)),
+        }
+    }
+    stack.is_empty().then_some(top)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fn_body, is_test_only_file, production_span};
+    use super::{fn_body, is_test_only_file, production_span, token_trees, tokens, TokenKind};
 
     #[test]
     fn production_span_is_the_same_for_inline_and_extracted_tests() {
@@ -572,5 +825,145 @@ mod tests {
         );
         // Signature is excluded; the body begins right after it.
         assert_eq!(fn_body("fn f(a: u8) { a }", "fn f("), Some("a: u8) { a }"));
+    }
+
+    fn token_texts(src: &str) -> Vec<(TokenKind, &str)> {
+        tokens(src)
+            .expect("the source lexes")
+            .into_iter()
+            .map(|t| (t.kind, t.text))
+            .collect()
+    }
+
+    #[test]
+    fn tokens_drop_comments_and_keep_each_literal_whole() {
+        use TokenKind::{Char, Close, Ident, Lifetime, Open, Punct, Str};
+        assert_eq!(
+            token_texts(
+                "let s = \"a // b { \"; // c }\n/* d /* e */ { */ let r = r#\"x \" }\"#;\n'a: loop { '}' }"
+            ),
+            [
+                (Ident, "let"),
+                (Ident, "s"),
+                (Punct, "="),
+                (Str, "\"a // b { \""),
+                (Punct, ";"),
+                (Ident, "let"),
+                (Ident, "r"),
+                (Punct, "="),
+                (Str, "r#\"x \" }\"#"),
+                (Punct, ";"),
+                (Lifetime, "'a"),
+                (Punct, ":"),
+                (Ident, "loop"),
+                (Open, "{"),
+                (Char, "'}'"),
+                (Close, "}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokens_join_operators_and_split_a_range_from_its_ends() {
+        use TokenKind::{Ident, Number, Punct};
+        assert_eq!(
+            token_texts("a::b -> c => d == e != f <= g >= h && i || j ..= k"),
+            [
+                (Ident, "a"),
+                (Punct, "::"),
+                (Ident, "b"),
+                (Punct, "->"),
+                (Ident, "c"),
+                (Punct, "=>"),
+                (Ident, "d"),
+                (Punct, "=="),
+                (Ident, "e"),
+                (Punct, "!="),
+                (Ident, "f"),
+                (Punct, "<="),
+                (Ident, "g"),
+                (Punct, ">="),
+                (Ident, "h"),
+                (Punct, "&&"),
+                (Ident, "i"),
+                (Punct, "||"),
+                (Ident, "j"),
+                (Punct, "..="),
+                (Ident, "k"),
+            ]
+        );
+        assert_eq!(
+            token_texts("0..1_000u16 1.5 0x1F"),
+            [
+                (Number, "0"),
+                (Punct, ".."),
+                (Number, "1_000u16"),
+                (Number, "1.5"),
+                (Number, "0x1F"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokens_read_raw_identifiers_byte_chars_and_lifetimes() {
+        use TokenKind::{Char, Ident, Lifetime, Str};
+        assert_eq!(
+            token_texts("r#type b'x' b\"y\" br#\"z\"# c\"w\" 'static '\\'' '\\u{7d}' ready"),
+            [
+                (Ident, "type"),
+                (Char, "b'x'"),
+                (Str, "b\"y\""),
+                (Str, "br#\"z\"#"),
+                (Str, "c\"w\""),
+                (Lifetime, "'static"),
+                (Char, "'\\''"),
+                (Char, "'\\u{7d}'"),
+                (Ident, "ready"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_token_carries_the_line_it_starts_on() {
+        let lines: Vec<(&str, usize)> = tokens("a\n/* x\ny */ b\n\"m\nn\" c\r\nd")
+            .expect("lexes")
+            .into_iter()
+            .map(|t| (t.text, t.line))
+            .collect();
+        assert_eq!(
+            lines,
+            [("a", 1), ("b", 3), ("\"m\nn\"", 4), ("c", 5), ("d", 6)]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_literal_or_comment_does_not_lex() {
+        assert_eq!(tokens("let s = \"open"), None);
+        assert_eq!(tokens("/* open /* nested */"), None);
+        assert_eq!(tokens("r#\"open\""), None);
+    }
+
+    #[test]
+    fn token_trees_nest_by_delimiter_and_refuse_a_mismatch() {
+        let toks = tokens("f(a, [b], {c})").expect("lexes");
+        let trees = token_trees(&toks).expect("balanced");
+        assert_eq!(trees.len(), 2);
+        assert!(trees[0].is_ident("f"));
+        assert_eq!(trees[1].delimiter(), Some(b'('));
+        let inner = trees[1].inner();
+        assert_eq!(inner.len(), 5);
+        assert!(inner[1].is_punct(","));
+        assert_eq!(inner[2].delimiter(), Some(b'['));
+        assert!(inner[2].inner()[0].is_ident("b"));
+        assert_eq!(inner[4].delimiter(), Some(b'{'));
+        // A group spans from its opening line to its closing one.
+        let spanning = tokens("f(\n    a,\n)").expect("lexes");
+        let trees = token_trees(&spanning).expect("balanced");
+        assert_eq!((trees[0].line(), trees[0].end_line()), (1, 1));
+        assert_eq!((trees[1].line(), trees[1].end_line()), (1, 3));
+        for unbalanced in ["(]", "(", ")", "{[}]"] {
+            let toks = tokens(unbalanced).expect("lexes");
+            assert_eq!(token_trees(&toks), None, "{unbalanced}");
+        }
     }
 }
