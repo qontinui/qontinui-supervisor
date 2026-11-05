@@ -117,6 +117,20 @@ pub fn read_and_latch(
     (runner.pid, runner.running)
 }
 
+/// The rows the sweep goes on to select from: every runner that WAS read —
+/// settled, or read without its lifecycle lock — and none that could not be.
+/// Pure.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn snapshot_of(reads: &[RowRead]) -> Vec<SweepRow> {
+    reads
+        .iter()
+        .filter_map(|read| match read {
+            RowRead::Settled(row) | RowRead::Unsettled(row) => Some(row.clone()),
+            RowRead::Unreadable { .. } => None,
+        })
+        .collect()
+}
+
 /// How one runner's read went.
 #[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,24 +209,30 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         .filter(|m| crate::process::job::should_assign_to_ephemeral_job(&m.config.kind()))
         .collect();
     let reads = futures::future::join_all(temps.iter().map(|m| read_row(m, settle_deadline))).await;
-    let mut snapshot: Vec<SweepRow> = Vec::with_capacity(reads.len());
-    for read in reads {
+    for read in &reads {
         match read {
-            RowRead::Settled(row) => snapshot.push(row),
+            RowRead::Settled(_) => {}
             RowRead::Unsettled(row) => {
-                emit(
-                    state,
-                    LogLevel::Warn,
-                    format!(
+                // With no pid yet, a start may record one just after this read:
+                // UNKNOWN, so say it is not stopped rather than let the summary
+                // read as "nothing to stop".
+                let msg = match row.3 {
+                    Some(pid) => format!(
                         "Shutdown sweep: a start or stop of temp runner '{}' was still in \
-                         progress after {}ms; read its PID ({}) without waiting for it",
+                         progress after {}ms; read its PID ({pid}) without waiting for it",
                         row.0,
-                        SWEEP_SETTLE_BOUND.as_millis(),
-                        row.3.map_or("none".to_string(), |p| p.to_string())
+                        SWEEP_SETTLE_BOUND.as_millis()
                     ),
-                )
-                .await;
-                snapshot.push(row);
+                    None => format!(
+                        "Shutdown sweep: a start or stop of temp runner '{}' was still in \
+                         progress after {}ms and it had no PID yet, so it was NOT stopped; the \
+                         supervisor's systemd unit (if any) or the next supervisor's \
+                         ledger-gated reconcile sweep frees it",
+                        row.0,
+                        SWEEP_SETTLE_BOUND.as_millis()
+                    ),
+                };
+                emit(state, LogLevel::Warn, msg).await;
             }
             RowRead::Unreadable { id } => {
                 emit(
@@ -230,7 +250,7 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         }
     }
 
-    let victims = temp_runners_to_sweep(&snapshot);
+    let victims = temp_runners_to_sweep(&snapshot_of(&reads));
     if victims.is_empty() {
         emit(
             state,
@@ -242,26 +262,16 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
     }
 
     // ---- kill phase: its own deadline, started only now ---------------------
-    let deadline = tokio::time::Instant::now() + bound;
-    let kills = victims.iter().map(|v| async move {
-        let outcome =
-            tokio::time::timeout_at(deadline, crate::process::proc_kill::kill_by_pid_tree(v.pid))
-                .await;
-        (v, outcome)
-    });
-    for (v, outcome) in futures::future::join_all(kills).await {
+    for (v, outcome) in kill_victims(&victims, bound).await {
         let (level, msg) = match outcome {
-            // `kill_by_pid_tree` answers `true` both when the group exited
-            // inside the SIGTERM grace and when it escalated to SIGKILL, so
-            // look again rather than claim an exit nobody observed.
-            Ok(Ok(true)) if !crate::process::proc_kill::pid_alive(v.pid) => (
+            KillOutcome::Stopped => (
                 LogLevel::Info,
                 format!(
                     "Shutdown sweep: stopped temp runner '{}' (PID {}, port {})",
                     v.id, v.pid, v.port
                 ),
             ),
-            Ok(Ok(true)) => (
+            KillOutcome::SignalledNotObserved => (
                 LogLevel::Warn,
                 format!(
                     "Shutdown sweep: signalled temp runner '{}' (PID {}, port {}) — SIGKILL was \
@@ -269,21 +279,21 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
                     v.id, v.pid, v.port
                 ),
             ),
-            Ok(Ok(false)) => (
+            KillOutcome::AlreadyGone => (
                 LogLevel::Info,
                 format!(
-                    "Shutdown sweep: temp runner '{}' (PID {}, port {}) was already gone",
+                    "Shutdown sweep: temp runner '{}' (PID {}, port {}) had already exited",
                     v.id, v.pid, v.port
                 ),
             ),
-            Ok(Err(e)) => (
+            KillOutcome::Failed(e) => (
                 LogLevel::Warn,
                 format!(
                     "Shutdown sweep: stopping temp runner '{}' (PID {}, port {}) failed: {e}",
                     v.id, v.pid, v.port
                 ),
             ),
-            Err(_) => (
+            KillOutcome::CutOff => (
                 LogLevel::Warn,
                 format!(
                     "Shutdown sweep: temp runner '{}' (PID {}, port {}) was CUT OFF by the {}s \
@@ -297,6 +307,57 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         };
         emit(state, level, msg).await;
     }
+}
+
+/// How one victim's kill ended.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// Signalled, and observed gone afterwards.
+    Stopped,
+    /// SIGKILL was sent after the SIGTERM grace, and the exit was not yet
+    /// observed when the kill returned.
+    SignalledNotObserved,
+    /// Gone before the sweep signalled it.
+    AlreadyGone,
+    /// The kill itself errored.
+    Failed(String),
+    /// The kill bound ran out first.
+    CutOff,
+}
+
+/// Kill every victim's process tree concurrently: SIGTERM to its group, then
+/// SIGKILL after `unix_kill`'s grace. The deadline is `bound` from NOW — this
+/// function starts its own clock, so time spent before the call (the read
+/// phase) can never eat the grace that precedes the SIGKILL.
+#[cfg(not(windows))]
+pub async fn kill_victims(
+    victims: &[SweepVictim],
+    bound: Duration,
+) -> Vec<(SweepVictim, KillOutcome)> {
+    let deadline = tokio::time::Instant::now() + bound;
+    let kills = victims.iter().map(|v| async move {
+        if !crate::process::proc_kill::pid_alive(v.pid) {
+            return (v.clone(), KillOutcome::AlreadyGone);
+        }
+        let outcome =
+            tokio::time::timeout_at(deadline, crate::process::proc_kill::kill_by_pid_tree(v.pid))
+                .await;
+        let outcome = match outcome {
+            // `kill_by_pid_tree` answers `true` both when the group exited
+            // inside the SIGTERM grace and when it escalated to SIGKILL, so
+            // look again rather than claim an exit nobody observed.
+            Ok(Ok(_)) if !crate::process::proc_kill::pid_alive(v.pid) => KillOutcome::Stopped,
+            Ok(Ok(true)) => KillOutcome::SignalledNotObserved,
+            // It was alive a moment ago, so a `false` means it exited in
+            // between: gone, by its own hand or ours.
+            Ok(Ok(false)) => KillOutcome::Stopped,
+            Ok(Err(e)) => KillOutcome::Failed(e.to_string()),
+            Err(_) => KillOutcome::CutOff,
+        };
+        (v.clone(), outcome)
+    });
+    futures::future::join_all(kills).await
 }
 
 #[cfg(test)]
@@ -493,6 +554,34 @@ mod tests {
         assert!(matches!(read, RowRead::Unsettled(_)), "{read:?}");
     }
 
+    /// A runner whose STATE lock is held past the deadline is reported
+    /// Unreadable (and named) rather than stalling the whole read phase.
+    #[tokio::test]
+    async fn a_state_lock_held_past_the_deadline_is_unreadable_not_a_stall() {
+        let busy = temp_runner("test-state-busy");
+        let _state = busy.runner.write().await;
+        let started = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_row(
+                &busy,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the read must give up at its own deadline, not wait for the lock");
+        assert_eq!(
+            read,
+            RowRead::Unreadable {
+                id: "test-state-busy".to_string()
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the read must give up at its deadline, not wait for the lock"
+        );
+    }
+
     /// Both callers — `shutdown_signal` and the self-restart endpoint — share
     /// ONE sweep through the state's once-cell.
     #[test]
@@ -512,6 +601,32 @@ mod tests {
             body.contains(".shutdown_sweep") && body.contains(".get_or_init("),
             "the sweep must run through the state's once-cell, or `shutdown_signal` and \
              `supervisor_restart` signal every temp runner twice, concurrently: {body}"
+        );
+    }
+
+    /// A runner read without its lifecycle lock is still swept; only one that
+    /// could not be read at all is left out.
+    #[test]
+    fn the_snapshot_keeps_settled_and_unsettled_rows_and_drops_unreadable_ones() {
+        let row = |id: &str, pid: u32| -> SweepRow {
+            (
+                id.to_string(),
+                9877,
+                RunnerKind::Temp { id: id.to_string() },
+                Some(pid),
+                true,
+            )
+        };
+        let reads = [
+            RowRead::Settled(row("test-a", 1)),
+            RowRead::Unsettled(row("test-b", 2)),
+            RowRead::Unreadable {
+                id: "test-c".to_string(),
+            },
+        ];
+        assert_eq!(
+            snapshot_of(&reads),
+            vec![row("test-a", 1), row("test-b", 2)]
         );
     }
 }

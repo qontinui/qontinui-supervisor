@@ -665,8 +665,9 @@ pub fn service_leaf(cgroup: &str) -> Option<&str> {
 /// and systemd stops the unit and kills the rest of its cgroup the moment the
 /// main process exits (`KillMode=mixed`, and the default `control-group`;
 /// plan Phase 0 P2c) — so the replacement dies with the process it replaces.
-/// That is exactly how `supervisor-verbs.sh start` runs the supervisor on
-/// Linux. An UNKNOWN answer is refused too: the input gates an action.
+/// That is how `supervisor-verbs.sh start` runs the supervisor on Linux once
+/// plan Phase 2 lands. An UNKNOWN answer is refused too: the input gates an
+/// action.
 pub fn self_restart_refusal(own: &OwnUnit, self_pid: u32) -> Option<String> {
     const HOW: &str = "Restart it with `supervisor-verbs.sh stop` and then `start`";
     match own {
@@ -716,6 +717,36 @@ pub fn own_unit_from_main_pid(unit: &str, answer: Result<(bool, String), String>
         },
     };
     OwnUnit::Unknown { why }
+}
+
+/// Why a user-owned runner must NOT be spawned unscoped, or `None`. A runner
+/// that could not be scoped out shares this supervisor's cgroup; when this
+/// supervisor is the MAIN process of its own service (how
+/// `supervisor-verbs.sh start` runs it once plan Phase 2 lands, with
+/// `KillMode=mixed`) that runner is killed with the unit on ANY supervisor
+/// exit, a crash included. UNKNOWN refuses too: the input gates a spawn.
+/// Everything that is not `Unscoped` is not this function's business. Pure.
+pub fn unscoped_spawn_refusal(
+    isolation: &Isolation,
+    own: &OwnUnit,
+    self_pid: u32,
+) -> Option<String> {
+    let Isolation::Unscoped(why) = isolation else {
+        return None;
+    };
+    match own {
+        OwnUnit::NotAService => None,
+        OwnUnit::Service { main_pid, .. } if *main_pid != self_pid => None,
+        OwnUnit::Service { unit, .. } => Some(format!(
+            "it could not be scoped out ({why}), and this supervisor is the main process of \
+             systemd unit {unit}, so the runner would share that unit's cgroup and be killed \
+             with it on any supervisor exit"
+        )),
+        OwnUnit::Unknown { why: own_why } => Some(format!(
+            "it could not be scoped out ({why}), and whether this supervisor is the main \
+             process of a systemd service is UNKNOWN ({own_why})"
+        )),
+    }
 }
 
 /// Read this process's own unit: `<proc_root>/self/cgroup`, and — when that
@@ -1307,5 +1338,54 @@ mod tests {
         let mut slot = Some(newer.clone());
         assert!(!record_startup_probe(&mut slot, available()));
         assert_eq!(slot, Some(newer));
+    }
+
+    #[test]
+    fn an_unscoped_user_owned_spawn_is_refused_inside_its_own_service_or_when_unknown() {
+        let unscoped = Isolation::Unscoped("`systemctl --user show` did not answer".to_string());
+        let own = OwnUnit::Service {
+            unit: "qontinui-supervisor-20261105T080000Z.service".to_string(),
+            main_pid: 4242,
+        };
+        let refused = unscoped_spawn_refusal(&unscoped, &own, 4242)
+            .expect("inside its own KillMode=mixed service an unscoped runner dies with it");
+        assert!(
+            refused.contains("qontinui-supervisor-20261105T080000Z.service"),
+            "{refused}"
+        );
+        assert!(unscoped_spawn_refusal(
+            &unscoped,
+            &OwnUnit::Unknown {
+                why: "systemctl did not answer".to_string()
+            },
+            4242
+        )
+        .is_some_and(|why| why.contains("UNKNOWN")));
+        // A fallback launch outside any service, or inside someone else's
+        // service: unscoped is the honest outcome, and it is reported as such.
+        assert_eq!(
+            unscoped_spawn_refusal(&unscoped, &OwnUnit::NotAService, 4242),
+            None
+        );
+        assert_eq!(
+            unscoped_spawn_refusal(
+                &unscoped,
+                &OwnUnit::Service {
+                    unit: "qontinui-runner.service".to_string(),
+                    main_pid: 100
+                },
+                4242
+            ),
+            None
+        );
+        // Only an UNSCOPED spawn is this function's business.
+        assert_eq!(
+            unscoped_spawn_refusal(&Isolation::Scoped(UNIT.to_string()), &own, 4242),
+            None
+        );
+        assert_eq!(
+            unscoped_spawn_refusal(&Isolation::NotApplicable, &own, 4242),
+            None
+        );
     }
 }

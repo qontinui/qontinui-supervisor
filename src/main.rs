@@ -831,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
     //   port-free wait, easily 30+ seconds wall-clock with several runners
     //   attached. The JobObject makes it redundant.
     // - Off Windows: there is no such job, so `shutdown_signal` already ran a
-    //   bounded (2 s) concurrent sweep at SIGNAL time — before this point is
+    //   bounded (~2.5 s: ≤500 ms read, then 2 s kill) concurrent sweep at SIGNAL time — before this point is
     //   reached, and even when it never is.
 
     Ok(())
@@ -1039,7 +1039,7 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
     // exits (the runner job is a no-op stub), so stop them NOW, at signal
     // time: the drain deadline armed below force-exits in 10 s, and an
     // in-flight long-poll keeps the serve future — and so every post-serve
-    // step — from ever running. Bounded at 2 s and concurrent; temp runners
+    // step — from ever running. Bounded (~2.5 s: ≤500 ms read, then 2 s kill) and concurrent; temp runners
     // only (`should_assign_to_ephemeral_job`), never a user-owned runner.
     #[cfg(not(windows))]
     process::shutdown_sweep::sweep_temp_runners_at_shutdown(

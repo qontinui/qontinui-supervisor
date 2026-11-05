@@ -2455,9 +2455,14 @@ pub async fn start_managed_runner(
     // before the spawn (`start_exe_mode_for_runner`), so the slow steps in
     // between (the exe copy, the env forwarders) cannot carry a start past the
     // sweep. A user-owned runner survives the supervisor's exit on every
-    // platform, so a restart of one that straddles the shutdown still starts.
+    // platform, so an operator's restart of one that straddles the shutdown
+    // still starts — but a crash-watchdog restart of ANY kind does not: nobody
+    // asked for it, a Linux start can outlast the drain deadline, and off
+    // Windows no later supervisor adopts what it would leave behind.
     // Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
-    if refuses_temp_start_at_shutdown(state, &managed.config.kind()) {
+    if refuses_temp_start_at_shutdown(state, &managed.config.kind())
+        || (matches!(start_as, StartAs::AfterCrash { .. }) && shutdown_has_latched(state))
+    {
         return Err(SupervisorError::ShuttingDown(runner_id));
     }
 
@@ -3805,6 +3810,30 @@ async fn start_exe_mode_for_runner(
     if let Some(probe) = probe {
         *state.runner_isolation_probe.write().await = Some(probe);
     }
+    // A user-owned runner that could not be scoped out is spawned unscoped only
+    // where that cannot kill it: never inside this supervisor's OWN service
+    // (whose cgroup dies with it, crash included), and never when that cannot
+    // be read.
+    if let crate::process::systemd_scope::Isolation::Unscoped(_) = &isolation {
+        let own = crate::process::systemd_scope::own_unit(std::path::Path::new("/proc")).await;
+        if let Some(why) = crate::process::systemd_scope::unscoped_spawn_refusal(
+            &isolation,
+            &own,
+            std::process::id(),
+        ) {
+            let msg = format!(
+                "Runner '{}' did NOT start: {why}. It was not started unscoped; retry once \
+                 `systemctl --user` answers.",
+                managed.config.name
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Error, msg.clone())
+                .await;
+            return Err(SupervisorError::Process(msg));
+        }
+    }
     cmd.current_dir(&state.config.project_dir)
         // Never the supervisor's own stdin: a runner leads its own process
         // group on Unix (below), so if the supervisor runs in a terminal's
@@ -4010,10 +4039,14 @@ fn refuses_temp_start_at_shutdown(
     state: &SharedState,
     kind: &qontinui_types::wire::runner_kind::RunnerKind,
 ) -> bool {
-    crate::process::job::should_assign_to_ephemeral_job(kind)
-        && state
-            .shutdown_latched
-            .load(std::sync::atomic::Ordering::Acquire)
+    crate::process::job::should_assign_to_ephemeral_job(kind) && shutdown_has_latched(state)
+}
+
+/// Whether the supervisor's shutdown has latched.
+fn shutdown_has_latched(state: &SharedState) -> bool {
+    state
+        .shutdown_latched
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Default deadline for a newly-spawned runner to bind its HTTP API

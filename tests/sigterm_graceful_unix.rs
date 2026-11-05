@@ -20,7 +20,15 @@
 //! from the binary's own startup line, that its ledger resolved under the
 //! tempdir — the property the isolation exists for, observed rather than
 //! assumed. It binds an OS-allocated port, never 9875.
-#![cfg(unix)]
+//!
+//! What it does touch: like any supervisor it health-POLLS the primary on
+//! :9876 (`GET` only). No `--watchdog` and no `--auto-start` are passed, so it
+//! never starts, stops or restarts the primary, and on SIGTERM it stops temp
+//! runners only — it has none.
+//!
+//! Linux only: on macOS `dirs::data_local_dir()` ignores `XDG_DATA_HOME`, so
+//! the ledger assertion below would need a different root there.
+#![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -7290,6 +7290,23 @@ async fn no_runner_is_started_once_the_shutdown_has_latched() {
         !matches!(err, SupervisorError::ShuttingDown(_)),
         "a named start is not refused as shutting down: {err}"
     );
+
+    // ...but a crash-watchdog restart of it is: nobody asked for that start, it
+    // can outlast the drain deadline, and off Windows nothing adopts it later.
+    let err = start_managed_runner(
+        &state,
+        &named,
+        None,
+        StartAs::AfterCrash {
+            exited_spawned_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .expect_err("a crash restart after the latch is refused");
+    assert!(
+        matches!(&err, SupervisorError::ShuttingDown(rid) if rid == "named-after-latch"),
+        "expected ShuttingDown('named-after-latch'), got: {err}"
+    );
 }
 
 /// `manager.rs`'s production source, for the source guards below.
@@ -7350,9 +7367,14 @@ fn the_spawn_site_reads_the_shutdown_latch_again_just_before_the_spawn() {
     let spawn = spawn_site
         .find("let mut child = cmd")
         .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    // The call AND its refusal: an `if` whose body no longer returns would
+    // keep the call's text and refuse nothing.
     let latch = spawn_site
-        .rfind("refuses_temp_start_at_shutdown(state, &managed.config.kind())")
-        .expect("the spawn site re-reads the shutdown latch for a temp start");
+        .rfind(
+            "refuses_temp_start_at_shutdown(state, &managed.config.kind()) {\n        \
+             return Err(SupervisorError::ShuttingDown(",
+        )
+        .expect("the spawn site re-reads the shutdown latch for a temp start, and refuses");
     let forwarders = spawn_site
         .find("for forwarder in env_forwarders::default_env_forwarders()")
         .expect("the env forwarders run at the spawn site");
@@ -7386,6 +7408,10 @@ fn the_spawn_site_confirms_a_scoped_landing_and_fails_an_early_exit() {
     assert!(
         exited_arm[..arm_end].contains("return Err("),
         "a scope start that exited before it landed is a FAILED start, not a started runner"
+    );
+    assert!(
+        exited_arm[..arm_end].contains("reap_with_stderr_tail(&mut child)"),
+        "the failed start is reaped and reports its exit status and stderr tail"
     );
 }
 
@@ -7432,5 +7458,63 @@ fn the_startup_reaper_runs_one_reconcile_pass_before_its_loop() {
         wait < pass && pass < looped,
         "the startup reconcile pass runs after the 30 s wait and before the loop (wait {wait}, \
          pass {pass}, loop {looped})"
+    );
+}
+
+/// An unscoped user-owned spawn is checked against the supervisor's own unit
+/// BEFORE it is spawned.
+#[test]
+fn the_spawn_site_refuses_an_unscoped_runner_inside_its_own_unit() {
+    let spawn_site = manager_fn_body("async fn start_exe_mode_for_runner(");
+    let spawn = spawn_site
+        .find("let mut child = cmd")
+        .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    let unscoped = spawn_site
+        .find("unscoped_spawn_refusal(")
+        .expect("an unscoped user-owned spawn is checked against the supervisor's own unit");
+    assert!(
+        unscoped < spawn,
+        "that check runs BEFORE the spawn ({unscoped} vs {spawn})"
+    );
+}
+
+/// Read a repo file for a source guard.
+fn repo_source(rel: &[&str]) -> String {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for part in rel {
+        path.push(part);
+    }
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+// The call sites of the small decisions `systemd_scope` tests directly: each
+// helper is pinned by its own unit test, and these pin that the HTTP route, the
+// startup probe and the crash watchdog actually use them.
+
+#[test]
+fn get_runners_names_a_scope_only_for_a_running_runner() {
+    assert!(
+        repo_source(&["src", "routes", "runners.rs"])
+            .contains("isolation_unit_for(isolation.as_ref(), is_running)"),
+        "GET /runners names a scope only for a RUNNING runner"
+    );
+}
+
+#[test]
+fn the_startup_probe_is_recorded_through_its_no_overwrite_helper() {
+    assert!(
+        repo_source(&["src", "main.rs"]).contains("process::systemd_scope::record_startup_probe("),
+        "the startup probe must not overwrite a newer spawn-time probe"
+    );
+}
+
+#[test]
+fn the_crash_watchdog_treats_a_shutdown_refusal_as_a_skip() {
+    let watchdog = manager_fn_body("async fn maybe_crash_restart(");
+    assert!(
+        watchdog.contains("| SupervisorError::ShuttingDown(_)),"),
+        "a restart refused at shutdown is a skip for the crash watchdog, not a failure"
     );
 }
