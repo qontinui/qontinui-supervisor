@@ -898,10 +898,8 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+        let base = format!("http://127.0.0.1:{port}");
         tokio::spawn(async move { axum::serve(listener, app).await });
 
         let record = restart_with_shadow();
