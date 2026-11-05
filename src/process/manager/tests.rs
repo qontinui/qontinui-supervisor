@@ -7156,18 +7156,19 @@ fn the_wedged_line_says_what_the_serving_arm_decided() {
 /// the kill guard panics there before any signal: the orphan lives. With the guard
 /// gone the stop kills the orphan and returns, and this test fails on both counts.
 ///
-/// The orphan (`test_kill_guard::spawn_an_orphan`) is `sh`'s background `sleep` on
+/// The orphan (`test_kill_guard::Orphan`) is `sh`'s background `sleep` on
 /// Unix and `cmd /c start /b`'s `ping` on Windows: alive, this user's, and reparented
 /// away from (Unix) or left with a dead parent pid by (Windows) this process. The
 /// runner is named and unprotected on a port nothing holds, so the readiness gate
 /// skips, the close-request is refused at once, and the ladder's first kill is the
 /// registry pid's, which no image check stands in front of. The test ends the
-/// orphan itself, directly, never through a guarded primitive.
+/// orphan itself, directly and only while its pid still names it, never through
+/// a guarded primitive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
     use crate::process::test_kill_guard;
-    let orphan = test_kill_guard::spawn_an_orphan();
-    let _ends_the_orphan = scopeguard::guard(orphan, test_kill_guard::end_an_orphan);
+    let orphan_process = test_kill_guard::Orphan::spawn();
+    let orphan = orphan_process.pid;
     assert!(
         crate::process::proc_kill::pid_alive(orphan)
             && !test_kill_guard::is_descendant_of_this_process(orphan),
@@ -7210,11 +7211,13 @@ async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
         ),
     };
     assert!(
-        refusal.starts_with(test_kill_guard::REFUSAL) && refusal.contains(&format!("pid {orphan}")),
+        refusal.starts_with(test_kill_guard::REFUSAL)
+            && refusal.contains(&format!("reaches pid {orphan} (")),
         "the stop panicked, but not in the kill guard over pid {orphan}: {refusal}"
     );
     assert!(
         alive_after,
         "the guard panicked, yet the orphan {orphan} is dead: something signalled it first"
     );
+    drop(orphan_process);
 }

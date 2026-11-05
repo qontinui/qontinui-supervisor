@@ -38,14 +38,15 @@ fn an_own_child_is_a_descendant() {
 
 #[test]
 fn an_orphan_the_test_made_is_not_a_descendant() {
-    let orphan = spawn_an_orphan();
-    let descends = is_descendant_of_this_process(orphan);
-    let alive = crate::process::proc_kill::pid_alive(orphan);
-    end_an_orphan(orphan);
-    assert!(alive, "the orphan {orphan} is alive");
+    let orphan = Orphan::spawn();
+    let descends = is_descendant_of_this_process(orphan.pid);
+    let alive = crate::process::proc_kill::pid_alive(orphan.pid);
+    let pid = orphan.pid;
+    drop(orphan);
+    assert!(alive, "the orphan {pid} is alive");
     assert!(
         !descends,
-        "an orphan this test made but is not the parent of ({orphan}) is not its descendant"
+        "an orphan this test made but is not the parent of ({pid}) is not its descendant"
     );
 }
 
@@ -66,6 +67,37 @@ fn pid_1_this_process_and_a_reaped_child_are_not_descendants() {
     );
 }
 
+/// An orphan's cleanup signals its pid only while the pid still names it: once
+/// the orphan has exited, the pid may name a process this test never made.
+#[test]
+fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
+    let mut child = a_child();
+    let pid = child.id();
+    let started = crate::process::temp_runner_ledger::process_start_time_secs(pid);
+    assert!(started.is_some(), "a live child's start time reads");
+
+    // A record of another process that once had this pid: left alone.
+    Orphan {
+        pid,
+        start_time_secs: started.map(|s| s.saturating_sub(3600)),
+    }
+    .end();
+    let spared = matches!(child.try_wait(), Ok(None));
+
+    // A record of this process: ended.
+    Orphan {
+        pid,
+        start_time_secs: started,
+    }
+    .end();
+    let ended = child.wait().map(|status| !status.success());
+    assert!(spared, "a pid that names another process is not signalled");
+    assert!(
+        matches!(ended, Ok(true)),
+        "the orphan's own process is ended: {ended:?}"
+    );
+}
+
 // --- the decisions, over hand-built tables ----------------------------------
 
 const OWN: u32 = 100;
@@ -75,9 +107,21 @@ fn row(pid: u32, ppid: Option<u32>, pgrp: Option<u32>, name: &str, start: u64) -
         pid,
         ppid,
         pgrp,
+        thread: false,
         name: name.to_string(),
         exe: Some(PathBuf::from(format!("/bin/{name}"))),
         start_time_secs: start,
+    }
+}
+
+/// A row for a thread of `process`, as sysinfo lists one on Linux.
+fn thread_of(tid: u32, process: &ProcRow) -> ProcRow {
+    ProcRow {
+        pid: tid,
+        ppid: Some(process.pid),
+        thread: true,
+        start_time_secs: process.start_time_secs + 1,
+        ..process.clone()
     }
 }
 
@@ -154,6 +198,28 @@ fn zero_and_values_kill_reads_as_negative_are_refused() {
     }
 }
 
+/// `kill(-1)` signals every process the user may signal. It is refused for
+/// what it is, not because some row happens to sit in group 1: this table has
+/// none.
+#[test]
+fn group_1_is_refused_as_the_signal_to_every_process_it_is() {
+    let rows: Vec<ProcRow> = table()
+        .into_iter()
+        .map(|mut r| {
+            if r.pgrp == Some(1) {
+                r.pgrp = Some(7);
+            }
+            r
+        })
+        .collect();
+    assert!(!rows.iter().any(|r| r.pgrp == Some(1)));
+    let refused = decide(&rows, Target::Group(1)).expect("group 1 is refused");
+    assert!(
+        refused.contains("kill(-1) is a signal to every process"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn an_unreadable_table_refuses() {
     let unreadable = CensusError::Unreadable("no table".to_string());
@@ -203,7 +269,67 @@ fn a_stale_parent_link_does_not_make_a_descendant_and_refuses_a_tree() {
     assert_eq!(decide(&rows, Target::Tree(101)), None, "a clean tree");
 }
 
+/// The guard proves every parent link: a parent that started after its row
+/// by less than the census's skew, or a start time it cannot read, is no link,
+/// although the census would keep either.
+#[test]
+fn an_unproven_parent_link_does_not_make_a_descendant() {
+    let mut rows = table();
+    // pid 102's process started at 21: one that "started" at 18 cannot be its
+    // child, only an orphan its reused pid now names.
+    rows.push(row(401, Some(102), None, "orphan-inside-the-skew", 18));
+    rows.push(row(402, Some(102), None, "orphan-of-unknown-age", 0));
+    for (pid, name) in [
+        (401, "orphan-inside-the-skew"),
+        (402, "orphan-of-unknown-age"),
+    ] {
+        let refused = decide(&rows, Target::Pid(pid)).unwrap_or_else(|| panic!("{name} allowed"));
+        assert!(refused.contains(&format!("(/bin/{name})")), "{refused}");
+    }
+}
+
+/// A signal to a thread's id reaches its whole process, so a thread is judged
+/// as its process: the test's own thread is the test, and a descendant's
+/// thread is that descendant.
+#[test]
+fn a_thread_is_judged_as_its_process() {
+    let mut rows = table();
+    let own = rows
+        .iter()
+        .find(|r| r.pid == OWN)
+        .cloned()
+        .expect("the test");
+    let stub = rows
+        .iter()
+        .find(|r| r.pid == 101)
+        .cloned()
+        .expect("a child");
+    rows.push(thread_of(150, &own));
+    rows.push(thread_of(151, &stub));
+    let refused = decide(&rows, Target::Pid(150)).expect("a thread of the test is the test");
+    assert!(
+        refused.contains("reaches pid 100 (/bin/test-binary)"),
+        "{refused}"
+    );
+    assert_eq!(decide(&rows, Target::Pid(151)), None, "a thread of a child");
+}
+
 // --- the tripwire: every signal call site sits in a guarded primitive -------
+
+/// What kind of signal a call site sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteKind {
+    /// `kill` / `killpg` from libc or nix.
+    Kill,
+    /// A kill command started as a process (`taskkill`, `kill`, `pkill`, …).
+    KillCommand,
+    /// sysinfo's `Process::kill` / `kill_with`.
+    Sysinfo,
+    /// process-wrap's group or job kill (`ChildWrapper::start_kill` / `kill`).
+    ProcessWrap,
+    /// A raw signal syscall or the Win32 terminate call.
+    Syscall,
+}
 
 /// One place production code sends a signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,10 +337,11 @@ struct SignalSite {
     /// Byte offset into the scanned text.
     offset: usize,
     line: usize,
+    kind: SiteKind,
     what: String,
 }
 
-/// Commands that kill by pid, as the one argument of a `new(…)`.
+/// Commands that kill by pid.
 const KILL_COMMANDS: [&str; 6] = [
     "taskkill",
     "taskkill.exe",
@@ -222,6 +349,29 @@ const KILL_COMMANDS: [&str; 6] = [
     "kill",
     "pkill",
     "killall",
+];
+
+/// The kill commands whose name means nothing else, flagged as a string
+/// literal anywhere: a `const TASKKILL: &str = "taskkill"` handed to `new` is
+/// the same command. `kill` alone is a word too, so it is flagged only as the
+/// one argument of a `new(…)`.
+const UNAMBIGUOUS_KILL_COMMANDS: [&str; 5] =
+    ["taskkill", "taskkill.exe", "tskill", "pkill", "killall"];
+
+/// Names that send a signal however they are reached: the raw syscalls (and
+/// their numbers, for `syscall(SYS_…)`) and the Win32 terminate calls.
+const SIGNAL_NAMES: [&str; 11] = [
+    "TerminateProcess",
+    "NtTerminateProcess",
+    "pidfd_send_signal",
+    "tgkill",
+    "tkill",
+    "sigqueue",
+    "rt_sigqueueinfo",
+    "SYS_kill",
+    "SYS_tkill",
+    "SYS_tgkill",
+    "SYS_pidfd_send_signal",
 ];
 
 /// A string literal's contents, its prefix, hashes and quotes removed.
@@ -235,21 +385,36 @@ fn unquote(literal: &str) -> &str {
         .unwrap_or(inner)
 }
 
+/// Whether a string literal spells a kill command with an option after it, the
+/// way a shell command does: `"taskkill /F /PID 7"`, `"kill -9 7"`.
+fn is_a_shell_kill(literal: &str) -> bool {
+    let words: Vec<&str> = unquote(literal).split_whitespace().collect();
+    words
+        .windows(2)
+        .any(|w| KILL_COMMANDS.contains(&w[0]) && (w[1].starts_with('/') || w[1].starts_with('-')))
+}
+
 /// Every signal call site in `text`, comments and string contents excluded:
 ///
-/// - a `libc::kill` / `libc::killpg` path, called or not, and `signal::kill`
-///   (nix's spelling);
-/// - `new("taskkill")` and the other [`KILL_COMMANDS`], however the command
-///   type is spelled;
+/// - a `libc::kill` / `libc::killpg` path, called or not, `signal::kill`
+///   (nix's spelling), and `kill` / `killpg` in a `use libc::{…}` group;
+/// - a kill command: an [`UNAMBIGUOUS_KILL_COMMANDS`] literal anywhere,
+///   `new("kill")`, and a [`KILL_COMMANDS`] word followed by an option inside
+///   a literal (a shell command);
 /// - in a file that names `sysinfo`, a `.kill(` or `.kill_with(` method call —
 ///   sysinfo's `Process::kill`. A `Child` handle's kill is the process this one
 ///   spawned, and a file with no sysinfo in it holds no sysinfo process;
-/// - `TerminateProcess` / `NtTerminateProcess`.
+/// - in a file that names `process_wrap`, a `.start_kill(` or `.kill(` method
+///   call — process-wrap's group or job kill;
+/// - any of the [`SIGNAL_NAMES`].
 fn signal_sites(text: &str) -> Vec<SignalSite> {
     let tokens = source_scan::tokens(text).expect("the production source lexes");
-    let names_sysinfo = tokens
-        .iter()
-        .any(|t| t.kind == TokenKind::Ident && t.text == "sysinfo");
+    let names = |crate_name: &str| {
+        tokens
+            .iter()
+            .any(|t| t.kind == TokenKind::Ident && t.text == crate_name)
+    };
+    let (names_sysinfo, names_process_wrap) = (names("sysinfo"), names("process_wrap"));
     let base = text.as_ptr() as usize;
     let mut sites = Vec::new();
     for (i, t) in tokens.iter().enumerate() {
@@ -257,39 +422,83 @@ fn signal_sites(text: &str) -> Vec<SignalSite> {
         let is = |k: usize, kind: TokenKind, texts: &[&str]| {
             at(k).is_some_and(|n| n.kind == kind && texts.contains(&n.text))
         };
-        let what = if t.kind == TokenKind::Ident
+        let site = |kind: SiteKind, what: String| Some((kind, what));
+        let found = if t.kind == TokenKind::Ident
             && ["libc", "signal"].contains(&t.text)
             && is(1, TokenKind::Punct, &["::"])
             && is(2, TokenKind::Ident, &["kill", "killpg"])
         {
-            at(2).map(|n| format!("{}::{}", t.text, n.text))
+            at(2).and_then(|n| site(SiteKind::Kill, format!("{}::{}", t.text, n.text)))
+        } else if t.kind == TokenKind::Ident
+            && t.text == "libc"
+            && is(1, TokenKind::Punct, &["::"])
+            && is(2, TokenKind::Open, &["{"])
+        {
+            // A `use libc::{…}` group: flag a `kill` or `killpg` inside it.
+            let mut depth = 0usize;
+            let mut imported = None;
+            for n in &tokens[i + 2..] {
+                match n.kind {
+                    TokenKind::Open => depth += 1,
+                    TokenKind::Close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    TokenKind::Ident if ["kill", "killpg"].contains(&n.text) => {
+                        imported = Some(n.text);
+                    }
+                    _ => {}
+                }
+            }
+            imported.and_then(|name| site(SiteKind::Kill, format!("libc::{{{name}}}")))
+        } else if t.kind == TokenKind::Str && UNAMBIGUOUS_KILL_COMMANDS.contains(&unquote(t.text)) {
+            site(
+                SiteKind::KillCommand,
+                format!("the kill command {}", t.text),
+            )
+        } else if t.kind == TokenKind::Str && is_a_shell_kill(t.text) {
+            site(
+                SiteKind::KillCommand,
+                format!("the kill command inside {}", t.text),
+            )
         } else if t.kind == TokenKind::Ident
             && t.text == "new"
             && is(1, TokenKind::Open, &["("])
-            && at(2).is_some_and(|n| {
-                n.kind == TokenKind::Str && KILL_COMMANDS.contains(&unquote(n.text))
-            })
+            && at(2).is_some_and(|n| n.kind == TokenKind::Str && unquote(n.text) == "kill")
             && is(3, TokenKind::Close, &[")"])
         {
-            at(2).map(|n| format!("new({})", n.text))
+            at(2).and_then(|n| site(SiteKind::KillCommand, format!("new({})", n.text)))
         } else if names_sysinfo
             && t.kind == TokenKind::Punct
             && t.text == "."
             && is(1, TokenKind::Ident, &["kill", "kill_with"])
             && is(2, TokenKind::Open, &["("])
         {
-            at(1).map(|n| format!("a sysinfo .{}()", n.text))
-        } else if t.kind == TokenKind::Ident
-            && ["TerminateProcess", "NtTerminateProcess"].contains(&t.text)
+            at(1).and_then(|n| site(SiteKind::Sysinfo, format!("a sysinfo .{}()", n.text)))
+        } else if names_process_wrap
+            && t.kind == TokenKind::Punct
+            && t.text == "."
+            && is(1, TokenKind::Ident, &["start_kill", "kill"])
+            && is(2, TokenKind::Open, &["("])
         {
-            Some(t.text.to_string())
+            at(1).and_then(|n| {
+                site(
+                    SiteKind::ProcessWrap,
+                    format!("a process-wrap .{}()", n.text),
+                )
+            })
+        } else if t.kind == TokenKind::Ident && SIGNAL_NAMES.contains(&t.text) {
+            site(SiteKind::Syscall, t.text.to_string())
         } else {
             None
         };
-        if let Some(what) = what {
+        if let Some((kind, what)) = found {
             sites.push(SignalSite {
                 offset: t.text.as_ptr() as usize - base,
                 line: t.line,
+                kind,
                 what,
             });
         }
@@ -300,10 +509,15 @@ fn signal_sites(text: &str) -> Vec<SignalSite> {
 /// What a function on the [`PRIMITIVES`] list may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Allowed {
-    /// Send a signal, after a `test_kill_guard::assert_may_signal_*` call.
-    AfterTheGuard,
+    /// Send a signal, after a call to each of these `test_kill_guard` asserts
+    /// and to no other one.
+    After(&'static [&'static str]),
     /// `kill(pid, 0)` only, which delivers nothing: `unix_kill::pid_alive`.
     SignalZero,
+    /// A process-wrap kill only, of the group or job it made for a child this
+    /// process spawned, whose members only that child's tree can be:
+    /// `guarded_command::kill_tree`.
+    OwnGroupOrJob,
 }
 
 /// A function production code may send a signal from, by its file under
@@ -314,7 +528,7 @@ struct Primitive {
     allowed: Allowed,
 }
 
-const PRIMITIVES: [Primitive; 6] = [
+const PRIMITIVES: [Primitive; 7] = [
     Primitive {
         file: "process/unix_kill.rs",
         signature: "pub(crate) fn pid_alive(",
@@ -323,39 +537,55 @@ const PRIMITIVES: [Primitive; 6] = [
     Primitive {
         file: "process/unix_kill.rs",
         signature: "fn raw_kill(",
-        allowed: Allowed::AfterTheGuard,
+        allowed: Allowed::After(&["assert_may_signal_pid"]),
     },
     Primitive {
         file: "process/unix_kill.rs",
         signature: "fn raw_kill_group(",
-        allowed: Allowed::AfterTheGuard,
+        allowed: Allowed::After(&["assert_may_signal_group"]),
     },
     Primitive {
         file: "process/windows.rs",
         signature: "pub async fn kill_by_pid(",
-        allowed: Allowed::AfterTheGuard,
+        allowed: Allowed::After(&["assert_may_signal_pid"]),
     },
     Primitive {
         file: "process/windows.rs",
         signature: "pub async fn kill_by_pid_tree(",
-        allowed: Allowed::AfterTheGuard,
+        allowed: Allowed::After(&["assert_may_signal_tree"]),
     },
     Primitive {
         file: "process/windows.rs",
         signature: "pub async fn cleanup_orphaned_slot_processes(",
-        allowed: Allowed::AfterTheGuard,
+        allowed: Allowed::After(&["assert_may_signal_pid"]),
+    },
+    Primitive {
+        file: "process/guarded_command.rs",
+        signature: "async fn kill_tree(",
+        allowed: Allowed::OwnGroupOrJob,
     },
 ];
 
-/// The offset in `body` of its first `test_kill_guard::assert_may_signal_*`.
-fn guard_offset(body: &str) -> Option<usize> {
-    let tokens = source_scan::tokens(body)?;
-    tokens.windows(3).find_map(|w| {
-        (w[0].text == "test_kill_guard"
-            && w[1].text == "::"
-            && w[2].text.starts_with("assert_may_signal_"))
-        .then(|| w[0].text.as_ptr() as usize - body.as_ptr() as usize)
-    })
+/// Every `test_kill_guard::assert_may_signal_*` call in `body`, as (offset in
+/// `body`, the assert's name).
+fn guard_calls(body: &str) -> Vec<(usize, &str)> {
+    let Some(tokens) = source_scan::tokens(body) else {
+        return Vec::new();
+    };
+    tokens
+        .windows(3)
+        .filter(|w| {
+            w[0].text == "test_kill_guard"
+                && w[1].text == "::"
+                && w[2].text.starts_with("assert_may_signal_")
+        })
+        .map(|w| {
+            (
+                w[0].text.as_ptr() as usize - body.as_ptr() as usize,
+                w[2].text,
+            )
+        })
+        .collect()
 }
 
 /// Whether the `libc::kill(…)` call at `call` passes the literal `0` as its
@@ -393,8 +623,9 @@ fn signals_zero(call: &str) -> bool {
 
 /// Every problem with `sources` — `(path under src/, LF text)` — against
 /// `primitives`: a signal site outside every listed primitive; a listed
-/// primitive that is gone, sends nothing, signals before its guard, or (the
-/// `pid_alive` exception) sends anything but signal 0.
+/// primitive that is gone or sends nothing; a guarded one whose guard is
+/// missing, comes after its signal or is the wrong one; and an exempt one that
+/// sends anything but what it is exempt for.
 fn signal_problems(sources: &[(String, String)], primitives: &[Primitive]) -> Vec<String> {
     let mut problems = Vec::new();
     let mut sends = vec![0usize; primitives.len()];
@@ -435,26 +666,52 @@ fn signal_problems(sources: &[(String, String)], primitives: &[Primitive]) -> Ve
         }
         for (i, range) in &bodies {
             let primitive = &primitives[*i];
-            let first = sites.iter().find(|s| range.contains(&s.offset));
+            let inside: Vec<&SignalSite> =
+                sites.iter().filter(|s| range.contains(&s.offset)).collect();
             match primitive.allowed {
-                Allowed::AfterTheGuard => {
-                    let guard = guard_offset(&production[range.clone()]).map(|g| g + range.start);
-                    if !matches!((guard, first), (Some(g), Some(f)) if g < f.offset) {
+                Allowed::After(guards) => {
+                    let calls = guard_calls(&production[range.clone()]);
+                    for (_, name) in calls.iter().filter(|(_, name)| !guards.contains(name)) {
                         problems.push(format!(
-                            "{path}: `{}` must call `test_kill_guard::assert_may_signal_*` \
-                             before it sends a signal",
+                            "{path}: `{}` calls the wrong guard `test_kill_guard::{name}`; it \
+                             must call {guards:?}",
                             primitive.signature
                         ));
                     }
+                    let first_signal = inside.first().map(|s| s.offset);
+                    for guard in guards {
+                        let guarded = calls
+                            .iter()
+                            .find(|(_, name)| name == guard)
+                            .map(|(at, _)| at + range.start);
+                        if !matches!((guarded, first_signal), (Some(g), Some(f)) if g < f) {
+                            problems.push(format!(
+                                "{path}: `{}` must call `test_kill_guard::{guard}` before it \
+                                 sends a signal",
+                                primitive.signature
+                            ));
+                        }
+                    }
                 }
                 Allowed::SignalZero => {
-                    for site in sites.iter().filter(|s| range.contains(&s.offset)) {
-                        if !signals_zero(&production[site.offset..range.end]) {
+                    for site in &inside {
+                        if site.kind != SiteKind::Kill
+                            || !signals_zero(&production[site.offset..range.end])
+                        {
                             problems.push(format!(
                                 "{path}:{} `{}` may send only signal 0, which delivers nothing",
                                 site.line, primitive.signature
                             ));
                         }
+                    }
+                }
+                Allowed::OwnGroupOrJob => {
+                    for site in inside.iter().filter(|s| s.kind != SiteKind::ProcessWrap) {
+                        problems.push(format!(
+                            "{path}:{} `{}` may send only process-wrap's kill of its own group \
+                             or job, not {}",
+                            site.line, primitive.signature, site.what
+                        ));
                     }
                 }
             }
@@ -532,12 +789,17 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
         Primitive {
             file: "unix.rs",
             signature: "fn raw_kill(",
-            allowed: Allowed::AfterTheGuard,
+            allowed: Allowed::After(&["assert_may_signal_pid"]),
         },
         Primitive {
             file: "win.rs",
             signature: "pub async fn sweep(",
-            allowed: Allowed::AfterTheGuard,
+            allowed: Allowed::After(&["assert_may_signal_pid"]),
+        },
+        Primitive {
+            file: "wrap.rs",
+            signature: "async fn kill_tree(",
+            allowed: Allowed::OwnGroupOrJob,
         },
     ];
     let pid_alive = "pub(crate) fn pid_alive(pid: u32) -> bool {\n    \
@@ -550,63 +812,66 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
                  for process in system.processes().values() {\n        \
                  crate::process::test_kill_guard::assert_may_signal_pid(process.pid().as_u32());\n        \
                  if process.kill() {}\n    }\n}\n";
-    let clean = |extra_unix: &str, extra_win: &str| {
+    let wrap = "use process_wrap::tokio::ChildWrapper;\n\
+                async fn kill_tree(child: &mut Box<dyn ChildWrapper>) {\n    \
+                let _ = child.start_kill();\n}\n";
+    let clean = |extra_unix: &str, extra_win: &str, extra_wrap: &str| {
         vec![
             (
                 "unix.rs".to_string(),
                 format!("{pid_alive}{raw_kill}{extra_unix}"),
             ),
             ("win.rs".to_string(), format!("{sweep}{extra_win}")),
+            ("wrap.rs".to_string(), format!("{wrap}{extra_wrap}")),
         ]
     };
-    let problems =
-        |extra_unix: &str, extra_win: &str| signal_problems(&clean(extra_unix, extra_win), &table);
+    let problems = |extra_unix: &str, extra_win: &str, extra_wrap: &str| {
+        signal_problems(&clean(extra_unix, extra_win, extra_wrap), &table)
+    };
+    let edited = |from: &str, to: &str| {
+        let sources: Vec<(String, String)> = clean("", "", "")
+            .into_iter()
+            .map(|(path, text)| (path, text.replace(from, to)))
+            .collect();
+        signal_problems(&sources, &table)
+    };
 
     // The guarded table itself is clean, and so are the near misses.
-    assert_eq!(problems("", ""), Vec::<String>::new());
+    assert_eq!(problems("", "", ""), Vec::<String>::new());
     let near_misses = "// libc::kill(pid, 9) in a comment\n\
                        fn quiet(child: &mut std::process::Child) {\n    \
                        let s = \"libc::kill(pid, 9)\";\n    \
-                       let _ = Command::new(\"cmd\").arg(\"taskkill\");\n    \
+                       let _ = Command::new(\"cmd\").arg(\"/C\");\n    \
                        info!(\"taskkill: killed PID {}\", 1);\n    \
+                       warn!(\"falling through to taskkill\");\n    \
+                       warn!(\"NO kill strategy ever ran\");\n    \
+                       let _ = child.kill();\n    \
                        let _ = s;\n}\n\
                        #[cfg(test)]\nmod tests {\n    \
                        fn cleanup(pid: i32) { unsafe { libc::kill(pid, 9); } }\n}\n";
-    assert_eq!(problems(near_misses, ""), Vec::<String>::new());
+    assert_eq!(problems(near_misses, "", ""), Vec::<String>::new());
     // A Child handle's kill is this process's own child: fine in a file with no
-    // sysinfo in it.
-    assert_eq!(
-        signal_problems(
-            &[
-                clean("", "").remove(0),
-                clean("", "").remove(1),
-                (
-                    "expo.rs".to_string(),
-                    "async fn stop(child: &mut tokio::process::Child) {\n    \
-                     let _ = child.kill().await;\n}\n"
-                        .to_string(),
-                ),
-            ],
-            &table
+    // sysinfo and no process-wrap in it. A file that is test code in its
+    // entirety is not production.
+    for (path, text) in [
+        (
+            "expo.rs",
+            "async fn stop(child: &mut tokio::process::Child) {\n    \
+             let _ = child.kill().await;\n    child.start_kill().ok();\n}\n",
         ),
-        Vec::<String>::new()
-    );
-    // A file that is test code in its entirety is not production.
-    assert_eq!(
-        signal_problems(
-            &[
-                clean("", "").remove(0),
-                clean("", "").remove(1),
-                (
-                    "helper.rs".to_string(),
-                    "#![cfg(test)]\nfn end(pid: i32) { unsafe { libc::kill(pid, 9); } }\n"
-                        .to_string(),
-                ),
-            ],
-            &table
+        (
+            "helper.rs",
+            "#![cfg(test)]\nfn end(pid: i32) { unsafe { libc::kill(pid, 9); } }\n",
         ),
-        Vec::<String>::new()
-    );
+    ] {
+        let mut sources = clean("", "", "");
+        sources.push((path.to_string(), text.to_string()));
+        assert_eq!(
+            signal_problems(&sources, &table),
+            Vec::<String>::new(),
+            "{path}"
+        );
+    }
 
     // Each shape outside a primitive is flagged, once, naming it.
     for (shape, what) in [
@@ -619,12 +884,35 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
             "libc::killpg",
         ),
         (
+            "use libc::{kill, SIGTERM};\nfn bare(pid: i32) {\n    unsafe { kill(pid, SIGTERM) };\n}\n",
+            "libc::{kill}",
+        ),
+        (
             "fn nix(pid: Pid) {\n    let _ = nix::sys::signal::kill(pid, None);\n}\n",
             "signal::kill",
         ),
         (
+            "fn thread_signal(tid: i64) {\n    unsafe { libc::syscall(libc::SYS_tgkill, 1, tid, 9) };\n}\n",
+            "SYS_tgkill",
+        ),
+        (
+            "fn pidfd(fd: i32) {\n    \
+             unsafe { libc::pidfd_send_signal(fd, 9, std::ptr::null_mut(), 0) };\n}\n",
+            "pidfd_send_signal",
+        ),
+        (
             "fn tk(pid: u32) {\n    let _ = Command::new(\"taskkill\").args([\"/F\"]);\n}\n",
-            "new(\"taskkill\")",
+            "the kill command \"taskkill\"",
+        ),
+        (
+            "const TASKKILL: &str = \"taskkill\";\n\
+             fn tk(pid: u32) {\n    let _ = Command::new(TASKKILL).arg(pid.to_string());\n}\n",
+            "the kill command \"taskkill\"",
+        ),
+        (
+            "fn shell(pid: u32) {\n    \
+             let _ = Command::new(\"cmd\").args([\"/C\", &format!(\"taskkill /F /PID {pid}\")]);\n}\n",
+            "the kill command inside \"taskkill /F /PID {pid}\"",
         ),
         (
             "fn k(pid: u32) {\n    let _ = tokio::process::Command::new(\"kill\").arg(\"-9\");\n}\n",
@@ -635,7 +923,7 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
             "TerminateProcess",
         ),
     ] {
-        let found = problems(shape, "");
+        let found = problems(shape, "", "");
         assert!(
             found.len() == 1 && found[0].contains(what) && found[0].contains("outside"),
             "{what}: {found:?}"
@@ -645,32 +933,43 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
         "",
         "fn other(system: &sysinfo::System) {\n    \
          for p in system.processes().values() { p.kill(); }\n}\n",
+        "",
     );
     assert!(
         found.len() == 1 && found[0].contains("a sysinfo .kill()"),
         "{found:?}"
     );
+    let found = problems(
+        "",
+        "",
+        "fn other(child: &mut Box<dyn ChildWrapper>) {\n    let _ = child.start_kill();\n}\n",
+    );
+    assert!(
+        found.len() == 1 && found[0].contains("a process-wrap .start_kill()"),
+        "{found:?}"
+    );
 
-    // A primitive whose guard is gone, or comes after its signal, is flagged.
-    let unguarded = clean("", "")
-        .into_iter()
-        .map(|(path, text)| {
-            (
-                path,
-                text.replace(
-                    "    #[cfg(test)]\n    \
-                     crate::process::test_kill_guard::assert_may_signal_pid(pid);\n",
-                    "",
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    let found = signal_problems(&unguarded, &table);
+    // A guarded primitive whose guard is gone, comes after its signal, or is
+    // the wrong one, is flagged.
+    let found = edited(
+        "    #[cfg(test)]\n    crate::process::test_kill_guard::assert_may_signal_pid(pid);\n",
+        "",
+    );
     assert!(
         found.len() == 1 && found[0].contains("`fn raw_kill(` must call"),
         "{found:?}"
     );
-    let late = clean("", "")
+    let found = edited(
+        "crate::process::test_kill_guard::assert_may_signal_pid(pid);",
+        "crate::process::test_kill_guard::assert_may_signal_group(pid);",
+    );
+    assert!(
+        found.len() == 2
+            && found.iter().any(|p| p.contains("calls the wrong guard"))
+            && found.iter().any(|p| p.contains("`fn raw_kill(` must call")),
+        "{found:?}"
+    );
+    let late = clean("", "", "")
         .into_iter()
         .map(|(path, text)| {
             (
@@ -694,32 +993,27 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
         "{found:?}"
     );
 
-    // `pid_alive` may send signal 0 and nothing else.
-    let signalling = clean("", "")
-        .into_iter()
-        .map(|(path, text)| {
-            (
-                path,
-                text.replace(
-                    "libc::kill(pid as libc::pid_t, 0)",
-                    "libc::kill(pid as libc::pid_t, libc::SIGTERM)",
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    let found = signal_problems(&signalling, &table);
+    // An exempt primitive may send only what it is exempt for.
+    let found = edited(
+        "libc::kill(pid as libc::pid_t, 0)",
+        "libc::kill(pid as libc::pid_t, libc::SIGTERM)",
+    );
     assert!(
         found.len() == 1 && found[0].contains("may send only signal 0"),
+        "{found:?}"
+    );
+    let found = edited(
+        "    let _ = child.start_kill();\n",
+        "    let _ = child.start_kill();\n    unsafe { libc::kill(-1, 9) };\n",
+    );
+    assert!(
+        found.len() == 1 && found[0].contains("may send only process-wrap's kill"),
         "{found:?}"
     );
 
     // A stale table is flagged: a listed primitive that is gone, or that sends
     // nothing.
-    let gone = clean("", "")
-        .into_iter()
-        .map(|(path, text)| (path, text.replace("fn raw_kill(", "fn renamed_kill(")))
-        .collect::<Vec<_>>();
-    let found = signal_problems(&gone, &table);
+    let found = edited("fn raw_kill(", "fn renamed_kill(");
     assert!(
         found.iter().any(|p| p.contains("no `fn raw_kill(`"))
             && found
@@ -727,19 +1021,10 @@ fn the_signal_scan_flags_each_shape_and_nothing_else() {
                 .any(|p| p.contains("outside every guarded primitive")),
         "{found:?}"
     );
-    let silent = clean("", "")
-        .into_iter()
-        .map(|(path, text)| {
-            (
-                path,
-                text.replace(
-                    "let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };",
-                    "let rc = 0;",
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    let found = signal_problems(&silent, &table);
+    let found = edited(
+        "let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };",
+        "let rc = 0;",
+    );
     assert!(
         found.len() == 2
             && found

@@ -75,6 +75,10 @@ pub struct ProcRow {
     /// The unit-test kill guard (`process::test_kill_guard`) reads it to judge
     /// a group signal.
     pub pgrp: Option<u32>,
+    /// True for a row that is a thread of another row's process: sysinfo lists
+    /// every Linux thread as a row whose parent is its process. A signal to a
+    /// thread's id reaches that whole process. Always false off Linux.
+    pub thread: bool,
     /// The process's image name as the platform reports it (`comm` on Linux,
     /// the image file name on Windows). Used only when `exe` is unresolved.
     pub name: String,
@@ -372,23 +376,40 @@ pub fn census_from_snapshot(
     })
 }
 
-/// The pids of `root`'s inclusive subtree over `rows`: `root` and every row
-/// that descends from it by parent links, in BFS order, children in ascending
-/// pid order, so the result does not depend on the snapshot's map order.
-///
-/// - A visited set guards against a malformed table (a pid listed as its own
-///   ancestor) looping forever.
-/// - An edge is followed only when it can be a real parent link: a row whose
-///   parent started more than [`PID_REUSE_SKEW_SECS`] after the row itself did
-///   not come from that parent. Windows keeps an orphan's parent pid after the
-///   parent exits, so a later process that reuses the pid would otherwise
-///   inherit the orphan as a child. A start time of `0` (unknown) on either
-///   side keeps the edge, the census's over-count direction.
-///
-/// [`census_from_snapshot`] counts `claude` images over it, and the unit-test
-/// kill guard (`process::test_kill_guard`) asks it whether a pid descends
-/// from the test process.
+/// Which parent links [`inclusive_subtree_by`] follows. Windows keeps an
+/// orphan's parent pid after the parent exits, so a later process that reuses
+/// the pid would otherwise inherit the orphan as a child; the two rules differ
+/// in which way they err on a link they cannot prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentLink {
+    /// The census's rule, which errs toward over-counting: a link is dropped
+    /// only when the parent started more than [`PID_REUSE_SKEW_SECS`] after the
+    /// row, and a start time of `0` (unknown) on either side keeps it.
+    Plausible,
+    /// The unit-test kill guard's rule, which errs toward refusing: a link is
+    /// followed only when both start times are known and the parent started no
+    /// later than the row. A real link always passes, since both are floors of
+    /// one clock, and a thread never starts before its process.
+    Proven,
+}
+
+/// The pids of `root`'s inclusive subtree over `rows` by the census's
+/// [`ParentLink::Plausible`] links: what [`census_from_snapshot`] counts
+/// `claude` images over. See [`inclusive_subtree_by`].
 pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
+    inclusive_subtree_by(root, rows, ParentLink::Plausible)
+}
+
+/// The pids of `root`'s inclusive subtree over `rows`: `root` and every row
+/// that descends from it by the parent links `links` follows, in BFS order,
+/// children in ascending pid order, so the result does not depend on the
+/// snapshot's map order. A visited set guards against a malformed table (a pid
+/// listed as its own ancestor) looping forever.
+///
+/// The census walks it with [`ParentLink::Plausible`], and the unit-test kill
+/// guard (`process::test_kill_guard`) with [`ParentLink::Proven`] to ask
+/// whether a pid descends from the test process.
+pub(crate) fn inclusive_subtree_by(root: u32, rows: &[ProcRow], links: ParentLink) -> Vec<u32> {
     let start_of: HashMap<u32, u64> = rows.iter().map(|r| (r.pid, r.start_time_secs)).collect();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for row in rows {
@@ -396,10 +417,14 @@ pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
             continue;
         };
         let parent_start = start_of.get(&ppid).copied().unwrap_or(0);
-        let reused_parent = parent_start != 0
-            && row.start_time_secs != 0
-            && parent_start > row.start_time_secs.saturating_add(PID_REUSE_SKEW_SECS);
-        if !reused_parent {
+        let known = parent_start != 0 && row.start_time_secs != 0;
+        let follow = match links {
+            ParentLink::Plausible => {
+                !known || parent_start <= row.start_time_secs.saturating_add(PID_REUSE_SKEW_SECS)
+            }
+            ParentLink::Proven => known && parent_start <= row.start_time_secs,
+        };
+        if follow {
             children.entry(ppid).or_default().push(row.pid);
         }
     }
@@ -435,7 +460,7 @@ pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
 /// own PID — a readable table always does, so its absence is the one
 /// enumeration failure `sysinfo` reports by omission rather than by error.
 pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
-    use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System, ThreadKind, UpdateKind};
     let system = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::new().with_exe(UpdateKind::Always)),
     );
@@ -446,6 +471,7 @@ pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
             pid: p.pid().as_u32(),
             ppid: p.parent().map(|pp| pp.as_u32()),
             pgrp: process_group_of(p.pid().as_u32()),
+            thread: p.thread_kind() == Some(ThreadKind::Userland),
             name: p.name().to_string_lossy().into_owned(),
             exe: p.exe().map(|e| e.to_path_buf()),
             start_time_secs: p.start_time(),
@@ -548,6 +574,7 @@ mod tests {
             pid,
             ppid,
             pgrp: None,
+            thread: false,
             name: name.to_string(),
             exe: exe.map(PathBuf::from),
             start_time_secs: start,
@@ -790,6 +817,13 @@ mod tests {
         );
         // A root that is not in the table still walks its children.
         assert_eq!(inclusive_subtree(7, &rows), vec![7]);
+        // The kill guard's rule proves each link: a parent that started after
+        // its row, even inside the skew, or a start time it cannot read, is not
+        // one.
+        assert_eq!(
+            inclusive_subtree_by(10, &rows, ParentLink::Proven),
+            vec![10, 11, 12, 20]
+        );
     }
 
     #[test]
