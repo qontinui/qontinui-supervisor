@@ -5411,9 +5411,17 @@ async fn stub_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) 
 
 /// Stop what a stub test left running and remove the early logs its starts opened.
 /// A stop reaches only the current spawn, so also end any older stub process still
-/// up, checked by image in case its pid has been reused.
+/// up ([`end_the_stub_spawns`]).
 async fn stop_the_stub(state: &SharedState, managed: &Arc<ManagedRunner>) {
     let _ = stop_runner_by_id(state, &managed.config.id, true, CloseIntent::Kill).await;
+    end_the_stub_spawns(state, managed).await;
+}
+
+/// End every spawn of a stub test's runner that is still up, by the pid its ring
+/// entry recorded and only while that pid runs the runner's exe copy (a pid can be
+/// reused), and remove the early logs its starts opened. Nothing of the stop path
+/// runs, so a test of the start can clean up with it alone.
+async fn end_the_stub_spawns(state: &SharedState, managed: &Arc<ManagedRunner>) {
     let copy = state.config.runner_exe_copy_path(&managed.config);
     let spawns: Vec<crate::state::SpawnMarker> =
         managed.recent_spawns.read().await.iter().cloned().collect();
@@ -5442,8 +5450,18 @@ async fn with_the_stub_stopped_after<Fut>(
 ) where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    with_cleanup_after(body, stop_the_stub(state, managed)).await;
+}
+
+/// Run a test's body, then `cleanup` on every exit path, a failed assertion
+/// included, and only then let that failure through.
+async fn with_cleanup_after<Fut, Cleanup>(body: Fut, cleanup: Cleanup)
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+    Cleanup: std::future::Future<Output = ()>,
+{
     let outcome = tokio::spawn(body).await;
-    stop_the_stub(state, managed).await;
+    cleanup.await;
     if let Err(failure) = outcome {
         std::panic::resume_unwind(failure.into_panic());
     }
@@ -5983,16 +6001,14 @@ async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempD
 /// copy and its exec (a temp start asks the primary for a window placement, for up
 /// to 3 s), so the 60 s sleep only bounds a holder that a killed test binary leaks.
 ///
-/// A temp start writes an instance root and a temp-runner ledger row and asks the
-/// primary for a window placement. The test asserts where each went, so it would fail
-/// a start that wrote into the operator's config or data dirs again or asked a live
-/// primary: the root and the row under this test's tempdir ([`stub_temp_runner`]),
-/// and the placement refused on the registered primary's refused port.
+/// The test enters this plan's changes only through `start_managed_runner`, the door
+/// every start takes: its cleanup ends the stub by pid ([`end_the_stub_spawns`])
+/// rather than through a stop, and where the start wrote and whom it asked is
+/// [`a_temp_start_writes_and_asks_nothing_outside_its_tempdir`]'s to assert.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked() {
     let (state, managed, tempdir) = stub_temp_runner().await;
-    let tempdir_path = tempdir.path().to_path_buf();
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -6044,8 +6060,31 @@ async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked
                 Some(copy.as_path()),
                 "the spawn runs something other than its copy"
             );
+        }
+    };
+    with_cleanup_after(body, end_the_stub_spawns(&state, &managed)).await;
+    drop(tempdir);
+}
 
-            // Where the start wrote, and whom it asked.
+/// A temp start writes an instance root and a temp-runner ledger row and asks the
+/// registered primary for a window placement. This asserts where each went, so it
+/// fails a start that writes into the operator's config or data dirs again or asks
+/// a live primary: the root and the row under this test's tempdir
+/// ([`stub_temp_runner`]), and exactly one placement GET, refused on `127.0.0.1` at
+/// the registered primary's refused port.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_temp_start_writes_and_asks_nothing_outside_its_tempdir() {
+    let (state, managed, tempdir) = stub_temp_runner().await;
+    let tempdir_path = tempdir.path().to_path_buf();
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            start_managed_runner(&state, &managed, None, StartAs::Registered)
+                .await
+                .expect("the stub starts");
+            let pid = managed.runner.read().await.pid.expect("the spawn's pid");
+
             let dirs = &state.config.ambient_user_dirs;
             let root = instance_config_dir(dirs, &managed.config.id).expect("an instance root");
             assert!(
@@ -6060,7 +6099,18 @@ async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked
                     .any(|row| row.pid == pid && row.port == managed.config.port),
                 "the spawn is recorded in this test's ledger at {ledger:?}"
             );
-            let primary_port = super::primary_runner_port(&state).await;
+
+            let primary_port = state
+                .get_primary()
+                .await
+                .expect("the fixture registers a primary")
+                .config
+                .port;
+            assert_ne!(
+                primary_port,
+                crate::config::DEFAULT_RUNNER_API_PORT,
+                "the fixture's primary is on a refused port, not a live primary's"
+            );
             let placement: Vec<String> = state
                 .logs
                 .history()
