@@ -1478,8 +1478,9 @@ pub async fn supervisor_restart(
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
     // A supervisor that is the MAIN process of a systemd service — which is
-    // how `supervisor-verbs.sh start` runs it on Linux once plan Phase 2 lands — cannot restart itself
-    // this way: the replacement would be spawned into the same unit, and
+    // how `supervisor-verbs.sh start` runs it on Linux once plan Phase 2
+    // lands — cannot restart itself this way: the replacement would be
+    // spawned into the same unit, and
     // systemd kills the rest of that unit's cgroup the moment this process
     // exits. Refuse BEFORE spawning anything, naming the way that works.
     let own_unit = crate::process::systemd_scope::own_unit(std::path::Path::new("/proc")).await;
@@ -1502,8 +1503,9 @@ pub async fn supervisor_restart(
     //   source of `POST /supervisor/shutdown` latency" (a 5 s graceful-stop
     //   poll plus a 5 s port-free wait per runner).
     // - Off Windows the runner job is a no-op stub and nothing reaps them, so
-    //   the bounded (~2.5 s: ≤500 ms read, then 2 s kill), concurrent shutdown sweep runs below, after the
-    //   shutdown is latched and BEFORE the hard exit is armed — otherwise that
+    //   the bounded (~2.5 s: ≤500 ms read, then 2 s kill), concurrent
+    //   shutdown sweep runs below, after the shutdown is latched and BEFORE the
+    //   hard exit is armed — otherwise that
     //   exit, ~600 ms later, would cut the sweep short inside its SIGTERM grace.
     //
     // User-owned runners (primary, named, external) survive this restart on

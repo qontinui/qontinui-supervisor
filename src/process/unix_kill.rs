@@ -87,6 +87,12 @@ pub(crate) fn group_alive(pgid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Send `signal` to every process in the group `pgid`. Returns whether any
+/// process received it (EPERM counts).
+pub(crate) fn kill_group(pgid: u32, signal: libc::c_int) -> bool {
+    raw_kill_group(pgid, signal)
+}
+
 /// Send `signal` to `pid`. Returns true if the signal was delivered (or the
 /// process exists but we lacked permission), false if there is no such
 /// process.

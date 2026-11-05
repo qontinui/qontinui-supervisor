@@ -123,7 +123,8 @@ async fn a_victim_the_bound_cuts_off_is_reported_cut_off() {
     )
     .await;
     assert_eq!(outcomes[0].1, KillOutcome::CutOff);
-    // `kill_on_drop` ends the dummy when its waiter is dropped with the test.
+    // Its waiter task owns the `Child`; the test runtime's shutdown drops it,
+    // and `kill_on_drop` ends the dummy then.
 }
 
 /// A leader gone and nothing left in its group: reported already gone.
@@ -201,4 +202,49 @@ async fn a_victim_still_live_after_the_kill_is_not_reported_stopped() {
     assert_eq!(outcomes[0].1, KillOutcome::SignalledNotObserved);
     assert!(dead(pid), "it was killed all the same");
     drop(child);
+}
+
+/// A group member that ignores SIGTERM, whose leader had already exited, is
+/// SIGKILLed after the grace — and only then reported stopped.
+#[tokio::test]
+async fn a_sigterm_ignoring_orphan_in_the_group_is_sigkilled_too() {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args([
+        "-c",
+        "(trap '' TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & echo $!; exit 0",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
+    lead_own_process_group(&mut cmd);
+    let child = cmd.spawn().expect("spawn the leader");
+    let leader = child.id().expect("pid");
+    let out = child.wait_with_output().await.expect("the leader exits");
+    let orphan: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the leader printed its child's pid");
+    until_sleeping(orphan).await;
+
+    let started = std::time::Instant::now();
+    let outcomes = kill_victims(
+        &[victim("test-stubborn-orphan", leader)],
+        SHUTDOWN_SWEEP_BOUND,
+    )
+    .await;
+    while !dead(orphan) {
+        assert!(
+            started.elapsed() < SHUTDOWN_SWEEP_BOUND + Duration::from_millis(500),
+            "the SIGTERM-ignoring member {orphan} must be SIGKILLed inside the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        matches!(
+            outcomes[0].1,
+            KillOutcome::Stopped | KillOutcome::SignalledNotObserved
+        ),
+        "{outcomes:?}"
+    );
 }

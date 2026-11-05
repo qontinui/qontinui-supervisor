@@ -117,6 +117,18 @@ pub fn read_and_latch(
     (runner.pid, runner.running)
 }
 
+/// The registry entries the read phase reads: TEMP runners only. A user-owned
+/// runner is never read here, so it never has a stop request latched on it and
+/// the sweep never waits on its locks. Pure.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn temp_runners_of(
+    all: Vec<std::sync::Arc<crate::state::ManagedRunner>>,
+) -> Vec<std::sync::Arc<crate::state::ManagedRunner>> {
+    all.into_iter()
+        .filter(|m| crate::process::job::should_assign_to_ephemeral_job(&m.config.kind()))
+        .collect()
+}
+
 /// The rows the sweep goes on to select from: every runner that WAS read —
 /// settled, or read without its lifecycle lock — and none that could not be.
 /// Pure.
@@ -204,10 +216,7 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         .await;
         return;
     };
-    let temps: Vec<_> = all
-        .into_iter()
-        .filter(|m| crate::process::job::should_assign_to_ephemeral_job(&m.config.kind()))
-        .collect();
+    let temps = temp_runners_of(all);
     let reads = futures::future::join_all(temps.iter().map(|m| read_row(m, settle_deadline))).await;
     for read in &reads {
         match read {
@@ -326,6 +335,10 @@ pub enum KillOutcome {
     CutOff,
 }
 
+/// How often the kill phase looks again for a signalled victim's exit.
+#[cfg(not(windows))]
+const SWEEP_POLL: Duration = Duration::from_millis(50);
+
 /// Kill every victim's process tree concurrently: SIGTERM to its group, then
 /// SIGKILL after `unix_kill`'s grace. The deadline is `bound` from NOW — this
 /// function starts its own clock, so time spent before the call (the read
@@ -344,17 +357,32 @@ pub async fn kill_victims(
         {
             return (v.clone(), KillOutcome::AlreadyGone);
         }
-        let outcome =
-            tokio::time::timeout_at(deadline, crate::process::proc_kill::kill_by_pid_tree(v.pid))
-                .await;
+        let gone = || {
+            !crate::process::proc_kill::pid_alive(v.pid)
+                && !crate::process::unix_kill::group_alive(v.pid)
+        };
+        let outcome = tokio::time::timeout_at(deadline, async {
+            let killed = crate::process::proc_kill::kill_by_pid_tree(v.pid).await?;
+            // `kill_by_pid_tree`'s grace polls only the LEADER, so a group
+            // member that ignores SIGTERM — or a whole group whose leader had
+            // already exited — can still be standing: SIGKILL the group.
+            if crate::process::unix_kill::group_alive(v.pid) {
+                crate::process::unix_kill::kill_group(v.pid, libc::SIGKILL);
+            }
+            // Give the reaper (the exit monitor, for a real runner) the rest of
+            // the bound to observe it, but return before the bound runs out.
+            while !gone() && tokio::time::Instant::now() + SWEEP_POLL < deadline {
+                tokio::time::sleep(SWEEP_POLL).await;
+            }
+            anyhow::Ok(killed)
+        })
+        .await;
         let outcome = match outcome {
-            // `kill_by_pid_tree` answers `true` both when the group exited
-            // inside the SIGTERM grace and when it escalated to SIGKILL, so
-            // look again rather than claim an exit nobody observed.
-            Ok(Ok(_)) if !crate::process::proc_kill::pid_alive(v.pid) => KillOutcome::Stopped,
-            // Still a live pid after the kill: SIGKILL went out after the grace
-            // and the exit has not been observed (or the number now names
-            // another process) — never "stopped".
+            // Stopped only when the leader AND its group are observed gone.
+            Ok(Ok(_)) if gone() => KillOutcome::Stopped,
+            // Still something live after the kill: SIGKILL went out and the
+            // exit has not been observed (or the number now names another
+            // process) — never "stopped".
             Ok(Ok(_)) => KillOutcome::SignalledNotObserved,
             Ok(Err(e)) => KillOutcome::Failed(e.to_string()),
             Err(_) => KillOutcome::CutOff,
@@ -655,5 +683,41 @@ mod tests {
         ] {
             assert!(body.contains(needle), "sweep_once lacks `{needle}`");
         }
+    }
+
+    /// The read phase reads TEMP runners only, so it never latches a stop
+    /// request on (or waits for the locks of) a user-owned runner.
+    #[test]
+    fn the_read_phase_reads_temp_runners_only() {
+        let named = |id: &str| {
+            let config = crate::config::RunnerConfig {
+                id: id.to_string(),
+                name: format!("Runner {id}"),
+                port: 9880,
+                kind: RunnerKind::Named {
+                    name: id.to_string(),
+                },
+                protected: false,
+                server_mode: false,
+                restate_ingress_port: None,
+                restate_admin_port: None,
+                restate_service_port: None,
+                external_restate_admin_url: None,
+                external_restate_ingress_url: None,
+                extra_env: Default::default(),
+                fresh_device_identity: false,
+            };
+            std::sync::Arc::new(crate::state::ManagedRunner::new(config, false))
+        };
+        let all = vec![
+            named("named-9880"),
+            std::sync::Arc::new(temp_runner("test-a")),
+            named("named-9881"),
+        ];
+        let ids: Vec<String> = temp_runners_of(all)
+            .iter()
+            .map(|m| m.config.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["test-a".to_string()]);
     }
 }

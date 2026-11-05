@@ -7291,8 +7291,10 @@ async fn no_runner_is_started_once_the_shutdown_has_latched() {
         "a named start is not refused as shutting down: {err}"
     );
 
-    // ...but a crash-watchdog restart of it is: nobody asked for that start, it
-    // can outlast the drain deadline, and off Windows nothing adopts it later.
+    // ...but off Windows a crash-watchdog restart of it is: nobody asked for
+    // that start, it can outlast the drain deadline, and nothing adopts it
+    // later. On Windows the next supervisor adopts it, so that restart is not
+    // refused for the shutdown (here it is superseded instead: never started).
     let err = start_managed_runner(
         &state,
         &named,
@@ -7302,11 +7304,18 @@ async fn no_runner_is_started_once_the_shutdown_has_latched() {
         },
     )
     .await
-    .expect_err("a crash restart after the latch is refused");
-    assert!(
-        matches!(&err, SupervisorError::ShuttingDown(rid) if rid == "named-after-latch"),
-        "expected ShuttingDown('named-after-latch'), got: {err}"
-    );
+    .expect_err("this crash restart starts nothing");
+    if cfg!(not(windows)) {
+        assert!(
+            matches!(&err, SupervisorError::ShuttingDown(rid) if rid == "named-after-latch"),
+            "expected ShuttingDown('named-after-latch'), got: {err}"
+        );
+    } else {
+        assert!(
+            !matches!(err, SupervisorError::ShuttingDown(_)),
+            "on Windows a crash restart is not refused for the shutdown: {err}"
+        );
+    }
 }
 
 /// `manager.rs`'s production source, for the source guards below.
@@ -7533,5 +7542,40 @@ fn the_crash_watchdog_treats_a_shutdown_refusal_as_a_skip() {
     assert!(
         watchdog.contains("| SupervisorError::ShuttingDown(_)),"),
         "a restart refused at shutdown is a skip for the crash watchdog, not a failure"
+    );
+}
+
+/// A supervisor that is shutting down makes no serving restart: its stop could
+/// land and the drain exit cut off its start, leaving a user-owned primary
+/// down.
+#[test]
+fn the_serving_watchdog_restarts_nothing_once_the_shutdown_has_latched() {
+    let decide = manager_fn_body("pub async fn maybe_serving_restart(");
+    let latch = decide
+        .find("if shutdown_has_latched(state) {\n        return None;")
+        .expect("maybe_serving_restart returns at once when the shutdown has latched");
+    let dispatch = decide
+        .find("serving_watchdog_restart(&state, &managed, attempt)")
+        .expect("maybe_serving_restart dispatches the restart");
+    assert!(
+        latch < dispatch,
+        "the latch is read before a restart is dispatched"
+    );
+}
+
+/// ...and read again where the serving restart is admitted, after the census
+/// that can take long enough for the shutdown to latch in between.
+#[test]
+fn the_serving_restart_rereads_the_shutdown_latch_before_it_is_admitted() {
+    let restart = manager_fn_body("async fn serving_watchdog_restart(");
+    let again = restart
+        .find("if shutdown_has_latched(state) {\n        return Err(SupervisorError::ShuttingDown(")
+        .expect("serving_watchdog_restart re-reads the latch");
+    let admit = restart
+        .find("admit_restart(")
+        .expect("serving_watchdog_restart admits its restart");
+    assert!(
+        again < admit,
+        "the latch is re-read before the restart is admitted"
     );
 }

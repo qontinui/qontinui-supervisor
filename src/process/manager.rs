@@ -4764,6 +4764,13 @@ pub async fn maybe_serving_restart(
 ) -> Option<ServingRestartDecision> {
     use crate::diagnostics::ServingEvent;
 
+    // A supervisor that is shutting down restarts nothing: the stop half could
+    // land and the drain exit cut off the start, leaving a user-owned primary
+    // down. Nobody asked for this restart.
+    if shutdown_has_latched(state) {
+        return None;
+    }
+
     let runner_id = managed.config.id.clone();
     let runner_name = managed.config.name.clone();
     let port = managed.config.port;
@@ -5206,6 +5213,11 @@ async fn serving_watchdog_restart(
     attempt: u32,
 ) -> Result<(), SupervisorError> {
     let runner_id = managed.config.id.clone();
+    // Read again here: the census between the decision and this call can take
+    // long enough for the shutdown to latch in between.
+    if shutdown_has_latched(state) {
+        return Err(SupervisorError::ShuttingDown(runner_id));
+    }
     // The watchdog never asks for a handoff: it acts only on a zero census, so
     // there is nothing to keep.
     let intent = CloseIntent::Kill;
