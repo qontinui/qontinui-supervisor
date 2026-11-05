@@ -921,7 +921,7 @@ jobs:
                  "whatever that exit code says, those primitives were not tested, which is" \
                  "UNKNOWN rather than a pass. Any reason a test gave for declining is listed" \
                  "below. On ubuntu-latest and on the self-hosted pool all of them should run:" \
-                 "python3, lsof and ports 9896-9898 are all expected to be available (on the" \
+                 "python3, lsof and ports 26896-26898 are all expected to be available (on the" \
                  "pool ${RUNNER_NAME:-?} shares the host's network with its other registrations," \
                  "so a concurrent job can hold a port; a re-run goes hosted). Fix the runner" \
                  "(or the test), never this roster."

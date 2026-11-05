@@ -52,6 +52,25 @@ use qontinui_supervisor::process::proc_kill;
 const POLL_ATTEMPTS: usize = 50;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The ports the three tests listen on, one each, so they can run in parallel.
+///
+/// Below every default ephemeral range (Linux 32768, Windows and macOS 49152),
+/// so no kernel allocation hands one out; outside the temp-runner range
+/// 9877-9899, where a live temp runner may sit, which these tests used until
+/// 2026-11-05 (plan `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`);
+/// and clear of the unit-test fixture blocks (`test_ports`, 27_000-28_999) and
+/// the older literals 29_871-29_884. Only a process that binds one explicitly
+/// can hold it, and then the child's bind fails and its test skips: the kill
+/// primitives here are only ever pointed at a listener the test itself spawned
+/// (see [`spawn_bound_listener`] and [`ProbeView::Child`]).
+const FIND_PID_ON_PORT_PORT: u16 = 26_896;
+const KILL_BY_PID_TREE_PORT: u16 = 26_897;
+const KILL_BY_PORT_PORT: u16 = 26_898;
+
+/// What the listener child prints once its `listen()` returned: its own word
+/// that it holds the port, which no probe of the port can give.
+const LISTENING: &str = "listening";
+
 /// Prefix on the one line a test prints when it DECLINES to run.
 ///
 /// Every skip below prints its reason and `return`s, so the test PASSES; CI
@@ -106,12 +125,10 @@ fn exercised(primitive: &str) {
 ///
 /// Every assertion in this file panics on failure, and a panic unwinds straight
 /// past any hand-written `child.wait()`. Without this guard a failed test leaks
-/// a live process holding a port in the temp-runner range (9877-9899) — and the
-/// reconcile sweep deliberately SPARES a listener it cannot match to its own
-/// spawn ledger (`process::temp_runner_ledger`), so nothing on the box will ever
-/// clean it up: the leak squats a spawn-test port until reboot. A red test
-/// becoming a *destructive* event is what makes this load-bearing rather than
-/// tidiness.
+/// a live process holding one of this file's ports, and nothing on the box
+/// would ever clean it up: the leak squats the port until reboot, and every
+/// later run of the test skips on it. A red test becoming a lasting one is what
+/// makes this load-bearing rather than tidiness.
 struct Listener {
     child: std::process::Child,
 }
@@ -143,6 +160,14 @@ impl Drop for Listener {
 /// child is a genuine OS process with its own PID and a held TCP listener —
 /// exactly the orphan shape D7 describes.
 ///
+/// **The child says itself that it holds the port**, by printing [`LISTENING`]
+/// after its `listen()` returned. This used to wait for the port to read held
+/// instead, and took that for "my child holds it": a process that took the
+/// port between the caller's pre-check and the child's bind read exactly the
+/// same, the child's bind failed, and `kill_by_port` then killed that process —
+/// on these tests' old ports, a live temp runner. A bind that fails now exits
+/// the child before it prints, so the test skips and kills nothing.
+///
 /// `None` means **the fixture could not be established**, which is UNKNOWN about
 /// the primitives under test rather than a verdict on them. That is the same
 /// three-state discipline this file already applies to the `lsof` probe (`Err`
@@ -152,10 +177,10 @@ impl Drop for Listener {
 ///
 /// * `python3` could not be spawned at all — absent, or the stock-macOS
 ///   command-line-tools stub;
-/// * the child EXITED before binding, i.e. the interpreter ran and the fixture
-///   is unusable.
+/// * the child EXITED before it listened: another process holds the port, or the
+///   interpreter ran and the fixture is unusable.
 ///
-/// A child that is still ALIVE and never bound within the budget is **not**
+/// A child that is still ALIVE and never listened within the budget is **not**
 /// environmental — the interpreter is running and the socket never appeared — so
 /// that case still panics.
 async fn spawn_bound_listener(port: u16) -> Option<Listener> {
@@ -165,11 +190,12 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
          s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
          s.bind(('127.0.0.1',{port}))\n\
          s.listen(8)\n\
+         print('{LISTENING}',flush=True)\n\
          while True: time.sleep(1)\n"
     );
-    let child = match std::process::Command::new("python3")
+    let mut child = match std::process::Command::new("python3")
         .args(["-c", &script])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
@@ -181,24 +207,36 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
             return None;
         }
     };
+    let stdout = child.stdout.take().expect("the listener's stdout is piped");
     let mut listener = Listener { child };
+    // The child's first line, or "" once it exits without one.
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line);
+        let _ = said.send(line);
+    });
 
     for _ in 0..POLL_ATTEMPTS {
-        if is_port_listening(port) {
-            return Some(listener);
+        match heard.try_recv() {
+            Ok(line) if line.trim() == LISTENING => return Some(listener),
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let status = listener
+                    .child
+                    .wait()
+                    .map_or_else(|e| format!("an unknown status ({e})"), |s| s.to_string());
+                skip(&format!(
+                    "python3 listener exited with {status} before it listened on port {port}: \
+                     another process holds the port, or the fixture is unusable"
+                ));
+                return None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => tokio::time::sleep(POLL_INTERVAL).await,
         }
-        if let Ok(Some(status)) = listener.child.try_wait() {
-            skip(&format!(
-                "python3 listener exited with {status} before binding port {port} \
-                 (fixture unusable)"
-            ));
-            return None;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     panic!(
-        "listener (pid {}) is still alive but never bound port {port} within the budget",
+        "listener (pid {}) is still alive but never listened on port {port} within the budget",
         listener.pid()
     );
 }
@@ -206,16 +244,20 @@ async fn spawn_bound_listener(port: u16) -> Option<Listener> {
 /// What the `lsof`-backed probe was observed doing while we waited for it.
 #[derive(Debug)]
 enum ProbeView {
-    /// The probe positively saw a listener on the port.
-    Saw,
+    /// The probe positively saw this test's child listening on the port.
+    Child,
+    /// The probe saw a different process listening on the port. With the child
+    /// listening too, a probe answer this test cannot account for: a kill by
+    /// port would reach that process, so nothing is killed.
+    Other(u32),
     /// The probe RAN for the whole budget and never saw the listener.
     NeverSaw,
     /// The probe could not RUN at all — UNKNOWN, never "nothing is listening".
     Unavailable(String),
 }
 
-/// Block until the `lsof`-backed probe can SEE the listener, the probe errors,
-/// or the shared budget is spent.
+/// Block until the `lsof`-backed probe can SEE the child `pid` listening, sees
+/// another process there, errors, or the shared budget is spent.
 ///
 /// [`spawn_bound_listener`] waits on `is_port_listening`, which BINDS the port
 /// to test it, so it succeeds the moment the listen backlog exists.
@@ -237,10 +279,11 @@ enum ProbeView {
 /// the ambiguity that made the original failure cost a rerun to diagnose.
 /// Callers name the view in their failure message so the next red says which it
 /// was.
-async fn wait_until_probe_sees(port: u16) -> ProbeView {
+async fn wait_until_probe_sees(port: u16, pid: u32) -> ProbeView {
     for _ in 0..POLL_ATTEMPTS {
         match proc_kill::find_pid_on_port(port).await {
-            Ok(Some(_)) => return ProbeView::Saw,
+            Ok(Some(found)) if found == pid => return ProbeView::Child,
+            Ok(Some(other)) => return ProbeView::Other(other),
             Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(e) => return ProbeView::Unavailable(e.to_string()),
         }
@@ -252,10 +295,7 @@ async fn wait_until_probe_sees(port: u16) -> ProbeView {
 /// the reaper and reconcile sweep use to close the orphan leak.
 #[tokio::test]
 async fn kill_by_port_frees_a_real_held_port() {
-    // A temp-runner-range port unlikely to collide with the live supervisor's
-    // runners (9877 is the bottom of the spawn range but this test runs in
-    // isolation; pick a high one in-range to reduce collision odds).
-    let port: u16 = 9898;
+    let port = KILL_BY_PORT_PORT;
     if is_port_listening(port) {
         skip(&format!("port {port} already in use (env not clean)"));
         return;
@@ -265,19 +305,39 @@ async fn kill_by_port_frees_a_real_held_port() {
         return;
     };
 
-    // Same race as in find_pid_on_port_locates_listener, one layer down:
-    // kill_by_port iterates `find_pids_on_port`, so a probe that has not yet
-    // seen the socket kills nothing and reports `false` — which the assertion
-    // below would read as a defect in the kill logic. Wait for the probe view
-    // first; this test was not observed failing, but it is the same defect and
-    // fixing only the one that happened to fire would be half a fix.
-    let view = wait_until_probe_sees(port).await;
-    if let ProbeView::Unavailable(e) = &view {
-        // The `lsof` probe could not RUN at all, which is UNKNOWN, not a defect
-        // in the kill logic under test — skip rather than assert against a probe
-        // that never answered. The Listener guard kills and reaps on the way out.
-        skip(&format!("listener probe unavailable ({e})"));
-        return;
+    // kill_by_port kills every listener on the port, so it runs only once the
+    // probe names this test's child as the listener: then the port's listener
+    // is a process this test spawned. Waiting also clears the race
+    // find_pid_on_port_locates_listener waits out, one layer down: a probe that
+    // has not yet seen the socket would kill nothing and report `false`, which
+    // the assertion below would read as a defect in the kill logic.
+    let view = wait_until_probe_sees(port, listener.pid()).await;
+    match &view {
+        ProbeView::Child => {}
+        ProbeView::Other(other) => {
+            // Never kill by port while the probe names another process: that
+            // kill would reach it. The Listener guard ends the child.
+            skip(&format!(
+                "port {port}'s listener reads as pid {other}, not this test's child {}; \
+                 kill_by_port would reach a process this test did not spawn",
+                listener.pid()
+            ));
+            return;
+        }
+        ProbeView::NeverSaw => panic!(
+            "the lsof probe ran for the whole {POLL_ATTEMPTS}-attempt budget and never saw \
+             the child (pid {}) its own word says is listening on port {port}: the probe is \
+             blind or still lagging, so kill_by_port would find nothing to kill",
+            listener.pid()
+        ),
+        ProbeView::Unavailable(e) => {
+            // The `lsof` probe could not RUN at all, which is UNKNOWN, not a
+            // defect in the kill logic under test — skip rather than assert
+            // against a probe that never answered. The Listener guard kills and
+            // reaps on the way out.
+            skip(&format!("listener probe unavailable ({e})"));
+            return;
+        }
     }
 
     // Still reachable independently of the view above: `lsof` can start failing
@@ -317,7 +377,7 @@ async fn kill_by_port_frees_a_real_held_port() {
 /// reaper.
 #[tokio::test]
 async fn kill_by_pid_tree_terminates_tracked_pid() {
-    let port: u16 = 9897;
+    let port = KILL_BY_PID_TREE_PORT;
     if is_port_listening(port) {
         skip(&format!("port {port} already in use (env not clean)"));
         return;
@@ -330,7 +390,7 @@ async fn kill_by_pid_tree_terminates_tracked_pid() {
 
     // Deliberately probe-free: this test addresses the child by its own PID and
     // never consults `lsof`, so the unsynchronised-observer race the other two
-    // tests wait out cannot reach it.
+    // tests wait out cannot reach it, and its kill reaches only the child.
     let killed = proc_kill::kill_by_pid_tree(pid)
         .await
         .expect("kill_by_pid_tree");
@@ -347,7 +407,7 @@ async fn kill_by_pid_tree_terminates_tracked_pid() {
 /// identify the orphan to kill.
 #[tokio::test]
 async fn find_pid_on_port_locates_listener() {
-    let port: u16 = 9896;
+    let port = FIND_PID_ON_PORT_PORT;
     if is_port_listening(port) {
         skip(&format!("port {port} already in use (env not clean)"));
         return;
@@ -361,7 +421,7 @@ async fn find_pid_on_port_locates_listener() {
     // Let the lsof view catch up with the bind view before asserting; see
     // wait_until_probe_sees. Without this the assertion below races the two
     // probes and fails with `left: None` on a perfectly good listener.
-    let view = wait_until_probe_sees(port).await;
+    let view = wait_until_probe_sees(port, expected_pid).await;
     if let ProbeView::Unavailable(e) = &view {
         // Three-state: the probe (lsof) could not run at all — that is UNKNOWN,
         // not "nothing was listening", so it must not be asserted against as a
@@ -377,8 +437,8 @@ async fn find_pid_on_port_locates_listener() {
                 Some(expected_pid),
                 "find_pid_on_port did not return the listener PID \
                  (lsof view while waiting: {view:?} — `NeverSaw` means the probe ran for the \
-                 whole {POLL_ATTEMPTS}-attempt budget and never saw a listener the bind probe \
-                 says is up, i.e. the probe is blind or still lagging, NOT find_pid_on_port \
+                 whole {POLL_ATTEMPTS}-attempt budget and never saw a listener the child \
+                 says it is, i.e. the probe is blind or still lagging, NOT find_pid_on_port \
                  returning a wrong PID)"
             );
             // Only inside the `Ok` arm, and only after the assertion: the `Err`
