@@ -18,16 +18,16 @@
 //! # The rule
 //!
 //! Before a signal is sent, every process it reaches must be a strict
-//! descendant of this test process: in
-//! `subtree_census::inclusive_subtree_by(std::process::id(), rows, ParentLink::Proven)`
-//! over one `subtree_census::snapshot_rows` snapshot, and not this process
-//! itself, whose signal would end every test in the binary. The walk carries
-//! the census's visited-set cycle guard, and follows a parent link only when
-//! both start times are known and the parent started no later than the child.
-//! A real link always passes (both times are floors of one clock), and an
-//! orphan whose stale parent pid (Windows keeps one) now names a later process
-//! does not: the census's own rule, which errs toward over-counting, would keep
-//! a link inside its skew or of unknown age.
+//! descendant of this test process: in `subtree_census::inclusive_subtree` of
+//! `std::process::id()`, walked over one `subtree_census::snapshot_rows`
+//! snapshot whose unproven parent links are cut first, and not this process
+//! itself, whose signal would end every test in the binary. A link is proven
+//! when both start times are known and the parent started no later than the
+//! child. A real link always is (both times are floors of one clock), and a
+//! recorded parent pid that now names a later process is not. That can happen
+//! on Windows, which records a process's creator pid and can hand that pid to
+//! a new process once the creator exits. The census itself follows every
+//! link, erring toward over-counting; the guard errs toward refusing.
 //!
 //! - **A pid** absent from the snapshot is allowed: there is nothing to signal
 //!   (it exited between its caller's check and this one). A thread's id is
@@ -36,13 +36,15 @@
 //!   threads would otherwise pass as its descendants. `0`, and any value
 //!   `kill()` would read as a negative pid, are refused: they name a process
 //!   group, or every process, rather than one process.
-//! - **A group** (`kill(-pgid)`): every live member ([`ProcRow::pgrp`]) must
-//!   be a descendant. A group with no live member is allowed, because nothing
-//!   is signalled. Group `1` is refused outright: `kill(-1)` is a signal to
-//!   every process this user may signal, not to a group.
-//! - **A tree** (`taskkill /T`): every process taskkill reaches — the pid and
-//!   everything under it by the raw parent links taskkill follows, stale ones
-//!   included — must be a descendant.
+//! - **A group** (`kill(-pgid)`): every live member must be a descendant, a
+//!   member being a row of the snapshot whose `getpgid(2)` is `pgid`, read only
+//!   when a group is judged. A group with no live member is allowed, because
+//!   nothing is signalled. Group `1` is refused outright: `kill(-1)` is a
+//!   signal to every process this user may signal, not to a group.
+//! - **A tree** (`taskkill /T`): every process the tree reaches must be a
+//!   descendant. The tree is taken as the pid and everything under it by the
+//!   recorded parent links, stale ones included, since this guard cannot show
+//!   that taskkill skips a stale link.
 //! - A snapshot that cannot be read refuses: no answer is not a descendant.
 //!
 //! A refusal **panics before the signal**, so even a panic a spawned task
@@ -62,11 +64,15 @@
 //! `unix_kill::pid_alive`'s `kill(pid, 0)` delivers nothing.
 //! `guarded_command::kill_tree` ends the process group (Unix) or JobObject
 //! (Windows) that process-wrap made for a child this process spawned, and
-//! `KillOnDrop` ends the same one when that child is dropped unreaped. Only
-//! that child's own tree can join either: a group through `setpgid` from
-//! inside it, a job by inheritance from a member. So every member is a process
-//! the test started, reparented or not, and a strict-descendant check would
-//! wrongly refuse the reparented ones.
+//! `KillOnDrop` ends the same one when that child is dropped unreaped. Its
+//! members are that child, what it starts, and whatever else joins. On Unix a
+//! process joins a group through `setpgid`, which POSIX allows any process of
+//! the same session to call for itself, so a stranger in this session could
+//! join; on Windows a process joins a job by inheritance from a member or
+//! through a handle to the job, which process-wrap does not hand out. What
+//! normally fills either is the child's own tree, reparented or not, which a
+//! strict-descendant check would wrongly refuse; a stranger that joined on
+//! purpose is outside what this exemption checks.
 //!
 //! `tests::no_signal_is_sent_outside_a_guarded_primitive` holds that set. The
 //! per-primitive asserts cannot see a primitive added after them; that test
@@ -87,9 +93,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use crate::process::subtree_census::{
-    inclusive_subtree_by, snapshot_rows, CensusError, ParentLink, ProcRow,
-};
+use crate::process::subtree_census::{inclusive_subtree, snapshot_rows, CensusError, ProcRow};
 
 /// How every refusal starts, so a test can tell the guard's panic from another.
 pub(crate) const REFUSAL: &str = "test kill guard: refusing to signal";
@@ -128,9 +132,29 @@ pub(crate) fn assert_may_signal_tree(pid: u32) {
 
 fn assert_may_signal(target: Target) {
     let rows = snapshot_rows();
-    if let Some(refusal) = refusal(rows.as_deref(), std::process::id(), target) {
+    if let Some(refusal) = refusal(
+        rows.as_deref(),
+        process_group_of,
+        std::process::id(),
+        target,
+    ) {
         panic!("{refusal}");
     }
+}
+
+/// The process group of `pid` (`getpgid(2)`), `None` when it is gone.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getpgid` takes a scalar pid and touches no memory.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group).ok()
+}
+
+/// No process groups in this sense off Unix.
+#[cfg(not(unix))]
+fn process_group_of(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// What a signal is addressed to.
@@ -154,18 +178,29 @@ impl fmt::Display for Target {
     }
 }
 
-/// The strict descendants of `own` in `rows`, by proven parent links only.
+/// The strict descendants of `own` in `rows`, by proven parent links only: a
+/// row keeps its parent link when both start times are known and the parent
+/// started no later than the row, and loses it otherwise.
 fn descendants(rows: &[ProcRow], own: u32) -> HashSet<u32> {
-    let mut set: HashSet<u32> = inclusive_subtree_by(own, rows, ParentLink::Proven)
-        .into_iter()
+    let start_of: HashMap<u32, u64> = rows.iter().map(|r| (r.pid, r.start_time_secs)).collect();
+    let proven: Vec<ProcRow> = rows
+        .iter()
+        .map(|row| ProcRow {
+            ppid: row.ppid.filter(|ppid| {
+                let parent = start_of.get(ppid).copied().unwrap_or(0);
+                parent != 0 && row.start_time_secs != 0 && parent <= row.start_time_secs
+            }),
+            ..row.clone()
+        })
         .collect();
+    let mut set: HashSet<u32> = inclusive_subtree(own, &proven).into_iter().collect();
     set.remove(&own);
     set
 }
 
-/// Everything `taskkill /T /PID <pid>` ends: `pid` and every process under it
-/// by the raw parent links Windows keeps, a stale one included, and none when
-/// `pid` is not in the table.
+/// What `taskkill /T /PID <pid>` is taken to end: `pid` and every process under
+/// it by the recorded parent links, a stale one included, and none when `pid`
+/// is not in the table.
 fn raw_tree(rows: &[ProcRow], pid: u32) -> Vec<&ProcRow> {
     let mut children: HashMap<u32, Vec<&ProcRow>> = HashMap::new();
     for row in rows {
@@ -210,8 +245,14 @@ fn image(row: &ProcRow) -> String {
 }
 
 /// Why a signal to `target` would reach a process this test did not spawn, as
-/// the refusal message; `None` when it may be sent. `own` is the test process.
-fn refusal(rows: Result<&[ProcRow], &CensusError>, own: u32, target: Target) -> Option<String> {
+/// the refusal message; `None` when it may be sent. `own` is the test process,
+/// and `group_of` reads a pid's process group, asked only for a group target.
+fn refusal(
+    rows: Result<&[ProcRow], &CensusError>,
+    group_of: impl Fn(u32) -> Option<u32>,
+    own: u32,
+    target: Target,
+) -> Option<String> {
     let (Target::Pid(raw) | Target::Group(raw) | Target::Tree(raw)) = target;
     if raw == 0 || i32::try_from(raw).is_err() {
         return Some(format!(
@@ -237,7 +278,10 @@ fn refusal(rows: Result<&[ProcRow], &CensusError>, own: u32, target: Target) -> 
     let descendants = descendants(rows, own);
     let reached: Vec<&ProcRow> = match target {
         Target::Pid(pid) => process_of(rows, pid),
-        Target::Group(pgid) => rows.iter().filter(|r| r.pgrp == Some(pgid)).collect(),
+        Target::Group(pgid) => rows
+            .iter()
+            .filter(|r| group_of(r.pid) == Some(pgid))
+            .collect(),
         Target::Tree(pid) => raw_tree(rows, pid),
     };
     let foreign = reached
@@ -258,8 +302,9 @@ fn refusal(rows: Result<&[ProcRow], &CensusError>, own: u32, target: Target) -> 
 ///
 /// Unix: `sh` starts `sleep` in the background, prints its pid and exits, so
 /// `sleep` is reparented away from this process. Windows: `cmd /c start /b`
-/// starts `ping` and exits, and the orphan is the `ping` whose stale parent
-/// pid is that `cmd`'s.
+/// starts `ping` and exits, and the orphan is the `ping` whose recorded parent
+/// pid is still that exited `cmd`'s (Windows records a process's creator pid
+/// and does not rewrite it).
 pub(crate) struct Orphan {
     pub(crate) pid: u32,
     /// Its start time when it was made, so [`Orphan::end`] signals the pid only

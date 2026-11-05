@@ -69,12 +69,6 @@ pub struct ProcRow {
     /// Parent PID, `None` when the platform could not resolve one (the init
     /// process, or a permission-denied `/proc` entry).
     pub ppid: Option<u32>,
-    /// Process group id: `getpgid(2)` on Unix, the same value as field 5 of
-    /// Linux's `/proc/<pid>/stat`. `None` on Windows, which has no process
-    /// groups in this sense, and for a process that exited before it was read.
-    /// The unit-test kill guard (`process::test_kill_guard`) reads it to judge
-    /// a group signal.
-    pub pgrp: Option<u32>,
     /// True for a row that is a thread of another row's process: sysinfo lists
     /// every Linux thread as a row whose parent is its process. A signal to a
     /// thread's id reaches that whole process. Always false off Linux.
@@ -376,55 +370,24 @@ pub fn census_from_snapshot(
     })
 }
 
-/// Which parent links [`inclusive_subtree_by`] follows. Windows keeps an
-/// orphan's parent pid after the parent exits, so a later process that reuses
-/// the pid would otherwise inherit the orphan as a child; the two rules differ
-/// in which way they err on a link they cannot prove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParentLink {
-    /// The census's rule, which errs toward over-counting: a link is dropped
-    /// only when the parent started more than [`PID_REUSE_SKEW_SECS`] after the
-    /// row, and a start time of `0` (unknown) on either side keeps it.
-    Plausible,
-    /// The unit-test kill guard's rule, which errs toward refusing: a link is
-    /// followed only when both start times are known and the parent started no
-    /// later than the row. A real link always passes, since both are floors of
-    /// one clock, and a thread never starts before its process.
-    Proven,
-}
-
-/// The pids of `root`'s inclusive subtree over `rows` by the census's
-/// [`ParentLink::Plausible`] links: what [`census_from_snapshot`] counts
-/// `claude` images over. See [`inclusive_subtree_by`].
-pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
-    inclusive_subtree_by(root, rows, ParentLink::Plausible)
-}
-
 /// The pids of `root`'s inclusive subtree over `rows`: `root` and every row
-/// that descends from it by the parent links `links` follows, in BFS order,
+/// that descends from it by the parent links the table records, in BFS order,
 /// children in ascending pid order, so the result does not depend on the
 /// snapshot's map order. A visited set guards against a malformed table (a pid
 /// listed as its own ancestor) looping forever.
 ///
-/// The census walks it with [`ParentLink::Plausible`], and the unit-test kill
-/// guard (`process::test_kill_guard`) with [`ParentLink::Proven`] to ask
-/// whether a pid descends from the test process.
-pub(crate) fn inclusive_subtree_by(root: u32, rows: &[ProcRow], links: ParentLink) -> Vec<u32> {
-    let start_of: HashMap<u32, u64> = rows.iter().map(|r| (r.pid, r.start_time_secs)).collect();
+/// Every link is followed, a stale one included: Windows keeps an orphan's
+/// parent pid after the parent exits, so a later process that reuses that pid
+/// is walked as the orphan's parent. That errs toward over-counting, the
+/// census's safe direction (a `claude` it should not count can only refuse a
+/// restart, a `claude` it dropped could let one through), and it is what
+/// [`census_from_snapshot`] counts `claude` images over. The unit-test kill
+/// guard (`process::test_kill_guard`) errs the other way, so it walks this
+/// over rows whose unproven links it has cut first.
+pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for row in rows {
-        let Some(ppid) = row.ppid else {
-            continue;
-        };
-        let parent_start = start_of.get(&ppid).copied().unwrap_or(0);
-        let known = parent_start != 0 && row.start_time_secs != 0;
-        let follow = match links {
-            ParentLink::Plausible => {
-                !known || parent_start <= row.start_time_secs.saturating_add(PID_REUSE_SKEW_SECS)
-            }
-            ParentLink::Proven => known && parent_start <= row.start_time_secs,
-        };
-        if follow {
+        if let Some(ppid) = row.ppid {
             children.entry(ppid).or_default().push(row.pid);
         }
     }
@@ -470,7 +433,6 @@ pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
         .map(|p| ProcRow {
             pid: p.pid().as_u32(),
             ppid: p.parent().map(|pp| pp.as_u32()),
-            pgrp: process_group_of(p.pid().as_u32()),
             thread: p.thread_kind() == Some(ThreadKind::Userland),
             name: p.name().to_string_lossy().into_owned(),
             exe: p.exe().map(|e| e.to_path_buf()),
@@ -485,21 +447,6 @@ pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
         )));
     }
     Ok(rows)
-}
-
-/// The process group of `pid` (`getpgid(2)`), `None` when it is gone.
-#[cfg(unix)]
-fn process_group_of(pid: u32) -> Option<u32> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
-    // SAFETY: `getpgid` takes a scalar pid and touches no memory.
-    let group = unsafe { libc::getpgid(pid) };
-    u32::try_from(group).ok()
-}
-
-/// No process groups in this sense off Unix.
-#[cfg(not(unix))]
-fn process_group_of(_pid: u32) -> Option<u32> {
-    None
 }
 
 /// I/O layer: take one process-table snapshot and census the inclusive
@@ -573,7 +520,6 @@ mod tests {
         ProcRow {
             pid,
             ppid,
-            pgrp: None,
             thread: false,
             name: name.to_string(),
             exe: exe.map(PathBuf::from),
@@ -790,11 +736,10 @@ mod tests {
         );
     }
 
-    /// The walk follows parent links in BFS order, and only the ones that can
-    /// be real: a row that started before its parent pid's process (more than
-    /// the skew) is an orphan whose stale parent pid was reused, not a child.
+    /// The walk follows every parent link the table records, in BFS order with
+    /// children in ascending pid order, whatever the rows' start times say.
     #[test]
-    fn the_subtree_follows_only_parent_links_that_can_be_real() {
+    fn the_subtree_follows_every_parent_link_in_bfs_order() {
         let rows = vec![
             row(1, None, "init", None, 1),
             row(10, Some(1), "root", None, 100),
@@ -802,14 +747,16 @@ mod tests {
             row(11, Some(10), "child", None, 100),
             row(20, Some(11), "grandchild", None, 102),
             // Started long before pid 10's process: an orphan whose parent pid
-            // 10 was reused, and so is everything under it.
+            // 10 was reused. Still walked, and so is everything under it.
             row(30, Some(10), "orphan", None, 50),
             row(31, Some(30), "orphans-child", None, 60),
-            // Inside the skew, or with an unknown start time: kept.
             row(40, Some(10), "same-second", None, 96),
             row(41, Some(10), "unknown-start", None, 0),
         ];
-        assert_eq!(inclusive_subtree(10, &rows), vec![10, 11, 12, 40, 41, 20]);
+        assert_eq!(
+            inclusive_subtree(10, &rows),
+            vec![10, 11, 12, 30, 40, 41, 20, 31]
+        );
         assert_eq!(
             inclusive_subtree(30, &rows),
             vec![30, 31],
@@ -817,12 +764,38 @@ mod tests {
         );
         // A root that is not in the table still walks its children.
         assert_eq!(inclusive_subtree(7, &rows), vec![7]);
-        // The kill guard's rule proves each link: a parent that started after
-        // its row, even inside the skew, or a start time it cannot read, is not
-        // one.
+    }
+
+    /// A stale parent link is followed and counted: a `claude` whose recorded
+    /// parent pid now names a process that started after it (an orphan whose
+    /// parent pid was reused, which Windows allows) is still in the runner's
+    /// census, and so is what runs under it. Dropping the link would be an
+    /// under-count, which could let a restart through over a live session.
+    #[test]
+    fn a_stale_parent_link_is_still_counted() {
+        let claude = Some("/home/u/.local/bin/claude");
+        let rows = vec![
+            row(1, None, "init", None, 1),
+            row(
+                100,
+                Some(1),
+                "qontinui-runner",
+                Some("/opt/runner/qontinui-runner"),
+                10_000,
+            ),
+            // Started an hour before the process its parent pid names.
+            row(300, Some(100), "claude", claude, 10_000 - 3_600),
+            row(301, Some(300), "claude", claude, 10_000 - 3_590),
+        ];
+        let census =
+            census_from_snapshot(100, &rows, None, RootSource::Registry).expect("root present");
+        assert_eq!(census.walked, 3, "the root, the stale child and its child");
         assert_eq!(
-            inclusive_subtree_by(10, &rows, ParentLink::Proven),
-            vec![10, 11, 12, 20]
+            census.verdict(),
+            CensusVerdict::Busy {
+                count: 2,
+                pids: vec![300, 301]
+            }
         );
     }
 

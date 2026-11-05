@@ -110,11 +110,10 @@ fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
 
 const OWN: u32 = 100;
 
-fn row(pid: u32, ppid: Option<u32>, pgrp: Option<u32>, name: &str, start: u64) -> ProcRow {
+fn row(pid: u32, ppid: Option<u32>, name: &str, start: u64) -> ProcRow {
     ProcRow {
         pid,
         ppid,
-        pgrp,
         thread: false,
         name: name.to_string(),
         exe: Some(PathBuf::from(format!("/bin/{name}"))),
@@ -133,37 +132,75 @@ fn thread_of(tid: u32, process: &ProcRow) -> ProcRow {
     }
 }
 
+/// A hand-built process table and the process group of each of its rows, which
+/// the guard reads with `getpgid` beside the census's rows.
+struct Table {
+    rows: Vec<ProcRow>,
+    groups: HashMap<u32, u32>,
+}
+
+impl Table {
+    fn push(&mut self, row: ProcRow, group: Option<u32>) {
+        if let Some(group) = group {
+            self.groups.insert(row.pid, group);
+        }
+        self.rows.push(row);
+    }
+
+    fn find(&self, pid: u32) -> ProcRow {
+        self.rows
+            .iter()
+            .find(|r| r.pid == pid)
+            .cloned()
+            .unwrap_or_else(|| panic!("pid {pid} is in the table"))
+    }
+
+    fn decide(&self, target: Target) -> Option<String> {
+        refusal(
+            Ok(&self.rows),
+            |pid| self.groups.get(&pid).copied(),
+            OWN,
+            target,
+        )
+    }
+}
+
 /// init; cargo, the test's parent; the test process in cargo's group; its two
 /// children, one leading its own group with a grandchild in it; and a live
 /// runner the test did not start.
-fn table() -> Vec<ProcRow> {
-    vec![
-        row(1, None, Some(1), "init", 1),
-        row(50, Some(1), Some(50), "cargo", 5),
-        row(OWN, Some(50), Some(50), "test-binary", 10),
-        row(101, Some(OWN), Some(50), "stub", 20),
-        row(102, Some(OWN), Some(102), "runner", 21),
-        row(103, Some(102), Some(102), "pane", 22),
-        row(200, Some(1), Some(200), "live-runner", 15),
-    ]
-}
-
-fn decide(rows: &[ProcRow], target: Target) -> Option<String> {
-    refusal(Ok(rows), OWN, target)
+fn table() -> Table {
+    let mut table = Table {
+        rows: Vec::new(),
+        groups: HashMap::new(),
+    };
+    for (pid, ppid, group, name, start) in [
+        (1, None, 1, "init", 1),
+        (50, Some(1), 50, "cargo", 5),
+        (OWN, Some(50), 50, "test-binary", 10),
+        (101, Some(OWN), 50, "stub", 20),
+        (102, Some(OWN), 102, "runner", 21),
+        (103, Some(102), 102, "pane", 22),
+        (200, Some(1), 200, "live-runner", 15),
+    ] {
+        table.push(row(pid, ppid, name, start), Some(group));
+    }
+    table
 }
 
 #[test]
 fn a_signal_to_a_descendant_is_allowed() {
-    let rows = table();
+    let table = table();
     for pid in [101, 102, 103] {
-        assert_eq!(decide(&rows, Target::Pid(pid)), None, "pid {pid}");
+        assert_eq!(table.decide(Target::Pid(pid)), None, "pid {pid}");
     }
 }
 
 #[test]
 fn a_signal_to_a_process_the_test_did_not_spawn_is_refused_and_named() {
-    let rows = table();
-    let refused = decide(&rows, Target::Pid(200)).expect("a foreign pid is refused");
+    let table = table();
+    let refused = table
+        .decide(Target::Pid(200))
+        .expect("a foreign pid is refused");
     for part in [
         REFUSAL,
         "pid 200",
@@ -175,7 +212,7 @@ fn a_signal_to_a_process_the_test_did_not_spawn_is_refused_and_named() {
     }
     for pid in [OWN, 50, 1] {
         assert!(
-            decide(&rows, Target::Pid(pid)).is_some(),
+            table.decide(Target::Pid(pid)).is_some(),
             "pid {pid} is not a descendant"
         );
     }
@@ -183,13 +220,13 @@ fn a_signal_to_a_process_the_test_did_not_spawn_is_refused_and_named() {
 
 #[test]
 fn a_pid_absent_from_the_table_is_allowed_because_nothing_is_signalled() {
-    assert_eq!(decide(&table(), Target::Pid(999)), None);
-    assert_eq!(decide(&table(), Target::Tree(999)), None);
+    assert_eq!(table().decide(Target::Pid(999)), None);
+    assert_eq!(table().decide(Target::Tree(999)), None);
 }
 
 #[test]
 fn zero_and_values_kill_reads_as_negative_are_refused() {
-    let rows = table();
+    let table = table();
     for target in [
         Target::Pid(0),
         Target::Pid(u32::MAX),
@@ -198,7 +235,9 @@ fn zero_and_values_kill_reads_as_negative_are_refused() {
         Target::Group(u32::MAX),
         Target::Tree(0),
     ] {
-        let refused = decide(&rows, target).unwrap_or_else(|| panic!("{target} allowed"));
+        let refused = table
+            .decide(target)
+            .unwrap_or_else(|| panic!("{target} allowed"));
         assert!(
             refused.contains("as a process group or as every process"),
             "{refused}"
@@ -211,17 +250,14 @@ fn zero_and_values_kill_reads_as_negative_are_refused() {
 /// none.
 #[test]
 fn group_1_is_refused_as_the_signal_to_every_process_it_is() {
-    let rows: Vec<ProcRow> = table()
-        .into_iter()
-        .map(|mut r| {
-            if r.pgrp == Some(1) {
-                r.pgrp = Some(7);
-            }
-            r
-        })
-        .collect();
-    assert!(!rows.iter().any(|r| r.pgrp == Some(1)));
-    let refused = decide(&rows, Target::Group(1)).expect("group 1 is refused");
+    let mut table = table();
+    for group in table.groups.values_mut() {
+        if *group == 1 {
+            *group = 7;
+        }
+    }
+    assert!(!table.groups.values().any(|g| *g == 1));
+    let refused = table.decide(Target::Group(1)).expect("group 1 is refused");
     assert!(
         refused.contains("kill(-1) is a signal to every process"),
         "{refused}"
@@ -231,69 +267,96 @@ fn group_1_is_refused_as_the_signal_to_every_process_it_is() {
 #[test]
 fn an_unreadable_table_refuses() {
     let unreadable = CensusError::Unreadable("no table".to_string());
-    let refused = refusal(Err(&unreadable), OWN, Target::Pid(101)).expect("refused");
+    let refused = refusal(Err(&unreadable), |_| None, OWN, Target::Pid(101)).expect("refused");
     assert!(refused.contains("could not be read (process table unreadable: no table)"));
+}
+
+/// A pid's group is asked for only when a group signal is judged: a pid or a
+/// tree signal reads no process group at all.
+#[test]
+fn only_a_group_signal_reads_process_groups() {
+    let table = table();
+    let asked = std::cell::Cell::new(0usize);
+    let counting = |pid: u32| {
+        asked.set(asked.get() + 1);
+        table.groups.get(&pid).copied()
+    };
+    for target in [Target::Pid(101), Target::Pid(200), Target::Tree(102)] {
+        let _ = refusal(Ok(&table.rows), counting, OWN, target);
+    }
+    assert_eq!(asked.get(), 0, "a pid or tree signal read a process group");
+    let _ = refusal(Ok(&table.rows), counting, OWN, Target::Group(102));
+    assert_eq!(
+        asked.get(),
+        table.rows.len(),
+        "a group signal reads every row's group once"
+    );
 }
 
 #[test]
 fn a_group_is_allowed_only_when_every_live_member_descends_from_the_test() {
-    let mut rows = table();
+    let mut table = table();
+    assert_eq!(table.decide(Target::Group(102)), None, "the runner's group");
     assert_eq!(
-        decide(&rows, Target::Group(102)),
-        None,
-        "the runner's group"
-    );
-    assert_eq!(
-        decide(&rows, Target::Group(777)),
+        table.decide(Target::Group(777)),
         None,
         "a group with no live member signals nothing"
     );
-    let cargo_group = decide(&rows, Target::Group(50)).expect("cargo's group is refused");
+    let cargo_group = table
+        .decide(Target::Group(50))
+        .expect("cargo's group is refused");
     assert!(cargo_group.contains("pid 50 (/bin/cargo)"), "{cargo_group}");
     // One stranger in an otherwise descendant group refuses it.
-    rows.push(row(300, Some(1), Some(102), "stranger", 30));
-    let refused = decide(&rows, Target::Group(102)).expect("a stranger in the group");
+    table.push(row(300, Some(1), "stranger", 30), Some(102));
+    let refused = table
+        .decide(Target::Group(102))
+        .expect("a stranger in the group");
     assert!(refused.contains("pid 300 (/bin/stranger)"), "{refused}");
 }
 
-/// Windows keeps an orphan's parent pid after the parent exits. When a later
-/// descendant reuses that pid, `taskkill /T` on the descendant ends the orphan
-/// too, and the orphan is not the descendant's child.
+/// A recorded parent pid can be stale: Windows records a process's creator pid
+/// and can hand that pid to a new process once the creator exits. When a later
+/// descendant holds such a pid, the orphan that recorded it is not that
+/// descendant's child, and a tree signal on the descendant, taken to follow
+/// recorded links, would reach it.
 #[test]
 fn a_stale_parent_link_does_not_make_a_descendant_and_refuses_a_tree() {
-    let mut rows = table();
-    rows.push(row(400, Some(102), None, "orphan", 3));
+    let mut table = table();
+    table.push(row(400, Some(102), "orphan", 3), None);
     assert!(
-        decide(&rows, Target::Pid(400)).is_some(),
+        table.decide(Target::Pid(400)).is_some(),
         "an orphan that started before its parent pid's process is not under it"
     );
-    assert_eq!(
-        decide(&rows, Target::Pid(102)),
-        None,
-        "the descendant alone"
-    );
-    let tree = decide(&rows, Target::Tree(102)).expect("the tree reaches the orphan");
+    assert_eq!(table.decide(Target::Pid(102)), None, "the descendant alone");
+    let tree = table
+        .decide(Target::Tree(102))
+        .expect("the tree reaches the orphan");
     assert!(tree.contains("pid 400 (/bin/orphan)"), "{tree}");
-    assert_eq!(decide(&rows, Target::Tree(101)), None, "a clean tree");
+    assert_eq!(table.decide(Target::Tree(101)), None, "a clean tree");
 }
 
-/// The guard proves every parent link: a parent that started after its row
-/// by less than the census's skew, or a start time it cannot read, is no link,
-/// although the census would keep either.
+/// The guard proves every parent link: a parent that started after its row,
+/// however briefly, or a start time it cannot read, is no link, although the
+/// census follows both.
 #[test]
 fn an_unproven_parent_link_does_not_make_a_descendant() {
-    let mut rows = table();
+    let mut table = table();
     // pid 102's process started at 21: one that "started" at 18 cannot be its
     // child, only an orphan its reused pid now names.
-    rows.push(row(401, Some(102), None, "orphan-inside-the-skew", 18));
-    rows.push(row(402, Some(102), None, "orphan-of-unknown-age", 0));
+    table.push(row(401, Some(102), "orphan-inside-the-skew", 18), None);
+    table.push(row(402, Some(102), "orphan-of-unknown-age", 0), None);
     for (pid, name) in [
         (401, "orphan-inside-the-skew"),
         (402, "orphan-of-unknown-age"),
     ] {
-        let refused = decide(&rows, Target::Pid(pid)).unwrap_or_else(|| panic!("{name} allowed"));
+        let refused = table
+            .decide(Target::Pid(pid))
+            .unwrap_or_else(|| panic!("{name} allowed"));
         assert!(refused.contains(&format!("(/bin/{name})")), "{refused}");
     }
+    // The census walks both, as it walks every recorded link.
+    let walked = inclusive_subtree(102, &table.rows);
+    assert!(walked.contains(&401) && walked.contains(&402), "{walked:?}");
 }
 
 /// A signal to a thread's id reaches its whole process, so a thread is judged
@@ -301,25 +364,19 @@ fn an_unproven_parent_link_does_not_make_a_descendant() {
 /// thread is that descendant.
 #[test]
 fn a_thread_is_judged_as_its_process() {
-    let mut rows = table();
-    let own = rows
-        .iter()
-        .find(|r| r.pid == OWN)
-        .cloned()
-        .expect("the test");
-    let stub = rows
-        .iter()
-        .find(|r| r.pid == 101)
-        .cloned()
-        .expect("a child");
-    rows.push(thread_of(150, &own));
-    rows.push(thread_of(151, &stub));
-    let refused = decide(&rows, Target::Pid(150)).expect("a thread of the test is the test");
+    let mut table = table();
+    let own = table.find(OWN);
+    let stub = table.find(101);
+    table.push(thread_of(150, &own), Some(50));
+    table.push(thread_of(151, &stub), Some(50));
+    let refused = table
+        .decide(Target::Pid(150))
+        .expect("a thread of the test is the test");
     assert!(
         refused.contains("reaches pid 100 (/bin/test-binary)"),
         "{refused}"
     );
-    assert_eq!(decide(&rows, Target::Pid(151)), None, "a thread of a child");
+    assert_eq!(table.decide(Target::Pid(151)), None, "a thread of a child");
 }
 
 // --- the tripwire: every signal call site sits in a guarded primitive -------
@@ -523,8 +580,8 @@ enum Allowed {
     /// `kill(pid, 0)` only, which delivers nothing: `unix_kill::pid_alive`.
     SignalZero,
     /// A process-wrap kill only, of the group or job it made for a child this
-    /// process spawned, whose members only that child's tree can be:
-    /// `guarded_command::kill_tree`.
+    /// process spawned, which that child's own tree normally fills (the module
+    /// doc says who else can join): `guarded_command::kill_tree`.
     OwnGroupOrJob,
 }
 
