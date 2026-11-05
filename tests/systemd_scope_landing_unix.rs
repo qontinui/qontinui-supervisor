@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use qontinui_supervisor::process::systemd_scope::{
-    await_scope_landing, proc_state, LandingOutcome,
+    await_scope_landing, proc_state, reap_with_stderr_tail, LandingOutcome, STDERR_TAIL_BYTES,
 };
 use qontinui_supervisor::process::unix_kill::lead_own_process_group;
 
@@ -187,4 +187,45 @@ async fn exiting_before_landing_is_reported_and_left_unreaped() {
     );
     let status = child.wait().await.expect("wait");
     assert!(!status.success());
+}
+
+/// A spawned process that exited before it landed: the spawn site reaps it
+/// and reports its exit status and the END of its stderr (where
+/// `systemd-run`'s own error is), bounded to `STDERR_TAIL_BYTES`.
+#[tokio::test]
+async fn an_early_exit_is_reaped_with_its_status_and_the_tail_of_its_stderr() {
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", "echo boom >&2; exit 3"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let (status, tail) = reap_with_stderr_tail(&mut child).await;
+    assert!(
+        status.contains('3'),
+        "the exit status names code 3: {status}"
+    );
+    assert_eq!(tail, "boom");
+
+    // More than the tail bound: only the END is kept, so the last line — where
+    // an error usually is — survives.
+    let mut child = tokio::process::Command::new("sh")
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 400 ]; do echo xxxxxxxxxxxxxxxxxxxx >&2; i=$((i+1)); done; \
+             echo LAST-LINE >&2; exit 1",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let (_, tail) = reap_with_stderr_tail(&mut child).await;
+    assert!(
+        tail.len() <= STDERR_TAIL_BYTES,
+        "the tail is bounded: {} bytes",
+        tail.len()
+    );
+    assert!(
+        tail.ends_with("LAST-LINE"),
+        "the END is kept: …{}",
+        &tail[tail.len().saturating_sub(40)..]
+    );
 }

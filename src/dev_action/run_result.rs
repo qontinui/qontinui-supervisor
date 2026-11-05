@@ -99,6 +99,7 @@ pub fn unhealthy_after_start_reason(
 /// [`SupervisorError::StartSuperseded`] (a crash-watchdog start that found
 /// the runner started, stopped or removed since the exit it answers),
 /// [`SupervisorError::ShuttingDown`] (a start arrived after the shutdown latched),
+/// [`SupervisorError::SelfRestartRefused`] (a self-restart that would die with its unit),
 /// [`SupervisorError::UnverifiedExe`] (the exe a start resolved has no identity),
 /// [`SupervisorError::NoDisplay`] (a Linux start has no display),
 /// [`SupervisorError::PortHeldByLiveRunner`] (a live runner holds the port),
@@ -129,6 +130,7 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
         | SupervisorError::RunnerLifecycleBusy(_)
         | SupervisorError::StartSuperseded(_)
         | SupervisorError::ShuttingDown(_)
+        | SupervisorError::SelfRestartRefused(_)
         | SupervisorError::UnverifiedExe(_)
         | SupervisorError::NoDisplay(_)
         | SupervisorError::PortHeldByLiveRunner { .. }

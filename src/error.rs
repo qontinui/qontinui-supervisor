@@ -30,6 +30,13 @@ pub enum SupervisorError {
     #[error("Supervisor is shutting down; not starting runner '{0}'")]
     ShuttingDown(String),
 
+    /// `POST /supervisor/restart` refused because of where this process sits
+    /// in systemd: a replacement spawned by a service's main process would be
+    /// killed with that service. A conflict with the process's own state, not
+    /// a malformed request.
+    #[error("{0}")]
+    SelfRestartRefused(String),
+
     /// Legacy variant — retained for call sites in `process/manager.rs` and
     /// `routes/runner.rs` that report "build currently in progress". With the
     /// parallel build pool, this is derived from "any slot busy".
@@ -319,6 +326,7 @@ impl SupervisorError {
             SupervisorError::RunnerLifecycleBusy(_) => StatusCode::CONFLICT,
             SupervisorError::StartSuperseded(_) => StatusCode::CONFLICT,
             SupervisorError::ShuttingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::SelfRestartRefused(_) => StatusCode::CONFLICT,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,

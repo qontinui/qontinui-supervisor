@@ -175,6 +175,11 @@ fn sigterm_is_a_graceful_shutdown_and_names_its_signal() {
         .split_whitespace()
         .next()
         .unwrap_or("");
+    // Off Windows nothing claims a kill-on-exit JobObject: no such reaper runs.
+    assert!(
+        !boot_log.contains("kill-on-exit JobObject"),
+        "the startup log must not claim a kill-on-exit JobObject off Windows. Output:\n{boot_log}"
+    );
     assert!(
         Path::new(ledger_path).starts_with(&data),
         "the ledger must resolve under the test's XDG_DATA_HOME ({}), got `{ledger_path}` — a \

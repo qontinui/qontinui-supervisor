@@ -281,6 +281,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let probe = process::systemd_scope::probe_systemd().await;
             let msg = match &probe {
+                // Off Linux there is no cgroup to share; say what does hold
+                // instead (the same wording `/health` serves).
+                _ if !cfg!(target_os = "linux") => format!(
+                    "Runner isolation: {}",
+                    process::systemd_scope::summarize_isolation(false, Some(&probe), &[]).reason
+                ),
                 process::systemd_scope::SystemdProbe::Available { systemd_run } => format!(
                     "Runner isolation: user-owned runners will be spawned into their own \
                      transient systemd scope (via {})",
@@ -299,10 +305,10 @@ async fn main() -> anyhow::Result<()> {
             // A user-owned spawn re-probes and records its own result. If one
             // already has, that answer is newer than this startup probe, so
             // it is kept rather than overwritten by an older reading.
-            let mut slot = state_for_probe.runner_isolation_probe.write().await;
-            if slot.is_none() {
-                *slot = Some(probe);
-            }
+            process::systemd_scope::record_startup_probe(
+                &mut *state_for_probe.runner_isolation_probe.write().await,
+                probe,
+            );
         });
     }
 

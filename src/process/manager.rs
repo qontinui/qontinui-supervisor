@@ -2446,18 +2446,18 @@ pub async fn start_managed_runner(
     // from the registry. See `ManagedRunner::lifecycle`.
     let _lifecycle = managed.lifecycle.lock().await;
 
-    // A supervisor that is shutting down starts nothing. Off Windows nothing in
-    // the OS reaps a temp runner when this process exits, and the shutdown
-    // sweep reads the registry once: a start that slipped in after it (a
-    // `spawn-test` build finishing during the drain, or a crash-watchdog
-    // restart of a swept runner) would be orphaned. Checked under the
-    // lifecycle lock, so the sweep — which waits for that lock — sees every
-    // start that got past this point. Plan
-    // 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
-    if state
-        .shutdown_latched
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    // A supervisor that is shutting down starts no TEMP runner. Off Windows
+    // nothing in the OS reaps a temp runner when this process exits, and the
+    // shutdown sweep reads the registry once: a temp start that slipped in
+    // after it (a `spawn-test` build finishing during the drain, or a
+    // crash-watchdog restart of a swept runner) would be orphaned. Read under
+    // the lifecycle lock, which the sweep waits for, and read AGAIN just
+    // before the spawn (`start_exe_mode_for_runner`), so the slow steps in
+    // between (the exe copy, the env forwarders) cannot carry a start past the
+    // sweep. A user-owned runner survives the supervisor's exit on every
+    // platform, so a restart of one that straddles the shutdown still starts.
+    // Plan 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
+    if refuses_temp_start_at_shutdown(state, &managed.config.kind()) {
         return Err(SupervisorError::ShuttingDown(runner_id));
     }
 
@@ -3926,6 +3926,13 @@ async fn start_exe_mode_for_runner(
     // non-zero exit. Cloning out keeps the lock held for the minimum span.
     let panic_log_dir = managed.panic_log_dir.read().await.clone();
 
+    // The second read of the shutdown latch for a temp start (the first is on
+    // entry to `start_managed_runner`): everything since then — the exe copy,
+    // the env forwarders — can take seconds, and the shutdown sweep must find
+    // every temp runner it is going to orphan otherwise.
+    if refuses_temp_start_at_shutdown(state, &managed.config.kind()) {
+        return Err(SupervisorError::ShuttingDown(managed.config.id.clone()));
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| SupervisorError::Process(format!("Failed to spawn exe: {}", e)))?;
@@ -3958,7 +3965,8 @@ async fn start_exe_mode_for_runner(
                 // supervisor's cgroup, and it is never retried unscoped. Reap
                 // it and name what it said — when `systemd-run` could not
                 // start the scope, its own error is on this stderr pipe.
-                let (status, stderr_tail) = reap_with_stderr_tail(&mut child).await;
+                let (status, stderr_tail) =
+                    crate::process::systemd_scope::reap_with_stderr_tail(&mut child).await;
                 let msg = format!(
                     "Runner '{}' did NOT start: it exited before its systemd scope landing was \
                      confirmed — {}. Exit: {}. stderr (tail): {}. It was not retried unscoped.",
@@ -3995,43 +4003,17 @@ async fn start_exe_mode_for_runner(
     })
 }
 
-/// Reap a spawned process that has already exited, and read the tail of its
-/// piped stderr — both bounded, since a grandchild could still hold the pipe.
-/// Returns `(exit status, stderr tail)` as display strings; either can read
-/// as UNKNOWN with the reason, never as an empty success.
-async fn reap_with_stderr_tail(child: &mut tokio::process::Child) -> (String, String) {
-    use tokio::io::AsyncReadExt;
-    const BOUND: Duration = Duration::from_secs(2);
-    const TAIL_BYTES: usize = 2048;
-
-    let status = match tokio::time::timeout(BOUND, child.wait()).await {
-        Ok(Ok(status)) => status.to_string(),
-        Ok(Err(e)) => format!("UNKNOWN (wait failed: {e})"),
-        Err(_) => format!("UNKNOWN (not reaped within {}s)", BOUND.as_secs()),
-    };
-    let tail = match child.stderr.take() {
-        None => "UNKNOWN (no stderr pipe)".to_string(),
-        Some(mut stderr) => {
-            let mut buf = Vec::new();
-            match tokio::time::timeout(BOUND, stderr.read_to_end(&mut buf)).await {
-                Ok(Ok(_)) => {
-                    let start = buf.len().saturating_sub(TAIL_BYTES);
-                    let text = String::from_utf8_lossy(&buf[start..]).trim().to_string();
-                    if text.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        text
-                    }
-                }
-                Ok(Err(e)) => format!("UNKNOWN (read failed: {e})"),
-                Err(_) => format!(
-                    "UNKNOWN (the pipe stayed open past {}s — a child may still hold it)",
-                    BOUND.as_secs()
-                ),
-            }
-        }
-    };
-    (status, tail)
+/// Whether a start of a runner of `kind` must be refused because the
+/// supervisor is shutting down: only a TEMP runner (the ownership predicate the
+/// sweep uses), and only once the shutdown has latched.
+fn refuses_temp_start_at_shutdown(
+    state: &SharedState,
+    kind: &qontinui_types::wire::runner_kind::RunnerKind,
+) -> bool {
+    crate::process::job::should_assign_to_ephemeral_job(kind)
+        && state
+            .shutdown_latched
+            .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Default deadline for a newly-spawned runner to bind its HTTP API
@@ -5487,8 +5469,13 @@ async fn maybe_crash_restart(
                         );
                     }
                     // A correct skip, not a failure. The event pairs with the
-                    // `RestartStarted` above, and its detail says superseded.
-                    Err(superseded @ SupervisorError::StartSuperseded(_)) => {
+                    // `RestartStarted` above, and its detail says superseded —
+                    // or, for a temp runner, that the supervisor is shutting
+                    // down and starts none.
+                    Err(
+                        superseded @ (SupervisorError::StartSuperseded(_)
+                        | SupervisorError::ShuttingDown(_)),
+                    ) => {
                         info!("crash-only watchdog: not restarting: {superseded}");
                         state
                             .diagnostics

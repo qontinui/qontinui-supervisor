@@ -685,10 +685,44 @@ pub fn self_restart_refusal(own: &OwnUnit, self_pid: u32) -> Option<String> {
     }
 }
 
+/// Which unit to ask about, read from a `/proc/self/cgroup` body: `Ok(None)`
+/// when this process is not in a `*.service` leaf, `Ok(Some((unit, user)))`
+/// when it is — `user` true for a unit under the user manager's cgroup
+/// (`…/user@<uid>.service/…`), which is then asked with `systemctl --user`.
+/// Pure.
+pub fn own_service_unit(cgroup_body: &str) -> Result<Option<(String, bool)>, String> {
+    let Some(path) = cgroup_path(cgroup_body) else {
+        return Err("/proc/self/cgroup names no cgroup path".to_string());
+    };
+    Ok(service_leaf(&path).map(|unit| (unit.to_string(), path.contains("/user@"))))
+}
+
+/// Classify `systemctl show -p MainPID --value <unit>`'s answer — `Ok((exited
+/// successfully, stdout))`, or `Err(why it did not answer)`. A main pid of 0
+/// (inactive, or a unit with no main process) is UNKNOWN, never "someone
+/// else's". Pure.
+pub fn own_unit_from_main_pid(unit: &str, answer: Result<(bool, String), String>) -> OwnUnit {
+    let why = match answer {
+        Err(why) => why,
+        Ok((false, _)) => format!("`systemctl show -p MainPID {unit}` failed"),
+        Ok((true, stdout)) => match stdout.trim().parse::<u32>() {
+            Ok(main_pid) if main_pid > 0 => {
+                return OwnUnit::Service {
+                    unit: unit.to_string(),
+                    main_pid,
+                }
+            }
+            _ => format!("`systemctl show -p MainPID {unit}` named no main process"),
+        },
+    };
+    OwnUnit::Unknown { why }
+}
+
 /// Read this process's own unit: `<proc_root>/self/cgroup`, and — when that
 /// ends in a `*.service` — the unit's `MainPID` from a bounded
 /// `systemctl [--user] show`. Off Linux, and in a unit-test build (which never
-/// queries the host's systemd), [`OwnUnit::NotAService`].
+/// queries the host's systemd), [`OwnUnit::NotAService`]; the decisions are
+/// [`own_service_unit`] and [`own_unit_from_main_pid`], tested directly.
 pub async fn own_unit(proc_root: &Path) -> OwnUnit {
     if !cfg!(target_os = "linux") || cfg!(test) {
         return OwnUnit::NotAService;
@@ -701,46 +735,99 @@ pub async fn own_unit(proc_root: &Path) -> OwnUnit {
             }
         }
     };
-    let Some(path) = cgroup_path(&body) else {
-        return OwnUnit::Unknown {
-            why: "/proc/self/cgroup names no cgroup path".to_string(),
-        };
-    };
-    let Some(unit) = service_leaf(&path) else {
-        return OwnUnit::NotAService;
+    let (unit, user) = match own_service_unit(&body) {
+        Ok(Some(found)) => found,
+        Ok(None) => return OwnUnit::NotAService,
+        Err(why) => return OwnUnit::Unknown { why },
     };
     let mut cmd = tokio::process::Command::new("systemctl");
-    // A unit under the user manager's cgroup (`…/user@<uid>.service/…`) is the
-    // user manager's; anything else is the system manager's.
-    if path.contains("/user@") {
+    if user {
         cmd.arg("--user");
     }
-    cmd.args(["show", "-p", "MainPID", "--value", unit])
+    cmd.args(["show", "-p", "MainPID", "--value", &unit])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let why = match tokio::time::timeout(MANAGER_PROBE_TIMEOUT, cmd.output()).await {
-        Err(_) => format!(
+    let answer = match tokio::time::timeout(MANAGER_PROBE_TIMEOUT, cmd.output()).await {
+        Err(_) => Err(format!(
             "`systemctl show -p MainPID {unit}` did not answer within {}s",
             MANAGER_PROBE_TIMEOUT.as_secs()
-        ),
-        Ok(Err(e)) => format!("`systemctl show -p MainPID {unit}` could not run: {e}"),
-        Ok(Ok(out)) if !out.status.success() => {
-            format!("`systemctl show -p MainPID {unit}` exited {}", out.status)
-        }
-        Ok(Ok(out)) => match String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() {
-            Ok(main_pid) if main_pid > 0 => {
-                return OwnUnit::Service {
-                    unit: unit.to_string(),
-                    main_pid,
-                }
-            }
-            _ => format!("`systemctl show -p MainPID {unit}` named no main process"),
-        },
+        )),
+        Ok(Err(e)) => Err(format!(
+            "`systemctl show -p MainPID {unit}` could not run: {e}"
+        )),
+        Ok(Ok(out)) => Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )),
     };
-    OwnUnit::Unknown { why }
+    own_unit_from_main_pid(&unit, answer)
 }
+
+// ---- small decisions the HTTP and startup paths share ----------------------
+
+/// `GET /runners` `isolation_unit`: the scope of a RUNNING runner, or `None` —
+/// a stopped runner's scope has already been collected, so naming it would
+/// point at nothing. Pure.
+pub fn isolation_unit_for(isolation: Option<&Isolation>, running: bool) -> Option<String> {
+    isolation
+        .filter(|_| running)
+        .and_then(|i| i.unit().map(str::to_string))
+}
+
+/// Store the STARTUP systemd probe only when no spawn-time probe has already
+/// answered: a spawn re-probes and records its own, newer result, and an older
+/// reading must not overwrite it. Returns whether it was stored. Pure.
+pub fn record_startup_probe(slot: &mut Option<SystemdProbe>, probe: SystemdProbe) -> bool {
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(probe);
+    true
+}
+
+/// Reap a spawned process that has already exited, and read the tail of its
+/// piped stderr — both bounded, since a grandchild could still hold the pipe.
+/// Returns `(exit status, stderr tail)` as display strings; either reads as
+/// UNKNOWN with the reason, never as an empty success. The tail is at most
+/// [`STDERR_TAIL_BYTES`] of the end of what was written.
+pub async fn reap_with_stderr_tail(child: &mut tokio::process::Child) -> (String, String) {
+    use tokio::io::AsyncReadExt;
+    const BOUND: Duration = Duration::from_secs(2);
+
+    let status = match tokio::time::timeout(BOUND, child.wait()).await {
+        Ok(Ok(status)) => status.to_string(),
+        Ok(Err(e)) => format!("UNKNOWN (wait failed: {e})"),
+        Err(_) => format!("UNKNOWN (not reaped within {}s)", BOUND.as_secs()),
+    };
+    let tail = match child.stderr.take() {
+        None => "UNKNOWN (no stderr pipe)".to_string(),
+        Some(mut stderr) => {
+            let mut buf = Vec::new();
+            match tokio::time::timeout(BOUND, stderr.read_to_end(&mut buf)).await {
+                Ok(Ok(_)) => {
+                    let start = buf.len().saturating_sub(STDERR_TAIL_BYTES);
+                    let text = String::from_utf8_lossy(&buf[start..]).trim().to_string();
+                    if text.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        text
+                    }
+                }
+                Ok(Err(e)) => format!("UNKNOWN (read failed: {e})"),
+                Err(_) => format!(
+                    "UNKNOWN (the pipe stayed open past {}s — a child may still hold it)",
+                    BOUND.as_secs()
+                ),
+            }
+        }
+    };
+    (status, tail)
+}
+
+/// How much of the end of a failed scope start's stderr is reported.
+pub const STDERR_TAIL_BYTES: usize = 2048;
 
 #[cfg(test)]
 mod tests {
@@ -1145,5 +1232,80 @@ mod tests {
         )
         .expect("an UNKNOWN own unit must be refused");
         assert!(unknown.contains("UNKNOWN"), "{unknown}");
+    }
+
+    #[test]
+    fn own_service_unit_reads_the_leaf_and_the_manager() {
+        assert_eq!(
+            own_service_unit(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-supervisor-20261105T080000Z.service\n"
+            ),
+            Ok(Some((
+                "qontinui-supervisor-20261105T080000Z.service".to_string(),
+                true
+            )))
+        );
+        // A system service: asked WITHOUT `--user`.
+        assert_eq!(
+            own_service_unit("0::/system.slice/qontinui-supervisor.service\n"),
+            Ok(Some(("qontinui-supervisor.service".to_string(), false)))
+        );
+        assert_eq!(
+            own_service_unit("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            Ok(None)
+        );
+        assert!(own_service_unit("").is_err());
+    }
+
+    #[test]
+    fn a_main_pid_of_zero_or_a_failed_answer_is_unknown() {
+        let unit = "qontinui-supervisor-20261105T080000Z.service";
+        assert_eq!(
+            own_unit_from_main_pid(unit, Ok((true, "4242\n".to_string()))),
+            OwnUnit::Service {
+                unit: unit.to_string(),
+                main_pid: 4242
+            }
+        );
+        for answer in [
+            Ok((true, "0\n".to_string())),
+            Ok((true, "\n".to_string())),
+            Ok((false, "4242\n".to_string())),
+            Err("did not answer".to_string()),
+        ] {
+            assert!(
+                matches!(
+                    own_unit_from_main_pid(unit, answer.clone()),
+                    OwnUnit::Unknown { .. }
+                ),
+                "{answer:?} must read UNKNOWN"
+            );
+        }
+    }
+
+    #[test]
+    fn isolation_unit_is_named_only_for_a_running_runner() {
+        let scoped = Isolation::Scoped(UNIT.to_string());
+        assert_eq!(
+            isolation_unit_for(Some(&scoped), true).as_deref(),
+            Some(UNIT)
+        );
+        assert_eq!(isolation_unit_for(Some(&scoped), false), None);
+        assert_eq!(
+            isolation_unit_for(Some(&Isolation::Unscoped("x".to_string())), true),
+            None
+        );
+        assert_eq!(isolation_unit_for(None, true), None);
+    }
+
+    #[test]
+    fn the_startup_probe_never_overwrites_a_newer_one() {
+        let mut slot = None;
+        assert!(record_startup_probe(&mut slot, available()));
+        assert_eq!(slot, Some(available()));
+        let newer = SystemdProbe::Unavailable("a spawn-time probe answered".to_string());
+        let mut slot = Some(newer.clone());
+        assert!(!record_startup_probe(&mut slot, available()));
+        assert_eq!(slot, Some(newer));
     }
 }

@@ -1491,7 +1491,7 @@ pub async fn supervisor_restart(
             .logs
             .emit(LogSource::Supervisor, LogLevel::Warn, msg.clone())
             .await;
-        return Err(SupervisorError::Validation(msg));
+        return Err(SupervisorError::SelfRestartRefused(msg));
     }
 
     // What happens to temp runners on this spawn-and-exit path is
@@ -2685,8 +2685,13 @@ mod tests {
         // and a supervisor that is its own unit's main process is refused
         // BEFORE it spawns a replacement that would die with that unit. Plan
         // 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
+        // The attribute line too: `cfg(windows)` would compile the sweep out
+        // of exactly the platforms it exists for, leaving its text in place.
         let sweep = body
-            .find("sweep_temp_runners_at_shutdown(")
+            .find(
+                "#[cfg(not(windows))]\n            \
+                 crate::process::shutdown_sweep::sweep_temp_runners_at_shutdown(",
+            )
             .expect("supervisor_restart must run the off-Windows temp-runner sweep");
         assert!(
             latch < sweep && sweep < exit,

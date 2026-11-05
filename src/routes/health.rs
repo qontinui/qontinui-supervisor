@@ -673,10 +673,11 @@ pub async fn health(
 /// "reason": …}` — whether user-owned runners this supervisor spawns leave its
 /// cgroup (Linux, plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
 /// and-orphans-its-temp-runners` Phase 1b; `unknown` until the systemd
-/// preflight has answered). Its consumer is qontinui-claude-config's
-/// `supervisor-verbs.sh stop` (that plan's Phase 2), which treats anything but
-/// `systemd-scope` as not isolated, and also checks each user-owned runner's
-/// own cgroup before it stops a supervisor.
+/// preflight has answered). It is supervisor-wide, so it is a summary, never
+/// proof about any one runner. Its consumer is qontinui-claude-config's
+/// `supervisor-verbs.sh stop`, which that plan's Phase 2 adds after this
+/// change; that verb reads each user-owned runner's own cgroup before it
+/// stops a supervisor.
 ///
 /// `systemd-scope` needs BOTH a positive systemd preflight AND no running
 /// user-owned runner this supervisor spawned unscoped: one such runner shares

@@ -728,10 +728,8 @@ pub async fn list_runners(
         // when this supervisor never started the runner.
         let isolation = managed.isolation.read().await.clone();
         let is_running = managed.runner.read().await.running;
-        let isolation_unit = isolation
-            .as_ref()
-            .filter(|_| is_running)
-            .and_then(|i| i.unit().map(str::to_string));
+        let isolation_unit =
+            crate::process::systemd_scope::isolation_unit_for(isolation.as_ref(), is_running);
         let isolation_json = isolation.as_ref().map(|i| i.to_json());
 
         let mut entry = json!({

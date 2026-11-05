@@ -43,9 +43,9 @@ use tracing::{debug, info};
 
 /// Poll interval while waiting for a SIGTERM'd process to exit before we
 /// escalate to SIGKILL.
-const TERM_POLL_MS: u64 = 100;
+pub(crate) const TERM_POLL_MS: u64 = 100;
 /// Total grace given to SIGTERM before escalating to SIGKILL.
-const TERM_GRACE_MS: u64 = 1500;
+pub(crate) const TERM_GRACE_MS: u64 = 1500;
 
 /// Make the process `cmd` spawns the leader of a new process group whose id
 /// is its own pid — what [`kill_by_pid_tree`]'s `kill(-pid, …)` addresses.

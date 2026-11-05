@@ -7276,6 +7276,17 @@ async fn no_runner_is_started_once_the_shutdown_has_latched() {
         managed.runner.read().await.pid.is_none(),
         "a refused start must spawn nothing"
     );
+
+    // A user-owned runner survives the supervisor's exit, so a start of one
+    // that straddles the shutdown is not refused for it.
+    let named = register_dead_named_runner(&state, "named-after-latch").await;
+    let err = start_managed_runner(&state, &named, None, StartAs::Registered)
+        .await
+        .expect_err("this state has no runner exe to start");
+    assert!(
+        !matches!(err, SupervisorError::ShuttingDown(_)),
+        "a named start is not refused as shutting down: {err}"
+    );
 }
 
 /// `manager.rs`'s production source, for the source guards below.
@@ -7310,8 +7321,10 @@ fn the_spawn_site_sets_the_process_group_and_stdin_before_it_spawns() {
     let spawn = spawn_site
         .find("let mut child = cmd")
         .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    // The attribute line too: flipping it to `cfg(windows)` would compile the
+    // call out of every Unix build while leaving the call's text in place.
     let group = spawn_site
-        .find("crate::process::unix_kill::lead_own_process_group(&mut cmd);")
+        .find("#[cfg(not(windows))]\n    crate::process::unix_kill::lead_own_process_group(&mut cmd);")
         .expect(
             "the runner must lead its own process group on Unix, or `kill_by_pid_tree`'s \
              `kill(-pid)` reaches no group and the shutdown sweep signals nothing but the pid",
@@ -7323,6 +7336,27 @@ fn the_spawn_site_sets_the_process_group_and_stdin_before_it_spawns() {
         group < spawn && stdin < spawn,
         "the process group and stdin are set BEFORE the spawn (group {group}, stdin {stdin}, \
          spawn {spawn})"
+    );
+}
+
+/// The second read of the shutdown latch: just before the spawn, after the
+/// slow steps (exe copy, env forwarders) a temp start takes once past the first.
+#[test]
+fn the_spawn_site_reads_the_shutdown_latch_again_just_before_the_spawn() {
+    let spawn_site = manager_fn_body("async fn start_exe_mode_for_runner(");
+    let spawn = spawn_site
+        .find("let mut child = cmd")
+        .expect("start_exe_mode_for_runner spawns the runner's `cmd`");
+    let latch = spawn_site
+        .rfind("refuses_temp_start_at_shutdown(state, &managed.config.kind())")
+        .expect("the spawn site re-reads the shutdown latch for a temp start");
+    let forwarders = spawn_site
+        .find("for forwarder in env_forwarders::default_env_forwarders()")
+        .expect("the env forwarders run at the spawn site");
+    assert!(
+        forwarders < latch && latch < spawn,
+        "the latch is re-read after the slow steps and immediately before the spawn \
+         (forwarders {forwarders}, latch {latch}, spawn {spawn})"
     );
 }
 
@@ -7359,8 +7393,8 @@ fn a_start_reads_the_shutdown_latch_under_its_lock_and_clears_the_old_verdict() 
         .find("managed.lifecycle.lock().await")
         .expect("start_managed_runner takes the lifecycle lock");
     let latch = start
-        .find("shutdown_latched")
-        .expect("a start must refuse once the shutdown has latched");
+        .find("refuses_temp_start_at_shutdown(state, &managed.config.kind())")
+        .expect("a temp start must refuse once the shutdown has latched");
     let refuse = start
         .find("SupervisorError::ShuttingDown(")
         .expect("checked above");

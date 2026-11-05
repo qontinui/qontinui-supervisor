@@ -19,18 +19,26 @@
 //! external runners are user-owned; served policy `runner-lifecycle` forbids
 //! stopping them, and this sweep never selects them.
 //!
-//! The sweep is bounded ([`SHUTDOWN_SWEEP_BOUND`], 2 s, which fits inside the
-//! post-serve `HARD_EXIT_DEADLINE_SECS = 3`); `unix_kill`'s SIGTERM grace is
-//! 1.5 s, so a straggler is SIGKILLed inside the bound. It logs one line per
-//! victim (id, pid, port), and one line for any victim the bound cut off —
-//! which the supervisor's systemd unit (if any) or the next supervisor's
-//! ledger-gated reconcile sweep then frees.
+//! The sweep is bounded in two phases: reading the temp runners (each waits
+//! at most [`SWEEP_SETTLE_BOUND`], 500 ms, for a start or stop of that runner
+//! in flight), then killing them, with a deadline of its own
+//! ([`SHUTDOWN_SWEEP_BOUND`], 2 s) started only once the read is done, so a
+//! slow read can never eat the kill's SIGTERM grace: `unix_kill`'s grace is
+//! 1.5 s, so a straggler is SIGKILLed inside the kill bound. At most ~2.5 s in
+//! all; it runs before `shutdown_signal` arms its 10 s drain deadline, and
+//! before the self-restart endpoint arms its exit. It logs one line per victim
+//! (id, pid, port), and one line for any victim the bound cut off — which the
+//! supervisor's systemd unit (if any) or the next supervisor's ledger-gated
+//! reconcile sweep then frees.
 
 use std::time::Duration;
 
 use qontinui_types::wire::runner_kind::RunnerKind;
 
-/// The whole sweep — registry snapshot plus every kill — finishes inside this.
+/// The kill phase — every temp runner signalled concurrently — finishes inside
+/// this, counted from the end of the read phase. It must exceed `unix_kill`'s
+/// SIGTERM grace plus one poll, or the SIGKILL that follows the grace would be
+/// cut off.
 #[cfg_attr(windows, allow(dead_code))]
 pub const SHUTDOWN_SWEEP_BOUND: Duration = Duration::from_secs(2);
 
@@ -43,12 +51,12 @@ pub struct SweepVictim {
     pub pid: u32,
 }
 
-/// How long the sweep waits for a temp runner's lifecycle lock — a start or
-/// stop of that runner in flight — before reading it anyway. A start that got
-/// past the shutdown latch before it was set is still spawning under that lock;
-/// waiting lets the pid it is about to record be seen. Every start that
-/// arrives after the latch is refused (`SupervisorError::ShuttingDown`), so no
-/// temp runner can appear after this wait.
+/// How long the read phase waits for a temp runner's lifecycle lock — a start
+/// or stop of that runner in flight — before reading it anyway. A temp start
+/// reads the shutdown latch twice under that lock: on entry, and again just
+/// before its spawn. So a start the latch did not stop is at most a spawn
+/// syscall and a registry write from recording its pid, and this wait sees it.
+/// A start whose lock outlasts the wait is named in a WARN line.
 #[cfg_attr(windows, allow(dead_code))]
 pub const SWEEP_SETTLE_BOUND: Duration = Duration::from_millis(500);
 
@@ -94,13 +102,69 @@ pub async fn sweep_temp_runners_at_shutdown(state: &crate::state::SharedState, b
         .await;
 }
 
+/// Read one runner's sweep row and, when it is a running runner with a pid,
+/// latch a stop request on it — so its exit monitor records an intended stop,
+/// not a crash to report or to restart. Returns `(pid, running)`. Pure over the
+/// state it is handed.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn read_and_latch(
+    runner: &mut crate::state::RunnerState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<u32>, bool) {
+    if runner.running && runner.pid.is_some() {
+        runner.latch_stop_request(now);
+    }
+    (runner.pid, runner.running)
+}
+
+/// How one runner's read went.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowRead {
+    /// Read after its lifecycle lock was taken: no start or stop in flight.
+    Settled(SweepRow),
+    /// Read without the lifecycle lock, which a start or stop still held at
+    /// the settle deadline.
+    Unsettled(SweepRow),
+    /// The runner state itself could not be locked by the deadline.
+    Unreadable { id: String },
+}
+
+/// Read one temp runner for the sweep, waiting until `settle_deadline` for its
+/// lifecycle lock and its state lock. Never waits past the deadline.
+#[cfg_attr(windows, allow(dead_code))]
+pub async fn read_row(
+    managed: &crate::state::ManagedRunner,
+    settle_deadline: tokio::time::Instant,
+) -> RowRead {
+    let lifecycle = tokio::time::timeout_at(settle_deadline, managed.lifecycle.lock())
+        .await
+        .ok();
+    let Ok(mut runner) = tokio::time::timeout_at(settle_deadline, managed.runner.write()).await
+    else {
+        return RowRead::Unreadable {
+            id: managed.config.id.clone(),
+        };
+    };
+    let (pid, running) = read_and_latch(&mut runner, chrono::Utc::now());
+    let row = (
+        managed.config.id.clone(),
+        managed.config.port,
+        managed.config.kind(),
+        pid,
+        running,
+    );
+    drop(runner);
+    match lifecycle {
+        Some(_guard) => RowRead::Settled(row),
+        None => RowRead::Unsettled(row),
+    }
+}
+
 #[cfg(not(windows))]
 async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
     use crate::log_capture::{LogLevel, LogSource};
     use tracing::{info, warn};
-
-    let deadline = tokio::time::Instant::now() + bound;
-    let settle_deadline = (tokio::time::Instant::now() + SWEEP_SETTLE_BOUND).min(deadline);
 
     async fn emit(state: &crate::state::SharedState, level: LogLevel, msg: String) {
         match level {
@@ -110,15 +174,17 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         state.logs.emit(LogSource::Supervisor, level, msg).await;
     }
 
-    let Ok(all) = tokio::time::timeout_at(deadline, state.get_all_runners()).await else {
+    // ---- read phase: bounded by SWEEP_SETTLE_BOUND -----------------------
+    let settle_deadline = tokio::time::Instant::now() + SWEEP_SETTLE_BOUND;
+    let Ok(all) = tokio::time::timeout_at(settle_deadline, state.get_all_runners()).await else {
         emit(
             state,
             LogLevel::Warn,
             format!(
-                "Shutdown sweep: could not read the runner registry within {}s — NO temp runner \
+                "Shutdown sweep: could not read the runner registry within {}ms — NO temp runner \
                  was stopped; the supervisor's systemd unit (if any) or the next supervisor's \
                  ledger-gated reconcile sweep frees them",
-                bound.as_secs_f64()
+                SWEEP_SETTLE_BOUND.as_millis()
             ),
         )
         .await;
@@ -128,58 +194,41 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         .into_iter()
         .filter(|m| crate::process::job::should_assign_to_ephemeral_job(&m.config.kind()))
         .collect();
-
-    // Read each temp runner under its lifecycle lock (bounded), and latch a
-    // stop request on every one about to be signalled, so its exit monitor
-    // records an intended stop — not a crash to report or to restart.
-    let reads = temps.iter().map(|managed| async move {
-        let lifecycle = tokio::time::timeout_at(settle_deadline, managed.lifecycle.lock())
-            .await
-            .ok();
-        let row = {
-            let mut runner = managed.runner.write().await;
-            if runner.running && runner.pid.is_some() {
-                runner.latch_stop_request(chrono::Utc::now());
+    let reads = futures::future::join_all(temps.iter().map(|m| read_row(m, settle_deadline))).await;
+    let mut snapshot: Vec<SweepRow> = Vec::with_capacity(reads.len());
+    for read in reads {
+        match read {
+            RowRead::Settled(row) => snapshot.push(row),
+            RowRead::Unsettled(row) => {
+                emit(
+                    state,
+                    LogLevel::Warn,
+                    format!(
+                        "Shutdown sweep: a start or stop of temp runner '{}' was still in \
+                         progress after {}ms; read its PID ({}) without waiting for it",
+                        row.0,
+                        SWEEP_SETTLE_BOUND.as_millis(),
+                        row.3.map_or("none".to_string(), |p| p.to_string())
+                    ),
+                )
+                .await;
+                snapshot.push(row);
             }
-            (
-                managed.config.id.clone(),
-                managed.config.port,
-                managed.config.kind(),
-                runner.pid,
-                runner.running,
-            )
-        };
-        (row, lifecycle.is_some())
-    });
-    let Ok(read) = tokio::time::timeout_at(deadline, futures::future::join_all(reads)).await else {
-        emit(
-            state,
-            LogLevel::Warn,
-            format!(
-                "Shutdown sweep: could not read the temp runners within {}s — NO temp runner was \
-                 stopped; the supervisor's systemd unit (if any) or the next supervisor's \
-                 ledger-gated reconcile sweep frees them",
-                bound.as_secs_f64()
-            ),
-        )
-        .await;
-        return;
-    };
-    for ((id, ..), settled) in &read {
-        if !settled {
-            emit(
-                state,
-                LogLevel::Warn,
-                format!(
-                    "Shutdown sweep: a start or stop of temp runner '{id}' was still in progress \
-                     after {}ms; read its PID without waiting for it",
-                    SWEEP_SETTLE_BOUND.as_millis()
-                ),
-            )
-            .await;
+            RowRead::Unreadable { id } => {
+                emit(
+                    state,
+                    LogLevel::Warn,
+                    format!(
+                        "Shutdown sweep: temp runner '{id}' could not be read within {}ms and \
+                         was NOT stopped; the supervisor's systemd unit (if any) or the next \
+                         supervisor's ledger-gated reconcile sweep frees it",
+                        SWEEP_SETTLE_BOUND.as_millis()
+                    ),
+                )
+                .await;
+            }
         }
     }
-    let snapshot: Vec<SweepRow> = read.into_iter().map(|(row, _)| row).collect();
 
     let victims = temp_runners_to_sweep(&snapshot);
     if victims.is_empty() {
@@ -192,6 +241,8 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
         return;
     }
 
+    // ---- kill phase: its own deadline, started only now ---------------------
+    let deadline = tokio::time::Instant::now() + bound;
     let kills = victims.iter().map(|v| async move {
         let outcome =
             tokio::time::timeout_at(deadline, crate::process::proc_kill::kill_by_pid_tree(v.pid))
@@ -236,7 +287,7 @@ async fn sweep_once(state: &crate::state::SharedState, bound: Duration) {
                 LogLevel::Warn,
                 format!(
                     "Shutdown sweep: temp runner '{}' (PID {}, port {}) was CUT OFF by the {}s \
-                     bound and may still be running",
+                     kill bound and may still be running",
                     v.id,
                     v.pid,
                     v.port,
@@ -335,5 +386,133 @@ mod tests {
             row("e", 9890, RunnerKind::External, Some(3)),
         ];
         assert_eq!(pids(&temp_runners_to_sweep(&snapshot)), Vec::<u32>::new());
+    }
+
+    /// The kill phase must outlast the SIGTERM grace plus one poll, or the
+    /// SIGKILL that follows the grace is cut off by the bound.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_kill_bound_outlasts_the_sigterm_grace() {
+        let grace = Duration::from_millis(
+            crate::process::unix_kill::TERM_GRACE_MS + crate::process::unix_kill::TERM_POLL_MS,
+        );
+        assert!(
+            grace < SHUTDOWN_SWEEP_BOUND,
+            "grace {grace:?} must be inside the kill bound {SHUTDOWN_SWEEP_BOUND:?}"
+        );
+    }
+
+    /// A running runner with a pid gets a stop request latched, so its exit
+    /// monitor records an intended stop; anything else is left untouched.
+    #[test]
+    fn the_sweep_latches_a_stop_request_only_on_a_running_runner_with_a_pid() {
+        let now = chrono::Utc::now();
+        let state_with = |running: bool, pid: Option<u32>| {
+            let mut runner = crate::state::RunnerState::default();
+            runner.running = running;
+            runner.pid = pid;
+            runner
+        };
+        let mut running = state_with(true, Some(4242));
+        assert_eq!(read_and_latch(&mut running, now), (Some(4242), true));
+        assert!(running.stop_requested);
+        assert_eq!(running.stop_requested_at, Some(now));
+
+        for (pid, is_running) in [(Some(4242), false), (None, true), (None, false)] {
+            let mut other = state_with(is_running, pid);
+            assert_eq!(read_and_latch(&mut other, now), (pid, is_running));
+            assert!(
+                !other.stop_requested,
+                "pid {pid:?} running {is_running}: nothing to stop, so no stop is latched"
+            );
+        }
+    }
+
+    fn temp_runner(id: &str) -> crate::state::ManagedRunner {
+        let config = crate::config::RunnerConfig {
+            id: id.to_string(),
+            name: format!("Runner {id}"),
+            port: 9899,
+            kind: RunnerKind::Temp { id: id.to_string() },
+            protected: false,
+            server_mode: false,
+            restate_ingress_port: None,
+            restate_admin_port: None,
+            restate_service_port: None,
+            external_restate_admin_url: None,
+            external_restate_ingress_url: None,
+            extra_env: Default::default(),
+            fresh_device_identity: false,
+        };
+        crate::state::ManagedRunner::new(config, false)
+    }
+
+    /// A start still holding the lifecycle lock when the sweep reads is waited
+    /// for, so the pid it records is seen; a lock held past the settle
+    /// deadline is read without it and reported Unsettled.
+    #[tokio::test]
+    async fn the_read_waits_for_a_start_in_flight_then_gives_up_at_the_deadline() {
+        let managed = std::sync::Arc::new(temp_runner("test-in-flight"));
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let starter = {
+            let managed = managed.clone();
+            tokio::spawn(async move {
+                let _lifecycle = managed.lifecycle.lock().await;
+                let _ = held_tx.send(());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut runner = managed.runner.write().await;
+                runner.running = true;
+                runner.pid = Some(4242);
+            })
+        };
+        held_rx.await.expect("the start holds the lifecycle lock");
+        let read = read_row(
+            &managed,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        starter.await.expect("the start finishes");
+        match read {
+            RowRead::Settled((_, _, _, pid, running)) => {
+                assert_eq!(pid, Some(4242), "the pid the start recorded must be seen");
+                assert!(running);
+            }
+            other => panic!("the read must wait for the start in flight: {other:?}"),
+        }
+        assert!(
+            managed.runner.read().await.stop_requested,
+            "the swept runner carries a stop request"
+        );
+
+        let stuck = temp_runner("test-stuck");
+        let _held = stuck.lifecycle.lock().await;
+        let read = read_row(
+            &stuck,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(read, RowRead::Unsettled(_)), "{read:?}");
+    }
+
+    /// Both callers — `shutdown_signal` and the self-restart endpoint — share
+    /// ONE sweep through the state's once-cell.
+    #[test]
+    fn the_sweep_runs_once_per_process() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("process")
+                .join("shutdown_sweep.rs"),
+        )
+        .expect("read shutdown_sweep.rs")
+        .replace("\r\n", "\n");
+        let body =
+            crate::source_scan::fn_body(&src, "pub async fn sweep_temp_runners_at_shutdown(")
+                .expect("sweep_temp_runners_at_shutdown exists");
+        assert!(
+            body.contains(".shutdown_sweep") && body.contains(".get_or_init("),
+            "the sweep must run through the state's once-cell, or `shutdown_signal` and \
+             `supervisor_restart` signal every temp runner twice, concurrently: {body}"
+        );
     }
 }
