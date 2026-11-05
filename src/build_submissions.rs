@@ -1801,9 +1801,12 @@ mod tests {
     }
 
     /// Both async doors register through `BuildSubmissionStore::insert`, so
-    /// they come under its cap. Registering with a raw map insert (as the
-    /// spawned task once did) leaves 17 rows here. The floor is 16, so a
-    /// smaller store would prove nothing.
+    /// they come under its cap. A synchronous raw map insert leaves 17 rows
+    /// here, which the length assertions catch. Registering inside the spawned
+    /// task, as it once did, leaves the row missing when `len()` is read on
+    /// this current-thread runtime, so the lengths still read 16. The two
+    /// `get(..).is_some()` assertions at the end catch that case. The floor is
+    /// 16, so a smaller store would prove nothing.
     #[tokio::test]
     async fn async_submissions_come_under_the_store_cap() {
         let store = Arc::new(BuildSubmissionStore::new(16));
