@@ -12,7 +12,9 @@
 //!
 //! * It SERVES or listens on it: [`held_ephemeral_listener`], or
 //!   [`held_ephemeral_tokio_listener`] to serve it with tokio. The port is the
-//!   test's while it holds the listener.
+//!   test's while the listener lives, and a server that shuts down drops its
+//!   listener. So when the code under test still probes or kills the port after
+//!   the test's server stops, the test listens on [`unheld_port`] instead.
 //! * The code under test only CONNECTS to a port nothing answers:
 //!   [`reserve_refused_port`]. Bound, never listened on, and kept, so a connect
 //!   is refused and nothing else can listen there.
@@ -81,8 +83,11 @@ pub fn held_ephemeral_listener() -> (std::net::TcpListener, u16) {
 
 /// [`held_ephemeral_listener`] as a tokio listener, for a test that serves it
 /// (`axum::serve`, an accept loop). The same rule: the port is the test's while
-/// it holds the listener, so hand the listener to the server rather than drop
-/// it.
+/// the listener lives, and a server keeps it only while it serves. A server that
+/// stops drops its listener (axum's graceful shutdown drops it as soon as the
+/// shutdown is signalled), so a test whose code under test still reads the port
+/// once the server has stopped (a stop's port probe, a kill of the port's
+/// listeners) binds [`unheld_port`] itself instead.
 pub async fn held_ephemeral_tokio_listener() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

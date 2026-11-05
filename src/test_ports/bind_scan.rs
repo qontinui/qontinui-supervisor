@@ -1,16 +1,20 @@
 //! The scan behind `test_ports::tests::no_test_code_binds_port_0_outside_test_ports`:
 //! every `bind(…)` in test code whose argument is an address with port 0.
 //!
-//! **Why a token rule is enough.** A port the kernel picked belongs to the test
-//! only while the socket that holds it lives. `test_ports` hands one out only
-//! together with that socket ([`super::held_ephemeral_listener`],
+//! **What a token rule holds, and what it cannot see.** A port the kernel picked
+//! belongs to the test only while the socket that holds it lives. `test_ports`
+//! hands one out only together with that socket ([`super::held_ephemeral_listener`],
 //! [`super::held_ephemeral_tokio_listener`]), and its dead-port fixtures
-//! ([`super::unheld_port`], [`super::reserve_refused_port`]) never release one.
-//! So the property needs no data flow: if test code binds port 0 in `test_ports`
-//! and nowhere else, no fixture outside it can let such a socket go and keep
-//! using its port. Dropping a listener that `test_ports` handed out is still
-//! possible; it is visible at the call site, and the helpers' docs say only a
-//! test whose subject is a released port does it.
+//! ([`super::unheld_port`], [`super::reserve_refused_port`]) never release one. So
+//! if test code binds port 0 in `test_ports` and nowhere else, no fixture outside it
+//! can bind a kernel-picked port, let the socket go and keep using the port: that
+//! takes a bind this rule flags. A test can still release a socket `test_ports`
+//! handed it, and no bind marks either way it does so: dropping the listener, or
+//! giving it to a server that shuts down, since a server drops its listener when it
+//! stops (axum's graceful shutdown drops it as soon as the shutdown is signalled).
+//! The helpers' docs carry that rule: a test whose code under test still probes or
+//! kills the port after its server stops listens on [`super::unheld_port`] instead,
+//! and only a test whose subject is a released port drops a listener on purpose.
 //!
 //! **A port-0 bind** is a call of `bind` (`TcpListener::bind(…)`,
 //! `sock.bind(…)`) whose parenthesised argument holds, at any depth:

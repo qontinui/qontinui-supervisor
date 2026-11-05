@@ -3252,6 +3252,13 @@ fn stated_defaults_reads_each_doc_spelling() {
 /// the close-request kills `child` (the runner's stand-in process) and stops
 /// listening, so the stop's PID wait and port reap both resolve without
 /// any kill landing on this test process.
+///
+/// It listens on [`crate::test_ports::unheld_port`], bound here, not on a port the
+/// kernel picked. The stop probes the port after the fake has stopped listening
+/// (`wait_for_port_free`) and can go on to kill whatever listens there, and axum's
+/// graceful shutdown drops its listener as soon as the close-request signals it. A
+/// kernel-picked port is then free for any `bind(0)` or `connect()` on the box to be
+/// handed; no kernel allocation hands out an unheld one.
 #[cfg(unix)]
 async fn spawn_fake_runner(
     readiness: &'static str,
@@ -3288,7 +3295,10 @@ async fn spawn_fake_runner(
                 }
             }),
         );
-    let (listener, port) = crate::test_ports::held_ephemeral_tokio_listener().await;
+    let port = crate::test_ports::unheld_port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("listen on the fake runner's unheld port");
     tokio::spawn(async move {
         let mut rx = stop_rx;
         let _ = axum::serve(listener, app)
