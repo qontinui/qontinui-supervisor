@@ -142,8 +142,11 @@ pub enum AmbientCoord {
 ///   all go through);
 /// - the app-data trees a runner writes under its instance name, which the
 ///   teardown removes (`process::app_data_dir_candidates`);
-/// - the harness's `~/.qontinui` a subject's home is provisioned from, and the
-///   paired-profile snapshots under it (`harness_qontinui_dir`, `home_dir`);
+/// - the harness's `~/.qontinui` a subject's home is provisioned from
+///   (`harness_qontinui_dir`, which follows a non-blank `$QONTINUI_HOME`), and
+///   the paired-profile snapshots spawn-test copies from
+///   `<home>/.qontinui/profiles` (`home_dir`, which does not: the two disagree
+///   when that variable is set, as they did before this switch);
 /// - the primary's paired-state dir a spawn-test snapshots
 ///   (`process::primary_paired_state_dir`);
 /// - the temp-runner ledger (`process::temp_runner_ledger`);
