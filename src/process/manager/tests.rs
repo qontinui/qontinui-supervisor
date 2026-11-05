@@ -5477,24 +5477,81 @@ fn text_file_busy_is_recognised_through_the_after_act_marker() {
     assert!(!is_text_file_busy(&SupervisorError::RunnerAlreadyRunning));
 }
 
-/// Wait out that fork, for at most two seconds in all. Every attempt copies the file
-/// again and opens a new descriptor, so it pays to wait. This sleep orders nothing
-/// a test asserts: it only lets a concurrent exec happen.
+/// The waits an ETXTBSY retry may still take: two seconds of waiting in all, in
+/// 100 ms steps. It budgets the WAITING, not wall-clock time since the first attempt:
+/// an attempt copies a 1+ MB stub and starts a process, which under a full parallel
+/// suite was measured at about 1.5 s, so a wall-clock deadline of two seconds left a
+/// slow first attempt no retry at all (`a_stop_queued_mid_start_targets_the_recorded_spawn`
+/// then failed on ETXTBSY in 3 of 3 full-suite runs while passing alone).
+#[cfg(unix)]
+struct TextFileBusyWaits(u32);
+
+#[cfg(unix)]
+impl TextFileBusyWaits {
+    const STEP: Duration = Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self(20)
+    }
+
+    /// Sleep one step and return `true` while waits remain; `false` once spent.
+    /// The sleep orders nothing a test asserts: it only lets a concurrent exec happen.
+    async fn wait(&mut self) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
+        self.0 -= 1;
+        tokio::time::sleep(Self::STEP).await;
+        true
+    }
+}
+
+/// Wait out that fork ([`TextFileBusyWaits`]). Every attempt copies the file again
+/// and opens a new descriptor, so it pays to wait.
 #[cfg(unix)]
 async fn past_text_file_busy<F, Fut, T>(mut attempt: F) -> Result<T, SupervisorError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, SupervisorError>>,
 {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut waits = TextFileBusyWaits::new();
     loop {
         match attempt().await {
-            Err(err) if is_text_file_busy(&err) && std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            Err(err) if is_text_file_busy(&err) && waits.wait().await => {}
             other => return other,
         }
     }
+}
+
+/// A slow attempt does not spend the retry budget: only waits do.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_slow_attempt_still_gets_its_text_file_busy_retries() {
+    let mut calls = 0u32;
+    let outcome = past_text_file_busy(|| {
+        calls += 1;
+        let call = calls;
+        async move {
+            // Far longer than the whole waiting budget.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if call < 3 {
+                Err(SupervisorError::Process(
+                    "Failed to spawn exe: Text file busy (os error 26)".into(),
+                ))
+            } else {
+                Ok(call)
+            }
+        }
+    })
+    .await;
+    assert_eq!(outcome.expect("retried past two slow ETXTBSY attempts"), 3);
+
+    let mut waits = TextFileBusyWaits::new();
+    let mut taken = 0;
+    while waits.wait().await {
+        taken += 1;
+    }
+    assert_eq!(taken, 20, "two seconds of waiting in 100 ms steps");
 }
 
 /// Stop what a stub test left running and remove the early logs its starts opened.
@@ -5636,7 +5693,7 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut waits = TextFileBusyWaits::new();
             loop {
                 let spawns_before = managed.recent_spawns.read().await.iter().count();
                 let holder = managed.lifecycle.lock().await;
@@ -5660,9 +5717,9 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
                 let busy = outcomes
                     .iter()
                     .any(|outcome| outcome.as_ref().is_err_and(is_text_file_busy));
-                if busy && std::time::Instant::now() < deadline {
+                if busy && waits.0 > 0 {
                     stop_the_stub(&state, &managed).await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    waits.wait().await;
                     continue;
                 }
                 let [first, second] = outcomes;
@@ -5875,7 +5932,7 @@ async fn through_a_held_open_door<A, F, Fut>(
     let answered = {
         let state = state.clone();
         tokio::spawn(async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut waits = TextFileBusyWaits::new();
             loop {
                 let response = door(state.clone()).await;
                 let errored_text_file_busy =
@@ -5890,9 +5947,8 @@ async fn through_a_held_open_door<A, F, Fut>(
                     answered_server_error,
                 )
                 .await
-                    && std::time::Instant::now() < deadline
+                    && waits.wait().await
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 return response;
