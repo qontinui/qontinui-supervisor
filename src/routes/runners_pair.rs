@@ -77,6 +77,7 @@ use std::time::Duration;
 
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
+use crate::process::executable_copy::copy_executable;
 use crate::state::SharedState;
 
 /// JSON body for `POST /runners/pair-with-token`.
@@ -168,7 +169,10 @@ impl Drop for PrivateCliCopy {
 ///
 /// The copy keeps the source's file name (so a `.cmd` test stub stays one) and
 /// its bytes are checked: a copy of ZERO bytes — the source rewritten with
-/// tauri-build's placeholder since it was resolved — is refused.
+/// tauri-build's placeholder since it was resolved — is refused. It is written
+/// by [`copy_executable`], so on Unix no fork of this process holds a write
+/// descriptor on the file the route then execs, which would refuse that exec
+/// `ETXTBSY` ("Text file busy").
 fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy, String> {
     sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
     let file_name = cli
@@ -184,7 +188,7 @@ fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy
         exe: dir.join(file_name),
         dir,
     };
-    let bytes = std::fs::copy(cli, &copy.exe)
+    let bytes = copy_executable(cli, &copy.exe)
         .map_err(|e| format!("copy {:?} -> {:?}: {e}", cli, copy.exe))?;
     if bytes == 0 {
         return Err(format!(

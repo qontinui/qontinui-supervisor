@@ -4,6 +4,10 @@
 pub mod claude_env;
 pub mod early_log;
 pub mod env_forwarders;
+/// The copies this process execs, written by a child `cp` and renamed into
+/// place on Unix so no fork of this process holds a writer on them (ETXTBSY) —
+/// plan `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`, Phase 3.
+pub(crate) mod executable_copy;
 pub mod guarded_command;
 pub mod health_probe;
 /// The instance root a non-primary spawn is given (`QONTINUI_INSTANCE_ROOT`) —

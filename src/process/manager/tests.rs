@@ -2280,7 +2280,7 @@ fn temp_runner_sidecars_land_in_its_own_dir_not_target_debug() {
     assert!(own_dir.ends_with("runners/qontinui-runner-test-9877"));
 
     std::fs::create_dir_all(&own_dir).expect("mkdir own dir");
-    std::fs::copy(&source_exe, &dest_exe).expect("copy exe");
+    copy_executable(&source_exe, &dest_exe).expect("copy exe");
     // The same roster loop start_exe_mode_for_runner runs.
     for sidecar in crate::build_monitor::RUNNER_SIDECARS
         .iter()

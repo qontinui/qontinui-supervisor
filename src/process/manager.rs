@@ -13,6 +13,7 @@ use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
 use crate::process::env_forwarders;
+use crate::process::executable_copy::copy_executable;
 use crate::process::instance_root::{self, InstanceRoot};
 use crate::process::port::wait_for_port_free;
 use crate::process::stop_ledger::{
@@ -3616,11 +3617,20 @@ async fn start_exe_mode_for_runner(
     // All runners use a copy of the exe to avoid locking the build artifact.
     // This allows cargo build to succeed while any runner is running.
     //
+    // The copy is `copy_executable`'s. On Unix a child `cp` writes a temp file
+    // that is renamed over the copy path, so no thread of this process that
+    // forks meanwhile can hand its child a write descriptor on the inode this
+    // start execs (`ETXTBSY`, "Text file busy"), and a prior copy a lost
+    // instance still runs is replaced by the rename rather than written in
+    // place.
+    //
     // The first copy can fail when a previous instance of this runner died
     // with the supervisor losing its PID — Windows will hold the prior copy
     // open until the OS releases the handle. Try to remove the stale copy
-    // and retry once. If that still fails, fail the spawn rather than fall
-    // back to running directly from `source_exe` (the slot binary).
+    // and retry once; that is for Windows and for real failures, since a Unix
+    // copy is never refused for a running prior copy. If that still fails,
+    // fail the spawn rather than fall back to running directly from
+    // `source_exe` (the slot binary).
     //
     // Why we never fall back to source_exe: it leaves a process running
     // out of `target-pool/slot-{k}/debug/qontinui-runner.exe`, locking the
@@ -3646,7 +3656,7 @@ async fn start_exe_mode_for_runner(
                 )));
             }
         }
-        match std::fs::copy(&source_exe, &copy_path) {
+        match copy_executable(&source_exe, &copy_path) {
             Ok(_) => {
                 info!(
                     "Copied runner exe for '{}' to {:?}",
@@ -3661,7 +3671,7 @@ async fn start_exe_mode_for_runner(
                     managed.config.name, first_err
                 );
                 let _ = std::fs::remove_file(&copy_path);
-                match std::fs::copy(&source_exe, &copy_path) {
+                match copy_executable(&source_exe, &copy_path) {
                     Ok(_) => {
                         info!(
                             "Copied runner exe for '{}' to {:?} on retry",
