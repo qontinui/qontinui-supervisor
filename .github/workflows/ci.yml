@@ -174,16 +174,16 @@ jobs:
       #      the change's, and a re-run goes hosted. lsof and python3 are what
       #      the orphan-kill suite below exercises the kill primitives with;
       #      without them it would fail ~10 minutes in.
-      #   2. A HOME of its own, and a rustup of the registration's own. Every
+      #   2. A HOME of its own, and a rustup of the slot's own. Every
       #      registration on the host runs as ONE account with ONE home, so
       #      the job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
       #      empties per job. CARGO_HOME stays on the account's persistent
       #      registry, which cargo locks itself. RUSTUP_HOME does not: the
       #      toolchain step runs `rustup default`, which on the account's
       #      shared RUSTUP_HOME rewrites the settings every other job on the
-      #      host reads. One registration runs one job at a time, so a
-      #      RUSTUP_HOME per registration, beside its target below, has no
-      #      concurrent writer; it downloads 1.95.0 once per registration.
+      #      host reads. A slot (item 5) is flock-held by one job at a time,
+      #      so a RUSTUP_HOME per slot, beside its target, has no concurrent
+      #      writer; it downloads 1.95.0 once per slot.
       #      This runs before the toolchain step, which finds rustup through
       #      CARGO_HOME.
       #   3. A PERSISTED SIBLING. The runner keeps $GITHUB_WORKSPACE/..
@@ -202,27 +202,39 @@ jobs:
       #      the machine it lands on.
       #   5. A PERSISTENT TARGET. actions/checkout cleans with `git clean
       #      -ffdx`, which deletes ./target on every job. So the target lives
-      #      under the account's persistent home, ONE per registration (two
-      #      jobs never share a cargo build lock), and ./target is a symlink to
-      #      it: the clean removes the link, never the tree behind it.
+      #      under the account's persistent home, in a slot of a fixed pool
+      #      (.github/scripts/ci-cache-slot.sh: K slots, default 4, repo var
+      #      CI_CACHE_SLOTS; the root's total bounded by B, default 40 GiB, repo
+      #      var CI_CACHE_BUDGET_GIB), and ./target is a symlink to it: the
+      #      clean removes the link, never the tree behind it. A slot is
+      #      flock-held for the whole job, so two jobs never share a cargo build
+      #      lock; with every slot held the job builds cold under $RUNNER_TEMP.
+      #      It used to be ONE per registration, which an org-wide pool
+      #      multiplied without bound (104G on nawa, 2026-11-04; plan
+      #      2026-11-04-devops-ci-persistent-target-caches-keyed-per-registration-grow-without-bound-on-the-org-pool),
+      #      so the helper also reaps those legacy per-registration dirs.
       #      CARGO_TARGET_DIR is deliberately not set. It saves CPU on a
       #      shared host, not wall time. Warm (run 41699811297), this job
       #      compiled 6 units, all of them this crate, where a cold run
       #      compiled 583, but it took as long: this crate's own lib, bin and
       #      test binaries rebuild every run, and the tests' execution
-      #      dominates. Bounded: a target over
-      #      40 GiB (a full Rust Check leaves about 7 GiB), under 60 GiB free
-      #      on its filesystem, or unreadable, starts cold. dist/ and
+      #      dominates. Bounded: a target over min(40 GiB, B/K) (a full Rust
+      #      Check leaves about 7 GiB) or unreadable starts cold; over B in
+      #      total, or under 60 GiB free on the filesystem, other unlocked slots
+      #      are evicted first, then this job's target. dist/ and
       #      frontend/node_modules stay in the workspace, so the clean still
       #      hands the no-dist step below the fresh tree it requires, and
       #      build.rs reruns for an absent dist/.
       - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
         if: runner.environment == 'self-hosted'
         shell: bash
+        env:
+          CI_CACHE_SLOTS: ${{ vars.CI_CACHE_SLOTS }}
+          CI_CACHE_BUDGET_GIB: ${{ vars.CI_CACHE_BUDGET_GIB }}
         run: |
           set -euo pipefail
           missing=""
-          for tool in cc git curl python3 lsof npm; do
+          for tool in cc git curl python3 lsof npm flock; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           if [ -n "$missing" ]; then
@@ -231,7 +243,11 @@ jobs:
           fi
 
           pool_home="$HOME"
-          state="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME"
+          # shellcheck source=/dev/null
+          . .github/scripts/ci-cache-slot.sh
+          ci_cache_slot_select --root "$pool_home/.cache/qontinui-supervisor-ci" \
+            --budget-gib 40 --entry-bound-gib 40 --floor-gib 60 --entry target
+          state="$CI_CACHE_STATE_DIR"
           job_home="$RUNNER_TEMP/home"
           mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
 
@@ -261,26 +277,13 @@ jobs:
             echo "CARGO_BUILD_JOBS=$jobs"
             echo "RUST_TEST_THREADS=$threads"
           } >> "$GITHUB_ENV"
-          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this registration's, under $state"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this job's slot ($CI_CACHE_SLOT), under $state"
           echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
 
-          cache="$state/target"
-          mkdir -p "$cache"
-          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
-            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
-          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
-          if [ "$used_kb" -gt $((40 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
-            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
+          # ci_cache_slot_select already bounded it (unreadable, over its
+          # bound, or under the free-space floor: cold) and created it.
+          cache="$CI_CACHE_ENTRY_DIR"
+          used_kb="$CI_CACHE_ENTRY_USED_KB"
           if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
           ln -sfn "$cache" target
           echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
@@ -973,6 +976,11 @@ jobs:
         run: bash .github/scripts/test-schemas-pin.sh
       - name: Pre-commit cargo target-dir tests
         run: bash .github/scripts/test-pre-commit-cargo.sh
+      # The persistent-cache slot pool's selection, eviction, legacy reap and
+      # lock lifetime, over a fixture tree; and that no workflow keys a
+      # persistent path by $RUNNER_NAME again.
+      - name: CI cache slot pool tests
+        run: bash .github/scripts/test-ci-cache-slot.sh
       # The pool label set is spelled in several places (see Rust Check's
       # `runs-on`). Drift there makes the router count no pool jobs, so a dead
       # pool reads healthy and the hosted floor never takes over, silently.
@@ -1030,16 +1038,19 @@ jobs:
           persist-credentials: false
 
       # SELF-HOSTED ONLY. The same step as Rust Check's, which says why each
-      # part exists; keep the two identical. The persistent target is keyed by
-      # registration, not by job, so whichever of the two jobs a registration
-      # ran last left it warm for the other.
+      # part exists; keep the two identical. Both jobs draw from the one slot
+      # pool, so whichever of the two jobs last held a slot left it warm for
+      # the other.
       - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
         if: runner.environment == 'self-hosted'
         shell: bash
+        env:
+          CI_CACHE_SLOTS: ${{ vars.CI_CACHE_SLOTS }}
+          CI_CACHE_BUDGET_GIB: ${{ vars.CI_CACHE_BUDGET_GIB }}
         run: |
           set -euo pipefail
           missing=""
-          for tool in cc git curl python3 lsof npm; do
+          for tool in cc git curl python3 lsof npm flock; do
             command -v "$tool" >/dev/null || missing="$missing $tool"
           done
           if [ -n "$missing" ]; then
@@ -1048,7 +1059,11 @@ jobs:
           fi
 
           pool_home="$HOME"
-          state="$pool_home/.cache/qontinui-supervisor-ci/$RUNNER_NAME"
+          # shellcheck source=/dev/null
+          . .github/scripts/ci-cache-slot.sh
+          ci_cache_slot_select --root "$pool_home/.cache/qontinui-supervisor-ci" \
+            --budget-gib 40 --entry-bound-gib 40 --floor-gib 60 --entry target
+          state="$CI_CACHE_STATE_DIR"
           job_home="$RUNNER_TEMP/home"
           mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
 
@@ -1078,26 +1093,13 @@ jobs:
             echo "CARGO_BUILD_JOBS=$jobs"
             echo "RUST_TEST_THREADS=$threads"
           } >> "$GITHUB_ENV"
-          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this registration's, under $state"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this job's slot ($CI_CACHE_SLOT), under $state"
           echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
 
-          cache="$state/target"
-          mkdir -p "$cache"
-          if ! used_kb=$(du -sk "$cache" 2>/dev/null | cut -f1) || [ -z "$used_kb" ]; then
-            echo "::notice title=persistent target reset::du could not read $cache: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
-          free_kb=$(df -Pk "$cache" | awk 'NR == 2 {print $4}')
-          if [ "$used_kb" -gt $((40 * 1048576)) ] || [ "$free_kb" -lt $((60 * 1048576)) ]; then
-            echo "::notice title=persistent target reset::$((used_kb / 1048576)) GiB used, $((free_kb / 1048576)) GiB free on its filesystem: starting cold"
-            chmod -R u+rwX "${cache:?}" 2>/dev/null || true
-            rm -rf "${cache:?}"
-            mkdir -p "$cache"
-            used_kb=0
-          fi
+          # ci_cache_slot_select already bounded it (unreadable, over its
+          # bound, or under the free-space floor: cold) and created it.
+          cache="$CI_CACHE_ENTRY_DIR"
+          used_kb="$CI_CACHE_ENTRY_USED_KB"
           if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
           ln -sfn "$cache" target
           echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
