@@ -319,12 +319,63 @@ mod tests {
         }
     }
 
+    /// An unheld port a claim can take now: one a bind without `SO_REUSEADDR`
+    /// succeeds on. A fixture port can still be in TIME_WAIT from a server an
+    /// earlier test process ran on it, since every process hands the slots out
+    /// again from the first. TIME_WAIT refuses that bind, though not the bind
+    /// probe or a listener, which both set `SO_REUSEADDR`. Nothing else connects
+    /// to a port this process owns, so one a claim can take now stays that way.
+    fn claimable_unheld_port() -> u16 {
+        loop {
+            let port = unheld_port();
+            if claim_slot(port).is_some() {
+                return port;
+            }
+        }
+    }
+
+    /// Why the claim test takes [`claimable_unheld_port`]: a server's TIME_WAIT
+    /// on a fixture port refuses a claim, while the bind probe still reads the
+    /// port free and a test can still listen on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn time_wait_on_a_fixture_port_refuses_a_claim_but_not_the_probe() {
+        use std::io::Read;
+        let port = claimable_unheld_port();
+        let server = std::net::TcpListener::bind(("127.0.0.1", port)).expect("listen");
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (accepted, _) = server.accept().expect("accept");
+        // The server closes first, so the TIME_WAIT is on its side, on `port`.
+        drop(accepted);
+        let mut rest = Vec::new();
+        client
+            .read_to_end(&mut rest)
+            .expect("read to the server's close");
+        drop(client);
+        drop(server);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while claim_slot(port).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "port {port} never entered TIME_WAIT"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::process::port::is_port_listening(port),
+            "the bind probe must still read port {port} free"
+        );
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("a test can still listen on a port in TIME_WAIT");
+    }
+
     /// The two ways a slot is skipped, and a kept claim, over slots built from
-    /// ports this process owns (six unheld ports, used here as three slots'
-    /// fixture and claim ports), so nothing else on the box can disturb them.
+    /// ports this process owns (six unheld ports a claim can take, used here as
+    /// three slots' fixture and claim ports), so nothing else on the box can
+    /// disturb them.
     #[test]
     fn a_claimed_or_held_slot_is_skipped_and_a_kept_claim_is_never_reused() {
-        let owned: Vec<u16> = (0..6).map(|_| unheld_port()).collect();
+        let owned: Vec<u16> = (0..6).map(|_| claimable_unheld_port()).collect();
         let slots = [
             (owned[0], owned[1]),
             (owned[2], owned[3]),
@@ -404,6 +455,12 @@ mod tests {
     fn no_test_code_binds_port_0_outside_test_ports() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let scans = bind_scan::scan_crate(root);
+        assert!(
+            scans
+                .iter()
+                .any(|(path, binds)| path.starts_with("tests/") && binds.is_some()),
+            "the scan read no file under tests/, so it shows nothing about integration tests"
+        );
         let mut unread = Vec::new();
         let mut outside = Vec::new();
         let mut own: BTreeMap<String, usize> = BTreeMap::new();
@@ -451,9 +508,3 @@ mod tests {
         );
     }
 }
-        assert!(
-            scans
-                .iter()
-                .any(|(path, binds)| path.starts_with("tests/") && binds.is_some()),
-            "the scan read no file under tests/, so it shows nothing about integration tests"
-        );
