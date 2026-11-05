@@ -5450,9 +5450,31 @@ async fn stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::
 /// Whether this error is the kernel refusing to exec the stub copy with ETXTBSY: a
 /// concurrent test's fork can inherit the copy's write descriptor until its exec.
 /// Linux only in practice: no other platform reports this error, so on Windows it
-/// never matches and the held-open door tests' retry is a no-op there.
+/// never matches and the held-open door tests' retry is a no-op there. A restart
+/// returns its start's error marked [`SupervisorError::AfterAct`] (its stop has
+/// already acted), so the marker is looked through: without it a restart that hit
+/// ETXTBSY was never retried and failed under a parallel suite.
 fn is_text_file_busy(err: &SupervisorError) -> bool {
-    matches!(err, SupervisorError::Process(msg) if msg.contains("Text file busy"))
+    match err {
+        SupervisorError::AfterAct(inner) => is_text_file_busy(inner),
+        SupervisorError::Process(msg) => msg.contains("Text file busy"),
+        _ => false,
+    }
+}
+
+/// A restart's ETXTBSY reaches the retry through its `AfterAct` marker.
+#[test]
+fn text_file_busy_is_recognised_through_the_after_act_marker() {
+    let busy =
+        || SupervisorError::Process("Failed to spawn exe: Text file busy (os error 26)".into());
+    assert!(is_text_file_busy(&busy()));
+    assert!(is_text_file_busy(&SupervisorError::AfterAct(Box::new(
+        busy()
+    ))));
+    assert!(!is_text_file_busy(&SupervisorError::AfterAct(Box::new(
+        SupervisorError::Process("Failed to spawn exe: not found".into())
+    ))));
+    assert!(!is_text_file_busy(&SupervisorError::RunnerAlreadyRunning));
 }
 
 /// Wait out that fork, for at most two seconds in all. Every attempt copies the file
