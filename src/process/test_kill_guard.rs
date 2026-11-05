@@ -24,10 +24,12 @@
 //! itself, whose signal would end every test in the binary. A link is proven
 //! when both start times are known and the parent started no later than the
 //! child. A real link always is (both times are floors of one clock), and a
-//! recorded parent pid that now names a later process is not. That can happen
-//! on Windows, which records a process's creator pid and can hand that pid to
-//! a new process once the creator exits. The census itself follows every
-//! link, erring toward over-counting; the guard errs toward refusing.
+//! recorded parent pid that now names a process that started in a later second
+//! is not. That can happen on Windows, which records a process's creator pid
+//! and can hand that pid to a new process once the creator exits. Start times
+//! have one-second resolution, so a pid reused within the child's own second
+//! still reads as its parent. The census itself follows every link, erring
+//! toward over-counting; the guard errs toward refusing.
 //!
 //! - **A pid** absent from the snapshot is allowed: there is nothing to signal
 //!   (it exited between its caller's check and this one). A thread's id is
@@ -103,11 +105,20 @@ const RULE: &str = "a unit test may signal only a process it spawned (a descenda
                     test process), and the guard refuses before any signal is sent (plan \
                     2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy, Phase 4)";
 
-/// Whether `pid` is a strict descendant of this process, read from one
-/// process-table snapshot. False for this process itself, for a pid not in the
-/// table, and when the table cannot be read.
+/// Whether `pid` names a strict descendant of this process, read from one
+/// process-table snapshot. `pid` is judged as the process a signal to it would
+/// reach, as [`assert_may_signal_pid`] judges it, so a thread's id is judged as
+/// its process. False for this process itself and each of its threads, for a
+/// pid not in the table, and when the table cannot be read.
 pub(crate) fn is_descendant_of_this_process(pid: u32) -> bool {
-    snapshot_rows().is_ok_and(|rows| descendants(&rows, std::process::id()).contains(&pid))
+    snapshot_rows().is_ok_and(|rows| is_descendant(&rows, std::process::id(), pid))
+}
+
+/// [`is_descendant_of_this_process`] over `rows`, with `own` as this process.
+fn is_descendant(rows: &[ProcRow], own: u32, pid: u32) -> bool {
+    let descendants = descendants(rows, own);
+    let process = process_of(rows, pid);
+    !process.is_empty() && process.iter().all(|row| descendants.contains(&row.pid))
 }
 
 /// Panic, before any signal is sent, unless a signal to `pid` reaches only a
@@ -180,7 +191,12 @@ impl fmt::Display for Target {
 
 /// The strict descendants of `own` in `rows`, by proven parent links only: a
 /// row keeps its parent link when both start times are known and the parent
-/// started no later than the row, and loses it otherwise.
+/// started no later than the row, and loses it when either is unknown or the
+/// parent started in a later second. Start times are whole seconds, so a parent
+/// pid reused by a process that started in the row's own second keeps the link.
+///
+/// Thread rows stay: a group signal reaches a descendant's threads, which are
+/// rows of their own in the group, and they are judged as descendants here.
 fn descendants(rows: &[ProcRow], own: u32) -> HashSet<u32> {
     let start_of: HashMap<u32, u64> = rows.iter().map(|r| (r.pid, r.start_time_secs)).collect();
     let proven: Vec<ProcRow> = rows
@@ -188,6 +204,7 @@ fn descendants(rows: &[ProcRow], own: u32) -> HashSet<u32> {
         .map(|row| ProcRow {
             ppid: row.ppid.filter(|ppid| {
                 let parent = start_of.get(ppid).copied().unwrap_or(0);
+                // Both in whole seconds: only a later second disproves a link.
                 parent != 0 && row.start_time_secs != 0 && parent <= row.start_time_secs
             }),
             ..row.clone()

@@ -335,22 +335,35 @@ fn a_stale_parent_link_does_not_make_a_descendant_and_refuses_a_tree() {
     assert_eq!(table.decide(Target::Tree(101)), None, "a clean tree");
 }
 
-/// The guard proves every parent link: a parent that started after its row,
-/// however briefly, or a start time it cannot read, is no link, although the
-/// census follows both.
+/// The guard proves every parent link: a parent that started in a later second
+/// than its row, or a start time it cannot read, is no link, although the
+/// census follows both. Start times are whole seconds, so a parent that started
+/// in its row's own second is a link.
 #[test]
 fn an_unproven_parent_link_does_not_make_a_descendant() {
     let mut table = table();
     // pid 102's process started at 21: one that "started" at 18 cannot be its
     // child, only an orphan its reused pid now names.
-    table.push(row(401, Some(102), "orphan-inside-the-skew", 18), None);
+    table.push(
+        row(401, Some(102), "orphan-started-before-its-parent", 18),
+        None,
+    );
     table.push(row(402, Some(102), "orphan-of-unknown-age", 0), None);
     for (pid, name) in [
-        (401, "orphan-inside-the-skew"),
+        (401, "orphan-started-before-its-parent"),
         (402, "orphan-of-unknown-age"),
     ] {
         let refused = table
             .decide(Target::Pid(pid))
+
+    // One that started in pid 102's own second reads as its child: the clock
+    // cannot tell the two apart.
+    table.push(row(403, Some(102), "child-in-its-parents-second", 21), None);
+    assert_eq!(
+        table.decide(Target::Pid(403)),
+        None,
+        "a child started in its parent's second"
+    );
             .unwrap_or_else(|| panic!("{name} allowed"));
         assert!(refused.contains(&format!("(/bin/{name})")), "{refused}");
     }
@@ -373,6 +386,64 @@ fn a_thread_is_judged_as_its_process() {
         .decide(Target::Pid(150))
         .expect("a thread of the test is the test");
     assert!(
+/// The predicate judges a pid as the guard does, a thread's id as its process:
+/// a thread of the test is not its descendant, though the thread's row is the
+/// test's child, and a thread of a descendant is that descendant.
+#[test]
+fn the_predicate_judges_a_thread_as_its_process() {
+    let mut table = table();
+    let own = table.find(OWN);
+    let stub = table.find(101);
+    table.push(thread_of(150, &own), Some(50));
+    table.push(thread_of(151, &stub), Some(50));
+    for (pid, descends, what) in [
+        (150, false, "a thread of the test"),
+        (151, true, "a thread of a child"),
+        (101, true, "a child"),
+        (103, true, "a grandchild"),
+        (OWN, false, "the test itself"),
+        (200, false, "a process the test did not spawn"),
+        (999, false, "a pid absent from the table"),
+    ] {
+        assert_eq!(
+            is_descendant(&table.rows, OWN, pid),
+            descends,
+            "{what} ({pid})"
+        );
+    }
+}
+
+/// On the real table: a thread of this test is not its descendant. sysinfo
+/// lists a Linux thread as a row parented to its process, so by its own row the
+/// thread would read as the test's child.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_of_this_test_is_not_its_descendant() {
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: `gettid` takes no argument and touches no memory.
+        let tid = unsafe { libc::gettid() };
+        tid_tx
+            .send(u32::try_from(tid).expect("a positive thread id"))
+            .expect("send the thread id");
+        let _ = done_rx.recv();
+    });
+    let tid = tid_rx.recv().expect("the thread's id");
+    let listed = snapshot_rows().is_ok_and(|rows| rows.iter().any(|r| r.pid == tid && r.thread));
+    let descends = is_descendant_of_this_process(tid);
+    drop(done_tx);
+    thread.join().expect("the thread ends");
+    assert!(
+        listed,
+        "the table lists thread {tid} as a thread row, or this test proves nothing"
+    );
+    assert!(
+        !descends,
+        "a thread of this test ({tid}) is the test, not its descendant"
+    );
+}
+
         refused.contains("reaches pid 100 (/bin/test-binary)"),
         "{refused}"
     );
