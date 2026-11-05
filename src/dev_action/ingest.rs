@@ -83,7 +83,17 @@ const INGEST_TIMEOUT_SECS: u64 = 5;
 /// Epoch 6: a held-open door's `Ran` is held to the same spawn, as of when the port
 /// answered (`dev_action::run_result::held_to_own_boot`). A row stamped 5 can still
 /// read a crashed boot as up, when a respawn answered inside a held-open wait.
-pub const ATTRIBUTION_EPOCH: u32 = 6;
+///
+/// Epoch 7 (#292, S3): a `restart` that ran the last-known-good exe is re-keyed to
+/// `restart_lkg`, so a `restart` row stamped 7 is a restart of the fresh exe. A row
+/// stamped 6 or below can be either: the LKG route was pooled into `restart`, which
+/// credits the LKG exe's clean boots to "restart under these states" (the
+/// performativity the kind split removes). One exception at 7: while coord still
+/// refuses `restart_lkg`, an LKG restart is resent as `restart` carrying
+/// `metadata.refused_kind: "restart_lkg"`, which a reader that keeps the two apart
+/// must exclude from `restart`. #292 landed still stamping 6, so a 6 from a build
+/// containing it carries the split too; a row stamped 7 always does.
+pub const ATTRIBUTION_EPOCH: u32 = 7;
 
 /// The snapshot `metadata` this build stamps on every row, so a row names the
 /// code that attributed it: `supervisor_build_sha` and `supervisor_build_dirty`
@@ -423,9 +433,10 @@ mod tests {
         assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
         // Epoch 1 is the unstamped pre-fix rows, 2 can carry semantics from before
         // #272, 3 reads a detached verdict off the port, 4 can close `confirmed` on a
-        // report it could not place, and 5 reads a held-open verdict off the port. A
-        // constant, so it is checked at compile time.
-        const _: () = assert!(ATTRIBUTION_EPOCH >= 6);
+        // report it could not place, 5 reads a held-open verdict off the port, and 6
+        // pools LKG-routed restarts into `restart`. A constant, so it is checked at
+        // compile time.
+        const _: () = assert!(ATTRIBUTION_EPOCH >= 7);
         assert_eq!(
             json["metadata"]["supervisor_build_sha"],
             serde_json::Value::from(crate::self_provenance::built_from_sha()),
