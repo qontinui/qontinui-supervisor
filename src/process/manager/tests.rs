@@ -3316,10 +3316,10 @@ fn port_held_by_live_runner_truth_table() {
 /// Negative branch, end to end: a listener on an ephemeral port that is
 /// NOT a runner does not trigger the refusal. The test process holds the
 /// listener (which the Unix `lsof` probe excludes by PID, so the probe
-/// reports no holder) and a spawned `sleep` child stands in for "a live
-/// process that is not a qontinui-runner" — `is_qontinui_runner_pid` is
-/// false for it, which is the identity half of the same predicate. A
-/// dead port is the trivially-allowed case.
+/// reports no holder) and a spawned child that lives until this test ends it
+/// stands in for "a live process that is not a qontinui-runner" —
+/// `is_qontinui_runner_pid` is false for it, which is the identity half of the
+/// same predicate. A dead port is the trivially-allowed case.
 #[tokio::test]
 async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
     let (listener, port) = crate::test_ports::held_ephemeral_listener();
@@ -3328,15 +3328,14 @@ async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
         "the bind probe must see our own listener"
     );
 
-    let mut sleeper = tokio::process::Command::new("sleep")
-        .arg("30")
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn sleep");
-    let sleep_pid = sleeper.id().expect("sleep has a pid");
+    let (mut child, child_pid) = spawn_a_child_that_exits_when_its_stdin_closes();
     assert!(
-        !crate::process::proc_kill::is_qontinui_runner_pid(sleep_pid),
-        "`sleep` must not read as a qontinui-runner image"
+        crate::process::proc_kill::pid_alive(child_pid),
+        "the fixture: the child is alive"
+    );
+    assert!(
+        !crate::process::proc_kill::is_qontinui_runner_pid(child_pid),
+        "the shell must not read as a qontinui-runner image"
     );
 
     match refuse_if_port_held_by_live_runner(port).await {
@@ -3348,7 +3347,7 @@ async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
     }
 
     drop(listener);
-    let _ = sleeper.kill().await;
+    let _ = child.kill().await;
 
     // A port nothing holds is allowed without consulting any probe.
     let dead_port = crate::test_ports::unheld_port();
@@ -5387,23 +5386,83 @@ async fn a_runner_that_never_answered_is_alerted_and_called_adopted_only_when_it
 }
 
 /// What a stub process runs: a builtin wait, so its image stays the stub's own and
-/// its process satisfies a stop's image check. It ends itself after a minute, so a
-/// failed test leaks nothing for long.
+/// its process satisfies a stop's image check. It waits for end of file on its
+/// test's lifeline ([`StubRoot`], named by `STUB_LIFELINE`), so it lives until its
+/// test ends it, however long the test is held up, and ends by itself once the test
+/// drops its fixture or the test process exits.
 #[cfg(unix)]
-const STUB_ENV_SCRIPT: &str = "read -t 60 <> <(:)\nexit 0\n";
+const STUB_ENV_SCRIPT: &str = "read -r unused <\"$STUB_LIFELINE\"\nexit 0\n";
+
+/// A stub test's tempdir and the lifeline of every stub process it starts: a FIFO
+/// in the tempdir that this value holds open, and nothing writes to. A stub reads it
+/// until end of file ([`STUB_ENV_SCRIPT`]), which comes only when this value is
+/// dropped, at the end of the test that holds it, or when the test process exits.
+#[cfg(unix)]
+struct StubRoot {
+    /// Declared first, so it is removed before the lifeline's writer closes: a stub
+    /// that opens the lifeline later finds no FIFO and exits, rather than wait for
+    /// a writer that will never come.
+    dir: tempfile::TempDir,
+    lifeline: std::path::PathBuf,
+    /// Never read: holding it open is what keeps every stub reading.
+    _writer: std::fs::File,
+}
+
+#[cfg(unix)]
+impl StubRoot {
+    fn new(dir: tempfile::TempDir) -> Self {
+        let lifeline = dir.path().join("stub-lifeline");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&lifeline)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {lifeline:?}: {made}");
+        // Read and write: opened for writing alone, a FIFO waits for a reader.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lifeline)
+            .expect("hold the stubs' lifeline open");
+        Self {
+            dir,
+            lifeline,
+            _writer: writer,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    fn lifeline(&self) -> &std::path::Path {
+        &self.lifeline
+    }
+
+    /// The variable a stub reads its lifeline's path from, beside `BASH_ENV`.
+    fn lifeline_env(&self) -> (String, String) {
+        (
+            "STUB_LIFELINE".to_string(),
+            self.lifeline().display().to_string(),
+        )
+    }
+}
 
 /// A primary whose exe is a stub, so a test drives a real successful start. The
 /// stub is a copy of bash, with `BASH_ENV` holding the script, since a runner is
 /// spawned with no arguments. A script with a shebang would not do: its image is
 /// the interpreter, which no stop's image check can match with the runner's copy.
 #[cfg(unix)]
-async fn stub_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+async fn stub_primary() -> (SharedState, Arc<ManagedRunner>, StubRoot) {
     let (state, root) = armed_state();
+    let root = StubRoot::new(root);
     let stub = root.path().join("stub-runner");
     std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
     let script = root.path().join("stub-runner.env");
     std::fs::write(&script, STUB_ENV_SCRIPT).expect("write the stub's script");
-    let env = [("BASH_ENV".to_string(), script.display().to_string())];
+    let env = [
+        ("BASH_ENV".to_string(), script.display().to_string()),
+        root.lifeline_env(),
+    ];
     let managed = register_armed_primary(&state, env.into_iter().collect()).await;
     *managed.source_exe_override.write().await = Some(stub);
     (state, managed, root)
@@ -5902,6 +5961,7 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         let script = root.path().join("stub-runner.env");
+        let (lifeline_key, lifeline) = root.lifeline_env();
         async move {
             let id = managed.config.id.clone();
             start_managed_runner(&state, &managed, None, StartAs::Registered)
@@ -5909,14 +5969,22 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
                 .expect("the stub starts");
             the_health_cache_clears_a_booting_primary(&managed).await;
 
+            // A process of the stub on the same lifeline, so it lives until this
+            // test ends it: once the stop begins, only a signal ends it.
             let copy = state.config.runner_exe_copy_path(&managed.config);
             let mut bystander = tokio::process::Command::new(&copy)
                 .env("BASH_ENV", &script)
+                .env(lifeline_key, lifeline)
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn a second process of the exe copy");
 
+            assert!(
+                matches!(bystander.try_wait(), Ok(None)),
+                "the fixture: the bystander was dead before the stop began, so this run \
+                 proves nothing"
+            );
             stop_runner_by_id(&state, &id, false, CloseIntent::Kill)
                 .await
                 .expect("the stop succeeds");
@@ -5933,7 +6001,8 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
 }
 
 /// A temp runner whose exe is `stub_primary`'s stub: a copy of bash, running
-/// `STUB_ENV_SCRIPT` from `BASH_ENV`. A temp runner because no spawn path wraps one
+/// `STUB_ENV_SCRIPT` from `BASH_ENV` on the returned [`StubRoot`]'s lifeline, so the
+/// stub lives until its test ends it. A temp runner because no spawn path wraps one
 /// in `systemd-run`, so on any box its start's own spawn is the exec a test reads.
 /// Its `DISPLAY` only satisfies a Linux temp start's display check; the stub opens
 /// no window. A fresh device identity, so its home is provisioned with no device
@@ -5947,8 +6016,9 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
 /// GET (`env_forwarders::WindowPositionEnv`, which asks the registered primary) is
 /// refused at once instead of asking whatever primary runner serves 9876.
 #[cfg(target_os = "linux")]
-async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, StubRoot) {
     let (mut config, root) = crate::config::config_over_an_empty_runner_tree();
+    let root = StubRoot::new(root);
     let refused = crate::test_ports::reserve_refused_port();
     for primary in config.runners.iter_mut().filter(|r| r.kind().is_primary()) {
         primary.port = refused;
@@ -5973,6 +6043,7 @@ async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempD
         external_restate_ingress_url: None,
         extra_env: [
             ("BASH_ENV".to_string(), script.display().to_string()),
+            root.lifeline_env(),
             ("DISPLAY".to_string(), ":0".to_string()),
         ]
         .into_iter()
@@ -5992,14 +6063,14 @@ async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempD
 /// fresh inode, so its exec is not refused. With the copy written in place, onto the
 /// held inode, the start fails `Failed to spawn exe: Text file busy (os error 26)`.
 ///
-/// The holder is a process of its own, `sh -c 'exec 3>>"$1"; exec sleep 60'`, not a
-/// fork of this test binary parked before its exec, which would inherit every
+/// The holder is a process of its own, `sh -c 'exec 3>>"$1"; read -r unused <"$2"'`,
+/// not a fork of this test binary parked before its exec, which would inherit every
 /// descriptor open at that moment, other tests' listeners and pipe ends included. It
-/// holds the descriptor until the test ends it, and the test reads `/proc/<pid>/fd/3`
-/// before the start and again after it: a holder that let go before the exec makes
-/// the run prove nothing, so that run fails. The start can spend seconds between its
-/// copy and its exec (a temp start asks the primary for a window placement, for up
-/// to 3 s), so the 60 s sleep only bounds a holder that a killed test binary leaks.
+/// waits on the stub's lifeline ([`StubRoot`]), so it holds the descriptor until the
+/// test ends it, however long the start takes (a temp start can spend seconds between
+/// its copy and its exec asking the primary for a window placement, and longer on a
+/// loaded box). The test reads `/proc/<pid>/fd/3` before the start and again after it:
+/// a holder that let go before the exec makes the run prove nothing, so that run fails.
 ///
 /// Its body and its cleanup enter this plan's changes only through
 /// `start_managed_runner`, the door every start takes: the cleanup ends the stub by
@@ -6015,13 +6086,15 @@ async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked
     let (state, managed, tempdir) = stub_temp_runner().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
+        let lifeline = tempdir.lifeline().to_path_buf();
         async move {
             let copy = state.config.runner_exe_copy_path(&managed.config);
             std::fs::create_dir_all(copy.parent().expect("the copy's dir"))
                 .expect("create the copy's dir");
             let mut holder = tokio::process::Command::new("sh")
-                .args(["-c", r#"exec 3>>"$1"; exec sleep 60"#, "sh"])
+                .args(["-c", r#"exec 3>>"$1"; read -r unused <"$2""#, "sh"])
                 .arg(&copy)
+                .arg(&lifeline)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -6262,21 +6335,13 @@ fn build_tree_from_working_tree_maps_the_wire_bool() {
 
 /// The orphaned-postmaster stop never kills a process running an executable
 /// outside the instance root — a recycled PID in a stale `postmaster.pid`.
-/// The PID is a `sleep` child this test owns (never the test process itself),
-/// whose image lies outside the tempdir root: the verdict must be a refusal and
-/// the child must still be alive.
+/// The PID is a child this test owns (never the test process itself), which
+/// lives until the test drops it and whose image lies outside the tempdir root:
+/// the verdict must be a refusal and the child must still be alive.
 #[cfg(unix)]
 #[tokio::test]
 async fn orphaned_postmaster_stop_refuses_a_pid_outside_the_root() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    let _reap = scopeguard::guard((), |()| {
-        let _ = child.kill();
-        let _ = child.wait();
-    });
+    let (_child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
     assert!(
         crate::process::proc_kill::pid_exe_path(pid).await.is_some(),
         "precondition: the child's image path must be readable, or the identity check is \
@@ -7207,24 +7272,21 @@ fn the_wedged_line_says_what_the_serving_arm_decided() {
 /// the kill guard panics there before any signal: the orphan lives. With the guard
 /// gone the stop kills the orphan and returns, and this test fails on both counts.
 ///
-/// The orphan (`test_kill_guard::Orphan`) is `sh`'s background `sleep` on
-/// Unix and `cmd /c start /b`'s `ping` on Windows: alive, this user's, and reparented
-/// away from (Unix) or left with a dead parent pid by (Windows) this process. The
-/// runner is named and unprotected on a port nothing holds, so the readiness gate
-/// skips, the close-request is refused at once, and the ladder's first kill is the
-/// registry pid's, which no image check stands in front of. The test ends the
-/// orphan itself, directly and only while its pid still names it, never through
-/// a guarded primitive.
+/// The orphan (`test_kill_guard::Orphan`) is `sh`'s background `cat` on Unix and
+/// `cmd /c start /b`'s `ping` on Windows: alive, this user's, and reparented away
+/// from (Unix) or left with a dead parent pid by (Windows) this process. It lives
+/// until this test ends it, however long the test is held up, so the fixture is
+/// read at the moment of the stop: an orphan dead by then fails as the fixture, and
+/// one dead after the stop was signalled. The runner is named and unprotected on a
+/// port nothing holds, so the readiness gate skips, the close-request is refused at
+/// once, and the ladder's first kill is the registry pid's, which no image check
+/// stands in front of. The test ends the orphan itself, directly and only while its
+/// pid still names it, never through a guarded primitive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
     use crate::process::test_kill_guard;
     let orphan_process = test_kill_guard::Orphan::spawn();
     let orphan = orphan_process.pid;
-    assert!(
-        crate::process::proc_kill::pid_alive(orphan)
-            && !test_kill_guard::is_descendant_of_this_process(orphan),
-        "the fixture: an orphan {orphan} that is alive and not this test's descendant"
-    );
 
     let (state, _root) = restart_test_state();
     let id = "named-kill-guard-arming";
@@ -7235,6 +7297,15 @@ async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
         runner.running = true;
     }
 
+    assert!(
+        !test_kill_guard::is_descendant_of_this_process(orphan),
+        "the fixture: the orphan {orphan} is this test's descendant"
+    );
+    assert!(
+        crate::process::proc_kill::pid_alive(orphan),
+        "the fixture: the orphan {orphan} was dead before the stop began, so this run \
+         proves nothing"
+    );
     let stop = tokio::spawn({
         let state = state.clone();
         async move { stop_runner_by_id(&state, id, true, CloseIntent::Kill).await }
@@ -7253,7 +7324,7 @@ async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
         }
         other => panic!(
             "the stop must panic in the kill guard before it signals pid {orphan}, but it \
-             returned {other:?} (the orphan is {})",
+             returned {other:?} (the orphan, alive when the stop began, is {})",
             if alive_after {
                 "alive"
             } else {

@@ -129,8 +129,6 @@ tokio = { version = "1", features = ["test-util"] }
 # unlocks the dev-only `util::ServiceExt` import. Used by the synthetic
 # build-id injection endpoint tests.
 tower = { version = "0.5", features = ["util"] }
-# Used for env-override scoping in tests.
-scopeguard = "1.2"
 
 # Unix process-kill primitives (kill_by_pid / kill_by_port / process-group
 # tree-kill) used by the reaper, stop path, and first-healthy watchdog so a

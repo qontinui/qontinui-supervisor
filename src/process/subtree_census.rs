@@ -528,16 +528,25 @@ mod tests {
     }
 
     /// The registry-root census of a live process with one non-`claude`
-    /// child walks at least the root plus that child and reads `Idle`.
+    /// child walks at least the root plus that child and reads `Idle`. The child
+    /// waits on its stdin, which this test holds, so it lives until the test
+    /// ends it, however long the census takes.
     #[test]
-    fn census_of_own_process_with_a_sleep_child_is_idle() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
+    fn census_of_own_process_with_a_shell_child_is_idle() {
+        #[cfg(unix)]
+        let mut command = Command::new("sh");
+        #[cfg(unix)]
+        command.args(["-c", "read unused"]);
+        #[cfg(windows)]
+        let mut command = Command::new("cmd");
+        #[cfg(windows)]
+        command.args(["/C", "set /p unused="]);
+        let mut child = command
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn a shell that waits on its stdin");
         let child_pid = child.id();
 
         let census = take_census(std::process::id(), None).expect("census of own pid");
@@ -549,7 +558,7 @@ mod tests {
         assert_eq!(census.root_source, RootSource::Registry);
         assert!(
             census.walked >= 2,
-            "expected the root and at least the sleep child {child_pid}, walked {}",
+            "expected the root and at least the shell child {child_pid}, walked {}",
             census.walked
         );
         assert_eq!(census.verdict(), CensusVerdict::Idle);

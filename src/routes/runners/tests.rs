@@ -3513,8 +3513,11 @@ async fn call_restart_route(
 #[cfg(unix)]
 #[tokio::test]
 async fn handoff_restart_route_forwards_the_intent_to_the_runner() {
-    let child = tokio::process::Command::new("sleep")
-        .arg("60")
+    // The stand-in waits on its stdin, which the handle holds, so it lives until
+    // the fake runner kills it, or the test drops it, however long the test takes.
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", "read unused"])
+        .stdin(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn stand-in runner process");

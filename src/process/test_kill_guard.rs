@@ -313,29 +313,58 @@ fn refusal(
 }
 
 /// A process this test made but is not the parent of, for a test that needs
-/// one: alive, this user's, and not a descendant. Dropping it ends it
-/// ([`Orphan::end`]), directly and never through a guarded primitive, which
-/// would refuse.
+/// one: alive, this user's, and not a descendant. It lives until its test ends
+/// it, however long the test is held up, so a test that finds it dead may read
+/// that as a signal's work. Dropping it ends it ([`Orphan::end`]), directly and
+/// never through a guarded primitive, which would refuse.
 ///
-/// Unix: `sh` starts `sleep` in the background, prints its pid and exits, so
-/// `sleep` is reparented away from this process. Windows: `cmd /c start /b`
-/// starts `ping` and exits, and the orphan is the `ping` whose recorded parent
-/// pid is still that exited `cmd`'s (Windows records a process's creator pid
-/// and does not rewrite it).
+/// Unix: `sh` starts `cat` in the background, prints its pid and exits, so `cat`
+/// is reparented away from this process. `cat` reads a pipe whose one write end
+/// this value holds (its lifeline), until end of file. That comes only when the
+/// value is dropped or this test process exits, so an orphan `end` did not
+/// signal, or one whose test binary was killed, goes with it.
+///
+/// Windows: `cmd /c start /b` starts `ping` for an hour and exits, and the
+/// orphan is the `ping` whose recorded parent pid is still that exited `cmd`'s
+/// (Windows records a process's creator pid and does not rewrite it). An hour
+/// outlasts any hold-up. A killed test binary leaks it for that hour, because
+/// no lane here runs the Windows arm to show a handle-held lifetime through
+/// `start /b` works.
 pub(crate) struct Orphan {
     pub(crate) pid: u32,
     /// Its start time when it was made, so [`Orphan::end`] signals the pid only
     /// while it still names this process: once the orphan has exited, the pid
     /// can be reused by a process this test never made.
     start_time_secs: Option<u64>,
+    /// Unix: the write end of the pipe the orphan reads, which it lives for.
+    /// `None` for a record of a process this test holds some other way. Never
+    /// read: holding it is the point, and dropping it closes it.
+    #[cfg(unix)]
+    _lifeline: Option<std::io::PipeWriter>,
 }
 
 impl Orphan {
     pub(crate) fn spawn() -> Self {
-        let pid = spawn_orphan_pid();
+        #[cfg(unix)]
+        let (pid, lifeline) = spawn_orphan();
+        #[cfg(windows)]
+        let pid = spawn_orphan();
         Self {
             pid,
             start_time_secs: crate::process::temp_runner_ledger::process_start_time_secs(pid),
+            #[cfg(unix)]
+            _lifeline: Some(lifeline),
+        }
+    }
+
+    /// A record of `pid` as an orphan that started at `start_time_secs`, for a
+    /// test of [`Orphan::end`] over a process the test holds itself.
+    fn record(pid: u32, start_time_secs: Option<u64>) -> Self {
+        Self {
+            pid,
+            start_time_secs,
+            #[cfg(unix)]
+            _lifeline: None,
         }
     }
 
@@ -371,46 +400,52 @@ impl Drop for Orphan {
     }
 }
 
+/// Start the orphan process (see [`Orphan`]) and return its pid and the write
+/// end of the pipe it lives for. `sh` keeps its stdin, the pipe, as fd 3 and
+/// hands that to `cat`: a background job's stdin is `/dev/null` unless the job
+/// redirects it.
+#[cfg(unix)]
+fn spawn_orphan() -> (u32, std::io::PipeWriter) {
+    let (reader, writer) = std::io::pipe().expect("a pipe for the orphan's lifeline");
+    let out = std::process::Command::new("sh")
+        .args(["-c", "exec 3<&0; cat <&3 >/dev/null 2>&1 & echo $!"])
+        .stdin(reader)
+        .output()
+        .expect("run sh to start the orphan");
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("sh printed the orphan's pid");
+    (pid, writer)
+}
+
 /// Start the orphan process (see [`Orphan`]) and return its pid.
-fn spawn_orphan_pid() -> u32 {
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("sh")
-            .args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"])
-            .output()
-            .expect("run sh to start the orphan");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("sh printed the orphan's pid")
-    }
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("cmd")
-            .args(["/c", "start", "/b", "ping", "-n", "60", "127.0.0.1"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("run cmd to start the orphan");
-        let cmd_pid = cmd.id();
-        let status = cmd.wait().expect("wait for cmd");
-        assert!(status.success(), "cmd /c start failed: {status:?}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let rows = snapshot_rows().expect("a process table");
-            if let Some(ping) = rows
-                .iter()
-                .find(|r| r.name.eq_ignore_ascii_case("ping.exe") && r.ppid == Some(cmd_pid))
-            {
-                return ping.pid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the orphaned ping never appeared"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
+#[cfg(windows)]
+fn spawn_orphan() -> u32 {
+    let mut cmd = std::process::Command::new("cmd")
+        .args(["/c", "start", "/b", "ping", "-n", "3600", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run cmd to start the orphan");
+    let cmd_pid = cmd.id();
+    let status = cmd.wait().expect("wait for cmd");
+    assert!(status.success(), "cmd /c start failed: {status:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let rows = snapshot_rows().expect("a process table");
+        if let Some(ping) = rows
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case("ping.exe") && r.ppid == Some(cmd_pid))
+        {
+            return ping.pid;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the orphaned ping never appeared"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

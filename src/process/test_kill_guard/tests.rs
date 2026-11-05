@@ -9,18 +9,20 @@ use std::path::{Path, PathBuf};
 
 // --- the predicate, on the real process table -------------------------------
 
-/// A process that runs for half a minute unless killed: this test's own child.
+/// This test's own child, which runs until the test ends it: it waits for end of
+/// file on its stdin, whose write end the returned handle holds, so only a kill,
+/// or dropping that stdin, ends it, however long the test is held up.
 fn a_child() -> std::process::Child {
     #[cfg(unix)]
-    let mut command = std::process::Command::new("sleep");
+    let mut command = std::process::Command::new("sh");
     #[cfg(unix)]
-    command.arg("30");
+    command.args(["-c", "read unused"]);
     #[cfg(windows)]
-    let mut command = std::process::Command::new("ping");
+    let mut command = std::process::Command::new("cmd");
     #[cfg(windows)]
-    command.args(["-n", "30", "127.0.0.1"]);
+    command.args(["/C", "set /p unused="]);
     command
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -79,12 +81,8 @@ fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
     // A record of another process that once had this pid: left alone. A
     // signalled child is not marked exited the instant the kill returns, so
     // it is watched for a second: a SIGKILL lands well inside that, and the
-    // spared child is a 30 s sleep.
-    Orphan {
-        pid,
-        start_time_secs: started.map(|s| s.saturating_sub(3600)),
-    }
-    .end();
+    // spared child lives until this test ends it.
+    Orphan::record(pid, started.map(|s| s.saturating_sub(3600))).end();
     let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let mut spared = true;
     while spared && std::time::Instant::now() < watch_until {
@@ -93,11 +91,7 @@ fn an_orphan_is_ended_only_while_its_pid_still_names_it() {
     }
 
     // A record of this process: ended.
-    Orphan {
-        pid,
-        start_time_secs: started,
-    }
-    .end();
+    Orphan::record(pid, started).end();
     let ended = child.wait().map(|status| !status.success());
     assert!(spared, "a pid that names another process is not signalled");
     assert!(
@@ -355,6 +349,12 @@ fn an_unproven_parent_link_does_not_make_a_descendant() {
     ] {
         let refused = table
             .decide(Target::Pid(pid))
+            .unwrap_or_else(|| panic!("{name} allowed"));
+        assert!(refused.contains(&format!("(/bin/{name})")), "{refused}");
+    }
+    // The census walks both, as it walks every recorded link.
+    let walked = inclusive_subtree(102, &table.rows);
+    assert!(walked.contains(&401) && walked.contains(&402), "{walked:?}");
 
     // One that started in pid 102's own second reads as its child: the clock
     // cannot tell the two apart.
@@ -364,12 +364,6 @@ fn an_unproven_parent_link_does_not_make_a_descendant() {
         None,
         "a child started in its parent's second"
     );
-            .unwrap_or_else(|| panic!("{name} allowed"));
-        assert!(refused.contains(&format!("(/bin/{name})")), "{refused}");
-    }
-    // The census walks both, as it walks every recorded link.
-    let walked = inclusive_subtree(102, &table.rows);
-    assert!(walked.contains(&401) && walked.contains(&402), "{walked:?}");
 }
 
 /// A signal to a thread's id reaches its whole process, so a thread is judged
@@ -386,6 +380,12 @@ fn a_thread_is_judged_as_its_process() {
         .decide(Target::Pid(150))
         .expect("a thread of the test is the test");
     assert!(
+        refused.contains("reaches pid 100 (/bin/test-binary)"),
+        "{refused}"
+    );
+    assert_eq!(table.decide(Target::Pid(151)), None, "a thread of a child");
+}
+
 /// The predicate judges a pid as the guard does, a thread's id as its process:
 /// a thread of the test is not its descendant, though the thread's row is the
 /// test's child, and a thread of a descendant is that descendant.
@@ -442,12 +442,6 @@ fn a_thread_of_this_test_is_not_its_descendant() {
         !descends,
         "a thread of this test ({tid}) is the test, not its descendant"
     );
-}
-
-        refused.contains("reaches pid 100 (/bin/test-binary)"),
-        "{refused}"
-    );
-    assert_eq!(table.decide(Target::Pid(151)), None, "a thread of a child");
 }
 
 // --- the tripwire: every signal call site sits in a guarded primitive -------
