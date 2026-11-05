@@ -61,13 +61,20 @@ pub const PID_REUSE_SKEW_SECS: u64 = 5;
 
 /// One row of a process-table snapshot, in the shape the pure layer walks.
 ///
-/// Built from `sysinfo::Process` by [`take_census`]; hand-built by tests.
+/// Built from `sysinfo::Process` by [`snapshot_rows`]; hand-built by tests.
+/// On Linux sysinfo lists every thread as a row too, parented to its process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcRow {
     pub pid: u32,
     /// Parent PID, `None` when the platform could not resolve one (the init
     /// process, or a permission-denied `/proc` entry).
     pub ppid: Option<u32>,
+    /// Process group id: `getpgid(2)` on Unix, the same value as field 5 of
+    /// Linux's `/proc/<pid>/stat`. `None` on Windows, which has no process
+    /// groups in this sense, and for a process that exited before it was read.
+    /// The unit-test kill guard (`process::test_kill_guard`) reads it to judge
+    /// a group signal.
+    pub pgrp: Option<u32>,
     /// The process's image name as the platform reports it (`comm` on Linux,
     /// the image file name on Windows). Used only when `exe` is unresolved.
     pub name: String,
@@ -311,6 +318,8 @@ fn is_claude_image(row: &ProcRow) -> bool {
 /// with no root must never be representable as `Idle`, which is why this
 /// returns a `Result` rather than an empty census. When `reference_unix_secs`
 /// is given, the PID-reuse guard runs on the root first (`Err(RootReused)`).
+///
+/// The walk is [`inclusive_subtree`].
 pub fn census_from_snapshot(
     root_pid: u32,
     procs: &[ProcRow],
@@ -341,9 +350,56 @@ pub fn census_from_snapshot(
         }
     };
 
+    let subtree = inclusive_subtree(root_pid, procs);
+    let mut live: Vec<CensusEntry> = subtree
+        .iter()
+        .filter_map(|pid| by_pid.get(pid))
+        .filter(|row| is_claude_image(row))
+        .map(|row| CensusEntry {
+            pid: row.pid,
+            name: row.name.clone(),
+            exe: row.exe.clone(),
+        })
+        .collect();
+    live.sort_by_key(|e| e.pid);
+
+    Ok(ClaudeCensus {
+        root_pid,
+        root_source,
+        walked: subtree.len(),
+        live,
+        pid_reuse_guard,
+    })
+}
+
+/// The pids of `root`'s inclusive subtree over `rows`: `root` and every row
+/// that descends from it by parent links, in BFS order, children in ascending
+/// pid order, so the result does not depend on the snapshot's map order.
+///
+/// - A visited set guards against a malformed table (a pid listed as its own
+///   ancestor) looping forever.
+/// - An edge is followed only when it can be a real parent link: a row whose
+///   parent started more than [`PID_REUSE_SKEW_SECS`] after the row itself did
+///   not come from that parent. Windows keeps an orphan's parent pid after the
+///   parent exits, so a later process that reuses the pid would otherwise
+///   inherit the orphan as a child. A start time of `0` (unknown) on either
+///   side keeps the edge, the census's over-count direction.
+///
+/// [`census_from_snapshot`] counts `claude` images over it, and the unit-test
+/// kill guard (`process::test_kill_guard`) asks it whether a pid descends
+/// from the test process.
+pub(crate) fn inclusive_subtree(root: u32, rows: &[ProcRow]) -> Vec<u32> {
+    let start_of: HashMap<u32, u64> = rows.iter().map(|r| (r.pid, r.start_time_secs)).collect();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for row in procs {
-        if let Some(ppid) = row.ppid {
+    for row in rows {
+        let Some(ppid) = row.ppid else {
+            continue;
+        };
+        let parent_start = start_of.get(&ppid).copied().unwrap_or(0);
+        let reused_parent = parent_start != 0
+            && row.start_time_secs != 0
+            && parent_start > row.start_time_secs.saturating_add(PID_REUSE_SKEW_SECS);
+        if !reused_parent {
             children.entry(ppid).or_default().push(row.pid);
         }
     }
@@ -352,42 +408,23 @@ pub fn census_from_snapshot(
         kids.dedup();
     }
 
-    let mut queue: VecDeque<u32> = VecDeque::from([root_pid]);
-    let mut visited: HashSet<u32> = HashSet::from([root_pid]);
-    let mut walked = 0usize;
-    let mut live: Vec<CensusEntry> = Vec::new();
-
+    let mut order = Vec::new();
+    let mut queue: VecDeque<u32> = VecDeque::from([root]);
+    let mut visited: HashSet<u32> = HashSet::from([root]);
     while let Some(pid) = queue.pop_front() {
-        walked += 1;
-        if let Some(row) = by_pid.get(&pid) {
-            if is_claude_image(row) {
-                live.push(CensusEntry {
-                    pid: row.pid,
-                    name: row.name.clone(),
-                    exe: row.exe.clone(),
-                });
-            }
-        }
-        if let Some(kids) = children.get(&pid) {
-            for &kid in kids {
-                if visited.insert(kid) {
-                    queue.push_back(kid);
-                }
+        order.push(pid);
+        for &kid in children.get(&pid).into_iter().flatten() {
+            if visited.insert(kid) {
+                queue.push_back(kid);
             }
         }
     }
-    live.sort_by_key(|e| e.pid);
-
-    Ok(ClaudeCensus {
-        root_pid,
-        root_source,
-        walked,
-        live,
-        pid_reuse_guard,
-    })
+    order
 }
 
-/// One `sysinfo` snapshot of the whole process table, in [`ProcRow`] form.
+/// One `sysinfo` snapshot of the whole process table, in [`ProcRow`] form, on
+/// every OS. The census reads it, and so does the unit-test kill guard
+/// (`process::test_kill_guard`).
 ///
 /// Same refresh idiom as [`crate::process::proc_kill::find_pids_holding_exe`]:
 /// processes only, with exe paths always resolved. `parent()` and
@@ -397,7 +434,7 @@ pub fn census_from_snapshot(
 /// `Err(Unreadable)` when the table does not even contain the supervisor's
 /// own PID — a readable table always does, so its absence is the one
 /// enumeration failure `sysinfo` reports by omission rather than by error.
-fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
+pub(crate) fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
     let system = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::new().with_exe(UpdateKind::Always)),
@@ -408,6 +445,7 @@ fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
         .map(|p| ProcRow {
             pid: p.pid().as_u32(),
             ppid: p.parent().map(|pp| pp.as_u32()),
+            pgrp: process_group_of(p.pid().as_u32()),
             name: p.name().to_string_lossy().into_owned(),
             exe: p.exe().map(|e| e.to_path_buf()),
             start_time_secs: p.start_time(),
@@ -421,6 +459,21 @@ fn snapshot_rows() -> Result<Vec<ProcRow>, CensusError> {
         )));
     }
     Ok(rows)
+}
+
+/// The process group of `pid` (`getpgid(2)`), `None` when it is gone.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getpgid` takes a scalar pid and touches no memory.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group).ok()
+}
+
+/// No process groups in this sense off Unix.
+#[cfg(not(unix))]
+fn process_group_of(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// I/O layer: take one process-table snapshot and census the inclusive
@@ -494,6 +547,7 @@ mod tests {
         ProcRow {
             pid,
             ppid,
+            pgrp: None,
             name: name.to_string(),
             exe: exe.map(PathBuf::from),
             start_time_secs: start,
@@ -707,6 +761,35 @@ mod tests {
                 pids: vec![20]
             }
         );
+    }
+
+    /// The walk follows parent links in BFS order, and only the ones that can
+    /// be real: a row that started before its parent pid's process (more than
+    /// the skew) is an orphan whose stale parent pid was reused, not a child.
+    #[test]
+    fn the_subtree_follows_only_parent_links_that_can_be_real() {
+        let rows = vec![
+            row(1, None, "init", None, 1),
+            row(10, Some(1), "root", None, 100),
+            row(12, Some(10), "late-child", None, 101),
+            row(11, Some(10), "child", None, 100),
+            row(20, Some(11), "grandchild", None, 102),
+            // Started long before pid 10's process: an orphan whose parent pid
+            // 10 was reused, and so is everything under it.
+            row(30, Some(10), "orphan", None, 50),
+            row(31, Some(30), "orphans-child", None, 60),
+            // Inside the skew, or with an unknown start time: kept.
+            row(40, Some(10), "same-second", None, 96),
+            row(41, Some(10), "unknown-start", None, 0),
+        ];
+        assert_eq!(inclusive_subtree(10, &rows), vec![10, 11, 12, 40, 41, 20]);
+        assert_eq!(
+            inclusive_subtree(30, &rows),
+            vec![30, 31],
+            "its own subtree"
+        );
+        // A root that is not in the table still walks its children.
+        assert_eq!(inclusive_subtree(7, &rows), vec![7]);
     }
 
     #[test]
