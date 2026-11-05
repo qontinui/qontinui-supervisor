@@ -2358,9 +2358,11 @@ async fn scoped_purge_never_evicts_another_requesters_runner() {
     // Session-A purges scoped to itself — only A's runner is reaped, B's
     // (and an unowned third) survive untouched.
     let state = make_state();
-    let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-    let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-    let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+    let id_a =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-A")).await;
+    let id_b =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-B")).await;
+    let id_unowned = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, false, Some("session-A")).await;
 
@@ -2393,9 +2395,11 @@ async fn unscoped_purge_reaps_all_stale_runners() {
     // The periodic sweep / body-less purge-stale passes None and reaps
     // every stale test runner regardless of owner (legacy behavior).
     let state = make_state();
-    let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-    let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-    let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
+    let id_a =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-A")).await;
+    let id_b =
+        insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), Some("session-B")).await;
+    let id_unowned = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, false, None).await;
     let purged_ids: std::collections::HashSet<String> =
@@ -2404,16 +2408,6 @@ async fn unscoped_purge_reaps_all_stale_runners() {
     for id in [&id_a, &id_b, &id_unowned] {
         assert!(purged_ids.contains(id), "unscoped purge reaps {id}");
     }
-}
-
-/// A loopback port nothing is listening on: bind an ephemeral port, read
-/// it, drop the listener. Never hard-code 9877 — a live temp runner on the
-/// test box may hold it.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = l.local_addr().expect("local addr").port();
-    drop(l);
-    port
 }
 
 /// Mark a registered runner running (or not) with the given start time and
@@ -2441,7 +2435,7 @@ async fn set_runner_phase(
 #[tokio::test]
 async fn purge_spares_a_runner_inside_its_spawn_startup_window() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2468,7 +2462,7 @@ async fn purge_spares_a_runner_inside_its_spawn_startup_window() {
 #[tokio::test]
 async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2488,13 +2482,46 @@ async fn purge_still_reaps_a_crashed_runner_past_its_startup_window() {
     assert!(!state.runners.read().await.contains_key(&id));
 }
 
+/// The crash arm's other branch: a runner past its startup window whose port IS
+/// listening is alive, and the purge spares it. Its port is held by a listener
+/// this test keeps past the purge, which is the state a released "dead" port is
+/// in once a concurrent bind takes it (plan
+/// `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`), reached on purpose.
+#[tokio::test]
+async fn purge_spares_a_runner_past_its_window_whose_port_is_listening() {
+    let state = make_state();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a live port");
+    let port = listener.local_addr().expect("local addr").port();
+    let id = insert_temp_runner_owned(&state, port, None).await;
+    set_runner_phase(
+        &state,
+        &id,
+        true,
+        Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        None,
+    )
+    .await;
+
+    let purged = super::purge_stale_test_runners_core(&state, true, None).await;
+
+    assert!(
+        purged.iter().all(|(pid, _, _)| pid != &id),
+        "a runner whose port is listening is alive and must be spared: {purged:?}"
+    );
+    assert!(
+        state.runners.read().await.contains_key(&id),
+        "the live runner must still be registered"
+    );
+    drop(listener);
+}
+
 /// Post-build / pre-start window: the placeholder is still running=false,
 /// no build is active, but the spawn handler owns it. Even the operator
 /// path (`respect_active_builds=false`) must spare it.
 #[tokio::test]
 async fn operator_purge_spares_a_placeholder_whose_spawn_is_in_flight() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(
         &state,
@@ -2519,7 +2546,7 @@ async fn operator_purge_spares_a_placeholder_whose_spawn_is_in_flight() {
 #[tokio::test]
 async fn purge_spares_a_just_started_runner_without_a_marker() {
     let state = make_state();
-    let port = free_port();
+    let port = crate::test_ports::unheld_port();
     let id = insert_temp_runner_owned(&state, port, None).await;
     set_runner_phase(&state, &id, true, Some(chrono::Utc::now()), None).await;
 
@@ -2540,7 +2567,7 @@ async fn purge_marker_protects_past_the_floor_but_within_the_budget() {
     let state = make_state();
     let started = chrono::Utc::now() - chrono::Duration::seconds(120);
 
-    let marked = insert_temp_runner_owned(&state, free_port(), None).await;
+    let marked = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
     set_runner_phase(
         &state,
         &marked,
@@ -2549,13 +2576,9 @@ async fn purge_marker_protects_past_the_floor_but_within_the_budget() {
         Some(std::time::Duration::from_secs(240)),
     )
     .await;
-    let unmarked = loop {
-        // Distinct id: ids are derived from the port.
-        let p = free_port();
-        if format!("test-{p}") != marked {
-            break insert_temp_runner_owned(&state, p, None).await;
-        }
-    };
+    // A distinct id, since ids are derived from the port: no two unheld ports
+    // are the same.
+    let unmarked = insert_temp_runner_owned(&state, crate::test_ports::unheld_port(), None).await;
     set_runner_phase(&state, &unmarked, true, Some(started), None).await;
 
     let purged = super::purge_stale_test_runners_core(&state, true, None).await;
@@ -4158,10 +4181,7 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     let (state, root) = state_over_an_empty_runner_tree();
     let id = "named-early-log-kept";
     // A port nothing holds, so the stop confirms at once.
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let port = crate::test_ports::unheld_port();
     let config = crate::config::RunnerConfig {
         id: id.to_string(),
         name: format!("Runner {id}"),
@@ -4396,10 +4416,12 @@ async fn a_panicked_spawn_build_names_its_runner_and_frees_its_key() {
 // ── Plan `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-
 //    door-and-pre-fix-ledger-rows` Phase 1 (D2): every lifecycle door mints ──
 
-/// An unprotected named runner on a refused port, registered in a state over
-/// an empty runner tree: the readiness gate skips it (`runner_not_protected`),
-/// nothing is listening to stop, and every start fails at exe resolution, so a
-/// door driven against it runs to its failure without touching a process.
+/// An unprotected named runner on a port nothing holds, registered in a state
+/// over an empty runner tree: the readiness gate skips it
+/// (`runner_not_protected`), nothing is listening to stop, and every start fails
+/// at exe resolution, so a door driven against it runs to its failure without
+/// touching a process. An unheld port and not a refused one, because a start's
+/// port guard bind-probes it.
 async fn register_dead_unprotected_named_runner(
     state: &crate::state::SharedState,
     id: &str,
@@ -4407,7 +4429,7 @@ async fn register_dead_unprotected_named_runner(
     let config = crate::config::RunnerConfig {
         id: id.to_string(),
         name: format!("Runner {id}"),
-        port: crate::test_ports::reserve_refused_port(),
+        port: crate::test_ports::unheld_port(),
         kind: qontinui_types::wire::runner_kind::RunnerKind::Named {
             name: id.to_string(),
         },

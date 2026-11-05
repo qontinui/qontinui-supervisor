@@ -18,14 +18,10 @@ fn startup_test_runner(port: u16) -> ManagedRunner {
 /// shares): exercised directly because the sweep itself is an endless loop.
 #[tokio::test]
 async fn skip_for_startup_window_decisions() {
-    // A port nothing listens on, below the default ephemeral ranges. A dropped
+    // A port nothing holds and no kernel allocation hands out. A dropped
     // ephemeral port can be handed to a concurrent test's listener, which then
     // reads as "the runner bound its port".
-    let dead_port: u16 = 29_871;
-    assert!(
-        !crate::process::port::is_port_listening(dead_port),
-        "something on this box listens on {dead_port}, which this test needs free"
-    );
+    let dead_port = crate::test_ports::unheld_port();
     let now = chrono::Utc::now();
     let budget = Some(Duration::from_secs(240));
 
@@ -3363,9 +3359,7 @@ async fn port_held_guard_does_not_refuse_a_non_runner_listener() {
     let _ = sleeper.kill().await;
 
     // A port nothing holds is allowed without consulting any probe.
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = dead.local_addr().unwrap().port();
-    drop(dead);
+    let dead_port = crate::test_ports::unheld_port();
     assert!(refuse_if_port_held_by_live_runner(dead_port).await.is_ok());
 }
 
@@ -3378,16 +3372,14 @@ fn restart_test_state() -> (SharedState, tempfile::TempDir) {
     (Arc::new(crate::state::SupervisorState::new(config)), root)
 }
 
-/// A registered, UNPROTECTED named runner on a port nothing listens on.
-/// Unprotected so the readiness gate skips (`NotProtected`) and the
-/// funnel reaches the latch; a dead port so any stop confirms instantly
-/// and the start fails at exe resolution (this state has no build slot
-/// and no cargo target-dir artifact).
+/// A registered, UNPROTECTED named runner on a port nothing holds
+/// ([`crate::test_ports::unheld_port`]). Unprotected so the readiness gate skips
+/// (`NotProtected`) and the funnel reaches the latch; an unheld port so any stop
+/// confirms instantly, its reap finds no listener to kill, and the start fails
+/// at exe resolution (this state has no build slot and no cargo target-dir
+/// artifact).
 async fn register_dead_named_runner(state: &SharedState, id: &str) -> Arc<ManagedRunner> {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-    register_named_runner_on_port(state, id, port).await
+    register_named_runner_on_port(state, id, crate::test_ports::unheld_port()).await
 }
 
 /// [`register_dead_named_runner`] on a port the caller chose.
@@ -3934,24 +3926,11 @@ fn spawn_a_child_that_exits_when_its_stdin_closes() -> (tokio::process::Child, u
     (child, pid)
 }
 
-/// A port for a test that reaches a stop's reap. Below the default ephemeral
-/// ranges, so no concurrent test's bind to port 0 is handed it: that reap kills
-/// what holds the port, and such a holder would be this test binary. Each test
-/// names its own.
-fn free_fixed_port(port: u16) -> u16 {
-    assert!(
-        !crate::process::port::is_port_listening(port),
-        "something on this box listens on {port}, which this test needs free"
-    );
-    port
-}
-
-/// The primary, registered on a port nothing listens on.
+/// The primary, registered on a port nothing holds
+/// ([`crate::test_ports::unheld_port`]).
 async fn register_dead_primary(state: &SharedState) -> Arc<ManagedRunner> {
     let mut config = crate::config::RunnerConfig::default_primary();
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    config.port = probe.local_addr().unwrap().port();
-    drop(probe);
+    config.port = crate::test_ports::unheld_port();
     let id = config.id.clone();
     let managed = Arc::new(ManagedRunner::new(config, false));
     state.runners.write().await.insert(id, managed.clone());
@@ -4149,25 +4128,14 @@ async fn a_second_start_of_a_primary_still_booting_is_refused() {
 /// A stop arriving mid-start latches only after that start has finished, and
 /// then stops the spawn it recorded. The test's guard stands in for a start. The
 /// paused clock runs out with nothing else to do once the stop has blocked as far
-/// as it can. A fixed port, because a dropped ephemeral one could be handed to a
-/// concurrent test's listener, which this stop's reap would then tree-kill along
-/// with this test binary.
+/// as it can. On an unheld port, because a dropped ephemeral one could be handed
+/// to a concurrent test's listener, which this stop's reap would then tree-kill
+/// along with this test binary.
 #[tokio::test(start_paused = true)]
 async fn a_stop_waits_for_a_start_to_record_its_spawn() {
     let (state, _root) = restart_test_state();
     let id = "named-stop-waits";
     let managed = register_dead_named_runner(&state, id).await;
-    let managed = {
-        let mut config = managed.config.clone();
-        config.port = free_fixed_port(29_872);
-        let managed = Arc::new(ManagedRunner::new(config, false));
-        state
-            .runners
-            .write()
-            .await
-            .insert(id.to_string(), managed.clone());
-        managed
-    };
 
     let start = managed.lifecycle.lock().await;
     let stop = {
@@ -5026,10 +4994,11 @@ async fn boot_start_of_an_unregistered_runner_mints_no_trial() {
     assert!(state.dev_actions.read().await.recent(10).is_empty());
 }
 
-/// An armed primary on `port`, for a test that drives the crash watchdog.
-async fn armed_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+/// An armed primary on a port nothing holds, for a test that drives the crash
+/// watchdog.
+async fn armed_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
     let (state, root) = armed_state();
-    let managed = register_armed_primary(&state, port, Default::default()).await;
+    let managed = register_armed_primary(&state, Default::default()).await;
     (state, managed, root)
 }
 
@@ -5044,13 +5013,14 @@ fn armed_state() -> (SharedState, tempfile::TempDir) {
     (Arc::new(crate::state::SupervisorState::new(config)), root)
 }
 
+/// The primary on a port nothing holds ([`crate::test_ports::unheld_port`]):
+/// these tests' stops reach the reap, which kills what holds the runner's port.
 async fn register_armed_primary(
     state: &SharedState,
-    port: u16,
     extra_env: std::collections::HashMap<String, String>,
 ) -> Arc<ManagedRunner> {
     let mut runner = crate::config::RunnerConfig::default_primary();
-    runner.port = free_fixed_port(port);
+    runner.port = crate::test_ports::unheld_port();
     runner.protected = false;
     runner.extra_env = extra_env;
     let id = runner.id.clone();
@@ -5093,7 +5063,7 @@ async fn the_backoff_task_begins_no_restart_of_a_runner_that_changed_during_it()
         (None, false, 0),
         (Some(exited), true, 0),
     ] {
-        let (state, managed, _root) = armed_primary(29_873).await;
+        let (state, managed, _root) = armed_primary().await;
         managed.runner.write().await.started_at = Some(exited);
 
         maybe_crash_restart(&state, &managed, false, false, exited).await;
@@ -5175,7 +5145,7 @@ async fn a_crash_restart_that_waited_on_the_lock_finds_what_landed_meanwhile() {
 /// the restart as failed.
 #[tokio::test(start_paused = true)]
 async fn a_superseded_crash_restart_says_so_and_logs_no_failure() {
-    let (state, managed, _root) = armed_primary(29_878).await;
+    let (state, managed, _root) = armed_primary().await;
     let exited = chrono::Utc::now();
     managed.runner.write().await.started_at = Some(exited);
 
@@ -5308,7 +5278,7 @@ async fn a_remover_gets_the_lock_only_uncontended_and_only_while_registered() {
 /// many disarms the arm. The current spawn's exit still does both.
 #[tokio::test]
 async fn a_late_exit_burns_no_crash_budget() {
-    let (state, managed, _root) = armed_primary(29_874).await;
+    let (state, managed, _root) = armed_primary().await;
 
     let spawn_a_child_and_record = || async {
         let child = spawn_a_child_that_exits_3();
@@ -5435,14 +5405,14 @@ const STUB_ENV_SCRIPT: &str = "read -t 60 <> <(:)\nexit 0\n";
 /// spawned with no arguments. A script with a shebang would not do: its image is
 /// the interpreter, which no stop's image check can match with the runner's copy.
 #[cfg(unix)]
-async fn stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+async fn stub_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
     let (state, root) = armed_state();
     let stub = root.path().join("stub-runner");
     std::fs::copy("/bin/bash", &stub).expect("copy bash as the stub");
     let script = root.path().join("stub-runner.env");
     std::fs::write(&script, STUB_ENV_SCRIPT).expect("write the stub's script");
     let env = [("BASH_ENV".to_string(), script.display().to_string())];
-    let managed = register_armed_primary(&state, port, env.into_iter().collect()).await;
+    let managed = register_armed_primary(&state, env.into_iter().collect()).await;
     *managed.source_exe_override.write().await = Some(stub);
     (state, managed, root)
 }
@@ -5568,7 +5538,7 @@ async fn wait_for_exit_stamp(managed: &ManagedRunner) -> crate::state::SpawnMark
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_queued_mid_start_targets_the_recorded_spawn() {
-    let (state, managed, _root) = stub_primary(29_875).await;
+    let (state, managed, _root) = stub_primary().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -5632,7 +5602,7 @@ async fn a_stop_queued_mid_start_targets_the_recorded_spawn() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_queued_behind_a_start_finds_its_spawn() {
-    let (state, managed, _root) = stub_primary(29_876).await;
+    let (state, managed, _root) = stub_primary().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -5687,7 +5657,7 @@ async fn a_start_queued_behind_a_start_finds_its_spawn() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
-    let (state, managed, _root) = stub_primary(29_881).await;
+    let (state, managed, _root) = stub_primary().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -5720,7 +5690,7 @@ async fn a_crash_watchdog_start_names_its_trial_on_the_spawn_ring() {
 /// A primary whose exe exits at once and cleanly, on every platform: its spawn's
 /// exit is observed, and a clean exit is one no crash watchdog answers, so nothing
 /// else starts behind the test's back.
-async fn exiting_stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
+async fn exiting_stub_primary() -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
     let (state, root) = armed_state();
     let stub = root
         .path()
@@ -5743,7 +5713,7 @@ async fn exiting_stub_primary(port: u16) -> (SharedState, Arc<ManagedRunner>, te
             std::collections::HashMap::new()
         }
     };
-    let managed = register_armed_primary(&state, port, env).await;
+    let managed = register_armed_primary(&state, env).await;
     *managed.source_exe_override.write().await = Some(stub);
     (state, managed, root)
 }
@@ -5928,7 +5898,7 @@ async fn through_a_held_open_door<A, F, Fut>(
 /// it is not `Ran`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
-    let (state, managed, _root) = exiting_stub_primary(29_882).await;
+    let (state, managed, _root) = exiting_stub_primary().await;
     let id = managed.config.id.clone();
     let answer = answer_the_port_after_the_boot_exits(managed.clone());
     through_a_held_open_door(state, managed, answer, false, move |state| {
@@ -5945,7 +5915,7 @@ async fn a_held_open_start_answers_the_port_and_its_trial_reads_its_own_boot() {
 /// is restarted through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot() {
-    let (state, managed, _root) = exiting_stub_primary(29_883).await;
+    let (state, managed, _root) = exiting_stub_primary().await;
     let answer = answer_the_port_after_the_boot_exits(managed.clone());
     through_a_held_open_door(state, managed, answer, false, |state| {
         crate::routes::runner::restart_runner(
@@ -5972,7 +5942,7 @@ async fn a_held_open_restart_answers_the_port_and_its_trial_reads_its_own_boot()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_open_start_whose_boot_answered_reads_ran() {
-    let (state, managed, _root) = stub_primary(29_884).await;
+    let (state, managed, _root) = stub_primary().await;
     let id = managed.config.id.clone();
     let answer = answer_the_port_while_the_boot_is_up(managed.clone());
     through_a_held_open_door(state, managed, answer, true, move |state| {
@@ -6001,7 +5971,7 @@ async fn the_health_cache_clears_a_booting_primary(managed: &ManagedRunner) -> u
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_replaces_a_primary_booting_before_it_binds() {
     use crate::diagnostics::RestartSource;
-    let (state, managed, _root) = stub_primary(29_877).await;
+    let (state, managed, _root) = stub_primary().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         async move {
@@ -6052,7 +6022,7 @@ async fn a_restart_replaces_a_primary_booting_before_it_binds() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
-    let (state, managed, root) = stub_primary(29_879).await;
+    let (state, managed, root) = stub_primary().await;
     let body = {
         let (state, managed) = (state.clone(), managed.clone());
         let script = root.path().join("stub-runner.env");
@@ -6093,7 +6063,7 @@ async fn a_ring_pid_settles_a_stop_two_processes_share_an_image_for() {
 /// pid from the registry, which is trusted, would be killed.
 #[tokio::test]
 async fn a_stop_leaves_a_ring_pid_that_runs_another_image_alone() {
-    let (state, managed, _root) = armed_primary(29_880).await;
+    let (state, managed, _root) = armed_primary().await;
     let (mut child, pid) = spawn_a_child_that_exits_when_its_stdin_closes();
     let _stdin = child.stdin.take().expect("the child's stdin");
     record_spawn_in_registry(&managed, Some(pid), None, None).await;
@@ -6680,16 +6650,18 @@ async fn mint_test_restart(
 /// [`SupervisorError::AfterAct`], so the door's `run_result_for` records it
 /// `Errored` on the door's own record (no store lookup), while the door's HTTP
 /// answer is the wrapped error's, unchanged. A cached open port is evidence of
-/// life, so the stop runs; the runner's port is reserved bound and never
-/// listening for the whole test, so the stop finds nothing to kill and no
-/// other process can take the port. The start then fails.
+/// life, so the stop runs. The runner's port is one nothing holds
+/// ([`crate::test_ports::unheld_port`]), so the stop's bind probe confirms it
+/// free at once and the stop succeeds with nothing to kill. The start then fails
+/// at exe resolution, and the failure is checked to be the start's: on a port a
+/// socket holds, the stop's own confirmation never comes and its `StillHeld`
+/// would satisfy `AfterAct` just as well.
 #[tokio::test]
 async fn a_restart_that_fails_after_its_stop_records_errored() {
     use crate::diagnostics::RestartSource;
     let (state, _root) = restart_test_state();
     let id = "named-after-stop";
-    let managed =
-        register_named_runner_on_port(&state, id, crate::test_ports::reserve_refused_port()).await;
+    let managed = register_named_runner_on_port(&state, id, crate::test_ports::unheld_port()).await;
     managed.cached_health.write().await.runner_port_open = true;
     let record = mint_test_restart(&state, &managed).await;
 
@@ -6712,6 +6684,10 @@ async fn a_restart_that_fails_after_its_stop_records_errored() {
     let SupervisorError::AfterAct(inner) = &err else {
         panic!("a failure after the stop must be marked AfterAct: {err:?}");
     };
+    assert!(
+        matches!(&**inner, SupervisorError::Process(msg) if msg.starts_with("Runner exe not found")),
+        "the failure after the stop must be the start's exe resolution, not the stop's: {inner:?}"
+    );
     assert_eq!(err.to_string(), inner.to_string());
     assert_eq!(err.to_status_body(), inner.to_status_body());
     assert!(record.record_run_result(crate::dev_action::run_result_for(&err)));

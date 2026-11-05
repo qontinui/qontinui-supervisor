@@ -264,12 +264,6 @@ mod tests {
         port
     }
 
-    /// A port nothing listens on.
-    fn silent_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    }
-
     async fn runner_on(port: u16) -> (SharedState, Arc<ManagedRunner>, tempfile::TempDir) {
         let (config, root) = crate::config::config_over_an_empty_runner_tree();
         let state: SharedState = Arc::new(SupervisorState::new(config));
@@ -416,7 +410,7 @@ mod tests {
     /// A wait out of budget and a runner gone from the registry each say so.
     #[tokio::test(start_paused = true)]
     async fn a_failed_wait_says_how_it_ended() {
-        let (state, managed, _root) = runner_on(silent_port()).await;
+        let (state, managed, _root) = runner_on(crate::test_ports::reserve_refused_port()).await;
         let id = managed.config.id.clone();
 
         let spent = poll_until_healthy(&state, &id, Duration::from_secs(1), None)
@@ -497,7 +491,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_wait_nobody_holds_open_lasts_the_first_healthy_budget() {
         let action = Uuid::new_v4();
-        let (state, managed, _root) = runner_on(silent_port()).await;
+        let (state, managed, _root) = runner_on(crate::test_ports::reserve_refused_port()).await;
         managed
             .recent_spawns
             .write()
