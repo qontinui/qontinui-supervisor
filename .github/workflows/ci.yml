@@ -1250,15 +1250,15 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Lint
-        run: npm run lint 2>/dev/null || echo "No lint script configured, skipping"
+        run: npm run lint
         if: always()
 
       - name: Format check
-        run: npx prettier --check "src/**/*.{ts,tsx}" 2>/dev/null || echo "No prettier config, skipping"
+        run: npm run format:check
         if: always()
 
       - name: Test
-        run: npx vitest run 2>/dev/null || echo "No test config, skipping"
+        run: npm test
         if: always()
 
       - name: Build
