@@ -232,20 +232,24 @@ impl BuildSubmissionStore {
         let id = sub.id;
         let arc = Arc::new(RwLock::new(sub));
         let mut map = self.submissions.write().await;
-        map.insert(id, arc.clone());
 
-        // Cap-enforcement: if over cap, evict oldest *terminal* entries.
-        // Collect (id, submitted_at, is_terminal) into a vec, sort, and
-        // remove the oldest terminals until we're under cap. Avoids
-        // borrowing issues by iterating after the snapshot.
-        if map.len() > self.cap {
+        // Cap-enforcement: if the new row would put the map over cap, evict the
+        // oldest *terminal* entries. Collect (id, submitted_at, is_terminal)
+        // into a vec, sort, and remove the oldest terminals until there is room.
+        //
+        // This runs BEFORE the new row goes in, and nothing awaits after it.
+        // A caller dropped at one of these awaits (an HTTP handler whose client
+        // disconnected) has then registered nothing, rather than leaving a
+        // `Queued` row that no task will ever drive, never terminal and so
+        // never evicted.
+        if map.len() + 1 > self.cap {
             let mut candidates: Vec<(Uuid, DateTime<Utc>, bool)> = Vec::with_capacity(map.len());
             for (k, v) in map.iter() {
                 let v = v.read().await;
                 candidates.push((*k, v.submitted_at, v.status.is_terminal()));
             }
             candidates.sort_by_key(|(_, ts, _)| *ts);
-            let to_remove = map.len() - self.cap;
+            let to_remove = map.len() + 1 - self.cap;
             let mut removed = 0;
             for (k, _, is_term) in candidates {
                 if removed >= to_remove {
@@ -257,6 +261,7 @@ impl BuildSubmissionStore {
                 }
             }
         }
+        map.insert(id, arc.clone());
         arc
     }
 
