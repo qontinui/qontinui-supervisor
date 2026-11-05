@@ -960,7 +960,7 @@ posted. A missing key there is UNKNOWN: builds from #270 and #272 stamp their sn
 read over. A change that moves only a row's category or evidence owes a bump too, even
 though coord's stats key on signatures: one epoch means one thing on a row. Without the
 bump, coord cannot tell rows recorded under the two semantics apart. A change to which
-kind a row is filed under owes one as well, since the kind is half the stats key: epoch 7
+kind a row is filed under owes one as well, since coord's expectations are served per `action_kind`: epoch 7
 marks the `restart` / `restart_lkg` split below, so a `restart` row stamped 6 or below may
 be an LKG-routed restart and one stamped 7 is not (save a resend carrying
 `metadata.refused_kind`).
