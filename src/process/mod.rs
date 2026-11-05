@@ -61,6 +61,11 @@ pub mod subtree_census;
 /// supervisor never spawned is the failure it exists to prevent, and a
 /// Windows-only test would not gate it.
 pub mod temp_runner_ledger;
+/// A unit test never signals a process it did not spawn: what every signal
+/// primitive asserts in a unit-test build (plan
+/// `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`, Phase 4).
+#[cfg(test)]
+pub(crate) mod test_kill_guard;
 #[cfg(not(target_os = "windows"))]
 pub mod unix_kill;
 #[cfg(target_os = "windows")]

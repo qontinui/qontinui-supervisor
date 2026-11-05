@@ -7149,3 +7149,72 @@ fn the_wedged_line_says_what_the_serving_arm_decided() {
         "no decision evaluated is said, never a claimed one"
     );
 }
+
+/// Phase 4's arming test (plan `2026-11-05-supervisor-test-flakes-dead-ports-etxtbsy`):
+/// a unit test never signals a process it did not spawn. A stop whose registry pid
+/// names an orphan this test made but is not the parent of reaches its pid kill, and
+/// the kill guard panics there before any signal: the orphan lives. With the guard
+/// gone the stop kills the orphan and returns, and this test fails on both counts.
+///
+/// The orphan (`test_kill_guard::spawn_an_orphan`) is `sh`'s background `sleep` on
+/// Unix and `cmd /c start /b`'s `ping` on Windows: alive, this user's, and reparented
+/// away from (Unix) or left with a dead parent pid by (Windows) this process. The
+/// runner is named and unprotected on a port nothing holds, so the readiness gate
+/// skips, the close-request is refused at once, and the ladder's first kill is the
+/// registry pid's, which no image check stands in front of. The test ends the
+/// orphan itself, directly, never through a guarded primitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unit_test_stop_never_signals_a_process_it_did_not_spawn() {
+    use crate::process::test_kill_guard;
+    let orphan = test_kill_guard::spawn_an_orphan();
+    let _ends_the_orphan = scopeguard::guard(orphan, test_kill_guard::end_an_orphan);
+    assert!(
+        crate::process::proc_kill::pid_alive(orphan)
+            && !test_kill_guard::is_descendant_of_this_process(orphan),
+        "the fixture: an orphan {orphan} that is alive and not this test's descendant"
+    );
+
+    let (state, _root) = restart_test_state();
+    let id = "named-kill-guard-arming";
+    let managed = register_dead_named_runner(&state, id).await;
+    {
+        let mut runner = managed.runner.write().await;
+        runner.pid = Some(orphan);
+        runner.running = true;
+    }
+
+    let stop = tokio::spawn({
+        let state = state.clone();
+        async move { stop_runner_by_id(&state, id, true, CloseIntent::Kill).await }
+    })
+    .await;
+    let alive_after = crate::process::proc_kill::pid_alive(orphan);
+
+    let refusal = match stop {
+        Err(join) if join.is_panic() => {
+            let payload = join.into_panic();
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        }
+        other => panic!(
+            "the stop must panic in the kill guard before it signals pid {orphan}, but it \
+             returned {other:?} (the orphan is {})",
+            if alive_after {
+                "alive"
+            } else {
+                "dead: the stop killed it"
+            }
+        ),
+    };
+    assert!(
+        refusal.starts_with(test_kill_guard::REFUSAL) && refusal.contains(&format!("pid {orphan}")),
+        "the stop panicked, but not in the kill guard over pid {orphan}: {refusal}"
+    );
+    assert!(
+        alive_after,
+        "the guard panicked, yet the orphan {orphan} is dead: something signalled it first"
+    );
+}
