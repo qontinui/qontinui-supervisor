@@ -451,3 +451,9 @@ mod tests {
         );
     }
 }
+        assert!(
+            scans
+                .iter()
+                .any(|(path, binds)| path.starts_with("tests/") && binds.is_some()),
+            "the scan read no file under tests/, so it shows nothing about integration tests"
+        );

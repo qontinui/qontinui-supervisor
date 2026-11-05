@@ -387,29 +387,37 @@ fn split<'a, 't>(trees: &'a [TokenTree<'t>], sep: &str) -> Vec<&'a [TokenTree<'t
 
 /// The port-0 binds in the test code of every `.rs` file under `root`'s `src/`
 /// and `tests/`, keyed by its path relative to `root` with `/` separators;
-/// `None` for a file that does not lex.
+/// `None` for a file that could not be read or does not lex, and for a directory
+/// that could not be listed (`src` and `tests` themselves included), so nothing
+/// the scan could not read passes as a file with no binds.
 ///
 /// A file is test code as a whole when it sits under `tests/`, opens with
 /// `#![cfg(test)]` ([`is_test_only_file`]), or is the file of a module declared
 /// `#[cfg(test)] mod NAME;` (or declared at all inside such a file); in every
 /// other file only test items are.
 pub(crate) fn scan_crate(root: &Path) -> BTreeMap<String, Option<Vec<Bind>>> {
-    let src = rust_files(&root.join("src"));
-    let tests = rust_files(&root.join("tests"));
-    let texts: BTreeMap<&PathBuf, String> = src
+    let (src, unlisted_src) = rust_files(&root.join("src"));
+    let (tests, unlisted_tests) = rust_files(&root.join("tests"));
+    let texts: BTreeMap<&PathBuf, Option<String>> = src
         .iter()
         .chain(&tests)
         .map(|path| {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            (path, text.replace("\r\n", "\n"))
+            let text = std::fs::read_to_string(path).ok();
+            (path, text.map(|text| text.replace("\r\n", "\n")))
         })
         .collect();
     let mut whole: BTreeSet<&PathBuf> = tests.iter().collect();
-    whole.extend(src.iter().filter(|path| is_test_only_file(&texts[path])));
+    whole.extend(
+        src.iter()
+            .filter(|path| texts[path].as_deref().is_some_and(is_test_only_file)),
+    );
     loop {
         let mut grew = false;
         for file in &src {
-            let Some(found) = scan(&texts[file], whole.contains(file)) else {
+            let Some(found) = texts[file]
+                .as_deref()
+                .and_then(|text| scan(text, whole.contains(file)))
+            else {
                 continue;
             };
             for decl in found.mod_decls {
@@ -427,34 +435,54 @@ pub(crate) fn scan_crate(root: &Path) -> BTreeMap<String, Option<Vec<Bind>>> {
             break;
         }
     }
+    let key_of = |path: &Path| {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        relative.to_string_lossy().replace('\\', "/")
+    };
+    let unlisted = unlisted_src
+        .iter()
+        .chain(&unlisted_tests)
+        .map(|dir| (key_of(dir), None));
     texts
         .iter()
         .map(|(path, text)| {
-            let relative = path.strip_prefix(root).unwrap_or(path);
-            let key = relative.to_string_lossy().replace('\\', "/");
-            (key, scan(text, whole.contains(path)).map(|s| s.binds))
+            let found = text
+                .as_deref()
+                .and_then(|text| scan(text, whole.contains(path)));
+            (key_of(path), found.map(|s| s.binds))
         })
+        .chain(unlisted)
         .collect()
 }
 
-/// Every `.rs` file under `dir`, sorted.
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Every `.rs` file under `dir`, sorted, and every directory there (`dir`
+/// itself included) that could not be listed, so a caller can say what it did
+/// not read.
+fn rust_files(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut files, mut unlisted) = (Vec::new(), Vec::new());
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&next) else {
+            unlisted.push(next);
             continue;
         };
-        for path in entries.flatten().map(|entry| entry.path()) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                unlisted.push(next.clone());
+                continue;
+            };
+            let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
+                files.push(path);
             }
         }
     }
-    out.sort();
-    out
+    files.sort();
+    unlisted.sort();
+    unlisted.dedup();
+    (files, unlisted)
 }
 
 /// The files a `mod` declaration in `file` can name: `NAME.rs` and

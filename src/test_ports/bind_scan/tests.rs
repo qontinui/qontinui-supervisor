@@ -146,6 +146,36 @@ fn module_declarations_carry_their_test_gate() {
     );
 }
 
+/// What the crate scan cannot read is reported as unread, never as a file with
+/// no binds: a file that cannot be read (a link to nothing) and a directory that
+/// cannot be listed (`tests/`, absent here).
+#[cfg(unix)]
+#[test]
+fn what_the_crate_scan_cannot_read_is_reported_unread() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src");
+    std::fs::write(src.join("lib.rs"), "fn f() {}\n").expect("write lib.rs");
+    std::os::unix::fs::symlink(root.path().join("absent.rs"), src.join("gone.rs"))
+        .expect("link gone.rs to nothing");
+    let scans = scan_crate(root.path());
+    assert_eq!(
+        scans.get("src/lib.rs"),
+        Some(&Some(Vec::new())),
+        "a file read and scanned: {scans:?}"
+    );
+    assert_eq!(
+        scans.get("src/gone.rs"),
+        Some(&None),
+        "a file that cannot be read: {scans:?}"
+    );
+    assert_eq!(
+        scans.get("tests"),
+        Some(&None),
+        "a directory that cannot be listed: {scans:?}"
+    );
+}
+
 #[test]
 fn a_file_that_does_not_lex_or_balance_is_none() {
     assert_eq!(scan("fn f() { let s = \"open; }", true), None);
