@@ -611,7 +611,9 @@ pub struct SupervisorState {
     /// `shutdown_signal` and the self-restart endpoint both await it; whichever
     /// arrives second waits for the first's sweep to finish instead of
     /// starting a second, concurrent one
-    /// (`process::shutdown_sweep::sweep_temp_runners_at_shutdown`).
+    /// (`process::shutdown_sweep::sweep_temp_runners_at_shutdown`). Never read
+    /// on Windows, where the kill-on-close job reaps temp runners instead.
+    #[cfg_attr(windows, allow(dead_code))]
     pub shutdown_sweep: tokio::sync::OnceCell<()>,
     pub cached_health: RwLock<CachedPortHealth>,
     /// Cached per-runner health snapshots, updated by the background health refresher.
