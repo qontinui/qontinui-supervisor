@@ -2472,6 +2472,83 @@ mod tests {
         }
     }
 
+    /// The success arm of the S3 re-key, pinned at source level because no
+    /// route test reaches a started primary: the no-rebuild restart re-keys
+    /// through `record_lkg_treatment(&action_record, lkg_pinned,
+    /// restart_result.is_ok())`, exactly once, after `manager::restart_runner`
+    /// and before the first thing on that path that records the action's run
+    /// result (`answer_failure`, `record_run_result`, `record_start_verdict`):
+    /// the watcher's window closes on that result, and a re-key after it could
+    /// reach coord as `restart`. `lkg_pinned` must be derived from
+    /// `biased_primary`, which is set only where the LKG override is written.
+    /// Fails if the call is removed, passes a constant, or moves after a result
+    /// is recorded, or if `lkg_pinned` stops tracking the override.
+    #[test]
+    fn the_restart_handler_rekeys_a_started_lkg_restart_before_recording_its_result() {
+        let squeezed: String = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn restart_runner(",
+        )
+        .expect("restart_runner exists")
+        .split_whitespace()
+        .collect();
+
+        // `lkg_pinned` is set exactly where the override is written to the LKG exe.
+        let write = "*primary.source_exe_override.write().await=Some(lkg_exe.clone());";
+        let pinned = "biased_primary=Some(primary);";
+        let write_at = squeezed.find(write).expect("the LKG override is written");
+        let pinned_at = squeezed
+            .find(pinned)
+            .expect("biased_primary records the pin");
+        assert_eq!(
+            squeezed.matches(pinned).count(),
+            1,
+            "one place records the pin"
+        );
+        assert_eq!(
+            squeezed.matches("biased_primary=").count(),
+            1,
+            "biased_primary is assigned only where the override is written"
+        );
+        assert!(
+            write_at < pinned_at,
+            "the pin is recorded after the override is written"
+        );
+        assert!(
+            squeezed.contains("letlkg_pinned=biased_primary.is_some();"),
+            "lkg_pinned must be derived from the override being written"
+        );
+
+        // On the synchronous path: the re-key follows the start and precedes
+        // every recording of the action's result.
+        let sync_path = squeezed
+            .split("letrestart_result=manager::restart_runner(")
+            .nth(1)
+            .expect("the synchronous restart calls manager::restart_runner");
+        let call = "record_lkg_treatment(&action_record,lkg_pinned,restart_result.is_ok());";
+        assert_eq!(
+            squeezed.matches("record_lkg_treatment(").count(),
+            1,
+            "the handler re-keys in exactly one place"
+        );
+        let rekey_at = sync_path
+            .find(call)
+            .unwrap_or_else(|| panic!("the restart handler must call {call}"));
+        let first_result = [
+            "answer_failure(",
+            "record_run_result(",
+            "record_start_verdict(",
+        ]
+        .iter()
+        .filter_map(|marker| sync_path.find(marker))
+        .min()
+        .expect("the synchronous path records a result");
+        assert!(
+            rekey_at < first_result,
+            "the re-key must precede the first recorded result on the synchronous path"
+        );
+    }
+
     /// Plan §6 Phase 5 test 5b — `POST /runner/fix-and-rebuild`. An identical
     /// `ActionKind::Build`; a failing `run_cargo_build` returned 500 into the
     /// submission while the action went `Confirmed`. Closing the build-pool
