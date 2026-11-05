@@ -6001,10 +6001,14 @@ async fn stub_temp_runner() -> (SharedState, Arc<ManagedRunner>, tempfile::TempD
 /// copy and its exec (a temp start asks the primary for a window placement, for up
 /// to 3 s), so the 60 s sleep only bounds a holder that a killed test binary leaks.
 ///
-/// The test enters this plan's changes only through `start_managed_runner`, the door
-/// every start takes: its cleanup ends the stub by pid ([`end_the_stub_spawns`])
-/// rather than through a stop, and where the start wrote and whom it asked is
-/// [`a_temp_start_writes_and_asks_nothing_outside_its_tempdir`]'s to assert.
+/// Its body and its cleanup enter this plan's changes only through
+/// `start_managed_runner`, the door every start takes: the cleanup ends the stub by
+/// pid ([`end_the_stub_spawns`]) rather than through a stop, and where the start wrote
+/// and whom it asked is [`a_temp_start_writes_and_asks_nothing_outside_its_tempdir`]'s
+/// to assert. Its fixture, [`stub_temp_runner`], builds the state through
+/// `SupervisorConfig::from_args` and `SupervisorState::new`, which this plan changed
+/// only so that a unit-test build reads its per-user dirs, the boot id's included,
+/// from the test's tempdir rather than the operator's.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_execs_its_copy_while_an_inheritor_of_an_earlier_write_is_parked() {

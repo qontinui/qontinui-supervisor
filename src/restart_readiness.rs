@@ -1380,8 +1380,9 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    /// A URL nothing is listening on: bind an ephemeral port to reserve it,
-    /// then drop the listener.
+    /// A URL whose connects are refused: the port is bound and kept by
+    /// [`crate::test_ports::reserve_refused_port`] and never listened on, so
+    /// nothing answers it and nothing else can listen there.
     async fn dead_url() -> String {
         let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{}", port)
