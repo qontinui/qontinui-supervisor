@@ -5483,6 +5483,9 @@ fn text_file_busy_is_recognised_through_the_after_act_marker() {
 /// suite was measured at about 1.5 s, so a wall-clock deadline of two seconds left a
 /// slow first attempt no retry at all (`a_stop_queued_mid_start_targets_the_recorded_spawn`
 /// then failed on ETXTBSY in 3 of 3 full-suite runs while passing alone).
+/// On merytshost, full runs on 2026-11-04 and 2026-11-05 also failed on ETXTBSY after
+/// the 2 s wall-clock retry: `a_stop_queued_mid_start_targets_the_recorded_spawn` in
+/// two runs, and `a_start_queued_behind_a_start_finds_its_spawn` in a later one.
 #[cfg(unix)]
 struct TextFileBusyWaits(u32);
 

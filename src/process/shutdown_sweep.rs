@@ -407,11 +407,10 @@ mod tests {
     #[test]
     fn the_sweep_latches_a_stop_request_only_on_a_running_runner_with_a_pid() {
         let now = chrono::Utc::now();
-        let state_with = |running: bool, pid: Option<u32>| {
-            let mut runner = crate::state::RunnerState::default();
-            runner.running = running;
-            runner.pid = pid;
-            runner
+        let state_with = |running: bool, pid: Option<u32>| crate::state::RunnerState {
+            running,
+            pid,
+            ..Default::default()
         };
         let mut running = state_with(true, Some(4242));
         assert_eq!(read_and_latch(&mut running, now), (Some(4242), true));
