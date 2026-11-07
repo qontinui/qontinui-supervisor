@@ -140,11 +140,16 @@ async fn a_victim_already_gone_is_reported_as_already_gone() {
 #[tokio::test]
 async fn a_victim_whose_leader_is_gone_still_has_its_group_signalled() {
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.args(["-c", "sleep 30 & echo $!; exit 0"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+    // The background `sleep` must not hold the leader's stdout, or reading it to
+    // EOF would wait out the sleep.
+    cmd.args([
+        "-c",
+        "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exit 0",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
     lead_own_process_group(&mut cmd);
     let child = cmd.spawn().expect("spawn the leader");
     let leader = child.id().expect("pid");
