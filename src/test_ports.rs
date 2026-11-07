@@ -2,8 +2,8 @@
 //!
 //! Binding a listener and DROPPING it frees the port, and a concurrently
 //! running test's mock server can bind it and answer (coord finding
-//! `2d01deb3`, the `flywheel` flake). A socket that is bound but never
-//! `listen()`ed refuses connects, and keeping it alive keeps the port taken.
+//! `2d01deb3`). A socket that is bound but never `listen()`ed refuses
+//! connects, and keeping it alive keeps the port taken.
 
 /// Reserve a refused loopback port for the rest of the test process. The
 /// socket is deliberately leaked: callers get a bare port number with no

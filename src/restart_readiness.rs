@@ -1360,8 +1360,8 @@ mod tests {
     use axum::Router;
 
     /// Spin up a server on an ephemeral port that answers `/restart-readiness`
-    /// with a fixed (status, body). Same shape the flywheel tests use — a real
-    /// HTTP round trip, no live runner required.
+    /// with a fixed (status, body): a real HTTP round trip, no live runner
+    /// required.
     async fn spawn_mock(status: u16, body: &'static str) -> String {
         let app = Router::new().route(
             READINESS_PATH,
@@ -1381,8 +1381,9 @@ mod tests {
         format!("http://127.0.0.1:{}", addr.port())
     }
 
-    /// A URL nothing is listening on: bind an ephemeral port to reserve it,
-    /// then drop the listener.
+    /// A URL nothing answers on: a port held by
+    /// [`crate::test_ports::reserve_refused_port`] (bound, never `listen()`ed,
+    /// kept alive), so connects are refused.
     async fn dead_url() -> String {
         let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{}", port)
