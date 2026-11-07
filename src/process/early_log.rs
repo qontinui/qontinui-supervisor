@@ -307,6 +307,13 @@ fn truncate_file_in_place(file: &mut File, keep_bytes: u64) -> std::io::Result<(
     file.seek(SeekFrom::Start(skip))?;
     let mut tail = Vec::with_capacity(keep_bytes as usize);
     file.read_to_end(&mut tail)?;
+    // `skip` is a byte offset, so it can land inside a multi-byte UTF-8
+    // character. Kept as-is, the file would START with orphaned continuation
+    // bytes, and every reader that decodes it as UTF-8 (`GET
+    // /runners/{id}/early-log`, the dev-action attribution scan) would fail on
+    // the whole file. Drop them: a UTF-8 character has at most 3 of them.
+    let orphaned = utf8_continuation_prefix_len(&tail);
+    tail.drain(..orphaned);
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&tail)?;
@@ -316,6 +323,16 @@ fn truncate_file_in_place(file: &mut File, keep_bytes: u64) -> std::io::Result<(
     // explicit anyway.
     file.seek(SeekFrom::End(0))?;
     Ok(())
+}
+
+/// How many bytes at the start of `bytes` are UTF-8 continuation bytes
+/// (`0b10xx_xxxx`), capped at the 3 a single character can carry.
+fn utf8_continuation_prefix_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take(3)
+        .take_while(|b| (**b & 0xC0) == 0x80)
+        .count()
 }
 
 /// Delete an early-log file: test cleanup only, since no production path
@@ -393,6 +410,39 @@ mod tests {
             content.contains("4999"),
             "most recent line should survive truncation"
         );
+    }
+
+    /// A truncation whose byte offset lands inside a multi-byte character
+    /// leaves a file that still decodes as UTF-8. Before the fix the kept tail
+    /// began with orphaned continuation bytes and `read_to_string` refused the
+    /// whole file, so the early-log route answered 404 for a log that existed.
+    #[test]
+    fn truncation_mid_character_leaves_valid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.log");
+        // "€" is 3 bytes. Cut 1 byte into the first one: 2 orphaned bytes.
+        let content = "€".repeat(10);
+        std::fs::write(&path, &content).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        truncate_file_in_place(&mut file, (content.len() - 1) as u64).unwrap();
+        drop(file);
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes).expect("the kept tail is valid UTF-8");
+        assert_eq!(text, "€".repeat(9));
+    }
+
+    #[test]
+    fn utf8_continuation_prefix_len_counts_only_leading_continuations() {
+        assert_eq!(utf8_continuation_prefix_len(b""), 0);
+        assert_eq!(utf8_continuation_prefix_len(b"abc"), 0);
+        assert_eq!(utf8_continuation_prefix_len(&[0x82, 0xAC, b'a']), 2);
+        assert_eq!(utf8_continuation_prefix_len(&[0xE2, 0x82, 0xAC]), 0);
+        // Never more than a character's worth, even on garbage input.
+        assert_eq!(utf8_continuation_prefix_len(&[0x80; 8]), 3);
     }
 
     #[test]
