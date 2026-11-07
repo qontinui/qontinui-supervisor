@@ -287,8 +287,10 @@ fn scan_early_log(path: Option<&Path>) -> (Vec<DevSignature>, Option<String>) {
     let Some(path) = path else {
         return (Vec::new(), None);
     };
-    match std::fs::read_to_string(path) {
-        Ok(content) => scan_log_content(&content),
+    // Lossy, like `GET /runners/{id}/early-log`: a log truncated mid-character
+    // by an older writer must still be scanned, not read as clean.
+    match std::fs::read(path) {
+        Ok(bytes) => scan_log_content(&String::from_utf8_lossy(&bytes)),
         Err(_) => (Vec::new(), None),
     }
 }
@@ -2861,6 +2863,24 @@ mod tests {
         let (sigs, evidence) = scan_early_log(Some(&path));
         assert!(sigs.contains(&DevSignature::DevTauriAssetMissing));
         assert_eq!(classify(None, &sigs), D3Category::Contradiction);
+        assert!(evidence.is_some());
+    }
+
+    /// An early log that starts mid-character (a pre-fix in-place truncation
+    /// kept orphaned continuation bytes) is still scanned. A strict decode
+    /// failed on the whole file and read it as clean.
+    #[test]
+    fn early_log_starting_mid_character_is_still_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("early.log");
+        let mut bytes = vec![0x82, 0xAC];
+        bytes.extend_from_slice(b"\nERROR tauri::manager: asset not found: index.html\n");
+        std::fs::write(&path, bytes).unwrap();
+        let (sigs, evidence) = scan_early_log(Some(&path));
+        assert!(
+            sigs.contains(&DevSignature::DevTauriAssetMissing),
+            "{sigs:?}"
+        );
         assert!(evidence.is_some());
     }
 
