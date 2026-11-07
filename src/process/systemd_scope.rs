@@ -1089,6 +1089,9 @@ mod tests {
     // ---- proc-root seam -------------------------------------------------
 
     const UNIT: &str = "qontinui-runner-x-20261104T230000000Z.scope";
+    // Read only by the `#[cfg(unix)]` proc-root tests below; ungated, a
+    // Windows `clippy --all-targets -D warnings` fails on it as dead code.
+    #[cfg(unix)]
     const SUPERVISOR_CGROUP: &str =
         "/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-supervisor-x.service";
 

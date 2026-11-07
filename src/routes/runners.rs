@@ -7378,8 +7378,18 @@ pub async fn runner_early_log(
     // the byte cap is small and the response is JSON, not chunked-text — and
     // streaming would race the writer's in-place truncation in
     // `early_log::truncate_file_in_place`.
-    let raw = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
+    // Decoded lossily: an early log written before the writer snapped its
+    // in-place truncation to a character boundary can start mid-character,
+    // and a strict decode would refuse the whole file over those bytes.
+    let (raw, file_bytes) = match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let file_bytes = bytes.len();
+            let text = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
+            (text, file_bytes)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (
                 axum::http::StatusCode::NOT_FOUND,
@@ -7413,18 +7423,21 @@ pub async fn runner_early_log(
         }
     };
 
-    let original_size = raw.len();
-    let (content, truncated) = if original_size > EARLY_LOG_RESPONSE_BYTE_CAP {
+    // `size_bytes` reports the file as it sits on disk. A lossy decode turns
+    // each invalid byte into U+FFFD, which is 3 bytes, so `raw.len()` can be
+    // larger than the file. The cap below works on the decoded string.
+    let decoded_len = raw.len();
+    let (content, truncated) = if decoded_len > EARLY_LOG_RESPONSE_BYTE_CAP {
         // Take the *last* cap bytes. The boundary may land mid-UTF-8 code
         // point (rare for log content, but possible). `char_indices` snaps
         // forward to the next valid boundary so the JSON serializer doesn't
         // bail.
-        let want_start = original_size - EARLY_LOG_RESPONSE_BYTE_CAP;
+        let want_start = decoded_len - EARLY_LOG_RESPONSE_BYTE_CAP;
         let snap = raw
             .char_indices()
             .find(|(i, _)| *i >= want_start)
             .map(|(i, _)| i)
-            .unwrap_or(original_size);
+            .unwrap_or(decoded_len);
         (raw[snap..].to_string(), true)
     } else {
         (raw, false)
@@ -7434,7 +7447,7 @@ pub async fn runner_early_log(
         "runner_id": id,
         "path": path.to_string_lossy(),
         "content": content,
-        "size_bytes": original_size,
+        "size_bytes": file_bytes,
         "truncated": truncated,
     }))
     .into_response()

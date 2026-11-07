@@ -4691,19 +4691,11 @@ async fn rebuild_and_restart_202_carries_action_id_only_when_a_build_can_run() {
 /// sweep prunes early logs, it names that retention (`retention_secs`) so a
 /// pruned file is distinguishable from a lost one. Pinned beside it: an
 /// unknown id, a registered runner with no captured path, and a file under
-/// the tail cap. Not covered here: the stopped-cache lookup, a non-NotFound
-/// read error, and truncation past the 1 MB cap.
+/// the tail cap. The other arms are in
+/// [`early_log_route_reads_the_stopped_cache_and_survives_bad_files`].
 #[tokio::test]
 async fn early_log_route_names_each_outcome() {
-    use axum::extract::{Path, State};
-    async fn call(state: &crate::state::SharedState, id: &str) -> (u16, serde_json::Value) {
-        let resp = super::runner_early_log(State(state.clone()), Path(id.to_string())).await;
-        let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("collect body");
-        (status, serde_json::from_slice(&bytes).expect("JSON body"))
-    }
+    let call = early_log_call;
 
     let state = make_state();
     let primary = crate::config::RunnerConfig::default_primary().id;
@@ -4744,4 +4736,95 @@ async fn early_log_route_names_each_outcome() {
     assert_eq!(body["content"], "boot line\n");
     assert_eq!(body["size_bytes"], 10);
     assert_eq!(body["truncated"], false);
+}
+
+/// Call `GET /runners/{id}/early-log` and return its status and JSON body.
+async fn early_log_call(state: &crate::state::SharedState, id: &str) -> (u16, serde_json::Value) {
+    use axum::extract::{Path, State};
+    let resp = super::runner_early_log(State(state.clone()), Path(id.to_string())).await;
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    (status, serde_json::from_slice(&bytes).expect("JSON body"))
+}
+
+/// The arms of `GET /runners/{id}/early-log` that
+/// [`early_log_route_names_each_outcome`] leaves out: a runner found only in
+/// the stopped cache, a read error other than NotFound, a file that does not
+/// decode as UTF-8, and a file past the 1 MB response cap whose cut lands
+/// inside a multi-byte character.
+#[tokio::test]
+async fn early_log_route_reads_the_stopped_cache_and_survives_bad_files() {
+    let state = make_state();
+    let primary = crate::config::RunnerConfig::default_primary().id;
+    let managed = state
+        .get_runner(&primary)
+        .await
+        .expect("primary registered");
+    let tmp = TempDir::new().unwrap();
+
+    // A runner gone from the registry is served from the stopped cache.
+    let stopped_id = "named-early-log-stopped";
+    let stopped_log = tmp.path().join("stopped-early.log");
+    fs::write(&stopped_log, "stopped boot\n").unwrap();
+    let mut snapshot = crate::process::stopped_cache::snapshot_from_managed(
+        &managed,
+        Some(1),
+        crate::process::stopped_cache::StopReason::GracefulStop,
+    )
+    .await;
+    snapshot.id = stopped_id.to_string();
+    snapshot.early_log_path = Some(stopped_log.clone());
+    state
+        .stopped_runners
+        .write()
+        .await
+        .insert(stopped_id.to_string(), snapshot);
+    assert!(state.get_runner(stopped_id).await.is_none());
+    let (status, body) = early_log_call(&state, stopped_id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["runner_id"], stopped_id);
+    assert_eq!(body["content"], "stopped boot\n");
+
+    // A read that fails for any reason but NotFound: 404 with the error, and
+    // no retention claim, since nothing was pruned. A directory fails the read
+    // on every platform without being NotFound.
+    let dir_path = tmp.path().join("a-directory");
+    fs::create_dir(&dir_path).unwrap();
+    *managed.early_log_path.write().await = Some(dir_path);
+    let (status, body) = early_log_call(&state, &primary).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "early_log_unavailable");
+    let reason = body["reason"].as_str().expect("reason is a string");
+    assert!(reason.starts_with("read failed: "), "{reason}");
+    assert!(body.get("retention_secs").is_none(), "{body}");
+
+    // A file that starts mid-character (what an older writer's in-place
+    // truncation could leave) is served, lossily, rather than refused.
+    let path = tmp.path().join("early.log");
+    let mut bytes = vec![0x82, 0xAC];
+    bytes.extend_from_slice(b"panic line\n");
+    fs::write(&path, &bytes).unwrap();
+    *managed.early_log_path.write().await = Some(path.clone());
+    let (status, body) = early_log_call(&state, &primary).await;
+    assert_eq!(status, 200, "{body}");
+    let content = body["content"].as_str().expect("content is a string");
+    // Each orphaned byte decodes to U+FFFD; `size_bytes` still reports the
+    // file on disk (13 bytes), not the longer decoded string (17).
+    assert_eq!(content, "\u{FFFD}\u{FFFD}panic line\n");
+    assert_eq!(body["size_bytes"], 13);
+
+    // Past the cap: the last cap bytes, snapped forward off a split character.
+    // "é" is 2 bytes; with cap - 1 bytes after it, the cut lands between them.
+    let cap = super::EARLY_LOG_RESPONSE_BYTE_CAP;
+    let big = format!("{}é{}", "a".repeat(10), "b".repeat(cap - 1));
+    fs::write(&path, &big).unwrap();
+    let (status, body) = early_log_call(&state, &primary).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["size_bytes"], big.len());
+    let content = body["content"].as_str().expect("content is a string");
+    assert_eq!(content.len(), cap - 1);
+    assert!(content.bytes().all(|b| b == b'b'));
 }
