@@ -5486,10 +5486,8 @@ fn text_file_busy_is_recognised_through_the_after_act_marker() {
 /// On merytshost, full runs on 2026-11-04 and 2026-11-05 also failed on ETXTBSY after
 /// the 2 s wall-clock retry: `a_stop_queued_mid_start_targets_the_recorded_spawn` in
 /// two runs, and `a_start_queued_behind_a_start_finds_its_spawn` in a later one.
-#[cfg(unix)]
 struct TextFileBusyWaits(u32);
 
-#[cfg(unix)]
 impl TextFileBusyWaits {
     const STEP: Duration = Duration::from_millis(100);
 
