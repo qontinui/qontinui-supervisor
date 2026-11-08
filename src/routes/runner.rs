@@ -665,6 +665,32 @@ pub async fn rebuild_when_idle(
         .into_response())
 }
 
+/// The guard that takes the primary's transient LKG `source_exe_override` off
+/// again, armed by [`restart_runner`] the moment it writes the override.
+///
+/// On the normal path (`run_now`) the restart has returned, so its start has
+/// resolved its exe, and the override comes off at once. Waiting for the lifecycle
+/// lock there would couple the answer to whatever holds it next: a stop queued
+/// behind the restart's start would hold the route for the length of that stop and
+/// leave its health wait polling a stopped runner. On a client hanging up the guard
+/// is dropped and runs on its own task while the restart's start may still be under
+/// way on its own task too, so only that cleanup first waits for the primary's
+/// lifecycle lock, which the start holds until it has resolved and copied its exe.
+/// Without the wait the start would launch the fresh exe the risk model routed away
+/// from.
+fn lkg_override_guard(
+    primary: std::sync::Arc<crate::state::ManagedRunner>,
+) -> manager::CleanupIfDropped {
+    let (now, if_dropped) = (primary.clone(), primary);
+    manager::CleanupIfDropped::new(async move {
+        *now.source_exe_override.write().await = None;
+    })
+    .if_dropped_run(async move {
+        let _lifecycle = if_dropped.lifecycle.lock().await;
+        *if_dropped.source_exe_override.write().await = None;
+    })
+}
+
 pub async fn restart_runner(
     State(state): State<SharedState>,
     Query(wait_q): Query<StartWaitQuery>,
@@ -971,13 +997,17 @@ pub async fn restart_runner(
     };
     // Track whether we set a transient override so we can clear it after the
     // restart, keeping the bias scoped to THIS restart (later restarts re-decide
-    // from fresh predictions rather than inheriting a sticky pin).
-    let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+    // from fresh predictions rather than inheriting a sticky pin). The guard
+    // (`lkg_override_guard`) is armed the moment the override is written, so it
+    // comes off on every exit, a client hanging up included: left in place,
+    // every later start of the primary would launch the LKG exe.
+    let mut lkg_override: Option<manager::CleanupIfDropped> = None;
     if want_lkg {
         let lkg_exe = state.config.lkg_exe_path();
         if lkg_exe.exists() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                lkg_override = Some(lkg_override_guard(primary));
                 let reason = if body.use_lkg == Some(true) {
                     "operator-requested (use_lkg:true)"
                 } else {
@@ -992,7 +1022,6 @@ pub async fn restart_runner(
                     .logs
                     .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                     .await;
-                biased_primary = Some(primary);
             }
         } else if minted.risk.route_lkg || body.use_lkg == Some(true) {
             // Wanted LKG but none exists — surface it rather than silently
@@ -1025,12 +1054,15 @@ pub async fn restart_runner(
     .await;
 
     // Clear the transient LKG override so the bias does not leak into the next
-    // restart (which re-evaluates risk from fresh predictions). The runner has
-    // already resolved + copied its exe by the time `restart_runner` returns, so
-    // clearing now does not affect the just-started process.
-    let lkg_pinned = biased_primary.is_some();
-    if let Some(primary) = biased_primary {
-        *primary.source_exe_override.write().await = None;
+    // restart (which re-evaluates risk from fresh predictions). On this path the
+    // runner has already resolved + copied its exe, since `restart_runner` has
+    // returned, so clearing now does not affect the just-started process, and the
+    // guard does not wait on the lifecycle lock here. Had the client hung up
+    // instead, the guard's own task would wait for that lock first
+    // (`lkg_override_guard`).
+    let lkg_pinned = lkg_override.is_some();
+    if let Some(lkg_override) = lkg_override {
+        lkg_override.run_now().await;
     }
     // S3: a restart that ran the LKG exe is a `restart_lkg` trial. Decided only
     // now, once the start has run: a readiness refusal or a failed start ran no
@@ -2506,6 +2538,58 @@ mod tests {
         }
     }
 
+    /// The LKG guard waits out a start that holds the primary's lifecycle lock only
+    /// when it is dropped (a client hanging up, so the cleanup runs on its own task
+    /// while the restart's start may still be resolving its exe). The test's lock
+    /// stands in for that start; cleared before it lets go, the start would launch
+    /// the fresh exe. Through `run_now` the restart has returned, so the override
+    /// comes off at once whoever holds the lock: the lock then stands in for a stop
+    /// queued behind the restart's start, which the route must not wait out.
+    #[tokio::test]
+    async fn the_lkg_override_waits_out_a_start_only_when_its_guard_is_dropped() {
+        let lkg = PathBuf::from("/lkg/qontinui-runner");
+        let primary = Arc::new(crate::state::ManagedRunner::new(
+            RunnerConfig::default_primary(),
+            false,
+        ));
+        let pinned = || async { primary.source_exe_override.read().await.clone() };
+
+        // Dropped: the override stays while the lock is held, and comes off after.
+        *primary.source_exe_override.write().await = Some(lkg.clone());
+        let start = primary.lifecycle.lock().await;
+        drop(lkg_override_guard(primary.clone()));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            pinned().await,
+            Some(lkg.clone()),
+            "dropped: the override came off while a start held the lock"
+        );
+        drop(start);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pinned().await.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropped: the override never came off"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // `run_now`: the override comes off at once, with the lock still held.
+        *primary.source_exe_override.write().await = Some(lkg.clone());
+        let queued_stop = primary.lifecycle.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lkg_override_guard(primary.clone()).run_now(),
+        )
+        .await
+        .expect("run_now waited on the lifecycle lock a queued stop holds");
+        assert_eq!(pinned().await, None, "run_now left the override in place");
+        drop(queued_stop);
+    }
+
     /// The success arm of the S3 re-key, pinned at source level because no
     /// route test reaches a started primary: the no-rebuild restart re-keys
     /// through `record_lkg_treatment(&action_record, lkg_pinned,
@@ -2514,9 +2598,11 @@ mod tests {
     /// result (`answer_failure`, `record_run_result`, `record_start_verdict`):
     /// the watcher's window closes on that result, and a re-key after it could
     /// reach coord as `restart`. `lkg_pinned` must be derived from
-    /// `biased_primary`, which is set only where the LKG override is written.
-    /// Fails if the call is removed, passes a constant, or moves after a result
-    /// is recorded, or if `lkg_pinned` stops tracking the override.
+    /// `lkg_override`, the guard armed only where the LKG override is written,
+    /// which takes the override off again on every exit, a client hanging up
+    /// included. Fails if the call is removed, passes a constant, or moves after
+    /// a result is recorded, if `lkg_pinned` stops tracking the override, or if
+    /// the override is cleared other than through that guard.
     #[test]
     fn the_restart_handler_rekeys_a_started_lkg_restart_before_recording_its_result() {
         let squeezed: String = crate::source_scan::fn_body(
@@ -2527,30 +2613,60 @@ mod tests {
         .split_whitespace()
         .collect();
 
-        // `lkg_pinned` is set exactly where the override is written to the LKG exe.
+        // `lkg_pinned` is set exactly where the override is written to the LKG
+        // exe, by the guard that clears it again.
         let write = "*primary.source_exe_override.write().await=Some(lkg_exe.clone());";
-        let pinned = "biased_primary=Some(primary);";
+        let pinned = "lkg_override=Some(lkg_override_guard(primary));";
         let write_at = squeezed.find(write).expect("the LKG override is written");
         let pinned_at = squeezed
             .find(pinned)
-            .expect("biased_primary records the pin");
+            .expect("lkg_override records the pin and clears it");
         assert_eq!(
             squeezed.matches(pinned).count(),
             1,
             "one place records the pin"
         );
         assert_eq!(
-            squeezed.matches("biased_primary=").count(),
+            squeezed.matches("lkg_override=").count(),
             1,
-            "biased_primary is assigned only where the override is written"
+            "lkg_override is assigned only where the override is written"
         );
+        assert_eq!(
+            squeezed.matches("source_exe_override.write()").count(),
+            1,
+            "the override is written once and cleared only by its guard"
+        );
+        let guard: String = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "fn lkg_override_guard(",
+        )
+        .expect("lkg_override_guard exists")
+        .split_whitespace()
+        .collect();
+        let now = guard
+            .find("CleanupIfDropped::new(asyncmove{*now.source_exe_override.write().await=None;})")
+            .unwrap_or_else(|| panic!("run_now must clear the override at once: {guard}"));
+        let if_dropped = guard
+            .find(".if_dropped_run(asyncmove{let_lifecycle=if_dropped.lifecycle.lock().await;*if_dropped.source_exe_override.write().await=None;})")
+            .expect("a dropped guard clears the override only once it holds the lifecycle lock");
+        assert!(now < if_dropped, "{guard}");
         assert!(
             write_at < pinned_at,
             "the pin is recorded after the override is written"
         );
         assert!(
-            squeezed.contains("letlkg_pinned=biased_primary.is_some();"),
+            squeezed.contains("letlkg_pinned=lkg_override.is_some();"),
             "lkg_pinned must be derived from the override being written"
+        );
+        let restarted_at = squeezed
+            .find("letrestart_result=manager::restart_runner(")
+            .expect("the synchronous restart");
+        let cleared_at = squeezed
+            .find("lkg_override.run_now().await;")
+            .expect("the guard runs on the normal path");
+        assert!(
+            restarted_at < cleared_at,
+            "the override comes off once the restart has returned"
         );
 
         // On the synchronous path: the re-key follows the start and precedes

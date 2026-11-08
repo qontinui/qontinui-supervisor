@@ -4255,10 +4255,11 @@ async fn a_stopped_spawns_early_log_outlives_the_longest_window() {
     .expect("the sweep exists");
     assert!(sweep.contains("prune_early_logs(&state,"));
     assert!(sweep.contains("early_log_dir_path()"));
-    // And the spawn writes where the sweep prunes.
+    // And the spawn writes where the sweep prunes: the start funnel's body, which
+    // `start_managed_runner` runs on its own task.
     let writer = crate::source_scan::fn_body(
         production_span(&manager),
-        "pub async fn start_managed_runner(",
+        "async fn start_holding_the_lifecycle_lock(",
     )
     .expect("the start funnel exists");
     assert!(writer.contains("early_log::early_log_dir()"));

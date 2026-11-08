@@ -3673,7 +3673,8 @@ async fn the_exit_monitor_stamps_the_exit_and_its_stop_request_then_attaches_its
 
 /// `start_managed_runner` records each spawn through
 /// `record_spawn_in_registry`: the registry entry gets its pid and start time,
-/// and the previous process's stop request is cleared; the ring's newest entry
+/// and the previous process's stop request is cleared, carried first onto the
+/// previous spawn if its exit is not stamped; the ring's newest entry
 /// is exactly `SpawnMarker::new(started_at, pid, early_log_path, initiated_by)`,
 /// dated at that same instant, which is now and which the call returns.
 #[tokio::test]
@@ -3681,11 +3682,12 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
     let (state, root) = restart_test_state();
     let managed = register_dead_named_runner(&state, "named-record-spawn").await;
     // The previous process's stop request, still latched as its stop left it.
+    let requested_at = chrono::Utc::now() - chrono::Duration::seconds(30);
     managed
         .runner
         .write()
         .await
-        .latch_stop_request(chrono::Utc::now() - chrono::Duration::seconds(30));
+        .latch_stop_request(requested_at);
     let earlier = crate::state::SpawnMarker::new(
         chrono::Utc::now() - chrono::Duration::seconds(60),
         Some(1),
@@ -3726,10 +3728,69 @@ async fn a_spawn_is_recorded_on_its_registry_entry_and_in_its_ring_at_one_instan
     assert_eq!(
         ring,
         [
-            earlier,
+            crate::state::SpawnMarker {
+                stop_requested_at: Some(requested_at),
+                ..earlier
+            },
             crate::state::SpawnMarker::new(started_at, Some(pid), Some(early_log), Some(action)),
         ],
-        "the ring's newest entry is not this spawn as the registry records it"
+        "the ring's newest entry is not this spawn as the registry records it, or the \
+         previous spawn, whose exit is not stamped, lost the request this start cleared"
+    );
+}
+
+/// Carrying a request stops at the newest entry, and only while its exit is not
+/// stamped: a stamped entry keeps what its monitor read. A request the monitor then
+/// finds dated after the exit is dropped like any other.
+#[test]
+fn a_carried_stop_request_reaches_only_the_spawn_still_waiting_for_its_exit() {
+    let at = |secs: i64| chrono::Utc::now() + chrono::Duration::seconds(secs);
+    let (spawned, requested, exited) = (at(-60), at(-30), at(-10));
+    let spawn = |spawned_at| crate::state::SpawnMarker::new(spawned_at, Some(1), None, None);
+
+    let mut ring = crate::state::SpawnRing::default();
+    ring.carry_stop_request(requested);
+    assert_eq!(ring.iter().count(), 0, "nothing to carry it to");
+
+    ring.push(spawn(spawned));
+    ring.stamp_exit(spawned, exited, None);
+    ring.carry_stop_request(requested);
+    assert_eq!(
+        ring.newest().expect("the spawn").stop_requested_at,
+        None,
+        "this exit's monitor has already read the flag"
+    );
+
+    let mut ring = crate::state::SpawnRing::default();
+    ring.push(spawn(spawned));
+    ring.carry_stop_request(requested);
+    ring.stamp_exit(spawned, exited, None);
+    assert_eq!(
+        ring.newest().expect("the spawn").stop_requested_at,
+        Some(requested),
+        "the monitor's empty read overwrote the carried request"
+    );
+
+    // The monitor woke after the later spawn's own stop latched: the flag it read is
+    // that stop's, and the carried request is this spawn's.
+    let mut ring = crate::state::SpawnRing::default();
+    ring.push(spawn(spawned));
+    ring.carry_stop_request(requested);
+    ring.stamp_exit(spawned, exited, Some(at(-20)));
+    assert_eq!(
+        ring.newest().expect("the spawn").stop_requested_at,
+        Some(requested),
+        "the later spawn's stop replaced this spawn's own request"
+    );
+
+    let mut ring = crate::state::SpawnRing::default();
+    ring.push(spawn(spawned));
+    ring.carry_stop_request(at(-5));
+    ring.stamp_exit(spawned, exited, None);
+    assert_eq!(
+        ring.newest().expect("the spawn").stop_requested_at,
+        None,
+        "that stop did not ask for an exit that had already happened"
     );
 }
 
@@ -3844,7 +3905,7 @@ fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry
     const RECORD: &str =
         "letspawned_at=record_spawn_in_registry(managed,pid,early_log_path,initiated_by).await;";
 
-    let start = body_of("pub async fn start_managed_runner(");
+    let start = body_of("async fn start_holding_the_lifecycle_lock(");
     assert_eq!(
         start.matches(RECORD).count(),
         1,
@@ -4342,8 +4403,9 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
     // thing it must span, so no block releases it early.
     //
     // What this cannot see: `managed` shadowed to another runner, a helper that took
-    // the guard's mutex some other way, and anything at run time. A cancelled future
-    // does release the guard, wherever it was. The DELETE route and the purge are
+    // the guard's mutex some other way, and anything at run time. A cancelled stop
+    // does release the guard, wherever it was. A start's task outlives its caller,
+    // and owns its guard for its whole body. The DELETE route and the purge are
     // checked for their binding at the end of this test, not for their span.
     let guard_spans = |sig: &str, body: &str, lock: &str, last: &str| {
         assert_eq!(
@@ -4371,24 +4433,38 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
     };
 
     const LOCK: &str = "let_lifecycle=managed.lifecycle.lock().await;";
+    // The start takes the lock in the caller's future, so a caller that goes away
+    // while queued abandons it, and moves the guard onto the task that runs the body,
+    // which takes no other.
     let start = body_of("pub async fn start_managed_runner(");
-    assert_eq!(start.matches(LOCK).count(), 1, "the start takes it once");
     in_order(
         "start_managed_runner",
         &start,
         &[
-            LOCK,
+            "letlifecycle=managed.lifecycle.clone().lock_owned().await;",
+            "run_detached(asyncmove{let_lifecycle=lifecycle;start_holding_the_lifecycle_lock(",
+        ],
+    );
+    let held = body_of("async fn start_holding_the_lifecycle_lock(");
+    assert!(
+        !held.contains("lifecycle."),
+        "the start's body must not take the lock its task owns"
+    );
+    in_order(
+        "start_holding_the_lifecycle_lock",
+        &held,
+        &[
+            "refuses_start_at_shutdown(",
             ".or_insert_with(",
             "ifrunner.running||newest_spawn_is_up(",
             "record_spawn_in_registry(",
             "monitor_runner_process_exit(",
         ],
     );
-    guard_spans(
-        "start_managed_runner",
-        &start,
-        LOCK,
-        "monitor_runner_process_exit(",
+    assert_eq!(
+        src.matches("start_holding_the_lifecycle_lock(").count(),
+        2,
+        "only start_managed_runner's task runs the body"
     );
 
     let stop = body_of("pub async fn stop_runner_by_id(");
@@ -5265,7 +5341,9 @@ async fn a_restart_re_inserts_only_once_it_holds_the_lock() {
         &state,
         &managed,
         None,
-        StartAs::Restart,
+        StartAs::Restart {
+            removed_by_its_stop: true,
+        },
     ));
     assert!(futures::poll!(&mut start).is_pending());
     state.runners.write().await.remove(&id);
@@ -5422,6 +5500,575 @@ async fn a_runner_that_never_answered_is_alerted_and_called_adopted_only_when_it
             assert!(logged[0].contains("NEVER answered"), "{row}: {logged:?}");
         }
     }
+}
+
+/// A spawn holding its port inside the first-healthy budget is a runner booting,
+/// so the alert stays quiet, and that is the whole of the rule: the budget's edge,
+/// a spawn with no recorded start, and an adopted runner, which has no budget.
+#[test]
+fn a_never_answered_alert_waits_out_the_first_healthy_budget() {
+    let now = chrono::Utc::now();
+    let budget = Duration::from_secs(90);
+    let ago = |secs: i64| Some(now - chrono::Duration::seconds(secs));
+    for (adopted, started_at, due) in [
+        (false, ago(30), false),
+        (false, ago(89), false),
+        (false, ago(90), true),
+        (false, ago(600), true),
+        (false, None, true),
+        (false, Some(now + chrono::Duration::seconds(5)), false),
+        (true, ago(30), true),
+        (true, None, true),
+    ] {
+        assert_eq!(
+            never_answered_alert_is_due(adopted, started_at, now, budget),
+            due,
+            "adopted={adopted} started_at={started_at:?}"
+        );
+    }
+}
+
+/// The same rule through the hook: a cold boot at its first escalation, about 30 s
+/// in, leaves no diagnostic and no error line.
+#[tokio::test]
+async fn a_cold_boot_at_its_first_escalation_is_not_alerted() {
+    use crate::log_capture::LogLevel;
+
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let spawned_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            Some(4242),
+            None,
+            None,
+        ));
+    {
+        let mut runner = managed.runner.write().await;
+        runner.pid = Some(4242);
+        runner.started_at = Some(spawned_at);
+    }
+
+    maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::Unknown,
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        serving_events(&state).await,
+        [],
+        "a booting runner was alerted"
+    );
+    let errors = state
+        .logs
+        .history()
+        .await
+        .into_iter()
+        .filter(|entry| matches!(entry.level, LogLevel::Error))
+        .count();
+    assert_eq!(errors, 0, "a booting runner logged an error");
+}
+
+/// The loop's cadence alerts at about 30 s and next at about 330 s. A spawn that
+/// passes its 90 s budget in between alerts on its first tick past it, once. The
+/// cadence still re-alerts.
+#[tokio::test]
+async fn a_spawn_past_its_budget_alerts_once_between_the_loops_alerts() {
+    use crate::diagnostics::ServingEvent;
+
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let spawned_at =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 1);
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            Some(4242),
+            None,
+            None,
+        ));
+    {
+        let mut runner = managed.runner.write().await;
+        runner.pid = Some(4242);
+        runner.started_at = Some(spawned_at);
+    }
+    for (should_alert, expected) in [(false, 1), (false, 1), (true, 2), (false, 2)] {
+        maybe_serving_restart(
+            &state,
+            &managed,
+            crate::state::RunnerLiveness::Unknown,
+            should_alert,
+        )
+        .await;
+        let alerts = serving_events(&state)
+            .await
+            .into_iter()
+            .filter(|event| *event == ServingEvent::NeverAnsweredSinceSpawn)
+            .count();
+        assert_eq!(alerts, expected, "should_alert={should_alert}");
+    }
+}
+
+/// A kill tells coord, since the port closing may leave the loop no tick to say so,
+/// as an event of its own. A stop that has latched ended that runner, so no alert.
+#[tokio::test]
+async fn a_first_healthy_kill_alerts_unless_a_stop_ended_the_runner() {
+    use crate::diagnostics::ServingEvent;
+
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-first-healthy-kill").await;
+    let kills = |events: Vec<ServingEvent>| {
+        events
+            .into_iter()
+            .filter(|event| *event == ServingEvent::FirstHealthyKill)
+            .count()
+    };
+
+    alert_first_healthy_kill(&state, &managed, 4242, 90).await;
+    assert_eq!(kills(serving_events(&state).await), 1);
+
+    managed
+        .runner
+        .write()
+        .await
+        .latch_stop_request(chrono::Utc::now());
+    alert_first_healthy_kill(&state, &managed, 4242, 90).await;
+    assert_eq!(
+        kills(serving_events(&state).await),
+        1,
+        "the operator ended this one"
+    );
+}
+
+/// The first tick past the budget stays quiet for a spawn the first-healthy watchdog
+/// still tracks, whose kill will speak, and for a spawn a stop has latched on.
+#[tokio::test]
+async fn a_spawn_something_else_answers_for_does_not_alert_on_passing_its_budget() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let spawned_at =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 1);
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            Some(4242),
+            None,
+            None,
+        ));
+
+    {
+        let mut runner = managed.runner.write().await;
+        runner.running = true;
+        runner.pid = Some(4242);
+        runner.started_at = Some(spawned_at);
+    }
+    maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::Unknown,
+        false,
+    )
+    .await;
+    assert_eq!(serving_events(&state).await, [], "the watchdog tracks it");
+
+    {
+        let mut runner = managed.runner.write().await;
+        runner.running = false;
+        runner.latch_stop_request(chrono::Utc::now());
+    }
+    maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::Unknown,
+        false,
+    )
+    .await;
+    assert_eq!(serving_events(&state).await, [], "a stop has latched");
+}
+
+/// A caller that goes away during a restart leaves no `restart_requested` latched
+/// behind: the latch silences the serving watchdog for that runner for good. The
+/// restart has no stop to make, so it goes straight to its start, which waits on the
+/// lock this test holds, and the caller goes away there.
+#[tokio::test]
+async fn a_restart_whose_caller_goes_away_still_clears_its_latch() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, _root) = restart_test_state();
+    let id = "named-restart-caller-gone";
+    let managed = register_dead_named_runner(&state, id).await;
+
+    let holder = managed.lifecycle.lock().await;
+    {
+        let state = state.clone();
+        let mut restart = Box::pin(async move {
+            restart_runner_by_id(
+                &state,
+                id,
+                false,
+                RestartSource::Manual,
+                false,
+                BuildTree::OriginMain,
+                CloseIntent::Kill,
+                None,
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !managed.runner.read().await.restart_requested {
+            assert!(futures::poll!(&mut restart).is_pending());
+            assert!(std::time::Instant::now() < deadline, "the latch never rose");
+            tokio::task::yield_now().await;
+        }
+        assert!(futures::poll!(&mut restart).is_pending());
+    }
+    drop(holder);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while managed.runner.read().await.restart_requested {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the latch stayed up after its caller went away"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A stop requested of spawn A, cleared by the start of B before A's monitor woke,
+/// is still A's request on A's entry, and never B's. Without the carry, a stopped
+/// spawn reads as a failed boot and its in-window panics count.
+#[tokio::test]
+async fn a_monitor_that_wakes_after_the_next_start_keeps_the_stop_request() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-late-request").await;
+
+    let (mut child_a, pid_a) = spawn_a_child_that_exits_when_its_stdin_closes();
+    let stdin_a = child_a.stdin.take().expect("A's stdin");
+    let spawned_a = record_spawn_in_registry(&managed, Some(pid_a), None, None).await;
+    let monitor_a = tokio::spawn(monitor_runner_process_exit_inner(
+        state.clone(),
+        managed.clone(),
+        child_a,
+        spawned_a,
+    ));
+
+    let requested_at = chrono::Utc::now();
+    managed
+        .runner
+        .write()
+        .await
+        .latch_stop_request(requested_at);
+    while chrono::Utc::now() == spawned_a {
+        tokio::task::yield_now().await;
+    }
+    let (mut child_b, pid_b) = spawn_a_child_that_exits_when_its_stdin_closes();
+    let _stdin_b = child_b.stdin.take().expect("B's stdin");
+    record_spawn_in_registry(&managed, Some(pid_b), None, None).await;
+    assert!(
+        !managed.runner.read().await.stop_requested,
+        "B's start clears the latch"
+    );
+
+    drop(stdin_a);
+    monitor_a.await.expect("A's monitor");
+
+    let ring = managed.recent_spawns.read().await;
+    let entries: Vec<&crate::state::SpawnMarker> = ring.iter().collect();
+    assert!(entries[0].exited_at.is_some(), "A's exit: {entries:?}");
+    assert_eq!(
+        entries[0].stop_requested_at,
+        Some(requested_at),
+        "A's stopped exit reads as unrequested"
+    );
+    assert_eq!(entries[1].stop_requested_at, None, "B was asked nothing");
+    drop(child_b);
+}
+
+/// A restart puts back only what its own stop removed. Anything else that removed
+/// the entry meant the runner to be gone, as a `DELETE` during a rebuild does. The
+/// test stands that `DELETE` in while the restart's start waits on the lifecycle
+/// lock: this restart needs no stop, so its start is all it does.
+#[tokio::test(start_paused = true)]
+async fn a_restart_does_not_bring_back_a_runner_removed_during_it() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, _root) = restart_test_state();
+    let id = "named-removed-mid-restart";
+    let managed = register_dead_named_runner(&state, id).await;
+
+    let holder = managed.lifecycle.lock().await;
+    let restart = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            restart_runner_by_id(
+                &state,
+                id,
+                false,
+                RestartSource::Manual,
+                false,
+                BuildTree::OriginMain,
+                CloseIntent::Kill,
+                None,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert!(
+        managed.runner.read().await.restart_requested,
+        "the restart must be under way, waiting on the lock, for this test to say anything"
+    );
+    state.runners.write().await.remove(id);
+    drop(holder);
+    tokio::time::resume();
+
+    let err = restart
+        .await
+        .expect("the restart")
+        .expect_err("the runner is gone");
+    assert!(matches!(err, SupervisorError::RunnerNotFound(_)), "{err}");
+    assert!(
+        state.runners.read().await.get(id).is_none(),
+        "the restart brought the removed runner back"
+    );
+}
+
+/// The other half: an entry the restart's own stop removed, as a `test-*` runner's
+/// is, goes back, so the restart does not strand the runner. This one fails later,
+/// at exe resolution.
+#[tokio::test]
+async fn a_restart_puts_back_the_entry_its_own_stop_removed() {
+    let (state, _root) = restart_test_state();
+    let id = "named-removed-by-its-stop";
+    let managed = register_dead_named_runner(&state, id).await;
+    state.runners.write().await.remove(id);
+
+    let err = start_managed_runner(
+        &state,
+        &managed,
+        None,
+        StartAs::Restart {
+            removed_by_its_stop: true,
+        },
+    )
+    .await
+    .expect_err("no build slot holds an exe");
+    assert!(failed_at_exe_resolution(&err), "{err}");
+    assert!(
+        state.runners.read().await.get(id).is_some(),
+        "the restart stranded the runner its stop removed"
+    );
+}
+
+/// The whole restart of a running `test-*` runner: its stop removes the entry, and
+/// its start is told so. Port-held evidence is what sends it to the stop. A fixed
+/// port nothing listens on, since the stop's reap kills whatever holds it, and it
+/// has to confirm the port free for the stop to succeed.
+#[tokio::test]
+async fn a_restart_of_a_test_runner_keeps_it_registered_through_its_own_stop() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, _root) = restart_test_state();
+    let id = format!("test-restart-own-stop-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_887)),
+        false,
+    ));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.clone(), managed.clone());
+    managed.cached_health.write().await.runner_port_open = true;
+
+    let err = restart_runner_by_id(
+        &state,
+        &id,
+        false,
+        RestartSource::Manual,
+        false,
+        BuildTree::OriginMain,
+        CloseIntent::Kill,
+        None,
+    )
+    .await
+    .expect_err("nothing can be started from an empty runner tree");
+    assert!(
+        managed.runner.read().await.stop_requested,
+        "the stop must have been reached"
+    );
+    let SupervisorError::AfterAct(inner) = &err else {
+        panic!("a failure after the stop is marked AfterAct: {err:?}");
+    };
+    assert!(
+        !matches!(**inner, SupervisorError::RunnerNotFound(_)),
+        "the restart's start refused the entry its own stop removed: {err}"
+    );
+    // A stop that failed before its registry removal would leave the entry
+    // registered too, so only an error from past the re-insert says anything.
+    assert!(
+        failed_at_exe_resolution(&err),
+        "the restart did not reach its start's exe resolution: {err}"
+    );
+    assert!(
+        state.get_runner(&id).await.is_some(),
+        "the restart stranded the runner its own stop removed"
+    );
+}
+
+/// Whether a start failed where every start in this empty runner tree ends once it
+/// is past its registry checks: resolving the exe. Looks through `AfterAct`.
+fn failed_at_exe_resolution(err: &SupervisorError) -> bool {
+    match err {
+        SupervisorError::AfterAct(inner) => failed_at_exe_resolution(inner),
+        SupervisorError::Process(msg) => msg.contains("Runner exe not found in any build slot"),
+        _ => false,
+    }
+}
+
+/// `rebuild_and_restart_by_id` cannot run in a unit test, since it builds. Its start
+/// must be told, as the other restart's is, what its own stop removed, read right
+/// after that stop and before the rebuild, which can take most of an hour.
+#[test]
+fn both_restarts_read_what_their_stop_removed_before_their_rebuild() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let in_order = |sig: &str, marks: &[&str]| {
+        let body: String = crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect();
+        let mut last = 0;
+        for mark in marks {
+            let at = body[last..]
+                .find(mark)
+                .unwrap_or_else(|| panic!("{sig}: no {mark} after byte {last}"));
+            last += at + mark.len();
+        }
+    };
+    in_order(
+        "pub async fn rebuild_and_restart_by_id(",
+        &[
+            "stop_runner_by_id(state,runner_id,",
+            "letremoved_by_its_stop=!is_registered(state,&managed).await;",
+            "run_cargo_build_with_requester(",
+            "StartAs::Restart{removed_by_its_stop,}",
+        ],
+    );
+    in_order(
+        "async fn restart_after_gate(",
+        &[
+            "stop_runner_by_id(state,runner_id,true,intent).await?;",
+            "removed_by_its_stop=!is_registered(state,managed).await;",
+            "primary_rebuild_from_origin_main(",
+            "StartAs::Restart{removed_by_its_stop,}",
+        ],
+    );
+}
+
+/// What no unit test can drive, at source level. The primary route's LKG override
+/// comes off through a guard armed as it goes on. A named runner's settings row sits on
+/// the detached task with its start. A kill alerts only once it has happened. The
+/// stop request is carried under the runner lock, before that lock's flag is cleared.
+#[test]
+fn what_must_follow_a_start_or_a_kill_is_wired() {
+    let scan = |path: &[&str], sig: &str, marks: &[&str]| {
+        let mut file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        file.extend(path);
+        let src = std::fs::read_to_string(&file)
+            .expect("read the source file")
+            .replace("\r\n", "\n");
+        let src = crate::source_scan::production_span(&src).to_string();
+        let body: String = crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect();
+        let mut last = 0;
+        for mark in marks {
+            let at = body[last..]
+                .find(mark)
+                .unwrap_or_else(|| panic!("{sig}: no {mark} after byte {last}"));
+            last += at + mark.len();
+        }
+    };
+    scan(
+        &["routes", "runner.rs"],
+        "pub async fn restart_runner(",
+        &[
+            "*primary.source_exe_override.write().await=Some(lkg_exe.clone());",
+            "lkg_override=Some(lkg_override_guard(primary));",
+            "manager::restart_runner(",
+            "lkg_override.run_now().await;",
+        ],
+    );
+    scan(
+        &["routes", "runner.rs"],
+        "fn lkg_override_guard(",
+        &[
+            "manager::CleanupIfDropped::new(asyncmove{*now.source_exe_override.write().await=None;})",
+            ".if_dropped_run(asyncmove{let_lifecycle=if_dropped.lifecycle.lock().await;",
+            "*if_dropped.source_exe_override.write().await=None;",
+        ],
+    );
+    scan(
+        &["routes", "runners.rs"],
+        "async fn spawn_named_inner(",
+        &[
+            "manager::run_detached(asyncmove{",
+            "manager::start_managed_runner(",
+            "settings::add_runner(",
+            "Ok(())})",
+        ],
+    );
+    scan(
+        &["process", "manager.rs"],
+        "async fn watch_first_healthy(",
+        &[
+            "kill_by_pid_tree(pid)",
+            "Ok(true)=>{",
+            "alert_first_healthy_kill(&state,&managed,pid,timeout_secs).await;",
+        ],
+    );
+    scan(
+        &["process", "manager.rs"],
+        "async fn record_spawn_in_registry(",
+        &[
+            "letmutrunner=managed.runner.write().await;letmutring=managed.recent_spawns.write().await;",
+            "ring.carry_stop_request(",
+            "runner.clear_stop_request();",
+        ],
+    );
+    scan(
+        &["process", "manager.rs"],
+        "pub async fn run_admitted_restart(",
+        &[
+            "runner.restart_requested=true;",
+            "letlatch={",
+            "CleanupIfDropped::new(asyncmove{managed.runner.write().await.restart_requested=false;})",
+            "restart_after_gate(",
+            "latch.run_now().await;",
+        ],
+    );
 }
 
 /// What a stub process runs: a builtin wait, so its image stays the stub's own and
@@ -5620,6 +6267,126 @@ async fn wait_for_exit_stamp(managed: &ManagedRunner) -> crate::state::SpawnMark
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A caller that goes away once its start holds the lifecycle lock does not end that
+/// start: an HTTP handler's future is dropped when its client hangs up. The spawn is
+/// recorded, and its exit monitor observes the process. The first poll takes the
+/// free lock and hands the start to its task.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_whose_caller_goes_away_still_gets_its_exit_monitor() {
+    let (state, managed, _root) = stub_primary(29_885).await;
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            let deadline = std::time::Instant::now() + MONITOR_BUDGET;
+            // What the last start that ended within its one poll returned. Its
+            // caller never went away, so such a start is no evidence either way.
+            let mut ended_within_its_poll: Option<String> = None;
+            let pid = loop {
+                let spawns_before = managed.recent_spawns.read().await.iter().count();
+                let left_mid_start = {
+                    let mut start = {
+                        let (state, managed) = (state.clone(), managed.clone());
+                        Box::pin(async move {
+                            start_managed_runner(&state, &managed, None, StartAs::Registered).await
+                        })
+                    };
+                    match futures::poll!(&mut start) {
+                        std::task::Poll::Pending => true,
+                        std::task::Poll::Ready(outcome) => {
+                            ended_within_its_poll = Some(format!("{outcome:?}"));
+                            false
+                        }
+                    }
+                };
+                // Queued behind the start's task: this returns when that start ends.
+                drop(managed.lifecycle.lock().await);
+                let newest = {
+                    let ring = managed.recent_spawns.read().await;
+                    (ring.iter().count() > spawns_before)
+                        .then(|| ring.newest().and_then(|spawn| spawn.pid))
+                        .flatten()
+                };
+                if let (true, Some(pid)) = (left_mid_start, newest) {
+                    break pid;
+                }
+                // The stub copy can fail with ETXTBSY, which this caller left
+                // before it could read. An inline start, cancelled at its first
+                // await, also lands here, and runs out the deadline.
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no spawn was recorded by a start whose caller left mid-start: the start \
+                     ended with its caller (the last start that ended within its one poll \
+                     returned {ended_within_its_poll:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+
+            crate::process::proc_kill::kill_by_pid(pid)
+                .await
+                .expect("kill the stub");
+            let entry = wait_for_exit_stamp(&managed).await;
+            assert_eq!(entry.pid, Some(pid), "{entry:?}");
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
+}
+
+/// A restart whose caller went away while it waited for the lifecycle lock ends there.
+/// If it went on it could overlap a retry, or undo a stop that arrived after its client
+/// left. On a stub exe, since an exe that cannot start proves nothing. A start that went
+/// on is queued ahead of this test's lock, so it has finished when that lock returns.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_whose_caller_goes_away_starts_nothing() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, managed, _root) = stub_primary(29_886).await;
+    let body = {
+        let (state, managed) = (state.clone(), managed.clone());
+        async move {
+            let holder = managed.lifecycle.lock().await;
+            {
+                let state = state.clone();
+                let id = managed.config.id.clone();
+                let mut restart = Box::pin(async move {
+                    restart_runner_by_id(
+                        &state,
+                        &id,
+                        false,
+                        RestartSource::Manual,
+                        true,
+                        BuildTree::OriginMain,
+                        CloseIntent::Kill,
+                        None,
+                    )
+                    .await
+                });
+                let deadline = std::time::Instant::now() + MONITOR_BUDGET;
+                while !managed.runner.read().await.restart_requested {
+                    assert!(futures::poll!(&mut restart).is_pending());
+                    assert!(std::time::Instant::now() < deadline, "the latch never rose");
+                    tokio::task::yield_now().await;
+                }
+                // As far as it can go: a start that went on queues on the lock now.
+                for _ in 0..50 {
+                    assert!(futures::poll!(&mut restart).is_pending());
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(holder);
+            drop(managed.lifecycle.lock().await);
+            assert_eq!(
+                managed.recent_spawns.read().await.iter().count(),
+                0,
+                "the restart went on to start a runner after its caller left"
+            );
+        }
+    };
+    with_the_stub_stopped_after(&state, &managed, body).await;
 }
 
 /// A real start, on a stub exe. A stop that arrives while it runs is ordered
@@ -7057,13 +7824,15 @@ fn a_prebind_alert_is_due_past_the_budget_and_repeats_on_its_own_cadence() {
 }
 
 /// A respawn that holds its port and never answers reads `UnresponsiveSince`
-/// through the previous boot's stamp. It is alerted as never answered since its
-/// spawn; a runner that answered during this spawn and went silent is not.
+/// through the previous boot's stamp. Past the first-healthy budget it is alerted
+/// as never answered since its spawn; a runner that answered during this spawn and
+/// went silent is not.
 #[tokio::test]
 async fn a_respawn_that_never_answered_is_alerted_as_never_answered() {
     use crate::diagnostics::ServingEvent;
 
-    let started = chrono::Utc::now() - chrono::Duration::seconds(35);
+    let started =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 5);
     for (stamp, expected) in [
         (
             started - chrono::Duration::days(2),
@@ -7088,6 +7857,135 @@ async fn a_respawn_that_never_answered_is_alerted_as_never_answered() {
         assert_eq!(serving_events(&state).await, expected, "stamp {stamp}");
         assert_eq!(managed.watchdog.read().await.serving_restart_attempts, 0);
     }
+}
+
+/// A respawn of a runner that answered before keeps that answer's stamp, so it reads
+/// `UnresponsiveSince` from its first tick. Inside the first-healthy budget it is a
+/// boot like any other and is not alerted at the loop's first escalation, about 30 s
+/// in. Past the budget, one no first-healthy watchdog tracks alerts once on its first
+/// tick there, whatever the cadence says, and then keeps to the cadence.
+#[tokio::test]
+async fn a_respawn_inside_its_budget_is_not_alerted_and_alerts_once_past_it() {
+    use crate::diagnostics::ServingEvent;
+
+    let earlier_answer = chrono::Utc::now() - chrono::Duration::days(2);
+    let budget = first_healthy_timeout_secs() as i64;
+    for (started_ago, ticks, expected) in [
+        (30, vec![true], 0),
+        (budget - 1, vec![true, false], 0),
+        (budget + 1, vec![false, false, true, false], 2),
+    ] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        let started = chrono::Utc::now() - chrono::Duration::seconds(started_ago);
+        {
+            let mut runner = managed.runner.write().await;
+            runner.last_seen_responding_at = Some(earlier_answer);
+            runner.started_at = Some(started);
+        }
+        for should_alert in ticks {
+            maybe_serving_restart(
+                &state,
+                &managed,
+                crate::state::RunnerLiveness::UnresponsiveSince(earlier_answer),
+                should_alert,
+            )
+            .await;
+        }
+        let alerts = serving_events(&state)
+            .await
+            .into_iter()
+            .filter(|event| *event == ServingEvent::NeverAnsweredSinceSpawn)
+            .count();
+        assert_eq!(alerts, expected, "started {started_ago}s ago");
+    }
+}
+
+/// A caller cancelled while `run_now` awaits the cleanup does not lose it: the
+/// partly-run cleanup goes to `Drop`, which runs the rest of it. The test holds the
+/// runner's write lock so the cleanup, clearing `restart_requested`, is parked on it
+/// when its caller goes away.
+#[tokio::test]
+async fn a_cleanup_whose_run_now_is_cancelled_partway_still_runs() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-cleanup-cancelled").await;
+    managed.runner.write().await.restart_requested = true;
+    let latch = {
+        let managed = managed.clone();
+        CleanupIfDropped::new(async move {
+            managed.runner.write().await.restart_requested = false;
+        })
+    };
+
+    let held = managed.runner.write().await;
+    {
+        let mut run_now = Box::pin(latch.run_now());
+        assert!(
+            futures::poll!(&mut run_now).is_pending(),
+            "the cleanup must be parked on the held lock for this test to say anything"
+        );
+    }
+    drop(held);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while managed.runner.read().await.restart_requested {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cleanup was lost with its cancelled run_now: the latch stayed up"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A guard with a dropped-path future runs it only when dropped before `run_now`
+/// began. A `run_now` that began and was cancelled is finished on `Drop` with its own
+/// cleanup, partly run, never the dropped-path one.
+#[tokio::test]
+async fn a_dropped_path_cleanup_runs_only_when_run_now_never_began() {
+    let ran = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = || {
+        let (now_ran, dropped_ran, gate) = (ran.clone(), ran.clone(), gate.clone());
+        CleanupIfDropped::new(async move {
+            drop(gate.lock().await);
+            now_ran.lock().unwrap().push("run_now");
+        })
+        .if_dropped_run(async move {
+            dropped_ran.lock().unwrap().push("if_dropped");
+        })
+    };
+    let settle = || async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while ran.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no cleanup ran");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        std::mem::take(&mut *ran.lock().unwrap())
+    };
+
+    drop(guard());
+    assert_eq!(settle().await, ["if_dropped"], "dropped before run_now");
+
+    guard().run_now().await;
+    assert_eq!(settle().await, ["run_now"], "run_now to its end");
+
+    let held = gate.lock().await;
+    {
+        let mut run_now = Box::pin(guard().run_now());
+        assert!(
+            futures::poll!(&mut run_now).is_pending(),
+            "the cleanup must be parked on the held gate for this to say anything"
+        );
+    }
+    drop(held);
+    assert_eq!(
+        settle().await,
+        ["run_now"],
+        "a cancelled run_now is finished with its own cleanup"
+    );
 }
 
 /// A primary alive on its newest spawn, silent and holding no port past the
@@ -7425,20 +8323,35 @@ fn the_spawn_site_confirms_a_scoped_landing_and_fails_an_early_exit() {
 
 #[test]
 fn a_start_reads_the_shutdown_latch_under_its_lock_and_clears_the_old_verdict() {
-    let start = manager_fn_body("pub async fn start_managed_runner(");
-    let lock = start
-        .find("managed.lifecycle.lock().await")
+    // The lock is taken before the body runs, and its guard moves onto the task
+    // that runs it; `the_lifecycle_lock_spans_the_start_and_the_stop` pins that
+    // the guard is held for the whole body.
+    let outer = manager_fn_body("pub async fn start_managed_runner(");
+    let taken = outer
+        .find("managed.lifecycle.clone().lock_owned().await")
         .expect("start_managed_runner takes the lifecycle lock");
+    let body_runs = outer
+        .find("start_holding_the_lifecycle_lock(")
+        .expect("start_managed_runner runs the start's body");
+    assert!(
+        taken < body_runs,
+        "the shutdown latch is read UNDER the lifecycle lock, which the sweep waits for: \
+         the lock is taken (byte {taken}) before the body that reads it runs ({body_runs})"
+    );
+    let start = manager_fn_body("async fn start_holding_the_lifecycle_lock(");
     let latch = start
         .find("refuses_start_at_shutdown(state, &managed.config.kind(), crash_restart)")
         .expect("a temp start must refuse once the shutdown has latched");
     let refuse = start
         .find("SupervisorError::ShuttingDown(")
         .expect("checked above");
+    let first_check = start
+        .find("match start_as {")
+        .expect("the start's StartAs checks");
     assert!(
-        lock < latch && latch < refuse,
-        "the shutdown latch is read UNDER the lifecycle lock, which the sweep waits for \
-         (lock {lock}, latch {latch}, refusal {refuse})"
+        latch < refuse && refuse < first_check,
+        "the latch is the first thing the start's body reads, before what its StartAs \
+         requires (latch {latch}, refusal {refuse}, checks {first_check})"
     );
     let reset = start
         .find("*managed.isolation.write().await = None;")
