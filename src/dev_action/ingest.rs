@@ -661,8 +661,12 @@ fn disposition(status: Option<reqwest::StatusCode>) -> Disposition {
 /// never panics, so the attribution watcher can `tokio::spawn` it.
 ///
 /// Each attempt carries this box's coord device JWT when one resolves from
-/// `sources` (re-resolved per attempt, so a token that expired during a backoff
-/// is replaced); coord observes it and never requires it. A retryable failure
+/// `sources`, looked up per attempt through the bearer cache
+/// ([`crate::fleet::resolve_device_bearer_cached_for`]): a token near its `exp`
+/// is replaced, but a failed lookup is remembered for 60 s, so a mint that
+/// failed once (a runner restarting, say) sends the attempts in that window
+/// anonymously. Coord observes the bearer and never requires it, so that costs
+/// device attribution for the window, never the trial. A retryable failure
 /// ([`Disposition::Retry`]) is retried up to [`INGEST_MAX_ATTEMPTS`] with
 /// [`INGEST_RETRY_BACKOFF`], at most [`INGEST_MAX_PENDING`] snapshots at once;
 /// past either bound the snapshot is dropped and counted.
