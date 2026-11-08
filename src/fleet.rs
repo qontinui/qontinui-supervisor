@@ -603,50 +603,94 @@ pub(crate) async fn resolve_device_bearer_for(
     }
 }
 
-/// The last device bearer [`resolve_device_bearer_cached_for`] resolved, with
-/// the sources it came from and its source label.
-type CachedBearer = ((bool, Option<String>), String, &'static str);
-static BEARER_CACHE: std::sync::Mutex<Option<CachedBearer>> = std::sync::Mutex::new(None);
+/// What [`resolve_device_bearer_cached_for`] last learned for one set of
+/// sources: a token (with its source label), or that none resolved.
+#[derive(Debug, Clone)]
+enum CachedBearer {
+    Hit {
+        token: String,
+        source: &'static str,
+    },
+    /// No usable token resolved; do not ask again before `until` (unix secs).
+    Miss {
+        until: i64,
+    },
+}
 
-/// [`resolve_device_bearer_for`], reusing the last bearer it resolved for the
-/// same `sources` while its `exp` is more than [`EXPIRY_SKEW_SECS`] away.
+/// The sources a cache entry was resolved from: whether the seeded rungs were
+/// read, and the runner the mint asked.
+type BearerCacheKey = (bool, Option<String>);
+
+static BEARER_CACHE: std::sync::Mutex<Option<(BearerCacheKey, CachedBearer)>> =
+    std::sync::Mutex::new(None);
+
+/// How long a failed lookup is remembered, so a box with no usable token (a
+/// signed-out, unpaired or wedged runner and nothing seeded) does not pay the
+/// cascade, a runner mint included, on every dev action and every ingest
+/// attempt. A seeded token or a newly paired runner is picked up within this.
+const NEGATIVE_BEARER_CACHE_SECS: i64 = 60;
+
+/// [`resolve_device_bearer_for`], remembering what it learned for the same
+/// `sources`: a token is reused while its `exp` is more than
+/// [`EXPIRY_SKEW_SECS`] away (a token with no readable `exp` is used once and
+/// not cached), and a miss for [`NEGATIVE_BEARER_CACHE_SECS`].
 ///
 /// For the per-action callers (the dev-action expectations fetch and snapshot
-/// ingest), which would otherwise pay the cascade, and on a box with no seeded
-/// token a runner mint, on every action. The transport guard still runs first
-/// on every call, so a cached token never goes to a cleartext non-loopback
-/// base. Sources that read no identity (`DeviceSources::for_access` under
-/// `At` / `Ignore`) never read or fill the cache. A token with no readable
-/// `exp` is used once and not cached.
+/// ingest). The transport guard still runs first on every call, so a cached
+/// token never goes to a cleartext non-loopback base. Sources that read no
+/// identity (`DeviceSources::for_access` under `At` / `Ignore`) never read or
+/// fill the cache.
 pub(crate) async fn resolve_device_bearer_cached_for(
     base: &str,
     sources: &DeviceSources,
 ) -> ResolvedBearer {
+    resolve_device_bearer_cached_at(base, sources, chrono::Utc::now().timestamp()).await
+}
+
+async fn resolve_device_bearer_cached_at(
+    base: &str,
+    sources: &DeviceSources,
+    now: i64,
+) -> ResolvedBearer {
     if !transport_may_carry_bearer(base) {
         return (None, SOURCE_WITHHELD);
     }
-    let key = (sources.read_seeded, sources.mint_base.clone());
+    let key: BearerCacheKey = (sources.read_seeded, sources.mint_base.clone());
     if key == (false, None) {
         return (None, SOURCE_NONE);
     }
-    let now = chrono::Utc::now().timestamp();
     let fresh = |token: &str| jwt_exp(token).is_some_and(|exp| exp > now + EXPIRY_SKEW_SECS);
     if let Ok(guard) = BEARER_CACHE.lock() {
-        if let Some((cached_key, token, source)) = guard.as_ref() {
-            if *cached_key == key && fresh(token) {
+        match guard.as_ref() {
+            Some((cached_key, CachedBearer::Hit { token, source }))
+                if *cached_key == key && fresh(token) =>
+            {
                 return (Some(token.clone()), source);
             }
+            Some((cached_key, CachedBearer::Miss { until }))
+                if *cached_key == key && now < *until =>
+            {
+                return (None, SOURCE_NONE);
+            }
+            _ => {}
         }
     }
-    match resolve_device_bearer(sources).await {
-        Some((token, source)) => {
-            if fresh(&token) {
-                if let Ok(mut guard) = BEARER_CACHE.lock() {
-                    *guard = Some((key, token.clone(), source));
-                }
-            }
-            (Some(token), source)
-        }
+    let resolved = resolve_device_bearer(sources).await;
+    let entry = match &resolved {
+        Some((token, source)) if fresh(token) => Some(CachedBearer::Hit {
+            token: token.clone(),
+            source,
+        }),
+        Some(_) => None,
+        None => Some(CachedBearer::Miss {
+            until: now + NEGATIVE_BEARER_CACHE_SECS,
+        }),
+    };
+    if let (Some(entry), Ok(mut guard)) = (entry, BEARER_CACHE.lock()) {
+        *guard = Some((key, entry));
+    }
+    match resolved {
+        Some((token, source)) => (Some(token), source),
         None => (None, SOURCE_NONE),
     }
 }
@@ -2391,6 +2435,91 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}", addr.port()), inv, eval)
+    }
+
+    /// The bearer cache is process-global, so its tests run one at a time and
+    /// start from an empty cache.
+    static BEARER_CACHE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_bearer_cache() {
+        *BEARER_CACHE.lock().unwrap() = None;
+    }
+
+    /// A minted token with a live `exp` is reused: two lookups, one mint.
+    /// Sources that read no identity never touch the cache, and a cleartext
+    /// remote base never gets the cached token.
+    #[tokio::test]
+    async fn the_bearer_cache_reuses_a_fresh_token_and_guards_its_transport() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let token = jwt_with(serde_json::json!({"exp": chrono::Utc::now().timestamp() + 3600}));
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": token})).await;
+        let sources = DeviceSources::fixture(&mint);
+        for _ in 0..2 {
+            let (got, source) =
+                resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+            assert_eq!(got.as_deref(), Some(token.as_str()));
+            assert_eq!(source, SOURCE_RUNNER_MINT);
+        }
+        assert_eq!(
+            *inv.lock().unwrap(),
+            1,
+            "the second lookup is served from the cache"
+        );
+
+        let (got, source) =
+            resolve_device_bearer_cached_for("http://coord.example.com", &sources).await;
+        assert!(got.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
+
+        let none = DeviceSources::for_access(&AmbientCoord::Ignore);
+        let (got, source) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &none).await;
+        assert!(got.is_none(), "identity-less sources never read the cache");
+        assert_eq!(source, SOURCE_NONE);
+        assert_eq!(*inv.lock().unwrap(), 1);
+
+        // Past the token's exp less the skew, the cache asks again.
+        let later = chrono::Utc::now().timestamp() + 3600 - EXPIRY_SKEW_SECS;
+        let _ = resolve_device_bearer_cached_at("https://coord.example.com", &sources, later).await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "a token near its exp is not served from the cache"
+        );
+        clear_bearer_cache();
+    }
+
+    /// A lookup that finds no token is remembered for the negative window, so
+    /// an unpaired runner is asked once per window, not once per action.
+    #[tokio::test]
+    async fn the_bearer_cache_remembers_a_miss_for_its_window() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": null})).await;
+        let sources = DeviceSources::fixture(&mint);
+        let now = chrono::Utc::now().timestamp();
+        for at in [now, now + NEGATIVE_BEARER_CACHE_SECS - 1] {
+            let (got, source) =
+                resolve_device_bearer_cached_at("https://coord.example.com", &sources, at).await;
+            assert!(got.is_none());
+            assert_eq!(source, SOURCE_NONE);
+        }
+        assert_eq!(*inv.lock().unwrap(), 1, "the miss is remembered");
+        let _ = resolve_device_bearer_cached_at(
+            "https://coord.example.com",
+            &sources,
+            now + NEGATIVE_BEARER_CACHE_SECS,
+        )
+        .await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "past the window the runner is asked again"
+        );
+        clear_bearer_cache();
     }
 
     #[tokio::test]
