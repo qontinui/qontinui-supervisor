@@ -6025,9 +6025,9 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
         &["routes", "runner.rs"],
         "fn lkg_override_guard(",
         &[
-            "manager::CleanupIfDropped::new(asyncmove{",
-            "let_lifecycle=primary.lifecycle.lock().await;",
-            "*primary.source_exe_override.write().await=None;",
+            "manager::CleanupIfDropped::new(asyncmove{*now.source_exe_override.write().await=None;})",
+            ".if_dropped_run(asyncmove{let_lifecycle=if_dropped.lifecycle.lock().await;",
+            "*if_dropped.source_exe_override.write().await=None;",
         ],
     );
     scan(
@@ -7935,6 +7935,57 @@ async fn a_cleanup_whose_run_now_is_cancelled_partway_still_runs() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A guard with a dropped-path future runs it only when dropped before `run_now`
+/// began. A `run_now` that began and was cancelled is finished on `Drop` with its own
+/// cleanup, partly run, never the dropped-path one.
+#[tokio::test]
+async fn a_dropped_path_cleanup_runs_only_when_run_now_never_began() {
+    let ran = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = || {
+        let (now_ran, dropped_ran, gate) = (ran.clone(), ran.clone(), gate.clone());
+        CleanupIfDropped::new(async move {
+            drop(gate.lock().await);
+            now_ran.lock().unwrap().push("run_now");
+        })
+        .if_dropped_run(async move {
+            dropped_ran.lock().unwrap().push("if_dropped");
+        })
+    };
+    let settle = || async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while ran.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no cleanup ran");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        std::mem::take(&mut *ran.lock().unwrap())
+    };
+
+    drop(guard());
+    assert_eq!(settle().await, ["if_dropped"], "dropped before run_now");
+
+    guard().run_now().await;
+    assert_eq!(settle().await, ["run_now"], "run_now to its end");
+
+    let held = gate.lock().await;
+    {
+        let mut run_now = Box::pin(guard().run_now());
+        assert!(
+            futures::poll!(&mut run_now).is_pending(),
+            "the cleanup must be parked on the held gate for this to say anything"
+        );
+    }
+    drop(held);
+    assert_eq!(
+        settle().await,
+        ["run_now"],
+        "a cancelled run_now is finished with its own cleanup"
+    );
 }
 
 /// A primary alive on its newest spawn, silent and holding no port past the

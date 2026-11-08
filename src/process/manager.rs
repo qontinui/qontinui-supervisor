@@ -2478,8 +2478,13 @@ where
 /// Cleanup that must happen on every exit from a stretch an HTTP client can cancel.
 /// Call [`Self::run_now`] on the normal path, which waits for it. If this is dropped
 /// instead, by a cancelled future or a panic, the cleanup runs on its own task.
+///
+/// The dropped path can run a different future ([`Self::if_dropped_run`]), for a
+/// cleanup that must wait out work the normal path knows has already ended.
 pub(crate) struct CleanupIfDropped {
     cleanup: Option<futures::future::BoxFuture<'static, ()>>,
+    /// Run instead of `cleanup` when this is dropped before [`Self::run_now`] began.
+    if_dropped: Option<futures::future::BoxFuture<'static, ()>>,
 }
 
 impl CleanupIfDropped {
@@ -2489,12 +2494,24 @@ impl CleanupIfDropped {
     {
         Self {
             cleanup: Some(Box::pin(cleanup)),
+            if_dropped: None,
         }
+    }
+
+    /// Run `cleanup` instead when this is dropped before [`Self::run_now`] began. Once
+    /// `run_now` has begun, a drop finishes `run_now`'s own cleanup instead.
+    pub(crate) fn if_dropped_run<F>(mut self, cleanup: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.if_dropped = Some(Box::pin(cleanup));
+        self
     }
 
     /// Polled in place, so a caller cancelled during this await leaves the partly-run
     /// cleanup to `Drop`, which runs the rest of it.
     pub(crate) async fn run_now(mut self) {
+        self.if_dropped = None;
         if let Some(cleanup) = self.cleanup.as_mut() {
             cleanup.await;
             self.cleanup = None;
@@ -2504,7 +2521,7 @@ impl CleanupIfDropped {
 
 impl Drop for CleanupIfDropped {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
+        if let Some(cleanup) = self.if_dropped.take().or_else(|| self.cleanup.take()) {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(cleanup);
             }
@@ -4900,6 +4917,9 @@ async fn alert_first_healthy_kill(
 /// flag the health cache lowered, would otherwise wait for the 330 s tick. A stop that
 /// has latched is ending this spawn anyway. The once-past-the-budget alert is marked
 /// per spawn on `WatchdogState::never_answered_alerted_spawn`, so it does not repeat.
+/// Residual: "tracked" is read as `running && pid.is_some()`, a proxy that outlives the
+/// watchdog after a failed kill or once the watchdog saw an answer first, so such a
+/// spawn's once-past-the-budget alert can wait for the loop's ~330 s cadence instead.
 #[allow(clippy::too_many_arguments)]
 async fn never_answered_alert_goes_out(
     managed: &ManagedRunner,
