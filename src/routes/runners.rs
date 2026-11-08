@@ -6020,38 +6020,48 @@ async fn spawn_named_inner(
     // non-pool artifact instead of refusing it — and the response says so.
     *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
 
-    // Start the runner using the Arc captured at insertion time (race-free
-    // — no re-lookup of `id` which could fail transiently under concurrent
-    // load).
-    if let Err(e) = manager::start_managed_runner(
-        &state,
-        &managed,
-        Some(action_id),
-        manager::StartAs::Registered,
-    )
-    .await
+    // Detached with its settings row: the start outlives a client that hangs up, and
+    // a live named runner with no row would not survive a supervisor restart.
     {
-        let mut runners = state.runners.write().await;
-        runners.remove(&id);
-        return Err(e);
-    }
+        let (state, managed, id, protect) =
+            (state.clone(), managed.clone(), id.clone(), body.protected);
+        manager::run_detached(async move {
+            // Start the runner using the Arc captured at insertion time (race-free
+            // — no re-lookup of `id` which could fail transiently under concurrent
+            // load).
+            if let Err(e) = manager::start_managed_runner(
+                &state,
+                &managed,
+                Some(action_id),
+                manager::StartAs::Registered,
+            )
+            .await
+            {
+                let mut runners = state.runners.write().await;
+                runners.remove(&id);
+                return Err(e);
+            }
 
-    // Persist to settings (named runners survive restarts)
-    let settings_path = settings::settings_path(&state.config);
-    settings::add_runner(&settings_path, &managed.config);
+            // Persist to settings (named runners survive restarts)
+            let settings_path = settings::settings_path(&state.config);
+            settings::add_runner(&settings_path, &managed.config);
 
-    // If protected, persist the protection flag via settings
-    if body.protected {
-        let mut settings = settings::load_settings(&settings_path);
-        if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
-            cfg.protected = true;
-            let _ = settings::try_save_settings(&settings_path, &settings);
-        }
-        // Update runtime protection flag
-        if let Some(managed) = state.get_runner(&id).await {
-            let mut protected = managed.protected.write().await;
-            *protected = true;
-        }
+            // If protected, persist the protection flag via settings
+            if protect {
+                let mut settings = settings::load_settings(&settings_path);
+                if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
+                    cfg.protected = true;
+                    let _ = settings::try_save_settings(&settings_path, &settings);
+                }
+                // Update runtime protection flag
+                if let Some(managed) = state.get_runner(&id).await {
+                    let mut protected = managed.protected.write().await;
+                    *protected = true;
+                }
+            }
+            Ok(())
+        })
+        .await?;
     }
 
     state

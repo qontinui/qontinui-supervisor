@@ -826,7 +826,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // make the effective threshold floor 330 s whatever the
                     // operator configured, so the 60 s clamp floor would be
                     // unreachable. The ALERT keeps `should_escalate`'s slower
-                    // cadence, which is passed in rather than recomputed.
+                    // cadence, which is passed in rather than recomputed, with the
+                    // one exception `maybe_serving_restart` names.
                     let serving_decision = if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
                         crate::process::manager::maybe_serving_restart(
                             &state,

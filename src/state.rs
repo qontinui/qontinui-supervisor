@@ -157,8 +157,10 @@ pub struct ManagedRunner {
     /// Orders this runner's starts, stops and removals against each other.
     ///
     /// `start_managed_runner` holds it from before what its `StartAs` requires,
-    /// a restart's re-insert included, until it returns, so through recording the
-    /// spawn and spawning that spawn's exit monitor.
+    /// a restart's re-insert included, until the start ends, so through recording
+    /// the spawn and spawning that spawn's exit monitor. An `Arc` because that
+    /// start runs on its own task, which owns the guard, so a caller that goes away
+    /// cannot end the start between the two.
     /// `stop_runner_by_id` holds it from its latch through its reset and a
     /// `test-*` runner's teardown. `reap_stale_test_runners`, the purge-stale
     /// sweep and `DELETE /runners/{id}` `try_lock` it, skip or refuse on contention
@@ -168,7 +170,7 @@ pub struct ManagedRunner {
     /// `restart_after_gate` holds it around neither of its two calls. The exit
     /// monitor never takes it: a stop's graceful wait, under this lock, is
     /// waiting for the monitor to clear `running`.
-    pub lifecycle: tokio::sync::Mutex<()>,
+    pub lifecycle: Arc<tokio::sync::Mutex<()>>,
     /// The spawn-isolation verdict of this supervisor's most recent start of
     /// the runner (plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
     /// and-orphans-its-temp-runners`, Phase 1b). On Linux a user-owned runner is
@@ -214,14 +216,15 @@ pub struct SpawnMarker {
     /// not: an exit nobody asked for, a crash, an unrequested clean exit, the
     /// first-healthy watchdog's kill of a wedged boot, which latches no stop,
     /// or an exit that had already happened when the stop was latched
-    /// ([`SpawnRing::stamp_exit`]). And `None` while no exit is stamped.
+    /// ([`SpawnRing::stamp_exit`]). While no exit is stamped it is `None`, unless a
+    /// later start has cleared a stop request meant for this spawn and carried it
+    /// here ([`SpawnRing::carry_stop_request`]), since the flag that monitor would
+    /// have read is gone by then.
     ///
-    /// Two lags the lifecycle lock cannot close, since the monitor waits
-    /// outside it. `exited_at` is read after the wait's wake-up, so a stop
-    /// latched between the real exit and that wake-up still dates before it
-    /// and reads as the exit's request. And a monitor that wakes only after a
-    /// later start recorded its spawn reads that start's cleared flag, so a
-    /// requested exit read that late stamps `None` (see the residual of
+    /// One lag the lifecycle lock cannot close, since the monitor waits outside
+    /// it: `exited_at` is read after the wait's wake-up, so a stop latched between
+    /// the real exit and that wake-up still dates before it and reads as the
+    /// exit's request (see the residual of
     /// `dev_action::attribution::is_startup_panic_of`).
     pub stop_requested_at: Option<DateTime<Utc>>,
     /// The panic the exit monitor parsed from the runner's panic log at that
@@ -313,10 +316,12 @@ impl SpawnRing {
     /// Stamp the exit of the spawn recorded at `spawned_at`: when it exited,
     /// and when a stop requested that exit. The monitor names the spawn it
     /// watches rather than a pid, so an exit cannot land on another spawn that
-    /// got the same pid from the OS. A request dated after `exited_at` is
-    /// dropped: that exit had already happened, so that stop did not ask for
-    /// it. Returns `false`, and changes nothing, when no entry matches: the
-    /// ring dropped that spawn.
+    /// got the same pid from the OS. A request a later start carried onto the entry
+    /// wins over the one the monitor read: it is known to be this spawn's, while the
+    /// flag may by then be a stop of the later spawn. A request dated after
+    /// `exited_at` is dropped: that exit had already happened, so that stop did
+    /// not ask for it. Returns `false`, and changes nothing, when no entry matches:
+    /// the ring dropped that spawn.
     pub fn stamp_exit(
         &mut self,
         spawned_at: DateTime<Utc>,
@@ -330,11 +335,27 @@ impl SpawnRing {
         {
             Some(spawn) => {
                 spawn.exited_at = Some(exited_at);
-                spawn.stop_requested_at =
-                    stop_requested_at.filter(|requested| *requested <= exited_at);
+                spawn.stop_requested_at = spawn
+                    .stop_requested_at
+                    .or(stop_requested_at)
+                    .filter(|requested| *requested <= exited_at);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Keep a stop request that the next start is about to clear, on the spawn it
+    /// was meant for: the newest entry, while its exit is not stamped. That
+    /// spawn's monitor has not read the flag yet and will read it cleared.
+    /// An entry whose exit is stamped keeps what its monitor read.
+    pub fn carry_stop_request(&mut self, requested_at: DateTime<Utc>) {
+        if let Some(spawn) = self
+            .entries
+            .back_mut()
+            .filter(|spawn| spawn.exited_at.is_none())
+        {
+            spawn.stop_requested_at = Some(requested_at);
         }
     }
 
@@ -511,7 +532,7 @@ impl ManagedRunner {
             resolved_exe: RwLock::new(None),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             isolation: RwLock::new(None),
         }
     }
@@ -1088,6 +1109,10 @@ pub struct WatchdogState {
     /// sent)`, so the alert repeats on its own cadence and starts over for a
     /// new spawn. Alert bookkeeping only: nothing restarts on it.
     pub last_prebind_alert: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The `started_at` of the spawn a never-answered alert has already gone out
+    /// for on passing the first-healthy budget, so that alert fires once there and
+    /// then keeps the escalation loop's slower cadence. Alert bookkeeping only.
+    pub never_answered_alerted_spawn: Option<DateTime<Utc>>,
 }
 
 pub struct BuildState {
@@ -2244,7 +2269,8 @@ impl RunnerState {
     /// adoption, which is the supervisor taking a live runner on) does this:
     /// clearing it when a stop completes would race the exit monitor's read.
     /// A start's clear can race that read too, when the monitor of an earlier
-    /// spawn wakes after the start (see [`SpawnMarker::stop_requested_at`]).
+    /// spawn wakes after the start, so a start first carries the request onto
+    /// that spawn's ring entry ([`SpawnRing::carry_stop_request`]).
     pub fn clear_stop_request(&mut self) {
         self.stop_requested = false;
         self.stop_requested_at = None;
@@ -2265,6 +2291,7 @@ impl WatchdogState {
             serving_disabled_reason: None,
             serving_restart_in_flight: false,
             last_prebind_alert: None,
+            never_answered_alerted_spawn: None,
         }
     }
 

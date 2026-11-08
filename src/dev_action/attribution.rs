@@ -349,8 +349,9 @@ impl ClosedWindow {
 ///    reads like one still up once its exit is stamped with the request. A
 ///    crash, an exit nobody asked for (a clean one included) and the
 ///    first-healthy watchdog's kill of a wedged boot, which latches no stop,
-///    read as failed boots. Both readings go by the exit monitor's stamp, so
-///    they hold except as the residuals below say. That stamp is on the
+///    read as failed boots. Both readings go by the exit monitor's stamp, or a
+///    request a later start carried onto the entry, so they hold except as the
+///    residuals below say. That stamp is on the
 ///    spawn's ring entry, and the exit is never read from `RunnerState::pid`:
 ///    the health cache clears that on every tick a primary's port is closed
 ///    and its API silent, so a primary still booting, before it binds its
@@ -406,15 +407,14 @@ impl ClosedWindow {
 /// - The lifecycle lock (`ManagedRunner::lifecycle`) orders one runner's starts,
 ///   stops and removals, so a stop arriving mid-start latches after the
 ///   spawn is recorded and targets it, and a second start finds it recorded. The
-///   exit monitor waits outside that lock, which leaves two lags in the stamp
+///   exit monitor waits outside that lock, which leaves one lag in the stamp
 ///   this rule reads (`SpawnMarker::stop_requested_at`). A stop latched between
 ///   the process's real exit and the monitor's wake-up dates before `exited_at`,
 ///   so a crash in that lag reads as a requested stop and, under `Ran`, its panic
-///   does not count. A monitor that wakes after a later start recorded its spawn
-///   reads that start's cleared flag, so the requested exit it stamps reads as
-///   unrequested: the stopped spawn reads as a failed boot and its in-window
-///   panics count, under `Ran` too. These are read from the code; none was
-///   reproduced on a running supervisor.
+///   does not count. This is read from the code; it was not reproduced on a
+///   running supervisor. A monitor that wakes after a later start recorded its
+///   spawn finds the request that start carried onto its entry
+///   (`SpawnRing::carry_stop_request`), so that exit still reads as requested.
 fn is_startup_panic_of(
     panic: &panic_log::RecentPanic,
     spawn: &SpawnMarker,

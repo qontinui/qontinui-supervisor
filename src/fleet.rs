@@ -1056,7 +1056,8 @@ pub async fn publish_on_startup(access: &AmbientCoord) {
 // required, `reversible` ∈ {no, roll-forward, restore} is optional, `checks`
 // is free text, and `repo` / `pr_number` are for PR-shaped events only. The
 // kind is hard-coded server-side to `agent_took_irreversible_action`, which
-// is exact for `RestartTaken` and stretched for the rest — so `checks` opens
+// is exact for `RestartTaken` and `FirstHealthyKill` and stretched for the
+// rest — so `checks` opens
 // with `serving_watchdog:<event>` and carries the true class until coord
 // grows a dedicated kind (a Follow-up in the plan).
 //
@@ -1110,7 +1111,7 @@ pub struct ServingWatchdogNotice {
     pub port: u16,
     /// The silence at decision time, as on the diagnostics event: `None`
     /// where nothing was measured, which the artifact line says rather than
-    /// printing 0.
+    /// printing 0. The budget for `FirstHealthyKill`.
     pub silent_for_secs: Option<u64>,
     /// The census / readiness verdict that backed the decision, verbatim.
     pub census_json: Option<serde_json::Value>,
@@ -1133,7 +1134,8 @@ pub enum NotifyOutcome {
     /// Coord's per-tenant notification window is exhausted (429). Nothing was
     /// retried and nothing else was posted: the diagnostics ring on this box
     /// already holds the event, and the next re-escalation interval will try
-    /// again on its own cadence.
+    /// again on its own cadence. A `FirstHealthyKill` has no later interval: the
+    /// port has closed, so for that event this is the ring's record alone.
     RateLimited { retry_after_secs: Option<u64> },
 }
 
@@ -1195,9 +1197,10 @@ fn checks_string(notice: &ServingWatchdogNotice) -> String {
 /// — no IO — so the golden test pins the wire shape against the real
 /// construction path.
 ///
-/// The key set is `{action, artifact, checks}` plus `reversible` for
-/// `RestartTaken` ONLY. The door is `deny_unknown_fields`, so one extra key is
-/// a 400 that surfaces nowhere an operator looks; and `reversible` is omitted
+/// The key set is `{action, artifact, checks}` plus `reversible` for an
+/// irreversible event ONLY ([`ServingEvent::is_irreversible`]). The door is
+/// `deny_unknown_fields`, so one extra key is a 400 that surfaces nowhere an
+/// operator looks; and `reversible` is omitted
 /// rather than sent for the non-restart classes because coord renders an
 /// absent value as "unrecorded" — the honest answer for a threshold or a
 /// refusal, which reversed nothing — whereas any present value would be a
@@ -1210,7 +1213,7 @@ pub fn build_agent_notification_body(notice: &ServingWatchdogNotice) -> serde_js
         "artifact".to_string(),
         serde_json::Value::from(artifact_line(notice)),
     );
-    if notice.event == ServingEvent::RestartTaken {
+    if notice.event.is_irreversible() {
         body.insert("reversible".to_string(), serde_json::Value::from("no"));
     }
     body.insert(
@@ -1670,12 +1673,13 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
 
-    const ALL_EVENTS: [ServingEvent; 8] = [
+    const ALL_EVENTS: [ServingEvent; 9] = [
         ServingEvent::Threshold,
         ServingEvent::NeverAnsweredSinceAdoption,
         ServingEvent::NeverAnsweredSinceSpawn,
         ServingEvent::NeverBoundSinceSpawn,
         ServingEvent::RestartTaken,
+        ServingEvent::FirstHealthyKill,
         ServingEvent::RestartRefusedSessionsLive,
         ServingEvent::RestartFailed,
         ServingEvent::Disarmed,
@@ -1806,21 +1810,21 @@ mod tests {
     /// GOLDEN: coord's `AgentNotificationBody` is `deny_unknown_fields`, so
     /// one extra key is a 400 that no operator ever sees. Pin the exact key
     /// set for every event class: `{action, artifact, checks}`, plus
-    /// `reversible` for `RestartTaken` ONLY — absent renders as "unrecorded"
+    /// `reversible` for an irreversible event ONLY — absent renders as "unrecorded"
     /// on coord, and a threshold or refusal reversed nothing. Never `repo`,
     /// `pr_number`, `kind` or `actor`.
     #[test]
     fn notification_body_carries_exactly_the_keys_coord_accepts() {
         for event in ALL_EVENTS {
             let body = build_agent_notification_body(&sample_notice(event));
-            let expected: Vec<&str> = if event == ServingEvent::RestartTaken {
+            let expected: Vec<&str> = if event.is_irreversible() {
                 vec!["action", "artifact", "checks", "reversible"]
             } else {
                 vec!["action", "artifact", "checks"]
             };
             assert_eq!(keys(&body), expected, "event {event}: {body}");
             assert_eq!(body["action"], "other", "event {event}");
-            if event == ServingEvent::RestartTaken {
+            if event.is_irreversible() {
                 assert_eq!(body["reversible"], "no");
             }
             let checks = body["checks"].as_str().unwrap();

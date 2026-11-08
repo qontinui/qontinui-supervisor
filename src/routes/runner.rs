@@ -971,13 +971,19 @@ pub async fn restart_runner(
     };
     // Track whether we set a transient override so we can clear it after the
     // restart, keeping the bias scoped to THIS restart (later restarts re-decide
-    // from fresh predictions rather than inheriting a sticky pin).
-    let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+    // from fresh predictions rather than inheriting a sticky pin). The guard is
+    // armed the moment the override is written, so it comes off on every exit,
+    // a client hanging up included: left in place, every later start of the
+    // primary would launch the LKG exe.
+    let mut lkg_override: Option<manager::CleanupIfDropped> = None;
     if want_lkg {
         let lkg_exe = state.config.lkg_exe_path();
         if lkg_exe.exists() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                lkg_override = Some(manager::CleanupIfDropped::new(async move {
+                    *primary.source_exe_override.write().await = None;
+                }));
                 let reason = if body.use_lkg == Some(true) {
                     "operator-requested (use_lkg:true)"
                 } else {
@@ -992,7 +998,6 @@ pub async fn restart_runner(
                     .logs
                     .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                     .await;
-                biased_primary = Some(primary);
             }
         } else if minted.risk.route_lkg || body.use_lkg == Some(true) {
             // Wanted LKG but none exists — surface it rather than silently
@@ -1028,9 +1033,9 @@ pub async fn restart_runner(
     // restart (which re-evaluates risk from fresh predictions). The runner has
     // already resolved + copied its exe by the time `restart_runner` returns, so
     // clearing now does not affect the just-started process.
-    let lkg_pinned = biased_primary.is_some();
-    if let Some(primary) = biased_primary {
-        *primary.source_exe_override.write().await = None;
+    let lkg_pinned = lkg_override.is_some();
+    if let Some(lkg_override) = lkg_override {
+        lkg_override.run_now().await;
     }
     // S3: a restart that ran the LKG exe is a `restart_lkg` trial. Decided only
     // now, once the start has run: a readiness refusal or a failed start ran no
@@ -2514,9 +2519,11 @@ mod tests {
     /// result (`answer_failure`, `record_run_result`, `record_start_verdict`):
     /// the watcher's window closes on that result, and a re-key after it could
     /// reach coord as `restart`. `lkg_pinned` must be derived from
-    /// `biased_primary`, which is set only where the LKG override is written.
-    /// Fails if the call is removed, passes a constant, or moves after a result
-    /// is recorded, or if `lkg_pinned` stops tracking the override.
+    /// `lkg_override`, the guard armed only where the LKG override is written,
+    /// which takes the override off again on every exit, a client hanging up
+    /// included. Fails if the call is removed, passes a constant, or moves after
+    /// a result is recorded, if `lkg_pinned` stops tracking the override, or if
+    /// the override is cleared other than through that guard.
     #[test]
     fn the_restart_handler_rekeys_a_started_lkg_restart_before_recording_its_result() {
         let squeezed: String = crate::source_scan::fn_body(
@@ -2527,30 +2534,46 @@ mod tests {
         .split_whitespace()
         .collect();
 
-        // `lkg_pinned` is set exactly where the override is written to the LKG exe.
+        // `lkg_pinned` is set exactly where the override is written to the LKG
+        // exe, by the guard that clears it again.
         let write = "*primary.source_exe_override.write().await=Some(lkg_exe.clone());";
-        let pinned = "biased_primary=Some(primary);";
+        let pinned = "lkg_override=Some(manager::CleanupIfDropped::new(asyncmove{*primary.source_exe_override.write().await=None;}));";
         let write_at = squeezed.find(write).expect("the LKG override is written");
         let pinned_at = squeezed
             .find(pinned)
-            .expect("biased_primary records the pin");
+            .expect("lkg_override records the pin and clears it");
         assert_eq!(
             squeezed.matches(pinned).count(),
             1,
             "one place records the pin"
         );
         assert_eq!(
-            squeezed.matches("biased_primary=").count(),
+            squeezed.matches("lkg_override=").count(),
             1,
-            "biased_primary is assigned only where the override is written"
+            "lkg_override is assigned only where the override is written"
+        );
+        assert_eq!(
+            squeezed.matches("source_exe_override.write()").count(),
+            2,
+            "the override is written once and cleared only by its guard"
         );
         assert!(
             write_at < pinned_at,
             "the pin is recorded after the override is written"
         );
         assert!(
-            squeezed.contains("letlkg_pinned=biased_primary.is_some();"),
+            squeezed.contains("letlkg_pinned=lkg_override.is_some();"),
             "lkg_pinned must be derived from the override being written"
+        );
+        let restarted_at = squeezed
+            .find("letrestart_result=manager::restart_runner(")
+            .expect("the synchronous restart");
+        let cleared_at = squeezed
+            .find("lkg_override.run_now().await;")
+            .expect("the guard runs on the normal path");
+        assert!(
+            restarted_at < cleared_at,
+            "the override comes off once the restart has returned"
         );
 
         // On the synchronous path: the re-key follows the start and precedes
