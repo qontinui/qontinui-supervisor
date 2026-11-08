@@ -1055,9 +1055,10 @@ pub async fn publish_on_startup(access: &AmbientCoord) {
 // closed set {publish, force_push, delete, rotate, other}, `artifact` is
 // required, `reversible` ∈ {no, roll-forward, restore} is optional, `checks`
 // is free text, and `repo` / `pr_number` are for PR-shaped events only. The
-// kind is hard-coded server-side to `agent_took_irreversible_action`, which
-// is exact for `RestartTaken` and `FirstHealthyKill` and stretched for the
-// rest — so `checks` opens
+// kind is hard-coded server-side to `agent_took_sensitive_action` (renamed from
+// `agent_took_irreversible_action`; qontinui-coord
+// `crates/coord/src/notifications.rs`), which fits `RestartTaken` and
+// `FirstHealthyKill` and is stretched for the rest — so `checks` opens
 // with `serving_watchdog:<event>` and carries the true class until coord
 // grows a dedicated kind (a Follow-up in the plan).
 //
@@ -1170,7 +1171,7 @@ fn artifact_line(notice: &ServingWatchdogNotice) -> String {
 }
 
 /// The `checks` field: the TRUE event class first (coord's kind is hard-coded
-/// to `agent_took_irreversible_action` for every class), then the detail,
+/// to `agent_took_sensitive_action` for every class), then the detail,
 /// then the census/verdict JSON — so a truncation, if one happens, eats the
 /// tail of the census and never the class.
 fn checks_string(notice: &ServingWatchdogNotice) -> String {

@@ -5866,7 +5866,7 @@ async fn a_restart_puts_back_the_entry_its_own_stop_removed() {
     )
     .await
     .expect_err("no build slot holds an exe");
-    assert!(!matches!(err, SupervisorError::RunnerNotFound(_)), "{err}");
+    assert!(failed_at_exe_resolution(&err), "{err}");
     assert!(
         state.runners.read().await.get(id).is_some(),
         "the restart stranded the runner its stop removed"
@@ -5917,10 +5917,26 @@ async fn a_restart_of_a_test_runner_keeps_it_registered_through_its_own_stop() {
         !matches!(**inner, SupervisorError::RunnerNotFound(_)),
         "the restart's start refused the entry its own stop removed: {err}"
     );
+    // A stop that failed before its registry removal would leave the entry
+    // registered too, so only an error from past the re-insert says anything.
+    assert!(
+        failed_at_exe_resolution(&err),
+        "the restart did not reach its start's exe resolution: {err}"
+    );
     assert!(
         state.get_runner(&id).await.is_some(),
         "the restart stranded the runner its own stop removed"
     );
+}
+
+/// Whether a start failed where every start in this empty runner tree ends once it
+/// is past its registry checks: resolving the exe. Looks through `AfterAct`.
+fn failed_at_exe_resolution(err: &SupervisorError) -> bool {
+    match err {
+        SupervisorError::AfterAct(inner) => failed_at_exe_resolution(inner),
+        SupervisorError::Process(msg) => msg.contains("Runner exe not found in any build slot"),
+        _ => false,
+    }
 }
 
 /// `rebuild_and_restart_by_id` cannot run in a unit test, since it builds. Its start
@@ -6000,9 +6016,18 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
         "pub async fn restart_runner(",
         &[
             "*primary.source_exe_override.write().await=Some(lkg_exe.clone());",
-            "lkg_override=Some(manager::CleanupIfDropped::new(",
+            "lkg_override=Some(lkg_override_guard(primary));",
             "manager::restart_runner(",
             "lkg_override.run_now().await;",
+        ],
+    );
+    scan(
+        &["routes", "runner.rs"],
+        "fn lkg_override_guard(",
+        &[
+            "manager::CleanupIfDropped::new(asyncmove{",
+            "let_lifecycle=primary.lifecycle.lock().await;",
+            "*primary.source_exe_override.write().await=None;",
         ],
     );
     scan(
@@ -7799,13 +7824,15 @@ fn a_prebind_alert_is_due_past_the_budget_and_repeats_on_its_own_cadence() {
 }
 
 /// A respawn that holds its port and never answers reads `UnresponsiveSince`
-/// through the previous boot's stamp. It is alerted as never answered since its
-/// spawn; a runner that answered during this spawn and went silent is not.
+/// through the previous boot's stamp. Past the first-healthy budget it is alerted
+/// as never answered since its spawn; a runner that answered during this spawn and
+/// went silent is not.
 #[tokio::test]
 async fn a_respawn_that_never_answered_is_alerted_as_never_answered() {
     use crate::diagnostics::ServingEvent;
 
-    let started = chrono::Utc::now() - chrono::Duration::seconds(35);
+    let started =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 5);
     for (stamp, expected) in [
         (
             started - chrono::Duration::days(2),
@@ -7829,6 +7856,84 @@ async fn a_respawn_that_never_answered_is_alerted_as_never_answered() {
         .await;
         assert_eq!(serving_events(&state).await, expected, "stamp {stamp}");
         assert_eq!(managed.watchdog.read().await.serving_restart_attempts, 0);
+    }
+}
+
+/// A respawn of a runner that answered before keeps that answer's stamp, so it reads
+/// `UnresponsiveSince` from its first tick. Inside the first-healthy budget it is a
+/// boot like any other and is not alerted at the loop's first escalation, about 30 s
+/// in. Past the budget, one no first-healthy watchdog tracks alerts once on its first
+/// tick there, whatever the cadence says, and then keeps to the cadence.
+#[tokio::test]
+async fn a_respawn_inside_its_budget_is_not_alerted_and_alerts_once_past_it() {
+    use crate::diagnostics::ServingEvent;
+
+    let earlier_answer = chrono::Utc::now() - chrono::Duration::days(2);
+    let budget = first_healthy_timeout_secs() as i64;
+    for (started_ago, ticks, expected) in [
+        (30, vec![true], 0),
+        (budget - 1, vec![true, false], 0),
+        (budget + 1, vec![false, false, true, false], 2),
+    ] {
+        let (state, _root) = restart_test_state();
+        let managed = register_dead_primary(&state).await;
+        let started = chrono::Utc::now() - chrono::Duration::seconds(started_ago);
+        {
+            let mut runner = managed.runner.write().await;
+            runner.last_seen_responding_at = Some(earlier_answer);
+            runner.started_at = Some(started);
+        }
+        for should_alert in ticks {
+            maybe_serving_restart(
+                &state,
+                &managed,
+                crate::state::RunnerLiveness::UnresponsiveSince(earlier_answer),
+                should_alert,
+            )
+            .await;
+        }
+        let alerts = serving_events(&state)
+            .await
+            .into_iter()
+            .filter(|event| *event == ServingEvent::NeverAnsweredSinceSpawn)
+            .count();
+        assert_eq!(alerts, expected, "started {started_ago}s ago");
+    }
+}
+
+/// A caller cancelled while `run_now` awaits the cleanup does not lose it: the
+/// partly-run cleanup goes to `Drop`, which runs the rest of it. The test holds the
+/// runner's write lock so the cleanup, clearing `restart_requested`, is parked on it
+/// when its caller goes away.
+#[tokio::test]
+async fn a_cleanup_whose_run_now_is_cancelled_partway_still_runs() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_named_runner(&state, "named-cleanup-cancelled").await;
+    managed.runner.write().await.restart_requested = true;
+    let latch = {
+        let managed = managed.clone();
+        CleanupIfDropped::new(async move {
+            managed.runner.write().await.restart_requested = false;
+        })
+    };
+
+    let held = managed.runner.write().await;
+    {
+        let mut run_now = Box::pin(latch.run_now());
+        assert!(
+            futures::poll!(&mut run_now).is_pending(),
+            "the cleanup must be parked on the held lock for this test to say anything"
+        );
+    }
+    drop(held);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while managed.runner.read().await.restart_requested {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cleanup was lost with its cancelled run_now: the latch stayed up"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

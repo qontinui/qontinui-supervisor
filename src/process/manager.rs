@@ -2492,9 +2492,12 @@ impl CleanupIfDropped {
         }
     }
 
+    /// Polled in place, so a caller cancelled during this await leaves the partly-run
+    /// cleanup to `Drop`, which runs the rest of it.
     pub(crate) async fn run_now(mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
+        if let Some(cleanup) = self.cleanup.as_mut() {
             cleanup.await;
+            self.cleanup = None;
         }
     }
 }
@@ -4883,6 +4886,48 @@ async fn alert_first_healthy_kill(
     .await;
 }
 
+/// Whether the never-answered alert for the runner's current spawn goes out on this
+/// tick. Both never-answered arms of [`maybe_serving_restart`] decide through this:
+/// the runner never seen answering (`Unknown`), and a respawn that has not answered
+/// during this spawn and reads `UnresponsiveSince` through an earlier boot's stamp.
+///
+/// Inside the first-healthy budget it never goes out ([`never_answered_alert_is_due`]).
+/// Past it, on the loop's cadence (`should_alert`), and once more on the first tick
+/// past the budget for a spawn no first-healthy watchdog is tracking and no stop has
+/// latched on. The loop's cadence alerts at about 30 s and next at about 330 s. A spawn
+/// the first-healthy watchdog still tracks is about to be killed, which alerts by
+/// itself ([`alert_first_healthy_kill`]). One it has stopped tracking, a primary whose
+/// flag the health cache lowered, would otherwise wait for the 330 s tick. A stop that
+/// has latched is ending this spawn anyway. The once-past-the-budget alert is marked
+/// per spawn on `WatchdogState::never_answered_alerted_spawn`, so it does not repeat.
+#[allow(clippy::too_many_arguments)]
+async fn never_answered_alert_goes_out(
+    managed: &ManagedRunner,
+    adopted: bool,
+    running: bool,
+    pid: Option<u32>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    stop_requested: bool,
+    should_alert: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let due = never_answered_alert_is_due(
+        adopted,
+        started_at,
+        now,
+        Duration::from_secs(first_healthy_timeout_secs()),
+    );
+    let watchdog_tracks_it = running && pid.is_some();
+    let first_past_the_budget =
+        due && !adopted && started_at.is_some() && !watchdog_tracks_it && !stop_requested && {
+            let mut watchdog = managed.watchdog.write().await;
+            let first = watchdog.never_answered_alerted_spawn != started_at;
+            watchdog.never_answered_alerted_spawn = started_at;
+            first
+        };
+    due && (should_alert || first_past_the_budget)
+}
+
 /// The serving watchdog hook, called from the health-cache escalation loop on
 /// every escalating tick for a runner.
 ///
@@ -4892,9 +4937,10 @@ async fn alert_first_healthy_kill(
 /// tick — it is a pure function over state already held, with no I/O — because
 /// evaluating it only on the alert cadence would make the effective threshold
 /// floor 330 s no matter what the operator configured. The ALERT keeps the
-/// slower cadence so a long wedge does not spam coord, with one exception: a spawn
-/// that has never answered and that no first-healthy watchdog is tracking alerts
-/// once on passing that budget. Inside the budget it does not alert at all.
+/// slower cadence so a long wedge does not spam coord. The never-answered alert, for a
+/// spawn that has not answered during this spawn (both of its arms), never goes out
+/// inside the first-healthy budget, and goes out once on passing it for a spawn no
+/// first-healthy watchdog is tracking ([`never_answered_alert_goes_out`]).
 ///
 /// Returns the decision taken on this tick, so the caller's log line can say
 /// what the serving arm did rather than guess; `None` when no decision was
@@ -4941,26 +4987,18 @@ pub async fn maybe_serving_restart(
     // it is never restarted — the supervisor cannot back the classification — but
     // it is never SILENT again either.
     if matches!(liveness, crate::state::RunnerLiveness::Unknown) {
-        let due = never_answered_alert_is_due(
+        if never_answered_alert_goes_out(
+            managed,
             adopted,
+            running,
+            pid,
             started_at,
+            stop_requested,
+            should_alert,
             now,
-            Duration::from_secs(first_healthy_timeout_secs()),
-        );
-        // The loop's cadence alerts at about 30 s and next at about 330 s. A spawn the
-        // first-healthy watchdog still tracks is about to be killed, which alerts by
-        // itself. One it has stopped tracking, a primary whose flag the health cache
-        // lowered, alerts on the tick it passes the budget, once. A stop that has
-        // latched is ending this spawn anyway.
-        let watchdog_tracks_it = running && pid.is_some();
-        let first_past_the_budget =
-            due && !adopted && started_at.is_some() && !watchdog_tracks_it && !stop_requested && {
-                let mut watchdog = managed.watchdog.write().await;
-                let first = watchdog.never_answered_alerted_spawn != started_at;
-                watchdog.never_answered_alerted_spawn = started_at;
-                first
-            };
-        if due && (should_alert || first_past_the_budget) {
+        )
+        .await
+        {
             let (whose, event, detail) = if adopted {
                 (
                     format!("adopted runner '{runner_name}'"),
@@ -5010,11 +5048,25 @@ pub async fn maybe_serving_restart(
 
     // A respawn that has never answered reads `UnresponsiveSince`, not `Unknown`,
     // because the previous boot's stamp survives the restart. Alert on it the
-    // way the branch above does, and then let the decision below run unchanged:
-    // the serving restart on a zero census past the threshold, counted from this
-    // spawn's start, is the recovery path for a boot that holds its port and hangs.
+    // way the branch above does, inside the same first-healthy budget, and then
+    // let the decision below run unchanged: the serving restart on a zero census
+    // past the threshold, counted from this spawn's start, is the recovery path
+    // for a boot that holds its port and hangs. A respawn is a spawn this
+    // supervisor made, so it is never treated as adopted here.
     if let crate::state::RunnerLiveness::UnresponsiveSince(at) = liveness {
-        if should_alert && !answered_during_spawn(Some(at), started_at) {
+        if !answered_during_spawn(Some(at), started_at)
+            && never_answered_alert_goes_out(
+                managed,
+                false,
+                running,
+                pid,
+                started_at,
+                stop_requested,
+                should_alert,
+                now,
+            )
+            .await
+        {
             let msg = format!(
                 "serving watchdog: runner '{runner_name}' (port {port}, pid {pid:?}) holds its port and has NEVER answered its HTTP API during this spawn (started {started_at:?}). Its liveness reads wedged only because an earlier boot last answered at {at}. Where the serving arm is armed for it (`--watchdog`, by default the primary only), the serving restart still applies past its threshold."
             );
