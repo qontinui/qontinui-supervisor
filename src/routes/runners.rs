@@ -5848,6 +5848,49 @@ pub async fn spawn_named(
         (id, port, managed)
     };
 
+    // Everything after the reservation runs on its own task, from the dev-action mint
+    // (a coord fetch, so a window a client can hang up in) through the build, the
+    // start, the health wait, the `DistMissing` teardown and the recorded verdict. A
+    // client that hangs up (dropping this future) changes nothing about what happens
+    // to the runner or to its action; one that stays sees exactly the response it
+    // always did.
+    let (status, resp) = manager::run_detached(spawn_named_after_reservation(
+        state,
+        Arc::new(body),
+        name,
+        id,
+        port,
+        managed,
+        no_wait,
+    ))
+    .await?;
+    let frontend_stale = resp
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut response = (status, Json(resp)).into_response();
+    if status == axum::http::StatusCode::OK && frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+    }
+    Ok(response)
+}
+
+/// What a spawn-named does once its placeholder holds the port, on the task
+/// [`spawn_named`] detaches it onto: stamp the requester, mint the dev-action, run
+/// [`spawn_named_inner`], record the terminal result and render the body. Always
+/// `Ok`: a failed spawn is a status and a body, stamped with its action like a
+/// successful one, so the caller can reach the verdict.
+async fn spawn_named_after_reservation(
+    state: SharedState,
+    body: Arc<SpawnNamedRequest>,
+    name: String,
+    id: String,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // friction-1: stamp the owning requester (mirror of spawn_test).
     if body.requester_id.is_some() {
         *managed.requester_id.write().await = body.requester_id.clone();
@@ -5863,9 +5906,9 @@ pub async fn spawn_named(
     )
     .await;
     let action_id = minted.record.action_id;
-    // The inner future runs inside this handler, so a client disconnect drops
-    // it: the guard records the action abandoned then.
-    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's handler future");
+    // The guard records the action abandoned if this task is dropped or panics
+    // before the verdict below; a client hanging up does not drop it.
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's detached task");
 
     let mut answered_at = None;
     let result = spawn_named_inner(
@@ -5903,18 +5946,7 @@ pub async fn spawn_named(
     };
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1), on a
     // failed response too, so its caller can reach the verdict.
-    let resp = minted.stamp(resp);
-    let frontend_stale = resp
-        .get("frontend_stale")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut response = (status, Json(resp)).into_response();
-    if status == axum::http::StatusCode::OK && frontend_stale {
-        response
-            .headers_mut()
-            .insert("X-Frontend-Stale", "1".parse().unwrap());
-    }
-    Ok(response)
+    Ok((status, minted.stamp(resp)))
 }
 
 /// spawn-named from "Item A" on: build, start, wait, assemble. Returns the
@@ -6060,48 +6092,42 @@ async fn spawn_named_inner(
     // non-pool artifact instead of refusing it — and the response says so.
     *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
 
-    // Detached with its settings row: the start outlives a client that hangs up, and
-    // a live named runner with no row would not survive a supervisor restart.
+    // This whole function runs on the task [`spawn_named`] detaches
+    // ([`spawn_named_after_reservation`]), so the start, its settings row and the
+    // health wait below all outlive a client that hangs up: a live named runner with
+    // no row would not survive a supervisor restart.
+    //
+    // Start the runner using the Arc captured at insertion time (race-free — no
+    // re-lookup of `id` which could fail transiently under concurrent load).
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
     {
-        let (state, managed, id, protect) =
-            (state.clone(), managed.clone(), id.clone(), body.protected);
-        manager::run_detached(async move {
-            // Start the runner using the Arc captured at insertion time (race-free
-            // — no re-lookup of `id` which could fail transiently under concurrent
-            // load).
-            if let Err(e) = manager::start_managed_runner(
-                &state,
-                &managed,
-                Some(action_id),
-                manager::StartAs::Registered,
-            )
-            .await
-            {
-                let mut runners = state.runners.write().await;
-                runners.remove(&id);
-                return Err(e);
-            }
+        let mut runners = state.runners.write().await;
+        runners.remove(&id);
+        return Err(e);
+    }
 
-            // Persist to settings (named runners survive restarts)
-            let settings_path = settings::settings_path(&state.config);
-            settings::add_runner(&settings_path, &managed.config);
+    // Persist to settings (named runners survive restarts)
+    let settings_path = settings::settings_path(&state.config);
+    settings::add_runner(&settings_path, &managed.config);
 
-            // If protected, persist the protection flag via settings
-            if protect {
-                let mut settings = settings::load_settings(&settings_path);
-                if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
-                    cfg.protected = true;
-                    let _ = settings::try_save_settings(&settings_path, &settings);
-                }
-                // Update runtime protection flag
-                if let Some(managed) = state.get_runner(&id).await {
-                    let mut protected = managed.protected.write().await;
-                    *protected = true;
-                }
-            }
-            Ok(())
-        })
-        .await?;
+    // If protected, persist the protection flag via settings
+    if body.protected {
+        let mut settings = settings::load_settings(&settings_path);
+        if let Some(cfg) = settings.runners.iter_mut().find(|r| r.id == id) {
+            cfg.protected = true;
+            let _ = settings::try_save_settings(&settings_path, &settings);
+        }
+        // Update runtime protection flag
+        if let Some(managed) = state.get_runner(&id).await {
+            let mut protected = managed.protected.write().await;
+            *protected = true;
+        }
     }
 
     state

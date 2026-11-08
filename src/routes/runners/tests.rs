@@ -4746,3 +4746,268 @@ async fn early_log_route_names_each_outcome() {
     assert_eq!(body["size_bytes"], 10);
     assert_eq!(body["truncated"], false);
 }
+
+// ── A spawn-named client that hangs up must not change what happens to the runner ──
+
+/// Poll `fut` once per step until `ready` holds, then drop it: the client hanging up.
+/// Returns `false` when the future finished first, which the caller decides the
+/// meaning of; panics when `ready` never holds.
+#[cfg(unix)]
+async fn hang_up_once<F, R, Fut>(fut: F, mut ready: R, what: &str) -> bool
+where
+    F: std::future::Future,
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut fut = Box::pin(fut);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if futures::poll!(fut.as_mut()).is_ready() {
+            return false;
+        }
+        if ready().await {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(fut);
+    true
+}
+
+/// A fixed port nothing holds or listens on, below the ephemeral range (so a
+/// concurrent test's port-0 bind cannot land on it). A stop's reap confirms a runner
+/// gone by the port being FREE, so the helper that reserves a refused port by keeping
+/// it bound would make a teardown's stop wait out every escalation and fail.
+#[cfg(unix)]
+fn free_port_nothing_holds() -> u16 {
+    const PORT: u16 = 29_890;
+    assert!(
+        !crate::process::port::is_port_listening(PORT),
+        "something on this box listens on {PORT}, which this test needs free"
+    );
+    PORT
+}
+
+/// Poll `until` for up to `secs` seconds.
+#[cfg(unix)]
+async fn eventually<R, Fut>(secs: u64, mut until: R) -> bool
+where
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if until().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    until().await
+}
+
+/// A client that hangs up while its spawn-named build waits for a slot leaves no
+/// placeholder holding the reserved port. The build stays queued behind every permit
+/// the test holds; closing the pool then ends it with an error, which the spawn must
+/// still clean up after, though nobody is waiting for the response.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_named_hung_up_during_its_build_leaves_no_placeholder() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    // A host under the disk floor refuses the build before it ever queues, so there
+    // is nothing to hang up on. Say so rather than fail on a property of the host.
+    if let Err(refusal) = crate::build_monitor::check_disk_guard(&state).await {
+        eprintln!(
+            "SKIPPED: this host is under the build disk floor, so no build queues: {refusal}"
+        );
+        return;
+    }
+    let held = state
+        .build_pool
+        .permits
+        .clone()
+        .acquire_many_owned(state.build_pool.permits.available_permits() as u32)
+        .await
+        .expect("take every build permit");
+    let request: super::SpawnNamedRequest = serde_json::from_value(serde_json::json!({
+        "name": "hangs-up-in-build",
+        "rebuild": true,
+        "port": crate::test_ports::reserve_refused_port(),
+    }))
+    .expect("a spawn-named body");
+    let handler = super::spawn_named(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(request),
+    );
+    let queued = || {
+        let state = state.clone();
+        async move {
+            state
+                .build_pool
+                .queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 1
+        }
+    };
+    assert!(
+        hang_up_once(handler, queued, "the build queued behind the held permits").await,
+        "the handler finished before the client hung up"
+    );
+
+    // The client is gone and the build is still waiting: the reservation stands, held
+    // by a spawn still under way rather than by an abandoned entry.
+    assert!(
+        state
+            .runners
+            .read()
+            .await
+            .keys()
+            .any(|id| id.starts_with("named-")),
+        "the placeholder went while its build was still queued"
+    );
+    // Close first, so the queued build fails fast instead of being handed a permit
+    // the moment `held` drops and spawning cargo in an empty tree.
+    state.build_pool.permits.close();
+    drop(held);
+    let cleaned = eventually(30, || {
+        let state = state.clone();
+        async move {
+            state
+                .runners
+                .read()
+                .await
+                .keys()
+                .all(|id| !id.starts_with("named-"))
+        }
+    })
+    .await;
+    assert!(
+        cleaned,
+        "a spawn-named hung up during its build left its placeholder holding the port"
+    );
+}
+
+/// What a stub runner runs: a builtin wait, so its image stays the stub's own and its
+/// process satisfies a stop's image check. It ends itself after a minute.
+#[cfg(unix)]
+const SPAWN_STUB_SCRIPT: &str = "read -t 60 <> <(:)\nexit 0\n";
+
+/// A client that hangs up during spawn-named's health wait, with `DistMissing` forced
+/// (the empty runner tree has no `dist/`), still gets the teardown that response
+/// owes: the runner is stopped, and its registry entry and settings row are gone, so
+/// it does not come back on the next supervisor restart. The stub never binds a
+/// port, so the wait runs its whole timeout.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_named_hung_up_during_its_health_wait_is_torn_down_on_dist_missing() {
+    let (state, root) = state_over_an_empty_runner_tree();
+    let slot_exe = state.config.runner_exe_path_for_slot(0);
+    std::fs::create_dir_all(slot_exe.parent().expect("a slot debug dir")).expect("mkdir slot");
+    std::fs::copy("/bin/bash", &slot_exe).expect("copy bash as the stub exe");
+    let script = root.path().join("spawn-stub.env");
+    std::fs::write(&script, SPAWN_STUB_SCRIPT).expect("write the stub's script");
+
+    let request_body = serde_json::json!({
+        "name": "hangs-up-in-wait",
+        "rebuild": false,
+        "wait": true,
+        "wait_timeout_secs": 1,
+        "allow_stale_fallback": true,
+        "port": free_port_nothing_holds(),
+        "extra_env": {"BASH_ENV": script.display().to_string()},
+    });
+    let pid: Arc<std::sync::Mutex<Option<u32>>> = Default::default();
+    // A concurrent test's fork can hold the stub copy's write descriptor until its
+    // exec, which fails the start with ETXTBSY and ends the handler before the
+    // client can hang up. That attempt proves nothing, so it is run again.
+    let mut hung_up = false;
+    for _ in 0..20 {
+        let request: super::SpawnNamedRequest =
+            serde_json::from_value(request_body.clone()).expect("a spawn-named body");
+        let handler = super::spawn_named(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::Json(request),
+        );
+        let running = || {
+            let (state, pid) = (state.clone(), pid.clone());
+            async move {
+                for managed in state.runners.read().await.values() {
+                    let runner = managed.runner.read().await;
+                    if managed.config.id.starts_with("named-")
+                        && runner.running
+                        && runner.pid.is_some()
+                    {
+                        *pid.lock().unwrap() = runner.pid;
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+        if hang_up_once(handler, running, "the named runner was started").await {
+            hung_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(hung_up, "no attempt got as far as a started runner");
+
+    let torn_down = eventually(30, || {
+        let state = state.clone();
+        async move {
+            let settings_path = crate::settings::settings_path(&state.config);
+            let row = crate::settings::load_settings(&settings_path)
+                .runners
+                .iter()
+                .any(|r| r.id.starts_with("named-"));
+            let entry = state
+                .runners
+                .read()
+                .await
+                .keys()
+                .any(|id| id.starts_with("named-"));
+            !row && !entry
+        }
+    })
+    .await;
+    // Whatever the outcome, do not leave the stub for its own minute to end.
+    let leftover: Vec<String> = state
+        .runners
+        .read()
+        .await
+        .keys()
+        .filter(|id| id.starts_with("named-"))
+        .cloned()
+        .collect();
+    for id in leftover {
+        let _ = crate::process::manager::stop_runner_by_id(
+            &state,
+            &id,
+            true,
+            crate::process::manager::CloseIntent::Kill,
+        )
+        .await;
+    }
+    let logs: Vec<String> = state
+        .logs
+        .history()
+        .await
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect();
+    assert!(
+        torn_down,
+        "a spawn-named hung up during its health wait kept its entry or its settings row; \
+         supervisor log: {logs:#?}"
+    );
+    let pid = pid.lock().unwrap().expect("the stub's pid");
+    assert!(
+        !crate::process::proc_kill::pid_alive(pid),
+        "the torn-down runner's process is still alive"
+    );
+}
