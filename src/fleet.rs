@@ -621,6 +621,9 @@ enum CachedBearer {
 /// read, and the runner the mint asked.
 type BearerCacheKey = (bool, Option<String>);
 
+/// One slot, process-global. A test that reaches it with sources that read an
+/// identity (`DeviceSources::fixture`) over an https or loopback base must
+/// hold `tests::BEARER_CACHE_TESTS`, or it races the cache tests.
 static BEARER_CACHE: std::sync::Mutex<Option<(BearerCacheKey, CachedBearer)>> =
     std::sync::Mutex::new(None);
 
@@ -2483,6 +2486,10 @@ mod tests {
             resolve_device_bearer_cached_for("https://coord.example.com", &none).await;
         assert!(got.is_none(), "identity-less sources never read the cache");
         assert_eq!(source, SOURCE_NONE);
+        // ...nor write it: the cached token is still served without a mint.
+        let (got, _) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+        assert_eq!(got.as_deref(), Some(token.as_str()));
         assert_eq!(*inv.lock().unwrap(), 1);
 
         // Past the token's exp less the skew, the cache asks again.
