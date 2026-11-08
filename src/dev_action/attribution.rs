@@ -1028,6 +1028,9 @@ pub fn spawn_attribution_watcher_with_timing(
                 crate::dev_action::ingest::resolve_tenant_id,
             );
             let ingest_record = Arc::clone(&record);
+            // The device bearer follows the same `AmbientCoord` the base came
+            // from: a planted coord gets none of this box's credentials.
+            let sources = crate::fleet::DeviceSources::for_access(access);
             tokio::spawn(async move {
                 crate::dev_action::post_snapshot_to_coord(
                     &base,
@@ -1035,6 +1038,7 @@ pub fn spawn_attribution_watcher_with_timing(
                     &outcome,
                     device_id,
                     tenant_id,
+                    &sources,
                 )
                 .await;
             });

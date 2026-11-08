@@ -603,6 +603,73 @@ pub(crate) async fn resolve_device_bearer_for(
     }
 }
 
+/// The last device bearer [`resolve_device_bearer_cached_for`] resolved, with
+/// the sources it came from and its source label.
+type CachedBearer = ((bool, Option<String>), String, &'static str);
+static BEARER_CACHE: std::sync::Mutex<Option<CachedBearer>> = std::sync::Mutex::new(None);
+
+/// [`resolve_device_bearer_for`], reusing the last bearer it resolved for the
+/// same `sources` while its `exp` is more than [`EXPIRY_SKEW_SECS`] away.
+///
+/// For the per-action callers (the dev-action expectations fetch and snapshot
+/// ingest), which would otherwise pay the cascade, and on a box with no seeded
+/// token a runner mint, on every action. The transport guard still runs first
+/// on every call, so a cached token never goes to a cleartext non-loopback
+/// base. Sources that read no identity (`DeviceSources::for_access` under
+/// `At` / `Ignore`) never read or fill the cache. A token with no readable
+/// `exp` is used once and not cached.
+pub(crate) async fn resolve_device_bearer_cached_for(
+    base: &str,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    let key = (sources.read_seeded, sources.mint_base.clone());
+    if key == (false, None) {
+        return (None, SOURCE_NONE);
+    }
+    let now = chrono::Utc::now().timestamp();
+    let fresh = |token: &str| jwt_exp(token).is_some_and(|exp| exp > now + EXPIRY_SKEW_SECS);
+    if let Ok(guard) = BEARER_CACHE.lock() {
+        if let Some((cached_key, token, source)) = guard.as_ref() {
+            if *cached_key == key && fresh(token) {
+                return (Some(token.clone()), source);
+            }
+        }
+    }
+    match resolve_device_bearer(sources).await {
+        Some((token, source)) => {
+            if fresh(&token) {
+                if let Ok(mut guard) = BEARER_CACHE.lock() {
+                    *guard = Some((key, token.clone(), source));
+                }
+            }
+            (Some(token), source)
+        }
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// [`attach_resolved_bearer`] for a per-request caller: the attach and the
+/// absence are logged at `debug!`, so a request made on every action does not
+/// push real events out of the supervisor's log buffer. Never logs the token.
+pub(crate) fn attach_bearer_quietly(
+    rb: reqwest::RequestBuilder,
+    resolved: ResolvedBearer,
+) -> reqwest::RequestBuilder {
+    match resolved {
+        (Some(token), source) => {
+            debug!("fleet: attaching coord device JWT (source: {source})");
+            rb.header("Authorization", format!("Bearer {token}"))
+        }
+        (None, reason) => {
+            debug!("fleet: no coord device JWT attached: {reason}");
+            rb
+        }
+    }
+}
+
 /// The transport half of [`resolve_device_bearer_for`]: `true` over
 /// `https://` or to a loopback host.
 pub(crate) fn transport_may_carry_bearer(base: &str) -> bool {

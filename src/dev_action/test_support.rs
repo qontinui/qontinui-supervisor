@@ -17,6 +17,8 @@ pub(crate) struct SeenRequest {
     pub path: String,
     pub query: String,
     pub body: String,
+    /// The request's `Authorization` header, verbatim; `None` when absent.
+    pub authorization: Option<String>,
 }
 
 pub(crate) struct PlantedCoord {
@@ -87,6 +89,11 @@ async fn answer(req: Request, recorder: &Mutex<Vec<SeenRequest>>, answer_body: V
         path: path.clone(),
         query: parts.uri.query().unwrap_or_default().to_string(),
         body: String::from_utf8_lossy(&bytes).into_owned(),
+        authorization: parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
     });
     match (parts.method, path.as_str()) {
         (Method::GET, "/coord/dev-actions/expectations") => Json(answer_body).into_response(),

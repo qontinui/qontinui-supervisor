@@ -29,6 +29,7 @@
 //!   `active_tenant_id` if present; `None` otherwise (no new config system).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -105,12 +106,24 @@ pub const ATTRIBUTION_EPOCH: u32 = 7;
 /// `route_lkg_shadow` (S3): the record's
 /// [`crate::dev_action::policy::RouteLkgShadow`] plus `use_lkg`, which exe the
 /// restart ran (the LKG one exactly when the door re-keyed it to
-/// `restart_lkg`). Coord copies the block into its forecast ledger at first
-/// ingest; snapshot metadata itself is pruned at 30 days.
+/// `restart_lkg`). Snapshot metadata itself is pruned at 30 days.
+///
+/// A minted record also carries `served` (Phase 5, S2): what the initiator
+/// was served at the mint ([`served_block`]). Coord does not copy either block
+/// into its forecast ledger as of coord `79429fa20` (its `forecast_ledger`
+/// issues from its own expectations read); that copy is the coord half of
+/// Phase 6c.
+///
+/// The whole map is held under [`METADATA_BUDGET_BYTES`] ([`fit_metadata`]),
+/// because coord refuses a snapshot whose metadata passes
+/// `MAX_SNAPSHOT_METADATA_BYTES` and the refusal would lose the trial.
 fn snapshot_metadata(record: &ActionRecord) -> serde_json::Map<String, serde_json::Value> {
     let mut metadata = serde_json::Map::new();
     if let Some(shadow) = route_lkg_shadow_block(record) {
         metadata.insert(ROUTE_LKG_SHADOW_KEY.to_string(), shadow);
+    }
+    if let Some(served) = served_block(record) {
+        metadata.insert(SERVED_KEY.to_string(), served);
     }
     metadata.insert(
         "supervisor_build_sha".to_string(),
@@ -124,7 +137,157 @@ fn snapshot_metadata(record: &ActionRecord) -> serde_json::Map<String, serde_jso
         "attribution_epoch".to_string(),
         serde_json::Value::from(ATTRIBUTION_EPOCH),
     );
+    fit_metadata(&mut metadata);
     metadata
+}
+
+/// The metadata key of the Phase 5 served stamp.
+const SERVED_KEY: &str = "served";
+
+/// The size ([`metadata_len`], coord's own measure) this build keeps snapshot
+/// metadata under: coord's `MAX_SNAPSHOT_METADATA_BYTES` (4096) less room for
+/// the restart_lkg re-key's `refused_kind` and for slack. coord strips and re-adds its own
+/// `ingest_auth` after its check, so that key costs nothing here.
+pub const METADATA_BUDGET_BYTES: usize = 3584;
+
+/// `metadata.served`, for a record a mint prepared:
+///
+/// - `predicted`: the ACK's `predicted` rows exactly as served;
+/// - `predicted_truncated`: `true` when [`fit_metadata`] cut rows to stay in
+///   budget (then `predicted` is a prefix of what was served);
+/// - `expectations_basis`: coord's top-level basis at the mint (`null` = coord
+///   gave no answer, never "no rows");
+/// - `route_lkg`: the live rule's advice;
+/// - `use_lkg`: whether the restart ran the last-known-good exe (the kind is
+///   `restart_lkg`), and `null` for a kind that is not a restart, where the
+///   question does not arise.
+fn served_block(record: &ActionRecord) -> Option<serde_json::Value> {
+    let served = record.served.as_ref()?;
+    let use_lkg = match record.kind() {
+        ActionKind::Restart => serde_json::Value::Bool(false),
+        ActionKind::RestartLkg => serde_json::Value::Bool(true),
+        ActionKind::Spawn | ActionKind::Build => serde_json::Value::Null,
+    };
+    Some(serde_json::json!({
+        "predicted": served.predicted,
+        "predicted_truncated": false,
+        "expectations_basis": record.expectations_basis,
+        "route_lkg": served.route_lkg,
+        "use_lkg": use_lkg,
+    }))
+}
+
+/// The metadata's size as coord's `snapshot_refusal` measures it: the JSON as
+/// Postgres prints it back from a jsonb column ([`rendered_jsonb_len`]), which
+/// is longer than compact serde JSON (`", "` / `": "` separators, every number
+/// in full decimal).
+fn metadata_len(metadata: &serde_json::Map<String, serde_json::Value>) -> usize {
+    metadata
+        .iter()
+        .fold(2 + 2 * metadata.len().saturating_sub(1), |acc, (k, v)| {
+            acc.saturating_add(escaped_len(k))
+                .saturating_add(2)
+                .saturating_add(rendered_jsonb_len(v))
+        })
+}
+
+/// The length of `value` as Postgres prints it back from a jsonb column
+/// (`jsonb_out`): `", "` between elements, `": "` after a key, strings escaped
+/// as JSON escapes them, and every number in full decimal. A port of coord's
+/// `dev_actions::rendered_jsonb_len` (qontinui-coord `00737e193`), the measure
+/// its `MAX_SNAPSHOT_METADATA_BYTES` refusal applies; keep the two in step.
+fn rendered_jsonb_len(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    let frame = |n: usize| 2 + 2 * n.saturating_sub(1);
+    let total = |lens: &mut dyn Iterator<Item = usize>| lens.fold(0, usize::saturating_add);
+    match value {
+        Value::Null | Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(n) => rendered_numeric_len(&n.to_string()),
+        Value::String(s) => escaped_len(s),
+        Value::Array(items) => {
+            frame(items.len()).saturating_add(total(&mut items.iter().map(rendered_jsonb_len)))
+        }
+        Value::Object(map) => {
+            frame(map.len()).saturating_add(total(&mut map.iter().map(|(k, v)| {
+                escaped_len(k)
+                    .saturating_add(2)
+                    .saturating_add(rendered_jsonb_len(v))
+            })))
+        }
+    }
+}
+
+/// A string's length as a JSON literal, quotes and escapes included.
+fn escaped_len(s: &str) -> usize {
+    serde_json::to_string(s).map_or(usize::MAX, |e| e.len())
+}
+
+/// The length Postgres's `numeric_out` prints for the JSON number `token`: no
+/// exponent, the integer digits the value needs (at least one), as many
+/// decimals as the token carries past its point, and a minus sign unless the
+/// value is zero.
+fn rendered_numeric_len(token: &str) -> usize {
+    let (sign, unsigned) = match token.strip_prefix('-') {
+        Some(rest) => (1, rest),
+        None => (0, token),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().unwrap_or(0)),
+        None => (unsigned, 0),
+    };
+    let sign = if mantissa.bytes().all(|b| matches!(b, b'0' | b'.')) {
+        0
+    } else {
+        sign
+    };
+    let (int_digits, frac_digits) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let int_len = (int_digits.len() as i64).saturating_add(exponent).max(1);
+    let scale = (frac_digits.len() as i64).saturating_sub(exponent).max(0);
+    let len = int_len.saturating_add(if scale > 0 { scale + 1 } else { 0 });
+    usize::try_from(len)
+        .unwrap_or(usize::MAX)
+        .saturating_add(sign)
+}
+
+/// Hold `metadata` under [`METADATA_BUDGET_BYTES`]: drop `served.predicted`
+/// rows from the tail (lowest posterior first, since the ACK is sorted) and
+/// mark `predicted_truncated`; if that is not enough, drop the
+/// `route_lkg_shadow` block, then the `served` block. A trial with less
+/// metadata beats a refused one.
+fn fit_metadata(metadata: &mut serde_json::Map<String, serde_json::Value>) {
+    while metadata_len(metadata) > METADATA_BUDGET_BYTES {
+        let popped = metadata
+            .get_mut(SERVED_KEY)
+            .and_then(|served| {
+                let rows = served.get_mut("predicted")?.as_array_mut()?;
+                rows.pop()?;
+                Some(served)
+            })
+            .map(|served| served["predicted_truncated"] = serde_json::Value::Bool(true))
+            .is_some();
+        if popped {
+            continue;
+        }
+        if metadata.remove(ROUTE_LKG_SHADOW_KEY).is_some() {
+            warn!(
+                "dev_action::ingest: dropped metadata.route_lkg_shadow to keep the snapshot's \
+                 metadata under {METADATA_BUDGET_BYTES} bytes"
+            );
+            continue;
+        }
+        // Coord-supplied strings left in `served` (its basis, a row's basis)
+        // are uncut, so the block itself goes before the trial would.
+        if metadata.remove(SERVED_KEY).is_some() {
+            warn!(
+                "dev_action::ingest: dropped metadata.served to keep the snapshot's metadata \
+                 under {METADATA_BUDGET_BYTES} bytes"
+            );
+            continue;
+        }
+        // Nothing left that this build may cut; send it and let coord answer.
+        return;
+    }
 }
 
 /// The metadata key of the S3 shadow stamp.
@@ -324,10 +487,161 @@ fn refused_for_restart_lkg(kind: &str, status: reqwest::StatusCode, detail: &str
         && detail.contains("unknown kind")
 }
 
-/// Best-effort POST of a completed snapshot to the coord at `base`. Fail-open:
-/// any failure (network error, non-2xx) logs a single `warn!` and returns. NEVER
-/// panics, NEVER propagates — safe to `await` or `tokio::spawn` from the
-/// attribution watcher without risk to the watcher.
+// ---------------------------------------------------------------------------
+// Delivery: device bearer, bounded retry, drop counter
+// ---------------------------------------------------------------------------
+
+/// Attempts per snapshot, the first included. A snapshot whose every attempt
+/// met a retryable failure ([`Disposition::Retry`]) is dropped and counted.
+pub const INGEST_MAX_ATTEMPTS: u32 = 4;
+
+/// The waits before attempts 2, 3 and 4 (production). Spread over ~2.5 min so
+/// a coord deploy roll or a short outage is ridden out, while no snapshot
+/// waits long enough to need a durable queue.
+#[cfg(not(test))]
+const INGEST_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+];
+
+/// Tests run the real retry loop with millisecond waits.
+#[cfg(test)]
+const INGEST_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+];
+
+const _: () = assert!(INGEST_RETRY_BACKOFF.len() == (INGEST_MAX_ATTEMPTS - 1) as usize);
+
+/// Snapshots in delivery (in flight or waiting out a backoff) at once. This
+/// in-memory set is the buffer: a snapshot arriving when it is full is dropped
+/// and counted rather than queued without bound. It is NOT durable: a
+/// supervisor exit loses what it holds, and no later process counts that.
+pub const INGEST_MAX_PENDING: usize = 64;
+
+/// Process-lifetime counters of snapshot delivery, served on `GET /health` as
+/// `supervisor.dev_action_ingest` ([`ingest_counters`]). Reset on supervisor
+/// restart, so read them as counts since this process started.
+static INGEST_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static INGEST_RETRIED: AtomicU64 = AtomicU64::new(0);
+static INGEST_REFUSED: AtomicU64 = AtomicU64::new(0);
+static INGEST_DROPPED_RETRIES_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+static INGEST_DROPPED_BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
+static INGEST_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// A point read of the delivery counters.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct IngestCounters {
+    /// Snapshots coord answered 2xx.
+    pub delivered: u64,
+    /// Retry attempts sent (a snapshot delivered on its third attempt adds 2).
+    pub retried: u64,
+    /// Snapshots coord refused with a status a resend cannot cure (a 4xx other
+    /// than 408 / 429). Not a drop: coord answered. The `warn!` names its body.
+    pub refused: u64,
+    /// Snapshots dropped after [`INGEST_MAX_ATTEMPTS`] retryable failures.
+    pub dropped_retries_exhausted: u64,
+    /// Snapshots dropped because [`INGEST_MAX_PENDING`] were already in delivery.
+    pub dropped_buffer_full: u64,
+    /// Snapshots in delivery right now.
+    pub pending: usize,
+}
+
+/// The delivery counters, for `GET /health`.
+pub fn ingest_counters() -> IngestCounters {
+    IngestCounters {
+        delivered: INGEST_DELIVERED.load(Ordering::Relaxed),
+        retried: INGEST_RETRIED.load(Ordering::Relaxed),
+        refused: INGEST_REFUSED.load(Ordering::Relaxed),
+        dropped_retries_exhausted: INGEST_DROPPED_RETRIES_EXHAUSTED.load(Ordering::Relaxed),
+        dropped_buffer_full: INGEST_DROPPED_BUFFER_FULL.load(Ordering::Relaxed),
+        pending: INGEST_PENDING.load(Ordering::Relaxed),
+    }
+}
+
+/// The delivery buffer: a gauge of snapshots in delivery and its capacity.
+/// Production uses [`DELIVERY_BUFFER`]; a test can bound its own.
+struct DeliveryBuffer {
+    pending: &'static AtomicUsize,
+    capacity: usize,
+}
+
+/// The process's delivery buffer: [`INGEST_PENDING`] under [`INGEST_MAX_PENDING`].
+const DELIVERY_BUFFER: DeliveryBuffer = DeliveryBuffer {
+    pending: &INGEST_PENDING,
+    capacity: INGEST_MAX_PENDING,
+};
+
+/// A slot in a delivery buffer, released on drop (every exit of the loop, a
+/// panic or a cancelled task included).
+struct PendingSlot {
+    pending: &'static AtomicUsize,
+}
+
+impl PendingSlot {
+    /// Take a slot of `buffer`, or `None` when its capacity is taken.
+    fn take(buffer: &DeliveryBuffer) -> Option<Self> {
+        let capacity = buffer.capacity;
+        buffer
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < capacity).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| PendingSlot {
+                pending: buffer.pending,
+            })
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What one attempt's answer means for the snapshot.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposition {
+    Delivered,
+    /// Worth another attempt: no answer (a connect error, a timeout), a 5xx, a
+    /// 408 or a 429. A resend is safe at coord: a re-POST of the same action
+    /// id fills in and never rewrites (coord's dev-action ingest since plan
+    /// `2026-10-27-bayesian-consequence-model-for-the-dev-twin` Phase 4), so
+    /// an attempt that timed out after coord committed it costs nothing when
+    /// it is sent again.
+    Retry,
+    /// coord answered, and a resend would get the same answer.
+    Refused,
+}
+
+fn disposition(status: Option<reqwest::StatusCode>) -> Disposition {
+    match status {
+        None => Disposition::Retry,
+        Some(s) if s.is_success() => Disposition::Delivered,
+        Some(s)
+            if s.is_server_error()
+                || s == reqwest::StatusCode::REQUEST_TIMEOUT
+                || s == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            Disposition::Retry
+        }
+        Some(_) => Disposition::Refused,
+    }
+}
+
+/// Deliver a completed snapshot to the coord at `base`. Fail-open: every
+/// failure is logged and counted ([`ingest_counters`]), none propagates, and it
+/// never panics, so the attribution watcher can `tokio::spawn` it.
+///
+/// Each attempt carries this box's coord device JWT when one resolves from
+/// `sources` (re-resolved per attempt, so a token that expired during a backoff
+/// is replaced); coord observes it and never requires it. A retryable failure
+/// ([`Disposition::Retry`]) is retried up to [`INGEST_MAX_ATTEMPTS`] with
+/// [`INGEST_RETRY_BACKOFF`], at most [`INGEST_MAX_PENDING`] snapshots at once;
+/// past either bound the snapshot is dropped and counted.
 ///
 /// A `restart_lkg` snapshot a coord refuses for its kind (one that predates the
 /// kind: the snapshot table's CHECK and coord's `SNAPSHOT_KINDS` gained it in
@@ -338,19 +652,55 @@ fn refused_for_restart_lkg(kind: &str, status: reqwest::StatusCode, detail: &str
 /// supervisor sends `restart_lkg` from the first build, coord keeps it under
 /// that kind from the moment it accepts it, and before then keeps it, marked,
 /// under `restart`. The cost is one refused POST per LKG-routed restart while
-/// coord lags, at about one LKG restart a month.
-pub async fn post_snapshot_to_coord(
+/// coord lags, at about one LKG restart a month. The re-key does not use up a
+/// retry attempt.
+pub(crate) async fn post_snapshot_to_coord(
     base: &str,
     record: &ActionRecord,
     outcome: &ActionOutcome,
     device_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
+    sources: &crate::fleet::DeviceSources,
 ) {
     let body = SnapshotIngestBody::from_record(record, outcome, device_id, tenant_id);
-    post_snapshot_body(base, record.action_id, body).await;
+    deliver_snapshot(base, record.action_id, body, || {
+        crate::fleet::resolve_device_bearer_cached_for(base, sources)
+    })
+    .await;
 }
 
-async fn post_snapshot_body(base: &str, action_id: Uuid, body: SnapshotIngestBody) {
+async fn deliver_snapshot<F, Fut>(
+    base: &str,
+    action_id: Uuid,
+    body: SnapshotIngestBody,
+    resolve_bearer: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = crate::fleet::ResolvedBearer>,
+{
+    deliver_snapshot_in(&DELIVERY_BUFFER, base, action_id, body, resolve_bearer).await;
+}
+
+async fn deliver_snapshot_in<F, Fut>(
+    buffer: &DeliveryBuffer,
+    base: &str,
+    action_id: Uuid,
+    body: SnapshotIngestBody,
+    resolve_bearer: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = crate::fleet::ResolvedBearer>,
+{
+    let capacity = buffer.capacity;
+    let Some(_slot) = PendingSlot::take(buffer) else {
+        INGEST_DROPPED_BUFFER_FULL.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "dev_action::ingest: DROPPED snapshot {action_id} ({}): {capacity} \
+             snapshots are already in delivery (dropped_buffer_full)",
+            body.kind
+        );
+        return;
+    };
     let url = format!("{base}/coord/dev-actions/snapshot");
 
     let client = match reqwest::Client::builder()
@@ -359,47 +709,85 @@ async fn post_snapshot_body(base: &str, action_id: Uuid, body: SnapshotIngestBod
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("dev_action::ingest: reqwest builder failed: {e}");
+            // No attempt can be made at all, so it is a drop like any other.
+            INGEST_DROPPED_RETRIES_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            warn!("dev_action::ingest: DROPPED snapshot {action_id}: reqwest builder failed: {e}");
             return;
         }
     };
 
     let mut body = body;
-    // At most two sends: the second only for a `restart_lkg` refused for its
-    // kind, re-keyed to `restart`, which cannot be refused that way again.
-    for _ in 0..2 {
-        match client.post(&url).json(&body).send().await {
+    let mut attempt: u32 = 1;
+    let mut rekeyed = false;
+    loop {
+        let bearer = resolve_bearer().await;
+        let sent = crate::fleet::attach_bearer_quietly(client.post(&url).json(&body), bearer)
+            .send()
+            .await;
+        let (status, detail) = match sent {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() {
-                    debug!(
-                        "dev_action::ingest: persisted snapshot {action_id} ({}) to coord",
-                        body.kind
-                    );
-                    return;
-                }
-                let detail = resp.text().await.unwrap_or_default();
-                if refused_for_restart_lkg(body.kind, status, &detail) {
+                let detail = if status.is_success() {
+                    String::new()
+                } else {
+                    resp.text().await.unwrap_or_default()
+                };
+                (Some(status), detail)
+            }
+            Err(e) => (None, e.to_string()),
+        };
+        match (disposition(status), status) {
+            (Disposition::Delivered, _) => {
+                INGEST_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "dev_action::ingest: persisted snapshot {action_id} ({}) to coord \
+                     (attempt {attempt})",
+                    body.kind
+                );
+                return;
+            }
+            (Disposition::Refused, Some(status)) => {
+                // Only coord's unknown-kind 400 on a `restart_lkg` snapshot is
+                // cured by a re-key, and only once.
+                if !rekeyed && refused_for_restart_lkg(body.kind, status, &detail) {
                     warn!(
                         "dev_action::ingest: coord refused kind restart_lkg for snapshot \
                          {action_id} ({detail}); re-sending it as restart with \
                          metadata.refused_kind=restart_lkg"
                     );
                     body = body.rekeyed_to_restart_for_a_coord_without_restart_lkg();
+                    rekeyed = true;
                     continue;
                 }
+                INGEST_REFUSED.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "dev_action::ingest: coord returned {status} for POST {url} \
-                     (snapshot {action_id}): {detail}"
+                     (snapshot {action_id}, not retried): {detail}"
                 );
                 return;
             }
-            Err(e) => {
-                warn!(
-                    "dev_action::ingest: POST {url} failed for snapshot {action_id} \
-                     (non-fatal): {e}"
+            (Disposition::Refused, None) | (Disposition::Retry, _) => {
+                let what = match status {
+                    Some(s) => format!("coord returned {s}: {detail}"),
+                    None => format!("no answer: {detail}"),
+                };
+                if attempt >= INGEST_MAX_ATTEMPTS {
+                    INGEST_DROPPED_RETRIES_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "dev_action::ingest: DROPPED snapshot {action_id} ({}) after \
+                         {attempt} attempts (dropped_retries_exhausted); last: {what}",
+                        body.kind
+                    );
+                    return;
+                }
+                let wait = INGEST_RETRY_BACKOFF[(attempt - 1) as usize];
+                debug!(
+                    "dev_action::ingest: POST {url} for snapshot {action_id} failed on \
+                     attempt {attempt} ({what}); retrying in {wait:?}"
                 );
-                return;
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                INGEST_RETRIED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -584,6 +972,382 @@ mod tests {
             evidence_ref: None,
             late_signatures: vec![],
         }
+    }
+
+    /// The delivery counters and the pending gauge are process-global, so the
+    /// tests that assert on them run one at a time under this lock.
+    static COUNTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Sources that resolve no bearer and read no identity.
+    fn no_sources() -> crate::fleet::DeviceSources {
+        crate::fleet::DeviceSources::for_access(&crate::config::AmbientCoord::Ignore)
+    }
+
+    fn served_row(signature: &str, posterior_mean: f64) -> PredictedSignature {
+        PredictedSignature {
+            signature: signature.to_string(),
+            posterior_mean,
+            occurrences: 1,
+            trials: 10,
+            evidence_basis: "marginal".to_string(),
+            exact_trials: None,
+            exact_occurrences: None,
+        }
+    }
+
+    /// A coord stand-in that answers POSTs from a script of statuses (the last
+    /// one repeating) and records each request's `Authorization` header.
+    async fn scripted_coord(
+        script: Vec<u16>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let recorder = seen.clone();
+        let script = Arc::new(script);
+        let app = axum::Router::new().route(
+            "/coord/dev-actions/snapshot",
+            post(move |headers: HeaderMap| {
+                let (recorder, script) = (recorder.clone(), script.clone());
+                async move {
+                    let mut seen = recorder.lock().expect("seen");
+                    seen.push(
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let code = script[(seen.len() - 1).min(script.len() - 1)];
+                    StatusCode::from_u16(code).expect("status")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (base, seen)
+    }
+
+    fn body_for(record: &ActionRecord) -> SnapshotIngestBody {
+        SnapshotIngestBody::from_record(record, &confirmed(), None, None)
+    }
+
+    /// Which answers are retried: none, a 5xx, a 408, a 429. A 2xx delivers;
+    /// any other 4xx is a refusal a resend would meet again.
+    #[test]
+    fn only_no_answer_5xx_408_and_429_are_retried() {
+        use reqwest::StatusCode;
+        assert_eq!(disposition(None), Disposition::Retry);
+        for code in [500, 502, 503, 504, 408, 429] {
+            let s = StatusCode::from_u16(code).expect("status");
+            assert_eq!(disposition(Some(s)), Disposition::Retry, "{code}");
+        }
+        for code in [200, 201, 204] {
+            let s = StatusCode::from_u16(code).expect("status");
+            assert_eq!(disposition(Some(s)), Disposition::Delivered, "{code}");
+        }
+        for code in [400, 401, 403, 404, 409, 413, 422] {
+            let s = StatusCode::from_u16(code).expect("status");
+            assert_eq!(disposition(Some(s)), Disposition::Refused, "{code}");
+        }
+    }
+
+    /// A snapshot coord answers 503 twice is delivered on the third attempt,
+    /// and every attempt carries the device bearer the resolver hands it.
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_with_the_bearer_on_every_attempt() {
+        let _serial = COUNTER_TESTS.lock().await;
+        let (base, seen) = scripted_coord(vec![503, 503, 200]).await;
+        let record = restart_with_shadow();
+        let before = ingest_counters();
+        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
+            (Some("header.payload.sig".to_string()), "test")
+        })
+        .await;
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 3, "two retries, then delivered: {seen:?}");
+        assert!(
+            seen.iter()
+                .all(|a| a.as_deref() == Some("Bearer header.payload.sig")),
+            "{seen:?}"
+        );
+        let after = ingest_counters();
+        assert_eq!(after.delivered, before.delivered + 1);
+        assert_eq!(after.retried, before.retried + 2);
+        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+    }
+
+    /// A snapshot that never gets an answer worth keeping is sent
+    /// INGEST_MAX_ATTEMPTS times, then dropped and counted; without a bearer
+    /// no `Authorization` header is sent at all.
+    #[tokio::test]
+    async fn a_snapshot_failing_every_attempt_is_dropped_and_counted() {
+        let _serial = COUNTER_TESTS.lock().await;
+        let (base, seen) = scripted_coord(vec![503]).await;
+        let record = restart_with_shadow();
+        let before = ingest_counters();
+        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
+            (None, crate::fleet::SOURCE_NONE)
+        })
+        .await;
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), INGEST_MAX_ATTEMPTS as usize, "{seen:?}");
+        assert!(seen.iter().all(Option::is_none), "{seen:?}");
+        let after = ingest_counters();
+        assert_eq!(
+            after.dropped_retries_exhausted,
+            before.dropped_retries_exhausted + 1
+        );
+        assert_eq!(
+            after.retried,
+            before.retried + u64::from(INGEST_MAX_ATTEMPTS - 1)
+        );
+        assert_eq!(after.delivered, before.delivered);
+        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+    }
+
+    /// A refused connection is retried the same way (no answer is retryable).
+    #[tokio::test]
+    async fn an_unreachable_coord_is_retried_then_dropped() {
+        let base = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let base = format!("http://{}", listener.local_addr().expect("addr"));
+            drop(listener);
+            base
+        };
+        let _serial = COUNTER_TESTS.lock().await;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let record = restart_with_shadow();
+        let before = ingest_counters();
+        deliver_snapshot(&base, record.action_id, body_for(&record), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { (None, crate::fleet::SOURCE_NONE) }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), INGEST_MAX_ATTEMPTS);
+        let after = ingest_counters();
+        assert_eq!(
+            after.dropped_retries_exhausted,
+            before.dropped_retries_exhausted + 1
+        );
+        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+    }
+
+    /// A 400 is not retried: one attempt, counted refused, not dropped.
+    #[tokio::test]
+    async fn a_refusal_is_sent_once_and_counted_refused() {
+        let _serial = COUNTER_TESTS.lock().await;
+        let (base, seen) = scripted_coord(vec![400]).await;
+        let record = restart_with_shadow();
+        let before = ingest_counters();
+        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
+            (None, crate::fleet::SOURCE_NONE)
+        })
+        .await;
+        assert_eq!(seen.lock().expect("seen").len(), 1);
+        let after = ingest_counters();
+        assert_eq!(after.refused, before.refused + 1);
+        assert_eq!(after.retried, before.retried);
+        assert_eq!(
+            after.dropped_retries_exhausted,
+            before.dropped_retries_exhausted
+        );
+        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+    }
+
+    /// A slot raises the pending gauge by one and its drop lowers it again; a
+    /// full buffer refuses the next slot and a delivery past it is dropped,
+    /// counted, and sends nothing.
+    #[tokio::test]
+    async fn the_delivery_buffer_is_bounded_and_its_slots_are_released() {
+        // A buffer of its own, so filling it cannot drop another test's snapshot.
+        static GAUGE: AtomicUsize = AtomicUsize::new(0);
+        let buffer = DeliveryBuffer {
+            pending: &GAUGE,
+            capacity: 2,
+        };
+        let _serial = COUNTER_TESTS.lock().await;
+        let before = ingest_counters();
+        let slot = PendingSlot::take(&buffer).expect("a slot");
+        assert_eq!(GAUGE.load(Ordering::SeqCst), 1);
+        drop(slot);
+        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+
+        let held: Vec<PendingSlot> = std::iter::from_fn(|| PendingSlot::take(&buffer)).collect();
+        assert_eq!(held.len(), 2);
+        assert!(PendingSlot::take(&buffer).is_none(), "the buffer is full");
+        let (base, seen) = scripted_coord(vec![200]).await;
+        let record = restart_with_shadow();
+        deliver_snapshot_in(
+            &buffer,
+            &base,
+            record.action_id,
+            body_for(&record),
+            || async { (None, crate::fleet::SOURCE_NONE) },
+        )
+        .await;
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "a dropped snapshot is not sent"
+        );
+        assert_eq!(
+            ingest_counters().dropped_buffer_full,
+            before.dropped_buffer_full + 1
+        );
+        drop(held);
+        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+        // A slot freed, the next delivery goes out and releases its own slot.
+        deliver_snapshot_in(
+            &buffer,
+            &base,
+            record.action_id,
+            body_for(&record),
+            || async { (None, crate::fleet::SOURCE_NONE) },
+        )
+        .await;
+        assert_eq!(seen.lock().expect("seen").len(), 1);
+        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+    }
+
+    /// The size measure is coord's: the JSON as Postgres prints it back. The
+    /// literals are coord's own fixtures (`metadata_is_measured_as_postgres_prints_it_back`).
+    #[test]
+    fn metadata_is_measured_the_way_coord_measures_it() {
+        use serde_json::json;
+        for (value, printed) in [
+            (json!({}), "{}"),
+            (json!([]), "[]"),
+            (json!(null), "null"),
+            (json!(false), "false"),
+            (
+                json!({"a": 1, "b": [true, null]}),
+                r#"{"a": 1, "b": [true, null]}"#,
+            ),
+            (json!("é\"\n\u{1}"), r#""é\"\n\u0001""#),
+            (json!(-5), "-5"),
+            (json!(1.0), "1.0"),
+            (json!(0.1), "0.1"),
+            (json!(123.456), "123.456"),
+            (json!(1.5e-7), "0.00000015"),
+            (json!(-0.0), "0.0"),
+        ] {
+            assert_eq!(rendered_jsonb_len(&value), printed.len(), "{value}");
+        }
+        assert_eq!(rendered_jsonb_len(&json!(1e308)), 309);
+        assert_eq!(rendered_jsonb_len(&json!(5e-324)), 326);
+        assert_eq!(rendered_numeric_len("1E+21"), 22);
+        let map = json!({"a": 1, "b": 0.00000015})
+            .as_object()
+            .expect("map")
+            .clone();
+        assert_eq!(metadata_len(&map), r#"{"a": 1, "b": 0.00000015}"#.len());
+    }
+
+    /// A coord basis too long to fit drops the whole `served` block rather
+    /// than the trial.
+    #[test]
+    fn an_oversized_coord_basis_drops_the_served_block_not_the_trial() {
+        use crate::dev_action::record::ServedAtMint;
+        let mut record = ActionRecord::new(ActionKind::Restart, None, "x".into(), &[]);
+        record.expectations_basis = Some("b".repeat(5000));
+        record.served = Some(ServedAtMint {
+            predicted: vec![],
+            route_lkg: false,
+        });
+        let json = serde_json::to_value(body_for(&record)).expect("serialize");
+        let metadata = json["metadata"].as_object().expect("object").clone();
+        assert!(metadata.get("served").is_none());
+        assert!(metadata_len(&metadata) <= METADATA_BUDGET_BYTES);
+        assert_eq!(json["metadata"]["attribution_epoch"], ATTRIBUTION_EPOCH);
+    }
+
+    /// A minted record stamps what it served: the ACK rows, coord's basis, the
+    /// live advice, and `use_lkg` read off the kind (`false` for a restart,
+    /// `true` once re-keyed, `null` for a kind that is not a restart). A record
+    /// no mint prepared stamps no `served` block.
+    #[test]
+    fn a_minted_record_stamps_what_it_served() {
+        use crate::dev_action::record::ServedAtMint;
+        let mut record = restart_with_shadow();
+        record.expectations_basis = Some("marginal".to_string());
+        record.served = Some(ServedAtMint {
+            predicted: vec![served_row("DEV-A", 0.4), served_row("DEV-B", 0.1)],
+            route_lkg: true,
+        });
+        let json = serde_json::to_value(body_for(&record)).expect("serialize");
+        let served = &json["metadata"]["served"];
+        assert_eq!(served["predicted"][0]["signature"], "DEV-A");
+        assert_eq!(served["predicted"][1]["signature"], "DEV-B");
+        assert_eq!(served["predicted"].as_array().map(Vec::len), Some(2));
+        assert_eq!(served["predicted_truncated"], false);
+        assert_eq!(served["expectations_basis"], "marginal");
+        assert_eq!(served["route_lkg"], true);
+        assert_eq!(served["use_lkg"], false);
+
+        assert!(record.rekey_restart_to_lkg());
+        let json = serde_json::to_value(body_for(&record)).expect("serialize");
+        assert_eq!(json["metadata"]["served"]["use_lkg"], true);
+
+        let mut spawn = ActionRecord::new(ActionKind::Spawn, None, "spawn".into(), &[]);
+        spawn.served = Some(ServedAtMint {
+            predicted: vec![],
+            route_lkg: false,
+        });
+        let json = serde_json::to_value(body_for(&spawn)).expect("serialize");
+        assert!(json["metadata"]["served"]["use_lkg"].is_null());
+        assert!(json["metadata"]["served"]["expectations_basis"].is_null());
+        assert_eq!(json["metadata"]["served"]["route_lkg"], false);
+
+        let unminted = ActionRecord::new(ActionKind::Restart, None, "x".into(), &[]);
+        let json = serde_json::to_value(body_for(&unminted)).expect("serialize");
+        assert!(json["metadata"].get("served").is_none());
+    }
+
+    /// Five served rows at coord's longest signature (128 bytes) plus a shadow
+    /// would pass coord's 4 KiB metadata bound; the stamp cuts served rows from
+    /// the tail, says so, and stays under the budget, so the trial is kept.
+    #[test]
+    fn oversized_served_rows_are_cut_to_keep_the_metadata_under_budget() {
+        use crate::dev_action::record::ServedAtMint;
+        let mut record = restart_with_shadow();
+        let long = |c: char| format!("DEV-{}", c.to_string().repeat(124));
+        record.served = Some(ServedAtMint {
+            predicted: ['A', 'B', 'C', 'D', 'E']
+                .iter()
+                .map(|c| {
+                    let mut row = served_row(&long(*c), 0.123_456_789_012_345_67);
+                    row.exact_trials = Some(u64::MAX);
+                    row.exact_occurrences = Some(u64::MAX);
+                    row.evidence_basis = "x".repeat(600);
+                    row
+                })
+                .collect(),
+            route_lkg: true,
+        });
+        // The input alone is over budget, so the test cannot pass vacuously.
+        let untrimmed = served_block(&record).expect("served");
+        assert!(rendered_jsonb_len(&untrimmed) > METADATA_BUDGET_BYTES);
+        let json = serde_json::to_value(body_for(&record)).expect("serialize");
+        let metadata = json["metadata"].as_object().expect("object").clone();
+        assert!(metadata_len(&metadata) <= METADATA_BUDGET_BYTES);
+        let served = &json["metadata"]["served"];
+        assert_eq!(served["predicted_truncated"], true);
+        let rows = served["predicted"].as_array().expect("rows");
+        assert!(rows.len() < 5, "rows were cut: {}", rows.len());
+        // The cut keeps the head of the ACK (highest posterior first).
+        if let Some(first) = rows.first() {
+            assert_eq!(first["signature"], long('A'));
+        }
+        // Coord's bound, by coord's measure.
+        assert!(metadata_len(&metadata) <= 4096);
     }
 
     /// A restart whose expectations held the 4-of-4 incident cell.
@@ -915,9 +1679,10 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         tokio::spawn(async move { axum::serve(listener, app).await });
 
+        let _serial = COUNTER_TESTS.lock().await;
         let record = restart_with_shadow();
         assert!(record.rekey_restart_to_lkg());
-        post_snapshot_to_coord(&base, &record, &confirmed(), None, None).await;
+        post_snapshot_to_coord(&base, &record, &confirmed(), None, None, &no_sources()).await;
         let sent = std::mem::take(&mut *seen.lock().expect("seen"));
         assert_eq!(sent.len(), 2, "refused once, then re-sent: {sent:?}");
         assert_eq!(sent[0]["kind"], "restart_lkg");
@@ -928,7 +1693,7 @@ mod tests {
         assert_eq!(sent[1]["action_id"], sent[0]["action_id"]);
 
         accepts_lkg.store(true, Ordering::SeqCst);
-        post_snapshot_to_coord(&base, &record, &confirmed(), None, None).await;
+        post_snapshot_to_coord(&base, &record, &confirmed(), None, None, &no_sources()).await;
         let sent = std::mem::take(&mut *seen.lock().expect("seen"));
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0]["kind"], "restart_lkg");

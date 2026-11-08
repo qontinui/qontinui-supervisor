@@ -442,6 +442,11 @@ pub struct SupervisorInfo {
     /// reader has to know. A missing key is UNKNOWN: builds from
     /// qontinui-supervisor#270 and #272 stamp epoch 2 and predate this field.
     pub attribution_epoch: u32,
+    /// Delivery counters of this process's dev-action snapshot ingest
+    /// ([`crate::dev_action::ingest::ingest_counters`]): delivered, retried,
+    /// refused, the two drop counts, and what is in delivery now. Process
+    /// lifetime only; a missing key is a build that predates the buffer.
+    pub dev_action_ingest: crate::dev_action::ingest::IngestCounters,
 }
 
 impl SupervisorInfo {
@@ -455,6 +460,7 @@ impl SupervisorInfo {
             built_from_sha: crate::self_provenance::built_from_sha().map(str::to_string),
             built_from_dirty: crate::self_provenance::built_from_dirty(),
             attribution_epoch: crate::dev_action::ingest::ATTRIBUTION_EPOCH,
+            dev_action_ingest: crate::dev_action::ingest::ingest_counters(),
         }
     }
 }
@@ -1675,6 +1681,23 @@ mod tests {
 
     /// `/health` serves the same epoch every snapshot of this binary is stamped
     /// with, so a box's stamp can be read without a snapshot having been posted.
+    #[test]
+    fn test_supervisor_block_serves_the_dev_action_ingest_counters() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        let block = &value["supervisor"]["dev_action_ingest"];
+        for key in [
+            "delivered",
+            "retried",
+            "refused",
+            "dropped_retries_exhausted",
+            "dropped_buffer_full",
+            "pending",
+        ] {
+            assert!(block[key].is_u64(), "{key} must be a count, got {block}");
+        }
+    }
+
     #[test]
     fn test_supervisor_block_serves_the_attribution_epoch() {
         let value = serde_json::to_value(build_minimal_health_response())
