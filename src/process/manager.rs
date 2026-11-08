@@ -6579,7 +6579,7 @@ pub async fn stop_runner_by_id(
     runner_id: &str,
     force: bool,
     intent: CloseIntent,
-) -> Result<(), SupervisorError> {
+) -> Result<StopOutcome, SupervisorError> {
     let managed = state
         .get_runner(runner_id)
         .await
@@ -7015,6 +7015,7 @@ pub async fn stop_runner_by_id(
     // Auto-remove ephemeral test runners (spawned via /runners/spawn-test)
     // from the runners map so they don't accumulate over time. These have IDs
     // prefixed with "test-" and are not persisted to settings.
+    let mut removed_entry = false;
     if runner_id.starts_with("test-") {
         if let Some(snapshot) = pre_clear_snapshot {
             let mut cache = state.stopped_runners.write().await;
@@ -7022,7 +7023,8 @@ pub async fn stop_runner_by_id(
         }
 
         let mut runners = state.runners.write().await;
-        if runners.remove(&runner_id).is_some() {
+        removed_entry = runners.remove(&runner_id).is_some();
+        if removed_entry {
             info!(
                 "Removed ephemeral test runner '{}' (id: {}) from state",
                 runner_name, runner_id
@@ -7053,7 +7055,43 @@ pub async fn stop_runner_by_id(
     state.notify_health_change();
     managed.health_cache_notify.notify_one();
 
-    Ok(())
+    Ok(StopOutcome { removed_entry })
+}
+
+/// What a completed [`stop_runner_by_id`] did that its caller cannot read back
+/// reliably afterwards. The lifecycle lock is released when the stop returns, so a
+/// registry read taken after it cannot tell this stop's removal from a `DELETE`
+/// that landed in the gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopOutcome {
+    /// Whether THIS stop took the runner's entry out of the registry, as a
+    /// `test-*` runner's does. Decided under the lifecycle lock, at the removal.
+    pub removed_entry: bool,
+}
+
+/// Test seam: runs between a stop's return and its restart's decision, in the gap
+/// the lifecycle lock does not cover. Keyed by runner id so concurrent tests cannot
+/// fire each other's hook.
+#[cfg(test)]
+pub(crate) type AfterStopHook =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) static AFTER_STOP_HOOKS: std::sync::Mutex<Vec<(String, AfterStopHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn after_stop_seam(runner_id: &str) {
+    let hook = {
+        let mut hooks = AFTER_STOP_HOOKS.lock().unwrap();
+        hooks
+            .iter()
+            .position(|(id, _)| id == runner_id)
+            .map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook().await;
+    }
 }
 
 /// Phase B: build the primary from a fresh `origin/main` worktree.
@@ -7523,6 +7561,35 @@ pub async fn run_admitted_restart(
         })
     };
 
+    // A `test-*` runner's stop keeps its per-instance state for the start half that
+    // follows, and the start re-registers the id. A restart cancelled between the two
+    // never reaches the failure arm below, so nothing would visit that id again. On
+    // the dropped path the guard waits for the lifecycle lock (a start already under
+    // way holds it, and re-registers the id first), then reaps when the restart left
+    // the state with no owner. The normal path reaps in place, without the lock.
+    // Reaps only what THIS restart's own stop kept (`stop_removed_entry`): a second
+    // restart of the same runner that lost the race to a stop saw the entry gone
+    // without removing it, and the state belongs to the winner.
+    let stop_removed_entry = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let orphan_guard = {
+        let (state, managed, id) = (state.clone(), managed.clone(), runner_id.to_string());
+        let (dropped_state, dropped_managed, dropped_id) =
+            (state.clone(), managed.clone(), id.clone());
+        let (removed, dropped_removed) = (stop_removed_entry.clone(), stop_removed_entry.clone());
+        CleanupIfDropped::new(async move {
+            reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+        })
+        .if_dropped_run(async move {
+            reap_orphaned_state_once_free(
+                &dropped_state,
+                &dropped_managed,
+                &dropped_id,
+                &dropped_removed,
+            )
+            .await;
+        })
+    };
+
     // The single in-flight body. Whatever it returns, the latch comes off
     // BEFORE the result is inspected — there is exactly one exit from here.
     let mut acted = false;
@@ -7535,6 +7602,7 @@ pub async fn run_admitted_restart(
         intent,
         initiated_by,
         &mut acted,
+        &stop_removed_entry,
     )
     .await;
     // A failure after the body acted is never "nothing ran", whatever the
@@ -7551,6 +7619,9 @@ pub async fn run_admitted_restart(
 
     match outcome {
         Ok(build_duration) => {
+            // Registered again by the start, so this reaps nothing unless a removal landed
+            // in the gap after it; it settles the guard.
+            orphan_guard.run_now().await;
             state
                 .diagnostics
                 .write()
@@ -7567,17 +7638,9 @@ pub async fn run_admitted_restart(
             // The stop half kept the temp runner's per-instance state for the
             // start half (`reap_instance_state_on_stop`). If the restart failed
             // before the start re-registered the id (e.g. a failed rebuild),
-            // no cleanup path will ever visit that id again — reap all of it,
-            // pairing copy included, here.
-            let still_registered = state.get_runner(runner_id).await.is_some();
-            if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered) {
-                warn!(
-                    "Temp runner '{}' was not re-registered by its failed restart; \
-                     reaping the per-instance state its stop kept",
-                    runner_id
-                );
-                reap_runner_instance_state(runner_id, &managed.config.name).await;
-            }
+            // no cleanup path will ever visit that id again — `orphan_guard`
+            // reaps all of it, pairing copy included.
+            orphan_guard.run_now().await;
             state
                 .diagnostics
                 .write()
@@ -7589,6 +7652,54 @@ pub async fn run_admitted_restart(
             Err(e)
         }
     }
+}
+
+/// Reap a `test-*` runner's per-instance state when a restart left it with no owner
+/// ([`orphaned_by_failed_restart`]): the stop dropped the id from the registry and
+/// kept that state for a start that never re-registered it.
+async fn reap_state_orphaned_by_restart(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+    stop_removed_entry: &std::sync::atomic::AtomicBool,
+) {
+    // Only state this restart's own stop kept is its to reap: without this, a
+    // restart that lost a race to a peer's stop (its own stop found the entry gone)
+    // would delete the pairing copy and config the peer's restart is still to use.
+    // Known limit: when that peer is a PLAIN stop (not a restart) that read the
+    // `restart_requested` latch and so kept the state, nothing reaps it, because the
+    // latch is a bool and cannot say whose restart the state was kept for. A leaked
+    // directory is the safer failure than deleting a live restart's pairing.
+    if !stop_removed_entry.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let still_registered = state.get_runner(runner_id).await.is_some();
+    if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered) {
+        warn!(
+            "Temp runner '{}' was not re-registered by its failed or cancelled restart; \
+             reaping the per-instance state its stop kept",
+            runner_id
+        );
+        reap_runner_instance_state(runner_id, &managed.config.name).await;
+    }
+}
+
+/// The dropped path of a cancelled restart's reap: wait for the runner's lifecycle
+/// lock, since a start already under way holds it and re-registers the id first, then
+/// reap what is left unowned. Not part of `run_admitted_restart`'s own body, which
+/// must never take the lock (it is not reentrant, and its start and stop take it).
+async fn reap_orphaned_state_once_free(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+    stop_removed_entry: &std::sync::atomic::AtomicBool,
+) {
+    // Only a `test-*` runner's stop keeps state for its start half.
+    if !is_temp_runner(runner_id) {
+        return;
+    }
+    let _lifecycle = managed.lifecycle.lock().await;
+    reap_state_orphaned_by_restart(state, managed, runner_id, stop_removed_entry).await;
 }
 
 /// Whether a FAILED restart left a temp runner's per-instance state with no owner:
@@ -7622,6 +7733,7 @@ async fn restart_after_gate(
     intent: CloseIntent,
     initiated_by: Option<uuid::Uuid>,
     acted: &mut bool,
+    stop_removed_entry: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<f64>, SupervisorError> {
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
@@ -7658,10 +7770,16 @@ async fn restart_after_gate(
         // `intent` rides along so a handoff restart's close-request carries
         // the handoff body and gets the extended graceful wait.
         *acted = true;
-        stop_runner_by_id(state, runner_id, true, intent).await?;
-        // Read now, before a rebuild that can take most of an hour: whatever
-        // removes the entry after this point meant the runner to be gone.
-        removed_by_its_stop = !is_registered(state, managed).await;
+        let stopped = stop_runner_by_id(state, runner_id, true, intent).await?;
+        // Before anything that can be cancelled: the reap of a cancelled restart
+        // reads it.
+        stop_removed_entry.store(stopped.removed_entry, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        after_stop_seam(runner_id).await;
+        // What the stop itself reports, decided under the lifecycle lock: a
+        // registry read here would also count a `DELETE` that landed after the
+        // lock was released, and re-insert a runner the operator deleted.
+        removed_by_its_stop = stopped.removed_entry;
     }
 
     // Rebuild if requested (global — single binary).
@@ -7721,7 +7839,9 @@ pub async fn stop_runner(state: &SharedState, force: bool) -> Result<(), Supervi
         .await
         .ok_or_else(|| SupervisorError::Other("No primary runner configured".to_string()))?;
 
-    stop_runner_by_id(state, &primary.config.id, force, CloseIntent::Kill).await
+    stop_runner_by_id(state, &primary.config.id, force, CloseIntent::Kill)
+        .await
+        .map(|_| ())
 }
 
 /// Legacy restart wrapper — targets the primary runner.
@@ -7820,14 +7940,17 @@ pub async fn rebuild_and_restart_by_id(
     // `/runners/{id}/stop` and `/runners/{id}/restart`.
     // `stopped` is whether this call actually stopped a running runner: a build
     // or start failure after that has acted on the runner (see `AfterAct`).
-    let stopped = match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
-        Ok(()) => true,
-        Err(SupervisorError::RunnerNotRunning) => false,
-        Err(e) => return Err(e),
-    };
-    // Read now, before the rebuild: an entry removed after this point, by a
-    // `DELETE` during the build, meant the runner to be gone.
-    let removed_by_its_stop = !is_registered(state, &managed).await;
+    // `removed_by_its_stop` is what the stop reports under its lifecycle lock, never
+    // a registry read after it: that would count a `DELETE` in the gap. No stop
+    // ran on `RunnerNotRunning`, so it removed nothing.
+    let (stopped, removed_by_its_stop) =
+        match stop_runner_by_id(state, runner_id, body.force, body.close_intent()).await {
+            Ok(outcome) => (true, outcome.removed_entry),
+            Err(SupervisorError::RunnerNotRunning) => (false, false),
+            Err(e) => return Err(e),
+        };
+    #[cfg(test)]
+    after_stop_seam(runner_id).await;
 
     // Step 2: rebuild.
     let rebuilt_at = chrono::Utc::now();

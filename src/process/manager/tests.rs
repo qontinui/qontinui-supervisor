@@ -2101,10 +2101,13 @@ fn temp_restart_keeps_the_instance_state() {
     }
 
     let restart = body_of("pub async fn run_admitted_restart(");
+    let reap = body_of("async fn reap_state_orphaned_by_restart(");
     assert!(
-        restart
-            .contains("if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)")
-            && restart.contains("reap_runner_instance_state(runner_id, &managed.config.name)"),
+        restart.contains("orphan_guard.run_now().await;")
+            && reap.contains(
+                "if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)"
+            )
+            && reap.contains("reap_runner_instance_state(runner_id, &managed.config.name)"),
         "a failed temp restart must reap the per-instance state its stop half kept"
     );
 
@@ -4616,7 +4619,7 @@ fn every_minted_start_names_its_action() {
         (
             "pub async fn run_admitted_restart(",
             "restart_after_gate(",
-            "initiated_by,&mutacted,)",
+            "initiated_by,&mutacted,",
         ),
         (
             "async fn restart_after_gate(",
@@ -5929,6 +5932,194 @@ async fn a_restart_of_a_test_runner_keeps_it_registered_through_its_own_stop() {
     );
 }
 
+/// The reap of a failed or cancelled restart is only for state ITS stop kept. A
+/// restart that lost a race to a peer's stop saw the entry already gone without
+/// removing it, and the pairing copy and config belong to the peer's restart.
+#[tokio::test]
+async fn a_restart_whose_stop_removed_nothing_never_reaps_a_peers_kept_state() {
+    let (state, _root) = restart_test_state();
+    let id = format!("test-peer-kept-state-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_891)),
+        false,
+    ));
+    // Not registered: the peer's stop removed it and its start has not yet put it back.
+    let Some(config_dir) = instance_config_dir(&id) else {
+        return;
+    };
+    std::fs::create_dir_all(&config_dir).expect("create the kept instance state");
+    let _cleanup = scopeguard::guard(config_dir.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
+
+    let removed = std::sync::atomic::AtomicBool::new(false);
+    reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+    assert!(
+        config_dir.exists(),
+        "a restart whose own stop removed nothing reaped a peer's kept state"
+    );
+
+    removed.store(true, std::sync::atomic::Ordering::SeqCst);
+    reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+    assert!(
+        !config_dir.exists(),
+        "a restart whose own stop removed the entry left its kept state unowned"
+    );
+}
+
+/// A `DELETE` that lands after a restart's stop returned, and before the restart
+/// decides whether to put the runner back, must stay a delete. The stop releases its
+/// lifecycle lock on return, so a registry read taken after it cannot tell its own
+/// removal from that `DELETE`; the stop's own report can. A named runner's stop
+/// removes nothing, so the restart's start must refuse the vanished entry.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_delete_between_a_restarts_stop_and_its_decision_stays_deleted() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, _root) = restart_test_state();
+    let id = "named-deleted-in-the-stop-gap";
+    let managed = register_dead_named_runner(&state, id).await;
+    // Port-held evidence is what sends the restart to its stop.
+    managed.cached_health.write().await.runner_port_open = true;
+    {
+        let state = state.clone();
+        AFTER_STOP_HOOKS.lock().unwrap().push((
+            id.to_string(),
+            Arc::new(move || {
+                let state = state.clone();
+                Box::pin(async move {
+                    state.runners.write().await.remove(id);
+                })
+            }),
+        ));
+    }
+
+    let err = restart_runner_by_id(
+        &state,
+        id,
+        false,
+        RestartSource::Manual,
+        false,
+        BuildTree::OriginMain,
+        CloseIntent::Kill,
+        None,
+    )
+    .await
+    .expect_err("the runner was deleted mid-restart");
+    let SupervisorError::AfterAct(inner) = &err else {
+        panic!("a failure after the stop is marked AfterAct: {err:?}");
+    };
+    assert!(
+        matches!(**inner, SupervisorError::RunnerNotFound(_)),
+        "the start must refuse the deleted runner: {err}"
+    );
+    assert!(
+        state.runners.read().await.get(id).is_none(),
+        "the restart re-inserted a runner deleted after its stop"
+    );
+}
+
+/// A restart of a `test-*` runner cancelled between its stop and its start still
+/// reaps the per-instance state its stop kept. The stop removed the entry; the hook
+/// then holds the lifecycle lock, so the restart waits for it where its start would
+/// re-register the id, and the caller goes away there. Nothing else visits that id
+/// again, so the dropped restart's guard must: it waits for the lock, finds the id
+/// unregistered, and reaps.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_restart_cancelled_after_its_stop_reaps_the_state_its_stop_kept() {
+    use crate::diagnostics::RestartSource;
+
+    let (state, _root) = restart_test_state();
+    let id = format!("test-cancelled-restart-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_889)),
+        false,
+    ));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.clone(), managed.clone());
+    managed.cached_health.write().await.runner_port_open = true;
+
+    let Some(config_dir) = instance_config_dir(&id) else {
+        return;
+    };
+    // Under the operator's real config dir, so it must not outlive a failed assertion.
+    std::fs::create_dir_all(&config_dir).expect("create the kept instance state");
+    let _cleanup = scopeguard::guard(config_dir.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
+
+    let held: Arc<std::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>> = Default::default();
+    {
+        let (managed, held) = (managed.clone(), held.clone());
+        AFTER_STOP_HOOKS.lock().unwrap().push((
+            id.clone(),
+            Arc::new(move || {
+                let (managed, held) = (managed.clone(), held.clone());
+                Box::pin(async move {
+                    let guard = managed.lifecycle.clone().lock_owned().await;
+                    *held.lock().unwrap() = Some(guard);
+                })
+            }),
+        ));
+    }
+
+    let restart = {
+        let (state, id) = (state.clone(), id.clone());
+        tokio::spawn(async move {
+            restart_runner_by_id(
+                &state,
+                &id,
+                false,
+                RestartSource::Manual,
+                false,
+                BuildTree::OriginMain,
+                CloseIntent::Kill,
+                None,
+            )
+            .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while held.lock().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restart never finished its stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        state.get_runner(&id).await.is_none(),
+        "the stop must have removed the entry"
+    );
+    // Cancel it where its start waits on the lock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    restart.abort();
+    let _ = restart.await;
+    // Long enough for a reaper that did not wait for the lock to have finished.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        config_dir.exists(),
+        "the kept state must outlive the cancel while the lock is held"
+    );
+
+    drop(held.lock().unwrap().take());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while config_dir.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled restart left its runner's instance state with no owner"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Whether a start failed where every start in this empty runner tree ends once it
 /// is past its registry checks: resolving the exe. Looks through `AfterAct`.
 fn failed_at_exe_resolution(err: &SupervisorError) -> bool {
@@ -5970,16 +6161,27 @@ fn both_restarts_read_what_their_stop_removed_before_their_rebuild() {
         "pub async fn rebuild_and_restart_by_id(",
         &[
             "stop_runner_by_id(state,runner_id,",
-            "letremoved_by_its_stop=!is_registered(state,&managed).await;",
+            "Ok(outcome)=>(true,outcome.removed_entry)",
             "run_cargo_build_with_requester(",
             "StartAs::Restart{removed_by_its_stop,}",
         ],
     );
+    // Neither restart reads the registry for it: the lock is gone by then.
+    for sig in [
+        "pub async fn rebuild_and_restart_by_id(",
+        "async fn restart_after_gate(",
+    ] {
+        let body = crate::source_scan::fn_body(&src, sig).unwrap_or_else(|| panic!("{sig} exists"));
+        assert!(
+            !body.contains("is_registered("),
+            "{sig} decides removed_by_its_stop from a registry read after its stop"
+        );
+    }
     in_order(
         "async fn restart_after_gate(",
         &[
             "stop_runner_by_id(state,runner_id,true,intent).await?;",
-            "removed_by_its_stop=!is_registered(state,managed).await;",
+            "removed_by_its_stop=stopped.removed_entry;",
             "primary_rebuild_from_origin_main(",
             "StartAs::Restart{removed_by_its_stop,}",
         ],
@@ -6032,13 +6234,47 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
     );
     scan(
         &["routes", "runners.rs"],
-        "async fn spawn_named_inner(",
+        "pub async fn spawn_named(",
+        &["manager::run_detached(spawn_named_after_reservation("],
+    );
+    scan(
+        &["routes", "runners.rs"],
+        "async fn spawn_named_after_reservation(",
         &[
-            "manager::run_detached(asyncmove{",
-            "manager::start_managed_runner(",
-            "settings::add_runner(",
-            "Ok(())})",
+            "mint_spawn_action(",
+            "RunResultGuard::arm(",
+            "spawn_named_inner(",
+            "record_start_verdict(",
         ],
+    );
+    // The handler itself touches none of what must outlive its client.
+    {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners.rs"),
+        )
+        .expect("read runners.rs")
+        .replace("\r\n", "\n");
+        let src = crate::source_scan::production_span(&src).to_string();
+        let handler = crate::source_scan::fn_body(&src, "pub async fn spawn_named(")
+            .expect("spawn_named exists");
+        for call in [
+            "spawn_named_inner(",
+            "mint_spawn_action(",
+            "record_start_verdict(",
+        ] {
+            assert!(
+                !handler.contains(call),
+                "spawn_named's handler future calls {call} itself, where a hang-up drops it"
+            );
+        }
+    }
+    scan(
+        &["routes", "runners.rs"],
+        "async fn spawn_named_inner(",
+        &["manager::start_managed_runner(", "settings::add_runner("],
     );
     scan(
         &["process", "manager.rs"],
@@ -6067,6 +6303,18 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
             "CleanupIfDropped::new(asyncmove{managed.runner.write().await.restart_requested=false;})",
             "restart_after_gate(",
             "latch.run_now().await;",
+        ],
+    );
+    scan(
+        &["process", "manager.rs"],
+        "pub async fn run_admitted_restart(",
+        &[
+            "letorphan_guard={",
+            "reap_state_orphaned_by_restart(",
+            ".if_dropped_run(asyncmove{reap_orphaned_state_once_free(",
+            "restart_after_gate(",
+            "orphan_guard.run_now().await;",
+            "orphan_guard.run_now().await;",
         ],
     );
 }
