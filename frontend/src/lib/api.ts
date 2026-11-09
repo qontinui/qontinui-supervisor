@@ -405,6 +405,11 @@ export interface WatchdogHealthWire {
   /// that predates the field, `null` when no such alert was sent.
   last_prebind_alert_at?: string | null;
   last_prebind_alert_spawn_started_at?: string | null;
+  /// The `started_at` of the spawn a first-healthy watchdog tracks right now.
+  /// Live, not historical: while it names the current spawn, the serving
+  /// watchdog holds its restart. `undefined` on an older supervisor, `null`
+  /// when no watchdog tracks a spawn.
+  first_healthy_tracked_spawn_started_at?: string | null;
 }
 
 /// `GET /health` → `originGuard` (`src/origin_guard.rs::OriginGuard::health_json`).

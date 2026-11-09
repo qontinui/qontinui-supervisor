@@ -801,6 +801,12 @@ pub async fn list_runners(
         // Set after the literal: one more key inside `json!` above exceeds the
         // macro's recursion limit.
         entry["isolation_unit"] = json!(isolation_unit);
+        // Live, not historical: the spawn a first-healthy watchdog tracks right
+        // now, which holds a serving restart while it names the current spawn.
+        // Same key and meaning as `WatchdogHealth` on `GET /health`.
+        entry["watchdog"]["first_healthy_tracked_spawn_started_at"] = json!(watchdog
+            .first_healthy_tracked_spawn_at()
+            .map(|spawn| spawn.to_rfc3339()));
         entry["isolation"] = json!(isolation_json);
         // Phase 8b: a `fresh_device_identity` runner's own device id, read
         // lazily from `<root>/home/machine.json` — the observable for an id
